@@ -1,6 +1,10 @@
+use crate::plugins::generic_cli::GenericCliPlugin;
+use crate::plugins::x07::X07Plugin;
+use crate::tool_runner::ToolRegistry;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -8,6 +12,17 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub process: ProcessConfig,
+    #[serde(default)]
+    pub tools: HashMap<String, ToolConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolConfig {
+    pub bin: String,
+    #[serde(default)]
+    pub source_pattern: Option<String>,
+    #[serde(default)]
+    pub manifest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +53,7 @@ impl Default for Config {
             index: IndexConfig::default(),
             search: SearchConfig::default(),
             process: ProcessConfig::default(),
+            tools: HashMap::new(),
         }
     }
 }
@@ -133,4 +149,35 @@ fn dirs_next() -> Option<std::path::PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
         })
+}
+
+/// Register tools from config into the tool registry.
+pub async fn register_tools(cfg: &Config, registry: &ToolRegistry) {
+    for (id, tool_cfg) in &cfg.tools {
+        if id == "x07" {
+            let plugin = Arc::new(X07Plugin::new(&tool_cfg.bin));
+            eprintln!("tools: registered x07 plugin ({})", tool_cfg.bin);
+            registry.register(plugin).await;
+        } else {
+            use crate::tool_runner::{ToolCommand, ToolDescriptor};
+            let mut commands = HashMap::new();
+            commands.insert("run".to_string(), ToolCommand {
+                bin: tool_cfg.bin.clone(),
+                args: Vec::new(),
+                output: "json".to_string(),
+            });
+            let descriptor = ToolDescriptor {
+                id: id.clone(),
+                commands,
+                source_pattern: tool_cfg.source_pattern.clone(),
+                manifest: tool_cfg.manifest.clone(),
+                diagnostics_format: "json".to_string(),
+                supports_quickfix: false,
+                quickfix_format: None,
+            };
+            let plugin = Arc::new(GenericCliPlugin::new(descriptor));
+            eprintln!("tools: registered generic plugin '{}'", id);
+            registry.register(plugin).await;
+        }
+    }
 }

@@ -1,8 +1,11 @@
 mod config;
 mod index;
 mod ops;
+mod pipeline_cache;
+mod plugins;
 mod protocol;
 mod session;
+mod tool_runner;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -46,6 +49,12 @@ async fn main() -> anyhow::Result<()> {
     ));
     ws_index.spawn_reindex();
 
+    let tool_reg = std::sync::Arc::new(tool_runner::ToolRegistry::new());
+    config::register_tools(&cfg, &tool_reg).await;
+
+    let pcache = std::sync::Arc::new(pipeline_cache::PipelineCache::new(&workspace));
+    eprintln!("pipeline cache: watching {:?}", workspace);
+
     let listener = UnixListener::bind(&cli.socket)?;
     eprintln!(
         "daimonos listening on {:?} (workspace: {:?})",
@@ -58,9 +67,11 @@ async fn main() -> anyhow::Result<()> {
         let debug = cli.debug;
         let idx = ws_index.clone();
         let cfg_clone = cfg.clone();
+        let tr = tool_reg.clone();
+        let pc = pcache.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ws, debug, idx, cfg_clone).await {
+            if let Err(e) = handle_connection(stream, ws, debug, idx, cfg_clone, tr, pc).await {
                 eprintln!("connection error: {e}");
             }
         });
@@ -73,11 +84,15 @@ async fn handle_connection(
     debug: bool,
     ws_index: std::sync::Arc<index::WorkspaceIndex>,
     cfg: std::sync::Arc<config::Config>,
+    tool_reg: std::sync::Arc<tool_runner::ToolRegistry>,
+    pcache: std::sync::Arc<pipeline_cache::PipelineCache>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut session = session::Session::new(workspace, cfg);
     session.index = Some(ws_index);
+    session.tool_registry = Some(tool_reg);
+    session.pipeline_cache = Some(pcache);
     let mut line = String::new();
 
     loop {

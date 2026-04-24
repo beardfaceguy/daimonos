@@ -60,6 +60,19 @@ pub fn schema(op: &Op) -> Response {
             ("p", "key", true),
         ]),
         op_schema(18, "session", "Session info", &[]),
+        op_schema(20, "tool_run", "Run registered tool command", &[
+            ("p", "tool_id", true), ("s", "command", true), ("q", "cwd", false),
+        ]),
+        op_schema(21, "tool_repair", "Repair loop: lint, fix, re-lint", &[
+            ("p", "tool_id", true), ("n", "max_iterations", false), ("q", "cwd", false),
+        ]),
+        op_schema(22, "tool_pipeline", "Run tool pipeline stages", &[
+            ("p", "tool_id", true), ("a", "stages", true), ("q", "cwd", false),
+        ]),
+        op_schema(23, "tool_register", "Register tool at runtime", &[
+            ("s", "descriptor_json", true),
+        ]),
+        op_schema(24, "tool_list", "List registered tools", &[]),
         op_schema(255, "schema", "Get opcode registry", &[
             ("n", "specific_op", false),
         ]),

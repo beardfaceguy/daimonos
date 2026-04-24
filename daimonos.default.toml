@@ -29,3 +29,17 @@ default_find_max = 20
 [process]
 # Number of trailing output lines returned by poll
 poll_tail_lines = 20
+
+# Registered tools for the tool runner.
+# Each tool gets a [tools.<id>] section.
+# Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.
+
+# [tools.x07]
+# bin = "/path/to/x07"
+# source_pattern = "**/*.x07.json"
+# manifest = "x07.json"
+
+# [tools.cargo]
+# bin = "cargo"
+# source_pattern = "**/*.rs"
+# manifest = "Cargo.toml"

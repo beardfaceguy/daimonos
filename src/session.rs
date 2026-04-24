@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::index::WorkspaceIndex;
+use crate::pipeline_cache::PipelineCache;
+use crate::tool_runner::ToolRegistry;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +14,8 @@ pub struct Session {
     pub env: HashMap<String, String>,
     pub bg_processes: HashMap<u32, BgProcess>,
     pub index: Option<Arc<WorkspaceIndex>>,
+    pub tool_registry: Option<Arc<ToolRegistry>>,
+    pub pipeline_cache: Option<Arc<PipelineCache>>,
     pub cfg: Arc<Config>,
     next_pid: u32,
 }
@@ -30,6 +34,8 @@ impl Session {
             env: HashMap::new(),
             bg_processes: HashMap::new(),
             index: None,
+            tool_registry: None,
+            pipeline_cache: None,
             cfg,
             next_pid: 1,
         }

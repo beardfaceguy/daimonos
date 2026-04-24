@@ -1,6 +1,7 @@
 mod file_ops;
 mod exec_ops;
 mod schema;
+mod tool_ops;
 
 use crate::protocol::{self, Op, Request, Response};
 use crate::session::Session;
@@ -32,6 +33,11 @@ async fn dispatch_op(session: &mut Session, op: Op) -> Response {
         protocol::op::POLL => exec_ops::poll(session, &op).await,
         protocol::op::KILL => exec_ops::kill(session, &op).await,
         protocol::op::FIND => find(session, &op).await,
+        protocol::op::TOOL_RUN => tool_ops::tool_run(session, &op).await,
+        protocol::op::TOOL_REPAIR => tool_ops::tool_repair(session, &op).await,
+        protocol::op::TOOL_PIPELINE => tool_ops::tool_pipeline(session, &op).await,
+        protocol::op::TOOL_REGISTER => tool_ops::tool_register(session, &op).await,
+        protocol::op::TOOL_LIST => tool_ops::tool_list(session, &op).await,
         protocol::op::ENV_SET => env_set(session, &op),
         protocol::op::ENV_GET => env_get(session, &op),
         protocol::op::SESSION => session_info(session),
