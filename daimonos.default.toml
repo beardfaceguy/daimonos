@@ -1,0 +1,31 @@
+# daimonos default configuration
+# Copy to ~/.config/daimonos/config.toml or place next to the binary to override.
+
+[index]
+# Maximum directory traversal depth
+max_depth = 20
+# Skip files larger than this (bytes)
+max_file_size = 1_000_000
+# Bytes to sniff for null bytes when detecting binary files
+binary_sniff_bytes = 512
+# File extensions to skip during indexing (known binary formats)
+skip_extensions = [
+  "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg",
+  "mp3", "mp4", "avi", "mov", "mkv", "flac", "wav", "ogg", "webm",
+  "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst",
+  "exe", "dll", "so", "dylib", "o", "a", "lib",
+  "wasm", "pyc", "pyo", "class",
+  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+  "sqlite", "db", "mdb",
+  "ttf", "otf", "woff", "woff2", "eot",
+]
+
+[search]
+# Default max results for grep when not specified by caller
+default_grep_max = 100
+# Default max results for find (trigram search) when not specified
+default_find_max = 20
+
+[process]
+# Number of trailing output lines returned by poll
+poll_tail_lines = 20
