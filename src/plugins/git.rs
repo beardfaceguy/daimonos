@@ -314,6 +314,7 @@ mod tests {
         Command::new("git").args(["init", "-b", "main"]).current_dir(dir).output().await.unwrap();
         Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().await.unwrap();
         Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().await.unwrap();
+        Command::new("git").args(["config", "commit.gpgsign", "false"]).current_dir(dir).output().await.unwrap();
     }
 
     #[tokio::test]

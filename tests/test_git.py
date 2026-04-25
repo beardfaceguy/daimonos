@@ -18,6 +18,7 @@ def _init_repo(ws):
     _git(ws, "init", "-b", "main")
     _git(ws, "config", "user.email", "test@test.com")
     _git(ws, "config", "user.name", "Test User")
+    _git(ws, "config", "commit.gpgsign", "false")
 
 
 def test_git_status_clean_repo(daimonos):
