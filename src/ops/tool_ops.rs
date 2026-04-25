@@ -30,13 +30,16 @@ pub async fn tool_run(session: &Session, op: &Op) -> Response {
     };
 
     let extra = build_tool_args(op);
-    let extra_ref = if extra.as_object().map_or(true, |o| o.is_empty()) {
+    let extra_ref = if extra.as_object().is_none_or(|o| o.is_empty()) {
         None
     } else {
         Some(&extra)
     };
 
-    match registry.run(tool_id, command, &cwd, &session.env, None, extra_ref).await {
+    match registry
+        .run(tool_id, command, &cwd, &session.env, None, extra_ref)
+        .await
+    {
         Ok(result) => Response::ok(serde_json::to_value(result).unwrap()),
         Err(e) => Response::err(5, &e),
     }
@@ -188,7 +191,10 @@ mod tests {
     #[tokio::test]
     async fn tool_run_missing_tool_id() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 20, ..Default::default() };
+        let op = Op {
+            c: 20,
+            ..Default::default()
+        };
         let resp = tool_run(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("tool id"));
@@ -197,7 +203,11 @@ mod tests {
     #[tokio::test]
     async fn tool_run_missing_command() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 20, p: Some("x07".into()), ..Default::default() };
+        let op = Op {
+            c: 20,
+            p: Some("x07".into()),
+            ..Default::default()
+        };
         let resp = tool_run(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("command"));
@@ -206,7 +216,12 @@ mod tests {
     #[tokio::test]
     async fn tool_run_no_registry() {
         let (_dir, session) = test_session_no_registry();
-        let op = Op { c: 20, p: Some("x07".into()), s: Some("build".into()), ..Default::default() };
+        let op = Op {
+            c: 20,
+            p: Some("x07".into()),
+            s: Some("build".into()),
+            ..Default::default()
+        };
         let resp = tool_run(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("registry not available"));
@@ -215,7 +230,12 @@ mod tests {
     #[tokio::test]
     async fn tool_run_unknown_tool() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 20, p: Some("nonexistent".into()), s: Some("build".into()), ..Default::default() };
+        let op = Op {
+            c: 20,
+            p: Some("nonexistent".into()),
+            s: Some("build".into()),
+            ..Default::default()
+        };
         let resp = tool_run(&session, &op).await;
         assert!(!resp.ok);
     }
@@ -258,7 +278,10 @@ mod tests {
     #[tokio::test]
     async fn tool_repair_missing_tool_id() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 21, ..Default::default() };
+        let op = Op {
+            c: 21,
+            ..Default::default()
+        };
         let resp = tool_repair(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("tool id"));
@@ -267,7 +290,11 @@ mod tests {
     #[tokio::test]
     async fn tool_repair_no_registry() {
         let (_dir, session) = test_session_no_registry();
-        let op = Op { c: 21, p: Some("x07".into()), ..Default::default() };
+        let op = Op {
+            c: 21,
+            p: Some("x07".into()),
+            ..Default::default()
+        };
         let resp = tool_repair(&session, &op).await;
         assert!(!resp.ok);
     }
@@ -275,7 +302,10 @@ mod tests {
     #[tokio::test]
     async fn tool_pipeline_missing_tool_id() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 22, ..Default::default() };
+        let op = Op {
+            c: 22,
+            ..Default::default()
+        };
         let resp = tool_pipeline(&session, &op).await;
         assert!(!resp.ok);
     }
@@ -283,7 +313,11 @@ mod tests {
     #[tokio::test]
     async fn tool_pipeline_missing_stages() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 22, p: Some("x07".into()), ..Default::default() };
+        let op = Op {
+            c: 22,
+            p: Some("x07".into()),
+            ..Default::default()
+        };
         let resp = tool_pipeline(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("stage names"));
@@ -292,7 +326,12 @@ mod tests {
     #[tokio::test]
     async fn tool_pipeline_empty_stages() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 22, p: Some("x07".into()), a: Some(vec![]), ..Default::default() };
+        let op = Op {
+            c: 22,
+            p: Some("x07".into()),
+            a: Some(vec![]),
+            ..Default::default()
+        };
         let resp = tool_pipeline(&session, &op).await;
         assert!(!resp.ok);
     }
@@ -300,7 +339,10 @@ mod tests {
     #[tokio::test]
     async fn tool_register_missing_descriptor() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 23, ..Default::default() };
+        let op = Op {
+            c: 23,
+            ..Default::default()
+        };
         let resp = tool_register(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("descriptor JSON"));
@@ -309,7 +351,11 @@ mod tests {
     #[tokio::test]
     async fn tool_register_invalid_json() {
         let (_dir, session) = test_session_with_registry();
-        let op = Op { c: 23, s: Some("{bad json".into()), ..Default::default() };
+        let op = Op {
+            c: 23,
+            s: Some("{bad json".into()),
+            ..Default::default()
+        };
         let resp = tool_register(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("invalid descriptor"));
@@ -324,12 +370,19 @@ mod tests {
                 "run": {"bin": "/usr/bin/echo", "args": ["hello"]}
             }
         });
-        let op = Op { c: 23, s: Some(desc.to_string()), ..Default::default() };
+        let op = Op {
+            c: 23,
+            s: Some(desc.to_string()),
+            ..Default::default()
+        };
         let resp = tool_register(&session, &op).await;
         assert!(resp.ok);
         assert_eq!(resp.d.unwrap()["registered"], "my_tool");
 
-        let list_op = Op { c: 24, ..Default::default() };
+        let list_op = Op {
+            c: 24,
+            ..Default::default()
+        };
         let list_resp = tool_list(&session, &list_op).await;
         assert!(list_resp.ok);
         let data = list_resp.d.unwrap();
@@ -339,7 +392,10 @@ mod tests {
     #[tokio::test]
     async fn tool_list_no_registry() {
         let (_dir, session) = test_session_no_registry();
-        let op = Op { c: 24, ..Default::default() };
+        let op = Op {
+            c: 24,
+            ..Default::default()
+        };
         let resp = tool_list(&session, &op).await;
         assert!(!resp.ok);
     }

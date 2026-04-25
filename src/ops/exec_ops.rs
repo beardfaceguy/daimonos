@@ -168,7 +168,11 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
         .map(|s| {
             let lines: Vec<&str> = s.lines().collect();
             let tail_n = session.cfg.process.poll_tail_lines;
-            let start = if lines.len() > tail_n { lines.len() - tail_n } else { 0 };
+            let start = if lines.len() > tail_n {
+                lines.len() - tail_n
+            } else {
+                0
+            };
             lines[start..].join("\n")
         });
 
@@ -222,12 +226,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = exec(&s, &Op {
-            c: 8,
-            s: Some("echo".into()),
-            a: Some(vec!["hello".into()]),
-            ..Op::default()
-        }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo".into()),
+                a: Some(vec!["hello".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["exit"], 0);
@@ -239,12 +247,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = exec(&s, &Op {
-            c: 8,
-            s: Some("sh".into()),
-            a: Some(vec!["-c".into(), "echo err >&2; exit 42".into()]),
-            ..Op::default()
-        }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "echo err >&2; exit 42".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["exit"], 42);
@@ -255,7 +267,14 @@ mod tests {
     async fn exec_missing_command_arg() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
-        let r = exec(&s, &Op { c: 8, ..Op::default() }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(3));
     }
@@ -264,11 +283,15 @@ mod tests {
     async fn exec_nonexistent_binary() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
-        let r = exec(&s, &Op {
-            c: 8,
-            s: Some("/nonexistent_binary_xyz".into()),
-            ..Op::default()
-        }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("/nonexistent_binary_xyz".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(5));
     }
@@ -279,12 +302,16 @@ mod tests {
         let mut s = session_in(dir.path());
         s.env.insert("MY_VAR".into(), "session_val".into());
 
-        let r = exec(&s, &Op {
-            c: 8,
-            s: Some("sh".into()),
-            a: Some(vec!["-c".into(), "echo $MY_VAR".into()]),
-            ..Op::default()
-        }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "echo $MY_VAR".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["out"], "session_val");
     }
@@ -294,28 +321,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        let bg_resp = bg(&mut s, &Op {
-            c: 9,
-            s: Some("sleep".into()),
-            a: Some(vec!["60".into()]),
-            ..Op::default()
-        }).await;
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("sleep".into()),
+                a: Some(vec!["60".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(bg_resp.ok);
         let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
 
-        let poll_resp = poll(&mut s, &Op {
-            c: 10,
-            n: Some(pid),
-            ..Op::default()
-        }).await;
+        let poll_resp = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(poll_resp.ok);
         assert_eq!(poll_resp.d.as_ref().unwrap()["running"], true);
 
-        let kill_resp = kill(&mut s, &Op {
-            c: 11,
-            n: Some(pid),
-            ..Op::default()
-        }).await;
+        let kill_resp = kill(
+            &mut s,
+            &Op {
+                c: 11,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(kill_resp.ok);
     }
 
@@ -323,11 +362,15 @@ mod tests {
     async fn poll_nonexistent_pid() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
-        let r = poll(&mut s, &Op {
-            c: 10,
-            n: Some(999),
-            ..Op::default()
-        }).await;
+        let r = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(999),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(7));
     }
@@ -362,12 +405,16 @@ mod tests {
         cfg.process.exec_output_max_chars = 100;
         let s = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
 
-        let r = exec(&s, &Op {
-            c: 8,
-            s: Some("sh".into()),
-            a: Some(vec!["-c".into(), "seq 1 1000".into()]),
-            ..Op::default()
-        }).await;
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "seq 1 1000".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let out = r.d.unwrap()["out"].as_str().unwrap().to_string();
         assert!(out.contains("truncated"));

@@ -51,10 +51,7 @@ fn get_str_array(args: &Value, key: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn get_str_map(
-    args: &Value,
-    key: &str,
-) -> Option<std::collections::HashMap<String, String>> {
+fn get_str_map(args: &Value, key: &str) -> Option<std::collections::HashMap<String, String>> {
     let obj = args.get(key)?.as_object()?;
     let mut map = std::collections::HashMap::new();
     for (k, v) in obj {
@@ -156,8 +153,7 @@ async fn dispatch_tool(
         }
 
         "search" => {
-            let mode = get_str(args, "mode")
-                .unwrap_or_else(|| "content".into());
+            let mode = get_str(args, "mode").unwrap_or_else(|| "content".into());
 
             let resp = if mode == "files" {
                 ops::dispatch(
@@ -350,10 +346,17 @@ async fn dispatch_tool(
             let cwd = session.cwd.clone();
             let env = session.env.clone();
 
-            let extra = if !args.is_null() { Some(args.clone()) } else { None };
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
             let extra_ref = extra.as_ref();
 
-            match registry.run("git", command, &cwd, &env, None, extra_ref).await {
+            match registry
+                .run("git", command, &cwd, &env, None, extra_ref)
+                .await
+            {
                 Ok(result) => {
                     let text = serde_json::to_string(&result.output).unwrap_or_default();
                     ok_text(text)
@@ -367,13 +370,18 @@ async fn dispatch_tool(
 }
 
 fn extract_result_text(result: &CallToolResult) -> String {
-    result.content.iter().filter_map(|c| {
-        if let rust_mcp_sdk::schema::ContentBlock::TextContent(tc) = c {
-            Some(tc.text.clone())
-        } else {
-            None
-        }
-    }).collect::<Vec<_>>().join("")
+    result
+        .content
+        .iter()
+        .filter_map(|c| {
+            if let rust_mcp_sdk::schema::ContentBlock::TextContent(tc) = c {
+                Some(tc.text.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[async_trait]
@@ -401,8 +409,7 @@ impl ServerHandler for DaimonosHandler {
         params: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
-        let args: Value =
-            serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
+        let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
 
         let mut session = self.session.lock().await;
 
@@ -423,7 +430,9 @@ impl ServerHandler for DaimonosHandler {
                 };
 
                 if tool == "batch" {
-                    results.push(json!({"ok": false, "tool": "batch", "error": "nested batch not allowed"}));
+                    results.push(
+                        json!({"ok": false, "tool": "batch", "error": "nested batch not allowed"}),
+                    );
                     continue;
                 }
 
@@ -767,8 +776,7 @@ pub async fn run_mcp_server(
             version: "0.1.0".into(),
             title: Some("Daimonos".into()),
             description: Some(
-                "Agent-optimized OS layer with structured file, exec, and search operations"
-                    .into(),
+                "Agent-optimized OS layer with structured file, exec, and search operations".into(),
             ),
             icons: vec![],
             website_url: None,
@@ -921,7 +929,9 @@ mod tests {
     #[tokio::test]
     async fn build_instructions_detects_cargo() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("Cargo.toml"), "[package]").await.unwrap();
+        tokio::fs::write(dir.path().join("Cargo.toml"), "[package]")
+            .await
+            .unwrap();
         let instructions = build_instructions(dir.path()).await;
         assert!(instructions.contains("Rust (Cargo)"));
     }
@@ -929,7 +939,9 @@ mod tests {
     #[tokio::test]
     async fn build_instructions_detects_git() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir(dir.path().join(".git")).await.unwrap();
+        tokio::fs::create_dir(dir.path().join(".git"))
+            .await
+            .unwrap();
         let instructions = build_instructions(dir.path()).await;
         assert!(instructions.contains("VCS: git"));
     }
@@ -938,7 +950,9 @@ mod tests {
     async fn build_instructions_lists_dirs() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::create_dir(dir.path().join("src")).await.unwrap();
-        tokio::fs::create_dir(dir.path().join("tests")).await.unwrap();
+        tokio::fs::create_dir(dir.path().join("tests"))
+            .await
+            .unwrap();
         let instructions = build_instructions(dir.path()).await;
         assert!(instructions.contains("Top-level dirs:"));
         assert!(instructions.contains("src"));

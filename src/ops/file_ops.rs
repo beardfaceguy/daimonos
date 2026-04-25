@@ -88,7 +88,12 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
 
     let edits = match &op.a {
         Some(a) if a.len() % 2 == 0 => a,
-        _ => return Response::err(3, "patch requires edits in 'a' as [old, new, old, new, ...]"),
+        _ => {
+            return Response::err(
+                3,
+                "patch requires edits in 'a' as [old, new, old, new, ...]",
+            )
+        }
     };
 
     let mut content = match tokio::fs::read_to_string(&path).await {
@@ -142,12 +147,20 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
         let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
         let is_dir = if is_symlink {
             // DirEntry::metadata() doesn't follow symlinks; use fs::metadata to resolve target
-            tokio::fs::metadata(entry.path()).await.ok().map(|m| m.is_dir()).unwrap_or(false)
+            tokio::fs::metadata(entry.path())
+                .await
+                .ok()
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
         } else {
             ft.as_ref().map(|t| t.is_dir()).unwrap_or(false)
         };
         let size = if is_symlink {
-            tokio::fs::metadata(entry.path()).await.ok().map(|m| m.len()).unwrap_or(0)
+            tokio::fs::metadata(entry.path())
+                .await
+                .ok()
+                .map(|m| m.len())
+                .unwrap_or(0)
         } else {
             entry.metadata().await.ok().map(|m| m.len()).unwrap_or(0)
         };
@@ -253,7 +266,9 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
         None => session.cwd.clone(),
     };
 
-    let max = op.n.unwrap_or(session.cfg.search.default_grep_max as i64).max(1) as usize;
+    let max =
+        op.n.unwrap_or(session.cfg.search.default_grep_max as i64)
+            .max(1) as usize;
     let file_glob = op.g.clone();
 
     let pattern_clone = pattern.clone();
@@ -353,7 +368,11 @@ mod tests {
     }
 
     fn op_read(path: &str) -> Op {
-        Op { c: 0, p: Some(path.to_string()), ..Op::default() }
+        Op {
+            c: 0,
+            p: Some(path.to_string()),
+            ..Op::default()
+        }
     }
 
     #[tokio::test]
@@ -361,12 +380,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        let w = write(&mut s, &Op {
-            c: 1,
-            p: Some("hello.txt".into()),
-            s: Some("line1\nline2\nline3".into()),
-            ..Op::default()
-        }).await;
+        let w = write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("hello.txt".into()),
+                s: Some("line1\nline2\nline3".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(w.ok);
 
         let r = read(&mut s, &op_read("hello.txt")).await;
@@ -381,20 +404,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("f.txt".into()),
-            s: Some("a\nb\nc\nd\ne".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("f.txt".into()),
+                s: Some("a\nb\nc\nd\ne".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
-        let r = read(&mut s, &Op {
-            c: 0,
-            p: Some("f.txt".into()),
-            n: Some(1),
-            n2: Some(2),
-            ..Op::default()
-        }).await;
+        let r = read(
+            &mut s,
+            &Op {
+                c: 0,
+                p: Some("f.txt".into()),
+                n: Some(1),
+                n2: Some(2),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["content"], "b\nc");
@@ -415,7 +446,14 @@ mod tests {
     async fn read_missing_path_arg() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
-        let r = read(&mut s, &Op { c: 0, ..Op::default() }).await;
+        let r = read(
+            &mut s,
+            &Op {
+                c: 0,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(3));
     }
@@ -424,12 +462,16 @@ mod tests {
     async fn write_creates_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
-        let w = write(&mut s, &Op {
-            c: 1,
-            p: Some("a/b/c.txt".into()),
-            s: Some("deep".into()),
-            ..Op::default()
-        }).await;
+        let w = write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("a/b/c.txt".into()),
+                s: Some("deep".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(w.ok);
         assert!(dir.path().join("a/b/c.txt").exists());
     }
@@ -439,22 +481,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("p.txt".into()),
-            s: Some("hello world foo bar".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("p.txt".into()),
+                s: Some("hello world foo bar".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("p.txt".into()),
-            a: Some(vec![
-                "hello".into(), "goodbye".into(),
-                "foo".into(), "baz".into(),
-            ]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("p.txt".into()),
+                a: Some(vec![
+                    "hello".into(),
+                    "goodbye".into(),
+                    "foo".into(),
+                    "baz".into(),
+                ]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["applied"], 2);
@@ -468,19 +520,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("pm.txt".into()),
-            s: Some("abc".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("pm.txt".into()),
+                s: Some("abc".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("pm.txt".into()),
-            a: Some(vec!["xyz".into(), "123".into()]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("pm.txt".into()),
+                a: Some(vec!["xyz".into(), "123".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["applied"], 0);
     }
@@ -490,22 +550,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("diff.txt".into()),
-            s: Some("hello world foo bar".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("diff.txt".into()),
+                s: Some("hello world foo bar".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("diff.txt".into()),
-            a: Some(vec![
-                "hello".into(), "goodbye".into(),
-                "foo".into(), "baz".into(),
-            ]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("diff.txt".into()),
+                a: Some(vec![
+                    "hello".into(),
+                    "goodbye".into(),
+                    "foo".into(),
+                    "baz".into(),
+                ]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["applied"], 2);
@@ -522,19 +592,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("nodiff.txt".into()),
-            s: Some("abc".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("nodiff.txt".into()),
+                s: Some("abc".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("nodiff.txt".into()),
-            a: Some(vec!["xyz".into(), "123".into()]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("nodiff.txt".into()),
+                a: Some(vec!["xyz".into(), "123".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["applied"], 0);
@@ -550,7 +628,14 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), "").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
 
-        let r = ls(&s, &Op { c: 3, ..Op::default() }).await;
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         let entries = d["entries"].as_array().unwrap();
@@ -567,21 +652,29 @@ mod tests {
 
         std::fs::write(dir.path().join("s.txt"), "hello").unwrap();
 
-        let r = stat(&s, &Op {
-            c: 4,
-            p: Some("s.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some("s.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["type"], "file");
         assert_eq!(d["size"], 5);
 
-        let r2 = stat(&s, &Op {
-            c: 4,
-            p: Some(".".into()),
-            ..Op::default()
-        }).await;
+        let r2 = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some(".".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r2.ok);
         assert_eq!(r2.d.unwrap()["type"], "dir");
     }
@@ -595,11 +688,15 @@ mod tests {
         std::fs::write(dir.path().join("y.rs"), "").unwrap();
         std::fs::write(dir.path().join("z.txt"), "").unwrap();
 
-        let r = glob(&s, &Op {
-            c: 5,
-            p: Some("*.rs".into()),
-            ..Op::default()
-        }).await;
+        let r = glob(
+            &s,
+            &Op {
+                c: 5,
+                p: Some("*.rs".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["files"].as_array().unwrap().len(), 2);
@@ -610,14 +707,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        std::fs::write(dir.path().join("g1.txt"), "hello world\nfoo bar\nhello again\n").unwrap();
+        std::fs::write(
+            dir.path().join("g1.txt"),
+            "hello world\nfoo bar\nhello again\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("g2.txt"), "no match here\n").unwrap();
 
-        let r = grep(&s, &Op {
-            c: 6,
-            p: Some("hello".into()),
-            ..Op::default()
-        }).await;
+        let r = grep(
+            &s,
+            &Op {
+                c: 6,
+                p: Some("hello".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         let count = d["matches"].as_array().unwrap().len();
@@ -631,10 +736,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         std::fs::write(dir.path().join("real.txt"), "symlink content").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("real.txt"),
-            dir.path().join("link.txt"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
 
         let r = read(&mut s, &op_read("link.txt")).await;
         assert!(r.ok);
@@ -659,14 +762,19 @@ mod tests {
         std::os::unix::fs::symlink(
             dir.path().join("original.txt"),
             dir.path().join("wlink.txt"),
-        ).unwrap();
+        )
+        .unwrap();
 
-        let w = write(&mut s, &Op {
-            c: 1,
-            p: Some("wlink.txt".into()),
-            s: Some("new content".into()),
-            ..Op::default()
-        }).await;
+        let w = write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("wlink.txt".into()),
+                s: Some("new content".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(w.ok);
 
         let actual = std::fs::read_to_string(dir.path().join("original.txt")).unwrap();
@@ -678,17 +786,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         std::fs::write(dir.path().join("ptarget.txt"), "hello world").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("ptarget.txt"),
-            dir.path().join("plink.txt"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("ptarget.txt"), dir.path().join("plink.txt"))
+            .unwrap();
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("plink.txt".into()),
-            a: Some(vec!["hello".into(), "goodbye".into()]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("plink.txt".into()),
+                a: Some(vec!["hello".into(), "goodbye".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["applied"], 1);
 
@@ -701,16 +811,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("stgt.txt"), "data").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("stgt.txt"),
-            dir.path().join("slink.txt"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("stgt.txt"), dir.path().join("slink.txt"))
+            .unwrap();
 
-        let r = stat(&s, &Op {
-            c: 4,
-            p: Some("slink.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some("slink.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["type"], "link");
@@ -724,11 +836,15 @@ mod tests {
         let s = session_in(dir.path());
         std::os::unix::fs::symlink("/no/such/path", dir.path().join("deadlink")).unwrap();
 
-        let r = stat(&s, &Op {
-            c: 4,
-            p: Some("deadlink".into()),
-            ..Op::default()
-        }).await;
+        let r = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some("deadlink".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["type"], "link");
@@ -740,16 +856,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::create_dir(dir.path().join("realdir")).unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("realdir"),
-            dir.path().join("dirlink"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("realdir"), dir.path().join("dirlink")).unwrap();
 
-        let r = stat(&s, &Op {
-            c: 4,
-            p: Some("dirlink".into()),
-            ..Op::default()
-        }).await;
+        let r = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some("dirlink".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["type"], "link");
     }
@@ -759,17 +876,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("real.txt"), "x").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("real.txt"),
-            dir.path().join("linked.txt"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("linked.txt"))
+            .unwrap();
 
-        let r = ls(&s, &Op { c: 3, ..Op::default() }).await;
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
 
         let real_entry = entries.iter().find(|e| e["n"] == "real.txt").unwrap();
-        assert!(real_entry.get("l").is_none(), "regular file should not have 'l' field");
+        assert!(
+            real_entry.get("l").is_none(),
+            "regular file should not have 'l' field"
+        );
 
         let link_entry = entries.iter().find(|e| e["n"] == "linked.txt").unwrap();
         assert_eq!(link_entry["l"], true);
@@ -780,12 +905,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("subdir"),
-            dir.path().join("dirlink"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("subdir"), dir.path().join("dirlink")).unwrap();
 
-        let r = ls(&s, &Op { c: 3, ..Op::default() }).await;
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
         let link_entry = entries.iter().find(|e| e["n"] == "dirlink").unwrap();
@@ -798,16 +927,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("greal.txt"), "findme in symlink\n").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("greal.txt"),
-            dir.path().join("glink.txt"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("greal.txt"), dir.path().join("glink.txt"))
+            .unwrap();
 
-        let r = grep(&s, &Op {
-            c: 6,
-            p: Some("findme".into()),
-            ..Op::default()
-        }).await;
+        let r = grep(
+            &s,
+            &Op {
+                c: 6,
+                p: Some("findme".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert!(d["matches"].as_array().unwrap().len() >= 1);
@@ -818,20 +949,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("glreal.rs"), "").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("glreal.rs"),
-            dir.path().join("gllink.rs"),
-        ).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("glreal.rs"), dir.path().join("gllink.rs"))
+            .unwrap();
 
-        let r = glob(&s, &Op {
-            c: 5,
-            p: Some("*.rs".into()),
-            ..Op::default()
-        }).await;
+        let r = glob(
+            &s,
+            &Op {
+                c: 5,
+                p: Some("*.rs".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         let count = d["files"].as_array().unwrap().len();
-        assert!(count >= 2, "glob should include both real and symlinked files");
+        assert!(
+            count >= 2,
+            "glob should include both real and symlinked files"
+        );
     }
 
     // --- Hard link tests ---
@@ -841,10 +977,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         std::fs::write(dir.path().join("hlsrc.txt"), "hard link data").unwrap();
-        std::fs::hard_link(
-            dir.path().join("hlsrc.txt"),
-            dir.path().join("hlcopy.txt"),
-        ).unwrap();
+        std::fs::hard_link(dir.path().join("hlsrc.txt"), dir.path().join("hlcopy.txt")).unwrap();
 
         let r = read(&mut s, &op_read("hlcopy.txt")).await;
         assert!(r.ok);
@@ -856,17 +989,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         std::fs::write(dir.path().join("hlw1.txt"), "old").unwrap();
-        std::fs::hard_link(
-            dir.path().join("hlw1.txt"),
-            dir.path().join("hlw2.txt"),
-        ).unwrap();
+        std::fs::hard_link(dir.path().join("hlw1.txt"), dir.path().join("hlw2.txt")).unwrap();
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("hlw2.txt".into()),
-            s: Some("new via hardlink".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("hlw2.txt".into()),
+                s: Some("new via hardlink".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
         let r = read(&mut s, &op_read("hlw1.txt")).await;
         assert!(r.ok);
@@ -881,16 +1015,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("hls.txt"), "data").unwrap();
-        std::fs::hard_link(
-            dir.path().join("hls.txt"),
-            dir.path().join("hls2.txt"),
-        ).unwrap();
+        std::fs::hard_link(dir.path().join("hls.txt"), dir.path().join("hls2.txt")).unwrap();
 
-        let r = stat(&s, &Op {
-            c: 4,
-            p: Some("hls2.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = stat(
+            &s,
+            &Op {
+                c: 4,
+                p: Some("hls2.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["type"], "file");
     }
@@ -900,17 +1035,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         std::fs::write(dir.path().join("hlp.txt"), "hello world").unwrap();
-        std::fs::hard_link(
-            dir.path().join("hlp.txt"),
-            dir.path().join("hlp2.txt"),
-        ).unwrap();
+        std::fs::hard_link(dir.path().join("hlp.txt"), dir.path().join("hlp2.txt")).unwrap();
 
-        let r = patch(&mut s, &Op {
-            c: 2,
-            p: Some("hlp2.txt".into()),
-            a: Some(vec!["hello".into(), "goodbye".into()]),
-            ..Op::default()
-        }).await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("hlp2.txt".into()),
+                a: Some(vec!["hello".into(), "goodbye".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["applied"], 1);
     }
@@ -920,12 +1056,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("hl1.txt"), "data").unwrap();
-        std::fs::hard_link(
-            dir.path().join("hl1.txt"),
-            dir.path().join("hl2.txt"),
-        ).unwrap();
+        std::fs::hard_link(dir.path().join("hl1.txt"), dir.path().join("hl2.txt")).unwrap();
 
-        let r = ls(&s, &Op { c: 3, ..Op::default() }).await;
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
         assert_eq!(entries.len(), 2);
@@ -965,12 +1105,16 @@ mod tests {
 
         read(&mut s, &op_read("rw.txt")).await;
 
-        write(&mut s, &Op {
-            c: 1,
-            p: Some("rw.txt".into()),
-            s: Some("modified".into()),
-            ..Op::default()
-        }).await;
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("rw.txt".into()),
+                s: Some("modified".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
         let r = read(&mut s, &op_read("rw.txt")).await;
         assert!(r.ok);
@@ -987,12 +1131,16 @@ mod tests {
 
         read(&mut s, &op_read("rp.txt")).await;
 
-        patch(&mut s, &Op {
-            c: 2,
-            p: Some("rp.txt".into()),
-            a: Some(vec!["hello".into(), "goodbye".into()]),
-            ..Op::default()
-        }).await;
+        patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("rp.txt".into()),
+                a: Some(vec!["hello".into(), "goodbye".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
 
         let r = read(&mut s, &op_read("rp.txt")).await;
         assert!(r.ok);
@@ -1028,13 +1176,17 @@ mod tests {
         read(&mut s, &op_read("partial.txt")).await;
 
         // Partial read should always return content, not "unchanged"
-        let r = read(&mut s, &Op {
-            c: 0,
-            p: Some("partial.txt".into()),
-            n: Some(2),
-            n2: Some(2),
-            ..Op::default()
-        }).await;
+        let r = read(
+            &mut s,
+            &Op {
+                c: 0,
+                p: Some("partial.txt".into()),
+                n: Some(2),
+                n2: Some(2),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["content"], "c\nd");

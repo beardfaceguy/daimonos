@@ -13,18 +13,20 @@ use tokio::sync::RwLock;
 /// - Custom quickfix extraction from X07 lint output
 pub struct X07Plugin {
     descriptor: ToolDescriptor,
+    #[allow(dead_code)] // used via tests + future wiring
     decl_cache: Arc<RwLock<DeclCache>>,
     symbol_index: Arc<RwLock<SymbolIndex>>,
 }
 
 /// Cache of lint/verify results keyed on declaration content hash.
+#[allow(dead_code)]
 struct DeclCache {
     entries: HashMap<String, CacheEntry>,
 }
 
+#[allow(dead_code)]
 struct CacheEntry {
     lint_ok: bool,
-    #[allow(dead_code)] // stored for future diagnostic retrieval
     diagnostics: Option<serde_json::Value>,
 }
 
@@ -64,36 +66,54 @@ pub struct ParamInfo {
 impl X07Plugin {
     pub fn new(x07_bin: &str) -> Self {
         let mut commands = HashMap::new();
-        commands.insert("build".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["build".into()],
-            output: "json".into(),
-        });
-        commands.insert("run".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["run".into(), "--stdin".into()],
-            output: "json".into(),
-        });
-        commands.insert("lint".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["lint".into()],
-            output: "json".into(),
-        });
-        commands.insert("test".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["test".into()],
-            output: "json".into(),
-        });
-        commands.insert("fmt".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["fmt".into()],
-            output: "json".into(),
-        });
-        commands.insert("verify".into(), ToolCommand {
-            bin: x07_bin.to_string(),
-            args: vec!["verify".into()],
-            output: "json".into(),
-        });
+        commands.insert(
+            "build".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["build".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "run".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["run".into(), "--stdin".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "lint".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["lint".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "test".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["test".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "fmt".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["fmt".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "verify".into(),
+            ToolCommand {
+                bin: x07_bin.to_string(),
+                args: vec!["verify".into()],
+                output: "json".into(),
+            },
+        );
 
         let descriptor = ToolDescriptor {
             id: "x07".into(),
@@ -162,6 +182,7 @@ impl X07Plugin {
     }
 
     /// Query the semantic index for symbols matching a query.
+    #[allow(dead_code)] // called from tests; wired into MCP in a future release
     pub async fn search_symbols(&self, query: &str, max: usize) -> Vec<serde_json::Value> {
         let idx = self.symbol_index.read().await;
         let query_lower = query.to_lowercase();
@@ -204,6 +225,7 @@ impl X07Plugin {
     }
 
     /// Check if a declaration's content hash is already cached with passing lint.
+    #[allow(dead_code)]
     pub async fn is_cached_clean(&self, content_hash: &str) -> bool {
         let cache = self.decl_cache.read().await;
         cache
@@ -214,6 +236,7 @@ impl X07Plugin {
     }
 
     /// Store lint result for a declaration hash.
+    #[allow(dead_code)]
     pub async fn cache_lint_result(
         &self,
         content_hash: &str,
@@ -231,6 +254,7 @@ impl X07Plugin {
     }
 
     /// Compute content hash for a file.
+    #[allow(dead_code)]
     pub fn content_hash(content: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content);
@@ -512,7 +536,9 @@ mod tests {
     #[tokio::test]
     async fn decl_cache_failing_lint() {
         let plugin = X07Plugin::new("/usr/bin/x07");
-        plugin.cache_lint_result("h1", false, Some(json!({"err": "bad"}))).await;
+        plugin
+            .cache_lint_result("h1", false, Some(json!({"err": "bad"})))
+            .await;
         assert!(!plugin.is_cached_clean("h1").await);
     }
 
@@ -529,7 +555,8 @@ mod tests {
         let plugin = X07Plugin::new("/usr/bin/x07");
         {
             let mut idx = plugin.symbol_index.write().await;
-            idx.modules.push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
+            idx.modules
+                .push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
         }
 
         let results = plugin.search_symbols("math", 10).await;
@@ -543,7 +570,8 @@ mod tests {
         let plugin = X07Plugin::new("/usr/bin/x07");
         {
             let mut idx = plugin.symbol_index.write().await;
-            idx.modules.push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
+            idx.modules
+                .push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
         }
 
         let results = plugin.search_symbols("add", 10).await;
@@ -558,7 +586,8 @@ mod tests {
         let plugin = X07Plugin::new("/usr/bin/x07");
         {
             let mut idx = plugin.symbol_index.write().await;
-            idx.modules.push(parse_x07_module(&sample_ast(), "m.x07.json").unwrap());
+            idx.modules
+                .push(parse_x07_module(&sample_ast(), "m.x07.json").unwrap());
         }
         let results = plugin.search_symbols("", 1).await;
         assert_eq!(results.len(), 1);

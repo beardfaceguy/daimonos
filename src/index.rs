@@ -215,11 +215,7 @@ impl WorkspaceIndex {
                     _ => continue,
                 };
 
-                if content
-                    .iter()
-                    .take(binary_sniff_bytes)
-                    .any(|&b| b == 0)
-                {
+                if content.iter().take(binary_sniff_bytes).any(|&b| b == 0) {
                     continue;
                 }
 
@@ -264,12 +260,19 @@ impl WorkspaceIndex {
             if is_first_index {
                 eprintln!(
                     "index: {} files, {} trigrams in {:?}",
-                    file_count, trigram_count, start.elapsed()
+                    file_count,
+                    trigram_count,
+                    start.elapsed()
                 );
             } else {
                 eprintln!(
                     "index: {} files ({} skipped, {} updated, {} added, {} removed) in {:?}",
-                    file_count, skipped, updated, added, removed, start.elapsed()
+                    file_count,
+                    skipped,
+                    updated,
+                    added,
+                    removed,
+                    start.elapsed()
                 );
             }
         });
@@ -304,7 +307,7 @@ impl WorkspaceIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.cmp(&a.score));
+        results.sort_by_key(|r| std::cmp::Reverse(r.score));
         results.truncate(max);
         results
     }
@@ -336,10 +339,7 @@ fn query_to_trigrams(query: &[u8]) -> Vec<Trigram> {
     if query.len() < 3 {
         return Vec::new();
     }
-    query
-        .windows(3)
-        .map(|w| [w[0], w[1], w[2]])
-        .collect()
+    query.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
 }
 
 #[cfg(test)]
@@ -475,7 +475,11 @@ mod tests {
         assert_eq!(idx.stats().await.files, 1);
 
         // Add a new file
-        std::fs::write(dir.path().join("brand_new.rs"), "fn brand_new_function() {}").unwrap();
+        std::fs::write(
+            dir.path().join("brand_new.rs"),
+            "fn brand_new_function() {}",
+        )
+        .unwrap();
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -534,7 +538,10 @@ mod tests {
         wait_for_index().await;
 
         let old_results = idx.search("old_function_name", 10).await;
-        assert!(old_results.is_empty(), "old content should not be searchable");
+        assert!(
+            old_results.is_empty(),
+            "old content should not be searchable"
+        );
 
         let new_results = idx.search("new_function_name", 10).await;
         assert!(!new_results.is_empty(), "new content should be searchable");

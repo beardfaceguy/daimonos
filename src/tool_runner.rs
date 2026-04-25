@@ -127,15 +127,17 @@ pub trait ToolPlugin: Send + Sync {
             }
         }
 
-        let output = child.wait_with_output().await.map_err(|e| format!("wait: {e}"))?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("wait: {e}"))?;
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         let parsed = if cmd_desc.output == "json" {
-            serde_json::from_str(&stdout).unwrap_or_else(|_| {
-                serde_json::json!({"raw": stdout.trim_end()})
-            })
+            serde_json::from_str(&stdout)
+                .unwrap_or_else(|_| serde_json::json!({"raw": stdout.trim_end()}))
         } else {
             serde_json::json!({"raw": stdout.trim_end()})
         };
@@ -150,10 +152,7 @@ pub trait ToolPlugin: Send + Sync {
     }
 
     /// Extract quickfixes from lint output. Plugins override for language-specific formats.
-    fn extract_quickfixes(
-        &self,
-        lint_output: &serde_json::Value,
-    ) -> Vec<QuickFix> {
+    fn extract_quickfixes(&self, lint_output: &serde_json::Value) -> Vec<QuickFix> {
         if !self.descriptor().supports_quickfix {
             return Vec::new();
         }
@@ -173,14 +172,13 @@ pub trait ToolPlugin: Send + Sync {
                 let content = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| format!("read: {e}"))?;
-                let mut doc: serde_json::Value = serde_json::from_str(&content)
-                    .map_err(|e| format!("parse: {e}"))?;
+                let mut doc: serde_json::Value =
+                    serde_json::from_str(&content).map_err(|e| format!("parse: {e}"))?;
                 let patch_obj: json_patch::Patch = serde_json::from_value(patch.clone())
                     .map_err(|e| format!("patch parse: {e}"))?;
-                json_patch::patch(&mut doc, &patch_obj)
-                    .map_err(|e| format!("patch apply: {e}"))?;
-                let out = serde_json::to_string_pretty(&doc)
-                    .map_err(|e| format!("serialize: {e}"))?;
+                json_patch::patch(&mut doc, &patch_obj).map_err(|e| format!("patch apply: {e}"))?;
+                let out =
+                    serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize: {e}"))?;
                 tokio::fs::write(&path, out)
                     .await
                     .map_err(|e| format!("write: {e}"))?;
@@ -263,7 +261,9 @@ impl ToolRegistry {
             .get(tool_id)
             .await
             .ok_or_else(|| format!("unknown tool: {tool_id}"))?;
-        plugin.run_command(command, cwd, env, stdin_data, args).await
+        plugin
+            .run_command(command, cwd, env, stdin_data, args)
+            .await
     }
 
     /// Run a repair loop: lint -> apply fixes -> re-lint, up to max_iterations.
@@ -434,16 +434,22 @@ mod tests {
 
     fn echo_descriptor() -> ToolDescriptor {
         let mut commands = HashMap::new();
-        commands.insert("run".into(), ToolCommand {
-            bin: "echo".into(),
-            args: vec!["hello".into()],
-            output: "text".into(),
-        });
-        commands.insert("json_run".into(), ToolCommand {
-            bin: "echo".into(),
-            args: vec![r#"{"status":"ok"}"#.into()],
-            output: "json".into(),
-        });
+        commands.insert(
+            "run".into(),
+            ToolCommand {
+                bin: "echo".into(),
+                args: vec!["hello".into()],
+                output: "text".into(),
+            },
+        );
+        commands.insert(
+            "json_run".into(),
+            ToolCommand {
+                bin: "echo".into(),
+                args: vec![r#"{"status":"ok"}"#.into()],
+                output: "json".into(),
+            },
+        );
         ToolDescriptor {
             id: "echo_tool".into(),
             commands,
@@ -535,7 +541,9 @@ mod tests {
         let registry = ToolRegistry::new();
         assert!(registry.list().await.is_empty());
 
-        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(
+            echo_descriptor(),
+        ));
         registry.register(plugin).await;
 
         let tools = registry.list().await;
@@ -546,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn registry_get_existing() {
         let registry = ToolRegistry::new();
-        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(
+            echo_descriptor(),
+        ));
         registry.register(plugin).await;
 
         assert!(registry.get("echo_tool").await.is_some());
@@ -557,7 +567,14 @@ mod tests {
     async fn registry_run_unknown_tool() {
         let registry = ToolRegistry::new();
         let result = registry
-            .run("nope", "build", Path::new("/tmp"), &HashMap::new(), None, None)
+            .run(
+                "nope",
+                "build",
+                Path::new("/tmp"),
+                &HashMap::new(),
+                None,
+                None,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown tool"));
@@ -566,11 +583,20 @@ mod tests {
     #[tokio::test]
     async fn registry_run_unknown_command() {
         let registry = ToolRegistry::new();
-        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(
+            echo_descriptor(),
+        ));
         registry.register(plugin).await;
 
         let result = registry
-            .run("echo_tool", "nonexistent", Path::new("/tmp"), &HashMap::new(), None, None)
+            .run(
+                "echo_tool",
+                "nonexistent",
+                Path::new("/tmp"),
+                &HashMap::new(),
+                None,
+                None,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown command"));
@@ -579,11 +605,20 @@ mod tests {
     #[tokio::test]
     async fn registry_run_echo_text() {
         let registry = ToolRegistry::new();
-        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(
+            echo_descriptor(),
+        ));
         registry.register(plugin).await;
 
         let result = registry
-            .run("echo_tool", "run", Path::new("/tmp"), &HashMap::new(), None, None)
+            .run(
+                "echo_tool",
+                "run",
+                Path::new("/tmp"),
+                &HashMap::new(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result.tool, "echo_tool");
@@ -595,11 +630,20 @@ mod tests {
     #[tokio::test]
     async fn registry_run_echo_json() {
         let registry = ToolRegistry::new();
-        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(
+            echo_descriptor(),
+        ));
         registry.register(plugin).await;
 
         let result = registry
-            .run("echo_tool", "json_run", Path::new("/tmp"), &HashMap::new(), None, None)
+            .run(
+                "echo_tool",
+                "json_run",
+                Path::new("/tmp"),
+                &HashMap::new(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result.output["status"], "ok");
@@ -609,9 +653,14 @@ mod tests {
     async fn registry_repair_no_lint_command() {
         let registry = ToolRegistry::new();
         let mut commands = HashMap::new();
-        commands.insert("build".into(), ToolCommand {
-            bin: "echo".into(), args: vec![], output: "json".into(),
-        });
+        commands.insert(
+            "build".into(),
+            ToolCommand {
+                bin: "echo".into(),
+                args: vec![],
+                output: "json".into(),
+            },
+        );
         let desc = ToolDescriptor {
             id: "no_lint".into(),
             commands,
@@ -624,7 +673,9 @@ mod tests {
         let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(desc));
         registry.register(plugin).await;
 
-        let result = registry.repair("no_lint", Path::new("/tmp"), &HashMap::new(), 3).await;
+        let result = registry
+            .repair("no_lint", Path::new("/tmp"), &HashMap::new(), 3)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no 'lint' command"));
     }
@@ -633,7 +684,12 @@ mod tests {
     async fn pipeline_unknown_tool() {
         let registry = ToolRegistry::new();
         let result = registry
-            .pipeline("nope", &["build".into()], Path::new("/tmp"), &HashMap::new())
+            .pipeline(
+                "nope",
+                &["build".into()],
+                Path::new("/tmp"),
+                &HashMap::new(),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -642,15 +698,30 @@ mod tests {
     async fn pipeline_short_circuits_on_failure() {
         let registry = ToolRegistry::new();
         let mut commands = HashMap::new();
-        commands.insert("ok_stage".into(), ToolCommand {
-            bin: "true".into(), args: vec![], output: "text".into(),
-        });
-        commands.insert("fail_stage".into(), ToolCommand {
-            bin: "false".into(), args: vec![], output: "text".into(),
-        });
-        commands.insert("after_fail".into(), ToolCommand {
-            bin: "echo".into(), args: vec!["should not run".into()], output: "text".into(),
-        });
+        commands.insert(
+            "ok_stage".into(),
+            ToolCommand {
+                bin: "true".into(),
+                args: vec![],
+                output: "text".into(),
+            },
+        );
+        commands.insert(
+            "fail_stage".into(),
+            ToolCommand {
+                bin: "false".into(),
+                args: vec![],
+                output: "text".into(),
+            },
+        );
+        commands.insert(
+            "after_fail".into(),
+            ToolCommand {
+                bin: "echo".into(),
+                args: vec!["should not run".into()],
+                output: "text".into(),
+            },
+        );
         let desc = ToolDescriptor {
             id: "multi".into(),
             commands,
@@ -664,7 +735,12 @@ mod tests {
         registry.register(plugin).await;
 
         let result = registry
-            .pipeline("multi", &["ok_stage".into(), "fail_stage".into(), "after_fail".into()], Path::new("/tmp"), &HashMap::new())
+            .pipeline(
+                "multi",
+                &["ok_stage".into(), "fail_stage".into(), "after_fail".into()],
+                Path::new("/tmp"),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(!result.all_ok);
@@ -676,12 +752,22 @@ mod tests {
     async fn pipeline_all_ok() {
         let registry = ToolRegistry::new();
         let mut commands = HashMap::new();
-        commands.insert("s1".into(), ToolCommand {
-            bin: "true".into(), args: vec![], output: "text".into(),
-        });
-        commands.insert("s2".into(), ToolCommand {
-            bin: "true".into(), args: vec![], output: "text".into(),
-        });
+        commands.insert(
+            "s1".into(),
+            ToolCommand {
+                bin: "true".into(),
+                args: vec![],
+                output: "text".into(),
+            },
+        );
+        commands.insert(
+            "s2".into(),
+            ToolCommand {
+                bin: "true".into(),
+                args: vec![],
+                output: "text".into(),
+            },
+        );
         let desc = ToolDescriptor {
             id: "good".into(),
             commands,
@@ -695,7 +781,12 @@ mod tests {
         registry.register(plugin).await;
 
         let result = registry
-            .pipeline("good", &["s1".into(), "s2".into()], Path::new("/tmp"), &HashMap::new())
+            .pipeline(
+                "good",
+                &["s1".into(), "s2".into()],
+                Path::new("/tmp"),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(result.all_ok);

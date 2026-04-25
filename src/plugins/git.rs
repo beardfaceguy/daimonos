@@ -133,13 +133,15 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
     }))
 }
 
-async fn git_log(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn git_log(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let limit = args
         .and_then(|a| a.get("limit").or_else(|| a.get("n")))
         .and_then(|v| v.as_i64())
         .unwrap_or(10)
-        .max(1)
-        .min(100);
+        .clamp(1, 100);
 
     let path_filter = args
         .and_then(|a| a.get("path").or_else(|| a.get("g")))
@@ -184,7 +186,10 @@ async fn git_log(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_j
     }))
 }
 
-async fn git_diff(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn git_diff(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let mode = args
         .and_then(|a| a.get("mode").or_else(|| a.get("g")))
         .and_then(|v| v.as_str())
@@ -245,10 +250,11 @@ fn parse_unified_diff(output: &str) -> Vec<serde_json::Value> {
     for line in output.lines() {
         if line.starts_with("diff --git") {
             continue;
-        } else if line.starts_with("--- a/") {
-            current_file = line[6..].to_string();
-        } else if line.starts_with("+++ b/") {
-            current_file = line[6..].to_string();
+        } else if let Some(f) = line
+            .strip_prefix("--- a/")
+            .or_else(|| line.strip_prefix("+++ b/"))
+        {
+            current_file = f.to_string();
         } else if line.starts_with("@@") {
             if !current_changes.is_empty() {
                 hunks.push(json!({
@@ -259,10 +265,10 @@ fn parse_unified_diff(output: &str) -> Vec<serde_json::Value> {
                 current_changes = Vec::new();
             }
             hunk_header = line.to_string();
-        } else if line.starts_with('+') {
-            current_changes.push(json!({"t": "+", "v": &line[1..]}));
-        } else if line.starts_with('-') {
-            current_changes.push(json!({"t": "-", "v": &line[1..]}));
+        } else if let Some(v) = line.strip_prefix('+') {
+            current_changes.push(json!({"t": "+", "v": v}));
+        } else if let Some(v) = line.strip_prefix('-') {
+            current_changes.push(json!({"t": "-", "v": v}));
         }
     }
 
@@ -311,10 +317,30 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup_git_repo(dir: &Path) {
-        Command::new("git").args(["init", "-b", "main"]).current_dir(dir).output().await.unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().await.unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().await.unwrap();
-        Command::new("git").args(["config", "commit.gpgsign", "false"]).current_dir(dir).output().await.unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -322,12 +348,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_git_repo(dir.path()).await;
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir.path()).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
 
         let plugin = GitPlugin::new();
         let env = HashMap::new();
-        let result = plugin.run_command("status", dir.path(), &env, None, None).await.unwrap();
+        let result = plugin
+            .run_command("status", dir.path(), &env, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output["clean"], true);
     }
@@ -337,15 +376,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_git_repo(dir.path()).await;
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir.path()).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
         std::fs::write(dir.path().join("f.txt"), "changed").unwrap();
 
         let plugin = GitPlugin::new();
         let env = HashMap::new();
-        let result = plugin.run_command("status", dir.path(), &env, None, None).await.unwrap();
+        let result = plugin
+            .run_command("status", dir.path(), &env, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.output["clean"], false);
-        assert!(result.output["modified"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().contains("f.txt")));
+        assert!(result.output["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("f.txt")));
     }
 
     #[tokio::test]
@@ -354,14 +410,27 @@ mod tests {
         setup_git_repo(dir.path()).await;
         for i in 0..5 {
             std::fs::write(dir.path().join("f.txt"), format!("v{i}")).unwrap();
-            Command::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
-            Command::new("git").args(["commit", "-m", &format!("commit {i}")]).current_dir(dir.path()).output().await.unwrap();
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-m", &format!("commit {i}")])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
         }
 
         let plugin = GitPlugin::new();
         let env = HashMap::new();
         let args = json!({"limit": 2});
-        let result = plugin.run_command("log", dir.path(), &env, None, Some(&args)).await.unwrap();
+        let result = plugin
+            .run_command("log", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
         assert_eq!(result.output["count"], 2);
     }
 
@@ -370,12 +439,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_git_repo(dir.path()).await;
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir.path()).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
 
         let plugin = GitPlugin::new();
         let env = HashMap::new();
-        let result = plugin.run_command("branch", dir.path(), &env, None, None).await.unwrap();
+        let result = plugin
+            .run_command("branch", dir.path(), &env, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.output["current"], "main");
     }
 
@@ -384,14 +466,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_git_repo(dir.path()).await;
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir.path()).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
 
         let registry = ToolRegistry::new();
         registry.register(Arc::new(GitPlugin::new())).await;
 
         let env = HashMap::new();
-        let result = registry.run("git", "status", dir.path(), &env, None, None).await.unwrap();
+        let result = registry
+            .run("git", "status", dir.path(), &env, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.output["clean"], true);
         assert_eq!(result.tool, "git");
     }
@@ -401,7 +496,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plugin = GitPlugin::new();
         let env = HashMap::new();
-        let result = plugin.run_command("status", dir.path(), &env, None, None).await;
+        let result = plugin
+            .run_command("status", dir.path(), &env, None, None)
+            .await;
         assert!(result.is_err());
     }
 

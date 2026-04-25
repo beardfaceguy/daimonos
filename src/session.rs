@@ -18,8 +18,14 @@ pub struct ReadCacheEntry {
 /// Tools visible by default. Extended tools (snapshots, git, diff, pipelines)
 /// appear after the model calls `list_all_tools` or uses one directly.
 pub const CORE_TOOLS: &[&str] = &[
-    "read_file", "write_file", "edit_file", "search",
-    "workspace_info", "exec", "batch", "list_all_tools",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "search",
+    "workspace_info",
+    "exec",
+    "batch",
+    "list_all_tools",
 ];
 
 /// Per-connection session state.
@@ -70,9 +76,17 @@ impl Session {
                 // Expose all tools by default for Cursor compatibility.
                 // Cursor caches list_tools and won't re-query after activation.
                 for name in &[
-                    "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete",
-                    "diff_files", "tool_pipeline", "tool_repair",
-                    "git_status", "git_log", "git_diff", "git_branch",
+                    "snapshot_create",
+                    "snapshot_restore",
+                    "snapshot_list",
+                    "snapshot_delete",
+                    "diff_files",
+                    "tool_pipeline",
+                    "tool_repair",
+                    "git_status",
+                    "git_log",
+                    "git_diff",
+                    "git_branch",
                 ] {
                     tools.insert(name.to_string());
                 }
@@ -88,8 +102,7 @@ impl Session {
         let mut env = HashMap::new();
 
         let parent_path = std::env::var("PATH").unwrap_or_default();
-        let parent_dirs: std::collections::HashSet<&str> =
-            parent_path.split(':').collect();
+        let parent_dirs: std::collections::HashSet<&str> = parent_path.split(':').collect();
 
         let mut extra: Vec<String> = Vec::new();
 
@@ -189,9 +202,17 @@ impl Session {
     /// Expose all known tools at once.
     pub fn activate_all_tools(&mut self) {
         for name in &[
-            "tool_pipeline", "tool_repair", "diff_files",
-            "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete",
-            "git_status", "git_log", "git_diff", "git_branch",
+            "tool_pipeline",
+            "tool_repair",
+            "diff_files",
+            "snapshot_create",
+            "snapshot_restore",
+            "snapshot_list",
+            "snapshot_delete",
+            "git_status",
+            "git_log",
+            "git_diff",
+            "git_branch",
         ] {
             self.exposed_tools.insert(name.to_string());
         }
@@ -201,10 +222,7 @@ impl Session {
 fn shellexpand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(rest)
-                .to_string_lossy()
-                .to_string();
+            return PathBuf::from(home).join(rest).to_string_lossy().to_string();
         }
     }
     path.to_string()
@@ -215,16 +233,16 @@ mod tests {
     use super::*;
 
     fn test_session(workspace: &str) -> Session {
-        Session::new(
-            PathBuf::from(workspace),
-            Arc::new(Config::default()),
-        )
+        Session::new(PathBuf::from(workspace), Arc::new(Config::default()))
     }
 
     #[test]
     fn resolve_relative_path() {
         let s = test_session("/workspace");
-        assert_eq!(s.resolve_path("foo.txt"), PathBuf::from("/workspace/foo.txt"));
+        assert_eq!(
+            s.resolve_path("foo.txt"),
+            PathBuf::from("/workspace/foo.txt")
+        );
         assert_eq!(
             s.resolve_path("sub/bar.rs"),
             PathBuf::from("/workspace/sub/bar.rs")

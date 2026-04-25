@@ -1,5 +1,5 @@
-mod file_ops;
 mod exec_ops;
+mod file_ops;
 mod git_ops;
 mod schema;
 mod snap_ops;
@@ -69,7 +69,9 @@ async fn find(session: &Session, op: &Op) -> Response {
         None => return Response::err(3, "find requires query in 'p'"),
     };
 
-    let max = op.n.unwrap_or(session.cfg.search.default_find_max as i64).max(1) as usize;
+    let max =
+        op.n.unwrap_or(session.cfg.search.default_find_max as i64)
+            .max(1) as usize;
 
     let idx = match &session.index {
         Some(i) => i,

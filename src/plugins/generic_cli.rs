@@ -28,16 +28,22 @@ mod tests {
 
     fn make_descriptor() -> ToolDescriptor {
         let mut commands = HashMap::new();
-        commands.insert("build".into(), ToolCommand {
-            bin: "cargo".into(),
-            args: vec!["build".into()],
-            output: "json".into(),
-        });
-        commands.insert("test".into(), ToolCommand {
-            bin: "cargo".into(),
-            args: vec!["test".into()],
-            output: "text".into(),
-        });
+        commands.insert(
+            "build".into(),
+            ToolCommand {
+                bin: "cargo".into(),
+                args: vec!["build".into()],
+                output: "json".into(),
+            },
+        );
+        commands.insert(
+            "test".into(),
+            ToolCommand {
+                bin: "cargo".into(),
+                args: vec!["test".into()],
+                output: "text".into(),
+            },
+        );
         ToolDescriptor {
             id: "rust".into(),
             commands,

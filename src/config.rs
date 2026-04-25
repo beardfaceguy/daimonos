@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub index: IndexConfig,
@@ -54,17 +54,6 @@ pub struct ProcessConfig {
     pub extra_path: Vec<String>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            index: IndexConfig::default(),
-            search: SearchConfig::default(),
-            process: ProcessConfig::default(),
-            tools: HashMap::new(),
-        }
-    }
-}
-
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
@@ -103,14 +92,11 @@ impl IndexConfig {
 
 fn default_skip_extensions() -> Vec<String> {
     [
-        "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg",
-        "mp3", "mp4", "avi", "mov", "mkv", "flac", "wav", "ogg", "webm",
-        "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst",
-        "exe", "dll", "so", "dylib", "o", "a", "lib",
-        "wasm", "pyc", "pyo", "class",
-        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-        "sqlite", "db", "mdb",
-        "ttf", "otf", "woff", "woff2", "eot",
+        "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg", "mp3", "mp4", "avi", "mov",
+        "mkv", "flac", "wav", "ogg", "webm", "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst",
+        "exe", "dll", "so", "dylib", "o", "a", "lib", "wasm", "pyc", "pyo", "class", "pdf", "doc",
+        "docx", "xls", "xlsx", "ppt", "pptx", "sqlite", "db", "mdb", "ttf", "otf", "woff", "woff2",
+        "eot",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -155,9 +141,7 @@ pub fn load(explicit: Option<&Path>, workspace: &Path) -> Config {
 fn dirs_next() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
 }
 
 #[cfg(test)]
@@ -252,11 +236,14 @@ pub async fn register_tools(cfg: &Config, registry: &ToolRegistry) {
         } else {
             use crate::tool_runner::{ToolCommand, ToolDescriptor};
             let mut commands = HashMap::new();
-            commands.insert("run".to_string(), ToolCommand {
-                bin: tool_cfg.bin.clone(),
-                args: Vec::new(),
-                output: "json".to_string(),
-            });
+            commands.insert(
+                "run".to_string(),
+                ToolCommand {
+                    bin: tool_cfg.bin.clone(),
+                    args: Vec::new(),
+                    output: "json".to_string(),
+                },
+            );
             let descriptor = ToolDescriptor {
                 id: id.clone(),
                 commands,

@@ -46,10 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let workspace = std::fs::canonicalize(&cli.workspace)?;
     let cfg = Arc::new(config::load(cli.config.as_deref(), &workspace));
 
-    let ws_index = Arc::new(index::WorkspaceIndex::new(
-        workspace.clone(),
-        &cfg.index,
-    ));
+    let ws_index = Arc::new(index::WorkspaceIndex::new(workspace.clone(), &cfg.index));
     ws_index.spawn_reindex();
 
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());

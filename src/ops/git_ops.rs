@@ -100,12 +100,16 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "hello\nworld\n").unwrap();
 
-        let r = diff(&s, &Op {
-            c: 14,
-            p: Some("a.txt".into()),
-            q: Some("b.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = diff(
+            &s,
+            &Op {
+                c: 14,
+                p: Some("a.txt".into()),
+                q: Some("b.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["identical"], true);
@@ -119,12 +123,16 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "line1\nline2\nline3\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "line1\nchanged\nline3\n").unwrap();
 
-        let r = diff(&s, &Op {
-            c: 14,
-            p: Some("a.txt".into()),
-            q: Some("b.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = diff(
+            &s,
+            &Op {
+                c: 14,
+                p: Some("a.txt".into()),
+                q: Some("b.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["identical"], false);
@@ -143,12 +151,16 @@ mod tests {
         let s = session_in(dir.path());
         std::fs::write(dir.path().join("orig.txt"), "alpha\nbeta\n").unwrap();
 
-        let r = diff(&s, &Op {
-            c: 14,
-            p: Some("orig.txt".into()),
-            s: Some("alpha\ngamma\n".into()),
-            ..Op::default()
-        }).await;
+        let r = diff(
+            &s,
+            &Op {
+                c: 14,
+                p: Some("orig.txt".into()),
+                s: Some("alpha\ngamma\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let d = r.d.unwrap();
         assert_eq!(d["identical"], false);
@@ -159,12 +171,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = diff(&s, &Op {
-            c: 14,
-            p: Some("nope.txt".into()),
-            q: Some("also_nope.txt".into()),
-            ..Op::default()
-        }).await;
+        let r = diff(
+            &s,
+            &Op {
+                c: 14,
+                p: Some("nope.txt".into()),
+                q: Some("also_nope.txt".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(1));
     }
@@ -174,7 +190,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = diff(&s, &Op { c: 14, ..Op::default() }).await;
+        let r = diff(
+            &s,
+            &Op {
+                c: 14,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(3));
     }

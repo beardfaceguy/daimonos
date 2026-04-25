@@ -7,12 +7,14 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 
 /// Caches tool command results keyed on workspace content hash.
-/// Automatically invalidates when source files change (via inotify).
+/// Automatically invalidates when source files change (via inotify/FSEvents).
+#[allow(dead_code)] // wired into Session but methods called only from test + future pipeline paths
 pub struct PipelineCache {
     inner: Arc<RwLock<CacheState>>,
     _watcher: Option<RecommendedWatcher>,
 }
 
+#[allow(dead_code)]
 struct CacheState {
     /// (tool_id, command) -> CachedResult
     entries: HashMap<(String, String), CachedResult>,
@@ -22,13 +24,14 @@ struct CacheState {
     last_invalidated: Instant,
 }
 
+#[allow(dead_code)]
 struct CachedResult {
     output: serde_json::Value,
     exit_code: i32,
-    #[allow(dead_code)] // retained for future TTL-based eviction
     created: Instant,
 }
 
+#[allow(dead_code)]
 impl PipelineCache {
     pub fn new(watch_path: &Path) -> Self {
         let inner = Arc::new(RwLock::new(CacheState {
@@ -46,10 +49,7 @@ impl PipelineCache {
         }
     }
 
-    fn start_watcher(
-        path: &Path,
-        inner: Arc<RwLock<CacheState>>,
-    ) -> Option<RecommendedWatcher> {
+    fn start_watcher(path: &Path, inner: Arc<RwLock<CacheState>>) -> Option<RecommendedWatcher> {
         let inner_clone = inner.clone();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
             if let Ok(event) = res {
@@ -85,7 +85,10 @@ impl PipelineCache {
         }
 
         let key = (tool_id.to_string(), command.to_string());
-        state.entries.get(&key).map(|c| (c.output.clone(), c.exit_code))
+        state
+            .entries
+            .get(&key)
+            .map(|c| (c.output.clone(), c.exit_code))
     }
 
     /// Store a result in the cache.

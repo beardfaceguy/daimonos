@@ -45,11 +45,10 @@ impl SnapshotStore {
         let workspace = self.workspace.clone();
         let files_dir_clone = files_dir.clone();
 
-        let (file_count, total_bytes) = tokio::task::spawn_blocking(move || {
-            copy_workspace(&workspace, &files_dir_clone)
-        })
-        .await
-        .map_err(|e| format!("spawn: {e}"))??;
+        let (file_count, total_bytes) =
+            tokio::task::spawn_blocking(move || copy_workspace(&workspace, &files_dir_clone))
+                .await
+                .map_err(|e| format!("spawn: {e}"))??;
 
         let now = chrono_now();
         let meta = SnapshotMeta {
@@ -81,11 +80,9 @@ impl SnapshotStore {
         let workspace = self.workspace.clone();
         let files_dir_clone = files_dir.clone();
 
-        tokio::task::spawn_blocking(move || {
-            restore_workspace(&workspace, &files_dir_clone)
-        })
-        .await
-        .map_err(|e| format!("spawn: {e}"))??;
+        tokio::task::spawn_blocking(move || restore_workspace(&workspace, &files_dir_clone))
+            .await
+            .map_err(|e| format!("spawn: {e}"))??;
 
         Ok(meta)
     }
@@ -157,14 +154,14 @@ fn copy_workspace(workspace: &Path, dest: &Path) -> Result<(usize, u64), String>
         let target = dest.join(rel);
 
         if path.is_dir() {
-            std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", rel.display()))?;
+            std::fs::create_dir_all(&target)
+                .map_err(|e| format!("mkdir {}: {e}", rel.display()))?;
         } else if path.is_file() {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("mkdir parent: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
             }
-            let bytes = std::fs::copy(path, &target)
-                .map_err(|e| format!("copy {}: {e}", rel.display()))?;
+            let bytes =
+                std::fs::copy(path, &target).map_err(|e| format!("copy {}: {e}", rel.display()))?;
             file_count += 1;
             total_bytes += bytes;
         }
@@ -179,10 +176,8 @@ fn restore_workspace(workspace: &Path, snap_files: &Path) -> Result<(), String> 
 
     // Remove workspace files not in the snapshot
     for (rel, path) in &workspace_set {
-        if !snap_set.contains_key(rel) {
-            if path.is_file() {
-                let _ = std::fs::remove_file(path);
-            }
+        if !snap_set.contains_key(rel) && path.is_file() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -190,11 +185,9 @@ fn restore_workspace(workspace: &Path, snap_files: &Path) -> Result<(), String> 
     for (rel, src) in &snap_set {
         let dest = workspace.join(rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
-        std::fs::copy(src, &dest)
-            .map_err(|e| format!("restore {}: {e}", rel))?;
+        std::fs::copy(src, &dest).map_err(|e| format!("restore {}: {e}", rel))?;
     }
 
     // Clean up empty directories
@@ -250,15 +243,18 @@ fn collect_workspace_paths(workspace: &Path) -> Result<HashMap<String, PathBuf>,
 fn clean_empty_dirs(root: &Path) {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(root).min_depth(1).contents_first(true) {
-        if let Ok(e) = entry {
-            let name = e.file_name().to_string_lossy();
-            if name == ".git" || name == ".daimonos" {
-                continue;
-            }
-            if e.file_type().is_dir() {
-                dirs.push(e.path().to_path_buf());
-            }
+    for e in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .contents_first(true)
+        .into_iter()
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy();
+        if name == ".git" || name == ".daimonos" {
+            continue;
+        }
+        if e.file_type().is_dir() {
+            dirs.push(e.path().to_path_buf());
         }
     }
 

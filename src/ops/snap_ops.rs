@@ -65,25 +65,36 @@ mod tests {
 
         let s = session_in(dir.path());
 
-        let r = snap(&s, &Op {
-            c: 12,
-            p: Some("checkpoint".into()),
-            ..Op::default()
-        }).await;
+        let r = snap(
+            &s,
+            &Op {
+                c: 12,
+                p: Some("checkpoint".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
         let id = r.d.as_ref().unwrap()["id"].as_str().unwrap().to_string();
 
         std::fs::write(dir.path().join("file.txt"), "modified").unwrap();
         std::fs::write(dir.path().join("extra.txt"), "new file").unwrap();
 
-        let r = restore(&s, &Op {
-            c: 13,
-            p: Some(id.clone()),
-            ..Op::default()
-        }).await;
+        let r = restore(
+            &s,
+            &Op {
+                c: 13,
+                p: Some(id.clone()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
 
-        assert_eq!(std::fs::read_to_string(dir.path().join("file.txt")).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "original"
+        );
         assert!(!dir.path().join("extra.txt").exists());
     }
 
@@ -94,7 +105,10 @@ mod tests {
 
         let r = snap_list(&s).await;
         assert!(r.ok);
-        assert_eq!(r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -103,12 +117,31 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
         let s = session_in(dir.path());
 
-        snap(&s, &Op { c: 12, p: Some("a".into()), ..Op::default() }).await;
-        snap(&s, &Op { c: 12, p: Some("b".into()), ..Op::default() }).await;
+        snap(
+            &s,
+            &Op {
+                c: 12,
+                p: Some("a".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        snap(
+            &s,
+            &Op {
+                c: 12,
+                p: Some("b".into()),
+                ..Op::default()
+            },
+        )
+        .await;
 
         let r = snap_list(&s).await;
         assert!(r.ok);
-        assert_eq!(r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -117,14 +150,32 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
         let s = session_in(dir.path());
 
-        let r = snap(&s, &Op { c: 12, ..Op::default() }).await;
+        let r = snap(
+            &s,
+            &Op {
+                c: 12,
+                ..Op::default()
+            },
+        )
+        .await;
         let id = r.d.as_ref().unwrap()["id"].as_str().unwrap().to_string();
 
-        let r = snap_delete(&s, &Op { c: 26, p: Some(id), ..Op::default() }).await;
+        let r = snap_delete(
+            &s,
+            &Op {
+                c: 26,
+                p: Some(id),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(r.ok);
 
         let r = snap_list(&s).await;
-        assert_eq!(r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            r.d.as_ref().unwrap()["snapshots"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -132,7 +183,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = snap_delete(&s, &Op { c: 26, p: Some("nope".into()), ..Op::default() }).await;
+        let r = snap_delete(
+            &s,
+            &Op {
+                c: 26,
+                p: Some("nope".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(7));
     }
@@ -142,7 +201,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = restore(&s, &Op { c: 13, p: Some("nope".into()), ..Op::default() }).await;
+        let r = restore(
+            &s,
+            &Op {
+                c: 13,
+                p: Some("nope".into()),
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(7));
     }
@@ -152,7 +219,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
 
-        let r = restore(&s, &Op { c: 13, ..Op::default() }).await;
+        let r = restore(
+            &s,
+            &Op {
+                c: 13,
+                ..Op::default()
+            },
+        )
+        .await;
         assert!(!r.ok);
         assert_eq!(r.e, Some(3));
     }
