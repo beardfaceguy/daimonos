@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 import tempfile
 import time
+from typing import Dict, List, Optional
 
 import pytest
 
@@ -19,7 +22,7 @@ class DaimonosClient:
         self._id += 1
         return self._id
 
-    def send_raw(self, msg: dict) -> dict | None:
+    def send_raw(self, msg: dict) -> Optional[dict]:
         """Send a JSON-RPC message. Returns the response, or None for notifications."""
         line = json.dumps(msg) + "\n"
         self.process.stdin.write(line.encode())
@@ -31,7 +34,7 @@ class DaimonosClient:
             raise RuntimeError("daimonos process closed stdout unexpectedly")
         return json.loads(resp_line)
 
-    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+    def call_tool(self, name: str, arguments: Optional[dict] = None) -> dict:
         req = {
             "jsonrpc": "2.0",
             "id": self._next_id(),
@@ -43,7 +46,7 @@ class DaimonosClient:
             raise RuntimeError(f"RPC error: {resp['error']}")
         return resp.get("result", {})
 
-    def list_tools(self) -> list[dict]:
+    def list_tools(self) -> List[dict]:
         req = {
             "jsonrpc": "2.0",
             "id": self._next_id(),

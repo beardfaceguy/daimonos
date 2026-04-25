@@ -434,7 +434,7 @@ mod tests {
     // --- Incremental index tests ---
 
     async fn wait_for_index() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
 
     #[tokio::test]
