@@ -4,11 +4,19 @@ Cross-tool guidance for AI coding agents working in this repository.
 
 ## Quick start (new agents)
 
-1. Read this file — project context, repo layout, conventions
-2. Check the **Daimonos** initiative in Linear for the vision, roadmap, and
-   active projects: search for initiative "Daimonos" or use `get_initiative`
-3. Check `.cursor/rules/` if scoped rule files exist
-4. Check `docs/` for technical specs (protocol, architecture decisions)
+**Do these in order. Do NOT skip to reading source code.**
+
+1. Read this file fully — project context, repo layout, conventions.
+2. **Go to Linear first.** Use the Linear MCP tools to read the Daimonos
+   initiative (`get_initiative` with query "Daimonos"), list all issues in the
+   daimonos project (`list_issues` with project "daimonos"), and list project
+   documents (`list_documents` with project "daimonos"). This is the
+   authoritative source for what's been done, what's in progress, and what's
+   planned. Understand the full project state from Linear before touching
+   the codebase.
+3. Check `.cursor/rules/` if scoped rule files exist.
+4. Check `docs/` for technical specs (protocol, architecture decisions).
+5. **Only then** read source code as needed for your specific task.
 
 ## What is Daimonos?
 
@@ -51,13 +59,38 @@ daimonos/
 ├── AGENTS.md                      # This file
 ├── Cargo.toml                     # Rust project manifest
 ├── daimonos.default.toml          # Reference config with all tunable values
+├── benchmarks/
+│   ├── README.md                  # How to run benchmarks
+│   ├── run-benchmark.sh           # Runner: executes tasks via agent CLI
+│   ├── setup-mcp.sh               # Configures MCP for daimonos mode
+│   ├── analyze-results.py         # Compares cursor vs daimonos results (single model)
+│   ├── compare-models.py          # Cross-model comparison report
+│   ├── tasks/                     # Task definitions (JSON)
+│   └── workspace/                 # Target codebase (Rust inventory app)
 ├── docs/
 │   └── protocol.md                # Opcode protocol specification
+├── tests/
+│   ├── conftest.py                # pytest fixture: DaimonosClient + MCP handshake
+│   ├── requirements.txt           # pytest
+│   ├── test_handshake.py          # MCP initialize, tool listing
+│   ├── test_read_write.py         # read_file / write_file
+│   ├── test_edit.py               # edit_file
+│   ├── test_search.py             # search (content + file modes)
+│   ├── test_exec.py               # exec
+│   ├── test_workspace_info.py     # workspace_info
+│   ├── test_errors.py             # Missing args, unknown tools, invalid paths
+│   ├── test_symlinks.py           # Symlink and hard link handling across all file ops
+│   ├── test_diff.py               # diff_files tool
+│   ├── test_git.py                # git_status, git_log, git_diff, git_branch
+│   ├── test_snapshots.py          # snapshot_create, restore, list, delete
+│   └── test_batch.py             # batch tool (multi-op single round-trip)
 └── src/
-    ├── main.rs                    # Daemon entrypoint, Unix socket listener
+    ├── main.rs                    # Entrypoint: --mcp (stdio MCP) or Unix socket mode
+    ├── mcp.rs                     # MCP server handler (stdio transport for Cursor)
     ├── config.rs                  # TOML config loading, tool registration
     ├── protocol.rs                # Request/Response types, opcode constants
     ├── session.rs                 # Per-connection session state
+    ├── snapshot.rs                # Workspace snapshot store (create, restore, list, delete)
     ├── index.rs                   # Background trigram workspace indexer
     ├── pipeline_cache.rs          # inotify-based tool output cache
     ├── tool_runner.rs             # ToolPlugin trait, registry, repair loop
@@ -65,11 +98,14 @@ daimonos/
     │   ├── mod.rs                 # Opcode dispatcher
     │   ├── file_ops.rs            # Opcodes 0-6: read, write, patch, ls, stat, glob, grep
     │   ├── exec_ops.rs            # Opcodes 8-11: exec, bg, poll, kill
+    │   ├── git_ops.rs             # Opcode 14: diff (in-process structured diffing)
+    │   ├── snap_ops.rs            # Opcodes 12-13, 25-26: snap, restore, snap_list, snap_delete
     │   ├── tool_ops.rs            # Opcodes 20-24: tool_run, repair, pipeline, register, list
     │   └── schema.rs              # Opcode 255: self-describing schema registry
     └── plugins/
         ├── mod.rs                 # Plugin module
         ├── generic_cli.rs         # Generic plugin for any CLI tool with JSON output
+        ├── git.rs                 # Git tool plugin (auto-registered when git on PATH)
         └── x07.rs                 # X07-specific plugin (semantic indexing, decl cache)
 ```
 
@@ -79,6 +115,7 @@ daimonos/
 |-----------|-------------|---------|
 | Rust (stable) | Building daimonos | `rustup` |
 | `socat` | Manual testing via Unix socket | system package manager |
+| Python 3 + pytest | MCP protocol tests | `pip install -r tests/requirements.txt` |
 
 ## Coding conventions
 
@@ -98,13 +135,102 @@ daimonos/
   7=snapshot not found). No panics in request handlers.
 - **New opcodes**: assign the next available number, add to `protocol::op`,
   add handler in `ops/mod.rs`, add schema entry in `ops/schema.rs`.
+- **Opcodes vs. tool plugins vs. exec**: opcodes are reserved for core OS
+  primitives with no external binary dependencies (read, write, diff, etc.).
+  External tools (git, cargo, npm, docker) belong in the **tool plugin
+  system** (`plugins/`) — implement `ToolPlugin`, auto-register at startup
+  when the tool is detected on PATH. For one-off commands, agents use `exec`
+  directly. Never add an opcode for an external binary.
+- **Exec usage tracking**: all `exec` and `bg` invocations are counted in
+  `session.exec_usage`. Use `session_info` to see the top commands. When a
+  tool shows up frequently, consider adding a declarative tool descriptor.
+- **Read deduplication**: `session.read_cache` tracks content hashes of files
+  the model has read. On re-read of an unchanged file, the response is
+  `{"unchanged": true, "lines": N}` instead of the full content. `write` and
+  `patch` operations invalidate the cache for the affected path. Partial
+  reads (with offset/limit) bypass the cache entirely.
+- **Edit confirmation with diffs**: `edit_file` (patch opcode) returns a
+  `diffs` array alongside `applied`, showing each `[old, new]` pair that
+  was successfully applied. When nothing matches, `diffs` is omitted.
+- **Exec output capping**: `exec` output (stdout and stderr) is
+  auto-truncated when it exceeds `config.process.exec_output_max_chars`
+  (default 100 KB). Truncated output keeps the first and last lines with a
+  `[N lines, M chars truncated]` notice in the middle.
+- **Lazy tool exposure**: only core tools (`read_file`, `write_file`,
+  `edit_file`, `search`, `workspace_info`, `exec`, `batch`,
+  `list_all_tools`) appear in the initial `list_tools` response. Extended
+  tools (snapshots, git, diff, pipelines) are exposed after the model calls
+  `list_all_tools` or uses one directly. This reduces initial system prompt
+  token overhead. The set of exposed tools is tracked in
+  `session.exposed_tools`.
+- **Proactive workspace context**: the MCP `instructions` field is built
+  dynamically at startup with workspace path, detected project type
+  (Cargo.toml → Rust, package.json → Node.js, etc.), VCS info, and
+  top-level directory listing — so the model has useful context without an
+  extra tool call.
+- **Compact responses**: all MCP tool responses use compact JSON
+  (`to_string`, not `to_string_pretty`). Redundant fields (`count` on
+  arrays, `size` on writes) are omitted. Empty `err` fields in exec
+  responses are skipped.
 
 ## Testing
 
-```bash
-# Build
-cargo build --release
+**Test-driven development is required.** When building new functionality, write
+tests as part of the same change — not as a follow-up task. Specifically:
 
+- **New opcodes or handlers**: add Rust unit tests in the module's
+  `#[cfg(test)] mod tests` block covering success paths, error paths, and edge
+  cases. If the opcode is exposed as an MCP tool, also add a pytest case in
+  the appropriate `tests/test_*.py` file.
+- **New MCP tools**: add both a Rust test for the underlying handler logic and
+  a pytest test that exercises the tool end-to-end over JSON-RPC.
+- **Bug fixes**: add a regression test that would have caught the bug before
+  applying the fix.
+- **Run both suites** (`cargo test` and `python3 -m pytest tests/ -v`) before
+  considering a change complete. Both must pass.
+
+A PR or change that adds functionality without corresponding tests is
+incomplete.
+
+The test suite has two layers:
+
+### Layer 1: Rust unit/integration tests
+
+Tests live inline as `#[cfg(test)] mod tests` in each module. They cover
+protocol parsing, session state, file operations, exec lifecycle, trigram
+indexing, and config loading. All filesystem tests use `tempfile` crates for
+isolation.
+
+```bash
+cargo test
+```
+
+### Layer 2: pytest MCP protocol conformance
+
+End-to-end tests that spawn the real binary, perform the MCP handshake, and
+exercise all 8 tools via JSON-RPC over stdio.
+
+```bash
+# Install deps (one time)
+pip install -r tests/requirements.txt
+
+# Run
+python3 -m pytest tests/ -v
+```
+
+The `daimonos` pytest fixture (`tests/conftest.py`) builds the binary once per
+session, spawns a fresh subprocess per test, performs the initialize/initialized
+handshake, and provides a `DaimonosClient` with `call_tool()`, `list_tools()`,
+and `send_raw()` methods.
+
+### Manual testing
+
+```bash
+# --- MCP mode (stdio, for Cursor integration) ---
+# Cursor mcp.json entry:
+# { "daimonos": { "command": "/path/to/daimonos", "args": ["--mcp", "-w", "/path/to/workspace"] } }
+
+# --- Socket mode (direct opcode protocol) ---
 # Start daemon
 ./target/release/daimonos --workspace /path/to/workspace --debug
 
@@ -115,6 +241,25 @@ echo '{"c":255}' | socat - UNIX-CONNECT:/tmp/daimonos.sock
 echo '{"batch":[{"c":4,"p":"Cargo.toml"},{"c":6,"p":"fn main","n":5}]}' | \
   socat - UNIX-CONNECT:/tmp/daimonos.sock
 ```
+
+## Linear project management
+
+Keep the Linear project accurate **as you work**, not after being asked.
+
+- **Before starting work**: check if a relevant issue exists. If not, create one
+  and set it to "In Progress."
+- **While working**: if scope changes or you discover sub-tasks, update the issue
+  description or create child issues.
+- **After completing work**: mark the issue "Done." If the work produced
+  decisions, trade-offs, or research worth preserving, add or update a Linear
+  document in the daimonos project.
+- **If you create new files or opcodes**: make sure the issue description
+  reflects what was actually built, not just what was planned.
+- **Never backfill** a batch of issues after the fact. Each piece of work should
+  have an issue created before or at the start of that work.
+
+The user should be able to open the daimonos project in Linear at any time and
+see an accurate picture of what's done, what's in progress, and what's next.
 
 ## Review checklist
 
@@ -127,4 +272,7 @@ When reviewing or producing a diff:
 - **Responses**: must be structured JSON. No raw text output.
 - **Error handling**: no panics, no unwrap() in request paths. Use
   `Response::err()`.
+- **Tests**: new functionality must include tests in the same change (Rust
+  unit tests + pytest MCP tests where applicable). Both `cargo test` and
+  `python3 -m pytest tests/ -v` must pass.
 - **Dependencies**: flag new crate additions for confirmation.

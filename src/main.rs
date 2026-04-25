@@ -1,21 +1,24 @@
 mod config;
 mod index;
+mod mcp;
 mod ops;
 mod pipeline_cache;
 mod plugins;
 mod protocol;
 mod session;
+mod snapshot;
 mod tool_runner;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 #[derive(Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 struct Cli {
-    /// Unix socket path
+    /// Unix socket path (ignored in --mcp mode)
     #[arg(short, long, default_value = "/tmp/daimonos.sock")]
     socket: PathBuf,
 
@@ -23,13 +26,17 @@ struct Cli {
     #[arg(short, long, default_value = ".")]
     workspace: PathBuf,
 
-    /// Human-readable debug output
+    /// Human-readable debug output (socket mode only)
     #[arg(long, default_value_t = false)]
     debug: bool,
 
     /// Path to config file (default: search workspace then ~/.config/daimonos/)
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Run as MCP server over stdio (for Cursor integration)
+    #[arg(long, default_value_t = false)]
+    mcp: bool,
 }
 
 #[tokio::main]
@@ -37,22 +44,45 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let workspace = std::fs::canonicalize(&cli.workspace)?;
-    let cfg = std::sync::Arc::new(config::load(cli.config.as_deref(), &workspace));
+    let cfg = Arc::new(config::load(cli.config.as_deref(), &workspace));
 
-    if cli.socket.exists() {
-        std::fs::remove_file(&cli.socket)?;
-    }
-
-    let ws_index = std::sync::Arc::new(index::WorkspaceIndex::new(
+    let ws_index = Arc::new(index::WorkspaceIndex::new(
         workspace.clone(),
         &cfg.index,
     ));
     ws_index.spawn_reindex();
 
-    let tool_reg = std::sync::Arc::new(tool_runner::ToolRegistry::new());
+    let tool_reg = Arc::new(tool_runner::ToolRegistry::new());
     config::register_tools(&cfg, &tool_reg).await;
 
-    let pcache = std::sync::Arc::new(pipeline_cache::PipelineCache::new(&workspace));
+    if plugins::git::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::git::GitPlugin::new()))
+            .await;
+        eprintln!("auto-registered git tool plugin");
+    }
+
+    let pcache = Arc::new(pipeline_cache::PipelineCache::new(&workspace));
+
+    if cli.mcp {
+        mcp::run_mcp_server(workspace, cfg, ws_index, tool_reg, pcache).await
+    } else {
+        run_socket_server(cli, workspace, cfg, ws_index, tool_reg, pcache).await
+    }
+}
+
+async fn run_socket_server(
+    cli: Cli,
+    workspace: PathBuf,
+    cfg: Arc<config::Config>,
+    ws_index: Arc<index::WorkspaceIndex>,
+    tool_reg: Arc<tool_runner::ToolRegistry>,
+    pcache: Arc<pipeline_cache::PipelineCache>,
+) -> anyhow::Result<()> {
+    if cli.socket.exists() {
+        std::fs::remove_file(&cli.socket)?;
+    }
+
     eprintln!("pipeline cache: watching {:?}", workspace);
 
     let listener = UnixListener::bind(&cli.socket)?;
@@ -82,10 +112,10 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     workspace: PathBuf,
     debug: bool,
-    ws_index: std::sync::Arc<index::WorkspaceIndex>,
-    cfg: std::sync::Arc<config::Config>,
-    tool_reg: std::sync::Arc<tool_runner::ToolRegistry>,
-    pcache: std::sync::Arc<pipeline_cache::PipelineCache>,
+    ws_index: Arc<index::WorkspaceIndex>,
+    cfg: Arc<config::Config>,
+    tool_reg: Arc<tool_runner::ToolRegistry>,
+    pcache: Arc<pipeline_cache::PipelineCache>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);

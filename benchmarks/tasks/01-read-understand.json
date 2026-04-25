@@ -1,0 +1,13 @@
+{
+  "id": "01-read-understand",
+  "name": "Read & understand a file",
+  "category": "file_read",
+  "applies_to": ["cursor", "daimonos"],
+  "prompt": "Read the file src/inventory.rs and give me a one-paragraph summary of what the Inventory struct does, what public methods it exposes, and what the Item struct's fields are.",
+  "expected_behavior": "Agent reads inventory.rs and provides an accurate summary covering: Item fields (sku, name, category, quantity, unit_price), Inventory methods (new, from_csv, items, find_by_sku, find_by_category, low_stock_items, total_inventory_value, items_by_category), and the is_low_stock/total_value/apply_discount methods on Item.",
+  "success_criteria": [
+    "Mentions all 5 Item fields by name",
+    "Mentions at least 4 of the 7 Inventory methods",
+    "Summary is factually accurate"
+  ]
+}

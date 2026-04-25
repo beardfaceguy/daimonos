@@ -1,0 +1,13 @@
+{
+  "id": "04-explore-architecture",
+  "name": "Explore directory structure and describe architecture",
+  "category": "multi_file",
+  "applies_to": ["cursor", "daimonos"],
+  "prompt": "Explore the project structure and describe the architecture. List all source files, explain how data flows from the CSV file through the system to the final JSON output, and identify any design issues or improvements you'd suggest.",
+  "expected_behavior": "Agent lists all files in the project, traces the data flow: main.rs loads CSV via Inventory::from_csv -> creates Inventory -> Report::generate builds category summaries -> serialized to JSON. May suggest improvements like error handling, config integration, or adding a CLI argument parser.",
+  "success_criteria": [
+    "Lists all 4 source files and the data file",
+    "Correctly traces the data flow from CSV to JSON output",
+    "Identifies at least one concrete improvement suggestion"
+  ]
+}

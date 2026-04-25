@@ -87,13 +87,16 @@ pub trait ToolPlugin: Send + Sync {
     fn descriptor(&self) -> &ToolDescriptor;
 
     /// Run a single command. Plugins can override for custom execution.
+    /// `args` carries tool-specific parameters (e.g. limit, mode, path filter).
     async fn run_command(
         &self,
         command: &str,
         cwd: &Path,
         env: &HashMap<String, String>,
         stdin_data: Option<&[u8]>,
+        args: Option<&serde_json::Value>,
     ) -> Result<ToolResult, String> {
+        let _ = args;
         let desc = self.descriptor();
         let cmd_desc = desc
             .commands
@@ -254,12 +257,13 @@ impl ToolRegistry {
         cwd: &Path,
         env: &HashMap<String, String>,
         stdin_data: Option<&[u8]>,
+        args: Option<&serde_json::Value>,
     ) -> Result<ToolResult, String> {
         let plugin = self
             .get(tool_id)
             .await
             .ok_or_else(|| format!("unknown tool: {tool_id}"))?;
-        plugin.run_command(command, cwd, env, stdin_data).await
+        plugin.run_command(command, cwd, env, stdin_data, args).await
     }
 
     /// Run a repair loop: lint -> apply fixes -> re-lint, up to max_iterations.
@@ -283,7 +287,7 @@ impl ToolRegistry {
         let mut total_fixes: u32 = 0;
 
         for i in 0..max_iterations {
-            let lint_result = plugin.run_command("lint", cwd, env, None).await?;
+            let lint_result = plugin.run_command("lint", cwd, env, None, None).await?;
             let fixes = plugin.extract_quickfixes(&lint_result.output);
 
             if fixes.is_empty() || lint_result.exit_code == 0 {
@@ -360,7 +364,7 @@ impl ToolRegistry {
                     stderr: String::new(),
                 }
             } else {
-                plugin.run_command(stage_name, cwd, env, None).await?
+                plugin.run_command(stage_name, cwd, env, None, None).await?
             };
 
             let failed = result.exit_code != 0;
@@ -421,4 +425,281 @@ fn extract_string_replace_fixes(output: &serde_json::Value) -> Vec<QuickFix> {
         }
     }
     fixes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn echo_descriptor() -> ToolDescriptor {
+        let mut commands = HashMap::new();
+        commands.insert("run".into(), ToolCommand {
+            bin: "echo".into(),
+            args: vec!["hello".into()],
+            output: "text".into(),
+        });
+        commands.insert("json_run".into(), ToolCommand {
+            bin: "echo".into(),
+            args: vec![r#"{"status":"ok"}"#.into()],
+            output: "json".into(),
+        });
+        ToolDescriptor {
+            id: "echo_tool".into(),
+            commands,
+            source_pattern: None,
+            manifest: None,
+            diagnostics_format: "json".into(),
+            supports_quickfix: false,
+            quickfix_format: None,
+        }
+    }
+
+    // --- ToolDescriptor serde tests ---
+
+    #[test]
+    fn descriptor_serialization_roundtrip() {
+        let desc = echo_descriptor();
+        let json = serde_json::to_string(&desc).unwrap();
+        let parsed: ToolDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "echo_tool");
+        assert_eq!(parsed.commands.len(), 2);
+    }
+
+    #[test]
+    fn descriptor_deserialize_defaults() {
+        let json = r#"{"id": "minimal", "commands": {}}"#;
+        let desc: ToolDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(desc.id, "minimal");
+        assert_eq!(desc.diagnostics_format, "json");
+        assert!(!desc.supports_quickfix);
+        assert!(desc.source_pattern.is_none());
+    }
+
+    // --- QuickFix extraction tests ---
+
+    #[test]
+    fn extract_json_patch_fixes_valid() {
+        let output = json!({
+            "diagnostics": [
+                {"file": "a.json", "quickfix": [{"op": "replace", "path": "/x", "value": 1}]},
+                {"file": "b.json", "quickfix": null},
+                {"file": "c.json"}
+            ]
+        });
+        let fixes = extract_json_patch_fixes(&output);
+        assert_eq!(fixes.len(), 1);
+        match &fixes[0] {
+            QuickFix::JsonPatch { file, .. } => assert_eq!(file, "a.json"),
+            _ => panic!("expected JsonPatch"),
+        }
+    }
+
+    #[test]
+    fn extract_json_patch_fixes_empty() {
+        let fixes = extract_json_patch_fixes(&json!({}));
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn extract_string_replace_fixes_valid() {
+        let output = json!({
+            "diagnostics": [
+                {"file": "main.rs", "old": "foo", "new": "bar"},
+                {"file": "lib.rs"},
+                {"file": "other.rs", "old": "x", "new": "y"}
+            ]
+        });
+        let fixes = extract_string_replace_fixes(&output);
+        assert_eq!(fixes.len(), 2);
+        match &fixes[0] {
+            QuickFix::StringReplace { file, old, new } => {
+                assert_eq!(file, "main.rs");
+                assert_eq!(old, "foo");
+                assert_eq!(new, "bar");
+            }
+            _ => panic!("expected StringReplace"),
+        }
+    }
+
+    #[test]
+    fn extract_string_replace_fixes_empty() {
+        let fixes = extract_string_replace_fixes(&json!({"nothing": true}));
+        assert!(fixes.is_empty());
+    }
+
+    // --- ToolRegistry tests ---
+
+    #[tokio::test]
+    async fn registry_register_and_list() {
+        let registry = ToolRegistry::new();
+        assert!(registry.list().await.is_empty());
+
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        registry.register(plugin).await;
+
+        let tools = registry.list().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "echo_tool");
+    }
+
+    #[tokio::test]
+    async fn registry_get_existing() {
+        let registry = ToolRegistry::new();
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        registry.register(plugin).await;
+
+        assert!(registry.get("echo_tool").await.is_some());
+        assert!(registry.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_run_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let result = registry
+            .run("nope", "build", Path::new("/tmp"), &HashMap::new(), None, None)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn registry_run_unknown_command() {
+        let registry = ToolRegistry::new();
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        registry.register(plugin).await;
+
+        let result = registry
+            .run("echo_tool", "nonexistent", Path::new("/tmp"), &HashMap::new(), None, None)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn registry_run_echo_text() {
+        let registry = ToolRegistry::new();
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        registry.register(plugin).await;
+
+        let result = registry
+            .run("echo_tool", "run", Path::new("/tmp"), &HashMap::new(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.tool, "echo_tool");
+        assert_eq!(result.command, "run");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.output["raw"].as_str().unwrap().trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn registry_run_echo_json() {
+        let registry = ToolRegistry::new();
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(echo_descriptor()));
+        registry.register(plugin).await;
+
+        let result = registry
+            .run("echo_tool", "json_run", Path::new("/tmp"), &HashMap::new(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.output["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn registry_repair_no_lint_command() {
+        let registry = ToolRegistry::new();
+        let mut commands = HashMap::new();
+        commands.insert("build".into(), ToolCommand {
+            bin: "echo".into(), args: vec![], output: "json".into(),
+        });
+        let desc = ToolDescriptor {
+            id: "no_lint".into(),
+            commands,
+            source_pattern: None,
+            manifest: None,
+            diagnostics_format: "json".into(),
+            supports_quickfix: false,
+            quickfix_format: None,
+        };
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(desc));
+        registry.register(plugin).await;
+
+        let result = registry.repair("no_lint", Path::new("/tmp"), &HashMap::new(), 3).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no 'lint' command"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let result = registry
+            .pipeline("nope", &["build".into()], Path::new("/tmp"), &HashMap::new())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_short_circuits_on_failure() {
+        let registry = ToolRegistry::new();
+        let mut commands = HashMap::new();
+        commands.insert("ok_stage".into(), ToolCommand {
+            bin: "true".into(), args: vec![], output: "text".into(),
+        });
+        commands.insert("fail_stage".into(), ToolCommand {
+            bin: "false".into(), args: vec![], output: "text".into(),
+        });
+        commands.insert("after_fail".into(), ToolCommand {
+            bin: "echo".into(), args: vec!["should not run".into()], output: "text".into(),
+        });
+        let desc = ToolDescriptor {
+            id: "multi".into(),
+            commands,
+            source_pattern: None,
+            manifest: None,
+            diagnostics_format: "text".into(),
+            supports_quickfix: false,
+            quickfix_format: None,
+        };
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(desc));
+        registry.register(plugin).await;
+
+        let result = registry
+            .pipeline("multi", &["ok_stage".into(), "fail_stage".into(), "after_fail".into()], Path::new("/tmp"), &HashMap::new())
+            .await
+            .unwrap();
+        assert!(!result.all_ok);
+        assert_eq!(result.short_circuited_at, Some("fail_stage".into()));
+        assert_eq!(result.stages.len(), 2); // after_fail never ran
+    }
+
+    #[tokio::test]
+    async fn pipeline_all_ok() {
+        let registry = ToolRegistry::new();
+        let mut commands = HashMap::new();
+        commands.insert("s1".into(), ToolCommand {
+            bin: "true".into(), args: vec![], output: "text".into(),
+        });
+        commands.insert("s2".into(), ToolCommand {
+            bin: "true".into(), args: vec![], output: "text".into(),
+        });
+        let desc = ToolDescriptor {
+            id: "good".into(),
+            commands,
+            source_pattern: None,
+            manifest: None,
+            diagnostics_format: "text".into(),
+            supports_quickfix: false,
+            quickfix_format: None,
+        };
+        let plugin = Arc::new(crate::plugins::generic_cli::GenericCliPlugin::new(desc));
+        registry.register(plugin).await;
+
+        let result = registry
+            .pipeline("good", &["s1".into(), "s2".into()], Path::new("/tmp"), &HashMap::new())
+            .await
+            .unwrap();
+        assert!(result.all_ok);
+        assert!(result.short_circuited_at.is_none());
+        assert_eq!(result.stages.len(), 2);
+    }
 }

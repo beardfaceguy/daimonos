@@ -24,6 +24,7 @@ struct DeclCache {
 
 struct CacheEntry {
     lint_ok: bool,
+    #[allow(dead_code)] // stored for future diagnostic retrieval
     diagnostics: Option<serde_json::Value>,
 }
 
@@ -114,6 +115,7 @@ impl X07Plugin {
     }
 
     /// Scan workspace for .x07.json files and build a semantic symbol index.
+    #[allow(dead_code)] // called by x07 integration flows, not by core daemon
     pub async fn index_workspace(&self, root: &Path) -> Vec<ModuleInfo> {
         let root = root.to_path_buf();
         let root_clone = root.clone();
@@ -278,7 +280,7 @@ impl ToolPlugin for X07Plugin {
 }
 
 /// Parse an X07 JSON AST module into a ModuleInfo struct.
-fn parse_x07_module(ast: &serde_json::Value, file: &str) -> Option<ModuleInfo> {
+pub(crate) fn parse_x07_module(ast: &serde_json::Value, file: &str) -> Option<ModuleInfo> {
     let module_id = ast.get("module_id")?.as_str()?.to_string();
     let schema_version = ast
         .get("schema_version")
@@ -361,4 +363,204 @@ fn parse_x07_module(ast: &serde_json::Value, file: &str) -> Option<ModuleInfo> {
         functions,
         imports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_runner::ToolPlugin;
+    use serde_json::json;
+
+    fn sample_ast() -> serde_json::Value {
+        json!({
+            "module_id": "math.core",
+            "schema_version": "1.0",
+            "kind": "library",
+            "imports": ["std.io", "std.fmt"],
+            "decls": [
+                {
+                    "kind": "defn",
+                    "name": "add",
+                    "params": [
+                        {"name": "a", "ty": "i64"},
+                        {"name": "b", "ty": "i64"}
+                    ],
+                    "result": "i64",
+                    "requires": [{"expr": "a >= 0"}],
+                    "ensures": [{"expr": "result == a + b"}]
+                },
+                {
+                    "kind": "defasync",
+                    "name": "fetch",
+                    "params": [{"name": "url", "ty": "String"}],
+                    "result": "Response"
+                },
+                {
+                    "kind": "type",
+                    "name": "Point"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_module_extracts_metadata() {
+        let module = parse_x07_module(&sample_ast(), "src/math.x07.json").unwrap();
+        assert_eq!(module.module_id, "math.core");
+        assert_eq!(module.schema_version, "1.0");
+        assert_eq!(module.kind, "library");
+        assert_eq!(module.file, "src/math.x07.json");
+        assert_eq!(module.imports, vec!["std.io", "std.fmt"]);
+    }
+
+    #[test]
+    fn parse_module_extracts_functions_only() {
+        let module = parse_x07_module(&sample_ast(), "test.x07.json").unwrap();
+        assert_eq!(module.functions.len(), 2); // defn + defasync, not type
+        assert_eq!(module.functions[0].name, "add");
+        assert_eq!(module.functions[0].kind, "defn");
+        assert_eq!(module.functions[1].name, "fetch");
+        assert_eq!(module.functions[1].kind, "defasync");
+    }
+
+    #[test]
+    fn parse_module_extracts_params() {
+        let module = parse_x07_module(&sample_ast(), "t.x07.json").unwrap();
+        let add = &module.functions[0];
+        assert_eq!(add.params.len(), 2);
+        assert_eq!(add.params[0].name, "a");
+        assert_eq!(add.params[0].ty, "i64");
+        assert_eq!(add.result, "i64");
+    }
+
+    #[test]
+    fn parse_module_tracks_contracts() {
+        let module = parse_x07_module(&sample_ast(), "t.x07.json").unwrap();
+        let add = &module.functions[0];
+        assert!(add.has_requires);
+        assert!(add.has_ensures);
+        assert_eq!(add.contract_count, 2);
+        let fetch = &module.functions[1];
+        assert!(!fetch.has_requires);
+        assert!(!fetch.has_ensures);
+        assert_eq!(fetch.contract_count, 0);
+    }
+
+    #[test]
+    fn parse_module_returns_none_without_module_id() {
+        let bad = json!({"kind": "library"});
+        assert!(parse_x07_module(&bad, "test").is_none());
+    }
+
+    #[test]
+    fn parse_module_defaults() {
+        let minimal = json!({"module_id": "m"});
+        let module = parse_x07_module(&minimal, "f").unwrap();
+        assert_eq!(module.schema_version, "unknown");
+        assert_eq!(module.kind, "module");
+        assert!(module.imports.is_empty());
+        assert!(module.functions.is_empty());
+    }
+
+    #[test]
+    fn x07_plugin_descriptor() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        let desc = plugin.descriptor();
+        assert_eq!(desc.id, "x07");
+        assert!(desc.commands.contains_key("build"));
+        assert!(desc.commands.contains_key("lint"));
+        assert!(desc.commands.contains_key("run"));
+        assert!(desc.commands.contains_key("test"));
+        assert!(desc.commands.contains_key("fmt"));
+        assert!(desc.commands.contains_key("verify"));
+        assert_eq!(desc.commands.len(), 6);
+        assert!(desc.supports_quickfix);
+        assert_eq!(desc.quickfix_format.as_deref(), Some("json_patch"));
+    }
+
+    #[test]
+    fn extract_quickfixes_from_diagnostics() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        let lint_output = json!({
+            "diagnostics": [
+                {"file": "src/main.x07.json", "quickfix": [{"op": "replace", "path": "/decls/0/name", "value": "fixed"}]},
+                {"file": "src/lib.x07.json", "quickfix": null},
+                {"source": "src/alt.x07.json", "fix": {"op": "add", "path": "/decls/-", "value": {}}}
+            ]
+        });
+        let fixes = plugin.extract_quickfixes(&lint_output);
+        assert_eq!(fixes.len(), 2); // null quickfix is skipped
+    }
+
+    #[test]
+    fn extract_quickfixes_empty_when_no_diagnostics() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        let fixes = plugin.extract_quickfixes(&json!({"status": "ok"}));
+        assert!(fixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn decl_cache_miss_then_hit() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        let hash = "abc123";
+        assert!(!plugin.is_cached_clean(hash).await);
+
+        plugin.cache_lint_result(hash, true, None).await;
+        assert!(plugin.is_cached_clean(hash).await);
+    }
+
+    #[tokio::test]
+    async fn decl_cache_failing_lint() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        plugin.cache_lint_result("h1", false, Some(json!({"err": "bad"}))).await;
+        assert!(!plugin.is_cached_clean("h1").await);
+    }
+
+    #[test]
+    fn content_hash_deterministic() {
+        let h1 = X07Plugin::content_hash(b"hello");
+        let h2 = X07Plugin::content_hash(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn search_symbols_by_module() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        {
+            let mut idx = plugin.symbol_index.write().await;
+            idx.modules.push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
+        }
+
+        let results = plugin.search_symbols("math", 10).await;
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["type"], "module");
+        assert_eq!(results[0]["module"], "math.core");
+    }
+
+    #[tokio::test]
+    async fn search_symbols_by_function() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        {
+            let mut idx = plugin.symbol_index.write().await;
+            idx.modules.push(parse_x07_module(&sample_ast(), "math.x07.json").unwrap());
+        }
+
+        let results = plugin.search_symbols("add", 10).await;
+        assert!(!results.is_empty());
+        let func = results.iter().find(|r| r["type"] == "function").unwrap();
+        assert_eq!(func["name"], "add");
+        assert_eq!(func["module"], "math.core");
+    }
+
+    #[tokio::test]
+    async fn search_symbols_respects_max() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        {
+            let mut idx = plugin.symbol_index.write().await;
+            idx.modules.push(parse_x07_module(&sample_ast(), "m.x07.json").unwrap());
+        }
+        let results = plugin.search_symbols("", 1).await;
+        assert_eq!(results.len(), 1);
+    }
 }

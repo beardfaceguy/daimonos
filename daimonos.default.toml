@@ -29,6 +29,10 @@ default_find_max = 20
 [process]
 # Number of trailing output lines returned by poll
 poll_tail_lines = 20
+# Additional directories to prepend to PATH for exec/bg commands.
+# Common tool dirs (~/.cargo/bin, ~/.local/bin, etc.) are auto-detected;
+# use this for non-standard locations.
+# extra_path = ["/opt/custom/bin"]
 
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.

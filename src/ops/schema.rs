@@ -41,17 +41,14 @@ pub fn schema(op: &Op) -> Response {
         op_schema(11, "kill", "Kill background process", &[
             ("n", "pid", true),
         ]),
-        op_schema(12, "snap", "Create workspace snapshot", &[
+        op_schema(12, "snap", "Create workspace snapshot (copies tracked files)", &[
             ("p", "tag", false),
         ]),
-        op_schema(13, "restore", "Restore workspace snapshot", &[
+        op_schema(13, "restore", "Restore workspace snapshot (replaces workspace files)", &[
             ("p", "id", true),
         ]),
-        op_schema(14, "diff", "Diff two files", &[
-            ("p", "path_a", true), ("q", "path_b", true),
-        ]),
-        op_schema(15, "git", "Git operation", &[
-            ("s", "subcommand", true), ("a", "args", false),
+        op_schema(14, "diff", "Structured diff between files or file and content", &[
+            ("p", "path_a", true), ("q", "path_b", false), ("s", "content_b", false),
         ]),
         op_schema(16, "env_set", "Set session env var", &[
             ("p", "key", true), ("s", "value", true),
@@ -73,6 +70,10 @@ pub fn schema(op: &Op) -> Response {
             ("s", "descriptor_json", true),
         ]),
         op_schema(24, "tool_list", "List registered tools", &[]),
+        op_schema(25, "snap_list", "List all workspace snapshots", &[]),
+        op_schema(26, "snap_delete", "Delete a workspace snapshot", &[
+            ("p", "id", true),
+        ]),
         op_schema(255, "schema", "Get opcode registry", &[
             ("n", "specific_op", false),
         ]),
@@ -105,4 +106,78 @@ fn op_schema(code: u8, name: &str, desc: &str, args: &[(&str, &str, bool)]) -> s
         "desc": desc,
         "params": params,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Op;
+
+    #[test]
+    fn full_registry_returns_all_ops() {
+        let op = Op { c: 255, ..Default::default() };
+        let resp = schema(&op);
+        assert!(resp.ok);
+        let data = resp.d.unwrap();
+        let ops = data["ops"].as_array().unwrap();
+        assert!(ops.len() >= 20, "should list at least 20 opcodes, got {}", ops.len());
+        assert_eq!(data["version"], "0.1.0");
+    }
+
+    #[test]
+    fn specific_op_returns_single() {
+        let op = Op { c: 255, n: Some(0), ..Default::default() };
+        let resp = schema(&op);
+        assert!(resp.ok);
+        let data = resp.d.unwrap();
+        assert_eq!(data["name"], "read");
+        assert_eq!(data["c"], 0);
+    }
+
+    #[test]
+    fn unknown_specific_op_returns_error() {
+        let op = Op { c: 255, n: Some(199), ..Default::default() };
+        let resp = schema(&op);
+        assert!(!resp.ok);
+        assert!(resp.m.unwrap().contains("unknown opcode"));
+    }
+
+    #[test]
+    fn op_schema_helper_required_params() {
+        let s = op_schema(42, "test_op", "A test", &[("p", "path", true), ("n", "count", false)]);
+        assert_eq!(s["c"], 42);
+        assert_eq!(s["name"], "test_op");
+        assert_eq!(s["desc"], "A test");
+        let params = s["params"].as_array().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0]["k"], "p");
+        assert_eq!(params[0]["req"], true);
+        assert_eq!(params[1]["k"], "n");
+        assert_eq!(params[1]["req"], false);
+    }
+
+    #[test]
+    fn each_op_has_required_fields() {
+        let op = Op { c: 255, ..Default::default() };
+        let resp = schema(&op);
+        let data = resp.d.unwrap();
+        for entry in data["ops"].as_array().unwrap() {
+            assert!(entry.get("c").is_some(), "op missing 'c' field");
+            assert!(entry.get("name").is_some(), "op missing 'name' field");
+            assert!(entry.get("desc").is_some(), "op missing 'desc' field");
+            assert!(entry.get("params").is_some(), "op missing 'params' field");
+        }
+    }
+
+    #[test]
+    fn known_opcodes_present() {
+        let op = Op { c: 255, ..Default::default() };
+        let resp = schema(&op);
+        let data = resp.d.unwrap();
+        let ops = data["ops"].as_array().unwrap();
+        let names: Vec<&str> = ops.iter().filter_map(|o| o["name"].as_str()).collect();
+        for expected in &["read", "write", "patch", "exec", "snap", "restore", "diff", "schema"] {
+            assert!(names.contains(expected), "missing opcode: {expected}");
+        }
+    }
 }

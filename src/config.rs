@@ -45,6 +45,13 @@ pub struct SearchConfig {
 #[serde(default)]
 pub struct ProcessConfig {
     pub poll_tail_lines: usize,
+    /// Max characters for exec stdout/stderr before truncation.
+    /// When exceeded, keeps first + last lines with a truncation notice.
+    pub exec_output_max_chars: usize,
+    /// Additional directories to prepend to PATH for exec/bg commands.
+    /// Common tool dirs (~/.cargo/bin, ~/.local/bin) are auto-detected;
+    /// use this for non-standard locations.
+    pub extra_path: Vec<String>,
 }
 
 impl Default for Config {
@@ -82,6 +89,8 @@ impl Default for ProcessConfig {
     fn default() -> Self {
         Self {
             poll_tail_lines: 20,
+            exec_output_max_chars: 100_000,
+            extra_path: Vec::new(),
         }
     }
 }
@@ -149,6 +158,88 @@ fn dirs_next() -> Option<std::path::PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_values() {
+        let cfg = Config::default();
+        assert_eq!(cfg.index.max_depth, 20);
+        assert_eq!(cfg.index.max_file_size, 1_000_000);
+        assert_eq!(cfg.search.default_grep_max, 100);
+        assert_eq!(cfg.search.default_find_max, 20);
+        assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert!(cfg.tools.is_empty());
+    }
+
+    #[test]
+    fn skip_extensions_includes_common_binaries() {
+        let cfg = Config::default();
+        let skip = cfg.index.skip_set();
+        assert!(skip.contains("png"));
+        assert!(skip.contains("exe"));
+        assert!(skip.contains("zip"));
+        assert!(skip.contains("wasm"));
+        assert!(!skip.contains("rs"));
+        assert!(!skip.contains("toml"));
+    }
+
+    #[test]
+    fn load_from_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("test.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[search]
+default_grep_max = 42
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(Some(&cfg_path), dir.path());
+        assert_eq!(cfg.search.default_grep_max, 42);
+        assert_eq!(cfg.search.default_find_max, 20);
+    }
+
+    #[test]
+    fn load_from_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("daimonos.toml"),
+            r#"
+[process]
+poll_tail_lines = 50
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(None, dir.path());
+        assert_eq!(cfg.process.poll_tail_lines, 50);
+    }
+
+    #[test]
+    fn load_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load(None, dir.path());
+        assert_eq!(cfg.index.max_depth, 20);
+    }
+
+    #[test]
+    fn parse_toml_with_tools() {
+        let toml_str = r#"
+[tools.mytest]
+bin = "/usr/bin/test"
+source_pattern = "*.rs"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.tools.contains_key("mytest"));
+        assert_eq!(cfg.tools["mytest"].bin, "/usr/bin/test");
+        assert_eq!(cfg.tools["mytest"].source_pattern.as_deref(), Some("*.rs"));
+    }
 }
 
 /// Register tools from config into the tool registry.

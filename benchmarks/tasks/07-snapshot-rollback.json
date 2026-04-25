@@ -1,0 +1,14 @@
+{
+  "id": "07-snapshot-rollback",
+  "name": "Snapshot, modify, and rollback",
+  "category": "snapshot",
+  "applies_to": ["daimonos"],
+  "prompt": "Create a snapshot of the current workspace state. Then modify src/config.rs by adding a new category entry (\"toys\", \"Toys & Games\") to the default_config function. Verify the change is in place. Then restore the snapshot to undo the change. Verify the file is back to its original state.",
+  "expected_behavior": "Agent creates a snapshot, edits config.rs, confirms the edit, restores the snapshot, and confirms config.rs is back to its original content.",
+  "success_criteria": [
+    "Successfully creates a snapshot",
+    "Makes the edit to config.rs",
+    "Restores the snapshot",
+    "Verifies config.rs is back to original after restore"
+  ]
+}

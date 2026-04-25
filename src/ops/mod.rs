@@ -1,6 +1,8 @@
 mod file_ops;
 mod exec_ops;
+mod git_ops;
 mod schema;
+mod snap_ops;
 mod tool_ops;
 
 use crate::protocol::{self, Op, Request, Response};
@@ -28,16 +30,31 @@ async fn dispatch_op(session: &mut Session, op: Op) -> Response {
         protocol::op::STAT => file_ops::stat(session, &op).await,
         protocol::op::GLOB => file_ops::glob(session, &op).await,
         protocol::op::GREP => file_ops::grep(session, &op).await,
-        protocol::op::EXEC => exec_ops::exec(session, &op).await,
-        protocol::op::BG => exec_ops::bg(session, &op).await,
+        protocol::op::EXEC => {
+            if let Some(cmd) = &op.s {
+                *session.exec_usage.entry(cmd.clone()).or_insert(0) += 1;
+            }
+            exec_ops::exec(session, &op).await
+        }
+        protocol::op::BG => {
+            if let Some(cmd) = &op.s {
+                *session.exec_usage.entry(cmd.clone()).or_insert(0) += 1;
+            }
+            exec_ops::bg(session, &op).await
+        }
         protocol::op::POLL => exec_ops::poll(session, &op).await,
         protocol::op::KILL => exec_ops::kill(session, &op).await,
+        protocol::op::SNAP => snap_ops::snap(session, &op).await,
+        protocol::op::RESTORE => snap_ops::restore(session, &op).await,
+        protocol::op::DIFF => git_ops::diff(session, &op).await,
         protocol::op::FIND => find(session, &op).await,
         protocol::op::TOOL_RUN => tool_ops::tool_run(session, &op).await,
         protocol::op::TOOL_REPAIR => tool_ops::tool_repair(session, &op).await,
         protocol::op::TOOL_PIPELINE => tool_ops::tool_pipeline(session, &op).await,
         protocol::op::TOOL_REGISTER => tool_ops::tool_register(session, &op).await,
         protocol::op::TOOL_LIST => tool_ops::tool_list(session, &op).await,
+        protocol::op::SNAP_LIST => snap_ops::snap_list(session).await,
+        protocol::op::SNAP_DELETE => snap_ops::snap_delete(session, &op).await,
         protocol::op::ENV_SET => env_set(session, &op),
         protocol::op::ENV_GET => env_get(session, &op),
         protocol::op::SESSION => session_info(session),
@@ -64,7 +81,6 @@ async fn find(session: &Session, op: &Op) -> Response {
 
     Response::ok(serde_json::json!({
         "results": results,
-        "count": results.len(),
         "index": stats,
     }))
 }
@@ -93,10 +109,17 @@ fn env_get(session: &Session, op: &Op) -> Response {
 }
 
 fn session_info(session: &Session) -> Response {
+    let mut top_cmds: Vec<_> = session.exec_usage.iter().collect();
+    top_cmds.sort_by(|a, b| b.1.cmp(a.1));
+    top_cmds.truncate(20);
+
     Response::ok(serde_json::json!({
         "workspace": session.workspace.to_string_lossy(),
         "cwd": session.cwd.to_string_lossy(),
         "env_keys": session.env.keys().collect::<Vec<_>>(),
         "bg_count": session.bg_processes.len(),
+        "exec_usage": top_cmds.into_iter()
+            .map(|(cmd, count)| serde_json::json!({"cmd": cmd, "n": count}))
+            .collect::<Vec<_>>(),
     }))
 }

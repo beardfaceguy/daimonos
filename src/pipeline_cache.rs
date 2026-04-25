@@ -25,6 +25,7 @@ struct CacheState {
 struct CachedResult {
     output: serde_json::Value,
     exit_code: i32,
+    #[allow(dead_code)] // retained for future TTL-based eviction
     created: Instant,
 }
 
@@ -121,5 +122,94 @@ impl PipelineCache {
         let mut hasher = Sha256::new();
         hasher.update(content);
         hex::encode(hasher.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_cache() -> (tempfile::TempDir, PipelineCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PipelineCache::new(dir.path());
+        (dir, cache)
+    }
+
+    #[tokio::test]
+    async fn cache_miss_on_empty() {
+        let (_dir, cache) = temp_cache();
+        assert!(cache.get("tool1", "build").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_then_get_returns_cached() {
+        let (_dir, cache) = temp_cache();
+        let output = serde_json::json!({"status": "ok"});
+        cache.put("tool1", "build", output.clone(), 0).await;
+        let result = cache.get("tool1", "build").await;
+        assert!(result.is_some());
+        let (val, exit) = result.unwrap();
+        assert_eq!(val, output);
+        assert_eq!(exit, 0);
+    }
+
+    #[tokio::test]
+    async fn different_keys_are_independent() {
+        let (_dir, cache) = temp_cache();
+        cache.put("tool1", "build", json!({"a": 1}), 0).await;
+        cache.put("tool1", "lint", json!({"b": 2}), 1).await;
+        cache.put("tool2", "build", json!({"c": 3}), 0).await;
+
+        let r1 = cache.get("tool1", "build").await.unwrap();
+        assert_eq!(r1.0, json!({"a": 1}));
+        let r2 = cache.get("tool1", "lint").await.unwrap();
+        assert_eq!(r2.1, 1);
+        let r3 = cache.get("tool2", "build").await.unwrap();
+        assert_eq!(r3.0, json!({"c": 3}));
+    }
+
+    #[tokio::test]
+    async fn dirty_flag_clears_cache() {
+        let (_dir, cache) = temp_cache();
+        cache.put("tool1", "build", json!({"ok": true}), 0).await;
+
+        {
+            let mut state = cache.inner.write().await;
+            state.dirty = true;
+        }
+
+        assert!(cache.get("tool1", "build").await.is_none());
+        // dirty flag is reset after clear
+        let state = cache.inner.read().await;
+        assert!(!state.dirty);
+        assert!(state.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_reports_entry_count() {
+        let (_dir, cache) = temp_cache();
+        let s1 = cache.stats().await;
+        assert_eq!(s1["entries"], 0);
+        assert_eq!(s1["dirty"], false);
+
+        cache.put("t", "c", json!(null), 0).await;
+        let s2 = cache.stats().await;
+        assert_eq!(s2["entries"], 1);
+    }
+
+    #[test]
+    fn hash_file_deterministic() {
+        let h1 = PipelineCache::hash_file(b"hello world");
+        let h2 = PipelineCache::hash_file(b"hello world");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn hash_file_different_content() {
+        let h1 = PipelineCache::hash_file(b"aaa");
+        let h2 = PipelineCache::hash_file(b"bbb");
+        assert_ne!(h1, h2);
     }
 }

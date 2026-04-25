@@ -1,10 +1,26 @@
 use crate::config::Config;
 use crate::index::WorkspaceIndex;
 use crate::pipeline_cache::PipelineCache;
+use crate::snapshot::SnapshotStore;
 use crate::tool_runner::ToolRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Tracks a file's content hash so re-reads of unchanged files can return a compact response.
+#[derive(Debug, Clone)]
+pub struct ReadCacheEntry {
+    pub hash: u64,
+    #[allow(dead_code)] // exposed for diagnostics and future compact re-read responses
+    pub lines: usize,
+}
+
+/// Tools visible by default. Extended tools (snapshots, git, diff, pipelines)
+/// appear after the model calls `list_all_tools` or uses one directly.
+pub const CORE_TOOLS: &[&str] = &[
+    "read_file", "write_file", "edit_file", "search",
+    "workspace_info", "exec", "batch", "list_all_tools",
+];
 
 /// Per-connection session state.
 /// Persists working directory, env vars, and background processes across calls.
@@ -16,7 +32,14 @@ pub struct Session {
     pub index: Option<Arc<WorkspaceIndex>>,
     pub tool_registry: Option<Arc<ToolRegistry>>,
     pub pipeline_cache: Option<Arc<PipelineCache>>,
+    pub snapshot_store: SnapshotStore,
     pub cfg: Arc<Config>,
+    pub exec_usage: HashMap<String, u32>,
+    /// Tracks content hashes of files the model has already read, keyed by canonical path.
+    pub read_cache: HashMap<PathBuf, ReadCacheEntry>,
+    /// Tools currently exposed in list_tools. Core tools are always present;
+    /// extended tools are added on first use or via `list_all_tools`.
+    pub exposed_tools: HashSet<String>,
     next_pid: u32,
 }
 
@@ -28,17 +51,88 @@ pub struct BgProcess {
 impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
         let cwd = workspace.clone();
+        let env = Self::build_initial_env(&cfg);
+        let snapshot_store = SnapshotStore::new(workspace.clone());
         Self {
             workspace,
             cwd,
-            env: HashMap::new(),
+            env,
             bg_processes: HashMap::new(),
             index: None,
             tool_registry: None,
             pipeline_cache: None,
+            snapshot_store,
             cfg,
+            exec_usage: HashMap::new(),
+            read_cache: HashMap::new(),
+            exposed_tools: {
+                let mut tools: HashSet<String> = CORE_TOOLS.iter().map(|s| s.to_string()).collect();
+                // Expose all tools by default for Cursor compatibility.
+                // Cursor caches list_tools and won't re-query after activation.
+                for name in &[
+                    "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete",
+                    "diff_files", "tool_pipeline", "tool_repair",
+                    "git_status", "git_log", "git_diff", "git_branch",
+                ] {
+                    tools.insert(name.to_string());
+                }
+                tools
+            },
             next_pid: 1,
         }
+    }
+
+    /// Build the initial session environment with an enhanced PATH.
+    /// Combines: config extra_path + auto-detected tool dirs + parent process PATH.
+    fn build_initial_env(cfg: &Config) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        let parent_path = std::env::var("PATH").unwrap_or_default();
+        let parent_dirs: std::collections::HashSet<&str> =
+            parent_path.split(':').collect();
+
+        let mut extra: Vec<String> = Vec::new();
+
+        // Config-specified extra paths (highest priority)
+        for dir in &cfg.process.extra_path {
+            let expanded = shellexpand_home(dir);
+            if std::path::Path::new(&expanded).is_dir() && !parent_dirs.contains(expanded.as_str())
+            {
+                extra.push(expanded);
+            }
+        }
+
+        // Auto-detect common tool directories
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            let candidates = [
+                home.join(".cargo/bin"),
+                home.join(".local/bin"),
+                home.join("go/bin"),
+                home.join(".deno/bin"),
+                home.join(".bun/bin"),
+                home.join(".local/share/fnm/aliases/default/bin"),
+            ];
+            for dir in &candidates {
+                if dir.is_dir() {
+                    let s = dir.to_string_lossy().to_string();
+                    if !parent_dirs.contains(s.as_str()) && !extra.contains(&s) {
+                        extra.push(s);
+                    }
+                }
+            }
+        }
+
+        if !extra.is_empty() {
+            let mut new_path = extra.join(":");
+            if !parent_path.is_empty() {
+                new_path.push(':');
+                new_path.push_str(&parent_path);
+            }
+            env.insert("PATH".to_string(), new_path);
+        }
+
+        env
     }
 
     pub fn resolve_path(&self, path: &str) -> PathBuf {
@@ -54,5 +148,203 @@ impl Session {
         let pid = self.next_pid;
         self.next_pid += 1;
         pid
+    }
+
+    /// Hash file content using a fast non-cryptographic hash.
+    pub fn content_hash(content: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Check if a file's content matches what the model has already seen.
+    /// Returns Some(entry) if the file is cached and unchanged.
+    pub fn check_read_cache(&self, path: &PathBuf, content: &str) -> Option<&ReadCacheEntry> {
+        let entry = self.read_cache.get(path)?;
+        if entry.hash == Self::content_hash(content) {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Record a file read in the cache.
+    pub fn update_read_cache(&mut self, path: PathBuf, content: &str) {
+        let hash = Self::content_hash(content);
+        let lines = content.lines().count();
+        self.read_cache.insert(path, ReadCacheEntry { hash, lines });
+    }
+
+    /// Invalidate the read cache for a path (after write or edit).
+    pub fn invalidate_read_cache(&mut self, path: &PathBuf) {
+        self.read_cache.remove(path);
+    }
+
+    /// Expose a tool so it appears in future list_tools responses.
+    pub fn activate_tool(&mut self, name: &str) {
+        self.exposed_tools.insert(name.to_string());
+    }
+
+    /// Expose all known tools at once.
+    pub fn activate_all_tools(&mut self) {
+        for name in &[
+            "tool_pipeline", "tool_repair", "diff_files",
+            "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete",
+            "git_status", "git_log", "git_diff", "git_branch",
+        ] {
+            self.exposed_tools.insert(name.to_string());
+        }
+    }
+}
+
+fn shellexpand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(rest)
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session(workspace: &str) -> Session {
+        Session::new(
+            PathBuf::from(workspace),
+            Arc::new(Config::default()),
+        )
+    }
+
+    #[test]
+    fn resolve_relative_path() {
+        let s = test_session("/workspace");
+        assert_eq!(s.resolve_path("foo.txt"), PathBuf::from("/workspace/foo.txt"));
+        assert_eq!(
+            s.resolve_path("sub/bar.rs"),
+            PathBuf::from("/workspace/sub/bar.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_path() {
+        let s = test_session("/workspace");
+        assert_eq!(s.resolve_path("/tmp/x.txt"), PathBuf::from("/tmp/x.txt"));
+    }
+
+    #[test]
+    fn alloc_pid_monotonic() {
+        let mut s = test_session("/workspace");
+        let p1 = s.alloc_pid();
+        let p2 = s.alloc_pid();
+        let p3 = s.alloc_pid();
+        assert_eq!(p1, 1);
+        assert_eq!(p2, 2);
+        assert_eq!(p3, 3);
+    }
+
+    #[test]
+    fn initial_state() {
+        let s = test_session("/workspace");
+        assert_eq!(s.workspace, PathBuf::from("/workspace"));
+        assert_eq!(s.cwd, PathBuf::from("/workspace"));
+        assert!(s.bg_processes.is_empty());
+        assert!(s.index.is_none());
+    }
+
+    #[test]
+    fn path_includes_cargo_bin_if_exists() {
+        let s = test_session("/workspace");
+        if let Some(home) = std::env::var_os("HOME") {
+            let cargo_bin = PathBuf::from(&home).join(".cargo/bin");
+            if cargo_bin.is_dir() {
+                let path = s.env.get("PATH").expect("PATH should be set");
+                assert!(
+                    path.contains(&cargo_bin.to_string_lossy().to_string()),
+                    "PATH should contain ~/.cargo/bin, got: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_inherits_parent_path() {
+        let s = test_session("/workspace");
+        if let Ok(parent_path) = std::env::var("PATH") {
+            if let Some(session_path) = s.env.get("PATH") {
+                assert!(
+                    session_path.ends_with(&parent_path),
+                    "session PATH should end with parent PATH"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extra_path_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("custom_bin");
+        std::fs::create_dir(&extra).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.process.extra_path = vec![extra.to_string_lossy().to_string()];
+        let s = Session::new(PathBuf::from("/workspace"), Arc::new(cfg));
+
+        let path = s.env.get("PATH").expect("PATH should be set");
+        assert!(
+            path.contains(&extra.to_string_lossy().to_string()),
+            "PATH should contain config extra_path dir"
+        );
+    }
+
+    #[test]
+    fn extra_path_skips_nonexistent_dirs() {
+        let mut cfg = Config::default();
+        cfg.process.extra_path = vec!["/nonexistent_dir_xyz".into()];
+        let s = Session::new(PathBuf::from("/workspace"), Arc::new(cfg));
+
+        if let Some(path) = s.env.get("PATH") {
+            assert!(
+                !path.contains("/nonexistent_dir_xyz"),
+                "PATH should not contain nonexistent dirs"
+            );
+        }
+    }
+
+    #[test]
+    fn exposed_tools_includes_all_tools() {
+        let s = test_session("/workspace");
+        assert!(s.exposed_tools.contains("read_file"));
+        assert!(s.exposed_tools.contains("write_file"));
+        assert!(s.exposed_tools.contains("exec"));
+        assert!(s.exposed_tools.contains("batch"));
+        assert!(s.exposed_tools.contains("list_all_tools"));
+        assert!(s.exposed_tools.contains("git_status"));
+        assert!(s.exposed_tools.contains("snapshot_create"));
+        assert!(s.exposed_tools.contains("diff_files"));
+    }
+
+    #[test]
+    fn activate_tool_adds_custom_to_exposed() {
+        let mut s = test_session("/workspace");
+        assert!(!s.exposed_tools.contains("custom_tool"));
+        s.activate_tool("custom_tool");
+        assert!(s.exposed_tools.contains("custom_tool"));
+    }
+
+    #[test]
+    fn activate_all_tools_is_idempotent() {
+        let mut s = test_session("/workspace");
+        let before = s.exposed_tools.len();
+        s.activate_all_tools();
+        assert!(s.exposed_tools.contains("snapshot_create"));
+        assert!(s.exposed_tools.contains("git_status"));
+        assert!(s.exposed_tools.contains("tool_pipeline"));
+        assert_eq!(s.exposed_tools.len(), before);
     }
 }

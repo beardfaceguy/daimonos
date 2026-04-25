@@ -8,7 +8,7 @@ pub enum Request {
     Batch { batch: Vec<Op> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Op {
     /// Opcode number
     pub c: u8,
@@ -69,6 +69,82 @@ impl Response {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_op() {
+        let json = r#"{"c": 0, "p": "foo.txt"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Single(op) => {
+                assert_eq!(op.c, 0);
+                assert_eq!(op.p.as_deref(), Some("foo.txt"));
+            }
+            _ => panic!("expected Single"),
+        }
+    }
+
+    #[test]
+    fn parse_batch() {
+        let json = r#"{"batch": [{"c": 0, "p": "a.txt"}, {"c": 1, "p": "b.txt", "s": "hi"}]}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Batch { batch } => {
+                assert_eq!(batch.len(), 2);
+                assert_eq!(batch[0].c, 0);
+                assert_eq!(batch[1].s.as_deref(), Some("hi"));
+            }
+            _ => panic!("expected Batch"),
+        }
+    }
+
+    #[test]
+    fn parse_minimal_op() {
+        let json = r#"{"c": 255}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Single(op) => {
+                assert_eq!(op.c, 255);
+                assert!(op.p.is_none());
+                assert!(op.s.is_none());
+                assert!(op.n.is_none());
+                assert!(op.a.is_none());
+                assert!(op.kv.is_none());
+            }
+            _ => panic!("expected Single"),
+        }
+    }
+
+    #[test]
+    fn op_default() {
+        let op = Op::default();
+        assert_eq!(op.c, 0);
+        assert!(op.p.is_none());
+    }
+
+    #[test]
+    fn response_ok_serialization() {
+        let resp = Response::ok(serde_json::json!({"x": 1}));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["d"]["x"], 1);
+        assert!(json.get("e").is_none());
+        assert!(json.get("m").is_none());
+    }
+
+    #[test]
+    fn response_err_serialization() {
+        let resp = Response::err(3, "bad arg");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["e"], 3);
+        assert_eq!(json["m"], "bad arg");
+        assert!(json.get("d").is_none());
+    }
+}
+
 /// Opcode constants
 pub mod op {
     pub const READ: u8 = 0;
@@ -85,7 +161,11 @@ pub mod op {
     pub const KILL: u8 = 11;
     pub const SNAP: u8 = 12;
     pub const RESTORE: u8 = 13;
+    pub const SNAP_LIST: u8 = 25;
+    pub const SNAP_DELETE: u8 = 26;
     pub const DIFF: u8 = 14;
+    #[deprecated(note = "git moved to tool plugin system — use TOOL_RUN with tool_id 'git'")]
+    #[allow(dead_code)]
     pub const GIT: u8 = 15;
     pub const ENV_SET: u8 = 16;
     pub const ENV_GET: u8 = 17;
