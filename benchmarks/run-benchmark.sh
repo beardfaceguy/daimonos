@@ -96,7 +96,7 @@ run_task() {
 
   if [[ "$MODE" == "daimonos" ]]; then
     claude_args+=(--mcp-config "$MCP_CONFIG" --strict-mcp-config)
-    claude_args+=(--append-system-prompt "IMPORTANT: Always use daimonos MCP tools instead of built-in tools. daimonos tools return structured JSON and cost fewer tokens. Use read_file, write_file, edit_file, search, exec, batch. Call list_all_tools to discover git/snapshot/diff tools.")
+    claude_args+=(--append-system-prompt "Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks.")
   fi
 
   local start_ns

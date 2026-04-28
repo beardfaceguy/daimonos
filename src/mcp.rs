@@ -17,9 +17,11 @@ use crate::config::Config;
 use crate::index::WorkspaceIndex;
 use crate::ops;
 use crate::pipeline_cache::PipelineCache;
-use crate::protocol::{self, Op, Request, Response};
+use crate::protocol::Response;
+use crate::script;
 use crate::session::Session;
 use crate::tool_runner::ToolRegistry;
+use crate::tools;
 
 pub struct DaimonosHandler {
     session: Arc<Mutex<Session>>,
@@ -33,34 +35,7 @@ impl DaimonosHandler {
     }
 }
 
-// --- Argument extraction helpers ---
-
-fn get_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key)?.as_str().map(String::from)
-}
-
-fn get_i64(args: &Value, key: &str) -> Option<i64> {
-    args.get(key)?.as_i64()
-}
-
-fn get_str_array(args: &Value, key: &str) -> Option<Vec<String>> {
-    args.get(key)?
-        .as_array()?
-        .iter()
-        .map(|v| v.as_str().map(String::from))
-        .collect()
-}
-
-fn get_str_map(args: &Value, key: &str) -> Option<std::collections::HashMap<String, String>> {
-    let obj = args.get(key)?.as_object()?;
-    let mut map = std::collections::HashMap::new();
-    for (k, v) in obj {
-        if let Some(s) = v.as_str() {
-            map.insert(k.clone(), s.to_string());
-        }
-    }
-    Some(map)
-}
+use tools::get_str;
 
 fn ok_text(text: String) -> std::result::Result<CallToolResult, CallToolError> {
     Ok(CallToolResult::text_content(vec![TextContent::new(
@@ -93,15 +68,65 @@ async fn dispatch_tool(
     name: &str,
     args: &Value,
 ) -> std::result::Result<CallToolResult, CallToolError> {
-    // Auto-activate extended tools on first use
     if !session.exposed_tools.contains(name) {
         session.activate_tool(name);
     }
+    session.used_tools.insert(name.to_string());
 
+    // Registry-based dispatch: if the tool has a to_request mapping, use it
+    if let Some(result) = tools::build_request(name, args) {
+        match result {
+            Ok(request) => {
+                let resp = ops::dispatch(session, request).await;
+                return response_to_result(resp);
+            }
+            Err(e) => return err_text(e),
+        }
+    }
+
+    // Special tools that need session access or custom handling
     match name {
+        "get_tool_schema" => {
+            let names = match args.get("tools").and_then(|v| v.as_array()) {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
+                None => match get_str(args, "tool") {
+                    Some(t) => vec![t],
+                    None => return err_text("get_tool_schema requires 'tools' array or 'tool' string".into()),
+                },
+            };
+
+            let all = tools::tool_definitions();
+            let results: Vec<Value> = all
+                .into_iter()
+                .filter(|t| names.contains(&t.name))
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
+                .collect();
+
+            if results.is_empty() {
+                let known: Vec<&str> = tools::all_tool_names();
+                err_text(format!("unknown tool(s): {:?}. Available: {:?}", names, known))
+            } else {
+                ok_text(serde_json::to_string(&results).unwrap_or_default())
+            }
+        }
+
+        "list_tool_signatures" => {
+            let sigs = script::tool_signatures();
+            ok_text(sigs)
+        }
+
         "list_all_tools" => {
             session.activate_all_tools();
-            let all = tool_definitions();
+            let all = tools::tool_definitions();
             let summary: Vec<Value> = all
                 .iter()
                 .map(|t| json!({"name": t.name, "description": t.description}))
@@ -109,96 +134,18 @@ async fn dispatch_tool(
             ok_text(serde_json::to_string(&summary).unwrap_or_default())
         }
 
-        "read_file" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::READ,
-                    p: get_str(args, "path"),
-                    n: get_i64(args, "offset"),
-                    n2: get_i64(args, "limit"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "write_file" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::WRITE,
-                    p: get_str(args, "path"),
-                    s: get_str(args, "content"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "edit_file" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::PATCH,
-                    p: get_str(args, "path"),
-                    a: get_str_array(args, "edits"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "search" => {
-            let mode = get_str(args, "mode").unwrap_or_else(|| "content".into());
-
-            let resp = if mode == "files" {
-                ops::dispatch(
-                    session,
-                    Request::Single(Op {
-                        c: protocol::op::FIND,
-                        p: get_str(args, "pattern"),
-                        n: get_i64(args, "max_results"),
-                        ..Default::default()
-                    }),
-                )
-                .await
-            } else {
-                ops::dispatch(
-                    session,
-                    Request::Single(Op {
-                        c: protocol::op::GREP,
-                        p: get_str(args, "pattern"),
-                        q: get_str(args, "path"),
-                        g: get_str(args, "glob"),
-                        n: get_i64(args, "max_results"),
-                        ..Default::default()
-                    }),
-                )
-                .await
-            };
-            response_to_result(resp)
-        }
-
         "workspace_info" => {
+            use crate::protocol::{Op, Request, op};
+
             let session_resp = ops::dispatch(
                 session,
-                Request::Single(Op {
-                    c: protocol::op::SESSION,
-                    ..Default::default()
-                }),
+                Request::Single(Op { c: op::SESSION, ..Default::default() }),
             )
             .await;
 
             let ls_resp = ops::dispatch(
                 session,
-                Request::Single(Op {
-                    c: protocol::op::LS,
-                    ..Default::default()
-                }),
+                Request::Single(Op { c: op::LS, ..Default::default() }),
             )
             .await;
 
@@ -224,125 +171,45 @@ async fn dispatch_tool(
             response_to_result(Response::ok(info))
         }
 
-        "exec" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::EXEC,
-                    s: get_str(args, "command"),
-                    a: get_str_array(args, "args"),
-                    q: get_str(args, "cwd"),
-                    kv: get_str_map(args, "env"),
-                    ..Default::default()
-                }),
+        "set_cwd" => {
+            let path = match get_str(args, "path") {
+                Some(p) => p,
+                None => return err_text("set_cwd requires 'path' argument".into()),
+            };
+
+            let previous = session.cwd.display().to_string();
+            let new_cwd = session.resolve_path(&path);
+
+            if !new_cwd.is_dir() {
+                return err_text(format!("not a directory: {}", new_cwd.display()));
+            }
+
+            let canonical = match new_cwd.canonicalize() {
+                Ok(p) => p,
+                Err(e) => return err_text(format!("resolve path: {e}")),
+            };
+
+            session.cwd = canonical.clone();
+            ok_text(
+                serde_json::to_string(&json!({
+                    "cwd": canonical.display().to_string(),
+                    "previous": previous,
+                }))
+                .unwrap_or_default(),
             )
-            .await;
-            response_to_result(resp)
         }
 
-        "tool_pipeline" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::TOOL_PIPELINE,
-                    p: get_str(args, "tool_id"),
-                    a: get_str_array(args, "stages"),
-                    q: get_str(args, "cwd"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
+        "git" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("git requires 'command' argument".into()),
+            };
 
-        "tool_repair" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::TOOL_REPAIR,
-                    p: get_str(args, "tool_id"),
-                    n: get_i64(args, "max_iterations"),
-                    q: get_str(args, "cwd"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "diff_files" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::DIFF,
-                    p: get_str(args, "path_a"),
-                    q: get_str(args, "path_b"),
-                    s: get_str(args, "content_b"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "snapshot_create" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::SNAP,
-                    p: get_str(args, "tag"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "snapshot_restore" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::RESTORE,
-                    p: get_str(args, "id"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "snapshot_list" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::SNAP_LIST,
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        "snapshot_delete" => {
-            let resp = ops::dispatch(
-                session,
-                Request::Single(Op {
-                    c: protocol::op::SNAP_DELETE,
-                    p: get_str(args, "id"),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            response_to_result(resp)
-        }
-
-        tool if tool.starts_with("git_") => {
             let registry = match &session.tool_registry {
                 Some(r) => r,
                 None => return err_text("tool registry not available".into()),
             };
 
-            let command = tool.strip_prefix("git_").unwrap();
             let cwd = session.cwd.clone();
             let env = session.env.clone();
 
@@ -354,7 +221,7 @@ async fn dispatch_tool(
             let extra_ref = extra.as_ref();
 
             match registry
-                .run("git", command, &cwd, &env, None, extra_ref)
+                .run("git", &command, &cwd, &env, None, extra_ref)
                 .await
             {
                 Ok(result) => {
@@ -392,10 +259,25 @@ impl ServerHandler for DaimonosHandler {
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<ListToolsResult, RpcError> {
         let session = self.session.lock().await;
-        let all = tool_definitions();
+        let all = tools::tool_definitions();
+        let workspace = &session.workspace;
+
         let visible: Vec<Tool> = all
             .into_iter()
             .filter(|t| session.exposed_tools.contains(&t.name))
+            .filter(|t| tools::passes_context_check(&t.name, workspace))
+            .map(|t| {
+                let already_used = session.used_tools.contains(&t.name);
+                if tools::has_full_schema(&t.name) && !already_used {
+                    t
+                } else {
+                    Tool {
+                        input_schema: serde_json::from_value(json!({"type": "object"}))
+                            .unwrap_or(t.input_schema),
+                        ..t
+                    }
+                }
+            })
             .collect();
         Ok(ListToolsResult {
             tools: visible,
@@ -410,6 +292,33 @@ impl ServerHandler for DaimonosHandler {
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
+
+        // execute_script needs Arc<Mutex<Session>> — handle it before locking.
+        if params.name == "execute_script" {
+            self.session.lock().await.used_tools.insert("execute_script".into());
+            let code = match args.get("code").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => return err_text("execute_script requires 'code' argument".into()),
+            };
+            let timeout_secs = args
+                .get("timeout")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(60) as u64;
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+
+            return match script::execute(&code, self.session.clone(), timeout).await {
+                Ok(result) => {
+                    let mut resp = json!({
+                        "result": result.value,
+                    });
+                    if !result.logs.is_empty() {
+                        resp["logs"] = json!(result.logs);
+                    }
+                    ok_text(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                Err(e) => err_text(format!("{e}"))
+            };
+        }
 
         let mut session = self.session.lock().await;
 
@@ -462,244 +371,18 @@ impl ServerHandler for DaimonosHandler {
     }
 }
 
-// --- Tool definitions ---
-
-fn tool_definitions() -> Vec<Tool> {
-    let defs = vec![
-        json!({
-            "name": "read_file",
-            "description": "Read file. Returns {content, lines} or {unchanged:true, lines} if already read and unmodified.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
-                    "offset": {"type": "integer", "description": "Start line (0-based)"},
-                    "limit": {"type": "integer", "description": "Max lines"}
-                },
-                "required": ["path"]
-            }
-        }),
-        json!({
-            "name": "write_file",
-            "description": "Write file, creating parent dirs.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }
-        }),
-        json!({
-            "name": "edit_file",
-            "description": "String-replace edits. Returns {applied, diffs} confirming each change.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
-                    "edits": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "[old, new, old, new, ...] pairs"
-                    }
-                },
-                "required": ["path", "edits"]
-            }
-        }),
-        json!({
-            "name": "search",
-            "description": "Regex content search or trigram file-name search.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["content", "files"], "description": "Default: content"},
-                    "path": {"type": "string", "description": "Scope dir"},
-                    "glob": {"type": "string", "description": "e.g. *.rs"},
-                    "max_results": {"type": "integer"}
-                },
-                "required": ["pattern"]
-            }
-        }),
-        json!({
-            "name": "workspace_info",
-            "description": "Session, root listing, and index stats in one call.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "exec",
-            "description": "Run command. Returns {exit, out, err?}. Output auto-truncated if very large.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "cwd": {"type": "string"},
-                    "env": {"type": "object", "additionalProperties": {"type": "string"}}
-                },
-                "required": ["command"]
-            }
-        }),
-        json!({
-            "name": "tool_pipeline",
-            "description": "Run tool stages sequentially, abort on failure.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tool_id": {"type": "string"},
-                    "stages": {"type": "array", "items": {"type": "string"}},
-                    "cwd": {"type": "string"}
-                },
-                "required": ["tool_id", "stages"]
-            }
-        }),
-        json!({
-            "name": "tool_repair",
-            "description": "Auto lint-fix loop until clean.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tool_id": {"type": "string"},
-                    "max_iterations": {"type": "integer", "description": "Default: 3"},
-                    "cwd": {"type": "string"}
-                },
-                "required": ["tool_id"]
-            }
-        }),
-        json!({
-            "name": "snapshot_create",
-            "description": "Snapshot workspace for rollback.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tag": {"type": "string", "description": "Optional label"}
-                }
-            }
-        }),
-        json!({
-            "name": "snapshot_restore",
-            "description": "Restore workspace from snapshot.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"}
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "snapshot_list",
-            "description": "List snapshots, newest first.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "snapshot_delete",
-            "description": "Delete a snapshot.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"}
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "diff_files",
-            "description": "Structured diff: hunks with =, +, - tagged lines.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path_a": {"type": "string"},
-                    "path_b": {"type": "string"},
-                    "content_b": {"type": "string", "description": "Alt: diff against string"}
-                },
-                "required": ["path_a"]
-            }
-        }),
-        json!({
-            "name": "git_status",
-            "description": "Structured working-tree status arrays.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "git_log",
-            "description": "Commits as {hash, author, message, date}.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Default: 10"},
-                    "path": {"type": "string", "description": "Filter by path"}
-                }
-            }
-        }),
-        json!({
-            "name": "git_diff",
-            "description": "Structured diff with files and hunks.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["unstaged", "staged"]}
-                }
-            }
-        }),
-        json!({
-            "name": "git_branch",
-            "description": "Current branch and branch list.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "list_all_tools",
-            "description": "Show all available tools including extended ones (snapshots, git, diff, pipelines). Call once to unlock them.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "batch",
-            "description": "Multiple tools in one round-trip. Returns results array. Use for independent parallel ops.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ops": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "tool": {"type": "string"},
-                                "arguments": {"type": "object"}
-                            },
-                            "required": ["tool"]
-                        }
-                    }
-                },
-                "required": ["ops"]
-            }
-        }),
-    ];
-
-    defs.into_iter()
-        .map(|v| serde_json::from_value(v).expect("valid tool definition"))
-        .collect()
-}
-
 // --- Proactive workspace context ---
 
 /// Build dynamic instructions that include workspace-specific context
 /// so the model has useful information without a separate tool call.
 async fn build_instructions(workspace: &std::path::Path) -> String {
     let mut parts = vec![
-        // Directive: tell the model to prefer daimonos tools
-        "IMPORTANT: Always use daimonos tools instead of built-in equivalents. \
-         Daimonos tools are faster, return structured JSON, and cost fewer tokens.\n\
-         - read_file instead of Read/cat\n\
-         - write_file instead of Write\n\
-         - edit_file instead of StrReplace/Edit\n\
-         - search instead of Grep/Glob/find\n\
-         - exec instead of Shell\n\
-         - batch to combine multiple operations in one call\n\
-         Use list_all_tools to discover git, snapshot, and diff tools."
-            .to_string(),
+        "Use daimonos tools, not built-in equivalents.".to_string(),
+        "If your plan requires 2+ tool calls, use execute_script instead — write a Starlark script that calls the tool functions and sets `result`. This is faster and cheaper than sequential calls. Only call individual tools when you need exactly one operation.".to_string(),
         format!("Workspace: {}", workspace.display()),
     ];
+
+    parts.push(format!("Starlark tool functions for execute_script:\n{}", script::tool_signatures()));
 
     // Detect primary language / project type from manifest files
     let markers: &[(&str, &str)] = &[
@@ -822,52 +505,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn get_str_extracts_string() {
-        let v = json!({"path": "/tmp/foo", "count": 5});
-        assert_eq!(get_str(&v, "path"), Some("/tmp/foo".into()));
-        assert_eq!(get_str(&v, "missing"), None);
-        assert_eq!(get_str(&v, "count"), None); // not a string
-    }
-
-    #[test]
-    fn get_i64_extracts_int() {
-        let v = json!({"offset": 42, "name": "hi"});
-        assert_eq!(get_i64(&v, "offset"), Some(42));
-        assert_eq!(get_i64(&v, "missing"), None);
-        assert_eq!(get_i64(&v, "name"), None); // not an int
-    }
-
-    #[test]
-    fn get_str_array_extracts_vec() {
-        let v = json!({"stages": ["build", "test", "deploy"]});
-        let arr = get_str_array(&v, "stages").unwrap();
-        assert_eq!(arr, vec!["build", "test", "deploy"]);
-        assert!(get_str_array(&v, "missing").is_none());
-    }
-
-    #[test]
-    fn get_str_array_returns_none_for_mixed() {
-        let v = json!({"arr": ["ok", 5]});
-        assert!(get_str_array(&v, "arr").is_none());
-    }
-
-    #[test]
-    fn get_str_map_extracts_hashmap() {
-        let v = json!({"env": {"KEY": "val", "FOO": "bar"}});
-        let map = get_str_map(&v, "env").unwrap();
-        assert_eq!(map.get("KEY"), Some(&"val".to_string()));
-        assert_eq!(map.get("FOO"), Some(&"bar".to_string()));
-    }
-
-    #[test]
-    fn get_str_map_skips_non_string_values() {
-        let v = json!({"env": {"K": "v", "N": 5}});
-        let map = get_str_map(&v, "env").unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("K"), Some(&"v".to_string()));
-    }
-
-    #[test]
     fn response_to_result_ok() {
         let resp = Response::ok(json!({"lines": 10}));
         let result = response_to_result(resp).unwrap();
@@ -883,9 +520,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_has_entries() {
-        let tools = tool_definitions();
-        assert!(!tools.is_empty());
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let defs = tools::tool_definitions();
+        assert!(!defs.is_empty());
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"edit_file"));
@@ -893,11 +530,14 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"batch"));
         assert!(names.contains(&"list_all_tools"));
+        assert!(names.contains(&"get_tool_schema"));
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"snapshot"));
     }
 
     #[test]
     fn tool_definitions_all_have_descriptions() {
-        for tool in tool_definitions() {
+        for tool in tools::tool_definitions() {
             assert!(!tool.name.is_empty(), "tool has empty name");
             assert!(
                 tool.description.is_some() && !tool.description.as_ref().unwrap().is_empty(),
@@ -909,10 +549,106 @@ mod tests {
 
     #[test]
     fn tool_definitions_no_duplicates() {
-        let tools = tool_definitions();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let defs = tools::tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
         let unique: std::collections::HashSet<&&str> = names.iter().collect();
         assert_eq!(names.len(), unique.len(), "duplicate tool names found");
+    }
+
+    #[test]
+    fn schema_token_savings_benchmark() {
+        let all = tools::tool_definitions();
+
+        let full_json: Vec<Value> = all
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
+            })
+            .collect();
+        let full_str = serde_json::to_string(&full_json).unwrap();
+        let full_chars = full_str.len();
+
+        let terse_json: Vec<Value> = all
+            .iter()
+            .map(|t| {
+                if tools::has_full_schema(&t.name) {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                } else {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": {"type": "object"},
+                    })
+                }
+            })
+            .collect();
+        let terse_str = serde_json::to_string(&terse_json).unwrap();
+        let terse_chars = terse_str.len();
+
+        let code_mode_tools: Vec<Value> = all
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.name.as_str(),
+                    "execute_script" | "list_tool_signatures" | "get_tool_schema"
+                )
+            })
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
+            })
+            .collect();
+        let code_mode_str = serde_json::to_string(&code_mode_tools).unwrap();
+        let code_mode_chars = code_mode_str.len();
+
+        let sigs = crate::script::tool_signatures();
+        let sig_chars = sigs.len();
+
+        let full_tokens = full_chars / 4;
+        let terse_tokens = terse_chars / 4;
+        let code_mode_tokens = code_mode_chars / 4;
+        let sig_tokens = sig_chars / 4;
+
+        let schema_reduction = 100.0 * (1.0 - terse_chars as f64 / full_chars as f64);
+        let code_mode_reduction =
+            100.0 * (1.0 - code_mode_chars as f64 / full_chars as f64);
+
+        eprintln!("=== Schema Token Benchmark ===");
+        eprintln!("Full schema:      {full_chars:>5} chars ({full_tokens:>4} est. tokens) — {total} tools",
+            total = all.len());
+        eprintln!("Terse schema:     {terse_chars:>5} chars ({terse_tokens:>4} est. tokens) — {schema_reduction:.1}% reduction");
+        eprintln!("Code-mode schema: {code_mode_chars:>5} chars ({code_mode_tokens:>4} est. tokens) — {code_mode_reduction:.1}% reduction");
+        eprintln!("Tool signatures:  {sig_chars:>5} chars ({sig_tokens:>4} est. tokens) — one-time cost");
+        eprintln!(
+            "Code-mode per-turn: {:>4} est. tokens (schema) vs {:>4} full ({:.1}% saved)",
+            code_mode_tokens,
+            full_tokens,
+            code_mode_reduction,
+        );
+
+        assert!(
+            schema_reduction > 20.0,
+            "terse schema should save >20% tokens, got {schema_reduction:.1}%"
+        );
+        assert!(
+            code_mode_reduction > 75.0,
+            "code-mode should save >75% schema tokens, got {code_mode_reduction:.1}%"
+        );
+        assert!(
+            code_mode_tools.len() == 3,
+            "code-mode surface should be 3 tools"
+        );
     }
 
     #[tokio::test]

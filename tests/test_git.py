@@ -1,4 +1,4 @@
-"""Tests for the git_status, git_log, git_diff, and git_branch MCP tools."""
+"""Tests for the unified git MCP tool."""
 
 import json
 import os
@@ -30,10 +30,10 @@ def test_git_status_clean_repo(daimonos):
     _git(ws, "add", ".")
     _git(ws, "commit", "-m", "init")
 
-    data = _parse(daimonos.call_tool("git_status"))
+    data = _parse(daimonos.call_tool("git", {"command": "status"}))
     assert data["clean"] is True
-    assert data["modified"] == []
-    assert data["untracked"] == []
+    assert "modified" not in data, "empty arrays should be omitted"
+    assert "untracked" not in data, "empty arrays should be omitted"
 
 
 def test_git_status_modified_file(daimonos):
@@ -48,7 +48,7 @@ def test_git_status_modified_file(daimonos):
     with open(os.path.join(ws, "file.txt"), "w") as f:
         f.write("changed")
 
-    data = _parse(daimonos.call_tool("git_status"))
+    data = _parse(daimonos.call_tool("git", {"command": "status"}))
     assert data["clean"] is False
     assert any("file.txt" in f for f in data["modified"])
 
@@ -65,12 +65,12 @@ def test_git_status_untracked_file(daimonos):
     with open(os.path.join(ws, "new_file.txt"), "w") as f:
         f.write("untracked")
 
-    data = _parse(daimonos.call_tool("git_status"))
+    data = _parse(daimonos.call_tool("git", {"command": "status"}))
     assert "new_file.txt" in data["untracked"]
 
 
 def test_git_status_not_a_repo(daimonos):
-    result = daimonos.call_tool("git_status")
+    result = daimonos.call_tool("git", {"command": "status"})
     assert result.get("isError") is True
 
 
@@ -88,13 +88,13 @@ def test_git_log_returns_commits(daimonos):
     _git(ws, "add", ".")
     _git(ws, "commit", "-m", "second commit")
 
-    data = _parse(daimonos.call_tool("git_log"))
+    data = _parse(daimonos.call_tool("git", {"command": "log"}))
     assert data["count"] == 2
     commits = data["commits"]
-    assert commits[0]["msg"] == "second commit"
-    assert commits[1]["msg"] == "first commit"
-    assert commits[0]["author"] == "Test User"
-    assert len(commits[0]["hash"]) >= 40
+    assert commits[0]["m"] == "second commit"
+    assert commits[1]["m"] == "first commit"
+    assert commits[0]["a"] == "Test User"
+    assert len(commits[0]["h"]) >= 7
 
 
 def test_git_log_with_limit(daimonos):
@@ -107,7 +107,7 @@ def test_git_log_with_limit(daimonos):
         _git(ws, "add", ".")
         _git(ws, "commit", "-m", f"commit {i}")
 
-    data = _parse(daimonos.call_tool("git_log", {"limit": 2}))
+    data = _parse(daimonos.call_tool("git", {"command": "log", "limit": 2}))
     assert data["count"] == 2
 
 
@@ -125,9 +125,9 @@ def test_git_log_with_path_filter(daimonos):
     _git(ws, "add", ".")
     _git(ws, "commit", "-m", "add b")
 
-    data = _parse(daimonos.call_tool("git_log", {"path": "a.txt"}))
+    data = _parse(daimonos.call_tool("git", {"command": "log", "path": "a.txt"}))
     assert data["count"] == 1
-    assert data["commits"][0]["msg"] == "add a"
+    assert data["commits"][0]["m"] == "add a"
 
 
 def test_git_diff_unstaged(daimonos):
@@ -142,7 +142,7 @@ def test_git_diff_unstaged(daimonos):
     with open(os.path.join(ws, "file.txt"), "w") as f:
         f.write("modified\n")
 
-    data = _parse(daimonos.call_tool("git_diff"))
+    data = _parse(daimonos.call_tool("git", {"command": "diff"}))
     assert data["staged"] is False
     assert data["file_count"] >= 1
     files = data["files"]
@@ -162,7 +162,7 @@ def test_git_diff_staged(daimonos):
         f.write("staged_change\n")
     _git(ws, "add", ".")
 
-    data = _parse(daimonos.call_tool("git_diff", {"mode": "staged"}))
+    data = _parse(daimonos.call_tool("git", {"command": "diff", "mode": "staged"}))
     assert data["staged"] is True
     assert data["file_count"] >= 1
 
@@ -176,7 +176,7 @@ def test_git_diff_clean_repo(daimonos):
     _git(ws, "add", ".")
     _git(ws, "commit", "-m", "init")
 
-    data = _parse(daimonos.call_tool("git_diff"))
+    data = _parse(daimonos.call_tool("git", {"command": "diff"}))
     assert data["file_count"] == 0
     assert data["files"] == []
 
@@ -190,7 +190,7 @@ def test_git_branch_current(daimonos):
     _git(ws, "add", ".")
     _git(ws, "commit", "-m", "init")
 
-    data = _parse(daimonos.call_tool("git_branch"))
+    data = _parse(daimonos.call_tool("git", {"command": "branch"}))
     assert data["current"] == "main"
     assert "main" in data["branches"]
 
@@ -207,7 +207,7 @@ def test_git_branch_multiple(daimonos):
     _git(ws, "branch", "feature")
     _git(ws, "branch", "bugfix")
 
-    data = _parse(daimonos.call_tool("git_branch"))
+    data = _parse(daimonos.call_tool("git", {"command": "branch"}))
     assert data["current"] == "main"
     assert data["count"] == 3
     branches = data["branches"]
@@ -216,12 +216,19 @@ def test_git_branch_multiple(daimonos):
     assert "bugfix" in branches
 
 
-def test_tools_list_includes_git_tools(daimonos):
-    """Git tools are visible in the initial tool listing."""
+def test_tools_list_includes_git(daimonos):
+    """Unified git tool is visible in the initial tool listing."""
     tools = daimonos.list_tools()
     tool_names = [t["name"] for t in tools]
-    assert "diff_files" in tool_names
-    assert "git_status" in tool_names
-    assert "git_log" in tool_names
-    assert "git_diff" in tool_names
-    assert "git_branch" in tool_names
+    assert "git" in tool_names
+    assert "git_status" not in tool_names, "individual git tools should be merged"
+
+
+def test_tools_list_hides_extended(daimonos):
+    """Extended tools like diff_files, tool_pipeline, ls are not in initial listing."""
+    tools = daimonos.list_tools()
+    tool_names = [t["name"] for t in tools]
+    assert "diff_files" not in tool_names
+    assert "tool_pipeline" not in tool_names
+    assert "tool_repair" not in tool_names
+    assert "ls" not in tool_names, "ls should be behind list_all_tools"

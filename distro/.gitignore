@@ -1,0 +1,10 @@
+build/
+buildroot/
+
+# Buildroot overlay: binary is copied at build time
+br2-external/overlay/usr/bin/daimonos
+
+# Alpine legacy: binary and generated files
+alpine-legacy/rootfs-overlay/usr/bin/daimonos
+alpine-legacy/rootfs-overlay/etc/daimonos.toml
+alpine-legacy/rootfs-overlay/home/agent/.ssh/authorized_keys

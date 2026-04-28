@@ -1,0 +1,5 @@
+/home/agent             d 755 agent agent - - - - -
+/home/agent/.ssh        d 700 agent agent - - - - -
+/home/agent/.ssh/authorized_keys f 600 agent agent - - - - -
+/home/agent/workspace   d 755 agent agent - - - - -
+/home/agent/.gitconfig  f 644 agent agent - - - - -

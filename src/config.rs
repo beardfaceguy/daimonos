@@ -156,7 +156,18 @@ mod tests {
         assert_eq!(cfg.search.default_grep_max, 100);
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert!(cfg.tools.is_empty());
+    }
+
+    #[test]
+    fn default_toml_parses_successfully() {
+        let toml_str = include_str!("../daimonos.default.toml");
+        let cfg: Config = toml::from_str(toml_str)
+            .expect("daimonos.default.toml must parse as valid Config");
+        assert_eq!(cfg.process.exec_output_max_chars, 100_000);
+        assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.index.max_depth, 20);
     }
 
     #[test]

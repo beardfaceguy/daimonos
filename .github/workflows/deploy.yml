@@ -1,0 +1,176 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: "EC2 instance type"
+        default: "t3.micro"
+      validate:
+        description: "Launch ephemeral instance to validate"
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Deploy AMI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: aws-deploy
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: disk-images
+          path: distro/buildroot/output/images/
+          run-id: ${{ github.event.inputs.artifact_run_id || github.run_id }}
+        continue-on-error: true
+
+      - name: Check for disk image
+        run: |
+          if [ ! -f distro/buildroot/output/images/disk-aws.img ]; then
+            echo "ERROR: disk-aws.img not found."
+            echo "Either run the 'Distro Build' workflow first, or provide artifact_run_id."
+            exit 1
+          fi
+
+      - name: Deploy to AWS
+        id: deploy
+        run: |
+          AMI_NAME="daimonos-$(date +%Y%m%d)-${GITHUB_SHA::8}"
+          BUCKET="${DAIMONOS_S3_BUCKET:-daimonos-images}"
+          IMAGE="distro/buildroot/output/images/disk-aws.img"
+          S3_KEY="images/${AMI_NAME}.raw"
+
+          aws s3 cp "$IMAGE" "s3://$BUCKET/$S3_KEY"
+
+          IMPORT_TASK=$(aws ec2 import-snapshot \
+            --description "$AMI_NAME" \
+            --disk-container "{
+              \"Description\": \"daimonos root\",
+              \"Format\": \"raw\",
+              \"UserBucket\": {\"S3Bucket\": \"$BUCKET\", \"S3Key\": \"$S3_KEY\"}
+            }" --output json)
+
+          TASK_ID=$(echo "$IMPORT_TASK" | python3 -c "import sys,json; print(json.load(sys.stdin)['ImportTaskId'])")
+          echo "Import task: $TASK_ID"
+
+          while true; do
+            STATUS=$(aws ec2 describe-import-snapshot-tasks --import-task-ids "$TASK_ID" --output json)
+            STATE=$(echo "$STATUS" | python3 -c "import sys,json; t=json.load(sys.stdin)['ImportSnapshotTasks'][0]['SnapshotTaskDetail']; print(t['Status'])")
+            echo "  Status: $STATE"
+            if [ "$STATE" = "completed" ]; then
+              SNAPSHOT_ID=$(echo "$STATUS" | python3 -c "import sys,json; t=json.load(sys.stdin)['ImportSnapshotTasks'][0]['SnapshotTaskDetail']; print(t['SnapshotId'])")
+              break
+            elif [ "$STATE" = "error" ] || [ "$STATE" = "deleted" ]; then
+              echo "ERROR: Snapshot import failed" && exit 1
+            fi
+            sleep 30
+          done
+
+          AMI_ID=$(aws ec2 register-image \
+            --name "$AMI_NAME" \
+            --description "daimonos agent OS (${GITHUB_SHA::8})" \
+            --architecture x86_64 \
+            --root-device-name /dev/sda1 \
+            --block-device-mappings "[{
+              \"DeviceName\": \"/dev/sda1\",
+              \"Ebs\": {\"SnapshotId\": \"$SNAPSHOT_ID\", \"VolumeSize\": 10, \"VolumeType\": \"gp3\", \"DeleteOnTermination\": true}
+            }]" \
+            --virtualization-type hvm \
+            --boot-mode legacy-bios \
+            --ena-support \
+            --output text --query 'ImageId')
+
+          aws ec2 create-tags --resources "$AMI_ID" \
+            --tags "Key=Name,Value=$AMI_NAME" "Key=Project,Value=daimonos" \
+                   "Key=GitSHA,Value=${GITHUB_SHA}" "Key=GitRef,Value=${GITHUB_REF_NAME}"
+
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "ami_name=$AMI_NAME" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "=== AMI registered ==="
+          echo "AMI ID:   $AMI_ID"
+          echo "AMI Name: $AMI_NAME"
+
+  validate:
+    name: Validate on EC2
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: ${{ inputs.validate }}
+    timeout-minutes: 15
+    environment: aws-deploy
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/ci-test -N "" -q
+          KEY_NAME="daimonos-ci-$(date +%s)"
+          aws ec2 import-key-pair \
+            --key-name "$KEY_NAME" \
+            --public-key-material fileb://~/.ssh/ci-test.pub
+          echo "key_name=$KEY_NAME" >> "$GITHUB_ENV"
+
+      - name: Launch ephemeral instance
+        run: |
+          AMI_ID="${{ needs.deploy.outputs.ami_id }}"
+          SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=daimonos-sg" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "${{ inputs.instance_type }}" \
+            --key-name "$key_name" \
+            --security-group-ids "$SG" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=daimonos-ci-validate},{Key=CI,Value=true}]" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_ENV"
+
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "instance_ip=$IP" >> "$GITHUB_ENV"
+          echo "Instance $INSTANCE_ID at $IP"
+
+      - name: Wait for boot and run smoke test
+        run: |
+          echo "Waiting for SSH (first boot: resize + reboot)..."
+          for i in $(seq 1 30); do
+            nc -z -w 3 "$instance_ip" 22 2>/dev/null && break
+            sleep 10
+          done
+          sleep 10
+          ./distro/smoke-test.sh ssh "agent@$instance_ip" -i ~/.ssh/ci-test
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -n "${instance_id:-}" ] && \
+            aws ec2 terminate-instances --instance-ids "$instance_id" || true
+          [ -n "${key_name:-}" ] && \
+            aws ec2 delete-key-pair --key-name "$key_name" || true

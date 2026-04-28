@@ -5,7 +5,9 @@ mod ops;
 mod pipeline_cache;
 mod plugins;
 mod protocol;
+mod script;
 mod session;
+mod tools;
 mod snapshot;
 mod tool_runner;
 

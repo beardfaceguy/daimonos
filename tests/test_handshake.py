@@ -62,29 +62,27 @@ def test_initialize_instructions_contain_workspace_context(daimonos_binary, tmp_
         })
 
         instructions = resp["result"].get("instructions", "")
-        assert "Workspace:" in instructions
+        assert "daimonos" in instructions.lower()
         assert str(tmp_path) in instructions
-        assert "list_all_tools" in instructions
-        assert "IMPORTANT" in instructions
-        assert "read_file" in instructions
     finally:
         proc.terminate()
         proc.wait(timeout=5)
 
 
-def test_list_tools_returns_all_tools(daimonos):
-    """All tools are exposed from the start for Cursor compatibility."""
+def test_list_tools_returns_core_tools(daimonos):
+    """Core tools + git + snapshots are exposed by default."""
     tools = daimonos.list_tools()
     tool_names = {t["name"] for t in tools}
 
     core = {"read_file", "write_file", "edit_file", "search",
-            "workspace_info", "exec", "batch", "list_all_tools"}
-    extended = {"snapshot_create", "snapshot_restore", "snapshot_list",
-                "snapshot_delete", "diff_files", "git_status", "git_log",
-                "git_diff", "git_branch", "tool_pipeline", "tool_repair"}
+            "workspace_info", "exec", "batch", "list_all_tools",
+            "git", "snapshot", "set_cwd"}
 
     assert core.issubset(tool_names)
-    assert extended.issubset(tool_names)
+
+    hidden = {"diff_files", "tool_pipeline", "tool_repair", "ls"}
+    for name in hidden:
+        assert name not in tool_names, f"{name} should be hidden by default"
 
 
 def test_list_all_tools_returns_catalog(daimonos):
@@ -95,8 +93,8 @@ def test_list_all_tools_returns_catalog(daimonos):
     catalog = json.loads(result["content"][0]["text"])
     catalog_names = {t["name"] for t in catalog}
 
-    assert "git_status" in catalog_names
-    assert "snapshot_create" in catalog_names
+    assert "git" in catalog_names
+    assert "snapshot" in catalog_names
     assert "diff_files" in catalog_names
     assert "batch" in catalog_names
 

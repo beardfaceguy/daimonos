@@ -126,54 +126,29 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
     }
 }
 
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".daimonos",
+    "__pycache__",
+    ".next",
+    "dist",
+];
+
 pub async fn ls(session: &Session, op: &Op) -> Response {
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
         None => session.cwd.clone(),
     };
 
+    let show_all = op.g.as_deref() == Some("all");
+    let stat = op.g.as_deref() == Some("stat");
+    let depth = op.n.unwrap_or(1).clamp(1, 5) as usize;
+
     let mut entries = Vec::new();
-    let mut dir = match tokio::fs::read_dir(&path).await {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Response::err(1, &format!("not found: {}", path.display()))
-        }
-        Err(e) => return Response::err(4, &format!("ls: {e}")),
-    };
-
-    while let Ok(Some(entry)) = dir.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let ft = entry.file_type().await.ok();
-        let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
-        let is_dir = if is_symlink {
-            // DirEntry::metadata() doesn't follow symlinks; use fs::metadata to resolve target
-            tokio::fs::metadata(entry.path())
-                .await
-                .ok()
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-        } else {
-            ft.as_ref().map(|t| t.is_dir()).unwrap_or(false)
-        };
-        let size = if is_symlink {
-            tokio::fs::metadata(entry.path())
-                .await
-                .ok()
-                .map(|m| m.len())
-                .unwrap_or(0)
-        } else {
-            entry.metadata().await.ok().map(|m| m.len()).unwrap_or(0)
-        };
-
-        let mut e = json!({
-            "n": name,
-            "d": is_dir,
-            "s": size,
-        });
-        if is_symlink {
-            e["l"] = json!(true);
-        }
-        entries.push(e);
+    if let Err(e) = ls_recurse(&path, &path, depth, show_all, stat, &mut entries).await {
+        return Response::err(4, &format!("ls: {e}"));
     }
 
     entries.sort_by(|a, b| {
@@ -183,6 +158,87 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
     });
 
     Response::ok(json!({"entries": entries}))
+}
+
+async fn ls_recurse(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    depth: usize,
+    show_all: bool,
+    stat: bool,
+    entries: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut dir = tokio::fs::read_dir(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("not found: {}", path.display())
+        } else {
+            format!("{e}")
+        }
+    })?;
+
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !show_all && name.starts_with('.') {
+            continue;
+        }
+
+        let ft = entry.file_type().await.ok();
+        let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
+
+        let meta = if is_symlink {
+            tokio::fs::metadata(entry.path()).await.ok()
+        } else {
+            entry.metadata().await.ok()
+        };
+
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+        if is_dir && SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path().as_path())
+            .to_string_lossy()
+            .to_string();
+
+        let mut e = json!({
+            "n": rel,
+            "d": is_dir,
+            "s": size,
+        });
+
+        if is_symlink {
+            e["l"] = json!(true);
+        }
+
+        if stat {
+            if let Some(ref m) = meta {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = m.permissions().mode();
+                e["m"] = json!(format!("{:o}", mode & 0o7777));
+
+                if let Ok(mtime) = m.modified() {
+                    if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        e["t"] = json!(dur.as_secs());
+                    }
+                }
+            }
+        }
+
+        entries.push(e);
+
+        if is_dir && depth > 1 {
+            let _ =
+                Box::pin(ls_recurse(root, &entry.path(), depth - 1, show_all, stat, entries))
+                    .await;
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn stat(session: &Session, op: &Op) -> Response {
@@ -920,6 +976,180 @@ mod tests {
         let link_entry = entries.iter().find(|e| e["n"] == "dirlink").unwrap();
         assert_eq!(link_entry["l"], true);
         assert_eq!(link_entry["d"], true, "symlink to dir should have d=true");
+    }
+
+    #[tokio::test]
+    async fn ls_omits_mode_mtime_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let entry = entries.iter().find(|e| e["n"] == "f.txt").unwrap();
+        assert!(entry.get("m").is_none(), "should NOT have mode field by default");
+        assert!(entry.get("t").is_none(), "should NOT have mtime field by default");
+    }
+
+    #[tokio::test]
+    async fn ls_includes_mode_and_mtime_with_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                g: Some("stat".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let entry = entries.iter().find(|e| e["n"] == "f.txt").unwrap();
+        assert!(entry.get("m").is_some(), "should have mode field");
+        assert!(entry.get("t").is_some(), "should have mtime field");
+        let mode = entry["m"].as_str().unwrap();
+        assert!(!mode.is_empty());
+        let mtime = entry["t"].as_u64().unwrap();
+        assert!(mtime > 0);
+    }
+
+    #[tokio::test]
+    async fn ls_hides_dotfiles_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"visible.txt"));
+        assert!(!names.contains(&".hidden"));
+    }
+
+    #[tokio::test]
+    async fn ls_shows_dotfiles_with_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                g: Some("all".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"visible.txt"));
+        assert!(names.contains(&".hidden"));
+    }
+
+    #[tokio::test]
+    async fn ls_recursive_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/child.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/b/grandchild.txt"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n: Some(2),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"a/child.txt"));
+        assert!(names.contains(&"a/b"));
+        assert!(
+            !names.contains(&"a/b/grandchild.txt"),
+            "depth=2 should not reach grandchild"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_skips_git_and_target_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&"Cargo.toml"));
+        assert!(!names.contains(&"target"), "target should be skipped");
+        assert!(!names.contains(&"node_modules"), "node_modules should be skipped");
+        assert!(!names.contains(&".git"), ".git is hidden AND in skip list");
+    }
+
+    #[tokio::test]
+    async fn ls_recursive_depth3_reaches_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/grandchild.txt"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n: Some(3),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(
+            names.contains(&"a/b/grandchild.txt"),
+            "depth=3 should reach grandchild"
+        );
     }
 
     #[tokio::test]

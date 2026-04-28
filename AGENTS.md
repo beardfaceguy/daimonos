@@ -67,6 +67,12 @@ daimonos/
 │   ├── compare-models.py          # Cross-model comparison report
 │   ├── tasks/                     # Task definitions (JSON)
 │   └── workspace/                 # Target codebase (Rust inventory app)
+├── distro/
+│   ├── build-buildroot.sh         # Build script: Buildroot disk image (canonical)
+│   ├── test-qemu.sh               # Boot image in QEMU for local testing
+│   ├── deploy-aws.sh              # Deploy image to AWS (S3 + AMI)
+│   ├── br2-external/              # Buildroot external tree (defconfig, overlay, board)
+│   └── alpine-legacy/             # Deprecated Alpine build (reference only)
 ├── docs/
 │   └── protocol.md                # Opcode protocol specification
 ├── tests/
@@ -81,24 +87,26 @@ daimonos/
 │   ├── test_errors.py             # Missing args, unknown tools, invalid paths
 │   ├── test_symlinks.py           # Symlink and hard link handling across all file ops
 │   ├── test_diff.py               # diff_files tool
-│   ├── test_git.py                # git_status, git_log, git_diff, git_branch
-│   ├── test_snapshots.py          # snapshot_create, restore, list, delete
+│   ├── test_git.py                # unified git tool (status, log, diff, branch, add, commit, etc.)
+│   ├── test_snapshots.py          # unified snapshot tool (create, restore, list, delete)
 │   └── test_batch.py             # batch tool (multi-op single round-trip)
 └── src/
     ├── main.rs                    # Entrypoint: --mcp (stdio MCP) or Unix socket mode
     ├── mcp.rs                     # MCP server handler (stdio transport for Cursor)
     ├── config.rs                  # TOML config loading, tool registration
     ├── protocol.rs                # Request/Response types, opcode constants
-    ├── session.rs                 # Per-connection session state
+    ├── session.rs                 # Per-connection session state (exposed tools, used tools)
+    ├── tools.rs                   # ToolDef registry: single source of truth for all tool definitions
+    ├── script.rs                  # Starlark interpreter: execute_script tool, tool function bindings
     ├── snapshot.rs                # Workspace snapshot store (create, restore, list, delete)
     ├── index.rs                   # Background trigram workspace indexer
     ├── pipeline_cache.rs          # inotify-based tool output cache
     ├── tool_runner.rs             # ToolPlugin trait, registry, repair loop
     ├── ops/
     │   ├── mod.rs                 # Opcode dispatcher
-    │   ├── file_ops.rs            # Opcodes 0-6: read, write, patch, ls, stat, glob, grep
+    │   ├── file_ops.rs            # Opcodes 0-6: read, write, patch, ls (auto-skips .git/node_modules/target), stat, glob, grep
     │   ├── exec_ops.rs            # Opcodes 8-11: exec, bg, poll, kill
-    │   ├── git_ops.rs             # Opcode 14: diff (in-process structured diffing)
+    │   ├── diff_ops.rs            # Opcode 14: diff (in-process structured diffing)
     │   ├── snap_ops.rs            # Opcodes 12-13, 25-26: snap, restore, snap_list, snap_delete
     │   ├── tool_ops.rs            # Opcodes 20-24: tool_run, repair, pipeline, register, list
     │   └── schema.rs              # Opcode 255: self-describing schema registry
@@ -158,16 +166,23 @@ daimonos/
   `[N lines, M chars truncated]` notice in the middle.
 - **Lazy tool exposure**: only core tools (`read_file`, `write_file`,
   `edit_file`, `search`, `workspace_info`, `exec`, `batch`,
-  `list_all_tools`) appear in the initial `list_tools` response. Extended
-  tools (snapshots, git, diff, pipelines) are exposed after the model calls
-  `list_all_tools` or uses one directly. This reduces initial system prompt
-  token overhead. The set of exposed tools is tracked in
+  `list_all_tools`) plus commonly-used consolidated tools (`git`,
+  `snapshot`, `set_cwd`) appear in the initial `list_tools` response.
+  Extended tools (`ls`, `diff_files`, `tool_pipeline`, `tool_repair`) are
+  exposed after the model calls `list_all_tools` or uses one directly.
+  This reduces initial system prompt token overhead (11 tools default vs
+  18 total). The set of exposed tools is tracked in
   `session.exposed_tools`.
 - **Proactive workspace context**: the MCP `instructions` field is built
   dynamically at startup with workspace path, detected project type
   (Cargo.toml → Rust, package.json → Node.js, etc.), VCS info, and
   top-level directory listing — so the model has useful context without an
   extra tool call.
+- **Consolidated tools**: related operations are grouped into single MCP
+  tools with an action/command parameter to minimize schema overhead.
+  `git` has a `command` enum (status, log, diff, branch, add, commit,
+  push, pull, checkout). `snapshot` has an `action` enum (create, restore,
+  list, delete). This pattern reduces tool definitions from ~26 to ~18.
 - **Compact responses**: all MCP tool responses use compact JSON
   (`to_string`, not `to_string_pretty`). Redundant fields (`count` on
   arrays, `size` on writes) are omitted. Empty `err` fields in exec

@@ -13,7 +13,9 @@ pub struct GitPlugin {
 impl GitPlugin {
     pub fn new() -> Self {
         let mut commands = HashMap::new();
-        for name in ["status", "log", "diff", "branch"] {
+        for name in [
+            "status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout",
+        ] {
             commands.insert(
                 name.to_string(),
                 ToolCommand {
@@ -57,6 +59,11 @@ impl ToolPlugin for GitPlugin {
             "log" => git_log(cwd, args).await?,
             "diff" => git_diff(cwd, args).await?,
             "branch" => git_branch(cwd).await?,
+            "add" => git_add(cwd, args).await?,
+            "commit" => git_commit(cwd, args).await?,
+            "push" => git_push(cwd, args).await?,
+            "pull" => git_pull(cwd, args).await?,
+            "checkout" => git_checkout(cwd, args).await?,
             _ => return Err(format!("unknown git command: {command}")),
         };
 
@@ -123,14 +130,23 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
         && untracked.is_empty()
         && renamed.is_empty();
 
-    Ok(json!({
-        "clean": clean,
-        "modified": modified,
-        "added": added,
-        "deleted": deleted,
-        "untracked": untracked,
-        "renamed": renamed,
-    }))
+    let mut result = json!({"clean": clean});
+    if !modified.is_empty() {
+        result["modified"] = json!(modified);
+    }
+    if !added.is_empty() {
+        result["added"] = json!(added);
+    }
+    if !deleted.is_empty() {
+        result["deleted"] = json!(deleted);
+    }
+    if !untracked.is_empty() {
+        result["untracked"] = json!(untracked);
+    }
+    if !renamed.is_empty() {
+        result["renamed"] = json!(renamed);
+    }
+    Ok(result)
 }
 
 async fn git_log(
@@ -148,7 +164,7 @@ async fn git_log(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let format = "%H%x00%an%x00%ae%x00%s%x00%aI";
+    let format = "%h%x00%an%x00%s%x00%aI";
     let limit_str = format!("-{limit}");
     let format_str = format!("--format={format}");
     let mut git_args = vec!["log", &limit_str, &format_str];
@@ -165,14 +181,13 @@ async fn git_log(
     let commits: Vec<serde_json::Value> = out
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(5, '\0').collect();
-            if parts.len() == 5 {
+            let parts: Vec<&str> = line.splitn(4, '\0').collect();
+            if parts.len() == 4 {
                 Some(json!({
-                    "hash": parts[0],
-                    "author": parts[1],
-                    "email": parts[2],
-                    "msg": parts[3],
-                    "date": parts[4],
+                    "h": parts[0],
+                    "a": parts[1],
+                    "m": parts[2],
+                    "d": parts[3],
                 }))
             } else {
                 None
@@ -296,6 +311,243 @@ async fn git_branch(cwd: &Path) -> Result<serde_json::Value, String> {
         "current": current,
         "branches": branches,
         "count": branches.len(),
+    }))
+}
+
+async fn git_add(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let paths: Vec<String> = args
+        .and_then(|a| a.get("paths"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![".".to_string()]);
+
+    let mut git_args: Vec<&str> = vec!["add"];
+    for p in &paths {
+        git_args.push(p.as_str());
+    }
+
+    run_git(cwd, &git_args).await?;
+
+    let status = git_status(cwd).await?;
+    Ok(json!({
+        "added_paths": paths,
+        "status": status,
+    }))
+}
+
+async fn git_commit(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let message = args
+        .and_then(|a| a.get("message").or_else(|| a.get("m")))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "commit requires 'message' argument".to_string())?;
+
+    let mut git_args = vec!["commit", "-m", message];
+
+    if args
+        .and_then(|a| a.get("all"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        git_args.insert(1, "-a");
+    }
+
+    let output = Command::new("git")
+        .args(&git_args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .map_err(|e| format!("git exec: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!("git commit: {}", stderr.trim()));
+    }
+
+    let hash = run_git(cwd, &["rev-parse", "--short", "HEAD"])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    Ok(json!({
+        "hash": hash,
+        "message": message,
+        "output": stdout.trim(),
+    }))
+}
+
+async fn git_push(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let remote = args
+        .and_then(|a| a.get("remote"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("origin");
+
+    let branch = args.and_then(|a| a.get("branch")).and_then(|v| v.as_str());
+
+    let mut git_args = vec!["push", remote];
+
+    let branch_owned;
+    if let Some(b) = branch {
+        branch_owned = b.to_string();
+        git_args.push(&branch_owned);
+    }
+
+    if args
+        .and_then(|a| a.get("set_upstream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        git_args.insert(1, "-u");
+    }
+
+    let output = Command::new("git")
+        .args(&git_args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .map_err(|e| format!("git exec: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!("git push: {}", stderr.trim()));
+    }
+
+    Ok(json!({
+        "remote": remote,
+        "output": format!("{}{}", stdout.trim(), stderr.trim()),
+    }))
+}
+
+async fn git_pull(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let remote = args
+        .and_then(|a| a.get("remote"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("origin");
+
+    let branch = args.and_then(|a| a.get("branch")).and_then(|v| v.as_str());
+
+    let mut git_args = vec!["pull", remote];
+
+    let branch_owned;
+    if let Some(b) = branch {
+        branch_owned = b.to_string();
+        git_args.push(&branch_owned);
+    }
+
+    if args
+        .and_then(|a| a.get("rebase"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        git_args.insert(1, "--rebase");
+    }
+
+    let output = Command::new("git")
+        .args(&git_args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .map_err(|e| format!("git exec: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!("git pull: {}", stderr.trim()));
+    }
+
+    Ok(json!({
+        "remote": remote,
+        "output": stdout.trim(),
+        "stderr": stderr.trim(),
+    }))
+}
+
+async fn git_checkout(
+    cwd: &Path,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let target = args
+        .and_then(|a| a.get("branch").or_else(|| a.get("ref")))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "checkout requires 'branch' argument".to_string())?;
+
+    let create = args
+        .and_then(|a| a.get("create"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut git_args = if create {
+        vec!["checkout", "-b", target]
+    } else {
+        vec!["checkout", target]
+    };
+
+    // Allow checking out specific files
+    let files: Option<Vec<String>> = args
+        .and_then(|a| a.get("files"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+    let file_refs: Vec<&str>;
+    if let Some(ref f) = files {
+        git_args.push("--");
+        file_refs = f.iter().map(|s| s.as_str()).collect();
+        for fr in &file_refs {
+            git_args.push(fr);
+        }
+    }
+
+    let output = Command::new("git")
+        .args(&git_args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .map_err(|e| format!("git exec: {e}"))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!("git checkout: {}", stderr.trim()));
+    }
+
+    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    Ok(json!({
+        "branch": current,
+        "created": create,
     }))
 }
 
@@ -498,6 +750,288 @@ mod tests {
         let env = HashMap::new();
         let result = plugin
             .run_command("status", dir.path(), &env, None, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_add_stages_files() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "world").unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"paths": ["a.txt"]});
+        let result = plugin
+            .run_command("add", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+
+        let status = &result.output["status"];
+        assert!(status["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap() == "a.txt"));
+        assert!(status["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap() == "b.txt"));
+    }
+
+    #[tokio::test]
+    async fn plugin_add_defaults_to_all() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let result = plugin
+            .run_command("add", dir.path(), &env, None, None)
+            .await
+            .unwrap();
+
+        let status = &result.output["status"];
+        assert!(
+            status.get("untracked").is_none(),
+            "untracked should be omitted when empty"
+        );
+        assert!(status["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap() == "a.txt"));
+    }
+
+    #[tokio::test]
+    async fn plugin_commit_creates_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"message": "test commit"});
+        let result = plugin
+            .run_command("commit", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+
+        assert!(!result.output["hash"].as_str().unwrap().is_empty());
+        assert_eq!(result.output["message"], "test commit");
+    }
+
+    #[tokio::test]
+    async fn plugin_log_uses_short_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let result = plugin
+            .run_command("log", dir.path(), &env, None, None)
+            .await
+            .unwrap();
+
+        let commits = result.output["commits"].as_array().unwrap();
+        assert!(!commits.is_empty());
+        let hash = commits[0]["h"].as_str().unwrap();
+        assert!(hash.len() <= 12, "should be a short hash, got: {hash}");
+        assert!(commits[0].get("a").is_some(), "should have author field 'a'");
+        assert!(commits[0].get("m").is_some(), "should have message field 'm'");
+        assert!(commits[0].get("d").is_some(), "should have date field 'd'");
+    }
+
+    #[tokio::test]
+    async fn plugin_status_clean_omits_empty_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let result = plugin
+            .run_command("status", dir.path(), &env, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.output["clean"], true);
+        assert!(
+            result.output.get("modified").is_none(),
+            "empty arrays should be omitted"
+        );
+        assert!(
+            result.output.get("added").is_none(),
+            "empty arrays should be omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_commit_requires_message() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let result = plugin
+            .run_command("commit", dir.path(), &env, None, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_commit_all_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(dir.path().join("f.txt"), "v2").unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"message": "auto-stage", "all": true});
+        let result = plugin
+            .run_command("commit", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+
+        assert!(!result.output["hash"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_checkout_creates_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"branch": "feature-x", "create": true});
+        let result = plugin
+            .run_command("checkout", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["branch"], "feature-x");
+        assert_eq!(result.output["created"], true);
+    }
+
+    #[tokio::test]
+    async fn plugin_checkout_switches_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "-b", "other"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"branch": "other"});
+        let result = plugin
+            .run_command("checkout", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["branch"], "other");
+        assert_eq!(result.output["created"], false);
+    }
+
+    #[tokio::test]
+    async fn plugin_checkout_requires_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let result = plugin
+            .run_command("checkout", dir.path(), &env, None, None)
             .await;
         assert!(result.is_err());
     }

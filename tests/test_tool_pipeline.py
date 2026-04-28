@@ -13,10 +13,10 @@ import pytest
 class TestToolPipeline:
     """Tests for the tool_pipeline MCP tool."""
 
-    def test_tool_pipeline_visible_in_list(self, daimonos):
+    def test_tool_pipeline_hidden_by_default(self, daimonos):
         tools = daimonos.list_tools()
         names = [t["name"] for t in tools]
-        assert "tool_pipeline" in names
+        assert "tool_pipeline" not in names, "tool_pipeline is behind list_all_tools"
 
     def test_tool_pipeline_missing_tool_id(self, daimonos):
         result = daimonos.call_tool("tool_pipeline", {
@@ -52,10 +52,10 @@ class TestToolPipeline:
 class TestToolRepair:
     """Tests for the tool_repair MCP tool."""
 
-    def test_tool_repair_visible_in_list(self, daimonos):
+    def test_tool_repair_hidden_by_default(self, daimonos):
         tools = daimonos.list_tools()
         names = [t["name"] for t in tools]
-        assert "tool_repair" in names
+        assert "tool_repair" not in names, "tool_repair is behind list_all_tools"
 
     def test_tool_repair_missing_tool_id(self, daimonos):
         result = daimonos.call_tool("tool_repair", {})

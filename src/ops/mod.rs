@@ -1,6 +1,6 @@
 mod exec_ops;
 mod file_ops;
-mod git_ops;
+mod diff_ops;
 mod schema;
 mod snap_ops;
 mod tool_ops;
@@ -46,7 +46,7 @@ async fn dispatch_op(session: &mut Session, op: Op) -> Response {
         protocol::op::KILL => exec_ops::kill(session, &op).await,
         protocol::op::SNAP => snap_ops::snap(session, &op).await,
         protocol::op::RESTORE => snap_ops::restore(session, &op).await,
-        protocol::op::DIFF => git_ops::diff(session, &op).await,
+        protocol::op::DIFF => diff_ops::diff(session, &op).await,
         protocol::op::FIND => find(session, &op).await,
         protocol::op::TOOL_RUN => tool_ops::tool_run(session, &op).await,
         protocol::op::TOOL_REPAIR => tool_ops::tool_repair(session, &op).await,

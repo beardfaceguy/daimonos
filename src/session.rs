@@ -3,6 +3,7 @@ use crate::index::WorkspaceIndex;
 use crate::pipeline_cache::PipelineCache;
 use crate::snapshot::SnapshotStore;
 use crate::tool_runner::ToolRegistry;
+use crate::tools;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,19 +15,6 @@ pub struct ReadCacheEntry {
     #[allow(dead_code)] // exposed for diagnostics and future compact re-read responses
     pub lines: usize,
 }
-
-/// Tools visible by default. Extended tools (snapshots, git, diff, pipelines)
-/// appear after the model calls `list_all_tools` or uses one directly.
-pub const CORE_TOOLS: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "search",
-    "workspace_info",
-    "exec",
-    "batch",
-    "list_all_tools",
-];
 
 /// Per-connection session state.
 /// Persists working directory, env vars, and background processes across calls.
@@ -46,6 +34,9 @@ pub struct Session {
     /// Tools currently exposed in list_tools. Core tools are always present;
     /// extended tools are added on first use or via `list_all_tools`.
     pub exposed_tools: HashSet<String>,
+    /// Tools the model has already called this session. Used to strip schemas
+    /// from list_tools responses — the model already has them in context.
+    pub used_tools: HashSet<String>,
     next_pid: u32,
 }
 
@@ -71,27 +62,8 @@ impl Session {
             cfg,
             exec_usage: HashMap::new(),
             read_cache: HashMap::new(),
-            exposed_tools: {
-                let mut tools: HashSet<String> = CORE_TOOLS.iter().map(|s| s.to_string()).collect();
-                // Expose all tools by default for Cursor compatibility.
-                // Cursor caches list_tools and won't re-query after activation.
-                for name in &[
-                    "snapshot_create",
-                    "snapshot_restore",
-                    "snapshot_list",
-                    "snapshot_delete",
-                    "diff_files",
-                    "tool_pipeline",
-                    "tool_repair",
-                    "git_status",
-                    "git_log",
-                    "git_diff",
-                    "git_branch",
-                ] {
-                    tools.insert(name.to_string());
-                }
-                tools
-            },
+            exposed_tools: tools::initial_exposed_tools(),
+            used_tools: HashSet::new(),
             next_pid: 1,
         }
     }
@@ -199,21 +171,9 @@ impl Session {
         self.exposed_tools.insert(name.to_string());
     }
 
-    /// Expose all known tools at once.
+    /// Expose all known tools at once (including on-demand tier 2 tools).
     pub fn activate_all_tools(&mut self) {
-        for name in &[
-            "tool_pipeline",
-            "tool_repair",
-            "diff_files",
-            "snapshot_create",
-            "snapshot_restore",
-            "snapshot_list",
-            "snapshot_delete",
-            "git_status",
-            "git_log",
-            "git_diff",
-            "git_branch",
-        ] {
+        for name in tools::on_demand_names() {
             self.exposed_tools.insert(name.to_string());
         }
     }
@@ -335,16 +295,30 @@ mod tests {
     }
 
     #[test]
-    fn exposed_tools_includes_all_tools() {
+    fn exposed_tools_includes_tier0_and_tier1() {
         let s = test_session("/workspace");
-        assert!(s.exposed_tools.contains("read_file"));
-        assert!(s.exposed_tools.contains("write_file"));
-        assert!(s.exposed_tools.contains("exec"));
-        assert!(s.exposed_tools.contains("batch"));
-        assert!(s.exposed_tools.contains("list_all_tools"));
-        assert!(s.exposed_tools.contains("git_status"));
-        assert!(s.exposed_tools.contains("snapshot_create"));
-        assert!(s.exposed_tools.contains("diff_files"));
+        let expected = tools::initial_exposed_tools();
+        for name in &expected {
+            assert!(s.exposed_tools.contains(name), "tool {name} should be exposed");
+        }
+    }
+
+    #[test]
+    fn on_demand_tools_hidden_by_default() {
+        let s = test_session("/workspace");
+        for name in tools::on_demand_names() {
+            assert!(!s.exposed_tools.contains(name), "on-demand tool {name} should be hidden until activated");
+        }
+    }
+
+    #[test]
+    fn has_full_schema_delegates_to_tools() {
+        assert!(tools::has_full_schema("read_file"));
+        assert!(tools::has_full_schema("exec"));
+        assert!(tools::has_full_schema("get_tool_schema"));
+        assert!(!tools::has_full_schema("git"));
+        assert!(!tools::has_full_schema("snapshot"));
+        assert!(!tools::has_full_schema("ls"));
     }
 
     #[test]
@@ -356,13 +330,13 @@ mod tests {
     }
 
     #[test]
-    fn activate_all_tools_is_idempotent() {
+    fn activate_all_tools_adds_on_demand() {
         let mut s = test_session("/workspace");
         let before = s.exposed_tools.len();
         s.activate_all_tools();
-        assert!(s.exposed_tools.contains("snapshot_create"));
-        assert!(s.exposed_tools.contains("git_status"));
-        assert!(s.exposed_tools.contains("tool_pipeline"));
-        assert_eq!(s.exposed_tools.len(), before);
+        for name in tools::on_demand_names() {
+            assert!(s.exposed_tools.contains(name), "activate_all should add {name}");
+        }
+        assert!(s.exposed_tools.len() > before);
     }
 }

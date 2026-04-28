@@ -1,0 +1,128 @@
+name: Distro Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "distro/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+env:
+  CARGO_TERM_COLOR: always
+  BR_VERSION: "2025.02.3"
+
+jobs:
+  build-image:
+    name: Build Buildroot image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            musl-tools build-essential gcc g++ \
+            bc cpio file rsync unzip wget \
+            python3 python3-setuptools \
+            libncurses-dev libssl-dev
+
+      - name: Build musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Cache Buildroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            distro/buildroot/dl
+            distro/buildroot/output/host
+            distro/buildroot/output/build
+          key: buildroot-${{ env.BR_VERSION }}-${{ hashFiles('distro/br2-external/configs/daimonos_defconfig', 'distro/br2-external/board/daimonos/linux.config') }}
+          restore-keys: |
+            buildroot-${{ env.BR_VERSION }}-
+
+      - name: Clone Buildroot
+        run: |
+          if [ ! -d distro/buildroot/.git ]; then
+            git clone --depth 1 --branch "$BR_VERSION" \
+              https://github.com/buildroot/buildroot.git distro/buildroot
+          fi
+
+      - name: Build disk images
+        run: ./distro/build-buildroot.sh
+        timeout-minutes: 45
+
+      - name: Verify kernel config
+        run: |
+          cd distro/br2-external/board/daimonos
+          for opt in BLK_DEV_NVME ENA_ETHERNET PCI_MSI ACPI VGA_CONSOLE \
+                     SERIAL_8250 SERIAL_8250_CONSOLE DEVTMPFS EXT4_FS MAGIC_SYSRQ; do
+            if grep -q "CONFIG_${opt}=y" linux.config; then
+              echo "OK: CONFIG_${opt}"
+            else
+              echo "MISSING: CONFIG_${opt}" && exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disk-images
+          path: |
+            distro/buildroot/output/images/disk-qemu.img
+            distro/buildroot/output/images/disk-aws.img
+          retention-days: 14
+
+  smoke-test-qemu:
+    name: QEMU smoke test
+    runs-on: ubuntu-latest
+    needs: [build-image]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: disk-images
+          path: distro/buildroot/output/images/
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Generate SSH key for test
+        run: ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+
+      - name: Boot QEMU and run smoke test
+        run: |
+          cp distro/buildroot/output/images/disk-qemu.img /tmp/test-disk.img
+
+          qemu-system-x86_64 \
+            -m 512M \
+            -nographic \
+            -drive file=/tmp/test-disk.img,format=raw,if=virtio \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial mon:stdio &
+          QEMU_PID=$!
+
+          echo "Waiting for QEMU to boot..."
+          for i in $(seq 1 60); do
+            if nc -z localhost 2222 2>/dev/null; then
+              echo "SSH port open after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          sleep 5
+          ./distro/smoke-test.sh qemu 2222 || { kill $QEMU_PID 2>/dev/null; exit 1; }
+          kill $QEMU_PID 2>/dev/null || true

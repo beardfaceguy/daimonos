@@ -1,0 +1,1 @@
+agent -1 agent -1 =- /home/agent /usr/bin/daimonos-shell - Agent user

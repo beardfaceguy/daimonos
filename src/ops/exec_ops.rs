@@ -4,6 +4,20 @@ use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
 
+/// When args is empty and command contains whitespace, shell-wrap via `sh -c`
+/// so models can send `command: "cargo test"` without splitting into args.
+fn build_command(cmd: &str, args: &[String]) -> Command {
+    if args.is_empty() && cmd.contains(' ') {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    } else {
+        let mut c = Command::new(cmd);
+        c.args(args);
+        c
+    }
+}
+
 /// Truncate output that exceeds `max_chars` by keeping first and last lines
 /// with a truncation notice in the middle.
 fn cap_output(text: &str, max_chars: usize) -> String {
@@ -56,9 +70,8 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         None => session.cwd.clone(),
     };
 
-    let mut command = Command::new(&cmd);
+    let mut command = build_command(&cmd, &args);
     command
-        .args(&args)
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -120,9 +133,8 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
         Err(e) => return Response::err(4, &format!("clone log: {e}")),
     };
 
-    let mut command = Command::new(&cmd);
+    let mut command = build_command(&cmd, &args);
     command
-        .args(&args)
         .current_dir(&cwd)
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
@@ -396,6 +408,67 @@ mod tests {
         assert!(capped.contains("line 0"));
         assert!(capped.contains("line 99"));
         assert!(capped.len() < text.len());
+    }
+
+    #[tokio::test]
+    async fn exec_unsplit_command_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo hello world".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["out"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn exec_unsplit_with_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo foo | tr f F".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["out"], "Foo");
+    }
+
+    #[tokio::test]
+    async fn exec_explicit_args_not_shell_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo".into()),
+                a: Some(vec!["hello".into(), "world".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["out"], "hello world");
     }
 
     #[tokio::test]
