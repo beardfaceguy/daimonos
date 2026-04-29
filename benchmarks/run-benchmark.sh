@@ -1,5 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# Runs benchmark tasks using the Claude CLI.
+# POSIX sh compatible (works with BusyBox ash).
+set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/workspace"
@@ -10,12 +12,10 @@ MODEL="${BENCH_MODEL:-opus}"
 DAIMONOS_BIN="${DAIMONOS_BIN:-$SCRIPT_DIR/../target/release/daimonos}"
 MCP_CONFIG="$WORKSPACE/.cursor/mcp.json"
 
-# Source API key if not already set
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   API_KEY_FILE="$SCRIPT_DIR/../claude_api_key.env"
-  if [[ -f "$API_KEY_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$API_KEY_FILE"
+  if [ -f "$API_KEY_FILE" ]; then
+    . "$API_KEY_FILE"
     export ANTHROPIC_API_KEY
   else
     echo "Error: ANTHROPIC_API_KEY not set and $API_KEY_FILE not found"
@@ -23,11 +23,11 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
   fi
 fi
 
-MODE="${1:-}" # "baseline" or "daimonos"
-TASK_FILTER="${2:-}" # optional: task id prefix to run a single task
-RUN_TAG="${BENCH_TAG:-}" # optional tag for naming runs (e.g. model name)
+MODE="${1:-}"
+TASK_FILTER="${2:-}"
+RUN_TAG="${BENCH_TAG:-}"
 
-if [[ -z "$MODE" ]]; then
+if [ -z "$MODE" ]; then
   echo "Usage: $0 <baseline|daimonos> [task-id]"
   echo ""
   echo "Environment variables:"
@@ -37,12 +37,12 @@ if [[ -z "$MODE" ]]; then
   exit 1
 fi
 
-if [[ "$MODE" != "baseline" && "$MODE" != "daimonos" ]]; then
+if [ "$MODE" != "baseline" ] && [ "$MODE" != "daimonos" ]; then
   echo "Error: mode must be 'baseline' or 'daimonos'"
   exit 1
 fi
 
-if [[ -n "$RUN_TAG" ]]; then
+if [ -n "$RUN_TAG" ]; then
   RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}-${RUN_TAG}"
 else
   RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}"
@@ -57,6 +57,15 @@ echo "Run ID:    $RUN_ID"
 echo "Workspace: $WORKSPACE"
 echo ""
 
+# Use node for JSON parsing (available on both Ubuntu and daimonos)
+json_field() {
+  node -e "var d=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));console.log(d[process.argv[2]]||'')" "$1" "$2"
+}
+
+json_array_join() {
+  node -e "var d=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));console.log((d[process.argv[2]]||[]).join(','))" "$1" "$2"
+}
+
 reset_workspace() {
   cd "$WORKSPACE"
   git checkout -- . 2>/dev/null || true
@@ -64,130 +73,126 @@ reset_workspace() {
 }
 
 run_task() {
-  local task_file="$1"
-  local task_id
-  task_id="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$task_file")"
-  local task_name
-  task_name="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "$task_file")"
-  local applies_to
-  applies_to="$(python3 -c "import json,sys; print(','.join(json.load(open(sys.argv[1]))['applies_to']))" "$task_file")"
+  task_file="$1"
+  task_id="$(json_field "$task_file" id)"
+  task_name="$(json_field "$task_file" name)"
+  applies_to="$(json_array_join "$task_file" applies_to)"
+  prompt="$(json_field "$task_file" prompt)"
 
-  if [[ -n "$TASK_FILTER" && "$task_id" != "$TASK_FILTER"* ]]; then
-    return 0
+  if [ -n "$TASK_FILTER" ]; then
+    case "$task_id" in
+      "$TASK_FILTER"*) ;;
+      *) return 0 ;;
+    esac
   fi
 
-  local check_mode="$MODE"
-  [[ "$check_mode" == "baseline" ]] && check_mode="cursor"
-  if [[ "$applies_to" != *"$check_mode"* ]]; then
-    echo "  SKIP $task_id ($task_name) — not applicable to $MODE"
-    return 0
-  fi
-
-  local prompt
-  prompt="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['prompt'])" "$task_file")"
+  check_mode="$MODE"
+  [ "$check_mode" = "baseline" ] && check_mode="cursor"
+  case "$applies_to" in
+    *"$check_mode"*) ;;
+    *)
+      echo "  SKIP $task_id ($task_name) — not applicable to $MODE"
+      return 0
+      ;;
+  esac
 
   echo "  RUN  $task_id: $task_name"
   reset_workspace
 
-  local out_file="$RUN_DIR/${task_id}.json"
+  out_file="$RUN_DIR/${task_id}.json"
+  raw_file="$RUN_DIR/${task_id}.raw.jsonl"
 
-  local claude_args=(-p --output-format stream-json --verbose --model "$MODEL"
-    --dangerously-skip-permissions --no-session-persistence --bare)
+  # Build claude CLI arguments (POSIX-compatible, no bash arrays)
+  CLAUDE_ARGS="-p --output-format stream-json --verbose --model $MODEL"
+  CLAUDE_ARGS="$CLAUDE_ARGS --dangerously-skip-permissions --no-session-persistence --bare"
 
-  if [[ "$MODE" == "daimonos" ]]; then
-    claude_args+=(--mcp-config "$MCP_CONFIG" --strict-mcp-config)
-    claude_args+=(--append-system-prompt "Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks.")
+  if [ "$MODE" = "daimonos" ]; then
+    CLAUDE_ARGS="$CLAUDE_ARGS --mcp-config $MCP_CONFIG --strict-mcp-config"
+    CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks. Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
   fi
 
-  local start_ns
-  start_ns="$(date +%s%N)"
+  start_s="$(date +%s)"
 
   cd "$WORKSPACE"
-  printf '%s' "$prompt" | "$CLAUDE" "${claude_args[@]}" > "$RUN_DIR/${task_id}.raw.jsonl" 2>/dev/null || true
+  # shellcheck disable=SC2086
+  printf '%s' "$prompt" | eval "\"$CLAUDE\" $CLAUDE_ARGS" > "$raw_file" 2>/dev/null || true
 
-  local end_ns
-  end_ns="$(date +%s%N)"
-  local wall_ms=$(( (end_ns - start_ns) / 1000000 ))
+  end_s="$(date +%s)"
+  wall_ms=$(( (end_s - start_s) * 1000 ))
 
-  python3 -c "
-import json, sys
+  # Parse results using node
+  node -e "
+var fs = require('fs');
+var rawFile = process.argv[1];
+var outFile = process.argv[2];
+var taskId = process.argv[3];
+var taskName = process.argv[4];
+var mode = process.argv[5];
+var wallMs = parseInt(process.argv[6]);
 
-raw_file = sys.argv[1]
-out_file = sys.argv[2]
-task_id = sys.argv[3]
-task_name = sys.argv[4]
-mode = sys.argv[5]
-wall_ms = int(sys.argv[6])
-
-events = []
-with open(raw_file) as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-result_event = None
-for e in events:
-    if e.get('type') == 'result':
-        result_event = e
-        break
-
-usage = result_event.get('usage', {}) if result_event else {}
-duration_ms = result_event.get('duration_ms', 0) if result_event else 0
-duration_api_ms = result_event.get('duration_api_ms', 0) if result_event else 0
-cost_usd = result_event.get('total_cost_usd', 0) if result_event else 0
-num_turns = result_event.get('num_turns', 0) if result_event else 0
-is_error = result_event.get('is_error', True) if result_event else True
-
-# Count tool calls: each assistant message content block with type 'tool_use'
-tool_calls = 0
-mcp_tool_calls = 0
-builtin_tool_calls = 0
-
-for e in events:
-    if e.get('type') == 'assistant':
-        msg = e.get('message', {})
-        content = msg.get('content', [])
-        if isinstance(content, list):
-            for block in content:
-                if block.get('type') == 'tool_use':
-                    tool_calls += 1
-                    tool_name = block.get('name', '')
-                    if tool_name.startswith('mcp__daimonos__'):
-                        mcp_tool_calls += 1
-                    else:
-                        builtin_tool_calls += 1
-
-summary = {
-    'task_id': task_id,
-    'task_name': task_name,
-    'mode': mode,
-    'wall_ms': wall_ms,
-    'duration_ms': duration_ms,
-    'duration_api_ms': duration_api_ms,
-    'cost_usd': cost_usd,
-    'num_turns': num_turns,
-    'input_tokens': usage.get('input_tokens', 0),
-    'output_tokens': usage.get('output_tokens', 0),
-    'cache_read_tokens': usage.get('cache_read_input_tokens', 0),
-    'cache_write_tokens': usage.get('cache_creation_input_tokens', 0),
-    'total_tokens': usage.get('input_tokens', 0) + usage.get('output_tokens', 0),
-    'tool_calls': tool_calls,
-    'mcp_tool_calls': mcp_tool_calls,
-    'builtin_tool_calls': builtin_tool_calls,
-    'is_error': is_error,
-    'success': not is_error,
+var events = [];
+var lines = fs.readFileSync(rawFile, 'utf8').split('\\n');
+for (var i = 0; i < lines.length; i++) {
+  var line = lines[i].trim();
+  if (line) {
+    try { events.push(JSON.parse(line)); } catch(e) {}
+  }
 }
 
-with open(out_file, 'w') as f:
-    json.dump(summary, f, indent=2)
+var resultEvent = null;
+for (var i = 0; i < events.length; i++) {
+  if (events[i].type === 'result') { resultEvent = events[i]; break; }
+}
 
-tc_detail = f'mcp:{mcp_tool_calls} builtin:{builtin_tool_calls}' if mode == 'daimonos' else f'{tool_calls}'
-print(f'       tokens: {summary[\"total_tokens\"]:,} (in:{summary[\"input_tokens\"]:,} out:{summary[\"output_tokens\"]:,}) | tools: {tc_detail} | cost: \${cost_usd:.4f} | wall: {wall_ms:,}ms')
-" "$RUN_DIR/${task_id}.raw.jsonl" "$out_file" "$task_id" "$task_name" "$MODE" "$wall_ms"
+var usage = resultEvent ? (resultEvent.usage || {}) : {};
+var durationMs = resultEvent ? (resultEvent.duration_ms || 0) : 0;
+var durationApiMs = resultEvent ? (resultEvent.duration_api_ms || 0) : 0;
+var costUsd = resultEvent ? (resultEvent.total_cost_usd || 0) : 0;
+var numTurns = resultEvent ? (resultEvent.num_turns || 0) : 0;
+var isError = resultEvent ? (resultEvent.is_error !== undefined ? resultEvent.is_error : true) : true;
+
+var toolCalls = 0, mcpToolCalls = 0, builtinToolCalls = 0;
+for (var i = 0; i < events.length; i++) {
+  if (events[i].type === 'assistant') {
+    var content = (events[i].message || {}).content || [];
+    if (Array.isArray(content)) {
+      for (var j = 0; j < content.length; j++) {
+        if (content[j].type === 'tool_use') {
+          toolCalls++;
+          if ((content[j].name || '').indexOf('mcp__daimonos__') === 0) mcpToolCalls++;
+          else builtinToolCalls++;
+        }
+      }
+    }
+  }
+}
+
+var inputTokens = usage.input_tokens || 0;
+var outputTokens = usage.output_tokens || 0;
+
+var summary = {
+  task_id: taskId, task_name: taskName, mode: mode,
+  wall_ms: wallMs, duration_ms: durationMs, duration_api_ms: durationApiMs,
+  cost_usd: costUsd, num_turns: numTurns,
+  input_tokens: inputTokens, output_tokens: outputTokens,
+  cache_read_tokens: usage.cache_read_input_tokens || 0,
+  cache_write_tokens: usage.cache_creation_input_tokens || 0,
+  total_tokens: inputTokens + outputTokens,
+  tool_calls: toolCalls, mcp_tool_calls: mcpToolCalls,
+  builtin_tool_calls: builtinToolCalls,
+  is_error: isError, success: !isError
+};
+
+fs.writeFileSync(outFile, JSON.stringify(summary, null, 2));
+
+var tcDetail = mode === 'daimonos'
+  ? 'mcp:' + mcpToolCalls + ' builtin:' + builtinToolCalls
+  : '' + toolCalls;
+console.log('       tokens: ' + summary.total_tokens.toLocaleString() +
+  ' (in:' + inputTokens.toLocaleString() + ' out:' + outputTokens.toLocaleString() +
+  ') | tools: ' + tcDetail + ' | cost: \$' + costUsd.toFixed(4) +
+  ' | wall: ' + wallMs.toLocaleString() + 'ms');
+" "$raw_file" "$out_file" "$task_id" "$task_name" "$MODE" "$wall_ms"
 }
 
 for task_file in "$TASKS_DIR"/*.json; do

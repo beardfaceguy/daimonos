@@ -76,11 +76,11 @@ def test_list_tools_returns_core_tools(daimonos):
 
     core = {"read_file", "write_file", "edit_file", "search",
             "workspace_info", "exec", "batch", "list_all_tools",
-            "git", "snapshot", "set_cwd"}
+            "snapshot", "set_cwd"}
 
     assert core.issubset(tool_names)
 
-    hidden = {"diff_files", "tool_pipeline", "tool_repair", "ls"}
+    hidden = {"diff_files", "tool_pipeline", "tool_repair"}
     for name in hidden:
         assert name not in tool_names, f"{name} should be hidden by default"
 

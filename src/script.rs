@@ -380,19 +380,139 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 
     fn git<'v>(
         command: &str,
+        #[starlark(require = named)] limit: Option<i64>,
+        #[starlark(require = named)] oneline: Option<bool>,
+        #[starlark(require = named)] path: Option<&str>,
+        #[starlark(require = named)] message: Option<&str>,
+        #[starlark(require = named)] all: Option<bool>,
+        #[starlark(require = named)] branch: Option<&str>,
+        #[starlark(require = named)] create: Option<bool>,
+        #[starlark(require = named)] mode: Option<&str>,
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         with_ctx(|ctx| {
             let session = ctx.session.clone();
             let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = limit { args_val["limit"] = serde_json::json!(v); }
+            if let Some(v) = oneline { args_val["oneline"] = serde_json::json!(v); }
+            if let Some(v) = path { args_val["path"] = serde_json::json!(v); }
+            if let Some(v) = message { args_val["message"] = serde_json::json!(v); }
+            if let Some(v) = all { args_val["all"] = serde_json::json!(v); }
+            if let Some(v) = branch { args_val["branch"] = serde_json::json!(v); }
+            if let Some(v) = create { args_val["create"] = serde_json::json!(v); }
+            if let Some(v) = mode { args_val["mode"] = serde_json::json!(v); }
             let resp = ctx.handle.block_on(async {
                 let s = session.lock().await;
                 let registry = s.tool_registry.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("git plugin not available"))?;
                 let cwd = s.cwd.clone();
                 let env = s.env.clone();
-                let args_val = serde_json::json!({"command": cmd});
                 registry.run("git", &cmd, &cwd, &env, None, Some(&args_val)).await
+                    .map(|r| Response::ok(r.output))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
+    fn gh<'v>(
+        command: &str,
+        #[starlark(require = named)] number: Option<i64>,
+        #[starlark(require = named)] state: Option<&str>,
+        #[starlark(require = named)] limit: Option<i64>,
+        #[starlark(require = named)] author: Option<&str>,
+        #[starlark(require = named)] title: Option<&str>,
+        #[starlark(require = named)] body: Option<&str>,
+        #[starlark(require = named)] base: Option<&str>,
+        #[starlark(require = named)] draft: Option<bool>,
+        #[starlark(require = named)] endpoint: Option<&str>,
+        #[starlark(require = named)] method: Option<&str>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let session = ctx.session.clone();
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = number { args_val["number"] = serde_json::json!(v); }
+            if let Some(v) = state { args_val["state"] = serde_json::json!(v); }
+            if let Some(v) = limit { args_val["limit"] = serde_json::json!(v); }
+            if let Some(v) = author { args_val["author"] = serde_json::json!(v); }
+            if let Some(v) = title { args_val["title"] = serde_json::json!(v); }
+            if let Some(v) = body { args_val["body"] = serde_json::json!(v); }
+            if let Some(v) = base { args_val["base"] = serde_json::json!(v); }
+            if let Some(v) = draft { args_val["draft"] = serde_json::json!(v); }
+            if let Some(v) = endpoint { args_val["endpoint"] = serde_json::json!(v); }
+            if let Some(v) = method { args_val["method"] = serde_json::json!(v); }
+            let resp = ctx.handle.block_on(async {
+                let s = session.lock().await;
+                let registry = s.tool_registry.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("gh plugin not available"))?;
+                let cwd = s.cwd.clone();
+                let env = s.env.clone();
+                registry.run("gh", &cmd, &cwd, &env, None, Some(&args_val)).await
+                    .map(|r| Response::ok(r.output))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
+    fn cargo<'v>(
+        command: &str,
+        #[starlark(require = named)] package: Option<&str>,
+        #[starlark(require = named)] filter: Option<&str>,
+        #[starlark(require = named)] lib: Option<bool>,
+        #[starlark(require = named)] release: Option<bool>,
+        #[starlark(require = named)] dev: Option<bool>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let session = ctx.session.clone();
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = package { args_val["package"] = serde_json::json!(v); }
+            if let Some(v) = filter { args_val["filter"] = serde_json::json!(v); }
+            if let Some(v) = lib { args_val["lib"] = serde_json::json!(v); }
+            if let Some(v) = release { args_val["release"] = serde_json::json!(v); }
+            if let Some(v) = dev { args_val["dev"] = serde_json::json!(v); }
+            let resp = ctx.handle.block_on(async {
+                let s = session.lock().await;
+                let registry = s.tool_registry.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("cargo plugin not available"))?;
+                let cwd = s.cwd.clone();
+                let env = s.env.clone();
+                registry.run("cargo", &cmd, &cwd, &env, None, Some(&args_val)).await
+                    .map(|r| Response::ok(r.output))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
+    fn docker<'v>(
+        command: &str,
+        #[starlark(require = named)] container: Option<&str>,
+        #[starlark(require = named)] tail: Option<i64>,
+        #[starlark(require = named)] file: Option<&str>,
+        #[starlark(require = named)] detach: Option<bool>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let session = ctx.session.clone();
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = container { args_val["container"] = serde_json::json!(v); }
+            if let Some(v) = tail { args_val["tail"] = serde_json::json!(v); }
+            if let Some(v) = file { args_val["file"] = serde_json::json!(v); }
+            if let Some(v) = detach { args_val["detach"] = serde_json::json!(v); }
+            let resp = ctx.handle.block_on(async {
+                let s = session.lock().await;
+                let registry = s.tool_registry.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("docker plugin not available"))?;
+                let cwd = s.cwd.clone();
+                let env = s.env.clone();
+                registry.run("docker", &cmd, &cwd, &env, None, Some(&args_val)).await
                     .map(|r| Response::ok(r.output))
                     .map_err(|e| anyhow::anyhow!("{e}"))
             })?;
@@ -411,7 +531,10 @@ pub fn tool_signatures() -> String {
         "def exec(command: str, args: list[str] = [], cwd: str = None) -> dict: ...",
         "def ls(path: str = None, depth: int = None) -> dict: ...",
         "def snapshot(action: str, id: str = None, tag: str = None) -> dict: ...",
-        "def git(command: str) -> dict: ...",
+        "def git(command: str, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
+        "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
+        "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
+        "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
     ];
     sigs.join("\n")

@@ -130,7 +130,37 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
         && untracked.is_empty()
         && renamed.is_empty();
 
-    let mut result = json!({"clean": clean});
+    // Include branch and HEAD info so a single status call gives full context
+    let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let head = run_git(cwd, &["log", "-1", "--format=%h%x00%s"])
+        .await
+        .ok()
+        .and_then(|out| {
+            let parts: Vec<&str> = out.trim().splitn(2, '\0').collect();
+            if parts.len() == 2 {
+                Some(json!({"h": parts[0], "m": parts[1]}))
+            } else {
+                None
+            }
+        });
+
+    let commit_count = run_git(cwd, &["rev-list", "--count", "HEAD"])
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    let mut result = json!({"clean": clean, "branch": branch});
+    if let Some(h) = head {
+        result["head"] = h;
+    }
+    if let Some(n) = commit_count {
+        result["commits"] = json!(n);
+    }
     if !modified.is_empty() {
         result["modified"] = json!(modified);
     }
@@ -159,13 +189,38 @@ async fn git_log(
         .unwrap_or(10)
         .clamp(1, 100);
 
+    let oneline = args
+        .and_then(|a| a.get("oneline"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let path_filter = args
         .and_then(|a| a.get("path").or_else(|| a.get("g")))
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let format = "%h%x00%an%x00%s%x00%aI";
     let limit_str = format!("-{limit}");
+
+    if oneline {
+        let format_str = "--format=%h %s".to_string();
+        let mut git_args = vec!["log", &limit_str, &format_str];
+
+        let path_owned;
+        if let Some(p) = &path_filter {
+            path_owned = p.clone();
+            git_args.push("--");
+            git_args.push(&path_owned);
+        }
+
+        let out = run_git(cwd, &git_args).await?;
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        return Ok(json!({
+            "log": lines,
+            "count": lines.len(),
+        }));
+    }
+
+    let format = "%h%x00%an%x00%s%x00%aI";
     let format_str = format!("--format={format}");
     let mut git_args = vec!["log", &limit_str, &format_str];
 
@@ -621,6 +676,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output["clean"], true);
+        assert_eq!(result.output["branch"], "main");
+        assert_eq!(result.output["head"]["m"], "init");
+        assert!(result.output["head"]["h"].as_str().unwrap().len() <= 12);
+        assert_eq!(result.output["commits"], 1);
     }
 
     #[tokio::test]
@@ -684,6 +743,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn plugin_log_oneline() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path()).await;
+        for i in 0..3 {
+            std::fs::write(dir.path().join("f.txt"), format!("v{i}")).unwrap();
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-m", &format!("commit {i}")])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+        }
+
+        let plugin = GitPlugin::new();
+        let env = HashMap::new();
+        let args = json!({"oneline": true});
+        let result = plugin
+            .run_command("log", dir.path(), &env, None, Some(&args))
+            .await
+            .unwrap();
+        let log = result.output["log"].as_array().unwrap();
+        assert_eq!(result.output["count"], 3);
+        assert!(log[0].as_str().unwrap().contains("commit 2"));
+        assert!(log[2].as_str().unwrap().contains("commit 0"));
     }
 
     #[tokio::test]
@@ -898,6 +990,10 @@ mod tests {
             result.output.get("added").is_none(),
             "empty arrays should be omitted"
         );
+        // branch and head should always be present
+        assert!(result.output.get("branch").is_some());
+        assert!(result.output.get("head").is_some());
+        assert!(result.output.get("commits").is_some());
     }
 
     #[tokio::test]

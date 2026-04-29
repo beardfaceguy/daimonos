@@ -61,6 +61,27 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("auto-registered git tool plugin");
     }
 
+    if plugins::docker::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::docker::DockerPlugin::new()))
+            .await;
+        eprintln!("auto-registered docker tool plugin");
+    }
+
+    if plugins::cargo::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::cargo::CargoPlugin::new()))
+            .await;
+        eprintln!("auto-registered cargo tool plugin");
+    }
+
+    if plugins::gh::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::gh::GhPlugin::new()))
+            .await;
+        eprintln!("auto-registered gh tool plugin");
+    }
+
     let pcache = Arc::new(pipeline_cache::PipelineCache::new(&workspace));
 
     if cli.mcp {

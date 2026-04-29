@@ -29,6 +29,12 @@ benchmarks/
 ├── run-benchmark.sh           # Runner script — executes tasks via agent CLI
 ├── setup-mcp.sh               # Configures .cursor/mcp.json for daimonos mode
 ├── analyze-results.py         # Compares results across runs
+├── compare-models.py          # Cross-model comparison report
+├── remote/                    # AWS remote benchmark orchestration
+│   ├── run-remote-benchmark.sh    # Master orchestrator (launch, provision, run, collect)
+│   ├── provision-ubuntu.sh        # Provisions Ubuntu instance
+│   ├── provision-daimonos.sh      # Provisions daimonos distro instance
+│   └── collect-results.sh         # Standalone result collector
 ├── workspace/                 # Target codebase (small Rust inventory app)
 │   ├── Cargo.toml
 │   ├── README.md
@@ -108,3 +114,59 @@ Key things to look for:
   responses
 - **Snapshot capability**: task 07 demonstrates a workflow that's impossible with
   Cursor's native tools
+
+## Remote benchmarking (AWS)
+
+Run identical benchmarks on two AWS instances to compare tool efficiency on the
+same hardware without network latency as a variable. One runs Ubuntu 24.04
+(baseline), one runs the daimonos distro with Node.js.
+
+**Linear issue:** CLA-220
+
+### Prerequisites
+
+- Daimonos distro AMI deployed (must include Node.js — see `distro/` build)
+- AWS credentials configured (`AWS_PROFILE` or default)
+- EC2 key pair for SSH access
+
+### Quick start
+
+```bash
+# Build the modified distro (includes Node.js + bench user)
+cd distro && ./build-buildroot.sh && ./deploy-aws.sh
+# Note the AMI ID from the output
+
+# Run the remote benchmark
+cd benchmarks/remote
+DAIMONOS_AMI=ami-xxx ./run-remote-benchmark.sh
+```
+
+### Options
+
+```bash
+# Keep instances alive for debugging
+DAIMONOS_AMI=ami-xxx ./run-remote-benchmark.sh --keep
+
+# Run a single task
+DAIMONOS_AMI=ami-xxx ./run-remote-benchmark.sh --task 03
+
+# Skip provisioning (re-run on already-provisioned instances)
+DAIMONOS_AMI=ami-xxx ./run-remote-benchmark.sh --skip-provision
+
+# Collect results from running instances if orchestrator was interrupted
+./collect-results.sh <ubuntu-ip> <daimonos-ip>
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DAIMONOS_AMI` | (required) | AMI ID for the daimonos distro |
+| `UBUNTU_AMI` | auto-detect | AMI ID for Ubuntu 24.04 |
+| `AWS_PROFILE` | `experimental-admin` | AWS CLI profile |
+| `AWS_REGION` | `us-east-1` | AWS region |
+| `INSTANCE_TYPE` | `t3.medium` | EC2 instance type |
+| `KEY_NAME` | auto-detect | EC2 key pair name |
+| `SSH_KEY` | `~/.ssh/id_ed25519` | Path to SSH private key |
+| `BENCH_MODEL` | `opus` | Model for Claude CLI |
+| `BENCH_TAG` | `remote` | Tag for run naming |

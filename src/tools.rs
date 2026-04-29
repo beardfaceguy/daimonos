@@ -288,6 +288,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "message": {"type": "string", "description": "commit: message"},
                     "all": {"type": "boolean", "description": "commit: auto-stage (-a)"},
                     "limit": {"type": "integer", "description": "log: max commits (default 10)"},
+                    "oneline": {"type": "boolean", "description": "log: compact format (hash + subject per line)"},
                     "path": {"type": "string", "description": "log: filter by path"},
                     "mode": {"type": "string", "enum": ["unstaged", "staged"], "description": "diff: scope"},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "add: files (default [\".\"])"},
@@ -302,6 +303,70 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             to_request: None, // uses ToolRegistry plugin
             context_check: Some(|ws| ws.join(".git").exists()),
+        },
+
+        ToolDef {
+            name: "cargo",
+            tier: ToolTier::Terse,
+            description: "Cargo operations. Commands: test, build, check, clippy, fmt, add.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["test", "build", "check", "clippy", "fmt", "add"]},
+                    "package": {"type": "string", "description": "Target package (--package)"},
+                    "filter": {"type": "string", "description": "test: name filter"},
+                    "lib": {"type": "boolean", "description": "test: --lib flag"},
+                    "release": {"type": "boolean", "description": "build/check: --release flag"},
+                    "dev": {"type": "boolean", "description": "add: --dev flag"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None, // uses ToolRegistry plugin
+            context_check: Some(|ws| ws.join("Cargo.toml").exists()),
+        },
+
+        ToolDef {
+            name: "gh",
+            tier: ToolTier::Terse,
+            description: "GitHub CLI. Commands: pr_view, pr_list, pr_create, pr_diff, pr_checks, api.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["pr_view", "pr_list", "pr_create", "pr_diff", "pr_checks", "api"]},
+                    "number": {"type": "integer", "description": "pr_view/pr_diff/pr_checks: PR number (default: current branch)"},
+                    "state": {"type": "string", "enum": ["open", "closed", "merged", "all"], "description": "pr_list: filter (default open)"},
+                    "limit": {"type": "integer", "description": "pr_list: max results (default 10)"},
+                    "author": {"type": "string", "description": "pr_list: filter by author"},
+                    "title": {"type": "string", "description": "pr_create: PR title (required)"},
+                    "body": {"type": "string", "description": "pr_create: PR body"},
+                    "base": {"type": "string", "description": "pr_create: base branch"},
+                    "draft": {"type": "boolean", "description": "pr_create: create as draft"},
+                    "endpoint": {"type": "string", "description": "api: REST endpoint (e.g. repos/{owner}/{repo}/pulls)"},
+                    "method": {"type": "string", "description": "api: HTTP method (default GET)"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None,
+            context_check: Some(|ws| ws.join(".git").exists()),
+        },
+
+        ToolDef {
+            name: "docker",
+            tier: ToolTier::Terse,
+            description: "Docker operations. Commands: ps, logs, exec, images, inspect, stop, compose_up, compose_down, compose_ps.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["ps", "logs", "exec", "images", "inspect", "stop", "compose_up", "compose_down", "compose_ps"]},
+                    "container": {"type": "string", "description": "logs/exec/inspect/stop: container name or id"},
+                    "tail": {"type": "integer", "description": "logs: max lines (default 50)"},
+                    "file": {"type": "string", "description": "compose_*: path to compose file (-f)"},
+                    "detach": {"type": "boolean", "description": "compose_up: run detached (default true)"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None,
+            context_check: None,
         },
 
         ToolDef {
@@ -615,6 +680,7 @@ mod tests {
     fn build_request_none_for_special_tools() {
         let args = json!({});
         assert!(build_request("git", &args).is_none());
+        assert!(build_request("docker", &args).is_none());
         assert!(build_request("set_cwd", &args).is_none());
         assert!(build_request("batch", &args).is_none());
     }

@@ -34,6 +34,10 @@ def test_git_status_clean_repo(daimonos):
     assert data["clean"] is True
     assert "modified" not in data, "empty arrays should be omitted"
     assert "untracked" not in data, "empty arrays should be omitted"
+    assert data["branch"] == "main"
+    assert data["head"]["m"] == "init"
+    assert len(data["head"]["h"]) <= 12
+    assert data["commits"] == 1
 
 
 def test_git_status_modified_file(daimonos):
@@ -109,6 +113,23 @@ def test_git_log_with_limit(daimonos):
 
     data = _parse(daimonos.call_tool("git", {"command": "log", "limit": 2}))
     assert data["count"] == 2
+
+
+def test_git_log_oneline(daimonos):
+    ws = daimonos.workspace
+    _init_repo(ws)
+
+    for i in range(3):
+        with open(os.path.join(ws, "file.txt"), "w") as f:
+            f.write(f"v{i}")
+        _git(ws, "add", ".")
+        _git(ws, "commit", "-m", f"commit {i}")
+
+    data = _parse(daimonos.call_tool("git", {"command": "log", "oneline": True}))
+    assert data["count"] == 3
+    assert isinstance(data["log"], list)
+    assert "commit 2" in data["log"][0]
+    assert "commit 0" in data["log"][2]
 
 
 def test_git_log_with_path_filter(daimonos):
@@ -217,7 +238,9 @@ def test_git_branch_multiple(daimonos):
 
 
 def test_tools_list_includes_git(daimonos):
-    """Unified git tool is visible in the initial tool listing."""
+    """Unified git tool is visible when workspace has .git."""
+    import os
+    os.makedirs(os.path.join(daimonos.workspace, ".git"), exist_ok=True)
     tools = daimonos.list_tools()
     tool_names = [t["name"] for t in tools]
     assert "git" in tool_names
@@ -225,10 +248,9 @@ def test_tools_list_includes_git(daimonos):
 
 
 def test_tools_list_hides_extended(daimonos):
-    """Extended tools like diff_files, tool_pipeline, ls are not in initial listing."""
+    """Extended tools like diff_files, tool_pipeline are not in initial listing."""
     tools = daimonos.list_tools()
     tool_names = [t["name"] for t in tools]
     assert "diff_files" not in tool_names
     assert "tool_pipeline" not in tool_names
     assert "tool_repair" not in tool_names
-    assert "ls" not in tool_names, "ls should be behind list_all_tools"

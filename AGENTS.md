@@ -42,10 +42,11 @@ read the Daimonos initiative description in Linear.
 | Vision, roadmap, project status | Linear initiative "Daimonos" |
 | Research findings and analysis | Linear project documents |
 | Task status and ownership | Linear issues |
+| Install & setup guides | `docs/install.md`, `docs/cursor-setup.md`, `docs/claude-cli-setup.md` |
 | Protocol specification | `docs/protocol.md` |
+| Configuration reference | `docs/configuration.md` and `daimonos.default.toml` |
 | Architecture decisions | `docs/` directory |
 | Coding rules and conventions | This file + `.cursor/rules/` |
-| Configuration reference | `daimonos.default.toml` |
 
 Technical documentation that doesn't fit in Linear (specs, diagrams,
 benchmarks, design docs) goes in `docs/`. Use Linear documents for research
@@ -65,6 +66,11 @@ daimonos/
 │   ├── setup-mcp.sh               # Configures MCP for daimonos mode
 │   ├── analyze-results.py         # Compares cursor vs daimonos results (single model)
 │   ├── compare-models.py          # Cross-model comparison report
+│   ├── remote/                    # AWS remote benchmark orchestration
+│   │   ├── run-remote-benchmark.sh    # Launch, provision, run, collect, teardown
+│   │   ├── provision-ubuntu.sh        # Provisions Ubuntu baseline instance
+│   │   ├── provision-daimonos.sh      # Provisions daimonos distro instance
+│   │   └── collect-results.sh         # Standalone result collector
 │   ├── tasks/                     # Task definitions (JSON)
 │   └── workspace/                 # Target codebase (Rust inventory app)
 ├── distro/
@@ -74,6 +80,10 @@ daimonos/
 │   ├── br2-external/              # Buildroot external tree (defconfig, overlay, board)
 │   └── alpine-legacy/             # Deprecated Alpine build (reference only)
 ├── docs/
+│   ├── install.md                 # Build & install instructions
+│   ├── cursor-setup.md            # Cursor IDE integration guide
+│   ├── claude-cli-setup.md        # Claude Code CLI integration guide
+│   ├── configuration.md           # Config file reference (all tunables)
 │   └── protocol.md                # Opcode protocol specification
 ├── tests/
 │   ├── conftest.py                # pytest fixture: DaimonosClient + MCP handshake
@@ -114,6 +124,9 @@ daimonos/
         ├── mod.rs                 # Plugin module
         ├── generic_cli.rs         # Generic plugin for any CLI tool with JSON output
         ├── git.rs                 # Git tool plugin (auto-registered when git on PATH)
+        ├── cargo.rs               # Cargo plugin: test, build, check, clippy, fmt, add (auto-registered)
+        ├── gh.rs                  # GitHub CLI plugin: pr_view/list/create/diff/checks, api (auto-registered)
+        ├── docker.rs              # Docker plugin: ps, logs, exec, images, inspect, stop, compose (auto-registered)
         └── x07.rs                 # X07-specific plugin (semantic indexing, decl cache)
 ```
 
@@ -167,11 +180,12 @@ daimonos/
 - **Lazy tool exposure**: only core tools (`read_file`, `write_file`,
   `edit_file`, `search`, `workspace_info`, `exec`, `batch`,
   `list_all_tools`) plus commonly-used consolidated tools (`git`,
-  `snapshot`, `set_cwd`) appear in the initial `list_tools` response.
-  Extended tools (`ls`, `diff_files`, `tool_pipeline`, `tool_repair`) are
-  exposed after the model calls `list_all_tools` or uses one directly.
-  This reduces initial system prompt token overhead (11 tools default vs
-  18 total). The set of exposed tools is tracked in
+  `cargo`, `gh`, `docker`, `snapshot`, `set_cwd`, `ls`) appear in the
+  initial `list_tools` response. Context-aware tools (`git`, `cargo`,
+  `gh`) are hidden when their prerequisites are missing (no `.git` or
+  `Cargo.toml`). Extended tools (`diff_files`, `tool_pipeline`,
+  `tool_repair`) are exposed after the model calls `list_all_tools` or
+  uses one directly. The set of exposed tools is tracked in
   `session.exposed_tools`.
 - **Proactive workspace context**: the MCP `instructions` field is built
   dynamically at startup with workspace path, detected project type
@@ -181,8 +195,12 @@ daimonos/
 - **Consolidated tools**: related operations are grouped into single MCP
   tools with an action/command parameter to minimize schema overhead.
   `git` has a `command` enum (status, log, diff, branch, add, commit,
-  push, pull, checkout). `snapshot` has an `action` enum (create, restore,
-  list, delete). This pattern reduces tool definitions from ~26 to ~18.
+  push, pull, checkout). `cargo` has a `command` enum (test, build,
+  check, clippy, fmt, add). `gh` has a `command` enum (pr_view, pr_list,
+  pr_create, pr_diff, pr_checks, api). `docker` has a `command` enum
+  (ps, logs, exec, images, inspect, stop, compose_up, compose_down,
+  compose_ps). `snapshot` has an `action` enum (create, restore, list,
+  delete). This pattern keeps tool definitions compact.
 - **Compact responses**: all MCP tool responses use compact JSON
   (`to_string`, not `to_string_pretty`). Redundant fields (`count` on
   arrays, `size` on writes) are omitted. Empty `err` fields in exec

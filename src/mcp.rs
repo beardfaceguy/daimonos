@@ -232,6 +232,105 @@ async fn dispatch_tool(
             }
         }
 
+        "gh" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("gh requires 'command' argument".into()),
+            };
+
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("gh", &command, &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("gh {command}: {e}")),
+            }
+        }
+
+        "cargo" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("cargo requires 'command' argument".into()),
+            };
+
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("cargo", &command, &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("cargo {command}: {e}")),
+            }
+        }
+
+        "docker" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("docker requires 'command' argument".into()),
+            };
+
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("docker", &command, &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("docker {command}: {e}")),
+            }
+        }
+
         _ => Err(CallToolError::unknown_tool(name.to_string())),
     }
 }
@@ -379,6 +478,7 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
     let mut parts = vec![
         "Use daimonos tools, not built-in equivalents.".to_string(),
         "If your plan requires 2+ tool calls, use execute_script instead — write a Starlark script that calls the tool functions and sets `result`. This is faster and cheaper than sequential calls. Only call individual tools when you need exactly one operation.".to_string(),
+        "Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].".to_string(),
         format!("Workspace: {}", workspace.display()),
     ];
 
@@ -532,6 +632,7 @@ mod tests {
         assert!(names.contains(&"list_all_tools"));
         assert!(names.contains(&"get_tool_schema"));
         assert!(names.contains(&"git"));
+        assert!(names.contains(&"docker"));
         assert!(names.contains(&"snapshot"));
     }
 
