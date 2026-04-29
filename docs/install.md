@@ -20,11 +20,32 @@ Optional (auto-detected at startup):
 | `docker` | Native Docker tool (ps, logs, images, compose, etc.) |
 | `node` | Used internally for some benchmark tooling |
 
-## Quick Start
+## Option A: Download Pre-Built Binary
+
+Pre-built binaries are available from
+[GitHub Releases](https://github.com/beardfaceguy/daimonos/releases).
+
+```bash
+# x86_64 (most Ubuntu/Debian desktops and servers)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# aarch64 / ARM64 (Graviton, Raspberry Pi, ARM servers)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-linux.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# musl static binary (works on any Linux, no glibc dependency)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux-musl.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+```
+
+Verify: `daimonos --help`
+
+## Option B: Build from Source
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-org/daimonos.git
+git clone https://github.com/beardfaceguy/daimonos.git
 cd daimonos
 
 # 2. Build (release mode recommended)

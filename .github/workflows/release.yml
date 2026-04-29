@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0). Leave empty for a dev build."
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: daimonos-x86_64-linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: daimonos-aarch64-linux
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            artifact: daimonos-x86_64-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              ;;
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+          esac
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/daimonos dist/daimonos
+          chmod +x dist/daimonos
+          cd dist
+          tar czf ${{ matrix.artifact }}.tar.gz daimonos
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz*
+          retention-days: 30
+
+  test:
+    name: Test release binary
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: daimonos-x86_64-linux
+          path: dist/
+
+      - name: Extract and verify binary
+        run: |
+          cd dist && sha256sum -c daimonos-x86_64-linux.tar.gz.sha256
+          tar xzf daimonos-x86_64-linux.tar.gz
+          chmod +x daimonos
+          ./daimonos --help
+
+      - name: MCP smoke test
+        run: |
+          WORKSPACE=$(mktemp -d)
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | \
+            dist/daimonos --mcp -w "$WORKSPACE" 2>/dev/null | \
+            python3 -c "import sys,json; r=json.loads(sys.stdin.readline()); assert r['result']['serverInfo']['name']=='daimonos', f'unexpected: {r}'; print('MCP init OK')"
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          find artifacts/ -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts/ -name '*.sha256' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Daimonos ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: release/*
