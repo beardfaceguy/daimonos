@@ -45,6 +45,8 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    session::enhance_process_path();
+
     let workspace = std::fs::canonicalize(&cli.workspace)?;
     let cfg = Arc::new(config::load(cli.config.as_deref(), &workspace));
 

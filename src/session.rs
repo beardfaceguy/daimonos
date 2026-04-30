@@ -87,26 +87,7 @@ impl Session {
             }
         }
 
-        // Auto-detect common tool directories
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            let candidates = [
-                home.join(".cargo/bin"),
-                home.join(".local/bin"),
-                home.join("go/bin"),
-                home.join(".deno/bin"),
-                home.join(".bun/bin"),
-                home.join(".local/share/fnm/aliases/default/bin"),
-            ];
-            for dir in &candidates {
-                if dir.is_dir() {
-                    let s = dir.to_string_lossy().to_string();
-                    if !parent_dirs.contains(s.as_str()) && !extra.contains(&s) {
-                        extra.push(s);
-                    }
-                }
-            }
-        }
+        collect_tool_dirs(&parent_dirs, &mut extra);
 
         if !extra.is_empty() {
             let mut new_path = extra.join(":");
@@ -186,6 +167,59 @@ fn shellexpand_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Collect common tool directories that should be on PATH.
+/// Appends to `extra` any existing directories not already in `existing`.
+fn collect_tool_dirs(existing: &std::collections::HashSet<&str>, extra: &mut Vec<String>) {
+    // System-wide tool directories (Homebrew on macOS, standard Linux paths)
+    for dir in &["/opt/homebrew/bin", "/usr/local/bin"] {
+        let p = std::path::Path::new(dir);
+        if p.is_dir() {
+            let s = dir.to_string();
+            if !existing.contains(s.as_str()) && !extra.contains(&s) {
+                extra.push(s);
+            }
+        }
+    }
+
+    // User-specific tool directories
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let candidates = [
+            home.join(".cargo/bin"),
+            home.join(".local/bin"),
+            home.join("go/bin"),
+            home.join(".deno/bin"),
+            home.join(".bun/bin"),
+            home.join(".local/share/fnm/aliases/default/bin"),
+        ];
+        for dir in &candidates {
+            if dir.is_dir() {
+                let s = dir.to_string_lossy().to_string();
+                if !existing.contains(s.as_str()) && !extra.contains(&s) {
+                    extra.push(s);
+                }
+            }
+        }
+    }
+}
+
+/// Enhance the process-level PATH with common tool directories.
+/// Call once at startup, before plugin `is_available()` checks.
+pub fn enhance_process_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let current_dirs: std::collections::HashSet<&str> = current.split(':').collect();
+    let mut extra: Vec<String> = Vec::new();
+    collect_tool_dirs(&current_dirs, &mut extra);
+    if !extra.is_empty() {
+        let mut new_path = extra.join(":");
+        if !current.is_empty() {
+            new_path.push(':');
+            new_path.push_str(&current);
+        }
+        std::env::set_var("PATH", &new_path);
+    }
 }
 
 #[cfg(test)]
