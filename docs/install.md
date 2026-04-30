@@ -6,6 +6,10 @@ agent-optimized equivalents that use fewer tokens and fewer round-trips.
 
 ## Prerequisites
 
+For pre-built binaries: just `curl` and a supported platform (see below).
+
+For building from source:
+
 | Dependency | Version | Why |
 |-----------|---------|-----|
 | **Rust** (stable) | 1.75+ | Builds the daimonos binary |
@@ -18,12 +22,13 @@ Optional (auto-detected at startup):
 | `cargo` | Native `cargo` tool (test, build, check, clippy, fmt) |
 | `gh` | Native GitHub CLI tool (pr_list, pr_create, api, etc.) |
 | `docker` | Native Docker tool (ps, logs, images, compose, etc.) |
-| `node` | Used internally for some benchmark tooling |
 
 ## Option A: Download Pre-Built Binary
 
 Pre-built binaries are available from
 [GitHub Releases](https://github.com/beardfaceguy/daimonos/releases).
+
+**Linux:**
 
 ```bash
 # x86_64 (most Ubuntu/Debian desktops and servers)
@@ -36,6 +41,18 @@ sudo mv daimonos /usr/local/bin/
 
 # musl static binary (works on any Linux, no glibc dependency)
 curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux-musl.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+```
+
+**macOS:**
+
+```bash
+# Apple Silicon (M1/M2/M3/M4)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-macos.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# Intel Mac
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-macos.tar.gz | tar xz
 sudo mv daimonos /usr/local/bin/
 ```
 

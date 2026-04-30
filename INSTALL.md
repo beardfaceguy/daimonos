@@ -1,90 +1,130 @@
-# Daimonos — Installation & Requirements
+# Daimonos — Installation & Setup
+
+Daimonos is a single Rust binary that acts as an MCP server for AI coding
+agents. It replaces built-in file, search, exec, and git tools with
+agent-optimized equivalents that use fewer tokens and fewer round-trips.
+Drop it into Cursor or Claude Code and your agent gets structured I/O,
+Starlark scripting, native cargo/gh/docker tools, and workspace snapshots
+— all in one process, no dependencies.
 
 ## Supported Platforms
 
-| Platform | Architecture | Status |
-|----------|-------------|--------|
-| Linux (Ubuntu/Debian) | x86_64, aarch64 | Fully supported |
-| macOS | Apple Silicon (aarch64) | Fully supported |
-| macOS | Intel (x86_64) | Should work (untested) |
-
-## Prerequisites
-
-### Required
-
-| Dependency | Version | How to install |
-|-----------|---------|----------------|
-| **Rust toolchain** | 1.75+ (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| **Git** | 2.x | Pre-installed on macOS; `apt install git` on Debian/Ubuntu |
-| **C compiler** | Any | Xcode CLI tools on macOS (`xcode-select --install`); `apt install build-essential` on Debian/Ubuntu |
-
-### Optional (for integration tests)
-
-| Dependency | Version | How to install |
-|-----------|---------|----------------|
-| **Python** | 3.9+ | Pre-installed on macOS; `apt install python3` on Debian/Ubuntu |
-| **pytest** | 8.x | `pip install -r tests/requirements.txt` |
+| Platform | Architecture | Pre-built binary | Build from source |
+|----------|-------------|-----------------|-------------------|
+| Linux (Ubuntu/Debian) | x86_64 | Yes | Yes |
+| Linux (Ubuntu/Debian) | aarch64 | Yes | Yes |
+| Linux (any distro) | x86_64 | Yes (musl static) | Yes |
+| macOS | Apple Silicon (aarch64) | Yes | Yes |
+| macOS | Intel (x86_64) | Yes | Yes |
 
 ## Quick Start
 
+### Option A: Pre-Built Binary (recommended)
+
+Pre-built binaries are available from
+[GitHub Releases](https://github.com/beardfaceguy/daimonos/releases).
+No Rust toolchain needed.
+
+**Linux:**
+
+```bash
+# x86_64 (most desktops and servers)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# aarch64 / ARM64 (Graviton, Raspberry Pi)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-linux.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# musl static binary (any Linux, no glibc dependency)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux-musl.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+```
+
+**macOS:**
+
+```bash
+# Apple Silicon (M1/M2/M3/M4)
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-macos.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+
+# Intel Mac
+curl -L https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-macos.tar.gz | tar xz
+sudo mv daimonos /usr/local/bin/
+```
+
+Verify the install:
+
+```bash
+daimonos --help
+```
+
+### Option B: Build from Source
+
+Requires Rust 1.75+ (stable), Git, and a C compiler.
+
 ```bash
 # 1. Clone the repository
-git clone git@github.com:beardfaceguy/daimonos.git
+git clone https://github.com/beardfaceguy/daimonos.git
 cd daimonos
 
 # 2. Build
 cargo build --release
 
-# 3. Run tests
-cargo test
+# 3. (Optional) Install to PATH
+sudo cp target/release/daimonos /usr/local/bin/
 
-# 4. (Optional) Run integration tests
-pip install -r tests/requirements.txt
-pytest tests/ -v
-
-# 5. Run the MCP server
-./target/release/daimonos --mcp -w /path/to/workspace
+# 4. Verify
+daimonos --help
 ```
 
-## Platform-Specific Notes
+First build takes 1-2 minutes. Subsequent builds are incremental (~5 seconds).
 
-### macOS
+## Configure Your IDE
 
-- The system Python (3.9) works for integration tests. No need to install a
-  newer version.
-- If your git config has `commit.gpgsign = true` globally, test repos
-  explicitly disable it. No GPG installation is needed for development.
-- File system notifications use FSEvents (via the `notify` crate). No extra
-  configuration needed.
+Once installed, set up Daimonos with your editor:
 
-### Linux
+- **[Cursor IDE](docs/cursor-setup.md)** — recommended for most users
+- **[Claude Code CLI](docs/claude-cli-setup.md)** — for terminal workflows
 
-- File system notifications use inotify. The default `fs.inotify.max_user_watches`
-  limit (usually 65536) is sufficient. For very large workspaces, increase it:
-  ```bash
-  echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-  sudo sysctl -p
-  ```
-
-## MCP Configuration (Cursor IDE)
-
-Add to your `.cursor/mcp.json`:
+The minimal Cursor config (add to `.cursor/mcp.json` in your project):
 
 ```json
 {
   "mcpServers": {
     "daimonos": {
-      "command": "/path/to/daimonos",
-      "args": ["--mcp", "-w", "/path/to/workspace"]
+      "command": "daimonos",
+      "args": ["--mcp", "-w", "."]
     }
   }
 }
 ```
 
-## CI
+## What You Get
 
-GitHub Actions runs on every push and PR against `master`:
-- **Rust tests** on Ubuntu and macOS
-- **Python integration tests** on Ubuntu and macOS
-- **Clippy** lint checks
-- **rustfmt** format checks
+| Feature | Benefit |
+|---------|---------|
+| **Structured tool output** | JSON responses instead of raw text — fewer tokens, better parsing |
+| **Starlark scripting** | Batch multiple tool calls in one round-trip via `execute_script` |
+| **Native plugins** | `cargo`, `gh`, `docker`, `git` as first-class MCP tools |
+| **Workspace snapshots** | Save/restore workspace state for safe experimentation |
+| **Terse output directive** | Automatic prompt tuning for ~27% output token reduction |
+| **Read deduplication** | Re-reads of unchanged files return a compact "unchanged" response |
+| **Trigram file search** | Fast file-name search without shelling out to `find` |
+
+## Optional Dependencies
+
+These are auto-detected at startup. If present, they're exposed as native
+MCP tools with structured output:
+
+| Tool | Enables |
+|------|---------|
+| `cargo` | `cargo` tool (test, build, check, clippy, fmt) |
+| `gh` | GitHub CLI tool (pr_list, pr_create, api, etc.) |
+| `docker` | Docker tool (ps, logs, images, compose, etc.) |
+
+## Further Reading
+
+- [Configuration reference](docs/configuration.md) — tuning indexing, search, exec
+- [Protocol specification](docs/protocol.md) — the opcode protocol under the hood
+- [Benchmark results](benchmarks/README.md) — token savings measurements

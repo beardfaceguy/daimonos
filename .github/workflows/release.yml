@@ -28,6 +28,12 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             artifact: daimonos-x86_64-linux-musl
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            artifact: daimonos-aarch64-macos
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            artifact: daimonos-x86_64-macos
 
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +47,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           case "${{ matrix.target }}" in
@@ -63,7 +70,11 @@ jobs:
           chmod +x dist/daimonos
           cd dist
           tar czf ${{ matrix.artifact }}.tar.gz daimonos
-          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
