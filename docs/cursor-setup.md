@@ -5,7 +5,7 @@ built-in file/search/exec tools with agent-optimized equivalents.
 
 ## Prerequisites
 
-- Daimonos binary built ([install guide](install.md))
+- Daimonos binary installed — [download a pre-built binary](https://github.com/beardfaceguy/daimonos/releases) or [build from source](install.md)
 - Cursor IDE installed
 
 ## Setup
@@ -25,7 +25,21 @@ In your project's root directory, create `.cursor/mcp.json`:
 }
 ```
 
-Replace the paths with your actual locations. For example:
+If you installed to `/usr/local/bin/` (the default for pre-built binaries),
+you can use `daimonos` directly and `.` for the current workspace:
+
+```json
+{
+  "mcpServers": {
+    "daimonos": {
+      "command": "daimonos",
+      "args": ["--mcp", "-w", "."]
+    }
+  }
+}
+```
+
+If you built from source and didn't install to PATH, use absolute paths:
 
 ```json
 {
@@ -37,9 +51,6 @@ Replace the paths with your actual locations. For example:
   }
 }
 ```
-
-**Important**: use absolute paths. Relative paths may not resolve correctly
-depending on how Cursor launches the process.
 
 ### 2. Verify in Cursor
 

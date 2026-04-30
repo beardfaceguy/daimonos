@@ -5,7 +5,7 @@ MCP server for terminal-based agent workflows.
 
 ## Prerequisites
 
-- Daimonos binary built ([install guide](install.md))
+- Daimonos binary installed — [download a pre-built binary](https://github.com/beardfaceguy/daimonos/releases) or [build from source](install.md)
 - Claude Code CLI installed (`claude` command available)
 
 ## Setup
