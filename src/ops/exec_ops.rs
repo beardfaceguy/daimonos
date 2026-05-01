@@ -174,12 +174,14 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
     };
 
     let status = proc.child.try_wait();
-    let tail = tokio::fs::read_to_string(&proc.output_path)
+    let output_path = proc.output_path.clone();
+    let tail_n = session.cfg.process.poll_tail_lines;
+
+    let tail = tokio::fs::read_to_string(&output_path)
         .await
         .ok()
         .map(|s| {
             let lines: Vec<&str> = s.lines().collect();
-            let tail_n = session.cfg.process.poll_tail_lines;
             let start = if lines.len() > tail_n {
                 lines.len() - tail_n
             } else {
@@ -191,6 +193,8 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
     match status {
         Ok(Some(exit)) => {
             let code = exit.code().unwrap_or(-1);
+            session.bg_processes.remove(&pid);
+            let _ = std::fs::remove_file(&output_path);
             Response::ok(json!({
                 "running": false,
                 "exit": code,
@@ -216,8 +220,13 @@ pub async fn kill(session: &mut Session, op: &Op) -> Response {
         None => return Response::err(7, &format!("no process with pid {pid}")),
     };
 
+    let output_path = proc.output_path.clone();
     match proc.child.kill().await {
-        Ok(()) => Response::ok(json!({"ok": true})),
+        Ok(()) => {
+            session.bg_processes.remove(&pid);
+            let _ = std::fs::remove_file(&output_path);
+            Response::ok(json!({"ok": true}))
+        }
         Err(e) => Response::err(4, &format!("kill: {e}")),
     }
 }
@@ -368,6 +377,161 @@ mod tests {
         )
         .await;
         assert!(kill_resp.ok);
+    }
+
+    #[tokio::test]
+    async fn bg_process_removed_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("true".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(bg_resp.ok);
+        let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
+        assert_eq!(s.bg_processes.len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let poll_resp = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(poll_resp.ok);
+        assert_eq!(poll_resp.d.as_ref().unwrap()["running"], false);
+
+        assert!(
+            !s.bg_processes.contains_key(&(pid as u32)),
+            "completed bg process should be removed from map, but {} entries remain",
+            s.bg_processes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_process_removed_after_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("sleep".into()),
+                a: Some(vec!["60".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(bg_resp.ok);
+        let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
+        assert_eq!(s.bg_processes.len(), 1);
+
+        let kill_resp = kill(
+            &mut s,
+            &Op {
+                c: 11,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(kill_resp.ok);
+
+        assert!(
+            !s.bg_processes.contains_key(&(pid as u32)),
+            "killed bg process should be removed from map, but {} entries remain",
+            s.bg_processes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_log_files_cleaned_up_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("true".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(bg_resp.ok);
+        let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
+        let log_path = std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
+        assert!(log_path.exists(), "log file should exist after bg spawn");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let poll_resp = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(poll_resp.ok);
+        assert_eq!(poll_resp.d.as_ref().unwrap()["running"], false);
+
+        assert!(
+            !log_path.exists(),
+            "log file at {} should be deleted after process completes",
+            log_path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_processes_dont_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        for i in 0..10 {
+            let bg_resp = bg(
+                &mut s,
+                &Op {
+                    c: 9,
+                    s: Some("true".into()),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(bg_resp.ok, "bg {i} failed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        for pid in 1..=10u32 {
+            poll(
+                &mut s,
+                &Op {
+                    c: 10,
+                    n: Some(pid as i64),
+                    ..Op::default()
+                },
+            )
+            .await;
+        }
+
+        assert!(
+            s.bg_processes.is_empty(),
+            "all 10 completed processes should be cleaned up, but {} remain",
+            s.bg_processes.len()
+        );
     }
 
     #[tokio::test]

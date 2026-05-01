@@ -1,0 +1,28 @@
+---
+description: Hard limits (cache sizes, timeouts, max counts) must be configurable, not hardcoded
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Configurable Limits
+
+Numeric limits — cache sizes, max retry counts, timeout durations, buffer
+sizes — must live in `Config` and `daimonos.default.toml`, not as magic
+numbers in operational code.
+
+## What went wrong
+
+When fixing unbounded caches, the max size (1024) was initially hardcoded
+in the X07 plugin and pipeline cache because they didn't have access to
+`Config`. Meanwhile `read_cache` and `exec_usage` correctly used
+`cfg.process.max_cache_entries`. This inconsistency means operators can't
+tune all caches uniformly.
+
+## Rule
+
+1. New limits go in `ProcessConfig` (or the relevant config section) with
+   a sensible default in `Default::default()`.
+2. Add the field to `daimonos.default.toml` with a comment.
+3. Reference `self.cfg.xxx` at the point of use — never `const MAX: usize`.
+4. Exception: truly internal invariants (like "a trigram is 3 bytes") are
+   fine as constants.

@@ -35,6 +35,9 @@ exec_output_max_chars = 100_000
 # Common tool dirs (~/.cargo/bin, ~/.local/bin, etc.) are auto-detected;
 # use this for non-standard locations.
 # extra_path = ["/opt/custom/bin"]
+# Max entries in session-level caches (read_cache, exec_usage).
+# When exceeded, oldest/least-used entries are evicted.
+max_cache_entries = 1024
 
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.

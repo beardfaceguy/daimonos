@@ -1,0 +1,32 @@
+---
+description: Resources created in a "start" path must be cleaned up in the corresponding "end" path
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Complete Resource Lifecycle
+
+When a function **creates** a resource (map entry, temp file, file handle,
+spawned process), the corresponding **teardown** path must clean it up.
+
+## What went wrong
+
+`bg()` inserted into `bg_processes` and created `/tmp/daimonos_bg_*.log`.
+Neither `poll()` nor `kill()` ever called `.remove()` on the map or deleted
+the log file. The "create" half existed but the "destroy" half was missing.
+
+## Rule
+
+1. For every `.insert()` into a map, grep for the corresponding `.remove()`.
+   If it doesn't exist, the lifecycle is incomplete.
+2. For every temp file created, ensure a `remove_file()` call exists on every
+   exit path where the file is no longer needed.
+3. When implementing a "check status" function (like `poll`), handle the
+   terminal state (process exited) by cleaning up — don't just report it.
+
+## Checklist for new bg/spawn patterns
+
+- [ ] Map entry removed when resource is done
+- [ ] Temp files deleted after final read
+- [ ] File handles dropped (not held past usefulness)
+- [ ] Test covers the full lifecycle: create → use → verify cleanup

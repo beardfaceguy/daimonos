@@ -89,13 +89,18 @@ impl Session {
 
         collect_tool_dirs(&parent_dirs, &mut extra);
 
-        if !extra.is_empty() {
+        let path_val = if !extra.is_empty() {
             let mut new_path = extra.join(":");
             if !parent_path.is_empty() {
                 new_path.push(':');
                 new_path.push_str(&parent_path);
             }
-            env.insert("PATH".to_string(), new_path);
+            new_path
+        } else {
+            parent_path
+        };
+        if !path_val.is_empty() {
+            env.insert("PATH".to_string(), path_val);
         }
 
         env
@@ -135,8 +140,15 @@ impl Session {
         }
     }
 
-    /// Record a file read in the cache.
+    /// Record a file read in the cache. Evicts oldest entries when full.
     pub fn update_read_cache(&mut self, path: PathBuf, content: &str) {
+        let max = self.cfg.process.max_cache_entries;
+        if self.read_cache.len() >= max {
+            let evict_key = self.read_cache.keys().next().cloned();
+            if let Some(k) = evict_key {
+                self.read_cache.remove(&k);
+            }
+        }
         let hash = Self::content_hash(content);
         let lines = content.lines().count();
         self.read_cache.insert(path, ReadCacheEntry { hash, lines });
@@ -145,6 +157,22 @@ impl Session {
     /// Invalidate the read cache for a path (after write or edit).
     pub fn invalidate_read_cache(&mut self, path: &PathBuf) {
         self.read_cache.remove(path);
+    }
+
+    /// Record an exec/bg command invocation, evicting the least-used entry when full.
+    pub fn record_exec_usage(&mut self, cmd: String) {
+        let max = self.cfg.process.max_cache_entries;
+        *self.exec_usage.entry(cmd).or_insert(0) += 1;
+        if self.exec_usage.len() > max {
+            let evict_key = self
+                .exec_usage
+                .iter()
+                .min_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = evict_key {
+                self.exec_usage.remove(&k);
+            }
+        }
     }
 
     /// Expose a tool so it appears in future list_tools responses.
@@ -372,5 +400,32 @@ mod tests {
             assert!(s.exposed_tools.contains(name), "activate_all should add {name}");
         }
         assert!(s.exposed_tools.len() > before);
+    }
+
+    #[test]
+    fn read_cache_bounded_after_many_files() {
+        let mut s = test_session("/workspace");
+        for i in 0..2000 {
+            let path = PathBuf::from(format!("/workspace/file_{i}.txt"));
+            s.update_read_cache(path, &format!("content {i}"));
+        }
+        assert!(
+            s.read_cache.len() <= 1024,
+            "read_cache should be bounded to a max size, but has {} entries",
+            s.read_cache.len()
+        );
+    }
+
+    #[test]
+    fn exec_usage_bounded_after_many_commands() {
+        let mut s = test_session("/workspace");
+        for i in 0..2000 {
+            s.record_exec_usage(format!("cmd_{i}"));
+        }
+        assert!(
+            s.exec_usage.len() <= 1024,
+            "exec_usage should be bounded to a max size, but has {} entries",
+            s.exec_usage.len()
+        );
     }
 }

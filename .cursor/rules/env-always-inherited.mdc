@@ -1,0 +1,41 @@
+---
+description: Session environment must always inherit parent PATH, not conditionally
+globs: src/session.rs
+alwaysApply: false
+---
+
+# Always Inherit Parent Environment
+
+When building a session's environment map, **always** include the parent
+process PATH — even when no extra directories are appended.
+
+## What went wrong
+
+`build_initial_env()` only inserted PATH into the env map when extra tool
+directories were found. If no extras existed, PATH was absent entirely.
+This caused downstream code that called `.expect("PATH should be set")` to
+panic, and meant subprocesses wouldn't inherit PATH at all.
+
+## Rule
+
+1. Always start with the parent PATH as the baseline.
+2. Prepend extras if they exist.
+3. The result should always be set in the env map (unless PATH is genuinely
+   empty, which is pathological).
+
+```rust
+// BAD: conditional PATH
+if !extra.is_empty() {
+    env.insert("PATH".into(), new_path);
+}
+
+// GOOD: always inherit
+let path_val = if !extra.is_empty() {
+    format!("{}:{}", extra.join(":"), parent_path)
+} else {
+    parent_path
+};
+if !path_val.is_empty() {
+    env.insert("PATH".into(), path_val);
+}
+```

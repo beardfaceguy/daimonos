@@ -32,13 +32,13 @@ async fn dispatch_op(session: &mut Session, op: Op) -> Response {
         protocol::op::GREP => file_ops::grep(session, &op).await,
         protocol::op::EXEC => {
             if let Some(cmd) = &op.s {
-                *session.exec_usage.entry(cmd.clone()).or_insert(0) += 1;
+                session.record_exec_usage(cmd.clone());
             }
             exec_ops::exec(session, &op).await
         }
         protocol::op::BG => {
             if let Some(cmd) = &op.s {
-                *session.exec_usage.entry(cmd.clone()).or_insert(0) += 1;
+                session.record_exec_usage(cmd.clone());
             }
             exec_ops::bg(session, &op).await
         }

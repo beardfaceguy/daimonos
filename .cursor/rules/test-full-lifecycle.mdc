@@ -1,0 +1,42 @@
+---
+description: Tests must verify the full lifecycle of resources, not just creation
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Test the Full Resource Lifecycle
+
+When writing tests for resource management, don't just test the happy path
+of creation and use. Test that resources are **cleaned up** afterward.
+
+## What went wrong
+
+The original `bg` tests verified that `bg()` spawned a process and `poll()`
+returned results, but never checked that the process entry was removed from
+the map or that the temp log file was deleted. The bugs lived in untested
+teardown paths for months.
+
+## Rule
+
+1. After the "done" action (poll returns exit, kill succeeds, cache clears),
+   assert the resource is **gone**: map is empty, file doesn't exist, count
+   is zero.
+2. Write an accumulation test: run N operations in a loop, then verify the
+   resource count is bounded (e.g. `assert!(map.is_empty())` or
+   `assert!(map.len() <= MAX)`).
+3. For disk resources, assert file non-existence with
+   `assert!(!path.exists())`.
+
+## Example
+
+```rust
+// After polling a completed process:
+assert!(!session.bg_processes.contains_key(&pid));
+assert!(!log_path.exists());
+
+// Accumulation test:
+for _ in 0..10 {
+    spawn_and_complete(&mut session).await;
+}
+assert!(session.bg_processes.is_empty());
+```

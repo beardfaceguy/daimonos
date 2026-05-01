@@ -2,15 +2,19 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+const MAX_CACHE_ENTRIES: usize = 1024;
 
 /// Caches tool command results keyed on workspace content hash.
 /// Automatically invalidates when source files change (via inotify/FSEvents).
 #[allow(dead_code)] // wired into Session but methods called only from test + future pipeline paths
 pub struct PipelineCache {
     inner: Arc<RwLock<CacheState>>,
+    dirty_flag: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -18,8 +22,6 @@ pub struct PipelineCache {
 struct CacheState {
     /// (tool_id, command) -> CachedResult
     entries: HashMap<(String, String), CachedResult>,
-    /// Tracks whether any source file has changed since last cache
-    dirty: bool,
     /// When the last invalidation happened
     last_invalidated: Instant,
 }
@@ -36,34 +38,24 @@ impl PipelineCache {
     pub fn new(watch_path: &Path) -> Self {
         let inner = Arc::new(RwLock::new(CacheState {
             entries: HashMap::new(),
-            dirty: false,
             last_invalidated: Instant::now(),
         }));
 
-        let inner_clone = inner.clone();
-        let watcher = Self::start_watcher(watch_path, inner_clone);
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+        let watcher = Self::start_watcher(watch_path, dirty_flag.clone());
 
         Self {
             inner,
+            dirty_flag,
             _watcher: watcher,
         }
     }
 
-    fn start_watcher(path: &Path, inner: Arc<RwLock<CacheState>>) -> Option<RecommendedWatcher> {
-        let inner_clone = inner.clone();
+    fn start_watcher(path: &Path, dirty: Arc<AtomicBool>) -> Option<RecommendedWatcher> {
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
             if let Ok(event) = res {
                 if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
-                    let inner = inner_clone.clone();
-                    // Mark dirty -- invalidation happens on next cache check
-                    // Using std::thread since this is a sync callback
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Handle::current();
-                        rt.block_on(async {
-                            let mut state = inner.write().await;
-                            state.dirty = true;
-                        });
-                    });
+                    dirty.store(true, Ordering::Relaxed);
                 }
             }
         })
@@ -75,15 +67,14 @@ impl PipelineCache {
 
     /// Get a cached result for a tool command, or None if cache miss or dirty.
     pub async fn get(&self, tool_id: &str, command: &str) -> Option<(serde_json::Value, i32)> {
-        let mut state = self.inner.write().await;
-
-        if state.dirty {
+        if self.dirty_flag.swap(false, Ordering::Relaxed) {
+            let mut state = self.inner.write().await;
             state.entries.clear();
-            state.dirty = false;
             state.last_invalidated = Instant::now();
             return None;
         }
 
+        let state = self.inner.read().await;
         let key = (tool_id.to_string(), command.to_string());
         state
             .entries
@@ -91,7 +82,7 @@ impl PipelineCache {
             .map(|c| (c.output.clone(), c.exit_code))
     }
 
-    /// Store a result in the cache.
+    /// Store a result in the cache. Evicts an arbitrary entry when full.
     pub async fn put(
         &self,
         tool_id: &str,
@@ -100,6 +91,12 @@ impl PipelineCache {
         exit_code: i32,
     ) {
         let mut state = self.inner.write().await;
+        if state.entries.len() >= MAX_CACHE_ENTRIES {
+            let evict_key = state.entries.keys().next().cloned();
+            if let Some(k) = evict_key {
+                state.entries.remove(&k);
+            }
+        }
         let key = (tool_id.to_string(), command.to_string());
         state.entries.insert(
             key,
@@ -113,9 +110,10 @@ impl PipelineCache {
 
     pub async fn stats(&self) -> serde_json::Value {
         let state = self.inner.read().await;
+        let dirty = self.dirty_flag.load(Ordering::Relaxed);
         serde_json::json!({
             "entries": state.entries.len(),
-            "dirty": state.dirty,
+            "dirty": dirty,
             "last_invalidated_ms": state.last_invalidated.elapsed().as_millis() as u64,
         })
     }
@@ -132,6 +130,7 @@ impl PipelineCache {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
 
     fn temp_cache() -> (tempfile::TempDir, PipelineCache) {
         let dir = tempfile::tempdir().unwrap();
@@ -177,15 +176,11 @@ mod tests {
         let (_dir, cache) = temp_cache();
         cache.put("tool1", "build", json!({"ok": true}), 0).await;
 
-        {
-            let mut state = cache.inner.write().await;
-            state.dirty = true;
-        }
+        cache.dirty_flag.store(true, Ordering::Relaxed);
 
         assert!(cache.get("tool1", "build").await.is_none());
-        // dirty flag is reset after clear
+        assert!(!cache.dirty_flag.load(Ordering::Relaxed));
         let state = cache.inner.read().await;
-        assert!(!state.dirty);
         assert!(state.entries.is_empty());
     }
 
@@ -214,5 +209,21 @@ mod tests {
         let h1 = PipelineCache::hash_file(b"aaa");
         let h2 = PipelineCache::hash_file(b"bbb");
         assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn cache_bounded_after_many_entries() {
+        let (_dir, cache) = temp_cache();
+        for i in 0..2000 {
+            cache
+                .put(&format!("tool_{i}"), &format!("cmd_{i}"), json!({"i": i}), 0)
+                .await;
+        }
+        let state = cache.inner.read().await;
+        assert!(
+            state.entries.len() <= 1024,
+            "pipeline cache should be bounded to a max size, but has {} entries",
+            state.entries.len()
+        );
     }
 }

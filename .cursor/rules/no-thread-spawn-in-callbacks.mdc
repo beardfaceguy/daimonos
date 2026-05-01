@@ -1,0 +1,38 @@
+---
+description: Never spawn OS threads in high-frequency callbacks — use atomics or channels
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# No Thread Spawning in High-Frequency Callbacks
+
+Never use `std::thread::spawn` inside a callback that fires on every
+filesystem event, network packet, or timer tick.
+
+## What went wrong
+
+The pipeline cache's `notify` watcher callback spawned a new OS thread on
+every filesystem modify/create/remove event, just to set a boolean flag.
+Under heavy churn, this created hundreds of short-lived threads — an
+unnecessary resource drain.
+
+## Rule
+
+1. If you only need to flip a flag, use `AtomicBool` with `Ordering::Relaxed`.
+2. If you need to send structured data, use a bounded channel
+   (`std::sync::mpsc` or `crossbeam`).
+3. If you absolutely need async from a sync callback, use
+   `tokio::runtime::Handle::try_current()` with `spawn` — not
+   `std::thread::spawn` + `block_on`.
+
+## Example
+
+```rust
+// BAD: thread per event
+std::thread::spawn(move || {
+    rt.block_on(async { state.write().await.dirty = true; });
+});
+
+// GOOD: lock-free atomic flag
+dirty_flag.store(true, Ordering::Relaxed);
+```

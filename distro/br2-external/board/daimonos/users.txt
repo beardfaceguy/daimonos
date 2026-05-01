@@ -1,1 +1,2 @@
 agent -1 agent -1 =- /home/agent /usr/bin/daimonos-shell - Agent user
+bench -1 bench -1 =- /home/bench /bin/sh - Benchmark user

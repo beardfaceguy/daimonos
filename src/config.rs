@@ -52,6 +52,9 @@ pub struct ProcessConfig {
     /// Common tool dirs (~/.cargo/bin, ~/.local/bin) are auto-detected;
     /// use this for non-standard locations.
     pub extra_path: Vec<String>,
+    /// Max entries in session-level caches (read_cache, exec_usage, pipeline_cache).
+    /// When exceeded, oldest/least-used entries are evicted.
+    pub max_cache_entries: usize,
 }
 
 impl Default for IndexConfig {
@@ -80,6 +83,7 @@ impl Default for ProcessConfig {
             poll_tail_lines: 20,
             exec_output_max_chars: 100_000,
             extra_path: Vec::new(),
+            max_cache_entries: 1024,
         }
     }
 }

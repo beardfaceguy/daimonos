@@ -81,6 +81,10 @@ install -d -m 700 "${TARGET_DIR}/home/agent/.ssh"
 install -d -m 755 "${TARGET_DIR}/home/agent/workspace"
 install -d -m 755 "${TARGET_DIR}/etc/daimonos"
 
+# --- Bench user directories (for on-instance benchmarking) ---
+install -d -m 755 "${TARGET_DIR}/home/bench"
+install -d -m 700 "${TARGET_DIR}/home/bench/.ssh"
+
 # --- First-boot rootfs auto-expand (CLA-216) ---
 cat > "${TARGET_DIR}/etc/init.d/S20resize" <<'INITSCRIPT'
 #!/bin/sh
@@ -167,17 +171,35 @@ chmod 755 "${TARGET_DIR}/etc/init.d/S40swap"
 cat > "${TARGET_DIR}/etc/init.d/S45sshkeys" <<'INITSCRIPT'
 #!/bin/sh
 
-AGENT_SSH_DIR="/home/agent/.ssh"
-KEYS_FILE="${AGENT_SSH_DIR}/authorized_keys"
 IMDS="http://169.254.169.254"
+
+inject_keys() {
+    local user="$1"
+    local ssh_dir="/home/${user}/.ssh"
+    local keys_file="${ssh_dir}/authorized_keys"
+
+    mkdir -p "$ssh_dir"
+
+    if [ -n "$IMDS_KEYS" ]; then
+        printf '%s' "$IMDS_KEYS" > "${keys_file}.imds"
+        if [ -f "$keys_file" ]; then
+            while IFS= read -r line; do
+                case "$line" in ""|\#*) continue ;; esac
+                grep -qF "$line" "${keys_file}.imds" 2>/dev/null || \
+                    echo "$line" >> "${keys_file}.imds"
+            done < "$keys_file"
+        fi
+        mv "${keys_file}.imds" "$keys_file"
+        chmod 600 "$keys_file"
+        chown "${user}:${user}" "$keys_file"
+    fi
+}
 
 case "$1" in
     start)
-        mkdir -p "$AGENT_SSH_DIR"
-
         TOKEN=""
+        IMDS_KEYS=""
         if grep -qi amazon /sys/class/dmi/id/sys_vendor 2>/dev/null; then
-            # On EC2: retry token fetch while DHCP settles
             for i in 1 2 3 5 8; do
                 TOKEN=$(curl -sf -X PUT -m 2 \
                     -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
@@ -192,7 +214,6 @@ case "$1" in
                 -H "X-aws-ec2-metadata-token: ${TOKEN}" \
                 "${IMDS}/latest/meta-data/public-keys/" 2>/dev/null) || true
 
-            IMDS_KEYS=""
             for entry in $KEY_IDS; do
                 idx=$(echo "$entry" | cut -d= -f1)
                 key=$(curl -sf -m 2 \
@@ -201,28 +222,16 @@ case "$1" in
                 [ -n "$key" ] && IMDS_KEYS="${IMDS_KEYS}${key}
 "
             done
-
-            if [ -n "$IMDS_KEYS" ]; then
-                printf '%s' "$IMDS_KEYS" > "${KEYS_FILE}.imds"
-                # Merge: IMDS keys first, then static keys not already present
-                if [ -f "$KEYS_FILE" ]; then
-                    while IFS= read -r line; do
-                        case "$line" in ""|\#*) continue ;; esac
-                        grep -qF "$line" "${KEYS_FILE}.imds" 2>/dev/null || \
-                            echo "$line" >> "${KEYS_FILE}.imds"
-                    done < "$KEYS_FILE"
-                fi
-                mv "${KEYS_FILE}.imds" "$KEYS_FILE"
-                chmod 600 "$KEYS_FILE"
-                chown agent:agent "$KEYS_FILE"
-                echo "SSH keys: $(wc -l < "$KEYS_FILE") key(s) installed (IMDS + static)"
-                exit 0
-            fi
         fi
 
-        # Fallback: keep static keys from overlay
-        if [ -f "$KEYS_FILE" ] && [ -s "$KEYS_FILE" ]; then
-            echo "IMDS unavailable, using $(wc -l < "$KEYS_FILE") static key(s)"
+        inject_keys "agent"
+        inject_keys "bench"
+
+        AGENT_KEYS="/home/agent/.ssh/authorized_keys"
+        if [ -f "$AGENT_KEYS" ] && [ -s "$AGENT_KEYS" ]; then
+            echo "SSH keys: $(wc -l < "$AGENT_KEYS") key(s) installed (IMDS + static)"
+        elif [ -n "$IMDS_KEYS" ]; then
+            echo "SSH keys installed from IMDS"
         else
             echo "WARNING: No SSH keys available"
         fi
@@ -237,6 +246,14 @@ cat > "${TARGET_DIR}/home/agent/.gitconfig" <<'GITCFG'
 [user]
 	email = agent@daimonos.dev
 	name = Daimonos Agent
+GITCFG
+
+# --- Git identity for bench user ---
+install -d -m 755 "${TARGET_DIR}/home/bench"
+cat > "${TARGET_DIR}/home/bench/.gitconfig" <<'GITCFG'
+[user]
+	email = bench@daimonos.dev
+	name = Daimonos Bench
 GITCFG
 
 # --- Lock root ---

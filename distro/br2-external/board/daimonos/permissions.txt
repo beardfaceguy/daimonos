@@ -3,3 +3,6 @@
 /home/agent/.ssh/authorized_keys f 600 agent agent - - - - -
 /home/agent/workspace   d 755 agent agent - - - - -
 /home/agent/.gitconfig  f 644 agent agent - - - - -
+/home/bench             d 755 bench bench - - - - -
+/home/bench/.ssh        d 700 bench bench - - - - -
+/home/bench/.ssh/authorized_keys f 600 bench bench - - - - -

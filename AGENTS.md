@@ -15,6 +15,7 @@ Cross-tool guidance for AI coding agents working in this repository.
    planned. Understand the full project state from Linear before touching
    the codebase.
 3. Check `.cursor/rules/` if scoped rule files exist.
+4. Check `.cursor/strategies/` if scoped strategy/pattern files exist.
 4. Check `docs/` for technical specs (protocol, architecture decisions).
 5. **Only then** read source code as needed for your specific task.
 

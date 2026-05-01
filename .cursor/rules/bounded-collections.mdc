@@ -1,0 +1,41 @@
+---
+description: Every HashMap/Vec held in long-lived state must have a bounded size with eviction
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Bounded Collections in Long-Lived State
+
+Every `HashMap`, `BTreeMap`, or `Vec` stored in a struct that lives for the
+duration of a session (e.g. `Session`, plugin caches, pipeline state) **must**
+have a maximum size with an eviction strategy.
+
+## What went wrong
+
+Four separate caches (`read_cache`, `exec_usage`, `decl_cache`,
+`pipeline_cache.entries`) were implemented as plain `HashMap::insert()` with
+no size check. Over a long session, each could grow without bound.
+
+## Rule
+
+1. When adding a collection to a long-lived struct, decide the max size
+   **at design time** and make it configurable (via `Config`) where possible.
+2. Before every `.insert()`, check `len() >= max` and evict.
+3. Prefer the simplest eviction that fits: arbitrary eviction (`.keys().next()`)
+   for caches, least-used eviction for frequency counters.
+
+## Example
+
+```rust
+// BAD: unbounded insert
+self.cache.insert(key, value);
+
+// GOOD: bounded insert with eviction
+if self.cache.len() >= self.cfg.max_cache_entries {
+    let evict = self.cache.keys().next().cloned();
+    if let Some(k) = evict {
+        self.cache.remove(&k);
+    }
+}
+self.cache.insert(key, value);
+```

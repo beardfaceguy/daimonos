@@ -235,7 +235,7 @@ impl X07Plugin {
             .unwrap_or(false)
     }
 
-    /// Store lint result for a declaration hash.
+    /// Store lint result for a declaration hash. Evicts an arbitrary entry when full.
     #[allow(dead_code)]
     pub async fn cache_lint_result(
         &self,
@@ -244,6 +244,13 @@ impl X07Plugin {
         diagnostics: Option<serde_json::Value>,
     ) {
         let mut cache = self.decl_cache.write().await;
+        const MAX_ENTRIES: usize = 1024;
+        if cache.entries.len() >= MAX_ENTRIES {
+            let evict_key = cache.entries.keys().next().cloned();
+            if let Some(k) = evict_key {
+                cache.entries.remove(&k);
+            }
+        }
         cache.entries.insert(
             content_hash.to_string(),
             CacheEntry {
@@ -548,6 +555,22 @@ mod tests {
         let h2 = X07Plugin::content_hash(b"hello");
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn decl_cache_bounded_after_many_entries() {
+        let plugin = X07Plugin::new("/usr/bin/x07");
+        for i in 0..2000 {
+            plugin
+                .cache_lint_result(&format!("hash_{i}"), true, None)
+                .await;
+        }
+        let cache = plugin.decl_cache.read().await;
+        assert!(
+            cache.entries.len() <= 1024,
+            "decl_cache should be bounded to a max size, but has {} entries",
+            cache.entries.len()
+        );
     }
 
     #[tokio::test]
