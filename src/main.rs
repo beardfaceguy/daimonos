@@ -1,3 +1,4 @@
+mod analytics;
 mod config;
 mod index;
 mod mcp;
@@ -39,6 +40,10 @@ struct Cli {
     /// Run as MCP server over stdio (for Cursor integration)
     #[arg(long, default_value_t = false)]
     mcp: bool,
+
+    /// Print token analytics summary and exit
+    #[arg(long, default_value_t = false)]
+    stats: bool,
 }
 
 #[tokio::main]
@@ -86,10 +91,44 @@ async fn main() -> anyhow::Result<()> {
 
     let pcache = Arc::new(pipeline_cache::PipelineCache::new(&workspace));
 
-    if cli.mcp {
-        mcp::run_mcp_server(workspace, cfg, ws_index, tool_reg, pcache).await
+    // Analytics: --stats prints summary and exits
+    if cli.stats {
+        let db_path = cfg.analytics.resolved_db_path();
+        if !db_path.exists() {
+            eprintln!("No analytics data found at {}", db_path.display());
+            return Ok(());
+        }
+        match analytics::AnalyticsStore::open_readonly(&db_path) {
+            Ok(store) => {
+                let report = store.format_stats_report(cfg.analytics.retention_days);
+                eprint!("{report}");
+            }
+            Err(e) => eprintln!("Failed to open analytics: {e}"),
+        }
+        return Ok(());
+    }
+
+    // Initialize analytics store for session tracking
+    let analytics_store = if cfg.analytics.enabled {
+        let db_path = cfg.analytics.resolved_db_path();
+        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+            Ok(store) => {
+                eprintln!("analytics: enabled ({})", db_path.display());
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                eprintln!("analytics: disabled (init failed: {e})");
+                None
+            }
+        }
     } else {
-        run_socket_server(cli, workspace, cfg, ws_index, tool_reg, pcache).await
+        None
+    };
+
+    if cli.mcp {
+        mcp::run_mcp_server(workspace, cfg, ws_index, tool_reg, pcache, analytics_store).await
+    } else {
+        run_socket_server(cli, workspace, cfg, ws_index, tool_reg, pcache, analytics_store).await
     }
 }
 
@@ -100,6 +139,7 @@ async fn run_socket_server(
     ws_index: Arc<index::WorkspaceIndex>,
     tool_reg: Arc<tool_runner::ToolRegistry>,
     pcache: Arc<pipeline_cache::PipelineCache>,
+    analytics: Option<Arc<analytics::AnalyticsStore>>,
 ) -> anyhow::Result<()> {
     if cli.socket.exists() {
         std::fs::remove_file(&cli.socket)?;
@@ -121,9 +161,10 @@ async fn run_socket_server(
         let cfg_clone = cfg.clone();
         let tr = tool_reg.clone();
         let pc = pcache.clone();
+        let an = analytics.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ws, debug, idx, cfg_clone, tr, pc).await {
+            if let Err(e) = handle_connection(stream, ws, debug, idx, cfg_clone, tr, pc, an).await {
                 eprintln!("connection error: {e}");
             }
         });
@@ -138,6 +179,7 @@ async fn handle_connection(
     cfg: Arc<config::Config>,
     tool_reg: Arc<tool_runner::ToolRegistry>,
     pcache: Arc<pipeline_cache::PipelineCache>,
+    analytics: Option<Arc<analytics::AnalyticsStore>>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -145,6 +187,7 @@ async fn handle_connection(
     session.index = Some(ws_index);
     session.tool_registry = Some(tool_reg);
     session.pipeline_cache = Some(pcache);
+    session.analytics = analytics;
     let mut line = String::new();
 
     loop {

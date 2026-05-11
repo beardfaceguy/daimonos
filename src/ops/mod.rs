@@ -116,7 +116,7 @@ fn session_info(session: &Session) -> Response {
     top_cmds.sort_by(|a, b| b.1.cmp(a.1));
     top_cmds.truncate(20);
 
-    Response::ok(serde_json::json!({
+    let mut info = serde_json::json!({
         "workspace": session.workspace.to_string_lossy(),
         "cwd": session.cwd.to_string_lossy(),
         "env_keys": session.env.keys().collect::<Vec<_>>(),
@@ -124,5 +124,19 @@ fn session_info(session: &Session) -> Response {
         "exec_usage": top_cmds.into_iter()
             .map(|(cmd, count)| serde_json::json!({"cmd": cmd, "n": count}))
             .collect::<Vec<_>>(),
-    }))
+    });
+
+    if let Some(analytics) = &session.analytics {
+        let stats = analytics.session_summary();
+        info["analytics"] = serde_json::json!({
+            "calls": stats.total_calls,
+            "req_tokens": stats.total_request_tokens,
+            "resp_tokens": stats.total_response_tokens,
+            "redirects": stats.redirect_hits,
+            "filters": stats.filter_hits,
+            "dedup_hits": stats.dedup_hits,
+        });
+    }
+
+    Response::ok(info)
 }

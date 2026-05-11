@@ -1,3 +1,4 @@
+use crate::analytics::AnalyticsStore;
 use crate::config::Config;
 use crate::index::WorkspaceIndex;
 use crate::pipeline_cache::PipelineCache;
@@ -37,6 +38,7 @@ pub struct Session {
     /// Tools the model has already called this session. Used to strip schemas
     /// from list_tools responses — the model already has them in context.
     pub used_tools: HashSet<String>,
+    pub analytics: Option<Arc<AnalyticsStore>>,
     next_pid: u32,
 }
 
@@ -64,6 +66,7 @@ impl Session {
             read_cache: HashMap::new(),
             exposed_tools: tools::initial_exposed_tools(),
             used_tools: HashSet::new(),
+            analytics: None,
             next_pid: 1,
         }
     }

@@ -12,6 +12,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub process: ProcessConfig,
+    pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -63,6 +64,50 @@ pub struct ProcessConfig {
     /// (e.g. `exec("cargo test")` routes through the cargo plugin for
     /// structured JSON output). Set false to always use raw exec.
     pub exec_plugin_redirect: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsConfig {
+    pub enabled: bool,
+    /// Path to SQLite database. Default: ~/.daimonos/analytics.db
+    pub db_path: Option<String>,
+    /// Days to retain analytics data before auto-cleanup.
+    pub retention_days: u64,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db_path: None,
+            retention_days: 90,
+        }
+    }
+}
+
+impl AnalyticsConfig {
+    pub fn resolved_db_path(&self) -> std::path::PathBuf {
+        if let Some(p) = &self.db_path {
+            let expanded = if let Some(rest) = p.strip_prefix("~/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    std::path::PathBuf::from(home).join(rest)
+                } else {
+                    std::path::PathBuf::from(p)
+                }
+            } else {
+                std::path::PathBuf::from(p)
+            };
+            return expanded;
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home)
+                .join(".daimonos")
+                .join("analytics.db")
+        } else {
+            std::path::PathBuf::from("/tmp/daimonos-analytics.db")
+        }
+    }
 }
 
 impl Default for IndexConfig {

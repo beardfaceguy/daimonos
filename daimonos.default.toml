@@ -49,6 +49,15 @@ exec_output_filters = true
 # Set false to always use raw exec.
 exec_plugin_redirect = true
 
+[analytics]
+# Track per-tool-call token usage, latency, and savings.
+# Data is stored in SQLite for cross-session history.
+enabled = true
+# Path to analytics database (default: ~/.daimonos/analytics.db)
+# db_path = "~/.daimonos/analytics.db"
+# Auto-delete records older than this many days
+retention_days = 90
+
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.
 # Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.

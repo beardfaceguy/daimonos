@@ -28,6 +28,8 @@ rust-mcp-sdk = { version = "0.9", default-features = false, features = ["server"
 similar = "3"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

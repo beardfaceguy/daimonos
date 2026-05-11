@@ -450,6 +450,21 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "session_stats",
+            tier: ToolTier::Terse,
+            description: "Token analytics. Scopes: session (current totals), history (cross-session), daily (trend).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["session", "history", "daily"], "description": "Default: session"},
+                    "days": {"type": "integer", "description": "history/daily: lookback days (default 30)"}
+                }
+            }),
+            to_request: None, // needs session.analytics access
+            context_check: None,
+        },
+
+        ToolDef {
             name: "list_all_tools",
             tier: ToolTier::Terse,
             description: "Show all available tools including extended ones (diff, pipelines, repair). Call once to unlock them.",

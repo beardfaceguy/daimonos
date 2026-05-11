@@ -106,6 +106,15 @@ starts when your IDE or CLI launches it and exits when the session ends.
 
 ## Next Steps
 
-- [Set up with Cursor IDE](cursor-setup.md) — recommended for most users
-- [Set up with Claude Code CLI](claude-cli-setup.md) — for terminal-based workflows
-- [Configuration reference](configuration.md) — tuning indexing, search, and exec behavior
+Pick the setup guide for your AI tool:
+
+- [Cursor IDE](cursor-setup.md)
+- [GitHub Copilot](copilot-setup.md) (VS Code, Visual Studio, JetBrains, Xcode, Eclipse)
+- [Claude Code CLI](claude-cli-setup.md)
+- [Windsurf](windsurf-setup.md)
+- [Cline](cline-setup.md) (VS Code extension)
+- [Gemini CLI](gemini-cli-setup.md)
+- [Zed Editor](zed-setup.md)
+- [Other tools](other-tools-setup.md) (Claude Desktop, ChatGPT, Continue.dev, BoltAI, etc.)
+
+For tuning behavior: [Configuration reference](configuration.md)

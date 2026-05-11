@@ -43,7 +43,7 @@ read the Daimonos initiative description in Linear.
 | Vision, roadmap, project status | Linear initiative "Daimonos" |
 | Research findings and analysis | Linear project documents |
 | Task status and ownership | Linear issues |
-| Install & setup guides | `docs/install.md`, `docs/cursor-setup.md`, `docs/claude-cli-setup.md` |
+| Install & setup guides | `docs/install.md` + per-tool guides in `docs/` |
 | Protocol specification | `docs/protocol.md` |
 | Configuration reference | `docs/configuration.md` and `daimonos.default.toml` |
 | Architecture decisions | `docs/` directory |
@@ -83,7 +83,13 @@ daimonos/
 ├── docs/
 │   ├── install.md                 # Build & install instructions
 │   ├── cursor-setup.md            # Cursor IDE integration guide
+│   ├── copilot-setup.md           # GitHub Copilot (VS Code, Visual Studio, JetBrains, Xcode, Eclipse)
 │   ├── claude-cli-setup.md        # Claude Code CLI integration guide
+│   ├── windsurf-setup.md          # Windsurf IDE integration guide
+│   ├── cline-setup.md             # Cline (VS Code extension) integration guide
+│   ├── gemini-cli-setup.md        # Gemini CLI integration guide
+│   ├── zed-setup.md               # Zed editor integration guide
+│   ├── other-tools-setup.md       # General MCP setup (Claude Desktop, ChatGPT, Continue.dev, etc.)
 │   ├── configuration.md           # Config file reference (all tunables)
 │   └── protocol.md                # Opcode protocol specification
 ├── tests/
@@ -100,9 +106,11 @@ daimonos/
 │   ├── test_diff.py               # diff_files tool
 │   ├── test_git.py                # unified git tool (status, log, diff, branch, add, commit, etc.)
 │   ├── test_snapshots.py          # unified snapshot tool (create, restore, list, delete)
-│   └── test_batch.py             # batch tool (multi-op single round-trip)
+│   ├── test_batch.py             # batch tool (multi-op single round-trip)
+│   └── test_analytics.py         # session_stats tool, workspace_info analytics, dedup tracking
 └── src/
-    ├── main.rs                    # Entrypoint: --mcp (stdio MCP) or Unix socket mode
+    ├── main.rs                    # Entrypoint: --mcp (stdio MCP), Unix socket, or --stats
+    ├── analytics.rs               # Token analytics: SQLite-backed per-tool-call tracking
     ├── mcp.rs                     # MCP server handler (stdio transport for Cursor)
     ├── config.rs                  # TOML config loading, tool registration
     ├── protocol.rs                # Request/Response types, opcode constants
@@ -212,6 +220,14 @@ daimonos/
   (ps, logs, exec, images, inspect, stop, compose_up, compose_down,
   compose_ps). `snapshot` has an `action` enum (create, restore, list,
   delete). This pattern keeps tool definitions compact.
+- **Token analytics**: every MCP tool call is instrumented with timing and
+  token estimation (`ceil(chars / 4.0)` heuristic). Analytics are stored in
+  SQLite (`~/.daimonos/analytics.db`) for cross-session history with 90-day
+  auto-cleanup. In-memory session stats track per-tool breakdowns, redirect
+  (L1) and filter (L2) hits, and read dedup hits. Exposed via `session_stats`
+  MCP tool (scopes: session, history, daily), `workspace_info` analytics
+  summary, and `daimonos --stats` CLI flag. Configure or disable via
+  `[analytics]` in `daimonos.toml`.
 - **Compact responses**: all MCP tool responses use compact JSON
   (`to_string`, not `to_string_pretty`). Redundant fields (`count` on
   arrays, `size` on writes) are omitted. Empty `err` fields in exec

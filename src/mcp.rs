@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::Config;
 use crate::index::WorkspaceIndex;
 use crate::ops;
@@ -64,6 +65,60 @@ fn response_to_result(resp: Response) -> std::result::Result<CallToolResult, Cal
 }
 
 async fn dispatch_tool(
+    session: &mut Session,
+    name: &str,
+    args: &Value,
+) -> std::result::Result<CallToolResult, CallToolError> {
+    let start = std::time::Instant::now();
+    let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
+
+    let result = dispatch_tool_inner(session, name, args).await;
+
+    // Record analytics
+    if let Some(analytics) = &session.analytics {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let (response_chars, was_redirect, was_filtered, read_dedup) = match &result {
+            Ok(r) => {
+                let text = extract_result_text(r);
+                let redirect = text.contains("\"via\":\"plugin\"") || text.contains("\"via\": \"plugin\"");
+                let filtered = text.contains("\"filter\":");
+                let dedup = text.contains("\"unchanged\":true") || text.contains("\"unchanged\": true");
+                (text.len(), redirect, filtered, dedup)
+            }
+            Err(_) => (0, false, false, false),
+        };
+
+        let command = match name {
+            "exec" | "git" | "cargo" | "gh" | "docker" => {
+                tools::get_str(args, "command")
+            }
+            _ => None,
+        };
+
+        let record = ToolCallRecord {
+            tool_name: name.to_string(),
+            command,
+            request_tokens: analytics::estimate_tokens(request_chars),
+            response_tokens: analytics::estimate_tokens(response_chars),
+            saved_tokens: 0, // baseline comparison not available at this layer
+            savings_pct: 0.0,
+            exec_time_ms: elapsed_ms,
+            was_redirect,
+            was_filtered,
+            read_dedup,
+            batch_size: 1,
+        };
+
+        let analytics = analytics.clone();
+        tokio::task::spawn_blocking(move || {
+            analytics.record(&record);
+        });
+    }
+
+    result
+}
+
+async fn dispatch_tool_inner(
     session: &mut Session,
     name: &str,
     args: &Value,
@@ -134,6 +189,36 @@ async fn dispatch_tool(
             ok_text(serde_json::to_string(&summary).unwrap_or_default())
         }
 
+        "session_stats" => {
+            let analytics = match &session.analytics {
+                Some(a) => a,
+                None => return err_text("analytics not enabled".into()),
+            };
+
+            let scope = tools::get_str(args, "scope").unwrap_or_else(|| "session".into());
+            let days = tools::get_i64(args, "days").unwrap_or(30) as u64;
+
+            match scope.as_str() {
+                "session" => {
+                    let stats = analytics.session_summary();
+                    ok_text(serde_json::to_string(&stats).unwrap_or_default())
+                }
+                "history" => {
+                    match analytics.history_summary(days) {
+                        Ok(summary) => ok_text(serde_json::to_string(&summary).unwrap_or_default()),
+                        Err(e) => err_text(format!("history query: {e}")),
+                    }
+                }
+                "daily" => {
+                    match analytics.daily_trend(days) {
+                        Ok(trend) => ok_text(serde_json::to_string(&trend).unwrap_or_default()),
+                        Err(e) => err_text(format!("daily query: {e}")),
+                    }
+                }
+                _ => err_text(format!("unknown scope: {scope}. Use session, history, or daily")),
+            }
+        }
+
         "workspace_info" => {
             use crate::protocol::{Op, Request, op};
 
@@ -157,6 +242,19 @@ async fn dispatch_tool(
                 None => None,
             };
 
+            let analytics_summary = session.analytics.as_ref().map(|a| {
+                let s = a.session_summary();
+                json!({
+                    "calls": s.total_calls,
+                    "req_tokens": s.total_request_tokens,
+                    "resp_tokens": s.total_response_tokens,
+                    "saved_tokens": s.total_saved_tokens,
+                    "redirects": s.redirect_hits,
+                    "filters": s.filter_hits,
+                    "dedup_hits": s.dedup_hits,
+                })
+            });
+
             let mut info = json!({});
             if let Some(d) = session_resp.d {
                 info["session"] = d;
@@ -166,6 +264,9 @@ async fn dispatch_tool(
             }
             if let Some(stats) = idx_stats {
                 info["index"] = stats;
+            }
+            if let Some(a) = analytics_summary {
+                info["analytics"] = a;
             }
 
             response_to_result(Response::ok(info))
@@ -544,11 +645,13 @@ pub async fn run_mcp_server(
     ws_index: Arc<WorkspaceIndex>,
     tool_reg: Arc<ToolRegistry>,
     pcache: Arc<PipelineCache>,
+    analytics: Option<Arc<AnalyticsStore>>,
 ) -> anyhow::Result<()> {
     let mut session = Session::new(workspace.clone(), cfg);
     session.index = Some(ws_index);
     session.tool_registry = Some(tool_reg);
     session.pipeline_cache = Some(pcache);
+    session.analytics = analytics;
 
     let instructions = build_instructions(&workspace).await;
     let handler = DaimonosHandler::new(session);

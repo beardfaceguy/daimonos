@@ -490,6 +490,40 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         })
     }
 
+    fn session_stats<'v>(
+        #[starlark(require = named, default = "session")] scope: &str,
+        #[starlark(require = named)] days: Option<i64>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let session = ctx.session.clone();
+            let scope = scope.to_string();
+            let resp = ctx.handle.block_on(async {
+                let s = session.lock().await;
+                let analytics = s.analytics.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("analytics not enabled"))?;
+                match scope.as_str() {
+                    "session" => {
+                        let stats = analytics.session_summary();
+                        Ok(Response::ok(serde_json::to_value(&stats).unwrap_or_default()))
+                    }
+                    "history" => {
+                        analytics.history_summary(days.unwrap_or(30) as u64)
+                            .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    }
+                    "daily" => {
+                        analytics.daily_trend(days.unwrap_or(30) as u64)
+                            .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    }
+                    _ => Err(anyhow::anyhow!("unknown scope: {scope}")),
+                }
+            })?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
     fn docker<'v>(
         command: &str,
         #[starlark(require = named)] container: Option<&str>,
@@ -535,6 +569,7 @@ pub fn tool_signatures() -> String {
         "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
         "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
         "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
+        "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
     ];
     sigs.join("\n")
