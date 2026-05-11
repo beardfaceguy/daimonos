@@ -108,7 +108,13 @@ run_task() {
 
   if [ "$MODE" = "daimonos" ]; then
     CLAUDE_ARGS="$CLAUDE_ARGS --mcp-config $MCP_CONFIG --strict-mcp-config"
-    CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks. Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
+    task_category="$(json_field "$task_file" category)"
+    if [ "$task_category" = "exec_filter" ]; then
+      # exec_filter tasks: force exec tool usage to exercise L1/L2 filtering
+      CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Use the daimonos exec tool to run shell commands. Do NOT use the cargo, git, gh, or docker tools directly — run all commands through exec(). Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
+    else
+      CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks. Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
+    fi
   fi
 
   start_s="$(date +%s)"

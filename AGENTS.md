@@ -117,6 +117,7 @@ daimonos/
     │   ├── mod.rs                 # Opcode dispatcher
     │   ├── file_ops.rs            # Opcodes 0-6: read, write, patch, ls (auto-skips .git/node_modules/target), stat, glob, grep
     │   ├── exec_ops.rs            # Opcodes 8-11: exec, bg, poll, kill
+    │   ├── exec_filter.rs         # Semantic exec output filters (test, build, install, lint)
     │   ├── diff_ops.rs            # Opcode 14: diff (in-process structured diffing)
     │   ├── snap_ops.rs            # Opcodes 12-13, 25-26: snap, restore, snap_list, snap_delete
     │   ├── tool_ops.rs            # Opcodes 20-24: tool_run, repair, pipeline, register, list
@@ -174,10 +175,19 @@ daimonos/
 - **Edit confirmation with diffs**: `edit_file` (patch opcode) returns a
   `diffs` array alongside `applied`, showing each `[old, new]` pair that
   was successfully applied. When nothing matches, `diffs` is omitted.
+- **Exec output filtering**: when `config.process.exec_output_filters` is
+  enabled (default: true), recognized commands get semantic output
+  compression via `ops/exec_filter.rs`. Test runners (cargo test, pytest,
+  jest, go test) return only summary + failures. Build commands (cargo
+  build, make, go build) return "ok" on success or just error/warning
+  lines on failure. Install commands (pip install, npm install) return
+  "ok: install complete" or error-only output. Linters get the same
+  treatment as builds. Unknown commands pass through unfiltered.
 - **Exec output capping**: `exec` output (stdout and stderr) is
   auto-truncated when it exceeds `config.process.exec_output_max_chars`
   (default 100 KB). Truncated output keeps the first and last lines with a
-  `[N lines, M chars truncated]` notice in the middle.
+  `[N lines, M chars truncated]` notice in the middle. Capping is applied
+  after filtering as a safety net.
 - **Lazy tool exposure**: only core tools (`read_file`, `write_file`,
   `edit_file`, `search`, `workspace_info`, `exec`, `batch`,
   `list_all_tools`) plus commonly-used consolidated tools (`git`,

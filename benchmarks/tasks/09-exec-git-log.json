@@ -1,0 +1,13 @@
+{
+  "id": "09-exec-git-log",
+  "name": "Run git commands via shell and summarize",
+  "category": "exec_filter",
+  "applies_to": ["cursor", "daimonos"],
+  "prompt": "Run the following commands in the shell and summarize the results: `git log --oneline`, `git status`, and `git diff --stat HEAD~1`. Tell me the number of commits, whether there are uncommitted changes, and what files were changed in the most recent commit.",
+  "expected_behavior": "Agent runs three git commands via exec/shell. Reports commit history, clean working tree, and files changed. In daimonos mode, L1 redirect intercepts git exec calls and returns structured JSON from the git plugin.",
+  "success_criteria": [
+    "Reports correct commit count from git log",
+    "Reports clean/dirty status correctly",
+    "Reports files changed in last commit"
+  ]
+}

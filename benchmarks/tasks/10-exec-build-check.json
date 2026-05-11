@@ -1,0 +1,13 @@
+{
+  "id": "10-exec-build-check",
+  "name": "Run build and lint via shell",
+  "category": "exec_filter",
+  "applies_to": ["cursor", "daimonos"],
+  "prompt": "Run `cargo check` and `cargo clippy` in the shell to check this project for compilation errors and lint warnings. Report whether the project compiles cleanly, and list any warnings or errors you find.",
+  "expected_behavior": "Agent runs cargo check and cargo clippy via exec/shell. Reports compilation success and any clippy warnings. In daimonos mode, L1 redirect intercepts these cargo commands and returns structured JSON from the cargo plugin.",
+  "success_criteria": [
+    "Reports successful compilation",
+    "Reports clippy results",
+    "No false errors reported"
+  ]
+}

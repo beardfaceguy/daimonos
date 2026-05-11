@@ -55,6 +55,14 @@ pub struct ProcessConfig {
     /// Max entries in session-level caches (read_cache, exec_usage, pipeline_cache).
     /// When exceeded, oldest/least-used entries are evicted.
     pub max_cache_entries: usize,
+    /// Apply semantic output filters to exec commands (test runners, builds,
+    /// installers, linters). Extracts only relevant output — e.g. failure
+    /// details from test runs, error lines from builds. Set false to disable.
+    pub exec_output_filters: bool,
+    /// Redirect exec commands to native plugins when a match is found
+    /// (e.g. `exec("cargo test")` routes through the cargo plugin for
+    /// structured JSON output). Set false to always use raw exec.
+    pub exec_plugin_redirect: bool,
 }
 
 impl Default for IndexConfig {
@@ -84,6 +92,8 @@ impl Default for ProcessConfig {
             exec_output_max_chars: 100_000,
             extra_path: Vec::new(),
             max_cache_entries: 1024,
+            exec_output_filters: true,
+            exec_plugin_redirect: true,
         }
     }
 }

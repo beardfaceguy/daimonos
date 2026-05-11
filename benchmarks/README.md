@@ -71,8 +71,19 @@ benchmarks/
 | 05 | Run tests and interpret results | execute | yes | yes |
 | 06 | Check git status and history | git | yes | yes |
 | 07 | Snapshot, modify, and rollback | snapshot | no | yes |
+| 08 | Run cargo test/build via shell | exec_filter | yes | yes |
+| 09 | Run git commands via shell | exec_filter | yes | yes |
+| 10 | Run build + lint via shell | exec_filter | yes | yes |
+| 11 | Multi-command shell workflow | exec_filter | yes | yes |
 
 Task 07 is daimonos-only since Cursor has no native snapshot/rollback capability.
+
+Tasks 08-11 are `exec_filter` tasks that exercise the exec output filtering
+pipeline (L1: plugin redirect, L2: semantic output filters). In daimonos mode,
+the system prompt instructs the agent to use `exec()` instead of native tools,
+so commands like `cargo test` flow through the exec pipeline where L1 redirects
+them to the cargo plugin for structured JSON, and L2 filters output for
+unrecognized commands. In baseline mode, the agent runs raw shell commands.
 
 ## Environment variables
 

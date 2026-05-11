@@ -1,7 +1,12 @@
+use crate::ops::exec_filter;
 use crate::protocol::{Op, Response};
 use crate::session::{BgProcess, Session};
+use crate::tool_runner::ToolRegistry;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 
 /// When args is empty and command contains whitespace, shell-wrap via `sh -c`
@@ -57,6 +62,337 @@ fn cap_output(text: &str, max_chars: usize) -> String {
     )
 }
 
+/// Attempt to redirect an exec command through a native plugin for structured output.
+/// Returns Some(Response) if the command was handled, None to fall through to raw exec.
+async fn try_plugin_redirect(
+    full_cmd: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    registry: &Arc<ToolRegistry>,
+) -> Option<Response> {
+    let words: Vec<&str> = full_cmd.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    let base = words[0].rsplit('/').next().unwrap_or(words[0]);
+    let rest = &words[1..];
+
+    match base {
+        "cargo" => parse_cargo_redirect(rest, cwd, env, registry).await,
+        "git" => parse_git_redirect(rest, cwd, env, registry).await,
+        "gh" => parse_gh_redirect(rest, cwd, env, registry).await,
+        "docker" => parse_docker_redirect(rest, cwd, env, registry).await,
+        _ => None,
+    }
+}
+
+fn plugin_response(output: serde_json::Value) -> Response {
+    let text = serde_json::to_string(&output).unwrap_or_default();
+    Response::ok(json!({"exit": 0, "out": text, "via": "plugin"}))
+}
+
+fn plugin_error_response(tool: &str, cmd: &str, err: &str) -> Response {
+    Response::ok(json!({"exit": 1, "out": format!("{tool} {cmd}: {err}"), "via": "plugin"}))
+}
+
+// --- cargo redirect ---
+
+async fn parse_cargo_redirect(
+    args: &[&str],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    registry: &Arc<ToolRegistry>,
+) -> Option<Response> {
+    if args.is_empty() {
+        return None;
+    }
+    let subcommand = args[0];
+    let rest = &args[1..];
+
+    match subcommand {
+        "test" | "build" | "check" | "clippy" | "fmt" | "add" => {}
+        _ => return None,
+    }
+
+    let mut plugin_args = json!({});
+    let mut i = 0;
+    let flag_args = rest;
+    while i < flag_args.len() {
+        match flag_args[i] {
+            "--package" | "-p" if i + 1 < flag_args.len() => {
+                plugin_args["package"] = json!(flag_args[i + 1]);
+                i += 2;
+            }
+            "--lib" => {
+                plugin_args["lib"] = json!(true);
+                i += 1;
+            }
+            "--check" if subcommand == "fmt" => {
+                plugin_args["check"] = json!(true);
+                i += 1;
+            }
+            "--release" if subcommand == "build" => {
+                plugin_args["release"] = json!(true);
+                i += 1;
+            }
+            "--" => {
+                // Everything after -- is the test filter
+                if i + 1 < flag_args.len() {
+                    plugin_args["filter"] = json!(flag_args[i + 1..].join(" "));
+                }
+                break;
+            }
+            _ => {
+                // Unrecognized flag — fall through to raw exec
+                return None;
+            }
+        }
+    }
+
+    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+        None
+    } else {
+        Some(plugin_args)
+    };
+
+    match registry
+        .run("cargo", subcommand, cwd, env, None, extra.as_ref())
+        .await
+    {
+        Ok(result) => Some(plugin_response(result.output)),
+        Err(e) => Some(plugin_error_response("cargo", subcommand, &e)),
+    }
+}
+
+// --- git redirect ---
+
+async fn parse_git_redirect(
+    args: &[&str],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    registry: &Arc<ToolRegistry>,
+) -> Option<Response> {
+    if args.is_empty() {
+        return None;
+    }
+    let subcommand = args[0];
+    let rest = &args[1..];
+
+    match subcommand {
+        "status" | "log" | "diff" | "branch" | "add" | "commit" | "push" | "pull"
+        | "checkout" => {}
+        _ => return None,
+    }
+
+    let mut plugin_args = json!({});
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "-n" | "--max-count" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<i64>() {
+                    plugin_args["limit"] = json!(n);
+                }
+                i += 2;
+            }
+            "--oneline" => {
+                plugin_args["oneline"] = json!(true);
+                i += 1;
+            }
+            "--staged" | "--cached" => {
+                plugin_args["mode"] = json!("staged");
+                i += 1;
+            }
+            "-m" if i + 1 < rest.len() => {
+                plugin_args["message"] = json!(rest[i + 1]);
+                i += 2;
+            }
+            "-a" | "--all" if subcommand == "commit" => {
+                plugin_args["all"] = json!(true);
+                i += 1;
+            }
+            "-b" if subcommand == "checkout" && i + 1 < rest.len() => {
+                plugin_args["branch"] = json!(rest[i + 1]);
+                plugin_args["create"] = json!(true);
+                i += 2;
+            }
+            "--" => {
+                // Path filter for log/diff
+                if i + 1 < rest.len() {
+                    plugin_args["path"] = json!(rest[i + 1]);
+                }
+                break;
+            }
+            arg if !arg.starts_with('-') => {
+                // Positional arg: branch name for checkout, path for add/log
+                match subcommand {
+                    "checkout" => {
+                        plugin_args["branch"] = json!(arg);
+                    }
+                    "add" => {
+                        plugin_args["path"] = json!(arg);
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+        None
+    } else {
+        Some(plugin_args)
+    };
+
+    match registry
+        .run("git", subcommand, cwd, env, None, extra.as_ref())
+        .await
+    {
+        Ok(result) => Some(plugin_response(result.output)),
+        Err(e) => Some(plugin_error_response("git", subcommand, &e)),
+    }
+}
+
+// --- gh redirect ---
+
+async fn parse_gh_redirect(
+    args: &[&str],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    registry: &Arc<ToolRegistry>,
+) -> Option<Response> {
+    if args.is_empty() {
+        return None;
+    }
+
+    // Map CLI subcommands to plugin commands
+    let (plugin_cmd, rest) = match (args[0], args.get(1).copied()) {
+        ("pr", Some("view")) => ("pr_view", &args[2..]),
+        ("pr", Some("list")) => ("pr_list", &args[2..]),
+        ("pr", Some("diff")) => ("pr_diff", &args[2..]),
+        ("pr", Some("checks")) => ("pr_checks", &args[2..]),
+        ("pr", Some("create")) => ("pr_create", &args[2..]),
+        ("api", _) => ("api", &args[1..]),
+        _ => return None,
+    };
+
+    let mut plugin_args = json!({});
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--state" if i + 1 < rest.len() => {
+                plugin_args["state"] = json!(rest[i + 1]);
+                i += 2;
+            }
+            "--limit" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<i64>() {
+                    plugin_args["limit"] = json!(n);
+                }
+                i += 2;
+            }
+            "--author" if i + 1 < rest.len() => {
+                plugin_args["author"] = json!(rest[i + 1]);
+                i += 2;
+            }
+            "--method" if i + 1 < rest.len() && plugin_cmd == "api" => {
+                plugin_args["method"] = json!(rest[i + 1]);
+                i += 2;
+            }
+            arg if !arg.starts_with('-') => {
+                // Positional: PR number or API endpoint
+                if plugin_cmd == "api" {
+                    plugin_args["endpoint"] = json!(arg);
+                } else if let Ok(n) = arg.parse::<i64>() {
+                    plugin_args["number"] = json!(n);
+                }
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+        None
+    } else {
+        Some(plugin_args)
+    };
+
+    match registry
+        .run("gh", plugin_cmd, cwd, env, None, extra.as_ref())
+        .await
+    {
+        Ok(result) => Some(plugin_response(result.output)),
+        Err(e) => Some(plugin_error_response("gh", plugin_cmd, &e)),
+    }
+}
+
+// --- docker redirect ---
+
+async fn parse_docker_redirect(
+    args: &[&str],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    registry: &Arc<ToolRegistry>,
+) -> Option<Response> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let (plugin_cmd, rest) = match (args[0], args.get(1).copied()) {
+        ("ps", _) => ("ps", &args[1..]),
+        ("images", _) => ("images", &args[1..]),
+        ("logs", _) => ("logs", &args[1..]),
+        ("stop", _) => ("stop", &args[1..]),
+        ("inspect", _) => ("inspect", &args[1..]),
+        ("compose", Some("up")) => ("compose_up", &args[2..]),
+        ("compose", Some("down")) => ("compose_down", &args[2..]),
+        ("compose", Some("ps")) => ("compose_ps", &args[2..]),
+        _ => return None,
+    };
+
+    let mut plugin_args = json!({});
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--tail" | "-n" if i + 1 < rest.len() => {
+                if let Ok(n) = rest[i + 1].parse::<i64>() {
+                    plugin_args["tail"] = json!(n);
+                }
+                i += 2;
+            }
+            "-f" if i + 1 < rest.len() && plugin_cmd.starts_with("compose") => {
+                plugin_args["file"] = json!(rest[i + 1]);
+                i += 2;
+            }
+            "-d" if plugin_cmd == "compose_up" => {
+                plugin_args["detach"] = json!(true);
+                i += 1;
+            }
+            arg if !arg.starts_with('-') => {
+                plugin_args["container"] = json!(arg);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+        None
+    } else {
+        Some(plugin_args)
+    };
+
+    match registry
+        .run("docker", plugin_cmd, cwd, env, None, extra.as_ref())
+        .await
+    {
+        Ok(result) => Some(plugin_response(result.output)),
+        Err(e) => Some(plugin_error_response("docker", plugin_cmd, &e)),
+    }
+}
+
 pub async fn exec(session: &Session, op: &Op) -> Response {
     let cmd = match &op.s {
         Some(c) => c.clone(),
@@ -69,6 +405,19 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         Some(d) => session.resolve_path(d),
         None => session.cwd.clone(),
     };
+
+    // Layer 1: try redirecting through a native plugin for structured output
+    if session.cfg.process.exec_plugin_redirect {
+        if args.is_empty() {
+            if let Some(registry) = &session.tool_registry {
+                if let Some(resp) =
+                    try_plugin_redirect(&cmd, &cwd, &session.env, registry).await
+                {
+                    return resp;
+                }
+            }
+        }
+    }
 
     let mut command = build_command(&cmd, &args);
     command
@@ -95,6 +444,21 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit = output.status.code().unwrap_or(-1);
     let max = session.cfg.process.exec_output_max_chars;
+
+    if session.cfg.process.exec_output_filters {
+        if let Some(filtered) =
+            exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit)
+        {
+            let mut resp = json!({
+                "exit": exit,
+                "out": cap_output(&filtered.out, max),
+            });
+            if !filtered.err.is_empty() {
+                resp["err"] = json!(cap_output(&filtered.err, max));
+            }
+            return Response::ok(resp);
+        }
+    }
 
     let mut resp = json!({
         "exit": exit,
@@ -656,5 +1020,264 @@ mod tests {
         let out = r.d.unwrap()["out"].as_str().unwrap().to_string();
         assert!(out.contains("truncated"));
         assert!(out.len() < 500);
+    }
+
+    // --- Plugin redirect tests ---
+
+    async fn session_with_registry(dir: &std::path::Path) -> Session {
+        use crate::plugins;
+        use crate::tool_runner::ToolRegistry;
+
+        let cfg = Arc::new(Config::default());
+        let mut s = Session::new(dir.to_path_buf(), cfg);
+
+        let r = ToolRegistry::new();
+        if plugins::cargo::is_available() {
+            r.register(Arc::new(plugins::cargo::CargoPlugin::new())).await;
+        }
+        if plugins::git::is_available() {
+            r.register(Arc::new(plugins::git::GitPlugin::new())).await;
+        }
+
+        s.tool_registry = Some(Arc::new(r));
+        s
+    }
+
+    #[tokio::test]
+    async fn redirect_cargo_test_via_exec() {
+        if !crate::plugins::cargo::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create a minimal Cargo project
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rtest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[test] fn it_works() { assert!(true); }\n",
+        )
+        .unwrap();
+
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("cargo test".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        let out = d["out"].as_str().unwrap();
+        assert!(
+            d.get("via").is_some(),
+            "should have 'via: plugin' marker"
+        );
+        assert!(out.contains("passed") || out.contains("ok"), "got: {out}");
+        assert!(
+            !out.contains("running 1 test"),
+            "should not contain raw test output, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_cargo_build_via_exec() {
+        if !crate::plugins::cargo::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rtest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("cargo build".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["via"], "plugin");
+    }
+
+    #[tokio::test]
+    async fn redirect_git_status_via_exec() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Init a git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("git status".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["via"], "plugin");
+        // Plugin returns structured JSON with clean/modified/untracked fields
+        let out = d["out"].as_str().unwrap();
+        assert!(out.contains("clean") || out.contains("modified") || out.contains("untracked"),
+            "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn redirect_unknown_command_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo hello".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        // Should NOT have via:plugin — went through raw exec
+        assert!(d.get("via").is_none());
+        assert_eq!(d["out"], "hello");
+    }
+
+    #[tokio::test]
+    async fn redirect_skipped_when_explicit_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo".into()),
+                a: Some(vec!["raw args".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert!(d.get("via").is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_cargo_unrecognized_flags_falls_through() {
+        if !crate::plugins::cargo::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rtest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let s = session_with_registry(dir.path()).await;
+
+        // --some-weird-flag isn't recognized, should fall through to raw exec
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("cargo build --some-weird-flag".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        // Falls through to raw exec (which will fail, but no via:plugin)
+        assert!(d.get("via").is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_disabled_by_config() {
+        if !crate::plugins::cargo::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rtest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.process.exec_plugin_redirect = false;
+
+        use crate::plugins;
+        use crate::tool_runner::ToolRegistry;
+
+        let mut s = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(plugins::cargo::CargoPlugin::new())).await;
+        s.tool_registry = Some(registry);
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("cargo build".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        // Redirect disabled — should go through raw exec
+        assert!(d.get("via").is_none());
     }
 }

@@ -1,4 +1,5 @@
 mod exec_ops;
+pub mod exec_filter;
 mod file_ops;
 mod diff_ops;
 mod schema;
