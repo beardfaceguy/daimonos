@@ -58,7 +58,8 @@ agent or developer needs while reading or writing code.
 
 ```
 daimonos/
-├── AGENTS.md                      # This file
+├── README.md                      # Project overview for humans
+├── AGENTS.md                      # This file (agent guidance)
 ├── Cargo.toml                     # Rust project manifest
 ├── daimonos.default.toml          # Reference config with all tunable values
 ├── benchmarks/
