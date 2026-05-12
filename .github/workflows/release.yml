@@ -232,6 +232,9 @@ jobs:
           python3 -c "
           import json, hashlib, os
 
+          tag = '$TAG'
+          version = '$VERSION'
+
           bundles = {
               'daimonos-x86_64-linux.mcpb': 0,
               'daimonos-aarch64-linux.mcpb': 1,
@@ -243,10 +246,13 @@ jobs:
           with open('server.json') as f:
               s = json.load(f)
 
-          s['version'] = '$VERSION'
+          s['version'] = version
 
           for filename, idx in bundles.items():
               path = os.path.join('mcpb-release', filename)
+              # Fix URL: replace placeholder with actual tag
+              url = s['packages'][idx]['identifier']
+              s['packages'][idx]['identifier'] = url.replace('VERSION_PLACEHOLDER', tag)
               if os.path.exists(path):
                   h = hashlib.sha256(open(path, 'rb').read()).hexdigest()
                   s['packages'][idx]['fileSha256'] = h

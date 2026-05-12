@@ -11,27 +11,27 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux.mcpb",
+      "identifier": "https://github.com/beardfaceguy/daimonos/releases/download/VERSION_PLACEHOLDER/daimonos-x86_64-linux.mcpb",
       "transport": { "type": "stdio" }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-linux.mcpb",
+      "identifier": "https://github.com/beardfaceguy/daimonos/releases/download/VERSION_PLACEHOLDER/daimonos-aarch64-linux.mcpb",
       "transport": { "type": "stdio" }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-aarch64-macos.mcpb",
+      "identifier": "https://github.com/beardfaceguy/daimonos/releases/download/VERSION_PLACEHOLDER/daimonos-aarch64-macos.mcpb",
       "transport": { "type": "stdio" }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-macos.mcpb",
+      "identifier": "https://github.com/beardfaceguy/daimonos/releases/download/VERSION_PLACEHOLDER/daimonos-x86_64-macos.mcpb",
       "transport": { "type": "stdio" }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/beardfaceguy/daimonos/releases/latest/download/daimonos-x86_64-linux-musl.mcpb",
+      "identifier": "https://github.com/beardfaceguy/daimonos/releases/download/VERSION_PLACEHOLDER/daimonos-x86_64-linux-musl.mcpb",
       "transport": { "type": "stdio" }
     }
   ]
