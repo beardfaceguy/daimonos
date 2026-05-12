@@ -7,6 +7,9 @@ coding agent with structured equivalents that return compact JSON instead of
 raw terminal output. The result: fewer tokens consumed, fewer round-trips, and
 lower API costs — with zero changes to your workflow.
 
+**Platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
+Windows support is [planned](https://linear.app/clawcorp/issue/CLA-302).
+
 The name comes from Greek *daimon* (agent/spirit), the etymological root of
 "daemon."
 

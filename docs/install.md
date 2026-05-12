@@ -4,6 +4,9 @@ Daimonos is a single Rust binary that acts as an MCP server for AI coding
 agents. It replaces built-in file, search, exec, and git tools with
 agent-optimized equivalents that use fewer tokens and fewer round-trips.
 
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon,
+Intel). Windows is not yet supported.
+
 ## Prerequisites
 
 For pre-built binaries: just `curl` and a supported platform (see below).
