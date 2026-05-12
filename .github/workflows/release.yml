@@ -218,18 +218,48 @@ jobs:
           curl -L https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz
           chmod +x mcp-publisher
 
-      - name: Update server.json version
+      - name: Download MCPB bundles and update server.json
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ needs.release.outputs.tag || github.ref_name }}"
+          TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
+
+          mkdir -p mcpb-release
+          gh release download "$TAG" --pattern '*.mcpb' --dir mcpb-release
+          ls -la mcpb-release/
+
           python3 -c "
-          import json
+          import json, hashlib, os
+
+          bundles = {
+              'daimonos-x86_64-linux.mcpb': 0,
+              'daimonos-aarch64-linux.mcpb': 1,
+              'daimonos-aarch64-macos.mcpb': 2,
+              'daimonos-x86_64-macos.mcpb': 3,
+              'daimonos-x86_64-linux-musl.mcpb': 4,
+          }
+
           with open('server.json') as f:
               s = json.load(f)
+
           s['version'] = '$VERSION'
+
+          for filename, idx in bundles.items():
+              path = os.path.join('mcpb-release', filename)
+              if os.path.exists(path):
+                  h = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+                  s['packages'][idx]['fileSha256'] = h
+                  print(f'{filename}: {h}')
+              else:
+                  print(f'WARNING: {filename} not found')
+
           with open('server.json', 'w') as f:
               json.dump(s, f, indent=2)
           "
+
+          echo "--- Updated server.json ---"
+          cat server.json
 
       - name: Publish to MCP Registry
         run: |
