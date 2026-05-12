@@ -76,10 +76,64 @@ jobs:
             shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           fi
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build MCPB bundle
+        run: |
+          npm install -g @anthropic-ai/mcpb
+
+          # Determine version from tag or Cargo.toml
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          fi
+
+          # Determine platform for this target
+          case "${{ matrix.target }}" in
+            *-apple-darwin) PLATFORM="darwin" ;;
+            *-linux-*)      PLATFORM="linux" ;;
+          esac
+
+          # Create per-platform bundle directory
+          BUNDLE_DIR=$(mktemp -d)
+          cp target/${{ matrix.target }}/release/daimonos "$BUNDLE_DIR/daimonos"
+          chmod +x "$BUNDLE_DIR/daimonos"
+
+          # Generate platform-specific manifest from template
+          python3 -c "
+          import json, sys
+          with open('mcpb/manifest.json') as f:
+              m = json.load(f)
+          m['version'] = '$VERSION'
+          m['compatibility']['platforms'] = ['$PLATFORM']
+          with open('$BUNDLE_DIR/manifest.json', 'w') as f:
+              json.dump(m, f, indent=2)
+          "
+
+          # Pack the bundle (signing is best-effort; mcpb verify has a known bug in v2.x)
+          mcpb pack "$BUNDLE_DIR" "dist/${{ matrix.artifact }}.mcpb"
+          mcpb sign "dist/${{ matrix.artifact }}.mcpb" --self-signed || true
+
+          # Generate SHA-256 for the .mcpb
+          cd dist
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.artifact }}.mcpb > ${{ matrix.artifact }}.mcpb.sha256
+          else
+            shasum -a 256 ${{ matrix.artifact }}.mcpb > ${{ matrix.artifact }}.mcpb.sha256
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.tar.gz*
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz*
+            dist/${{ matrix.artifact }}.mcpb*
           retention-days: 30
 
   test:
@@ -135,6 +189,7 @@ jobs:
         run: |
           mkdir -p release
           find artifacts/ -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts/ -name '*.mcpb' -exec cp {} release/ \;
           find artifacts/ -name '*.sha256' -exec cp {} release/ \;
           ls -la release/
 
@@ -147,3 +202,36 @@ jobs:
           prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
           generate_release_notes: true
           files: release/*
+
+  publish-registry:
+    name: Publish to MCP Registry
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz
+          chmod +x mcp-publisher
+
+      - name: Update server.json version
+        run: |
+          TAG="${{ needs.release.outputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          python3 -c "
+          import json
+          with open('server.json') as f:
+              s = json.load(f)
+          s['version'] = '$VERSION'
+          with open('server.json', 'w') as f:
+              json.dump(s, f, indent=2)
+          "
+
+      - name: Publish to MCP Registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish server.json

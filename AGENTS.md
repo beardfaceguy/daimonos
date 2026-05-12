@@ -62,6 +62,9 @@ daimonos/
 ├── AGENTS.md                      # This file (agent guidance)
 ├── Cargo.toml                     # Rust project manifest
 ├── daimonos.default.toml          # Reference config with all tunable values
+├── server.json                    # GitHub MCP Registry metadata
+├── mcpb/
+│   └── manifest.json              # MCPB bundle manifest template (binary server)
 ├── benchmarks/
 │   ├── README.md                  # How to run benchmarks
 │   ├── run-benchmark.sh           # Runner: executes tasks via agent CLI

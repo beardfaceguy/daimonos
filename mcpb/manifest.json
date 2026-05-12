@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.3",
+  "name": "daimonos",
+  "display_name": "Daimonos",
+  "version": "0.0.0",
+  "description": "Agent-optimized MCP server with structured JSON tools. 20-45% token savings.",
+  "long_description": "Daimonos replaces built-in file, search, exec, and git tools with structured equivalents that return compact JSON instead of raw terminal output. Native plugins for git, cargo, gh, and docker. Semantic output filtering, read deduplication, batch operations, workspace snapshots, and token analytics.",
+  "author": {
+    "name": "beardfaceguy",
+    "url": "https://github.com/beardfaceguy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beardfaceguy/daimonos.git"
+  },
+  "homepage": "https://github.com/beardfaceguy/daimonos",
+  "documentation": "https://github.com/beardfaceguy/daimonos/blob/master/docs/install.md",
+  "support": "https://github.com/beardfaceguy/daimonos/issues",
+  "server": {
+    "type": "binary",
+    "entry_point": "daimonos",
+    "mcp_config": {
+      "command": "${__dirname}/daimonos",
+      "args": ["--mcp", "-w", "${user_config.workspace}"],
+      "env": {}
+    }
+  },
+  "user_config": {
+    "workspace": {
+      "type": "directory",
+      "title": "Workspace Directory",
+      "description": "Root directory of the project to work in",
+      "required": true,
+      "default": "${HOME}"
+    }
+  },
+  "tools": [
+    { "name": "read_file", "description": "Read file with optional offset/limit and content-hash deduplication" },
+    { "name": "write_file", "description": "Write file with auto-mkdir" },
+    { "name": "edit_file", "description": "String replacement with diff confirmation" },
+    { "name": "search", "description": "Regex search (content mode) or file discovery (file mode)" },
+    { "name": "exec", "description": "Run commands with semantic output filtering" },
+    { "name": "batch", "description": "Multiple operations in a single round-trip" },
+    { "name": "workspace_info", "description": "Project type, git status, directory listing, analytics" },
+    { "name": "git", "description": "Structured git operations: status, log, diff, branch, add, commit, push, pull, checkout" },
+    { "name": "snapshot", "description": "Workspace checkpoint and rollback: create, restore, list, delete" },
+    { "name": "session_stats", "description": "Token analytics: session, history, or daily scope" },
+    { "name": "ls", "description": "Directory listing with depth control" },
+    { "name": "set_cwd", "description": "Change working directory" }
+  ],
+  "tools_generated": true,
+  "keywords": ["developer-tools", "coding", "file-system", "git", "rust", "token-optimization", "structured-output"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["darwin", "linux"]
+  }
+}

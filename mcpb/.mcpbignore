@@ -1,0 +1,12 @@
+.git/
+target/
+tests/
+benchmarks/
+distro/
+docs/
+src/
+*.toml
+*.md
+*.lock
+.github/
+.cursor/
