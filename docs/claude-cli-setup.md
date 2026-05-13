@@ -29,15 +29,29 @@ The Claude CLI reads the same `.cursor/mcp.json` format as Cursor IDE.
 
 ### 2. Run with daimonos
 
-Use `--mcp-config` and `--strict-mcp-config` to ensure the CLI uses daimonos
-tools:
+Two modes:
+
+**A. Daimonos-only (recommended for benchmarking / clean tests).** Disables
+built-in `Read`/`Edit`/`Bash`/`Grep`/etc. so only daimonos tools are
+available:
+
+```bash
+claude --mcp-config .cursor/mcp.json \
+       --strict-mcp-config \
+       --tools "" \
+       --append-system-prompt "Use daimonos MCP tools, not built-in equivalents."
+```
+
+**B. Daimonos alongside built-ins (recommended for daily use).** Exposes
+daimonos tools *and* Claude's built-ins; the system prompt nudges the model
+to prefer daimonos:
 
 ```bash
 claude --mcp-config .cursor/mcp.json \
        --append-system-prompt "Use daimonos MCP tools, not built-in equivalents."
 ```
 
-For non-interactive (piped) usage:
+For non-interactive (piped) usage, add `-p`:
 
 ```bash
 echo "Read src/main.rs and summarize it" | \
@@ -65,7 +79,8 @@ dclaude "Run the tests and tell me if anything fails"
 | Flag | Purpose |
 |------|---------|
 | `--mcp-config <path>` | Path to MCP server config (JSON) |
-| `--strict-mcp-config` | Disable all built-in tools; only MCP tools available |
+| `--strict-mcp-config` | Use *only* the MCP servers from `--mcp-config`, ignoring `~/.claude.json` and other sources |
+| `--tools ""` | Disable all built-in tools (use with `--strict-mcp-config` for a daimonos-only environment). Pass tool names like `"Bash,Edit"` to allow a subset |
 | `--append-system-prompt <text>` | Add instruction to prefer daimonos tools |
 | `--model <name>` | Model to use (default: claude-sonnet) |
 | `-p` | Pipe mode (read prompt from stdin, no interactive session) |
@@ -105,19 +120,27 @@ docker(command, container=None, tail=None, ...)
 
 ## Verifying It Works
 
-Run a simple test:
+Confirm Claude can see and load daimonos:
 
 ```bash
-echo "What files are in this project?" | \
+echo "List files in this workspace." | \
   claude -p --mcp-config .cursor/mcp.json \
+    --strict-mcp-config --tools "" \
     --append-system-prompt "Use daimonos MCP tools, not built-in equivalents." \
-    --output-format stream-json 2>/dev/null | \
-  grep -o '"mcp__daimonos__[^"]*"' | sort -u
+    --output-format stream-json --verbose 2>/dev/null | \
+  grep -oE '"mcp_servers":\[[^]]*\]|mcp__daimonos__[a-z_]+' | sort -u
 ```
 
-You should see tool names like `"mcp__daimonos__read_file"`,
-`"mcp__daimonos__search"`, etc. If you see `"Read"` or `"Shell"` instead,
-the MCP config isn't being picked up.
+Expected output: `"mcp_servers":[{"name":"daimonos","status":"connected"}]`
+plus one or more `mcp__daimonos__*` tool names that Claude actually called.
+
+If you see `"status":"failed"` or no `mcp__daimonos__*` lines, common causes:
+
+- The `command` path in `.cursor/mcp.json` is not absolute or not executable.
+- The `-w` workspace path is not absolute or doesn't exist.
+- The daimonos binary segfaults on startup — run it directly:
+  `./daimonos --mcp -w /path/to/workspace` and make sure it stays alive
+  reading from stdin.
 
 ## Benchmarking
 
