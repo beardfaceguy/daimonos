@@ -1,14 +1,26 @@
-# Claude Code CLI Setup
+# Claude Code Setup
 
-This guide configures the Claude Code CLI (`claude`) to use daimonos as its
-MCP server for terminal-based agent workflows.
+This guide configures **Claude Code** — both the `claude` CLI (Linux, macOS,
+Windows/WSL) and the **Claude Code Desktop** app (macOS only) — to use
+daimonos as its MCP server.
+
+Pick the path that matches how you launch Claude Code:
+
+- [CLI workflow](#cli-workflow) — terminal-driven, full control over flags
+- [Desktop workflow](#desktop-workflow) — clicking the macOS app icon
+
+---
 
 ## Prerequisites
 
 - Daimonos binary installed — [download a pre-built binary](https://github.com/beardfaceguy/daimonos/releases) or [build from source](install.md)
-- Claude Code CLI installed (`claude` command available)
+- Claude Code installed:
+  - **CLI**: `claude` command on `$PATH` (`brew install anthropic/claude-code/claude-code`, `npm i -g @anthropic-ai/claude-code`, or the installer from anthropic.com)
+  - **Desktop**: macOS app from [code.claude.com/desktop](https://code.claude.com/docs/en/desktop-quickstart) (macOS only — no Linux/Windows desktop build)
 
-## Setup
+---
+
+## CLI workflow
 
 ### 1. Create the MCP config file
 
@@ -74,7 +86,7 @@ Then use `dclaude` anywhere:
 dclaude "Run the tests and tell me if anything fails"
 ```
 
-## Flags Reference
+### CLI flags reference
 
 | Flag | Purpose |
 |------|---------|
@@ -86,6 +98,85 @@ dclaude "Run the tests and tell me if anything fails"
 | `-p` | Pipe mode (read prompt from stdin, no interactive session) |
 | `--output-format stream-json` | Machine-readable output (for scripting) |
 | `--dangerously-skip-permissions` | Skip tool permission prompts (for CI/automation) |
+
+---
+
+## Desktop workflow
+
+The Claude Code Desktop app launches without any CLI flags, so daimonos has
+to live in a config location the app auto-discovers. Use `claude mcp add` to
+register it — the CLI and Desktop app share the same MCP registry.
+
+### Option A: Register globally for every project (recommended)
+
+One time, from anywhere:
+
+```bash
+claude mcp add daimonos -s user -- /usr/local/bin/daimonos --mcp
+```
+
+This works because daimonos's `-w` defaults to `.` (the current working
+directory) and Claude Code spawns each MCP server with CWD set to the open
+project's root. So every project you open in Claude Code Desktop will spawn
+daimonos against *that* project — no per-project setup needed.
+
+### Option B: Register per-project (checks the config into the repo)
+
+From inside the project directory:
+
+```bash
+cd /path/to/project
+claude mcp add daimonos -s project -- /usr/local/bin/daimonos --mcp
+```
+
+This writes `.mcp.json` in the project root, which can be committed so the
+whole team picks it up. First time the project opens in Claude Code Desktop,
+a workspace-trust dialog will ask you to approve the server.
+
+### Verifying it works
+
+1. Open a project folder in Claude Code Desktop (`File → Open Folder`).
+2. In the chat, type `/mcp` — daimonos should be listed as `connected`.
+3. Ask "list the files in this workspace" and confirm a `mcp__daimonos__ls`
+   tool call appears in the trace (toggle "Show tool calls" in the chat
+   view).
+
+### Biasing the model toward daimonos in the Desktop app
+
+The Desktop app always exposes Claude's built-in `Read`/`Edit`/`Bash` tools
+alongside daimonos — there is no equivalent to the CLI's `--tools ""`. To
+nudge the model to use daimonos anyway, add either:
+
+- A project-level `CLAUDE.md` at the repo root:
+
+  ```markdown
+  # Tool preferences
+
+  Use daimonos MCP tools, not built-in equivalents. If a task needs 2+
+  operations, use `execute_script` to run them as a single Starlark script.
+  ```
+
+- Or a global instruction in **Settings → Custom Instructions**.
+
+### macOS Gatekeeper
+
+First launch of the daimonos binary may be blocked by Gatekeeper. Clear
+the quarantine attribute:
+
+```bash
+xattr -dr com.apple.quarantine /usr/local/bin/daimonos
+```
+
+### Importing from the old Claude Desktop chat app
+
+If you previously had MCP servers configured in the (non-Code) Claude
+Desktop chat app, import them in one shot:
+
+```bash
+claude mcp add-from-claude-desktop
+```
+
+---
 
 ## Starlark Scripts
 
@@ -118,7 +209,9 @@ gh(command, number=None, state=None, limit=None, ...)
 docker(command, container=None, tail=None, ...)
 ```
 
-## Verifying It Works
+---
+
+## Verifying the CLI install
 
 Confirm Claude can see and load daimonos:
 
@@ -142,10 +235,12 @@ If you see `"status":"failed"` or no `mcp__daimonos__*` lines, common causes:
   `./daimonos --mcp -w /path/to/workspace` and make sure it stays alive
   reading from stdin.
 
+---
+
 ## Benchmarking
 
 The `benchmarks/` directory includes a full benchmark harness for comparing
-daimonos vs built-in tools:
+daimonos vs built-in tools (CLI only):
 
 ```bash
 cd benchmarks

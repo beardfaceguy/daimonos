@@ -85,7 +85,7 @@ First build takes 1-2 minutes. Subsequent builds are incremental (~5 seconds).
 Once installed, set up Daimonos with your editor:
 
 - **[Cursor IDE](docs/cursor-setup.md)** — recommended for most users
-- **[Claude Code CLI](docs/claude-cli-setup.md)** — for terminal workflows
+- **[Claude Code](docs/claude-code-setup.md)** — CLI (Linux/macOS/WSL) + macOS Desktop app
 
 The minimal Cursor config (add to `.cursor/mcp.json` in your project):
 

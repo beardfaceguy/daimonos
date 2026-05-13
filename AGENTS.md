@@ -88,7 +88,7 @@ daimonos/
 │   ├── install.md                 # Build & install instructions
 │   ├── cursor-setup.md            # Cursor IDE integration guide
 │   ├── copilot-setup.md           # GitHub Copilot (VS Code, Visual Studio, JetBrains, Xcode, Eclipse)
-│   ├── claude-cli-setup.md        # Claude Code CLI integration guide
+│   ├── claude-code-setup.md       # Claude Code integration (CLI + macOS Desktop)
 │   ├── windsurf-setup.md          # Windsurf IDE integration guide
 │   ├── cline-setup.md             # Cline (VS Code extension) integration guide
 │   ├── gemini-cli-setup.md        # Gemini CLI integration guide

@@ -113,7 +113,7 @@ Pick the setup guide for your AI tool:
 
 - [Cursor IDE](cursor-setup.md)
 - [GitHub Copilot](copilot-setup.md) (VS Code, Visual Studio, JetBrains, Xcode, Eclipse)
-- [Claude Code CLI](claude-cli-setup.md)
+- [Claude Code](claude-code-setup.md) (CLI + macOS Desktop app)
 - [Windsurf](windsurf-setup.md)
 - [Cline](cline-setup.md) (VS Code extension)
 - [Gemini CLI](gemini-cli-setup.md)

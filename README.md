@@ -132,7 +132,7 @@ close it. No daemon to manage, no background service.
 
 - [Cursor IDE](docs/cursor-setup.md)
 - [GitHub Copilot](docs/copilot-setup.md) (VS Code, Visual Studio, JetBrains, Xcode, Eclipse)
-- [Claude Code CLI](docs/claude-cli-setup.md)
+- [Claude Code](docs/claude-code-setup.md) (CLI + macOS Desktop app)
 - [Windsurf](docs/windsurf-setup.md)
 - [Cline](docs/cline-setup.md) (VS Code extension)
 - [Gemini CLI](docs/gemini-cli-setup.md)
