@@ -38,14 +38,17 @@ pub struct Op {
     pub g: Option<String>,
 }
 
-/// Out-of-band metadata about a response, used by the MCP analytics layer
-/// to classify what happened during dispatch (plugin redirect, exec output
-/// filtering, read deduplication). These flags must be set at the source
-/// site rather than reconstructed by substring-matching the serialized JSON,
-/// which is brittle and produces false positives when string fields happen
-/// to contain the same tokens.
+/// Out-of-band metadata about a response, consumed by the dispatch layer
+/// and downstream analytics consumers (the MCP server today, anything else
+/// that wraps `ops::dispatch` tomorrow) to classify what happened during
+/// dispatch (plugin redirect, exec output filtering, read deduplication).
+/// These flags must be set at the source site rather than reconstructed by
+/// substring-matching the serialized JSON, which is brittle and produces
+/// false positives when string fields happen to contain the same tokens.
 ///
-/// The field is `#[serde(skip)]` so it never reaches the wire.
+/// The field is `#[serde(skip)]` so it never reaches the wire — it is
+/// transport-agnostic state shared between the handler and its in-process
+/// caller, never sent to clients on the socket or stdio paths.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResponseMeta {
     /// True when the request was satisfied by a registered tool plugin

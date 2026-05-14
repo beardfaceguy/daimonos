@@ -90,22 +90,25 @@ async fn dispatch_tool(
     let start = std::time::Instant::now();
     let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
 
-    // Reset the per-call meta scratch so we never inherit flags from a
-    // previous tool call on the same session. `dispatch_tool_inner` will
-    // set this when (and only when) it produces a structured `Response`.
-    session.last_response_meta = crate::protocol::ResponseMeta::default();
+    // Drain any stale meta from a prior call so `dispatch_tool_inner`
+    // starts with a clean slate. Without this, a handler that doesn't set
+    // meta (and there are several) could inherit flags from the previous
+    // call on the same session.
+    let _ = std::mem::take(&mut session.last_response_meta);
 
     let result = dispatch_tool_inner(session, name, args).await;
+
+    // Always drain after the inner runs so the slot is reset for the next
+    // turn — even when analytics is disabled. Reading the structured meta
+    // here avoids the brittle wire-text inspection we used to do (substring
+    // match → re-parse JSON → top-level key probe). Both of those approaches
+    // were coupled to the response format and prone to drift; this reads
+    // exactly what handlers set.
+    let meta = std::mem::take(&mut session.last_response_meta);
 
     // Record analytics
     if let Some(analytics) = &session.analytics {
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        // Take the meta back out: any flags belong to *this* call.
-        // Reading the structured meta avoids the brittle wire-text inspection
-        // we used to do (substring match → re-parse JSON → top-level key
-        // probe). Both of those approaches were coupled to the response
-        // format and prone to drift; this reads exactly what handlers set.
-        let meta = std::mem::take(&mut session.last_response_meta);
         let (response_chars, was_redirect, was_filtered, read_dedup) = match &result {
             Ok(r) => (
                 extract_result_text(r).len(),
@@ -846,20 +849,74 @@ mod tests {
     // `session.last_response_meta`. This guarantees no false positives
     // from user-supplied content and no drift from the wire format.
 
-    #[test]
-    fn response_meta_round_trips_to_session() {
-        // Simulate `dispatch_tool_inner` stashing meta after `ops::dispatch`.
-        let resp = Response::ok(json!({"x": 1})).redirect_via_plugin();
-        let mut session_meta = resp.meta.clone();
-        assert!(session_meta.redirect_via_plugin);
+    /// Drive the full plumbing: a real `Session` + a real `dispatch_tool`
+    /// call for a `read_file` that produces a dedup hit must (a) stash
+    /// `meta.read_dedup = true` via the inner dispatcher and then (b) have
+    /// it consumed (`mem::take`) by the outer `dispatch_tool` so the slot
+    /// is reset before the next turn.
+    #[tokio::test]
+    async fn dispatch_tool_threads_meta_through_session_and_resets_after() {
+        use crate::config::Config;
 
-        // `dispatch_tool` then takes the meta back out for analytics.
-        let taken = std::mem::take(&mut session_meta);
-        assert!(taken.redirect_via_plugin);
-        assert!(
-            !session_meta.redirect_via_plugin,
-            "take() must reset to default"
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dedup.txt"), "hello\n").unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+
+        let args = json!({"path": "dedup.txt"});
+
+        // First read: cache miss. dispatch_tool consumes whatever the inner
+        // produced and resets the slot to default.
+        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        assert_eq!(
+            session.last_response_meta,
+            crate::protocol::ResponseMeta::default(),
+            "dispatch_tool must reset last_response_meta after every call"
         );
+
+        // Second read: cache hit. The inner dispatcher must set
+        // meta.read_dedup BEFORE dispatch_tool takes it; we observe the
+        // reset side of the contract again, plus the unchanged payload.
+        let result = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        let payload = extract_result_text(&result);
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed.get("unchanged"),
+            Some(&Value::Bool(true)),
+            "second read of unchanged file must dedup; payload = {payload}"
+        );
+        assert_eq!(
+            session.last_response_meta,
+            crate::protocol::ResponseMeta::default(),
+            "dispatch_tool must reset last_response_meta after consuming the dedup signal"
+        );
+    }
+
+    /// Inner-only test: skip `dispatch_tool`'s `mem::take` and assert that
+    /// `dispatch_tool_inner` actually stashes `meta` on the session. Pinning
+    /// this directly catches regressions where the stashing line is removed
+    /// or moved out of the dispatch path.
+    #[tokio::test]
+    async fn dispatch_tool_inner_stashes_meta_on_session() {
+        use crate::config::Config;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dedup.txt"), "hello\n").unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+
+        let args = json!({"path": "dedup.txt"});
+        let _ = dispatch_tool_inner(&mut session, "read_file", &args).await.unwrap();
+        assert!(
+            !session.last_response_meta.read_dedup,
+            "first read is a cache miss; meta.read_dedup must be false"
+        );
+
+        let _ = dispatch_tool_inner(&mut session, "read_file", &args).await.unwrap();
+        assert!(
+            session.last_response_meta.read_dedup,
+            "second read of unchanged content must stash meta.read_dedup = true"
+        );
+        assert!(!session.last_response_meta.redirect_via_plugin);
+        assert!(!session.last_response_meta.filter_applied);
     }
 
     #[test]
