@@ -43,6 +43,14 @@ RESULTS_DIR = HERE / "results"
 DEFAULT_TASKS = ["read_100", "search_many", "snapshot_cycle", "exec_burst"]
 DEFAULT_REPLICATES = 20
 
+# How long we wait for the daimonos socket to appear after Popen. The
+# daemon binds before accepting any connections, and on this machine
+# the socket shows up within a few tens of milliseconds — 10 s is
+# generous enough that genuine slow-start cases (cold disk cache,
+# heavily loaded CI machine) clear with margin but tight enough that a
+# wedged daemon can't hang the harness indefinitely.
+STARTUP_TIMEOUT_S = 10.0
+
 
 @dataclass
 class CallSample:
@@ -288,7 +296,7 @@ def run_task(
             stderr=subprocess.PIPE,
             cwd=str(workspace),
         )
-        deadline = time.time() + 10.0
+        deadline = time.time() + STARTUP_TIMEOUT_S
         while not socket_path.exists():
             if proc.poll() is not None:
                 err = proc.stderr.read() if proc.stderr else b""
@@ -299,7 +307,7 @@ def run_task(
             if time.time() >= deadline:
                 raise RuntimeError(
                     f"daimonos did not create socket for task "
-                    f"{task_mod.ID} within 10 s"
+                    f"{task_mod.ID} within {STARTUP_TIMEOUT_S:.0f} s"
                 )
             time.sleep(0.025)
 
@@ -322,12 +330,19 @@ def run_task(
     finally:
         if client is not None:
             client.close()
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5.0)
+            else:
+                # Daemon already exited (early-fail path). Still call
+                # wait() so the OS reaps the zombie and Python closes
+                # the stderr PIPE deterministically rather than waiting
+                # for GC.
                 proc.wait(timeout=5.0)
         if keep_workspace:
             print(
@@ -367,7 +382,11 @@ def main() -> int:
     parser.add_argument(
         "--keep-workspace",
         action="store_true",
-        help="Don't delete the per-task temp workspaces (for debugging)",
+        help=(
+            "Don't delete the per-task temp workspaces after each task "
+            "finishes (the daemon is still terminated as normal — this "
+            "preserves files for inspection, not a live daemon)"
+        ),
     )
     args = parser.parse_args()
 
