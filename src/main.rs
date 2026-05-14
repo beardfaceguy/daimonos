@@ -18,6 +18,39 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+/// On Linux, ask the kernel to send SIGTERM to this process when its
+/// parent dies. Defends against the case where the editor that spawned
+/// `daimonos --mcp` crashes (or is SIGKILL'd) without orderly shutdown:
+/// the orphaned daimonos would otherwise survive forever, holding
+/// inotify watches and pipe fds that no one will ever read from again.
+///
+/// On non-Linux this is a no-op; the idle-timeout watchdog in
+/// `mcp::run_mcp_server` provides equivalent protection across platforms.
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal() {
+    // PR_SET_PDEATHSIG = 1, SIGTERM = 15. Using a raw extern keeps this
+    // dependency-free; libc is already in our transitive tree but we
+    // don't want to take a direct dep just for one syscall.
+    unsafe extern "C" {
+        fn prctl(
+            option: std::os::raw::c_int,
+            arg2: std::os::raw::c_ulong,
+            arg3: std::os::raw::c_ulong,
+            arg4: std::os::raw::c_ulong,
+            arg5: std::os::raw::c_ulong,
+        ) -> std::os::raw::c_int;
+    }
+    const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
+    const SIGTERM: std::os::raw::c_ulong = 15;
+    let rc = unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) };
+    if rc != 0 {
+        eprintln!("daimonos: prctl(PR_SET_PDEATHSIG) failed (rc={rc}); parent-death cleanup unavailable");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_parent_death_signal() {}
+
 #[derive(Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 struct Cli {
@@ -49,6 +82,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.mcp {
+        install_parent_death_signal();
+    }
 
     session::enhance_process_path();
 

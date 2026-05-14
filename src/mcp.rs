@@ -10,7 +10,9 @@ use rust_mcp_sdk::schema::{
 use rust_mcp_sdk::{McpServer, StdioTransport, TransportOptions};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
@@ -26,14 +28,30 @@ use crate::tools;
 
 pub struct DaimonosHandler {
     session: Arc<Mutex<Session>>,
+    /// Updated on every incoming request so the idle watchdog can detect
+    /// abandonment. Storing unix-seconds in an `AtomicU64` lets the
+    /// watchdog read it without ever blocking on the session mutex.
+    last_activity: Arc<AtomicU64>,
 }
 
 impl DaimonosHandler {
-    pub fn new(session: Session) -> Self {
+    pub fn new(session: Session, last_activity: Arc<AtomicU64>) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
+            last_activity,
         }
     }
+
+    fn poke_activity(&self) {
+        self.last_activity.store(now_unix_secs(), Ordering::Relaxed);
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 use tools::get_str;
@@ -458,6 +476,7 @@ impl ServerHandler for DaimonosHandler {
         _request: Option<PaginatedRequestParams>,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<ListToolsResult, RpcError> {
+        self.poke_activity();
         let session = self.session.lock().await;
         let all = tools::tool_definitions();
         let workspace = &session.workspace;
@@ -491,6 +510,7 @@ impl ServerHandler for DaimonosHandler {
         params: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
+        self.poke_activity();
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
 
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
@@ -639,6 +659,58 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
 
 // --- MCP server entry point ---
 
+/// Resolve the effective idle timeout in seconds. The
+/// `DAIMONOS_IDLE_TIMEOUT_SECS` environment variable wins over the
+/// `[mcp] idle_timeout_secs` config value when present and parseable;
+/// this lets the test suite use very short timeouts without writing a
+/// config file. A value of `0` from either source disables the watchdog.
+fn effective_idle_timeout(cfg: &Config) -> u64 {
+    if let Ok(raw) = std::env::var("DAIMONOS_IDLE_TIMEOUT_SECS") {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            return parsed;
+        }
+    }
+    cfg.mcp.idle_timeout_secs
+}
+
+/// Spawn a background tokio task that exits the process when the MCP
+/// server has been idle (no incoming list_tools / call_tool requests) for
+/// longer than `timeout_secs`. The watchdog is disabled when
+/// `timeout_secs == 0`.
+///
+/// This protects against the leaked-stdin scenario: a parent editor
+/// closes its agent panel without sending a shutdown and without closing
+/// the stdin pipe (because another worker still holds the write-end).
+/// The MCP read loop would otherwise block forever, leaving an orphan
+/// daimonos process holding inotify watches, fds and memory.
+fn spawn_idle_watchdog(timeout_secs: u64, last_activity: Arc<AtomicU64>) {
+    if timeout_secs == 0 {
+        eprintln!("daimonos: idle watchdog disabled (idle_timeout_secs = 0)");
+        return;
+    }
+    eprintln!(
+        "daimonos: idle watchdog armed ({timeout_secs}s); process will exit after that long without an MCP request"
+    );
+    tokio::spawn(async move {
+        // Tick frequently enough that the test suite can use short
+        // timeouts (e.g. 2s) without flake, but not so often that the
+        // watchdog wastes CPU on a quiet server.
+        let interval = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(interval).await;
+            let last = last_activity.load(Ordering::Relaxed);
+            let now = now_unix_secs();
+            let idle = now.saturating_sub(last);
+            if idle >= timeout_secs {
+                eprintln!(
+                    "daimonos: idle for {idle}s (>= {timeout_secs}s timeout) — exiting to release resources"
+                );
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 pub async fn run_mcp_server(
     workspace: PathBuf,
     cfg: Arc<Config>,
@@ -647,6 +719,10 @@ pub async fn run_mcp_server(
     pcache: Arc<PipelineCache>,
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> anyhow::Result<()> {
+    let idle_timeout_secs = effective_idle_timeout(&cfg);
+    let last_activity = Arc::new(AtomicU64::new(now_unix_secs()));
+    spawn_idle_watchdog(idle_timeout_secs, last_activity.clone());
+
     let mut session = Session::new(workspace.clone(), cfg);
     session.index = Some(ws_index);
     session.tool_registry = Some(tool_reg);
@@ -654,7 +730,7 @@ pub async fn run_mcp_server(
     session.analytics = analytics;
 
     let instructions = build_instructions(&workspace).await;
-    let handler = DaimonosHandler::new(session);
+    let handler = DaimonosHandler::new(session, last_activity);
 
     let server_details = InitializeResult {
         server_info: Implementation {

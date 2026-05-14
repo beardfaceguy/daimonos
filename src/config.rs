@@ -14,6 +14,7 @@ pub struct Config {
     pub process: ProcessConfig,
     pub analytics: AnalyticsConfig,
     pub pipeline_cache: PipelineCacheConfig,
+    pub mcp: McpConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -75,6 +76,27 @@ pub struct AnalyticsConfig {
     pub db_path: Option<String>,
     /// Days to retain analytics data before auto-cleanup.
     pub retention_days: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Maximum seconds the MCP server may sit idle (no incoming requests)
+    /// before it self-exits. Protects against orphaned subprocesses when
+    /// a parent editor leaks the stdin pipe (e.g. closes an agent panel
+    /// without sending a shutdown / closing stdin) — without this, the
+    /// process blocks in its read loop forever and accumulates resources.
+    /// Set to 0 to disable. Overridable at startup via the
+    /// `DAIMONOS_IDLE_TIMEOUT_SECS` environment variable (used by tests).
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 600,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

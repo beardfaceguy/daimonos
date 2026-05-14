@@ -58,6 +58,16 @@ enabled = true
 # Auto-delete records older than this many days
 retention_days = 90
 
+[mcp]
+# Idle watchdog for `daimonos --mcp`. If no MCP request (list_tools or
+# call_tool) arrives in this many seconds, the process exits cleanly to
+# release resources (inotify watches, fds, memory). This protects against
+# orphaned subprocesses when a parent editor closes an agent panel without
+# sending a shutdown and without closing the stdin pipe (e.g. another
+# editor worker still holds the write-end). Set to 0 to disable.
+# Override at startup with the DAIMONOS_IDLE_TIMEOUT_SECS env var.
+idle_timeout_secs = 600
+
 [pipeline_cache]
 # The pipeline cache invalidates tool results when workspace files change.
 # It registers one inotify watch per source-tree directory (after filtering
