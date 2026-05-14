@@ -249,6 +249,7 @@ def run_task(
     task_mod,
     binary: Path,
     iterations: int,
+    keep_workspace: bool = False,
 ) -> TaskResult:
     """Spawn a fresh daimonos for this task, point it at a clean
     workspace, run the iterations, tear it all down.
@@ -259,43 +260,49 @@ def run_task(
     cross-contaminates snapshot payloads with files written by earlier
     tasks, making results depend on task-list order rather than purely
     on server behavior.
+
+    Cleanup invariant: any path that returns/raises after `mkdtemp` must
+    go through the finally block so the tempdir and the daemon process
+    can never be leaked, even when the daemon failed to start. Pass
+    `keep_workspace=True` to preserve the tempdir for post-mortem
+    inspection — useful when a task panics mid-run.
     """
     workspace = Path(tempfile.mkdtemp(prefix=f"daimonos-bench-{task_mod.ID}-"))
     socket_path = workspace / "bench.sock"
     env = os.environ.copy()
     env["HOME"] = str(workspace)
     env.pop("DAIMONOS_CONFIG", None)
-    proc = subprocess.Popen(
-        [
-            str(binary),
-            "--socket",
-            str(socket_path),
-            "--workspace",
-            str(workspace),
-        ],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        cwd=str(workspace),
-    )
-    deadline = time.time() + 10.0
-    while not socket_path.exists():
-        if proc.poll() is not None:
-            err = proc.stderr.read() if proc.stderr else b""
-            raise RuntimeError(
-                f"daimonos exited early for task {task_mod.ID}: "
-                f"{err.decode(errors='replace')!r}"
-            )
-        if time.time() >= deadline:
-            proc.kill()
-            raise RuntimeError(
-                f"daimonos did not create socket for task {task_mod.ID} "
-                "within 10 s"
-            )
-        time.sleep(0.025)
-
+    proc: subprocess.Popen | None = None
     client: Client | None = None
     try:
+        proc = subprocess.Popen(
+            [
+                str(binary),
+                "--socket",
+                str(socket_path),
+                "--workspace",
+                str(workspace),
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            cwd=str(workspace),
+        )
+        deadline = time.time() + 10.0
+        while not socket_path.exists():
+            if proc.poll() is not None:
+                err = proc.stderr.read() if proc.stderr else b""
+                raise RuntimeError(
+                    f"daimonos exited early for task {task_mod.ID}: "
+                    f"{err.decode(errors='replace')!r}"
+                )
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"daimonos did not create socket for task "
+                    f"{task_mod.ID} within 10 s"
+                )
+            time.sleep(0.025)
+
         task_mod.setup(workspace)
         client = Client(socket_path)
         result = TaskResult(
@@ -315,13 +322,20 @@ def run_task(
     finally:
         if client is not None:
             client.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
-        shutil.rmtree(workspace, ignore_errors=True)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+        if keep_workspace:
+            print(
+                f"bench: kept workspace for {task_mod.ID}: {workspace}",
+                file=sys.stderr,
+            )
+        else:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> int:
@@ -350,6 +364,11 @@ def main() -> int:
         default=None,
         help="Path to daimonos binary (default: auto-detect)",
     )
+    parser.add_argument(
+        "--keep-workspace",
+        action="store_true",
+        help="Don't delete the per-task temp workspaces (for debugging)",
+    )
     args = parser.parse_args()
 
     binary = args.binary or find_binary()
@@ -370,7 +389,9 @@ def main() -> int:
             f"× {args.replicates} replicates",
             file=sys.stderr,
         )
-        result = run_task(task_mod, binary, args.replicates)
+        result = run_task(
+            task_mod, binary, args.replicates, keep_workspace=args.keep_workspace
+        )
         all_results.append(result)
         summary = result.summary()
         print(
