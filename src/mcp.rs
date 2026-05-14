@@ -137,10 +137,11 @@ async fn dispatch_tool(
             batch_size: 1,
         };
 
-        let analytics = analytics.clone();
-        tokio::task::spawn_blocking(move || {
-            analytics.record(&record);
-        });
+        // Use the tracked spawn so the idle watchdog can drain in-flight
+        // SQLite writes before exiting. A bare `spawn_blocking` would be
+        // dropped on `std::process::exit` and silently lose the last few
+        // tool calls of a session.
+        analytics.record_async(record);
     }
 
     result
@@ -703,7 +704,11 @@ fn effective_idle_timeout(cfg: &Config) -> u64 {
 /// the stdin pipe (because another worker still holds the write-end).
 /// The MCP read loop would otherwise block forever, leaving an orphan
 /// daimonos process holding inotify watches, fds and memory.
-fn spawn_idle_watchdog(timeout_secs: u64, last_activity: Arc<AtomicU64>) {
+fn spawn_idle_watchdog(
+    timeout_secs: u64,
+    last_activity: Arc<AtomicU64>,
+    analytics: Option<Arc<AnalyticsStore>>,
+) {
     if timeout_secs == 0 {
         eprintln!("daimonos: idle watchdog disabled (idle_timeout_secs = 0)");
         return;
@@ -725,6 +730,29 @@ fn spawn_idle_watchdog(timeout_secs: u64, last_activity: Arc<AtomicU64>) {
                 eprintln!(
                     "daimonos: idle for {idle}s (>= {timeout_secs}s timeout) — exiting to release resources"
                 );
+                // Drain any in-flight SQLite writes spawned by
+                // `AnalyticsStore::record_async`. Without this gate the
+                // process exits while the blocking pool still holds
+                // unsent INSERTs and we silently lose the trailing tool
+                // calls of the session — exactly the analytics we'd want
+                // most when investigating idle-shutdown behavior.
+                if let Some(an) = analytics.as_ref() {
+                    let pending = an.pending_writes();
+                    if pending > 0 {
+                        eprintln!(
+                            "daimonos: draining {pending} pending analytics writes before exit"
+                        );
+                        let drained = an
+                            .wait_until_quiet(Duration::from_secs(2))
+                            .await;
+                        if !drained {
+                            eprintln!(
+                                "daimonos: analytics drain timed out; {} writes may be lost",
+                                an.pending_writes()
+                            );
+                        }
+                    }
+                }
                 std::process::exit(0);
             }
         }
@@ -741,7 +769,7 @@ pub async fn run_mcp_server(
 ) -> anyhow::Result<()> {
     let idle_timeout_secs = effective_idle_timeout(&cfg);
     let last_activity = Arc::new(AtomicU64::new(now_unix_secs()));
-    spawn_idle_watchdog(idle_timeout_secs, last_activity.clone());
+    spawn_idle_watchdog(idle_timeout_secs, last_activity.clone(), analytics.clone());
 
     let mut session = Session::new(workspace.clone(), cfg);
     session.index = Some(ws_index);

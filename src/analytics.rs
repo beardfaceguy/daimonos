@@ -3,7 +3,9 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Estimate token count from character length (same heuristic as RTK).
 pub fn estimate_tokens(chars: usize) -> u64 {
@@ -83,6 +85,12 @@ pub struct AnalyticsStore {
     session_id: String,
     session_stats: Mutex<SessionStats>,
     retention_days: u64,
+    /// In-flight asynchronous SQLite writes. The MCP layer fires `record`
+    /// from a `spawn_blocking` task to keep the request hot path off the
+    /// SQLite mutex; the idle watchdog needs to know when those tasks have
+    /// drained before calling `std::process::exit(0)`, otherwise the last
+    /// few tool calls of a session never make it to disk.
+    pending_writes: Arc<AtomicUsize>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -130,6 +138,7 @@ impl AnalyticsStore {
             session_id,
             session_stats: Mutex::new(SessionStats::default()),
             retention_days,
+            pending_writes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -145,6 +154,7 @@ impl AnalyticsStore {
             session_id: String::new(),
             session_stats: Mutex::new(SessionStats::default()),
             retention_days: 0,
+            pending_writes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -226,6 +236,47 @@ impl AnalyticsStore {
 
     pub fn session_summary(&self) -> SessionStats {
         self.session_stats.lock().unwrap().clone()
+    }
+
+    /// Spawn an asynchronous SQLite write for this record. Tracks the task
+    /// in `pending_writes` so a subsequent `wait_until_quiet` can drain the
+    /// queue before process exit. Use this from request paths instead of
+    /// firing your own `spawn_blocking` — bare `spawn_blocking` calls can be
+    /// dropped on `std::process::exit` and silently lose writes.
+    pub fn record_async(self: &Arc<Self>, rec: ToolCallRecord) {
+        self.pending_writes.fetch_add(1, Ordering::SeqCst);
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            me.record(&rec);
+            me.pending_writes.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    /// Number of `record_async` tasks that have been spawned but have not
+    /// yet completed their SQLite write. Useful as a shutdown gate.
+    pub fn pending_writes(&self) -> usize {
+        self.pending_writes.load(Ordering::SeqCst)
+    }
+
+    /// Block until every in-flight `record_async` task completes its SQLite
+    /// write or `timeout` elapses. Returns true if the queue drained, false
+    /// if the deadline hit first. Polls because the writes happen on the
+    /// blocking pool — there's no future to await directly.
+    pub async fn wait_until_quiet(&self, timeout: Duration) -> bool {
+        if self.pending_writes() == 0 {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(20);
+        loop {
+            if self.pending_writes() == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     pub fn history_summary(&self, days: u64) -> Result<HistorySummary, String> {
@@ -569,5 +620,86 @@ mod tests {
         };
         assert!(!has_old, "old records should be cleaned up");
         assert!(history.total_calls >= 100);
+    }
+
+    // --- Async-write drain (vikunja #248) ---
+    //
+    // Ensures the spawn_blocking-based `record_async` path tracks in-flight
+    // writes so `wait_until_quiet` can be used as a shutdown gate. Without
+    // this, the idle watchdog would `std::process::exit(0)` while the
+    // blocking pool still held unsent INSERTs and the trailing tool calls
+    // of a session would never reach disk.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_writes_starts_at_zero() {
+        let (_dir, store) = test_store();
+        assert_eq!(store.pending_writes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_async_drains_to_disk_with_wait_until_quiet() {
+        let (_dir, store) = test_store();
+        let store = Arc::new(store);
+
+        for i in 0..20 {
+            store.record_async(sample_record(&format!("tool_{i}")));
+        }
+
+        let drained = store
+            .wait_until_quiet(Duration::from_secs(5))
+            .await;
+        assert!(drained, "wait_until_quiet must succeed within budget");
+        assert_eq!(
+            store.pending_writes(),
+            0,
+            "no writes should remain pending after drain"
+        );
+
+        // All 20 records must have actually landed in SQLite.
+        let history = store.history_summary(1).unwrap();
+        assert_eq!(
+            history.total_calls, 20,
+            "wait_until_quiet must guarantee writes are durable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_until_quiet_returns_immediately_when_idle() {
+        let (_dir, store) = test_store();
+        let start = Instant::now();
+        let drained = store
+            .wait_until_quiet(Duration::from_secs(1))
+            .await;
+        assert!(drained);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "no-op drain must be effectively instant; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_until_quiet_times_out_when_writes_stuck() {
+        let (_dir, store) = test_store();
+        let store = Arc::new(store);
+
+        // Simulate a stuck write by directly bumping the pending counter
+        // without ever producing a corresponding decrement. This isolates
+        // the timeout logic from the SQLite path.
+        store.pending_writes.fetch_add(1, Ordering::SeqCst);
+
+        let start = Instant::now();
+        let drained = store
+            .wait_until_quiet(Duration::from_millis(100))
+            .await;
+        assert!(!drained, "must report failure when deadline elapses");
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "must respect the timeout budget"
+        );
+        assert_eq!(store.pending_writes(), 1, "pending count must be unchanged");
+
+        // Cleanup so the test doesn't leak the bumped counter.
+        store.pending_writes.fetch_sub(1, Ordering::SeqCst);
     }
 }
