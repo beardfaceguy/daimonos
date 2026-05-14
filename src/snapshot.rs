@@ -25,105 +25,134 @@ impl SnapshotStore {
         Self { workspace }
     }
 
-    fn snapshots_dir(&self) -> PathBuf {
-        self.workspace.join(SNAPSHOTS_DIR)
-    }
-
-    fn snap_dir(&self, id: &str) -> PathBuf {
-        self.snapshots_dir().join(id)
-    }
-
     /// Create a snapshot of the workspace.
     /// Copies all tracked files (respecting .gitignore), preserving relative paths.
+    ///
+    /// All filesystem work (mkdir, recursive copy, manifest write) runs on
+    /// the blocking thread pool. Previously the `mkdir` and manifest write
+    /// were inline `std::fs::*` calls before/after `spawn_blocking`, which
+    /// blocked the tokio runtime when the workspace lived on a slow
+    /// filesystem (network mount, BTRFS under load, etc.). See vikunja #252.
     pub async fn create(&self, tag: Option<String>) -> Result<SnapshotMeta, String> {
-        let id = Uuid::new_v4().to_string();
-        let snap_dir = self.snap_dir(&id);
-        let files_dir = snap_dir.join("files");
-
-        std::fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
-
         let workspace = self.workspace.clone();
-        let files_dir_clone = files_dir.clone();
-
-        let (file_count, total_bytes) =
-            tokio::task::spawn_blocking(move || copy_workspace(&workspace, &files_dir_clone))
-                .await
-                .map_err(|e| format!("spawn: {e}"))??;
-
-        let now = chrono_now();
-        let meta = SnapshotMeta {
-            id,
-            tag,
-            created: now,
-            file_count,
-            total_bytes,
-        };
-
-        let manifest_path = snap_dir.join(MANIFEST_FILE);
-        let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("json: {e}"))?;
-        std::fs::write(&manifest_path, json).map_err(|e| format!("write manifest: {e}"))?;
-
-        Ok(meta)
+        tokio::task::spawn_blocking(move || create_impl(&workspace, tag))
+            .await
+            .map_err(|e| format!("spawn: {e}"))?
     }
 
     /// Restore a snapshot, replacing workspace files with the snapshot's contents.
     /// Removes files not in the snapshot that were in the workspace (tracked files only).
     pub async fn restore(&self, id: &str) -> Result<SnapshotMeta, String> {
-        let snap_dir = self.snap_dir(id);
-        if !snap_dir.exists() {
-            return Err(format!("snapshot not found: {id}"));
-        }
-
-        let meta = self.read_manifest(id)?;
-        let files_dir = snap_dir.join("files");
-
         let workspace = self.workspace.clone();
-        let files_dir_clone = files_dir.clone();
-
-        tokio::task::spawn_blocking(move || restore_workspace(&workspace, &files_dir_clone))
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || restore_impl(&workspace, &id))
             .await
-            .map_err(|e| format!("spawn: {e}"))??;
-
-        Ok(meta)
+            .map_err(|e| format!("spawn: {e}"))?
     }
 
     /// List all snapshots, newest first.
-    pub fn list(&self) -> Result<Vec<SnapshotMeta>, String> {
-        let dir = self.snapshots_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut snaps = Vec::new();
-        let entries = std::fs::read_dir(&dir).map_err(|e| format!("readdir: {e}"))?;
-
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let id = entry.file_name().to_string_lossy().to_string();
-                if let Ok(meta) = self.read_manifest(&id) {
-                    snaps.push(meta);
-                }
-            }
-        }
-
-        snaps.sort_by(|a, b| b.created.cmp(&a.created));
-        Ok(snaps)
+    ///
+    /// Now async: the body walks `.daimonos/snapshots/<id>/manifest.json`
+    /// for every snapshot, which previously blocked the runtime when
+    /// called from `snap_ops::snap_list`.
+    pub async fn list(&self) -> Result<Vec<SnapshotMeta>, String> {
+        let workspace = self.workspace.clone();
+        tokio::task::spawn_blocking(move || list_impl(&workspace))
+            .await
+            .map_err(|e| format!("spawn: {e}"))?
     }
 
     /// Delete a snapshot.
-    pub fn delete(&self, id: &str) -> Result<(), String> {
-        let snap_dir = self.snap_dir(id);
-        if !snap_dir.exists() {
-            return Err(format!("snapshot not found: {id}"));
-        }
-        std::fs::remove_dir_all(&snap_dir).map_err(|e| format!("delete: {e}"))
+    ///
+    /// Now async: `remove_dir_all` can take seconds on a snapshot of a
+    /// large source tree, and we used to call it on the tokio runtime
+    /// thread from `snap_ops::snap_delete`.
+    pub async fn delete(&self, id: &str) -> Result<(), String> {
+        let workspace = self.workspace.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || delete_impl(&workspace, &id))
+            .await
+            .map_err(|e| format!("spawn: {e}"))?
+    }
+}
+
+fn snapshots_dir(workspace: &Path) -> PathBuf {
+    workspace.join(SNAPSHOTS_DIR)
+}
+
+fn snap_dir(workspace: &Path, id: &str) -> PathBuf {
+    snapshots_dir(workspace).join(id)
+}
+
+fn read_manifest_at(workspace: &Path, id: &str) -> Result<SnapshotMeta, String> {
+    let path = snap_dir(workspace, id).join(MANIFEST_FILE);
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read manifest: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
+}
+
+fn create_impl(workspace: &Path, tag: Option<String>) -> Result<SnapshotMeta, String> {
+    let id = Uuid::new_v4().to_string();
+    let snap_dir_path = snap_dir(workspace, &id);
+    let files_dir = snap_dir_path.join("files");
+
+    std::fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
+    let (file_count, total_bytes) = copy_workspace(workspace, &files_dir)?;
+
+    let meta = SnapshotMeta {
+        id,
+        tag,
+        created: chrono_now(),
+        file_count,
+        total_bytes,
+    };
+
+    let manifest_path = snap_dir_path.join(MANIFEST_FILE);
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("json: {e}"))?;
+    std::fs::write(&manifest_path, json).map_err(|e| format!("write manifest: {e}"))?;
+
+    Ok(meta)
+}
+
+fn restore_impl(workspace: &Path, id: &str) -> Result<SnapshotMeta, String> {
+    let snap_dir_path = snap_dir(workspace, id);
+    if !snap_dir_path.exists() {
+        return Err(format!("snapshot not found: {id}"));
     }
 
-    fn read_manifest(&self, id: &str) -> Result<SnapshotMeta, String> {
-        let path = self.snap_dir(id).join(MANIFEST_FILE);
-        let content = std::fs::read_to_string(&path).map_err(|e| format!("read manifest: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
+    let meta = read_manifest_at(workspace, id)?;
+    let files_dir = snap_dir_path.join("files");
+    restore_workspace(workspace, &files_dir)?;
+    Ok(meta)
+}
+
+fn list_impl(workspace: &Path) -> Result<Vec<SnapshotMeta>, String> {
+    let dir = snapshots_dir(workspace);
+    if !dir.exists() {
+        return Ok(Vec::new());
     }
+
+    let mut snaps = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("readdir: {e}"))?;
+
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let id = entry.file_name().to_string_lossy().to_string();
+            if let Ok(meta) = read_manifest_at(workspace, &id) {
+                snaps.push(meta);
+            }
+        }
+    }
+
+    snaps.sort_by(|a, b| b.created.cmp(&a.created));
+    Ok(snaps)
+}
+
+fn delete_impl(workspace: &Path, id: &str) -> Result<(), String> {
+    let snap_dir_path = snap_dir(workspace, id);
+    if !snap_dir_path.exists() {
+        return Err(format!("snapshot not found: {id}"));
+    }
+    std::fs::remove_dir_all(&snap_dir_path).map_err(|e| format!("delete: {e}"))
 }
 
 fn copy_workspace(workspace: &Path, dest: &Path) -> Result<(usize, u64), String> {
@@ -353,12 +382,12 @@ mod tests {
         setup_workspace(dir.path());
 
         let store = SnapshotStore::new(dir.path().to_path_buf());
-        assert_eq!(store.list().unwrap().len(), 0);
+        assert_eq!(store.list().await.unwrap().len(), 0);
 
         store.create(Some("first".into())).await.unwrap();
         store.create(Some("second".into())).await.unwrap();
 
-        let snaps = store.list().unwrap();
+        let snaps = store.list().await.unwrap();
         assert_eq!(snaps.len(), 2);
     }
 
@@ -370,16 +399,16 @@ mod tests {
         let store = SnapshotStore::new(dir.path().to_path_buf());
         let meta = store.create(Some("temp".into())).await.unwrap();
 
-        assert_eq!(store.list().unwrap().len(), 1);
-        store.delete(&meta.id).unwrap();
-        assert_eq!(store.list().unwrap().len(), 0);
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        store.delete(&meta.id).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn delete_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path().to_path_buf());
-        let result = store.delete("nope");
+        let result = store.delete("nope").await;
         assert!(result.is_err());
     }
 
@@ -462,5 +491,35 @@ mod tests {
             std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "fn main() { v2() }"
         );
+    }
+
+    /// Regression for vikunja #252.
+    ///
+    /// The fix's effective regression signal is *compile-time*: both
+    /// `list()` and `delete()` are now `async fn` returning futures, and
+    /// every caller (`snap_ops::snap_list`, `snap_ops::snap_delete`, the
+    /// tests above) takes them with `.await`. A revert of either method
+    /// to `pub fn` would fail to compile against this file.
+    ///
+    /// This test locks that contract in. It does *not* try to assert
+    /// liveness via wall-clock timing — on a tmpfs-backed `tempdir` the
+    /// fs work completes in microseconds, faster than any `tokio::time`
+    /// resolution. To meaningfully observe the runtime staying responsive
+    /// *during* the fs work we'd need an artificially slow fs hook in
+    /// production code, which isn't worth the surface area. Use the
+    /// compile-time `.await` requirement as the test of record.
+    #[tokio::test]
+    async fn list_and_delete_have_async_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_workspace(dir.path());
+        let store = SnapshotStore::new(dir.path().to_path_buf());
+        let meta = store.create(Some("api-shape".into())).await.unwrap();
+
+        // The fact that these three lines compile is the regression test:
+        // a `.await` on the return value of `list()` / `delete()` would
+        // not type-check if either method were reverted to sync.
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        store.delete(&meta.id).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 0);
     }
 }

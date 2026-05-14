@@ -28,7 +28,7 @@ pub async fn restore(session: &Session, op: &Op) -> Response {
 
 /// Opcode 25: List all snapshots.
 pub async fn snap_list(session: &Session) -> Response {
-    match session.snapshot_store.list() {
+    match session.snapshot_store.list().await {
         Ok(snaps) => Response::ok(json!({"snapshots": snaps})),
         Err(e) => Response::err(4, &e),
     }
@@ -42,7 +42,7 @@ pub async fn snap_delete(session: &Session, op: &Op) -> Response {
         None => return Response::err(3, "snap_delete requires snapshot id in 'p'"),
     };
 
-    match session.snapshot_store.delete(id) {
+    match session.snapshot_store.delete(id).await {
         Ok(()) => Response::ok(json!({"deleted": id})),
         Err(e) => Response::err(7, &e),
     }
