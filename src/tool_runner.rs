@@ -328,8 +328,8 @@ impl ToolRegistry {
 
         Ok(RepairResult {
             tool: tool_id.to_string(),
+            total_iterations: iterations.len() as u32,
             iterations,
-            total_iterations: total_fixes,
             total_fixes,
             final_clean,
         })
@@ -647,6 +647,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output["status"], "ok");
+    }
+
+    /// Mock plugin for driving the repair loop deterministically:
+    /// each lint call returns N diagnostics from `fixes_per_iteration`,
+    /// and `apply_quickfix` always succeeds without touching the filesystem.
+    struct MockRepairPlugin {
+        descriptor: ToolDescriptor,
+        lint_call_count: std::sync::atomic::AtomicUsize,
+        fixes_per_iteration: Vec<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlugin for MockRepairPlugin {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        async fn run_command(
+            &self,
+            command: &str,
+            _cwd: &Path,
+            _env: &HashMap<String, String>,
+            _stdin_data: Option<&[u8]>,
+            _args: Option<&serde_json::Value>,
+        ) -> Result<ToolResult, String> {
+            if command != "lint" {
+                return Err(format!("mock: unknown command {command}"));
+            }
+            let i = self
+                .lint_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.fixes_per_iteration.get(i).copied().unwrap_or(0);
+            let diagnostics: Vec<serde_json::Value> = (0..n)
+                .map(|j| json!({"file": format!("f{j}.txt"), "old": "x", "new": "y"}))
+                .collect();
+            Ok(ToolResult {
+                tool: self.descriptor.id.clone(),
+                command: command.to_string(),
+                exit_code: if n == 0 { 0 } else { 1 },
+                output: json!({"diagnostics": diagnostics}),
+                stderr: String::new(),
+            })
+        }
+
+        async fn apply_quickfix(&self, _fix: &QuickFix, _cwd: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    fn mock_repair_descriptor() -> ToolDescriptor {
+        let mut commands = HashMap::new();
+        commands.insert(
+            "lint".into(),
+            ToolCommand {
+                bin: "true".into(),
+                args: vec![],
+                output: "json".into(),
+            },
+        );
+        ToolDescriptor {
+            id: "mock_repair".into(),
+            commands,
+            source_pattern: None,
+            manifest: None,
+            diagnostics_format: "json".into(),
+            supports_quickfix: true,
+            quickfix_format: Some("string_replace".into()),
+        }
+    }
+
+    /// Regression test for fix #1 (vikunja #243): RepairResult.total_iterations
+    /// must reflect the number of loop iterations actually run, NOT the total
+    /// number of fixes applied. The two were aliased due to a copy-paste bug.
+    #[tokio::test]
+    async fn repair_total_iterations_distinct_from_total_fixes() {
+        let registry = ToolRegistry::new();
+        // Sequence: iter 1 applies 3 fixes, iter 2 applies 1 fix, iter 3 sees
+        // an empty diagnostic list and breaks. iterations.len() == 3, total_fixes == 4.
+        let plugin = Arc::new(MockRepairPlugin {
+            descriptor: mock_repair_descriptor(),
+            lint_call_count: std::sync::atomic::AtomicUsize::new(0),
+            fixes_per_iteration: vec![3, 1, 0],
+        });
+        registry.register(plugin).await;
+
+        let result = registry
+            .repair("mock_repair", Path::new("/tmp"), &HashMap::new(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.iterations.len(),
+            3,
+            "loop should record one entry per iteration (incl. terminating clean iter)"
+        );
+        assert_eq!(result.total_fixes, 4, "expected 3 + 1 + 0 fixes applied");
+        assert_eq!(
+            result.total_iterations, 3,
+            "total_iterations must equal iterations.len(), not total_fixes"
+        );
+        assert_ne!(
+            result.total_iterations, result.total_fixes,
+            "total_iterations and total_fixes must report different counts here"
+        );
     }
 
     #[tokio::test]
