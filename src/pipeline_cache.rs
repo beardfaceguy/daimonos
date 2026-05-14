@@ -52,13 +52,23 @@ struct CacheState {
     /// state (rather than on `PipelineCache`) so eviction logic can read
     /// it under the same write lock.
     max_entries: usize,
+    /// Strictly-monotonic logical clock incremented on every `get`/`put`
+    /// hit. Used to drive LRU eviction without relying on wall-clock
+    /// timestamps (which can tie at sub-millisecond resolution and
+    /// require sleeps in tests). The counter is bumped on the same write
+    /// lock that mutates the entry it's stamping, so the value assigned
+    /// to `CachedResult.last_touched` is always unique.
+    access_counter: u64,
 }
 
 #[allow(dead_code)]
 struct CachedResult {
     output: serde_json::Value,
     exit_code: i32,
-    created: Instant,
+    /// Value of `CacheState.access_counter` at the most recent touch
+    /// (insert or read). Eviction picks the entry with the smallest
+    /// `last_touched` — i.e. the least-recently-used entry.
+    last_touched: u64,
 }
 
 #[allow(dead_code)]
@@ -75,6 +85,7 @@ impl PipelineCache {
             entries: HashMap::new(),
             last_invalidated: Instant::now(),
             max_entries: cfg.max_entries,
+            access_counter: 0,
         }));
 
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -175,6 +186,12 @@ impl PipelineCache {
     }
 
     /// Get a cached result for a tool command, or None if cache miss or dirty.
+    ///
+    /// A hit bumps the entry's `last_touched` stamp so that the next
+    /// eviction protects recently-used entries. This requires a write
+    /// lock; the cache is small and write-heavy (every tool invocation
+    /// touches it) so the extra contention is preferable to a
+    /// stale-LRU-stamp footgun.
     pub async fn get(&self, tool_id: &str, command: &str) -> Option<(serde_json::Value, i32)> {
         if self.dirty_flag.swap(false, Ordering::Relaxed) {
             let mut state = self.inner.write().await;
@@ -183,15 +200,20 @@ impl PipelineCache {
             return None;
         }
 
-        let state = self.inner.read().await;
+        let mut state = self.inner.write().await;
         let key = (tool_id.to_string(), command.to_string());
-        state
-            .entries
-            .get(&key)
-            .map(|c| (c.output.clone(), c.exit_code))
+        let next = state.access_counter.wrapping_add(1);
+        state.access_counter = next;
+        state.entries.get_mut(&key).map(|c| {
+            c.last_touched = next;
+            (c.output.clone(), c.exit_code)
+        })
     }
 
-    /// Store a result in the cache. Evicts an arbitrary entry when full.
+    /// Store a result in the cache. When the entry cap is reached, evicts
+    /// the least-recently-used entry (the one with the smallest
+    /// `last_touched` stamp). Inserting a fresh entry — or overwriting an
+    /// existing one — counts as a recency touch.
     pub async fn put(
         &self,
         tool_id: &str,
@@ -200,19 +222,30 @@ impl PipelineCache {
         exit_code: i32,
     ) {
         let mut state = self.inner.write().await;
-        if state.entries.len() >= state.max_entries {
-            let evict_key = state.entries.keys().next().cloned();
+        let key = (tool_id.to_string(), command.to_string());
+
+        // Insert-or-overwrite path doesn't need eviction; only growth past
+        // the cap does. Checking key presence first avoids evicting an
+        // entry we're about to overwrite.
+        if !state.entries.contains_key(&key) && state.entries.len() >= state.max_entries {
+            let evict_key = state
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.last_touched)
+                .map(|(k, _)| k.clone());
             if let Some(k) = evict_key {
                 state.entries.remove(&k);
             }
         }
-        let key = (tool_id.to_string(), command.to_string());
+
+        let next = state.access_counter.wrapping_add(1);
+        state.access_counter = next;
         state.entries.insert(
             key,
             CachedResult {
                 output,
                 exit_code,
-                created: Instant::now(),
+                last_touched: next,
             },
         );
     }
@@ -373,6 +406,80 @@ mod tests {
             PipelineCacheConfig::default().max_entries,
             1024,
             "default cap must remain 1024 to match the prior hardcoded MAX_CACHE_ENTRIES"
+        );
+    }
+
+    /// Regression for vikunja #255. Eviction used to pick
+    /// `entries.keys().next()`, an arbitrary key in HashMap iteration order.
+    /// Under true LRU, accessing an entry must protect it from the next
+    /// eviction; only the least-recently-touched entry should be dropped.
+    #[tokio::test]
+    async fn cache_evicts_least_recently_used_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PipelineCacheConfig {
+            max_watches: 8192,
+            extra_ignore_dirs: Vec::new(),
+            max_entries: 3,
+        };
+        let cache = PipelineCache::with_config(dir.path(), &cfg);
+
+        cache.put("t", "a", json!("a"), 0).await;
+        cache.put("t", "b", json!("b"), 0).await;
+        cache.put("t", "c", json!("c"), 0).await;
+
+        // Touch "a" so "b" becomes the LRU entry.
+        assert!(cache.get("t", "a").await.is_some());
+
+        // This put forces an eviction. With true LRU it must drop "b",
+        // not "a". The old `HashMap::keys().next()` implementation would
+        // drop an arbitrary entry — passing this test under the old code
+        // was a coin flip on the hash seed.
+        cache.put("t", "d", json!("d"), 0).await;
+
+        assert!(
+            cache.get("t", "a").await.is_some(),
+            "recently-accessed 'a' must survive LRU eviction"
+        );
+        assert!(
+            cache.get("t", "b").await.is_none(),
+            "least-recently-used 'b' must be evicted"
+        );
+        assert!(cache.get("t", "c").await.is_some(), "'c' must survive");
+        assert!(cache.get("t", "d").await.is_some(), "just-inserted 'd' must be present");
+
+        let state = cache.inner.read().await;
+        assert_eq!(state.entries.len(), 3, "cache size must remain at the cap");
+    }
+
+    /// LRU bookkeeping for repeated access: putting the same key multiple
+    /// times must update its recency too, not just on `get()`.
+    #[tokio::test]
+    async fn cache_put_refreshes_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PipelineCacheConfig {
+            max_watches: 8192,
+            extra_ignore_dirs: Vec::new(),
+            max_entries: 3,
+        };
+        let cache = PipelineCache::with_config(dir.path(), &cfg);
+
+        cache.put("t", "a", json!("a"), 0).await;
+        cache.put("t", "b", json!("b"), 0).await;
+        cache.put("t", "c", json!("c"), 0).await;
+
+        // Re-put "a" — its recency should jump to the most recent slot,
+        // making "b" the LRU.
+        cache.put("t", "a", json!("a_v2"), 0).await;
+
+        cache.put("t", "d", json!("d"), 0).await;
+
+        assert!(
+            cache.get("t", "a").await.is_some(),
+            "re-put 'a' must survive — put() must refresh recency"
+        );
+        assert!(
+            cache.get("t", "b").await.is_none(),
+            "'b' must be evicted as the new LRU"
         );
     }
 
