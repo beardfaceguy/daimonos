@@ -202,12 +202,18 @@ impl PipelineCache {
 
         let mut state = self.inner.write().await;
         let key = (tool_id.to_string(), command.to_string());
+        // Compute the next stamp first (it's a u64 copy) then assign it
+        // only on a hit. Bumping the counter on misses is still correct
+        // (it just leaves gaps in the logical clock) but wastes values.
         let next = state.access_counter.wrapping_add(1);
-        state.access_counter = next;
-        state.entries.get_mut(&key).map(|c| {
+        let result = state.entries.get_mut(&key).map(|c| {
             c.last_touched = next;
             (c.output.clone(), c.exit_code)
-        })
+        });
+        if result.is_some() {
+            state.access_counter = next;
+        }
+        result
     }
 
     /// Store a result in the cache. When the entry cap is reached, evicts
