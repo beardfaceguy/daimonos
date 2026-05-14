@@ -9,6 +9,14 @@ use crate::tools;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Process-global counter for background-process IDs. Shared across all
+/// `Session` instances in the same daemon process so concurrent sessions
+/// (and concurrent tests) never collide on the same pid — which used to
+/// cause race conditions on the shared `/tmp/daimonos_bg_<pid>.log`
+/// filename, since every session's `next_pid` started at 1.
+static NEXT_BG_PID: AtomicU32 = AtomicU32::new(1);
 
 /// Tracks a file's content hash so re-reads of unchanged files can return a compact response.
 #[derive(Debug, Clone)]
@@ -46,7 +54,6 @@ pub struct Session {
     /// same dispatch turn. Replaces brittle substring matching on the
     /// serialized response text.
     pub last_response_meta: ResponseMeta,
-    next_pid: u32,
 }
 
 pub struct BgProcess {
@@ -75,7 +82,6 @@ impl Session {
             used_tools: HashSet::new(),
             analytics: None,
             last_response_meta: ResponseMeta::default(),
-            next_pid: 1,
         }
     }
 
@@ -127,9 +133,12 @@ impl Session {
     }
 
     pub fn alloc_pid(&mut self) -> u32 {
-        let pid = self.next_pid;
-        self.next_pid += 1;
-        pid
+        // Process-global to avoid collisions on the shared
+        // `/tmp/daimonos_bg_<pid>.log` filename when multiple sessions
+        // (or multiple parallel tests) live in the same process.
+        // `Ordering::Relaxed` is sufficient — we don't need a memory
+        // fence, just a unique monotonic value.
+        NEXT_BG_PID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Hash file content using a fast non-cryptographic hash.
@@ -294,9 +303,11 @@ mod tests {
         let p1 = s.alloc_pid();
         let p2 = s.alloc_pid();
         let p3 = s.alloc_pid();
-        assert_eq!(p1, 1);
-        assert_eq!(p2, 2);
-        assert_eq!(p3, 3);
+        // `NEXT_BG_PID` is process-global, so we don't assert absolute
+        // values — other tests in this run may have already advanced it.
+        // What matters is monotonicity and contiguity for one session.
+        assert_eq!(p2, p1 + 1);
+        assert_eq!(p3, p2 + 1);
     }
 
     #[test]

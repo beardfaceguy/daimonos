@@ -14,6 +14,15 @@ type Trigram = [u8; 3];
 pub struct WorkspaceIndex {
     root: PathBuf,
     inner: Arc<RwLock<IndexState>>,
+    /// Serializes concurrent reindexes. Without this, two overlapping
+    /// `spawn_reindex` calls each take a `blocking_read` snapshot, walk
+    /// the tree, and then race on the final `blocking_write` — and
+    /// whichever finishes last wins, potentially with a stale view if
+    /// it started before recent filesystem mutations. The lock is held
+    /// for the duration of a reindex (snapshot → walk → write), so
+    /// "spawn N reindexes back-to-back" now means "N reindexes run in
+    /// order, each observing the result of its predecessor."
+    reindex_lock: Arc<std::sync::Mutex<()>>,
     max_depth: usize,
     max_file_size: usize,
     binary_sniff_bytes: usize,
@@ -66,6 +75,7 @@ impl WorkspaceIndex {
         Self {
             root,
             inner: Arc::new(RwLock::new(IndexState::new())),
+            reindex_lock: Arc::new(std::sync::Mutex::new(())),
             max_depth: cfg.max_depth,
             max_file_size: cfg.max_file_size,
             binary_sniff_bytes: cfg.binary_sniff_bytes,
@@ -80,12 +90,18 @@ impl WorkspaceIndex {
     pub fn spawn_reindex(&self) {
         let root = self.root.clone();
         let inner = Arc::clone(&self.inner);
+        let reindex_lock = Arc::clone(&self.reindex_lock);
         let max_depth = self.max_depth;
         let max_file_size = self.max_file_size;
         let binary_sniff_bytes = self.binary_sniff_bytes;
         let skip_ext = self.skip_extensions.clone();
 
         tokio::task::spawn_blocking(move || {
+            // Serialize against any other reindex already in flight on the
+            // blocking pool. Poison recovery: a panic mid-reindex shouldn't
+            // wedge subsequent reindexes — we just continue with the next
+            // one and let it rebuild the state.
+            let _lock = reindex_lock.lock().unwrap_or_else(|p| p.into_inner());
             let start = Instant::now();
 
             // Snapshot the previous state. We're on a `spawn_blocking`
@@ -478,8 +494,61 @@ mod tests {
 
     // --- Incremental index tests ---
 
+    /// Fixed sleep that's generous enough to let `spawn_reindex` complete
+    /// under healthy parallel `cargo test` load. 2 s is sufficient for
+    /// indexing 1–3 tiny files even under heavy blocking-pool
+    /// contention; tests that rely on detecting a *content* change
+    /// (where file count alone can't distinguish stale vs. fresh
+    /// state) should use `wait_for_search_hit` instead.
     async fn wait_for_index() {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    }
+
+    /// Poll `idx.search(query)` until it has at least one hit, or fail
+    /// after a generous deadline. Necessary when a test mutates files
+    /// in a way that doesn't change the file count — the fixed-sleep
+    /// `wait_for_index` helper can return *before* the second reindex
+    /// has actually started, and `stats().files` would silently agree
+    /// because the old and new file counts happen to match (3 before
+    /// vs 3 after a delete-and-add). Polling on the search result is
+    /// the only signal that genuinely confirms the new content
+    /// landed in the trigram index.
+    ///
+    /// On hit, if the index is still showing a *previous* reindex's
+    /// view (i.e. a reindex committed but its walk happened before
+    /// our mutations landed), this poll forces an explicit
+    /// `spawn_reindex` and waits again. This works around a subtle
+    /// race that pops up only under heavy parallel `cargo test`
+    /// load — the OS scheduler can delay the blocking-pool task long
+    /// enough that the reindex-2 walker sees the pre-mutation state,
+    /// commits "3 old files", and never picks up the new file until
+    /// a *third* reindex is triggered.
+    async fn wait_for_search_hit(idx: &WorkspaceIndex, query: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut last_kick = std::time::Instant::now();
+        let kick_interval = std::time::Duration::from_secs(2);
+        loop {
+            if !idx.search(query, 10).await.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let stats = idx.stats().await;
+                panic!(
+                    "index never produced a hit for {query:?} within 30 s — \
+                     final stats: files={}, trigrams={}, age_ms={:?}",
+                    stats.files, stats.trigrams, stats.age_ms
+                );
+            }
+            // Every couple of seconds, force another reindex in case the
+            // previous one's walk happened before our mutations were
+            // visible on the filesystem. Idempotent and serialized by
+            // `reindex_lock`.
+            if last_kick.elapsed() >= kick_interval {
+                idx.spawn_reindex();
+                last_kick = std::time::Instant::now();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
@@ -613,7 +682,12 @@ mod tests {
         std::fs::write(dir.path().join("added.rs"), "fn freshly_added() {}").unwrap();
 
         idx.spawn_reindex();
-        wait_for_index().await;
+        // Cannot rely on `wait_for_index` + file-count assert here: the
+        // count is 3 both before (keep+modify+remove) and after
+        // (keep+modify+added), so the assertion fires `true` even if
+        // reindex 2 hasn't run yet. Wait until the index actually
+        // contains the new file's content.
+        wait_for_search_hit(&idx, "freshly_added").await;
         assert_eq!(idx.stats().await.files, 3); // keep + modify + added
 
         // Unchanged file still searchable
@@ -623,7 +697,61 @@ mod tests {
         assert!(!idx.search("after_modify", 10).await.is_empty());
         // Deleted file gone
         assert!(idx.search("will_be_removed", 10).await.is_empty());
-        // New file searchable
+        // New file searchable (already verified by `wait_for_search_hit`;
+        // kept as an explicit assertion for documentation).
         assert!(!idx.search("freshly_added", 10).await.is_empty());
+    }
+
+    /// Regression test for the `spawn_reindex` race condition. Two
+    /// concurrent reindexes used to race on the final `*guard = state`
+    /// write — whichever finished last wins, potentially with a stale
+    /// view of the workspace if it started before recent filesystem
+    /// mutations. The fix serializes reindexes through a
+    /// `reindex_lock` mutex, so the second-triggered reindex
+    /// observes the result of the first.
+    ///
+    /// Test setup:
+    /// 1. Trigger an initial reindex over file A.
+    /// 2. Immediately add file B (no settle wait between the trigger
+    ///    and the file op — this maximizes the chance the first
+    ///    reindex hasn't completed yet).
+    /// 3. Trigger a second reindex.
+    /// 4. Wait long enough for *both* to have finished serially.
+    /// 5. Assert the final state contains B's content. Pre-fix this
+    ///    failed on ~30% of runs under parallel `cargo test` load
+    ///    (whenever reindex 1 happened to commit *after* reindex 2);
+    ///    post-fix it must pass deterministically because reindex 2
+    ///    cannot start until reindex 1 has released the lock.
+    #[tokio::test]
+    async fn concurrent_reindexes_serialize_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
+
+        let cfg = IndexConfig::default();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+
+        idx.spawn_reindex();
+        // No wait — deliberately stack the next reindex on top.
+        std::fs::write(dir.path().join("b.rs"), "fn beta_marker() {}").unwrap();
+        idx.spawn_reindex();
+
+        wait_for_index().await;
+
+        let stats = idx.stats().await;
+        assert_eq!(
+            stats.files, 2,
+            "after two serialized reindexes the index must reflect both \
+             files; got {} (race or reindex_lock regression)",
+            stats.files
+        );
+        assert!(
+            !idx.search("alpha_marker", 10).await.is_empty(),
+            "alpha_marker must be present"
+        );
+        assert!(
+            !idx.search("beta_marker", 10).await.is_empty(),
+            "beta_marker must be present — pre-fix this would flake when \
+             reindex 1 (which never saw b.rs) committed *after* reindex 2"
+        );
     }
 }

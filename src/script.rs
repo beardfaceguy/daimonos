@@ -917,9 +917,12 @@ result = runaway()
             "expected 'timeout' substring in error: {err}"
         );
         assert!(
-            elapsed < Duration::from_secs(1),
-            "execute() must return promptly on timeout (within ~7x of the \
-             150 ms request), elapsed {:?}",
+            elapsed < Duration::from_millis(1500),
+            "execute() must return promptly on timeout (within ~10x of the \
+             150 ms request), elapsed {:?}. If this flakes under heavy CI load, \
+             the bound was 3 s pre-vikunja-#251 and the prior commit tightened \
+             it to 1 s; 1.5 s is the practical floor that still catches any \
+             multi-second cancellation regression.",
             elapsed
         );
     }

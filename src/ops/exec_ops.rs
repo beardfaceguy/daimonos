@@ -998,19 +998,34 @@ mod tests {
         let log_path = std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
         assert!(log_path.exists(), "log file should exist after bg spawn");
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let poll_resp = poll(
-            &mut s,
-            &Op {
-                c: 10,
-                n: Some(pid),
-                ..Op::default()
-            },
-        )
-        .await;
-        assert!(poll_resp.ok);
-        assert_eq!(poll_resp.d.as_ref().unwrap()["running"], false);
+        // Poll in a loop until the process is observed completed (or the loop
+        // times out). The earlier fixed 200 ms sleep was racy under parallel
+        // `cargo test` load — `true` may genuinely finish in <1 ms, but the
+        // tokio scheduler may not get back to this task that quickly when
+        // hundreds of sibling tests are saturating the runtime.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut poll_resp;
+        loop {
+            poll_resp = poll(
+                &mut s,
+                &Op {
+                    c: 10,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(poll_resp.ok);
+            if poll_resp.d.as_ref().unwrap()["running"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bg `true` did not complete within 5 s — runtime is unusably \
+                 starved or the bg process tracking is broken"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         assert!(
             !log_path.exists(),
@@ -1024,6 +1039,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
 
+        // Collect the pids this session was assigned. `alloc_pid` is now
+        // process-global so the pids are no longer guaranteed to be 1..=10 —
+        // a parallel test may have advanced the counter further.
+        let mut pids = Vec::with_capacity(10);
         for i in 0..10 {
             let bg_resp = bg(
                 &mut s,
@@ -1035,16 +1054,18 @@ mod tests {
             )
             .await;
             assert!(bg_resp.ok, "bg {i} failed");
+            let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
+            pids.push(pid);
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        for pid in 1..=10u32 {
+        for pid in pids {
             poll(
                 &mut s,
                 &Op {
                     c: 10,
-                    n: Some(pid as i64),
+                    n: Some(pid),
                     ..Op::default()
                 },
             )
