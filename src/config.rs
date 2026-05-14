@@ -76,9 +76,9 @@ pub struct ProcessConfig {
 }
 
 /// Default cap for `ProcessConfig::max_script_threads`. Exposed so the
-/// fallback used by `script::script_semaphore()` when
-/// `configure_max_concurrent` was never called stays in sync with the
-/// config default and the value in `daimonos.default.toml`.
+/// fallback used inside `script.rs` when `script::configure_max_concurrent`
+/// was never called stays in sync with the struct default and the value
+/// in `daimonos.default.toml`.
 pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
 
 #[derive(Debug, Deserialize)]

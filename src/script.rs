@@ -14,6 +14,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
+use crate::ops;
+use crate::protocol::{Request, Response};
+use crate::session::Session;
+use crate::tools;
 
 /// Lazily-initialized global cap on concurrent Starlark script threads.
 ///
@@ -31,14 +35,14 @@ use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
 static SCRIPT_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Initialize a `OnceLock<Arc<Semaphore>>` to a `Semaphore::new(n)`.
-/// Returns `Err(())` if the cell was already initialized, so callers
+/// Returns `false` if the cell was already initialized, so callers
 /// can surface that to the operator.
 ///
 /// Extracted from `configure_max_concurrent` so unit tests can exercise
 /// the locking semantics against a local `OnceLock` without touching
 /// the process-global `SCRIPT_PERMITS`.
-fn init_semaphore(cell: &OnceLock<Arc<Semaphore>>, n: usize) -> Result<(), ()> {
-    cell.set(Arc::new(Semaphore::new(n))).map_err(|_| ())
+fn init_semaphore(cell: &OnceLock<Arc<Semaphore>>, n: usize) -> bool {
+    cell.set(Arc::new(Semaphore::new(n))).is_ok()
 }
 
 /// Configure the script-thread concurrency cap.
@@ -54,7 +58,7 @@ fn init_semaphore(cell: &OnceLock<Arc<Semaphore>>, n: usize) -> Result<(), ()> {
 /// almost certainly a misconfiguration, not an intentional kill switch.
 pub fn configure_max_concurrent(max_threads: usize) {
     let max_threads = max_threads.max(1);
-    if init_semaphore(&SCRIPT_PERMITS, max_threads).is_err() {
+    if !init_semaphore(&SCRIPT_PERMITS, max_threads) {
         eprintln!(
             "daimonos: configure_max_concurrent({max_threads}) ignored — \
              script semaphore was already initialized"
@@ -67,12 +71,6 @@ fn script_semaphore() -> Arc<Semaphore> {
         .get_or_init(|| Arc::new(Semaphore::new(DEFAULT_MAX_SCRIPT_THREADS)))
         .clone()
 }
-
-
-use crate::ops;
-use crate::protocol::{Request, Response};
-use crate::session::Session;
-use crate::tools;
 
 thread_local! {
     static PRINT_LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -144,11 +142,6 @@ pub async fn execute(
     let handle = tokio::runtime::Handle::current();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = Arc::clone(&cancel);
-    // Cancel on any drop of this future — covers timeout, caller-side
-    // future cancellation (MCP disconnect, parent abort), and the
-    // normal-completion path (where it's a harmless no-op because the
-    // thread is already gone).
-    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
 
     // Acquire a script-thread slot. Bounds concurrent OS threads to
     // `process.max_script_threads`; pure-CPU runaway scripts hold
@@ -169,17 +162,23 @@ pub async fn execute(
         }
     };
 
+    // Cancel on any drop of this future from this point forward —
+    // covers timeout and caller-side future cancellation (MCP client
+    // disconnect, parent task abort). Installed *after* permit
+    // acquisition so the acquire-timeout error path doesn't flip a
+    // flag no thread will ever read.
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
+
     // The slot acquire consumed part of the budget. If it consumed
     // *all* of it, fail fast with a clear message rather than spawning
     // a thread that will be cancelled on its first tool dispatch and
     // reporting a misleading "0 ms" timeout.
-    let original_timeout = timeout;
     let remaining = timeout.saturating_sub(acquire_start.elapsed());
     if remaining.is_zero() {
         return Err(format!(
             "script timeout after {} ms (entire budget consumed acquiring \
              thread slot)",
-            original_timeout.as_millis()
+            timeout.as_millis()
         ));
     }
 
@@ -202,17 +201,14 @@ pub async fn execute(
 
     match tokio::time::timeout(remaining, rx).await {
         Ok(Ok(r)) => r,
-        Ok(Err(_)) => Err("script thread exited without result".to_string()),
-        Err(_) => {
-            // Cancel flag will also be flipped by `_cancel_guard` on
-            // function return; setting it explicitly here costs
-            // nothing and makes the timeout path self-documenting.
-            cancel.store(true, Ordering::Relaxed);
-            Err(format!(
-                "script timeout after {} ms",
-                original_timeout.as_millis()
-            ))
-        }
+        // The sender is dropped without sending only if the script
+        // thread panicked before reaching `tx.send`. Surface that
+        // rather than the vaguer "exited without result".
+        Ok(Err(_)) => Err("script thread panicked before producing a result".to_string()),
+        // Cancel-on-drop will flip the flag when `_cancel_guard`
+        // unwinds at function return; no explicit `cancel.store`
+        // needed here.
+        Err(_) => Err(format!("script timeout after {} ms", timeout.as_millis())),
     }
 }
 
@@ -837,7 +833,7 @@ result = True
     #[test]
     fn init_semaphore_sets_cap_on_first_call() {
         let cell: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        init_semaphore(&cell, 7).expect("first init must succeed");
+        assert!(init_semaphore(&cell, 7), "first init must succeed");
         let sem = cell.get().expect("cell must be initialized");
         assert_eq!(
             sem.available_permits(),
@@ -849,10 +845,11 @@ result = True
     #[test]
     fn init_semaphore_rejects_second_call() {
         let cell: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        init_semaphore(&cell, 4).expect("first init must succeed");
-        init_semaphore(&cell, 99).expect_err(
+        assert!(init_semaphore(&cell, 4), "first init must succeed");
+        assert!(
+            !init_semaphore(&cell, 99),
             "second init must fail — `configure_max_concurrent` is documented \
-             as idempotent",
+             as idempotent"
         );
         let sem = cell.get().expect("cell must still be initialized");
         assert_eq!(
@@ -920,8 +917,9 @@ result = runaway()
             "expected 'timeout' substring in error: {err}"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
-            "execute() must return promptly on timeout, elapsed {:?}",
+            elapsed < Duration::from_secs(1),
+            "execute() must return promptly on timeout (within ~7x of the \
+             150 ms request), elapsed {:?}",
             elapsed
         );
     }
@@ -957,7 +955,12 @@ def loop_forever():
 
 loop_forever()
 "#;
-            let _ = execute(runaway, session.clone(), Duration::from_millis(100)).await;
+            let first = execute(runaway, session.clone(), Duration::from_millis(100)).await;
+            assert!(
+                first.is_err(),
+                "first execute() must time out — if it accidentally succeeds, \
+                 the rest of the test is meaningless"
+            );
 
             let second = tokio::time::timeout(
                 Duration::from_secs(5),
