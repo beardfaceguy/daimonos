@@ -1004,9 +1004,8 @@ mod tests {
         // tokio scheduler may not get back to this task that quickly when
         // hundreds of sibling tests are saturating the runtime.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut poll_resp;
         loop {
-            poll_resp = poll(
+            let poll_resp = poll(
                 &mut s,
                 &Op {
                     c: 10,
