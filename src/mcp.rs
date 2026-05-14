@@ -299,14 +299,18 @@ async fn dispatch_tool_inner(
             let previous = session.cwd.display().to_string();
             let new_cwd = session.resolve_path(&path);
 
-            if !new_cwd.is_dir() {
-                return err_text(format!("not a directory: {}", new_cwd.display()));
-            }
-
+            // Canonicalize first, then stat the canonical path. Reversing
+            // these (is_dir → canonicalize) opens a TOCTOU window where
+            // a symlink target can be swapped between the two syscalls
+            // and produces misleading errors for non-existent paths.
             let canonical = match new_cwd.canonicalize() {
                 Ok(p) => p,
                 Err(e) => return err_text(format!("resolve path: {e}")),
             };
+
+            if !canonical.is_dir() {
+                return err_text(format!("not a directory: {}", canonical.display()));
+            }
 
             session.cwd = canonical.clone();
             ok_text(
