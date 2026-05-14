@@ -786,23 +786,52 @@ mod tests {
         )
         .await;
         assert!(bg_resp.ok, "bg failed: {:?}", bg_resp.m);
-        let pid = bg_resp.d.unwrap()["pid"].as_u64().unwrap();
+        let pid = bg_resp.d.unwrap()["pid"].as_u64().unwrap() as i64;
+        let log_path =
+            std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
 
-        // Wait for the spawned process to finish writing.
-        for _ in 0..50 {
-            if dir.path().join("out.txt").exists() {
+        let out_file = dir.path().join("out.txt");
+        let mut appeared = false;
+        for _ in 0..100 {
+            if out_file.exists() {
+                appeared = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let _ = s.bg_processes.remove(&(pid as u32));
+        assert!(
+            appeared,
+            "bg subprocess never wrote out.txt within 2s (likely never ran or env not propagated)"
+        );
 
-        let written = std::fs::read_to_string(dir.path().join("out.txt"))
+        let written = std::fs::read_to_string(&out_file)
             .expect("bg subprocess should have created out.txt");
         assert_eq!(
             written.trim(),
             "kv_value",
             "bg subprocess did not see op.kv env var (got: {written:?})"
+        );
+
+        let poll_resp = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(poll_resp.ok);
+        assert_eq!(poll_resp.d.as_ref().unwrap()["running"], false);
+
+        assert!(
+            s.bg_processes.is_empty(),
+            "bg_processes map should be empty after poll() reaped completed child"
+        );
+        assert!(
+            !log_path.exists(),
+            "bg log file at {} should be deleted after poll() reap",
+            log_path.display()
         );
     }
 
