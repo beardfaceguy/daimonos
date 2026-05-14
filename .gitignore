@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 /benchmarks/results/
 /benchmarks/workspace/
+/benchmarks/server-bench/results/
 claude_api_key.env
