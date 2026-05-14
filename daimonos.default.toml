@@ -85,6 +85,12 @@ max_watches = 8192
 # extra_ignore_dirs = ["bazel-out", "vendor"]
 extra_ignore_dirs = []
 
+# Hard cap on the number of (tool_id, command) results held in memory.
+# When the cap is reached, the oldest entry is evicted to make room. Higher
+# values trade memory for cache hit rate; the default sits at the prior
+# hardcoded cap so existing operators see no behavioral change.
+max_entries = 1024
+
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.
 # Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.

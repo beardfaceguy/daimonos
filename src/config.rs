@@ -114,6 +114,10 @@ pub struct PipelineCacheConfig {
     /// `build`, `out`, `.venv`, `venv`, `__pycache__`, `.cache`, `.next`,
     /// `.nuxt`, `.turbo`, `.tox`, `.mypy_cache`, `.pytest_cache`).
     pub extra_ignore_dirs: Vec<String>,
+    /// Hard cap on the number of `(tool_id, command)` results held in the
+    /// pipeline cache. When `put()` would exceed this, the oldest entry is
+    /// evicted. Operators tuning this trade memory for cache hit rate.
+    pub max_entries: usize,
 }
 
 impl Default for AnalyticsConfig {
@@ -188,6 +192,7 @@ impl Default for PipelineCacheConfig {
         Self {
             max_watches: 8192,
             extra_ignore_dirs: Vec::new(),
+            max_entries: 1024,
         }
     }
 }

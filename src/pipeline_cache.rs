@@ -8,8 +8,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-const MAX_CACHE_ENTRIES: usize = 1024;
-
 /// Directory base names that are never worth watching for cache invalidation.
 /// These are skipped even when `.gitignore` doesn't exclude them and even when
 /// they aren't hidden (e.g. `target`, `node_modules`). Without this filter a
@@ -49,6 +47,11 @@ struct CacheState {
     entries: HashMap<(String, String), CachedResult>,
     /// When the last invalidation happened
     last_invalidated: Instant,
+    /// Per-instance cap on `entries.len()`, taken from
+    /// `PipelineCacheConfig.max_entries` at construction. Stored on the
+    /// state (rather than on `PipelineCache`) so eviction logic can read
+    /// it under the same write lock.
+    max_entries: usize,
 }
 
 #[allow(dead_code)]
@@ -71,6 +74,7 @@ impl PipelineCache {
         let inner = Arc::new(RwLock::new(CacheState {
             entries: HashMap::new(),
             last_invalidated: Instant::now(),
+            max_entries: cfg.max_entries,
         }));
 
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -196,7 +200,7 @@ impl PipelineCache {
         exit_code: i32,
     ) {
         let mut state = self.inner.write().await;
-        if state.entries.len() >= MAX_CACHE_ENTRIES {
+        if state.entries.len() >= state.max_entries {
             let evict_key = state.entries.keys().next().cloned();
             if let Some(k) = evict_key {
                 state.entries.remove(&k);
@@ -326,9 +330,49 @@ mod tests {
         }
         let state = cache.inner.read().await;
         assert!(
-            state.entries.len() <= 1024,
-            "pipeline cache should be bounded to a max size, but has {} entries",
+            state.entries.len() <= PipelineCacheConfig::default().max_entries,
+            "pipeline cache should be bounded to the default max_entries cap, but has {} entries",
             state.entries.len()
+        );
+    }
+
+    /// Regression for vikunja #256: the entry cap must come from
+    /// `PipelineCacheConfig.max_entries`, not a hardcoded `const`. Construct
+    /// the cache with a tiny custom cap and verify `put()` honors it.
+    #[tokio::test]
+    async fn cache_max_entries_is_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PipelineCacheConfig {
+            max_watches: 8192,
+            extra_ignore_dirs: Vec::new(),
+            max_entries: 4,
+        };
+        let cache = PipelineCache::with_config(dir.path(), &cfg);
+
+        for i in 0..20 {
+            cache
+                .put(&format!("tool_{i}"), &format!("cmd_{i}"), json!({"i": i}), 0)
+                .await;
+        }
+
+        let state = cache.inner.read().await;
+        assert!(
+            state.entries.len() <= cfg.max_entries,
+            "configured cap of {} not honored; got {} entries",
+            cfg.max_entries,
+            state.entries.len()
+        );
+    }
+
+    /// `PipelineCacheConfig::default()` must still cap at 1024 entries so
+    /// the previous hardcoded behavior is preserved when callers don't
+    /// override the field.
+    #[test]
+    fn default_max_entries_preserves_legacy_cap() {
+        assert_eq!(
+            PipelineCacheConfig::default().max_entries,
+            1024,
+            "default cap must remain 1024 to match the prior hardcoded MAX_CACHE_ENTRIES"
         );
     }
 
@@ -411,6 +455,7 @@ mod tests {
         let cfg = PipelineCacheConfig {
             max_watches: 25,
             extra_ignore_dirs: Vec::new(),
+            max_entries: 1024,
         };
         let cache = PipelineCache::with_config(root, &cfg);
         std::thread::sleep(std::time::Duration::from_millis(150));
