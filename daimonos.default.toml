@@ -58,6 +58,23 @@ enabled = true
 # Auto-delete records older than this many days
 retention_days = 90
 
+[pipeline_cache]
+# The pipeline cache invalidates tool results when workspace files change.
+# It registers one inotify watch per source-tree directory (after filtering
+# out heavyweight dirs like .git/node_modules/target/dist/build/.venv via
+# .gitignore + a built-in skip list).
+#
+# Hard cap on directory watches the cache may register. On Linux this directly
+# bounds inotify usage so a single daimonos process can't exhaust
+# fs.inotify.max_user_watches. When the cap is reached the watcher stops
+# adding more dirs and logs a warning; later changes in unwatched dirs won't
+# invalidate the cache, but the process stays within its kernel-resource budget.
+max_watches = 8192
+# Extra directory base names to skip on top of .gitignore + the built-in list.
+# Use this for project-specific build/cache dirs the watcher should ignore.
+# extra_ignore_dirs = ["bazel-out", "vendor"]
+extra_ignore_dirs = []
+
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.
 # Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.

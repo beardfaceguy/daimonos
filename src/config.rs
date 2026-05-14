@@ -13,6 +13,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub process: ProcessConfig,
     pub analytics: AnalyticsConfig,
+    pub pipeline_cache: PipelineCacheConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -74,6 +75,23 @@ pub struct AnalyticsConfig {
     pub db_path: Option<String>,
     /// Days to retain analytics data before auto-cleanup.
     pub retention_days: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct PipelineCacheConfig {
+    /// Hard cap on directory watches the pipeline cache may register.
+    /// On Linux this directly bounds inotify watch usage so a single
+    /// daimonos process can't exhaust `fs.inotify.max_user_watches`.
+    /// When the cap is reached the watcher stops adding more dirs and
+    /// logs a warning; later changes in unwatched dirs won't invalidate
+    /// the cache, but the process stays within its kernel-resource budget.
+    pub max_watches: usize,
+    /// Extra directory base names to skip on top of `.gitignore` rules and
+    /// the built-in skip list (`.git`, `node_modules`, `target`, `dist`,
+    /// `build`, `out`, `.venv`, `venv`, `__pycache__`, `.cache`, `.next`,
+    /// `.nuxt`, `.turbo`, `.tox`, `.mypy_cache`, `.pytest_cache`).
+    pub extra_ignore_dirs: Vec<String>,
 }
 
 impl Default for AnalyticsConfig {
@@ -139,6 +157,15 @@ impl Default for ProcessConfig {
             max_cache_entries: 1024,
             exec_output_filters: true,
             exec_plugin_redirect: true,
+        }
+    }
+}
+
+impl Default for PipelineCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_watches: 8192,
+            extra_ignore_dirs: Vec::new(),
         }
     }
 }

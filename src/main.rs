@@ -89,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("auto-registered gh tool plugin");
     }
 
-    let pcache = Arc::new(pipeline_cache::PipelineCache::new(&workspace));
+    let pcache = Arc::new(pipeline_cache::PipelineCache::with_config(
+        &workspace,
+        &cfg.pipeline_cache,
+    ));
 
     // Analytics: --stats prints summary and exits
     if cli.stats {
