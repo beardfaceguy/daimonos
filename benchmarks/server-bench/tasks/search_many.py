@@ -1,9 +1,11 @@
 """Run 50 grep calls with varied patterns against a synthetic source tree.
 
 Stresses opcode 6 (grep): pattern arg in `p`, search root in `q`, max
-results in `n`. The first 25 patterns hit real content in every file;
-the last 25 are deliberate misses so we measure the "nothing found"
-short-circuit path too.
+results in `n`. The pattern list mixes hits and misses against
+`FILE_TEMPLATE` — `needle`/`fn process`/`TODO`/`Result<`/etc. land in
+every file, names like `Send`/`#[derive` never appear, and the trailing
+25 `nonexistent_token_*` entries are guaranteed misses. We want both
+sides of the hit/miss latency distribution in one task.
 
 Per-call timing here reflects ripgrep spawn cost + result formatting,
 which is the dominant factor in real-world agent search latency.

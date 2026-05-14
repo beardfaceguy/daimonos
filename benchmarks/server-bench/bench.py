@@ -246,27 +246,82 @@ def load_task(task_id: str):
 
 
 def run_task(
-    client: Client,
     task_mod,
-    workspace: Path,
+    binary: Path,
     iterations: int,
-    daemon_pid: int,
 ) -> TaskResult:
-    task_mod.setup(workspace)
-    result = TaskResult(
-        task_id=task_mod.ID,
-        description=task_mod.DESCRIPTION,
-        iterations=iterations,
+    """Spawn a fresh daimonos for this task, point it at a clean
+    workspace, run the iterations, tear it all down.
+
+    Each task gets its own daemon + workspace so opcodes that operate
+    on the whole workspace root (snap/restore especially) see only what
+    setup() put there. Mixing tasks into one shared daemon
+    cross-contaminates snapshot payloads with files written by earlier
+    tasks, making results depend on task-list order rather than purely
+    on server behavior.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix=f"daimonos-bench-{task_mod.ID}-"))
+    socket_path = workspace / "bench.sock"
+    env = os.environ.copy()
+    env["HOME"] = str(workspace)
+    env.pop("DAIMONOS_CONFIG", None)
+    proc = subprocess.Popen(
+        [
+            str(binary),
+            "--socket",
+            str(socket_path),
+            "--workspace",
+            str(workspace),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(workspace),
     )
-    # Warm-up iteration: not recorded. Discards the first run's
-    # caches-cold penalty so we measure steady-state.
-    task_mod.run_iteration(client, workspace)
-    for _ in range(iterations):
-        for op_code, elapsed_ns in task_mod.run_iteration(client, workspace):
-            result.timings_ns.append(int(elapsed_ns))
-            result.op_codes.append(int(op_code))
-    result.resources = proc_resource_snapshot(daemon_pid)
-    return result
+    deadline = time.time() + 10.0
+    while not socket_path.exists():
+        if proc.poll() is not None:
+            err = proc.stderr.read() if proc.stderr else b""
+            raise RuntimeError(
+                f"daimonos exited early for task {task_mod.ID}: "
+                f"{err.decode(errors='replace')!r}"
+            )
+        if time.time() >= deadline:
+            proc.kill()
+            raise RuntimeError(
+                f"daimonos did not create socket for task {task_mod.ID} "
+                "within 10 s"
+            )
+        time.sleep(0.025)
+
+    client: Client | None = None
+    try:
+        task_mod.setup(workspace)
+        client = Client(socket_path)
+        result = TaskResult(
+            task_id=task_mod.ID,
+            description=task_mod.DESCRIPTION,
+            iterations=iterations,
+        )
+        # Warm-up iteration: not recorded. Discards the first run's
+        # caches-cold penalty so we measure steady-state.
+        task_mod.run_iteration(client, workspace)
+        for _ in range(iterations):
+            for op_code, elapsed_ns in task_mod.run_iteration(client, workspace):
+                result.timings_ns.append(int(elapsed_ns))
+                result.op_codes.append(int(op_code))
+        result.resources = proc_resource_snapshot(proc.pid)
+        return result
+    finally:
+        if client is not None:
+            client.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> int:
@@ -295,11 +350,6 @@ def main() -> int:
         default=None,
         help="Path to daimonos binary (default: auto-detect)",
     )
-    parser.add_argument(
-        "--keep-workspace",
-        action="store_true",
-        help="Don't delete the per-run temp workspace (for debugging)",
-    )
     args = parser.parse_args()
 
     binary = args.binary or find_binary()
@@ -309,106 +359,37 @@ def main() -> int:
 
     out_dir = args.out or (RESULTS_DIR / time.strftime("%Y%m%d-%H%M%S"))
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    workspace_root = Path(tempfile.mkdtemp(prefix="daimonos-bench-"))
-    socket_path = workspace_root / "bench.sock"
     print(f"bench: binary={binary}", file=sys.stderr)
-    print(f"bench: workspace={workspace_root}", file=sys.stderr)
-    print(f"bench: socket={socket_path}", file=sys.stderr)
     print(f"bench: out={out_dir}", file=sys.stderr)
 
-    # Build an isolated env so the bench can't inherit a stale
-    # daimonos.toml from somewhere up the tree and so analytics writes
-    # don't pollute the user's ~/.daimonos/analytics.db. HOME points at
-    # the per-run workspace so any default-config paths land there.
-    env = os.environ.copy()
-    env["HOME"] = str(workspace_root)
-    env.pop("DAIMONOS_CONFIG", None)
+    all_results: list[TaskResult] = []
+    for task_id in args.tasks:
+        task_mod = load_task(task_id)
+        print(
+            f"bench: running {task_id} ({task_mod.DESCRIPTION}) "
+            f"× {args.replicates} replicates",
+            file=sys.stderr,
+        )
+        result = run_task(task_mod, binary, args.replicates)
+        all_results.append(result)
+        summary = result.summary()
+        print(
+            f"  → {summary['count']} calls, "
+            f"median={summary['median_ns']/1000:.1f}µs, "
+            f"p99={summary['p99_ns']/1000:.1f}µs, "
+            f"stdev={summary['stdev_ns']/1000:.1f}µs",
+            file=sys.stderr,
+        )
 
-    proc = subprocess.Popen(
-        [
-            str(binary),
-            "--socket",
-            str(socket_path),
-            "--workspace",
-            str(workspace_root),
-        ],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        cwd=str(workspace_root),
-    )
-
-    # Wait for the socket to appear. The daemon binds before accepting
-    # any connections, so a short polling loop is sufficient.
-    deadline = time.time() + 10.0
-    while not socket_path.exists():
-        if proc.poll() is not None:
-            err = proc.stderr.read() if proc.stderr else b""
-            print(
-                f"daimonos exited early: {err.decode(errors='replace')!r}",
-                file=sys.stderr,
-            )
-            return 2
-        if time.time() >= deadline:
-            proc.kill()
-            print("daimonos did not create socket within 10 s", file=sys.stderr)
-            return 2
-        time.sleep(0.025)
-
-    client: Client | None = None
-    try:
-        client = Client(socket_path)
-        all_results: list[TaskResult] = []
-        for task_id in args.tasks:
-            task_mod = load_task(task_id)
-            task_ws = workspace_root / task_id
-            task_ws.mkdir(parents=True, exist_ok=True)
-            print(
-                f"bench: running {task_id} ({task_mod.DESCRIPTION}) "
-                f"× {args.replicates} replicates",
-                file=sys.stderr,
-            )
-            result = run_task(
-                client, task_mod, task_ws, args.replicates, proc.pid
-            )
-            all_results.append(result)
-            summary = result.summary()
-            print(
-                f"  → {summary['count']} calls, "
-                f"median={summary['median_ns']/1000:.1f}µs, "
-                f"p99={summary['p99_ns']/1000:.1f}µs, "
-                f"stdev={summary['stdev_ns']/1000:.1f}µs",
-                file=sys.stderr,
-            )
-
-        out_payload = {
-            "binary": str(binary),
-            "replicates": args.replicates,
-            "tasks": [
-                {
-                    **{k: v for k, v in asdict(r).items() if k != "timings_ns"},
-                    "timings_ns": r.timings_ns,
-                    "summary": r.summary(),
-                }
-                for r in all_results
-            ],
-        }
-        out_file = out_dir / "results.json"
-        out_file.write_text(json.dumps(out_payload, indent=2))
-        print(f"bench: wrote {out_file}", file=sys.stderr)
-        return 0
-    finally:
-        if client is not None:
-            client.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
-        if not args.keep_workspace:
-            shutil.rmtree(workspace_root, ignore_errors=True)
+    out_payload = {
+        "binary": str(binary),
+        "replicates": args.replicates,
+        "tasks": [{**asdict(r), "summary": r.summary()} for r in all_results],
+    }
+    out_file = out_dir / "results.json"
+    out_file.write_text(json.dumps(out_payload, indent=2))
+    print(f"bench: wrote {out_file}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
