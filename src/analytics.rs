@@ -158,10 +158,29 @@ impl AnalyticsStore {
         })
     }
 
+    /// Acquire the in-memory stats mutex, recovering past poison rather
+    /// than panicking. A poisoned mutex doesn't corrupt our data — the
+    /// fields are plain numeric counters and HashMaps that survive a
+    /// panic mid-update — so `into_inner()` returns the still-valid
+    /// guard. See vikunja #254.
+    fn stats_lock(&self) -> std::sync::MutexGuard<'_, SessionStats> {
+        self.session_stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Same poison-tolerant pattern for the SQLite connection mutex.
+    /// SQLite itself is durable on disk and the in-memory `Connection`
+    /// state isn't sensitive to mid-statement poisoning (statements run
+    /// to completion or surface a `Result` error to our code).
+    fn db_lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.db.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn record(&self, rec: &ToolCallRecord) {
         // Update in-memory session stats
         {
-            let mut stats = self.session_stats.lock().unwrap();
+            let mut stats = self.stats_lock();
             stats.total_calls += 1;
             stats.total_request_tokens += rec.request_tokens;
             stats.total_response_tokens += rec.response_tokens;
@@ -193,7 +212,7 @@ impl AnalyticsStore {
         // Persist to SQLite
         let now = Utc::now().to_rfc3339();
         let cmd = rec.command.as_deref().map(anonymize_command);
-        let db = self.db.lock().unwrap();
+        let db = self.db_lock();
 
         let _ = db.execute(
             "INSERT INTO tool_calls (timestamp, session_id, tool_name, command,
@@ -220,7 +239,7 @@ impl AnalyticsStore {
         // Auto-cleanup old records (probabilistic: ~1% of inserts)
         if self.retention_days > 0 {
             let should_cleanup: bool = {
-                let stats = self.session_stats.lock().unwrap();
+                let stats = self.stats_lock();
                 stats.total_calls % 100 == 0
             };
             if should_cleanup {
@@ -235,7 +254,7 @@ impl AnalyticsStore {
     }
 
     pub fn session_summary(&self) -> SessionStats {
-        self.session_stats.lock().unwrap().clone()
+        self.stats_lock().clone()
     }
 
     /// Spawn an asynchronous SQLite write for this record. Tracks the task
@@ -280,7 +299,7 @@ impl AnalyticsStore {
     }
 
     pub fn history_summary(&self, days: u64) -> Result<HistorySummary, String> {
-        let db = self.db.lock().unwrap();
+        let db = self.db_lock();
         let cutoff = Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
@@ -342,7 +361,7 @@ impl AnalyticsStore {
     }
 
     pub fn daily_trend(&self, days: u64) -> Result<Vec<DailyStats>, String> {
-        let db = self.db.lock().unwrap();
+        let db = self.db_lock();
         let cutoff = Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
@@ -372,8 +391,8 @@ impl AnalyticsStore {
     }
 
     pub fn db_path(&self) -> Option<PathBuf> {
-        let db = self.db.lock().unwrap();
-        db.path().map(|p| PathBuf::from(p))
+        let db = self.db_lock();
+        db.path().map(PathBuf::from)
     }
 
     /// Format a CLI-friendly stats report.
@@ -509,6 +528,96 @@ mod tests {
         assert_eq!(stats.per_tool.len(), 2);
         assert_eq!(stats.per_tool["read_file"].calls, 2);
         assert_eq!(stats.per_tool["exec"].saved_tokens, 120);
+    }
+
+    // --- Mutex poison recovery (vikunja #254) ---
+    //
+    // `Mutex::lock().unwrap()` panics for the rest of the process's life
+    // once any holder of the same mutex has panicked. Because `record()`
+    // is called from every MCP request handler, a single bug elsewhere
+    // would poison the analytics mutexes and turn all subsequent tool
+    // calls into 500s. These tests deliberately poison each mutex and
+    // assert the next analytics call still completes.
+
+    /// Poison a mutex via the canonical recipe: lock it on a separate
+    /// thread, then panic while the guard is held. `thread::join()`
+    /// swallows the panic so the test process survives.
+    fn poison_via_thread<F: FnOnce() + Send + 'static>(f: F) {
+        let _ = std::thread::spawn(f).join();
+    }
+
+    #[test]
+    fn record_recovers_from_poisoned_stats_mutex() {
+        let (_dir, store) = test_store();
+        let store = Arc::new(store);
+        let cloned = Arc::clone(&store);
+        poison_via_thread(move || {
+            let _g = cloned.session_stats.lock();
+            panic!("intentional poison");
+        });
+        assert!(
+            store.session_stats.is_poisoned(),
+            "test setup: session_stats must be poisoned"
+        );
+
+        // The fix: record() must not panic on the poisoned mutex.
+        store.record(&sample_record("read_file"));
+        let summary = store.session_summary();
+        assert_eq!(summary.total_calls, 1, "record must succeed past poison");
+    }
+
+    #[test]
+    fn record_recovers_from_poisoned_db_mutex() {
+        let (_dir, store) = test_store();
+        let store = Arc::new(store);
+        let cloned = Arc::clone(&store);
+        poison_via_thread(move || {
+            let _g = cloned.db.lock();
+            panic!("intentional poison");
+        });
+        assert!(store.db.is_poisoned(), "test setup: db must be poisoned");
+
+        // The fix: record() must not panic on the poisoned db mutex.
+        store.record(&sample_record("read_file"));
+        let summary = store.session_summary();
+        assert_eq!(
+            summary.total_calls, 1,
+            "record must update in-memory stats even when db mutex is poisoned"
+        );
+
+        // The SQLite INSERT happens after the stats update, with its
+        // Result discarded by `record()`. The in-memory assertion above
+        // alone would pass even if poison recovery on `db_lock()` had
+        // failed and the row was lost. Verify the row actually landed by
+        // round-tripping through `history_summary` (which itself must
+        // also recover from the still-poisoned mutex).
+        let history = store
+            .history_summary(1)
+            .expect("history_summary must not panic on poisoned mutex");
+        assert_eq!(
+            history.total_calls, 1,
+            "INSERT must have landed in SQLite after poison recovery"
+        );
+    }
+
+    #[test]
+    fn history_summary_recovers_from_poisoned_db_mutex() {
+        let (_dir, store) = test_store();
+        store.record(&sample_record("read_file"));
+        let store = Arc::new(store);
+        let cloned = Arc::clone(&store);
+        poison_via_thread(move || {
+            let _g = cloned.db.lock();
+            panic!("intentional poison");
+        });
+        assert!(store.db.is_poisoned());
+
+        // history_summary must complete (no panic) and report the
+        // previously-recorded data.
+        let history = store
+            .history_summary(30)
+            .expect("history_summary must not panic on poisoned mutex");
+        assert!(history.total_calls >= 1);
     }
 
     #[test]
