@@ -9,6 +9,22 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 
+/// Merge per-call env vars (`op.kv`) on top of the session env, so callers
+/// can override session-wide values for a single invocation. Used by `exec`,
+/// `bg`, and the plugin-redirect path so they all see the same environment.
+fn merge_env(
+    session_env: &HashMap<String, String>,
+    op_kv: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut merged = session_env.clone();
+    if let Some(kv) = op_kv {
+        for (k, v) in kv {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    merged
+}
+
 /// When args is empty and command contains whitespace, shell-wrap via `sh -c`
 /// so models can send `command: "cargo test"` without splitting into args.
 fn build_command(cmd: &str, args: &[String]) -> Command {
@@ -406,12 +422,14 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         None => session.cwd.clone(),
     };
 
-    // Layer 1: try redirecting through a native plugin for structured output
+    let env = merge_env(&session.env, op.kv.as_ref());
+
+    // Layer 1: try redirecting through a native plugin for structured output.
+    // Pass the merged env so per-call kv reaches the plugin too.
     if session.cfg.process.exec_plugin_redirect {
         if args.is_empty() {
             if let Some(registry) = &session.tool_registry {
-                if let Some(resp) =
-                    try_plugin_redirect(&cmd, &cwd, &session.env, registry).await
+                if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await
                 {
                     return resp;
                 }
@@ -425,14 +443,8 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    for (k, v) in &session.env {
+    for (k, v) in &env {
         command.env(k, v);
-    }
-
-    if let Some(kv) = &op.kv {
-        for (k, v) in kv {
-            command.env(k, v);
-        }
     }
 
     let output = match command.output().await {
@@ -503,7 +515,8 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
 
-    for (k, v) in &session.env {
+    let env = merge_env(&session.env, op.kv.as_ref());
+    for (k, v) in &env {
         command.env(k, v);
     }
 
@@ -699,6 +712,123 @@ mod tests {
         .await;
         assert!(r.ok);
         assert_eq!(r.d.unwrap()["out"], "session_val");
+    }
+
+    // --- merge_env unit tests (vikunja #244 / #245) ---
+
+    #[test]
+    fn merge_env_no_kv_returns_session_env_clone() {
+        let mut session = HashMap::new();
+        session.insert("A".to_string(), "1".to_string());
+        session.insert("B".to_string(), "2".to_string());
+
+        let merged = merge_env(&session, None);
+        assert_eq!(merged, session);
+    }
+
+    #[test]
+    fn merge_env_kv_adds_new_keys() {
+        let mut session = HashMap::new();
+        session.insert("SESSION_KEY".to_string(), "s".to_string());
+
+        let mut kv = HashMap::new();
+        kv.insert("PER_CALL_KEY".to_string(), "p".to_string());
+
+        let merged = merge_env(&session, Some(&kv));
+        assert_eq!(merged.get("SESSION_KEY"), Some(&"s".to_string()));
+        assert_eq!(merged.get("PER_CALL_KEY"), Some(&"p".to_string()));
+    }
+
+    #[test]
+    fn merge_env_kv_overrides_session() {
+        let mut session = HashMap::new();
+        session.insert("SHARED".to_string(), "session_value".to_string());
+
+        let mut kv = HashMap::new();
+        kv.insert("SHARED".to_string(), "per_call_value".to_string());
+
+        let merged = merge_env(&session, Some(&kv));
+        assert_eq!(merged.get("SHARED"), Some(&"per_call_value".to_string()));
+    }
+
+    #[test]
+    fn merge_env_empty_session_with_kv() {
+        let session = HashMap::new();
+        let mut kv = HashMap::new();
+        kv.insert("ONLY_KV".to_string(), "x".to_string());
+
+        let merged = merge_env(&session, Some(&kv));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("ONLY_KV"), Some(&"x".to_string()));
+    }
+
+    /// Regression for vikunja #244: `bg()` previously iterated only
+    /// `session.env` and silently dropped per-call `op.kv`, producing
+    /// inconsistent behavior vs `exec()`.
+    #[tokio::test]
+    async fn bg_passes_op_kv_to_subprocess() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let mut kv = HashMap::new();
+        kv.insert("BG_KV_VAR".to_string(), "kv_value".to_string());
+
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "echo $BG_KV_VAR > out.txt".into()]),
+                q: Some(dir.path().to_string_lossy().into()),
+                kv: Some(kv),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(bg_resp.ok, "bg failed: {:?}", bg_resp.m);
+        let pid = bg_resp.d.unwrap()["pid"].as_u64().unwrap();
+
+        // Wait for the spawned process to finish writing.
+        for _ in 0..50 {
+            if dir.path().join("out.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = s.bg_processes.remove(&(pid as u32));
+
+        let written = std::fs::read_to_string(dir.path().join("out.txt"))
+            .expect("bg subprocess should have created out.txt");
+        assert_eq!(
+            written.trim(),
+            "kv_value",
+            "bg subprocess did not see op.kv env var (got: {written:?})"
+        );
+    }
+
+    /// Regression for vikunja #244: `op.kv` should override session env.
+    #[tokio::test]
+    async fn exec_op_kv_overrides_session_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        s.env.insert("SHARED".into(), "session_value".into());
+
+        let mut kv = HashMap::new();
+        kv.insert("SHARED".to_string(), "per_call_value".to_string());
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "echo $SHARED".into()]),
+                kv: Some(kv),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert_eq!(r.d.unwrap()["out"], "per_call_value");
     }
 
     #[tokio::test]
