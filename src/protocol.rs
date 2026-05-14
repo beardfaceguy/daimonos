@@ -38,6 +38,29 @@ pub struct Op {
     pub g: Option<String>,
 }
 
+/// Out-of-band metadata about a response, used by the MCP analytics layer
+/// to classify what happened during dispatch (plugin redirect, exec output
+/// filtering, read deduplication). These flags must be set at the source
+/// site rather than reconstructed by substring-matching the serialized JSON,
+/// which is brittle and produces false positives when string fields happen
+/// to contain the same tokens.
+///
+/// The field is `#[serde(skip)]` so it never reaches the wire.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResponseMeta {
+    /// True when the request was satisfied by a registered tool plugin
+    /// instead of raw exec (e.g. `git status` short-circuited through the
+    /// git plugin).
+    pub redirect_via_plugin: bool,
+    /// True when an exec response went through `exec_filter` semantic
+    /// compression (test-runner summary, build "ok", install "ok", etc.).
+    pub filter_applied: bool,
+    /// True when a read of an unchanged file was satisfied from
+    /// `session.read_cache` and returned the compact `{"unchanged": true}`
+    /// payload instead of the file body.
+    pub read_dedup: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -47,6 +70,8 @@ pub struct Response {
     pub e: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub m: Option<String>,
+    #[serde(skip)]
+    pub meta: ResponseMeta,
 }
 
 impl Response {
@@ -56,6 +81,7 @@ impl Response {
             d: Some(data),
             e: None,
             m: None,
+            meta: ResponseMeta::default(),
         }
     }
 
@@ -65,7 +91,26 @@ impl Response {
             d: None,
             e: Some(code),
             m: Some(msg.to_string()),
+            meta: ResponseMeta::default(),
         }
+    }
+
+    /// Mark this response as the product of a tool-plugin redirect.
+    pub fn redirect_via_plugin(mut self) -> Self {
+        self.meta.redirect_via_plugin = true;
+        self
+    }
+
+    /// Mark this response as having gone through semantic exec filtering.
+    pub fn filter_applied(mut self) -> Self {
+        self.meta.filter_applied = true;
+        self
+    }
+
+    /// Mark this response as a read-cache deduplication hit.
+    pub fn read_dedup(mut self) -> Self {
+        self.meta.read_dedup = true;
+        self
     }
 }
 
@@ -142,6 +187,56 @@ mod tests {
         assert_eq!(json["e"], 3);
         assert_eq!(json["m"], "bad arg");
         assert!(json.get("d").is_none());
+    }
+
+    #[test]
+    fn response_meta_defaults_all_false() {
+        let resp = Response::ok(serde_json::json!({}));
+        assert!(!resp.meta.redirect_via_plugin);
+        assert!(!resp.meta.filter_applied);
+        assert!(!resp.meta.read_dedup);
+        let err = Response::err(1, "x");
+        assert_eq!(err.meta, ResponseMeta::default());
+    }
+
+    #[test]
+    fn response_meta_builders_set_individual_flags() {
+        let r = Response::ok(serde_json::json!({})).redirect_via_plugin();
+        assert!(r.meta.redirect_via_plugin);
+        assert!(!r.meta.filter_applied);
+        assert!(!r.meta.read_dedup);
+
+        let r = Response::ok(serde_json::json!({})).filter_applied();
+        assert!(!r.meta.redirect_via_plugin);
+        assert!(r.meta.filter_applied);
+        assert!(!r.meta.read_dedup);
+
+        let r = Response::ok(serde_json::json!({})).read_dedup();
+        assert!(!r.meta.redirect_via_plugin);
+        assert!(!r.meta.filter_applied);
+        assert!(r.meta.read_dedup);
+    }
+
+    #[test]
+    fn response_meta_builders_compose() {
+        // Hypothetical case where multiple flags would apply simultaneously
+        // — confirm the builders chain without clobbering each other.
+        let r = Response::ok(serde_json::json!({}))
+            .redirect_via_plugin()
+            .filter_applied()
+            .read_dedup();
+        assert!(r.meta.redirect_via_plugin);
+        assert!(r.meta.filter_applied);
+        assert!(r.meta.read_dedup);
+    }
+
+    #[test]
+    fn response_meta_is_skipped_in_wire_format() {
+        // The meta field must not leak onto the wire — clients never see it.
+        let resp = Response::ok(serde_json::json!({"x": 1})).redirect_via_plugin();
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(!serialized.contains("meta"));
+        assert!(!serialized.contains("redirect_via_plugin"));
     }
 }
 

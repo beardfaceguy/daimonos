@@ -90,19 +90,29 @@ async fn dispatch_tool(
     let start = std::time::Instant::now();
     let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
 
+    // Reset the per-call meta scratch so we never inherit flags from a
+    // previous tool call on the same session. `dispatch_tool_inner` will
+    // set this when (and only when) it produces a structured `Response`.
+    session.last_response_meta = crate::protocol::ResponseMeta::default();
+
     let result = dispatch_tool_inner(session, name, args).await;
 
     // Record analytics
     if let Some(analytics) = &session.analytics {
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        // Take the meta back out: any flags belong to *this* call.
+        // Reading the structured meta avoids the brittle wire-text inspection
+        // we used to do (substring match → re-parse JSON → top-level key
+        // probe). Both of those approaches were coupled to the response
+        // format and prone to drift; this reads exactly what handlers set.
+        let meta = std::mem::take(&mut session.last_response_meta);
         let (response_chars, was_redirect, was_filtered, read_dedup) = match &result {
-            Ok(r) => {
-                let text = extract_result_text(r);
-                let redirect = text.contains("\"via\":\"plugin\"") || text.contains("\"via\": \"plugin\"");
-                let filtered = text.contains("\"filter\":");
-                let dedup = text.contains("\"unchanged\":true") || text.contains("\"unchanged\": true");
-                (text.len(), redirect, filtered, dedup)
-            }
+            Ok(r) => (
+                extract_result_text(r).len(),
+                meta.redirect_via_plugin,
+                meta.filter_applied,
+                meta.read_dedup,
+            ),
             Err(_) => (0, false, false, false),
         };
 
@@ -151,6 +161,12 @@ async fn dispatch_tool_inner(
         match result {
             Ok(request) => {
                 let resp = ops::dispatch(session, request).await;
+                // Stash structured response metadata for the analytics layer.
+                // Doing this here (rather than substring-matching the wire
+                // text in `dispatch_tool`) avoids brittle false positives
+                // when tool output happens to contain `"via":"plugin"` or
+                // `"unchanged":true` as user data.
+                session.last_response_meta = resp.meta.clone();
                 return response_to_result(resp);
             }
             Err(e) => return err_text(e),
@@ -792,6 +808,30 @@ mod tests {
         let resp = Response::ok(json!({"lines": 10}));
         let result = response_to_result(resp).unwrap();
         assert!(result.is_error.is_none() || !result.is_error.unwrap());
+    }
+
+    // --- ResponseMeta plumbing (vikunja #247): structured analytics signals ---
+    //
+    // Replaces the previous wire-text classifier (`classify_response`) and
+    // the substring matcher before that. Handlers now set `Response.meta`
+    // at the source site and the MCP layer reads those flags directly via
+    // `session.last_response_meta`. This guarantees no false positives
+    // from user-supplied content and no drift from the wire format.
+
+    #[test]
+    fn response_meta_round_trips_to_session() {
+        // Simulate `dispatch_tool_inner` stashing meta after `ops::dispatch`.
+        let resp = Response::ok(json!({"x": 1})).redirect_via_plugin();
+        let mut session_meta = resp.meta.clone();
+        assert!(session_meta.redirect_via_plugin);
+
+        // `dispatch_tool` then takes the meta back out for analytics.
+        let taken = std::mem::take(&mut session_meta);
+        assert!(taken.redirect_via_plugin);
+        assert!(
+            !session_meta.redirect_via_plugin,
+            "take() must reset to default"
+        );
     }
 
     #[test]

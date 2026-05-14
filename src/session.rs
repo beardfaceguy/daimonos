@@ -2,6 +2,7 @@ use crate::analytics::AnalyticsStore;
 use crate::config::Config;
 use crate::index::WorkspaceIndex;
 use crate::pipeline_cache::PipelineCache;
+use crate::protocol::ResponseMeta;
 use crate::snapshot::SnapshotStore;
 use crate::tool_runner::ToolRegistry;
 use crate::tools;
@@ -39,6 +40,12 @@ pub struct Session {
     /// from list_tools responses — the model already has them in context.
     pub used_tools: HashSet<String>,
     pub analytics: Option<Arc<AnalyticsStore>>,
+    /// Out-of-band metadata produced by the most recent `ops::dispatch` call.
+    /// Populated by the MCP layer right before it converts the `Response`
+    /// into a `CallToolResult` and consumed by the analytics layer in the
+    /// same dispatch turn. Replaces brittle substring matching on the
+    /// serialized response text.
+    pub last_response_meta: ResponseMeta,
     next_pid: u32,
 }
 
@@ -67,6 +74,7 @@ impl Session {
             exposed_tools: tools::initial_exposed_tools(),
             used_tools: HashSet::new(),
             analytics: None,
+            last_response_meta: ResponseMeta::default(),
             next_pid: 1,
         }
     }

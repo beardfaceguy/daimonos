@@ -105,11 +105,12 @@ async fn try_plugin_redirect(
 
 fn plugin_response(output: serde_json::Value) -> Response {
     let text = serde_json::to_string(&output).unwrap_or_default();
-    Response::ok(json!({"exit": 0, "out": text, "via": "plugin"}))
+    Response::ok(json!({"exit": 0, "out": text, "via": "plugin"})).redirect_via_plugin()
 }
 
 fn plugin_error_response(tool: &str, cmd: &str, err: &str) -> Response {
     Response::ok(json!({"exit": 1, "out": format!("{tool} {cmd}: {err}"), "via": "plugin"}))
+        .redirect_via_plugin()
 }
 
 // --- cargo redirect ---
@@ -468,7 +469,7 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
             if !filtered.err.is_empty() {
                 resp["err"] = json!(cap_output(&filtered.err, max));
             }
-            return Response::ok(resp);
+            return Response::ok(resp).filter_applied();
         }
     }
 
@@ -1438,5 +1439,136 @@ mod tests {
         let d = r.d.unwrap();
         // Redirect disabled — should go through raw exec
         assert!(d.get("via").is_none());
+    }
+
+    // --- Structured ResponseMeta plumbing (vikunja #247) ---
+    //
+    // The `via:plugin` JSON marker is for human/agent inspection; the
+    // analytics layer reads the structured `Response.meta` flag instead.
+    // These tests pin the meta plumbing for both sources of the flag in
+    // exec_ops: plugin redirects (success + error) and raw-exec passthrough.
+
+    #[tokio::test]
+    async fn plugin_redirect_sets_meta_flag() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("git status".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert!(
+            r.meta.redirect_via_plugin,
+            "plugin redirect must set meta.redirect_via_plugin"
+        );
+        assert!(!r.meta.filter_applied);
+        assert!(!r.meta.read_dedup);
+    }
+
+    #[tokio::test]
+    async fn raw_exec_does_not_set_redirect_meta_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_with_registry(dir.path()).await;
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo hello".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert!(
+            !r.meta.redirect_via_plugin,
+            "raw exec must not set meta.redirect_via_plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_error_response_still_sets_meta_flag() {
+        // A plugin can short-circuit a command and surface a 1-exit error
+        // payload (e.g. invalid args). The response is still a redirect
+        // and analytics should count it as such.
+        let resp = plugin_error_response("git", "bogus", "no such subcommand");
+        assert!(resp.ok); // plugin errors are wrapped as ok responses
+        assert!(
+            resp.meta.redirect_via_plugin,
+            "plugin_error_response must still mark the redirect"
+        );
+    }
+
+    /// Positive handler-level coverage for the third meta flag: when a
+    /// recognized command goes through `exec_filter`, the response must
+    /// carry `meta.filter_applied = true`. Uses `make` (classified as
+    /// Build) with no Makefile so the filter compresses the failure into
+    /// a `FAILED (exit N)` summary deterministically.
+    #[tokio::test]
+    async fn filtered_exec_sets_filter_applied_meta_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        assert!(
+            s.cfg.process.exec_output_filters,
+            "default config must have exec_output_filters enabled for this test"
+        );
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("make".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok, "exec call itself must succeed (failure is in subprocess)");
+        assert!(
+            r.meta.filter_applied,
+            "recognized command must set meta.filter_applied; meta = {:?}",
+            r.meta
+        );
+        assert!(!r.meta.redirect_via_plugin);
+        assert!(!r.meta.read_dedup);
+    }
+
+    /// Negative case: an unrecognized command must NOT set
+    /// `meta.filter_applied`.
+    #[tokio::test]
+    async fn unfiltered_exec_does_not_set_filter_applied_meta_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("echo".into()),
+                a: Some(vec!["hi".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert!(
+            !r.meta.filter_applied,
+            "unrecognized command must not set meta.filter_applied"
+        );
     }
 }

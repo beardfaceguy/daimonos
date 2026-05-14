@@ -28,7 +28,8 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
             return Response::ok(json!({
                 "unchanged": true,
                 "lines": total_lines,
-            }));
+            }))
+            .read_dedup();
         }
         session.update_read_cache(path, &content);
     }
@@ -1437,5 +1438,62 @@ mod tests {
         let d = r.d.unwrap();
         assert_eq!(d["content"], "c\nd");
         assert!(d.get("unchanged").is_none());
+    }
+
+    // --- Structured ResponseMeta plumbing (vikunja #247) ---
+    //
+    // Asserts the analytics signal travels via `Response.meta` rather than
+    // requiring the MCP layer to re-parse the wire format. A dedup hit must
+    // carry `meta.read_dedup = true`; the first (cache-miss) read and any
+    // partial read must leave the flag false.
+
+    #[tokio::test]
+    async fn read_dedup_sets_meta_flag_on_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        std::fs::write(dir.path().join("dup.txt"), "hello\n").unwrap();
+
+        let first = read(&mut s, &op_read("dup.txt")).await;
+        assert!(first.ok);
+        assert!(
+            !first.meta.read_dedup,
+            "first read is a cache miss; meta.read_dedup must be false"
+        );
+
+        let second = read(&mut s, &op_read("dup.txt")).await;
+        assert!(second.ok);
+        assert!(
+            second.meta.read_dedup,
+            "second read of unchanged content must set meta.read_dedup"
+        );
+        assert_eq!(second.d.as_ref().unwrap()["unchanged"], true);
+    }
+
+    #[tokio::test]
+    async fn read_dedup_meta_not_set_for_partial_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        std::fs::write(dir.path().join("p.txt"), "a\nb\nc\n").unwrap();
+
+        // Prime the cache via a full read.
+        let _ = read(&mut s, &op_read("p.txt")).await;
+
+        // Partial reads bypass the dedup branch entirely.
+        let partial = read(
+            &mut s,
+            &Op {
+                c: 0,
+                p: Some("p.txt".into()),
+                n: Some(1),
+                n2: Some(1),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(partial.ok);
+        assert!(
+            !partial.meta.read_dedup,
+            "partial reads must never set meta.read_dedup"
+        );
     }
 }
