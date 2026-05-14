@@ -247,10 +247,10 @@ workloads from the ground up.
 ### Running tests
 
 ```bash
-# Rust unit tests (189+ tests)
+# Rust unit tests (350+ tests, parallel-safe)
 cargo test
 
-# End-to-end MCP protocol tests (pytest)
+# End-to-end MCP protocol tests (150+ pytest cases)
 python3 -m pytest tests/ -v
 ```
 
@@ -259,8 +259,8 @@ python3 -m pytest tests/ -v
 ```bash
 cd benchmarks
 ./setup-mcp.sh
-./run-benchmark.sh cursor     # baseline
-./run-benchmark.sh daimonos   # with daimonos
+./run-benchmark.sh baseline   # IDE built-in tools
+./run-benchmark.sh daimonos   # routed through daimonos MCP
 python3 analyze-results.py results/
 ```
 
@@ -275,7 +275,8 @@ All behavior is tunable via a TOML config file. See
 Key sections:
 - `[index]` — Trigram indexer tuning (max depth, file size limits)
 - `[search]` — Search result limits
-- `[process]` — Exec timeout, output capping, semantic filters
+- `[process]` — Exec timeout, output capping, semantic filters, max concurrent Starlark script threads
+- `[pipeline_cache]` — Subprocess result cache size, inotify watch cap, extra ignored directories
 - `[analytics]` — Token tracking (SQLite storage, retention)
 - `[tools.*]` — Per-tool plugin configuration
 
