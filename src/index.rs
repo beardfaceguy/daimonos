@@ -88,23 +88,27 @@ impl WorkspaceIndex {
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
 
-            // Snapshot the previous state
+            // Snapshot the previous state. We're on a `spawn_blocking`
+            // worker thread, so the tokio-recommended pattern is
+            // `RwLock::blocking_read` rather than asking
+            // `Handle::current()` to `block_on` a read future. The latter
+            // works on the multi-threaded runtime but is fragile on the
+            // current-thread flavor (the runtime's I/O driver and our
+            // blocking worker live on different threads, and the round
+            // trip through the scheduler is pure overhead).
             let prev = {
-                let inner_clone = inner.clone();
-                tokio::runtime::Handle::current().block_on(async {
-                    let guard = inner_clone.read().await;
-                    let prev_paths: HashMap<String, (u32, u64)> = guard
-                        .path_to_id
-                        .iter()
-                        .map(|(path, &id)| {
-                            let mtime = guard.mtimes.get(id as usize).copied().unwrap_or(0);
-                            (path.clone(), (id, mtime))
-                        })
-                        .collect();
-                    let prev_trigrams = guard.trigrams.clone();
-                    let prev_files = guard.files.clone();
-                    (prev_paths, prev_trigrams, prev_files)
-                })
+                let guard = inner.blocking_read();
+                let prev_paths: HashMap<String, (u32, u64)> = guard
+                    .path_to_id
+                    .iter()
+                    .map(|(path, &id)| {
+                        let mtime = guard.mtimes.get(id as usize).copied().unwrap_or(0);
+                        (path.clone(), (id, mtime))
+                    })
+                    .collect();
+                let prev_trigrams = guard.trigrams.clone();
+                let prev_files = guard.files.clone();
+                (prev_paths, prev_trigrams, prev_files)
             };
             let (prev_paths, mut trigrams, _prev_files) = prev;
             let is_first_index = prev_paths.is_empty();
@@ -251,11 +255,12 @@ impl WorkspaceIndex {
                 last_indexed: Some(start),
             };
 
-            let inner_clone = inner.clone();
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = inner_clone.write().await;
+            // Same rationale as the snapshot read above: stay on the
+            // blocking thread instead of bouncing through the runtime.
+            {
+                let mut guard = inner.blocking_write();
                 *guard = state;
-            });
+            }
 
             if is_first_index {
                 eprintln!(
@@ -381,6 +386,46 @@ mod tests {
     fn query_to_trigrams_too_short() {
         assert!(query_to_trigrams(b"ab").is_empty());
         assert!(query_to_trigrams(b"").is_empty());
+    }
+
+    /// Regression for vikunja #253: the reindex worker used to call
+    /// `Handle::current().block_on(...)` from inside `spawn_blocking`,
+    /// which bounces the read/write futures back through the runtime
+    /// scheduler. The pattern works on the multi-threaded runtime by
+    /// accident but is fragile (and pure overhead) on the current-thread
+    /// flavor. The fix moves to `RwLock::blocking_read`/`blocking_write`.
+    ///
+    /// This test pins the contract on both runtime flavors: spawn a
+    /// reindex, await completion via `stats()`, and assert files were
+    /// actually indexed. If a future change reintroduces the pattern
+    /// (or a deadlock-prone variant), this test deadlocks/hangs/fails on
+    /// at least one of the two flavors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_works_on_multi_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
+        let cfg = IndexConfig::default();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        idx.spawn_reindex();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stats = idx.stats().await;
+        assert_eq!(stats.files, 1, "multi-thread reindex did not complete");
+        let hits = idx.search("alpha_marker", 10).await;
+        assert!(!hits.is_empty(), "search after multi-thread reindex empty");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reindex_works_on_current_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn beta_marker() {}").unwrap();
+        let cfg = IndexConfig::default();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        idx.spawn_reindex();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stats = idx.stats().await;
+        assert_eq!(stats.files, 1, "current-thread reindex did not complete");
+        let hits = idx.search("beta_marker", 10).await;
+        assert!(!hits.is_empty(), "search after current-thread reindex empty");
     }
 
     #[tokio::test]
