@@ -280,21 +280,42 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::Ordering;
 
-    fn temp_cache() -> (tempfile::TempDir, PipelineCache) {
+    /// Lock guard alias: zero-sized struct on non-Linux so the
+    /// `let (_dir, _cache, _lock) = temp_cache();` destructure stays
+    /// portable. On Linux the third field is the real
+    /// `INOTIFY_TEST_LOCK` guard held for the test body.
+    #[cfg(target_os = "linux")]
+    type InotifyTestGuard = std::sync::MutexGuard<'static, ()>;
+    #[cfg(not(target_os = "linux"))]
+    type InotifyTestGuard = ();
+
+    /// Note: the returned guard is `std::sync::MutexGuard<'static, ()>`
+    /// on Linux, which is `!Send`. Tests using `temp_cache()` are
+    /// `#[tokio::test]` (current-thread runtime by default), so
+    /// holding it across `.await` is fine — but if any test is later
+    /// annotated `flavor = "multi_thread"`, the compiler will reject
+    /// it. At that point, drop the guard explicitly before the first
+    /// `.await` or switch to a `tokio::sync::Mutex`.
+    fn temp_cache() -> (tempfile::TempDir, PipelineCache, InotifyTestGuard) {
+        #[cfg(target_os = "linux")]
+        let lock = inotify_test_lock();
+        #[cfg(not(target_os = "linux"))]
+        let lock: InotifyTestGuard = ();
+
         let dir = tempfile::tempdir().unwrap();
         let cache = PipelineCache::new(dir.path());
-        (dir, cache)
+        (dir, cache, lock)
     }
 
     #[tokio::test]
     async fn cache_miss_on_empty() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         assert!(cache.get("tool1", "build").await.is_none());
     }
 
     #[tokio::test]
     async fn put_then_get_returns_cached() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         let output = serde_json::json!({"status": "ok"});
         cache.put("tool1", "build", output.clone(), 0).await;
         let result = cache.get("tool1", "build").await;
@@ -306,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_keys_are_independent() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         cache.put("tool1", "build", json!({"a": 1}), 0).await;
         cache.put("tool1", "lint", json!({"b": 2}), 1).await;
         cache.put("tool2", "build", json!({"c": 3}), 0).await;
@@ -321,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_flag_clears_cache() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         cache.put("tool1", "build", json!({"ok": true}), 0).await;
 
         cache.dirty_flag.store(true, Ordering::Relaxed);
@@ -334,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_reports_entry_count() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         let s1 = cache.stats().await;
         assert_eq!(s1["entries"], 0);
         assert_eq!(s1["dirty"], false);
@@ -361,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_bounded_after_many_entries() {
-        let (_dir, cache) = temp_cache();
+        let (_dir, cache, _lock) = temp_cache();
         for i in 0..2000 {
             cache
                 .put(&format!("tool_{i}"), &format!("cmd_{i}"), json!({"i": i}), 0)
@@ -380,6 +401,8 @@ mod tests {
     /// the cache with a tiny custom cap and verify `put()` honors it.
     #[tokio::test]
     async fn cache_max_entries_is_configurable() {
+        #[cfg(target_os = "linux")]
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cfg = PipelineCacheConfig {
             max_watches: 8192,
@@ -421,6 +444,8 @@ mod tests {
     /// eviction; only the least-recently-touched entry should be dropped.
     #[tokio::test]
     async fn cache_evicts_least_recently_used_entry() {
+        #[cfg(target_os = "linux")]
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cfg = PipelineCacheConfig {
             max_watches: 8192,
@@ -461,6 +486,8 @@ mod tests {
     /// times must update its recency too, not just on `get()`.
     #[tokio::test]
     async fn cache_put_refreshes_recency() {
+        #[cfg(target_os = "linux")]
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cfg = PipelineCacheConfig {
             max_watches: 8192,
@@ -487,6 +514,53 @@ mod tests {
             cache.get("t", "b").await.is_none(),
             "'b' must be evicted as the new LRU"
         );
+    }
+
+    /// Process-global lock taken by every test that constructs a
+    /// `PipelineCache`. The cache spawns a `notify::Watcher`
+    /// background thread that holds inotify watches for the cache's
+    /// entire lifetime, so any test with a live cache contributes
+    /// `/proc/self/fdinfo` entries that the inotify-counting tests
+    /// could see in their measurement window.
+    ///
+    /// Without this serialization, parallel `cargo test` runs can
+    /// have one inotify-counting test capture `baseline =
+    /// count_inotify_watches()` while another test's PipelineCache
+    /// is concurrently active, inflating "added X watches" past
+    /// configured caps. Confirmed locally: 1-in-4 flake rate against
+    /// `pipeline_cache_respects_max_watches_cap` pre-fix.
+    ///
+    /// Direction of the remaining (harmless) race after this fix:
+    /// "concurrent unlocked watchers inflating the count" is the
+    /// behavior we lock out; "previous-test cleanup landing during
+    /// `baseline`" is benign because such watches are subtracted out
+    /// of the `added` delta.
+    ///
+    /// Plain `std::sync::Mutex` rather than pulling in `serial_test`
+    /// — AGENTS.md asks new crate additions be flagged for
+    /// confirmation, and a static mutex is the smaller hammer.
+    #[cfg(target_os = "linux")]
+    static INOTIFY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Centralized acquire for `INOTIFY_TEST_LOCK` with consistent
+    /// poison recovery. Every test in this module that constructs a
+    /// `PipelineCache` should hold the guard for the test body.
+    ///
+    /// Poison recovery (`unwrap_or_else(|p| p.into_inner())`) keeps
+    /// one panicking test from cascading through the rest. Note that
+    /// a panicking test still drops its `PipelineCache` on unwind
+    /// (Rust's stack unwinding runs `Drop` impls), so its inotify
+    /// watches are released to the kernel before any subsequent
+    /// test observes `count_inotify_watches()`.
+    ///
+    /// On non-Linux platforms `count_inotify_watches()` always
+    /// returns 0 and the inotify-counting tests are `#[cfg(target_os
+    /// = "linux")]`, so the lock is also Linux-only.
+    #[cfg(target_os = "linux")]
+    fn inotify_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        INOTIFY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Counts the number of active inotify watch descriptors held by the
@@ -518,9 +592,18 @@ mod tests {
     /// `fs.inotify.max_user_watches`. The watcher must filter ignored
     /// directories before walking, so the watch count tracks the actual
     /// source tree size — not the worst-case directory count.
+    ///
+    /// `count_inotify_watches()` queries `/proc/self/fdinfo/*` —
+    /// process-global state shared with the other two inotify-watch
+    /// tests in this module. Without serialization, baselines
+    /// captured at the start of one test race against watch creation
+    /// in another, producing spurious "added X watches" inflation
+    /// and intermittent failures. We hold `INOTIFY_TEST_LOCK` for
+    /// the entire body to force these tests to take turns.
     #[cfg(target_os = "linux")]
     #[test]
     fn pipeline_cache_does_not_watch_ignored_dirs() {
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -554,9 +637,16 @@ mod tests {
     /// `max_watches` must be a hard cap: even on a tree of unfiltered source
     /// dirs, the watcher should never register more than the configured
     /// number of inotify watches.
+    ///
+    /// Holds `INOTIFY_TEST_LOCK` — see
+    /// `pipeline_cache_does_not_watch_ignored_dirs` for the rationale.
+    /// This test was the original flake source: concurrent watch
+    /// creation in the sibling tests inflated `count_inotify_watches()`
+    /// past the 25-watch cap.
     #[cfg(target_os = "linux")]
     #[test]
     fn pipeline_cache_respects_max_watches_cap() {
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -584,9 +674,13 @@ mod tests {
 
     /// Watcher must fully release inotify watches when the cache is dropped,
     /// so that short-lived sessions don't accumulate kernel resources.
+    ///
+    /// Holds `INOTIFY_TEST_LOCK` — see
+    /// `pipeline_cache_does_not_watch_ignored_dirs` for the rationale.
     #[cfg(target_os = "linux")]
     #[test]
     fn pipeline_cache_releases_watches_on_drop() {
+        let _lock = inotify_test_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
 
