@@ -48,6 +48,13 @@ exec_output_filters = true
 # returning structured JSON instead of raw verbose output.
 # Set false to always use raw exec.
 exec_plugin_redirect = true
+# Max concurrent Starlark script threads. Each execute_script call runs on
+# a dedicated OS thread; pure-CPU runaway scripts cannot be cancelled
+# (starlark 0.13 does not expose a hook in its public API), so this caps
+# the number of leaked threads the daemon will tolerate before blocking
+# new execute_script calls. Raise if you legitimately run many concurrent
+# scripts; lower to fail fast under buggy script load.
+max_script_threads = 32
 
 [analytics]
 # Track per-tool-call token usage, latency, and savings.

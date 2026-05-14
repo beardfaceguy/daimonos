@@ -66,7 +66,20 @@ pub struct ProcessConfig {
     /// (e.g. `exec("cargo test")` routes through the cargo plugin for
     /// structured JSON output). Set false to always use raw exec.
     pub exec_plugin_redirect: bool,
+    /// Maximum number of concurrently-running Starlark script threads.
+    /// Each `execute_script` invocation runs on a dedicated OS thread;
+    /// pure-CPU runaway scripts cannot be cancelled, so this bounds the
+    /// damage a misbehaving script (or sequence of them) can do. New
+    /// `execute_script` calls block until a slot is free, capped by the
+    /// caller's script timeout.
+    pub max_script_threads: usize,
 }
+
+/// Default cap for `ProcessConfig::max_script_threads`. Exposed so the
+/// fallback used by `script::script_semaphore()` when
+/// `configure_max_concurrent` was never called stays in sync with the
+/// config default and the value in `daimonos.default.toml`.
+pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -183,6 +196,7 @@ impl Default for ProcessConfig {
             max_cache_entries: 1024,
             exec_output_filters: true,
             exec_plugin_redirect: true,
+            max_script_threads: DEFAULT_MAX_SCRIPT_THREADS,
         }
     }
 }

@@ -92,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     let workspace = std::fs::canonicalize(&cli.workspace)?;
     let cfg = Arc::new(config::load(cli.config.as_deref(), &workspace));
 
+    script::configure_max_concurrent(cfg.process.max_script_threads);
+
     let ws_index = Arc::new(index::WorkspaceIndex::new(workspace.clone(), &cfg.index));
     ws_index.spawn_reindex();
 

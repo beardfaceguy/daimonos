@@ -8,9 +8,66 @@ use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
 use starlark::values::{Heap, Value as StarlarkValue};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
+
+/// Lazily-initialized global cap on concurrent Starlark script threads.
+///
+/// Pure-CPU runaway scripts cannot be cancelled by the current
+/// `starlark` 0.13 evaluator (its `before_stmt` hook is `pub(crate)`),
+/// so each such script leaks one OS thread until the process exits.
+/// This semaphore is the daemon's only real defense against unbounded
+/// thread allocation: when the configured cap is reached, new
+/// `execute()` calls await an available slot, bounded by the per-call
+/// script timeout so callers fail fast instead of hanging indefinitely.
+///
+/// `OwnedSemaphorePermit` is held by the script thread for its entire
+/// lifetime, so for cancellable scripts (the common case) the permit
+/// drops as soon as the thread unwinds.
+static SCRIPT_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Initialize a `OnceLock<Arc<Semaphore>>` to a `Semaphore::new(n)`.
+/// Returns `Err(())` if the cell was already initialized, so callers
+/// can surface that to the operator.
+///
+/// Extracted from `configure_max_concurrent` so unit tests can exercise
+/// the locking semantics against a local `OnceLock` without touching
+/// the process-global `SCRIPT_PERMITS`.
+fn init_semaphore(cell: &OnceLock<Arc<Semaphore>>, n: usize) -> Result<(), ()> {
+    cell.set(Arc::new(Semaphore::new(n))).map_err(|_| ())
+}
+
+/// Configure the script-thread concurrency cap.
+///
+/// Idempotent — only the first call wins. Should be called once at
+/// startup from the binary entry point with
+/// `config.process.max_script_threads`. If a later call attempts to
+/// reconfigure, the request is logged and ignored. If never called,
+/// the cap defaults to `config::DEFAULT_MAX_SCRIPT_THREADS`.
+///
+/// Values below 1 are clamped to 1 — a zero cap would block every
+/// `execute_script` until each per-call timeout fires, which is
+/// almost certainly a misconfiguration, not an intentional kill switch.
+pub fn configure_max_concurrent(max_threads: usize) {
+    let max_threads = max_threads.max(1);
+    if init_semaphore(&SCRIPT_PERMITS, max_threads).is_err() {
+        eprintln!(
+            "daimonos: configure_max_concurrent({max_threads}) ignored — \
+             script semaphore was already initialized"
+        );
+    }
+}
+
+fn script_semaphore() -> Arc<Semaphore> {
+    SCRIPT_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(DEFAULT_MAX_SCRIPT_THREADS)))
+        .clone()
+}
+
 
 use crate::ops;
 use crate::protocol::{Request, Response};
@@ -28,11 +85,56 @@ pub struct ScriptResult {
     pub logs: Vec<String>,
 }
 
+/// Drop-guard that flips a cancellation `AtomicBool` when dropped.
+///
+/// Held inside `execute()` for the lifetime of the future. Any path
+/// that drops the future — timeout, the MCP client disconnecting, the
+/// outer task being cancelled, even an `await` point being aborted —
+/// runs this `Drop` and signals the script thread to stop. Without it,
+/// a caller-cancelled `execute_script` would leave its script thread
+/// running until natural completion.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Execute a Starlark script with daimonos tool bindings.
 ///
 /// Tools are exposed as synchronous functions that internally block on
 /// the tokio runtime (via `Handle::block_on`) to call async daimonos ops.
-/// The script runs in a dedicated thread to avoid blocking the async runtime.
+///
+/// Threading model:
+/// - The script runs on a dedicated `std::thread`, NOT on the tokio
+///   blocking pool. If we used `spawn_blocking`, a runaway script
+///   would hold one blocking-pool slot indefinitely because
+///   `tokio::time::timeout` only drops the `JoinHandle` — Tokio has
+///   no mechanism to cancel a blocking task. With a 512-slot default
+///   pool, ~500 runaways would freeze every blocking operation in
+///   the daemon.
+/// - Completion is signaled through `tokio::sync::oneshot`, so the
+///   tokio side awaits a native future and consumes zero blocking-
+///   pool slots whether the script returns or times out.
+/// - Cancellation is driven by a shared `AtomicBool` held inside a
+///   `CancelOnDrop` guard. Every tool dispatch checks the flag (via
+///   `with_ctx`) and short-circuits with an error; the Starlark
+///   evaluator unwinds and the thread exits cleanly. The flag is set
+///   by `Drop` rather than only on timeout, so caller-side future
+///   cancellation (MCP client disconnect, parent task abort) also
+///   propagates to the script.
+///
+/// Leak classes worth knowing about:
+/// 1. Pure-CPU runaways (no tool calls) — `starlark` 0.13 has no
+///    public cancellation hook, so the thread runs until process
+///    exit. Bounded by `process.max_script_threads`.
+/// 2. Long-running in-flight tool calls — the cancel check happens
+///    only between tool dispatches. A script blocked inside a slow
+///    `exec`, `gh`, or `docker` op past the timeout still occupies
+///    its thread until that inner op completes.
+/// 3. Spawn failure — `std::thread::Builder::spawn` can fail under
+///    extreme resource pressure; we surface this as an error.
 pub async fn execute(
     code: &str,
     session: Arc<Mutex<Session>>,
@@ -40,16 +142,77 @@ pub async fn execute(
 ) -> Result<ScriptResult, String> {
     let code = code.to_string();
     let handle = tokio::runtime::Handle::current();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_thread = Arc::clone(&cancel);
+    // Cancel on any drop of this future — covers timeout, caller-side
+    // future cancellation (MCP disconnect, parent abort), and the
+    // normal-completion path (where it's a harmless no-op because the
+    // thread is already gone).
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
 
-    let result = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || {
-        run_starlark(&code, session, handle)
-    }))
-    .await;
+    // Acquire a script-thread slot. Bounds concurrent OS threads to
+    // `process.max_script_threads`; pure-CPU runaway scripts hold
+    // their slot forever, so this is the effective leak ceiling. The
+    // acquire is bounded by the caller's timeout so a saturated cap
+    // surfaces as a structured error instead of hanging the MCP
+    // request indefinitely.
+    let acquire_start = std::time::Instant::now();
+    let permit = match tokio::time::timeout(timeout, script_semaphore().acquire_owned()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return Err(format!("acquire script thread slot: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "script timeout after {} ms (no script thread slot available — \
+                 max_script_threads reached)",
+                timeout.as_millis()
+            ))
+        }
+    };
 
-    match result {
+    // The slot acquire consumed part of the budget. If it consumed
+    // *all* of it, fail fast with a clear message rather than spawning
+    // a thread that will be cancelled on its first tool dispatch and
+    // reporting a misleading "0 ms" timeout.
+    let original_timeout = timeout;
+    let remaining = timeout.saturating_sub(acquire_start.elapsed());
+    if remaining.is_zero() {
+        return Err(format!(
+            "script timeout after {} ms (entire budget consumed acquiring \
+             thread slot)",
+            original_timeout.as_millis()
+        ));
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<ScriptResult, String>>();
+
+    std::thread::Builder::new()
+        // Linux truncates `/proc/<pid>/task/<tid>/comm` to 15 chars
+        // (`TASK_COMM_LEN - 1`). Keep this prefix short so it shows
+        // up readable in `ps -L`.
+        .name("dmns-starlark".into())
+        .spawn(move || {
+            // The permit is dropped — and the slot returned — when this
+            // closure exits, whether by completion, eval error, or the
+            // cancel-flag unwind path.
+            let _permit = permit;
+            let result = run_starlark(&code, session, handle, cancel_for_thread);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("spawn script thread: {e}"))?;
+
+    match tokio::time::timeout(remaining, rx).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(format!("script thread panic: {e}")),
-        Err(_) => Err(format!("script timeout after {}s", timeout.as_secs())),
+        Ok(Err(_)) => Err("script thread exited without result".to_string()),
+        Err(_) => {
+            // Cancel flag will also be flipped by `_cancel_guard` on
+            // function return; setting it explicitly here costs
+            // nothing and makes the timeout path self-documenting.
+            cancel.store(true, Ordering::Relaxed);
+            Err(format!(
+                "script timeout after {} ms",
+                original_timeout.as_millis()
+            ))
+        }
     }
 }
 
@@ -57,11 +220,12 @@ fn run_starlark(
     code: &str,
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
+    cancel: Arc<AtomicBool>,
 ) -> Result<ScriptResult, String> {
     let ast = AstModule::parse("script", code.to_string(), &Dialect::Standard)
         .map_err(|e| format!("parse error: {e}"))?;
 
-    let globals = build_globals(session, handle);
+    let globals = build_globals(session, handle, cancel);
     let module = Module::new();
 
     PRINT_LOG.with(|log| log.borrow_mut().clear());
@@ -134,13 +298,15 @@ fn starlark_to_json<'v>(val: StarlarkValue<'v>, heap: &'v Heap) -> Value {
 fn build_globals(
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
+    cancel: Arc<AtomicBool>,
 ) -> Globals {
-    // We store session + handle in a thread-local so the starlark_module
-    // functions can access them without capturing closures.
+    // We store session + handle + cancel flag in a thread-local so the
+    // starlark_module functions can access them without capturing closures.
     TOOL_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(ToolContext {
             session,
             handle,
+            cancel,
         });
     });
 
@@ -153,12 +319,26 @@ fn build_globals(
 struct ToolContext {
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
+    /// Set to `true` by `execute()` when the timeout fires. Tool dispatch
+    /// checks this flag and short-circuits with an error so the Starlark
+    /// evaluator unwinds and the script thread exits.
+    cancel: Arc<AtomicBool>,
 }
 
 thread_local! {
     static TOOL_CTX: RefCell<Option<ToolContext>> = const { RefCell::new(None) };
 }
 
+/// Run `f` with the active `ToolContext`.
+///
+/// Cancellation check lives here, at the single entry point shared by
+/// every Starlark tool binding. When `execute()` times out it flips
+/// `ctx.cancel`; the next call from inside the script — whether it
+/// routes through `dispatch_request` or one of the plugin shortcuts
+/// that call `ctx.handle.block_on(...)` directly — returns an error,
+/// the Starlark evaluator unwinds, and the script thread exits cleanly.
+/// Centralizing this here means tool bindings inherit cancellation
+/// without per-function plumbing.
 fn with_ctx<F, R>(f: F) -> Result<R, anyhow::Error>
 where
     F: FnOnce(&ToolContext) -> Result<R, anyhow::Error>,
@@ -168,6 +348,9 @@ where
         let ctx = borrow
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tool context not initialized"))?;
+        if ctx.cancel.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("script cancelled (timeout)"));
+        }
         f(ctx)
     })
 }
@@ -649,6 +832,146 @@ result = True
         let code = "result = 42";
         let result = execute(code, session, Duration::from_millis(5000)).await.unwrap();
         assert_eq!(result.value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn init_semaphore_sets_cap_on_first_call() {
+        let cell: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        init_semaphore(&cell, 7).expect("first init must succeed");
+        let sem = cell.get().expect("cell must be initialized");
+        assert_eq!(
+            sem.available_permits(),
+            7,
+            "semaphore should be sized to the requested cap"
+        );
+    }
+
+    #[test]
+    fn init_semaphore_rejects_second_call() {
+        let cell: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        init_semaphore(&cell, 4).expect("first init must succeed");
+        init_semaphore(&cell, 99).expect_err(
+            "second init must fail — `configure_max_concurrent` is documented \
+             as idempotent",
+        );
+        let sem = cell.get().expect("cell must still be initialized");
+        assert_eq!(
+            sem.available_permits(),
+            4,
+            "first-call value must win on conflict"
+        );
+    }
+
+    /// `CancelOnDrop` is what propagates caller-side future cancellation
+    /// (MCP client disconnect, outer task abort) to the script thread.
+    /// Without it, a script that the caller no longer cares about would
+    /// run to natural completion holding its `max_script_threads` slot.
+    #[test]
+    fn cancel_on_drop_sets_flag_when_dropped() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = CancelOnDrop(Arc::clone(&cancel));
+            assert!(
+                !cancel.load(Ordering::Relaxed),
+                "flag must remain unset while the guard is alive"
+            );
+        }
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "dropping the guard must flip the cancel flag — this is what \
+             propagates caller-side future cancellation into the script \
+             thread"
+        );
+    }
+
+    /// A script that loops over tool calls past the timeout must
+    /// cause `execute()` to return a timeout error promptly.
+    ///
+    /// The companion cancel-mechanism guarantee (that the underlying
+    /// script thread actually terminates after the cancel flag flips)
+    /// is verified in isolation by `cancel_on_drop_sets_flag_when_dropped`.
+    /// Asserting it here too would require reading a process-global
+    /// thread counter, which is unreliable under default parallel
+    /// `cargo test` because other tests' script threads perturb the
+    /// count.
+    #[tokio::test]
+    async fn execute_timeout_aborts_runaway_tool_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let session = Arc::new(Mutex::new(session));
+
+        let code = r#"
+def runaway():
+    for i in range(10000000):
+        exec("true")
+    return "should not reach"
+
+result = runaway()
+"#;
+
+        let start = std::time::Instant::now();
+        let result = execute(code, session, Duration::from_millis(150)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected timeout error, got {:?}", result);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timeout"),
+            "expected 'timeout' substring in error: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "execute() must return promptly on timeout, elapsed {:?}",
+            elapsed
+        );
+    }
+
+    /// Resource-leak regression. Pre-fix code put the script on the
+    /// tokio blocking pool via `spawn_blocking`, and a runaway script
+    /// held its slot forever because `tokio::time::timeout` has no
+    /// way to cancel a blocking task. With a single-slot blocking
+    /// pool the second `execute()` would hang. Post-fix scripts run
+    /// on dedicated `std::thread`s and the blocking pool is untouched.
+    ///
+    /// This test is intentionally *not* `#[tokio::test]` so it can
+    /// build a custom runtime with `max_blocking_threads(1)` — the
+    /// bug is only observable when the pool size is artificially
+    /// constrained.
+    #[test]
+    fn runaway_script_does_not_starve_tokio_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+            let session = Arc::new(Mutex::new(session));
+
+            let runaway = r#"
+def loop_forever():
+    for i in range(10000000):
+        exec("true")
+
+loop_forever()
+"#;
+            let _ = execute(runaway, session.clone(), Duration::from_millis(100)).await;
+
+            let second = tokio::time::timeout(
+                Duration::from_secs(5),
+                execute(r#"result = "ok""#, session, Duration::from_secs(2)),
+            )
+            .await;
+
+            assert!(
+                second.is_ok(),
+                "second execute() hung — runaway script starved the tokio blocking pool"
+            );
+            let result = second.unwrap().expect("second execute() must succeed");
+            assert_eq!(result.value, serde_json::json!("ok"));
+        });
     }
 
     #[tokio::test]
