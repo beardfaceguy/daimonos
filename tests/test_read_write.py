@@ -113,3 +113,79 @@ def test_read_dedup_partial_read_bypasses_cache(daimonos):
     })["content"][0]["text"])
     assert r["content"] == "b"
     assert "unchanged" not in r
+
+
+# --- Trailing newline preservation (vikunja #246, fix #4) ---
+#
+# `str::lines()` strips trailing newlines, and `lines.join("\n")` does not
+# restore them. The pre-fix `read()` collected lines and joined, silently
+# losing the final `\n`. Any agent doing read → modify → write was producing
+# round-trip-unsafe writes. These tests cover full reads, slice-to-EOF reads,
+# and ensure no spurious newline is added when the original lacked one.
+
+
+def test_read_full_preserves_trailing_newline(daimonos):
+    """Full read of a file ending in '\\n' must return content ending in '\\n'."""
+    daimonos.call_tool("write_file", {"path": "trail.txt", "content": "a\nb\nc\n"})
+    r = json.loads(daimonos.call_tool("read_file", {"path": "trail.txt"})["content"][0]["text"])
+    assert r["content"] == "a\nb\nc\n", repr(r["content"])
+    assert r["lines"] == 3
+
+
+def test_read_full_does_not_add_trailing_newline_when_absent(daimonos):
+    """Full read of a file WITHOUT trailing newline must not gain one."""
+    daimonos.call_tool("write_file", {"path": "notrail.txt", "content": "a\nb\nc"})
+    r = json.loads(daimonos.call_tool("read_file", {"path": "notrail.txt"})["content"][0]["text"])
+    assert r["content"] == "a\nb\nc", repr(r["content"])
+
+
+def test_read_write_byte_identical_round_trip(daimonos):
+    """The canonical regression for vikunja #246: read then write must be
+    byte-identical when the file ends with a newline."""
+    original = "alpha\nbeta\ngamma\n"
+    daimonos.call_tool("write_file", {"path": "rt.txt", "content": original})
+    r = json.loads(daimonos.call_tool("read_file", {"path": "rt.txt"})["content"][0]["text"])
+    daimonos.call_tool("write_file", {"path": "rt2.txt", "content": r["content"]})
+    r2 = json.loads(daimonos.call_tool("read_file", {"path": "rt2.txt"})["content"][0]["text"])
+    assert r2["content"] == original, (
+        f"round-trip lost the trailing newline: {r2['content']!r} != {original!r}"
+    )
+
+
+def test_read_offset_to_eof_preserves_trailing_newline(daimonos):
+    """Offset read that reaches EOF must keep the file's trailing newline."""
+    daimonos.call_tool(
+        "write_file", {"path": "off.txt", "content": "x\ny\nz\nw\n"},
+    )
+    r = json.loads(
+        daimonos.call_tool("read_file", {"path": "off.txt", "offset": 2})["content"][0]["text"]
+    )
+    assert r["content"] == "z\nw\n", repr(r["content"])
+
+
+def test_read_limited_slice_omits_trailing_newline_when_not_at_eof(daimonos):
+    """Limited read that does NOT reach EOF must not append a newline."""
+    daimonos.call_tool(
+        "write_file", {"path": "lim.txt", "content": "x\ny\nz\nw\n"},
+    )
+    r = json.loads(
+        daimonos.call_tool(
+            "read_file", {"path": "lim.txt", "offset": 1, "limit": 2}
+        )["content"][0]["text"]
+    )
+    assert r["content"] == "y\nz", repr(r["content"])
+    assert r["returned"] == 2
+
+
+def test_read_limited_slice_to_eof_preserves_trailing_newline(daimonos):
+    """Limited read whose slice happens to end at EOF must keep the newline."""
+    daimonos.call_tool(
+        "write_file", {"path": "lim2.txt", "content": "x\ny\nz\n"},
+    )
+    r = json.loads(
+        daimonos.call_tool(
+            "read_file", {"path": "lim2.txt", "offset": 1, "limit": 2}
+        )["content"][0]["text"]
+    )
+    assert r["content"] == "y\nz\n", repr(r["content"])
+    assert r["returned"] == 2

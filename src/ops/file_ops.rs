@@ -33,21 +33,37 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         session.update_read_cache(path, &content);
     }
 
-    let lines: Vec<&str> = if limit > 0 {
-        content.lines().skip(offset).take(limit as usize).collect()
-    } else if offset > 0 {
-        content.lines().skip(offset).collect()
+    // Preserve the file's trailing newline. `str::lines()` discards
+    // trailing newlines and `lines.join("\n")` doesn't restore them, so
+    // a naive collect+join silently makes read→modify→write lossy.
+    // Full reads return content verbatim; sliced reads re-emit the
+    // trailing newline only when the slice actually reaches EOF.
+    let ends_with_newline = content.ends_with('\n');
+
+    let (body, returned_count) = if is_full_read {
+        (content.clone(), total_lines)
     } else {
-        content.lines().collect()
+        let lines: Vec<&str> = if limit > 0 {
+            content.lines().skip(offset).take(limit as usize).collect()
+        } else {
+            content.lines().skip(offset).collect()
+        };
+        let returned = lines.len();
+        let reaches_eof = offset.saturating_add(returned) >= total_lines;
+        let mut joined = lines.join("\n");
+        if reaches_eof && ends_with_newline && !joined.is_empty() {
+            joined.push('\n');
+        }
+        (joined, returned)
     };
 
     let mut resp = json!({
-        "content": lines.join("\n"),
+        "content": body,
         "lines": total_lines,
     });
     if offset > 0 || limit > 0 {
         resp["offset"] = json!(offset);
-        resp["returned"] = json!(lines.len());
+        resp["returned"] = json!(returned_count);
     }
     Response::ok(resp)
 }
