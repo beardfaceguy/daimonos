@@ -14,6 +14,9 @@
 # Override the model with: CURSOR_REVIEW_MODEL="<model-slug>"
 
 set -u
+set -o pipefail
+# Intentionally NOT using `set -e`: we capture the agent CLI exit code
+# explicitly via $? and want graceful handling, not abrupt termination.
 
 # Git hooks run in a minimal shell — ensure common install locations are in PATH.
 for p in "$HOME/.local/bin" "/usr/local/bin"; do
@@ -44,8 +47,9 @@ fi
 
 # Hard cap on diff size sent to the model. Massive diffs blow up cost / context.
 MAX_BYTES=${CURSOR_REVIEW_MAX_BYTES:-200000}
-if (( ${#DIFF} > MAX_BYTES )); then
-  echo "cursor-review: staged diff > ${MAX_BYTES} bytes — skipping AI review."
+DIFF_BYTES=$(printf '%s' "$DIFF" | wc -c)
+if (( DIFF_BYTES > MAX_BYTES )); then
+  echo "cursor-review: staged diff (${DIFF_BYTES} bytes) > ${MAX_BYTES} bytes — skipping AI review."
   echo "  Run \`/agent-review\` from the Source Control tab instead."
   exit 0
 fi
@@ -76,14 +80,23 @@ else
 fi
 echo "cursor-review: model = $REVIEW_MODEL"
 
-OUT=$(printf '%s\n%s\n' "$PROMPT" "$DIFF" \
-  | agent -p \
-      --trust \
-      --mode=ask \
-      --output-format text \
-      ${CURSOR_REVIEW_MODEL:+--model "$CURSOR_REVIEW_MODEL"} \
-      2>&1)
+agent_args=(-p --trust --mode=ask --output-format text)
+if [[ -n "${CURSOR_REVIEW_MODEL:-}" ]]; then
+  agent_args+=(--model "$CURSOR_REVIEW_MODEL")
+fi
+OUT=$(printf '%s\n%s\n' "$PROMPT" "$DIFF" | agent "${agent_args[@]}" 2>&1)
 STATUS=$?
+
+# Without python3 we can't do deterministic grouping + verdict gating —
+# fall through gracefully instead of erroring out on a fresh system.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo
+  echo "──────── Cursor AI review (raw) ────────"
+  echo "$OUT"
+  echo "────────────────────────────────────────"
+  echo "cursor-review: python3 not found — skipping verdict gate."
+  exit 0
+fi
 
 # ── Format, group, and determine verdict deterministically ───────────
 RESULT=$(python3 -c "
@@ -146,7 +159,11 @@ if [[ $STATUS -ne 0 ]]; then
   exit 0
 fi
 
-VERDICT=$(echo "$RESULT" | grep -oE '^(PASS|FAIL)$' | tail -1)
+VERDICT=$(echo "$RESULT" | grep -oE '^(PASS|FAIL)$' | tail -1 || true)
+if [[ -z "$VERDICT" ]]; then
+  echo "cursor-review: could not parse verdict from review output — not blocking commit."
+  exit 0
+fi
 if [[ "$VERDICT" == "FAIL" ]]; then
   if [[ "${CURSOR_REVIEW_BLOCK:-0}" == "1" ]]; then
     echo "cursor-review: FAIL — blocking commit (CURSOR_REVIEW_BLOCK=1)."

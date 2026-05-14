@@ -1,3 +1,4 @@
 # AI code review of the staged diff (warn-only by default).
 # Set CURSOR_REVIEW_BLOCK=1 to enforce, CURSOR_REVIEW_SKIP=1 to bypass.
-./scripts/cursor-review.sh
+ROOT=$(git rev-parse --show-toplevel) || exit 0
+exec "$ROOT/scripts/cursor-review.sh"
