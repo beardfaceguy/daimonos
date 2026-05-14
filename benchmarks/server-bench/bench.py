@@ -338,12 +338,12 @@ def run_task(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5.0)
-            else:
-                # Daemon already exited (early-fail path). Still call
-                # wait() so the OS reaps the zombie and Python closes
-                # the stderr PIPE deterministically rather than waiting
-                # for GC.
-                proc.wait(timeout=5.0)
+            # Close the stderr PIPE explicitly. proc.poll() already
+            # reaped the child if it exited; what poll/wait don't do is
+            # release the parent-side pipe fd — that stays open until
+            # GC unless we close it here.
+            if proc.stderr is not None:
+                proc.stderr.close()
         if keep_workspace:
             print(
                 f"bench: kept workspace for {task_mod.ID}: {workspace}",
