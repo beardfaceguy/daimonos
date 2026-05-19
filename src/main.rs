@@ -8,9 +8,9 @@ mod plugins;
 mod protocol;
 mod script;
 mod session;
-mod tools;
 mod snapshot;
 mod tool_runner;
+mod tools;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -44,12 +44,26 @@ fn install_parent_death_signal() {
     const SIGTERM: std::os::raw::c_ulong = 15;
     let rc = unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) };
     if rc != 0 {
-        eprintln!("daimonos: prctl(PR_SET_PDEATHSIG) failed (rc={rc}); parent-death cleanup unavailable");
+        eprintln!(
+            "daimonos: prctl(PR_SET_PDEATHSIG) failed (rc={rc}); parent-death cleanup unavailable"
+        );
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 fn install_parent_death_signal() {}
+
+/// True when `DAIMONOS_LOG_STARTUP` requests MCP stderr diagnostics (mirrors
+/// `[mcp] startup_logs` / `--verbose`, but readable before config load).
+fn env_requests_mcp_startup_logs() -> bool {
+    match std::env::var("DAIMONOS_LOG_STARTUP") {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            !t.is_empty() && t != "0" && t != "false" && t != "no"
+        }
+        Err(_) => false,
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
@@ -74,6 +88,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     mcp: bool,
 
+    /// Emit informational stderr during MCP startup (config source, plugins,
+    /// indexer stats, idle watchdog). Cursor classifies MCP subprocess stderr
+    /// as errors in the UI; omit this flag unless you are debugging daimonos.
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+
     /// Print token analytics summary and exit
     #[arg(long, default_value_t = false)]
     stats: bool,
@@ -90,42 +110,64 @@ async fn main() -> anyhow::Result<()> {
     session::enhance_process_path();
 
     let workspace = std::fs::canonicalize(&cli.workspace)?;
-    let cfg = Arc::new(config::load(cli.config.as_deref(), &workspace));
+    let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
+    let quiet_cfg_stderr = cli.mcp && !startup_logs_early;
+    let cfg = Arc::new(config::load(
+        cli.config.as_deref(),
+        &workspace,
+        quiet_cfg_stderr,
+    ));
+    let startup_logs = startup_logs_early || cfg.mcp.startup_logs;
+    // When MCP runs without startup diagnostics, avoid benign stderr lines —
+    // Cursor surfaces subprocess stderr as `[error]` even for informational text.
+    let mcp_quiet_stderr = cli.mcp && !startup_logs;
 
     script::configure_max_concurrent(cfg.process.max_script_threads);
 
-    let ws_index = Arc::new(index::WorkspaceIndex::new(workspace.clone(), &cfg.index));
+    let ws_index = Arc::new(index::WorkspaceIndex::new(
+        workspace.clone(),
+        &cfg.index,
+        !mcp_quiet_stderr,
+    ));
     ws_index.spawn_reindex();
 
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());
-    config::register_tools(&cfg, &tool_reg).await;
+    config::register_tools(&cfg, &tool_reg, mcp_quiet_stderr).await;
 
     if plugins::git::is_available() {
         tool_reg
             .register(Arc::new(plugins::git::GitPlugin::new()))
             .await;
-        eprintln!("auto-registered git tool plugin");
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered git tool plugin");
+        }
     }
 
     if plugins::docker::is_available() {
         tool_reg
             .register(Arc::new(plugins::docker::DockerPlugin::new()))
             .await;
-        eprintln!("auto-registered docker tool plugin");
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered docker tool plugin");
+        }
     }
 
     if plugins::cargo::is_available() {
         tool_reg
             .register(Arc::new(plugins::cargo::CargoPlugin::new()))
             .await;
-        eprintln!("auto-registered cargo tool plugin");
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered cargo tool plugin");
+        }
     }
 
     if plugins::gh::is_available() {
         tool_reg
             .register(Arc::new(plugins::gh::GhPlugin::new()))
             .await;
-        eprintln!("auto-registered gh tool plugin");
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered gh tool plugin");
+        }
     }
 
     let pcache = Arc::new(pipeline_cache::PipelineCache::with_config(
@@ -155,7 +197,9 @@ async fn main() -> anyhow::Result<()> {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
             Ok(store) => {
-                eprintln!("analytics: enabled ({})", db_path.display());
+                if !mcp_quiet_stderr {
+                    eprintln!("analytics: enabled ({})", db_path.display());
+                }
                 Some(Arc::new(store))
             }
             Err(e) => {
@@ -168,9 +212,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cli.mcp {
-        mcp::run_mcp_server(workspace, cfg, ws_index, tool_reg, pcache, analytics_store).await
+        mcp::run_mcp_server(
+            workspace,
+            cfg,
+            ws_index,
+            tool_reg,
+            pcache,
+            analytics_store,
+            startup_logs,
+        )
+        .await
     } else {
-        run_socket_server(cli, workspace, cfg, ws_index, tool_reg, pcache, analytics_store).await
+        run_socket_server(
+            cli,
+            workspace,
+            cfg,
+            ws_index,
+            tool_reg,
+            pcache,
+            analytics_store,
+        )
+        .await
     }
 }
 

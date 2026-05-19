@@ -95,6 +95,22 @@ exec_output_max_chars = 100_000
 extra_path = ["/opt/custom/bin", "/usr/local/go/bin"]
 ```
 
+### `[mcp]` — MCP server (`--mcp`)
+
+These settings apply only when running as an MCP server over stdio (Cursor,
+Zed, etc.). Socket-mode daemon behavior is unchanged.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `idle_timeout_secs` | `600` | Exit cleanly after this many seconds with **no** MCP requests (`list_tools`, `call_tool`, …). Protects against orphaned processes when an editor leaks stdin. Set `0` to disable. Overridable with `DAIMONOS_IDLE_TIMEOUT_SECS`. |
+| `startup_logs` | `false` | When `false`, omit benign informational lines on stderr during MCP startup and idle shutdown (plugin registration, indexer stats, watchdog messages). Some MCP hosts (notably **Cursor**) classify **all** subprocess stderr as `[error]` in the UI. Use `--verbose`, `[mcp] startup_logs = true`, or `DAIMONOS_LOG_STARTUP=1` when debugging daimonos. |
+
+```toml
+[mcp]
+idle_timeout_secs = 600
+startup_logs = false
+```
+
 ### `[tools.<id>]` — Tool Plugins (Advanced)
 
 Register external tools for the tool runner system. Most users don't need
@@ -114,7 +130,8 @@ These are not part of the config file but affect daimonos behavior:
 
 | Variable | Description |
 |----------|-------------|
-| `DAIMONOS_LOG` | Set to `debug` or `trace` for verbose logging to stderr |
+| `DAIMONOS_IDLE_TIMEOUT_SECS` | Overrides `[mcp] idle_timeout_secs` when set to a parseable integer. `0` disables the idle watchdog. Used by tests. |
+| `DAIMONOS_LOG_STARTUP` | When non-empty and not `0` / `false` / `no`, enables MCP stderr startup diagnostics before config load (same family as `--verbose` / `[mcp] startup_logs`). |
 | `PATH` | Daimonos inherits the launching process's `PATH` for exec/bg commands |
 
 ## Performance Tuning Tips

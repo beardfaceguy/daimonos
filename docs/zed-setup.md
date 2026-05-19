@@ -58,3 +58,9 @@ If daimonos isn't on your PATH, use the absolute path:
 - Restart Zed after changing the config.
 - Context-aware tools (`cargo`, `git`, `gh`) only appear when their
   prerequisites exist in the workspace.
+- **Idle disconnect (~10 min):** `[mcp] idle_timeout_secs` defaults to `600`;
+  raise or set `0` in config if you want the MCP server to stay up without
+  traffic (see `docs/configuration.md`).
+- **Diagnostics:** `--verbose`, `DAIMONOS_LOG_STARTUP=1`, or `[mcp] startup_logs = true`
+  restores informational stderr during MCP startup (Cursor treats subprocess stderr as errors;
+  Zed is usually quieter — same flags apply).

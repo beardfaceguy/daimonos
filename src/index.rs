@@ -27,6 +27,10 @@ pub struct WorkspaceIndex {
     max_file_size: usize,
     binary_sniff_bytes: usize,
     skip_extensions: HashSet<String>,
+    /// When true, print one-line indexer stats to stderr after each reindex.
+    /// Disabled in MCP quiet mode so hosts like Cursor don't surface benign
+    /// lines as `[error]` (they classify all subprocess stderr as errors).
+    log_progress: bool,
 }
 
 struct IndexState {
@@ -71,7 +75,7 @@ pub struct SearchResult {
 }
 
 impl WorkspaceIndex {
-    pub fn new(root: PathBuf, cfg: &IndexConfig) -> Self {
+    pub fn new(root: PathBuf, cfg: &IndexConfig, log_progress: bool) -> Self {
         Self {
             root,
             inner: Arc::new(RwLock::new(IndexState::new())),
@@ -80,6 +84,7 @@ impl WorkspaceIndex {
             max_file_size: cfg.max_file_size,
             binary_sniff_bytes: cfg.binary_sniff_bytes,
             skip_extensions: cfg.skip_set(),
+            log_progress,
         }
     }
 
@@ -95,6 +100,7 @@ impl WorkspaceIndex {
         let max_file_size = self.max_file_size;
         let binary_sniff_bytes = self.binary_sniff_bytes;
         let skip_ext = self.skip_extensions.clone();
+        let log_progress = self.log_progress;
 
         tokio::task::spawn_blocking(move || {
             // Serialize against any other reindex already in flight on the
@@ -278,23 +284,25 @@ impl WorkspaceIndex {
                 *guard = state;
             }
 
-            if is_first_index {
-                eprintln!(
-                    "index: {} files, {} trigrams in {:?}",
-                    file_count,
-                    trigram_count,
-                    start.elapsed()
-                );
-            } else {
-                eprintln!(
-                    "index: {} files ({} skipped, {} updated, {} added, {} removed) in {:?}",
-                    file_count,
-                    skipped,
-                    updated,
-                    added,
-                    removed,
-                    start.elapsed()
-                );
+            if log_progress {
+                if is_first_index {
+                    eprintln!(
+                        "index: {} files, {} trigrams in {:?}",
+                        file_count,
+                        trigram_count,
+                        start.elapsed()
+                    );
+                } else {
+                    eprintln!(
+                        "index: {} files ({} skipped, {} updated, {} added, {} removed) in {:?}",
+                        file_count,
+                        skipped,
+                        updated,
+                        added,
+                        removed,
+                        start.elapsed()
+                    );
+                }
             }
         });
     }
@@ -421,7 +429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
         idx.spawn_reindex();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stats = idx.stats().await;
@@ -435,13 +443,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn beta_marker() {}").unwrap();
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
         idx.spawn_reindex();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stats = idx.stats().await;
         assert_eq!(stats.files, 1, "current-thread reindex did not complete");
         let hits = idx.search("beta_marker", 10).await;
-        assert!(!hits.is_empty(), "search after current-thread reindex empty");
+        assert!(
+            !hits.is_empty(),
+            "search after current-thread reindex empty"
+        );
     }
 
     #[tokio::test]
@@ -453,7 +464,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/gamma.rs"), "fn gamma_function() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -475,7 +486,7 @@ mod tests {
         std::fs::write(dir.path().join("text.txt"), "searchable content here").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
         idx.spawn_reindex();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -487,7 +498,7 @@ mod tests {
     async fn search_empty_index() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
         let results = idx.search("anything", 10).await;
         assert!(results.is_empty());
     }
@@ -558,7 +569,7 @@ mod tests {
         std::fs::write(dir.path().join("other.rs"), "fn other() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -582,7 +593,7 @@ mod tests {
         std::fs::write(dir.path().join("existing.rs"), "fn existing() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -610,7 +621,7 @@ mod tests {
         std::fs::write(dir.path().join("delete_me.rs"), "fn delete_me_unique() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -636,7 +647,7 @@ mod tests {
         std::fs::write(dir.path().join("mutable.rs"), "fn old_function_name() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -669,7 +680,7 @@ mod tests {
         std::fs::write(dir.path().join("remove.rs"), "fn will_be_removed() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         wait_for_index().await;
@@ -728,7 +739,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
 
         let cfg = IndexConfig::default();
-        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg);
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         // No wait — deliberately stack the next reindex on top.

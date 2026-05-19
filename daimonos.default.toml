@@ -74,6 +74,11 @@ retention_days = 90
 # editor worker still holds the write-end). Set to 0 to disable.
 # Override at startup with the DAIMONOS_IDLE_TIMEOUT_SECS env var.
 idle_timeout_secs = 600
+# When false (default), MCP mode avoids benign stderr lines during startup and
+# idle shutdown so Cursor does not surface them as `[error]` (Cursor treats all
+# MCP subprocess stderr as errors). Use `--verbose`, export DAIMONOS_LOG_STARTUP=1,
+# or set true here for diagnostics.
+startup_logs = false
 
 [pipeline_cache]
 # The pipeline cache invalidates tool results when workspace files change.

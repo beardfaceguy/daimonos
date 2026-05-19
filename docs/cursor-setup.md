@@ -126,6 +126,28 @@ Additional capabilities not available in Cursor built-in tools:
 - Check that `--strict-mcp-config` is not set unless you intend to disable
   built-in tools entirely.
 
+### MCP log lines marked `[error]` for benign text (`auto-registered…`, `index: …`)
+
+Cursor treats **all stderr** from MCP subprocesses as errors. Daimonos
+suppresses informational stderr by default in `--mcp` mode so normal startup
+does not spam the MCP log. To see those lines again when debugging daimonos:
+
+- Add `--verbose` to the server args in `.cursor/mcp.json`, **or**
+- Set environment variable `DAIMONOS_LOG_STARTUP=1` for the MCP server process,
+  **or**
+- Set `[mcp] startup_logs = true` in `daimonos.toml` or
+  `~/.config/daimonos/config.toml` (see `docs/configuration.md`).
+
+### MCP disconnects after ~10 minutes idle
+
+By design: `[mcp] idle_timeout_secs` defaults to `600`. With no MCP traffic,
+the server exits to release inotify watches and memory (guards against leaked
+stdin when an editor closes a panel oddly). To keep long-lived idle sessions:
+
+- Raise `idle_timeout_secs` (for example `86400`), **or**
+- Set `idle_timeout_secs = 0` to disable the watchdog, **or**
+- Export `DAIMONOS_IDLE_TIMEOUT_SECS` with your chosen value (`0` disables).
+
 ### "Permission denied" errors
 
 - Daimonos sandboxes all file operations to the workspace root. Paths outside

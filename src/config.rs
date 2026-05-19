@@ -102,12 +102,20 @@ pub struct McpConfig {
     /// Set to 0 to disable. Overridable at startup via the
     /// `DAIMONOS_IDLE_TIMEOUT_SECS` environment variable (used by tests).
     pub idle_timeout_secs: u64,
+    /// When `false` (default), `--mcp` mode avoids informational messages on
+    /// stderr during startup and idle shutdown. Cursor (and some other MCP
+    /// hosts) classify subprocess stderr as `[error]` in the UI even when the
+    /// text is benign (plugin registration lines, indexer stats, watchdog).
+    /// Use `--verbose`, set `[mcp] startup_logs = true`, or export
+    /// `DAIMONOS_LOG_STARTUP=1` to restore stderr diagnostics.
+    pub startup_logs: bool,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 600,
+            startup_logs: false,
         }
     }
 }
@@ -235,7 +243,11 @@ fn default_skip_extensions() -> Vec<String> {
 /// 2. <workspace>/daimonos.toml
 /// 3. ~/.config/daimonos/config.toml
 /// 4. Built-in defaults
-pub fn load(explicit: Option<&Path>, workspace: &Path) -> Config {
+///
+/// When `quiet_diagnostic_stderr` is true, suppress informational messages for
+/// successful config discovery (`loaded from …`, `using built-in defaults`).
+/// Parse/read failures are always printed — those are real errors.
+pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: bool) -> Config {
     let candidates = [
         explicit.map(|p| p.to_path_buf()),
         Some(workspace.join("daimonos.toml")),
@@ -247,7 +259,9 @@ pub fn load(explicit: Option<&Path>, workspace: &Path) -> Config {
             match std::fs::read_to_string(candidate) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(cfg) => {
-                        eprintln!("config: loaded from {:?}", candidate);
+                        if !quiet_diagnostic_stderr {
+                            eprintln!("config: loaded from {:?}", candidate);
+                        }
                         return cfg;
                     }
                     Err(e) => {
@@ -261,7 +275,9 @@ pub fn load(explicit: Option<&Path>, workspace: &Path) -> Config {
         }
     }
 
-    eprintln!("config: using built-in defaults");
+    if !quiet_diagnostic_stderr {
+        eprintln!("config: using built-in defaults");
+    }
     Config::default()
 }
 
@@ -284,17 +300,19 @@ mod tests {
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
+        assert!(!cfg.mcp.startup_logs);
         assert!(cfg.tools.is_empty());
     }
 
     #[test]
     fn default_toml_parses_successfully() {
         let toml_str = include_str!("../daimonos.default.toml");
-        let cfg: Config = toml::from_str(toml_str)
-            .expect("daimonos.default.toml must parse as valid Config");
+        let cfg: Config =
+            toml::from_str(toml_str).expect("daimonos.default.toml must parse as valid Config");
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.index.max_depth, 20);
+        assert!(!cfg.mcp.startup_logs);
     }
 
     #[test]
@@ -322,7 +340,7 @@ default_grep_max = 42
         )
         .unwrap();
 
-        let cfg = load(Some(&cfg_path), dir.path());
+        let cfg = load(Some(&cfg_path), dir.path(), false);
         assert_eq!(cfg.search.default_grep_max, 42);
         assert_eq!(cfg.search.default_find_max, 20);
     }
@@ -339,14 +357,14 @@ poll_tail_lines = 50
         )
         .unwrap();
 
-        let cfg = load(None, dir.path());
+        let cfg = load(None, dir.path(), false);
         assert_eq!(cfg.process.poll_tail_lines, 50);
     }
 
     #[test]
     fn load_falls_back_to_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = load(None, dir.path());
+        let cfg = load(None, dir.path(), false);
         assert_eq!(cfg.index.max_depth, 20);
     }
 
@@ -365,11 +383,13 @@ source_pattern = "*.rs"
 }
 
 /// Register tools from config into the tool registry.
-pub async fn register_tools(cfg: &Config, registry: &ToolRegistry) {
+pub async fn register_tools(cfg: &Config, registry: &ToolRegistry, quiet_stderr: bool) {
     for (id, tool_cfg) in &cfg.tools {
         if id == "x07" {
             let plugin = Arc::new(X07Plugin::new(&tool_cfg.bin));
-            eprintln!("tools: registered x07 plugin ({})", tool_cfg.bin);
+            if !quiet_stderr {
+                eprintln!("tools: registered x07 plugin ({})", tool_cfg.bin);
+            }
             registry.register(plugin).await;
         } else {
             use crate::tool_runner::{ToolCommand, ToolDescriptor};
@@ -392,7 +412,9 @@ pub async fn register_tools(cfg: &Config, registry: &ToolRegistry) {
                 quickfix_format: None,
             };
             let plugin = Arc::new(GenericCliPlugin::new(descriptor));
-            eprintln!("tools: registered generic plugin '{}'", id);
+            if !quiet_stderr {
+                eprintln!("tools: registered generic plugin '{}'", id);
+            }
             registry.register(plugin).await;
         }
     }

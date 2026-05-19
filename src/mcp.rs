@@ -120,9 +120,7 @@ async fn dispatch_tool(
         };
 
         let command = match name {
-            "exec" | "git" | "cargo" | "gh" | "docker" => {
-                tools::get_str(args, "command")
-            }
+            "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
             _ => None,
         };
 
@@ -187,7 +185,11 @@ async fn dispatch_tool_inner(
                     .collect::<Vec<_>>(),
                 None => match get_str(args, "tool") {
                     Some(t) => vec![t],
-                    None => return err_text("get_tool_schema requires 'tools' array or 'tool' string".into()),
+                    None => {
+                        return err_text(
+                            "get_tool_schema requires 'tools' array or 'tool' string".into(),
+                        )
+                    }
                 },
             };
 
@@ -206,7 +208,10 @@ async fn dispatch_tool_inner(
 
             if results.is_empty() {
                 let known: Vec<&str> = tools::all_tool_names();
-                err_text(format!("unknown tool(s): {:?}. Available: {:?}", names, known))
+                err_text(format!(
+                    "unknown tool(s): {:?}. Available: {:?}",
+                    names, known
+                ))
             } else {
                 ok_text(serde_json::to_string(&results).unwrap_or_default())
             }
@@ -241,34 +246,38 @@ async fn dispatch_tool_inner(
                     let stats = analytics.session_summary();
                     ok_text(serde_json::to_string(&stats).unwrap_or_default())
                 }
-                "history" => {
-                    match analytics.history_summary(days) {
-                        Ok(summary) => ok_text(serde_json::to_string(&summary).unwrap_or_default()),
-                        Err(e) => err_text(format!("history query: {e}")),
-                    }
-                }
-                "daily" => {
-                    match analytics.daily_trend(days) {
-                        Ok(trend) => ok_text(serde_json::to_string(&trend).unwrap_or_default()),
-                        Err(e) => err_text(format!("daily query: {e}")),
-                    }
-                }
-                _ => err_text(format!("unknown scope: {scope}. Use session, history, or daily")),
+                "history" => match analytics.history_summary(days) {
+                    Ok(summary) => ok_text(serde_json::to_string(&summary).unwrap_or_default()),
+                    Err(e) => err_text(format!("history query: {e}")),
+                },
+                "daily" => match analytics.daily_trend(days) {
+                    Ok(trend) => ok_text(serde_json::to_string(&trend).unwrap_or_default()),
+                    Err(e) => err_text(format!("daily query: {e}")),
+                },
+                _ => err_text(format!(
+                    "unknown scope: {scope}. Use session, history, or daily"
+                )),
             }
         }
 
         "workspace_info" => {
-            use crate::protocol::{Op, Request, op};
+            use crate::protocol::{op, Op, Request};
 
             let session_resp = ops::dispatch(
                 session,
-                Request::Single(Op { c: op::SESSION, ..Default::default() }),
+                Request::Single(Op {
+                    c: op::SESSION,
+                    ..Default::default()
+                }),
             )
             .await;
 
             let ls_resp = ops::dispatch(
                 session,
-                Request::Single(Op { c: op::LS, ..Default::default() }),
+                Request::Single(Op {
+                    c: op::LS,
+                    ..Default::default()
+                }),
             )
             .await;
 
@@ -282,7 +291,7 @@ async fn dispatch_tool_inner(
 
             let analytics_summary = session.analytics.as_ref().map(|a| {
                 let s = a.session_summary();
-                json!({
+                let mut j = json!({
                     "calls": s.total_calls,
                     "req_tokens": s.total_request_tokens,
                     "resp_tokens": s.total_response_tokens,
@@ -290,7 +299,16 @@ async fn dispatch_tool_inner(
                     "redirects": s.redirect_hits,
                     "filters": s.filter_hits,
                     "dedup_hits": s.dedup_hits,
-                })
+                });
+                if let Some(p) = a.db_path() {
+                    if let Some(obj) = j.as_object_mut() {
+                        obj.insert(
+                            "db_path".to_string(),
+                            json!(p.to_string_lossy()),
+                        );
+                    }
+                }
+                j
             });
 
             let mut info = json!({});
@@ -539,15 +557,16 @@ impl ServerHandler for DaimonosHandler {
 
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
         if params.name == "execute_script" {
-            self.session.lock().await.used_tools.insert("execute_script".into());
+            self.session
+                .lock()
+                .await
+                .used_tools
+                .insert("execute_script".into());
             let code = match args.get("code").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
                 None => return err_text("execute_script requires 'code' argument".into()),
             };
-            let timeout_secs = args
-                .get("timeout")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(60) as u64;
+            let timeout_secs = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(60) as u64;
             let timeout = std::time::Duration::from_secs(timeout_secs);
 
             return match script::execute(&code, self.session.clone(), timeout).await {
@@ -560,7 +579,7 @@ impl ServerHandler for DaimonosHandler {
                     }
                     ok_text(serde_json::to_string(&resp).unwrap_or_default())
                 }
-                Err(e) => err_text(format!("{e}"))
+                Err(e) => err_text(format!("{e}")),
             };
         }
 
@@ -627,7 +646,10 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
         format!("Workspace: {}", workspace.display()),
     ];
 
-    parts.push(format!("Starlark tool functions for execute_script:\n{}", script::tool_signatures()));
+    parts.push(format!(
+        "Starlark tool functions for execute_script:\n{}",
+        script::tool_signatures()
+    ));
 
     // Detect primary language / project type from manifest files
     let markers: &[(&str, &str)] = &[
@@ -711,14 +733,19 @@ fn spawn_idle_watchdog(
     timeout_secs: u64,
     last_activity: Arc<AtomicU64>,
     analytics: Option<Arc<AnalyticsStore>>,
+    startup_logs: bool,
 ) {
     if timeout_secs == 0 {
-        eprintln!("daimonos: idle watchdog disabled (idle_timeout_secs = 0)");
+        if startup_logs {
+            eprintln!("daimonos: idle watchdog disabled (idle_timeout_secs = 0)");
+        }
         return;
     }
-    eprintln!(
-        "daimonos: idle watchdog armed ({timeout_secs}s); process will exit after that long without an MCP request"
-    );
+    if startup_logs {
+        eprintln!(
+            "daimonos: idle watchdog armed ({timeout_secs}s); process will exit after that long without an MCP request"
+        );
+    }
     tokio::spawn(async move {
         // Tick frequently enough that the test suite can use short
         // timeouts (e.g. 2s) without flake, but not so often that the
@@ -730,9 +757,11 @@ fn spawn_idle_watchdog(
             let now = now_unix_secs();
             let idle = now.saturating_sub(last);
             if idle >= timeout_secs {
-                eprintln!(
-                    "daimonos: idle for {idle}s (>= {timeout_secs}s timeout) — exiting to release resources"
-                );
+                if startup_logs {
+                    eprintln!(
+                        "daimonos: idle for {idle}s (>= {timeout_secs}s timeout) — exiting to release resources"
+                    );
+                }
                 // Drain any in-flight SQLite writes spawned by
                 // `AnalyticsStore::record_async`. Without this gate the
                 // process exits while the blocking pool still holds
@@ -742,13 +771,13 @@ fn spawn_idle_watchdog(
                 if let Some(an) = analytics.as_ref() {
                     let pending = an.pending_writes();
                     if pending > 0 {
-                        eprintln!(
-                            "daimonos: draining {pending} pending analytics writes before exit"
-                        );
-                        let drained = an
-                            .wait_until_quiet(Duration::from_secs(2))
-                            .await;
-                        if !drained {
+                        if startup_logs {
+                            eprintln!(
+                                "daimonos: draining {pending} pending analytics writes before exit"
+                            );
+                        }
+                        let drained = an.wait_until_quiet(Duration::from_secs(2)).await;
+                        if !drained && startup_logs {
                             eprintln!(
                                 "daimonos: analytics drain timed out; {} writes may be lost",
                                 an.pending_writes()
@@ -769,10 +798,16 @@ pub async fn run_mcp_server(
     tool_reg: Arc<ToolRegistry>,
     pcache: Arc<PipelineCache>,
     analytics: Option<Arc<AnalyticsStore>>,
+    startup_logs: bool,
 ) -> anyhow::Result<()> {
     let idle_timeout_secs = effective_idle_timeout(&cfg);
     let last_activity = Arc::new(AtomicU64::new(now_unix_secs()));
-    spawn_idle_watchdog(idle_timeout_secs, last_activity.clone(), analytics.clone());
+    spawn_idle_watchdog(
+        idle_timeout_secs,
+        last_activity.clone(),
+        analytics.clone(),
+        startup_logs,
+    );
 
     let mut session = Session::new(workspace.clone(), cfg);
     session.index = Some(ws_index);
@@ -819,10 +854,12 @@ pub async fn run_mcp_server(
 
     let server = server_runtime::create_server(options);
 
-    eprintln!(
-        "daimonos MCP server starting (stdio, workspace: {:?})",
-        workspace
-    );
+    if startup_logs {
+        eprintln!(
+            "daimonos MCP server starting (stdio, workspace: {:?})",
+            workspace
+        );
+    }
 
     server
         .start()
@@ -866,7 +903,9 @@ mod tests {
 
         // First read: cache miss. dispatch_tool consumes whatever the inner
         // produced and resets the slot to default.
-        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        let _ = dispatch_tool(&mut session, "read_file", &args)
+            .await
+            .unwrap();
         assert_eq!(
             session.last_response_meta,
             crate::protocol::ResponseMeta::default(),
@@ -876,7 +915,9 @@ mod tests {
         // Second read: cache hit. The inner dispatcher must set
         // meta.read_dedup BEFORE dispatch_tool takes it; we observe the
         // reset side of the contract again, plus the unchanged payload.
-        let result = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        let result = dispatch_tool(&mut session, "read_file", &args)
+            .await
+            .unwrap();
         let payload = extract_result_text(&result);
         let parsed: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(
@@ -904,13 +945,17 @@ mod tests {
         let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
 
         let args = json!({"path": "dedup.txt"});
-        let _ = dispatch_tool_inner(&mut session, "read_file", &args).await.unwrap();
+        let _ = dispatch_tool_inner(&mut session, "read_file", &args)
+            .await
+            .unwrap();
         assert!(
             !session.last_response_meta.read_dedup,
             "first read is a cache miss; meta.read_dedup must be false"
         );
 
-        let _ = dispatch_tool_inner(&mut session, "read_file", &args).await.unwrap();
+        let _ = dispatch_tool_inner(&mut session, "read_file", &args)
+            .await
+            .unwrap();
         assert!(
             session.last_response_meta.read_dedup,
             "second read of unchanged content must stash meta.read_dedup = true"
@@ -1030,20 +1075,19 @@ mod tests {
         let sig_tokens = sig_chars / 4;
 
         let schema_reduction = 100.0 * (1.0 - terse_chars as f64 / full_chars as f64);
-        let code_mode_reduction =
-            100.0 * (1.0 - code_mode_chars as f64 / full_chars as f64);
+        let code_mode_reduction = 100.0 * (1.0 - code_mode_chars as f64 / full_chars as f64);
 
         eprintln!("=== Schema Token Benchmark ===");
         eprintln!("Full schema:      {full_chars:>5} chars ({full_tokens:>4} est. tokens) — {total} tools",
             total = all.len());
         eprintln!("Terse schema:     {terse_chars:>5} chars ({terse_tokens:>4} est. tokens) — {schema_reduction:.1}% reduction");
         eprintln!("Code-mode schema: {code_mode_chars:>5} chars ({code_mode_tokens:>4} est. tokens) — {code_mode_reduction:.1}% reduction");
-        eprintln!("Tool signatures:  {sig_chars:>5} chars ({sig_tokens:>4} est. tokens) — one-time cost");
+        eprintln!(
+            "Tool signatures:  {sig_chars:>5} chars ({sig_tokens:>4} est. tokens) — one-time cost"
+        );
         eprintln!(
             "Code-mode per-turn: {:>4} est. tokens (schema) vs {:>4} full ({:.1}% saved)",
-            code_mode_tokens,
-            full_tokens,
-            code_mode_reduction,
+            code_mode_tokens, full_tokens, code_mode_reduction,
         );
 
         assert!(

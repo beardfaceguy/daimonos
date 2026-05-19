@@ -77,6 +77,8 @@ def test_workspace_info_includes_analytics(daimonos):
     assert analytics["calls"] >= 1
     assert "resp_tokens" in analytics
     assert "redirects" in analytics
+    assert "db_path" in analytics
+    assert isinstance(analytics["db_path"], str)
 
 
 def test_session_stats_tracks_read_dedup(daimonos):
