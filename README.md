@@ -1,5 +1,10 @@
 # Daimonos
 
+[![CI](https://github.com/beardfaceguy/daimonos/actions/workflows/ci.yml/badge.svg)](https://github.com/beardfaceguy/daimonos/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/beardfaceguy/daimonos?display_name=tag)](https://github.com/beardfaceguy/daimonos/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue)](https://github.com/modelcontextprotocol/registry)
+
 **An agent-optimized OS layer that makes AI coding agents faster and cheaper.**
 
 Daimonos replaces the built-in file, search, exec, and git tools in your AI
@@ -84,6 +89,28 @@ edit, run tests, git operations):
 Remote benchmarks on AWS (same hardware, same model, same tasks) showed
 **20.3% cost reduction** and **14.0% faster** task completion.
 
+## 60-second demo
+
+Use this script for README readers, release notes, and social posts:
+
+```bash
+# 1) Install daimonos
+cargo build --release
+sudo cp target/release/daimonos /usr/local/bin/
+
+# 2) Configure your MCP client (example: Cursor)
+# .cursor/mcp.json -> command: daimonos, args: ["--mcp", "-w", "/path/to/project"]
+
+# 3) Ask your agent to run:
+# "Run cargo test and summarize failures only."
+# "Show git status as structured output."
+```
+
+What to highlight in the demo:
+- same workflows, less tool-output noise
+- structured responses instead of raw terminal spam
+- fewer tokens and fewer round-trips for common coding tasks
+
 ## Quick start
 
 ### Install
@@ -113,6 +140,12 @@ See [docs/install.md](docs/install.md) for all platforms (ARM Linux, Intel Mac,
 musl static builds).
 
 ### Configure your IDE
+
+For most users, start with one of these:
+
+- **Cursor**: [Cursor IDE setup](docs/cursor-setup.md)
+- **Zed**: [Zed setup](docs/zed-setup.md)
+- **Claude Code**: [Claude Code setup](docs/claude-code-setup.md)
 
 Add Daimonos as an MCP server. For **Cursor**, add to your project's
 `.cursor/mcp.json`:
