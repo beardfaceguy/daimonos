@@ -19,6 +19,17 @@ Cross-tool guidance for AI coding agents working in this repository.
 4. Check `docs/` for technical specs (protocol, architecture decisions).
 5. **Only then** read source code as needed for your specific task.
 
+## Daimonos tool usage policy
+
+For repository/workspace operations in this project, use the daimonos MCP
+server tools by default. This includes file reads/writes, search, exec, git,
+cargo, docker, snapshots, and workspace introspection.
+
+- Prefer `execute_script` when a task needs 2+ daimonos tool calls.
+- Use single daimonos tools only for one-off operations.
+- Use non-daimonos tools only when the target system is external to the
+  workspace (for example Vikunja, GitHub, Atlassian, or web search).
+
 ## What is Daimonos?
 
 Daimonos is a **bare-metal operating system purpose-built for AI agents**. The

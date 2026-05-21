@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::analytics::{self, ToolCallRecord};
 use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
 use crate::ops;
 use crate::protocol::{Request, Response};
@@ -351,12 +352,96 @@ where
     })
 }
 
+fn request_label(request: &Request) -> String {
+    use crate::protocol::op;
+    match request {
+        Request::Single(opc) => match opc.c {
+            op::READ => "read_file",
+            op::WRITE => "write_file",
+            op::PATCH => "edit_file",
+            op::LS => "ls",
+            op::STAT => "stat",
+            op::GLOB => "glob",
+            op::GREP => "search",
+            op::EXEC => "exec",
+            op::BG => "bg",
+            op::POLL => "poll",
+            op::KILL => "kill",
+            op::SNAP => "snapshot_create",
+            op::RESTORE => "snapshot_restore",
+            op::SNAP_LIST => "snapshot_list",
+            op::SNAP_DELETE => "snapshot_delete",
+            op::DIFF => "diff_files",
+            op::FIND => "search_files",
+            op::TOOL_RUN => "tool_run",
+            op::TOOL_REPAIR => "tool_repair",
+            op::TOOL_PIPELINE => "tool_pipeline",
+            op::TOOL_REGISTER => "tool_register",
+            op::TOOL_LIST => "tool_list",
+            op::ENV_SET => "env_set",
+            op::ENV_GET => "env_get",
+            op::SESSION => "session_info",
+            op::SCHEMA => "schema",
+            _ => "unknown_op",
+        }
+        .to_string(),
+        Request::Batch { .. } => "batch".to_string(),
+    }
+}
+
+fn request_command_hint(request: &Request) -> Option<String> {
+    use crate::protocol::op;
+    match request {
+        Request::Single(opc) if opc.c == op::EXEC || opc.c == op::BG => opc.s.clone(),
+        _ => None,
+    }
+}
+
+fn request_batch_size(request: &Request) -> u32 {
+    match request {
+        Request::Single(_) => 1,
+        Request::Batch { batch } => batch.len().max(1) as u32,
+    }
+}
+
+fn response_chars(resp: &Response) -> usize {
+    match &resp.d {
+        Some(d) => serde_json::to_string(d).map(|s| s.len()).unwrap_or(0),
+        None => resp.m.as_ref().map(|m| m.len()).unwrap_or(0),
+    }
+}
+
 fn dispatch_request(request: Request) -> Result<Response, anyhow::Error> {
+    // `Request` is deserialize-only today; debug-form length is enough for the
+    // coarse token-estimation heuristic used by analytics.
+    let request_chars = format!("{request:?}").len();
+    let label = request_label(&request);
+    let command = request_command_hint(&request);
+    let batch_size = request_batch_size(&request);
+    let started = std::time::Instant::now();
+
     with_ctx(|ctx| {
         let session = ctx.session.clone();
         let resp = ctx.handle.block_on(async {
             let mut s = session.lock().await;
-            ops::dispatch(&mut s, request).await
+            let resp = ops::dispatch(&mut s, request).await;
+            if let Some(analytics) = s.analytics.clone() {
+                let record = ToolCallRecord {
+                    tool_name: format!("script:{label}"),
+                    command,
+                    request_tokens: analytics::estimate_tokens(request_chars),
+                    response_tokens: analytics::estimate_tokens(response_chars(&resp)),
+                    saved_tokens: 0,
+                    savings_pct: 0.0,
+                    exec_time_ms: started.elapsed().as_millis() as u64,
+                    was_redirect: resp.meta.redirect_via_plugin,
+                    was_filtered: resp.meta.filter_applied,
+                    read_dedup: resp.meta.read_dedup,
+                    batch_size,
+                };
+                analytics.record_async(record);
+            }
+            resp
         });
         Ok(resp)
     })
@@ -757,6 +842,7 @@ pub fn tool_signatures() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::AnalyticsStore;
     use crate::config::Config;
 
     fn test_session() -> Arc<Mutex<Session>> {
@@ -828,6 +914,39 @@ result = True
         let code = "result = 42";
         let result = execute(code, session, Duration::from_millis(5000)).await.unwrap();
         assert_eq!(result.value, serde_json::json!(42));
+    }
+
+    /// Regression: internal tool calls issued from `execute_script` must
+    /// update analytics counters so `session_stats` / `workspace_info` remain
+    /// a reliable verification signal when callers batch through scripts.
+    #[tokio::test]
+    async fn execute_script_records_internal_tool_calls_in_analytics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let db_path = dir.path().join("script_analytics.db");
+        let analytics = Arc::new(AnalyticsStore::new(&db_path, 30).unwrap());
+        session.analytics = Some(analytics.clone());
+        let session = Arc::new(Mutex::new(session));
+
+        let code = r#"
+write_file(path="hello.txt", content="hello")
+read_file(path="hello.txt")
+result = True
+"#;
+
+        let result = execute(code, session, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(result.value, serde_json::json!(true));
+
+        assert!(
+            analytics.wait_until_quiet(Duration::from_secs(1)).await,
+            "analytics writes should drain promptly"
+        );
+        let stats = analytics.session_summary();
+        assert!(
+            stats.total_calls >= 2,
+            "expected at least write_file + read_file calls, got {}",
+            stats.total_calls
+        );
     }
 
     #[test]

@@ -10,6 +10,9 @@ lower API costs — with zero changes to your workflow.
 **Platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
 Windows support is [planned](https://linear.app/clawcorp/issue/CLA-302).
 
+For repository agent/operator conventions, see `AGENTS.md` (especially
+**Daimonos tool usage policy**).
+
 The name comes from Greek *daimon* (agent/spirit), the etymological root of
 "daemon."
 
@@ -285,6 +288,12 @@ Key sections:
 Daimonos is in active development. If you're interested in contributing, start
 with the [AGENTS.md](AGENTS.md) file for coding conventions, architecture
 decisions, and the review checklist.
+
+See also:
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+- [CHANGELOG.md](CHANGELOG.md)
+- [LICENSE](LICENSE)
 
 ## License
 

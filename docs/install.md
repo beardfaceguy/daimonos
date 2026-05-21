@@ -109,6 +109,9 @@ starts when your IDE or CLI launches it and exits when the session ends.
 
 ## Next Steps
 
+For repository agent/operator conventions, see `AGENTS.md` (especially
+**Daimonos tool usage policy**).
+
 Pick the setup guide for your AI tool:
 
 - [Cursor IDE](cursor-setup.md)
