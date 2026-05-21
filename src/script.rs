@@ -352,43 +352,6 @@ where
     })
 }
 
-fn request_label(request: &Request) -> String {
-    use crate::protocol::op;
-    match request {
-        Request::Single(opc) => match opc.c {
-            op::READ => "read_file",
-            op::WRITE => "write_file",
-            op::PATCH => "edit_file",
-            op::LS => "ls",
-            op::STAT => "stat",
-            op::GLOB => "glob",
-            op::GREP => "search",
-            op::EXEC => "exec",
-            op::BG => "bg",
-            op::POLL => "poll",
-            op::KILL => "kill",
-            op::SNAP => "snapshot_create",
-            op::RESTORE => "snapshot_restore",
-            op::SNAP_LIST => "snapshot_list",
-            op::SNAP_DELETE => "snapshot_delete",
-            op::DIFF => "diff_files",
-            op::FIND => "search_files",
-            op::TOOL_RUN => "tool_run",
-            op::TOOL_REPAIR => "tool_repair",
-            op::TOOL_PIPELINE => "tool_pipeline",
-            op::TOOL_REGISTER => "tool_register",
-            op::TOOL_LIST => "tool_list",
-            op::ENV_SET => "env_set",
-            op::ENV_GET => "env_get",
-            op::SESSION => "session_info",
-            op::SCHEMA => "schema",
-            _ => "unknown_op",
-        }
-        .to_string(),
-        Request::Batch { .. } => "batch".to_string(),
-    }
-}
-
 fn request_command_hint(request: &Request) -> Option<String> {
     use crate::protocol::op;
     match request {
@@ -411,11 +374,10 @@ fn response_chars(resp: &Response) -> usize {
     }
 }
 
-fn dispatch_request(request: Request) -> Result<Response, anyhow::Error> {
+fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::Error> {
     // `Request` is deserialize-only today; debug-form length is enough for the
     // coarse token-estimation heuristic used by analytics.
     let request_chars = format!("{request:?}").len();
-    let label = request_label(&request);
     let command = request_command_hint(&request);
     let batch_size = request_batch_size(&request);
     let started = std::time::Instant::now();
@@ -450,10 +412,60 @@ fn dispatch_request(request: Request) -> Result<Response, anyhow::Error> {
 /// Dispatch a tool call by name, using the tools registry to map args → Request.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
     match tools::build_request(name, args) {
-        Some(Ok(request)) => dispatch_request(request),
+        Some(Ok(request)) => dispatch_request(request, name),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
     }
+}
+
+fn run_registry_tool(
+    ctx: &ToolContext,
+    tool_id: &str,
+    command: &str,
+    args_val: &Value,
+) -> Result<Response, anyhow::Error> {
+    let started = std::time::Instant::now();
+    let request_chars = serde_json::to_string(args_val).map(|s| s.len()).unwrap_or(0);
+
+    let resp = ctx.handle.block_on(async {
+        let s = ctx.session.lock().await;
+        let cwd = s.cwd.clone();
+        let env = s.env.clone();
+        let analytics = s.analytics.clone();
+
+        let resp = if let Some(registry) = s.tool_registry.as_ref() {
+            match registry
+                .run(tool_id, command, &cwd, &env, None, Some(args_val))
+                .await
+            {
+                Ok(r) => Response::ok(r.output),
+                Err(e) => Response::err(5, &e),
+            }
+        } else {
+            Response::err(5, &format!("{tool_id} plugin not available"))
+        };
+
+        if let Some(analytics) = analytics {
+            let record = ToolCallRecord {
+                tool_name: format!("script:{tool_id}"),
+                command: Some(command.to_string()),
+                request_tokens: analytics::estimate_tokens(request_chars),
+                response_tokens: analytics::estimate_tokens(response_chars(&resp)),
+                saved_tokens: 0,
+                savings_pct: 0.0,
+                exec_time_ms: started.elapsed().as_millis() as u64,
+                was_redirect: resp.meta.redirect_via_plugin,
+                was_filtered: resp.meta.filter_applied,
+                read_dedup: resp.meta.read_dedup,
+                batch_size: 1,
+            };
+            analytics.record_async(record);
+        }
+
+        resp
+    });
+
+    Ok(resp)
 }
 
 fn response_to_starlark_dict<'v>(resp: Response, heap: &'v Heap) -> anyhow::Result<Dict<'v>> {
@@ -655,7 +667,6 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         with_ctx(|ctx| {
-            let session = ctx.session.clone();
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
             if let Some(v) = limit { args_val["limit"] = serde_json::json!(v); }
@@ -666,16 +677,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
             if let Some(v) = branch { args_val["branch"] = serde_json::json!(v); }
             if let Some(v) = create { args_val["create"] = serde_json::json!(v); }
             if let Some(v) = mode { args_val["mode"] = serde_json::json!(v); }
-            let resp = ctx.handle.block_on(async {
-                let s = session.lock().await;
-                let registry = s.tool_registry.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("git plugin not available"))?;
-                let cwd = s.cwd.clone();
-                let env = s.env.clone();
-                registry.run("git", &cmd, &cwd, &env, None, Some(&args_val)).await
-                    .map(|r| Response::ok(r.output))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            })?;
+            let resp = run_registry_tool(ctx, "git", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
     }
@@ -695,7 +697,6 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         with_ctx(|ctx| {
-            let session = ctx.session.clone();
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
             if let Some(v) = number { args_val["number"] = serde_json::json!(v); }
@@ -708,16 +709,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
             if let Some(v) = draft { args_val["draft"] = serde_json::json!(v); }
             if let Some(v) = endpoint { args_val["endpoint"] = serde_json::json!(v); }
             if let Some(v) = method { args_val["method"] = serde_json::json!(v); }
-            let resp = ctx.handle.block_on(async {
-                let s = session.lock().await;
-                let registry = s.tool_registry.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("gh plugin not available"))?;
-                let cwd = s.cwd.clone();
-                let env = s.env.clone();
-                registry.run("gh", &cmd, &cwd, &env, None, Some(&args_val)).await
-                    .map(|r| Response::ok(r.output))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            })?;
+            let resp = run_registry_tool(ctx, "gh", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
     }
@@ -732,7 +724,6 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         with_ctx(|ctx| {
-            let session = ctx.session.clone();
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
             if let Some(v) = package { args_val["package"] = serde_json::json!(v); }
@@ -740,16 +731,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
             if let Some(v) = lib { args_val["lib"] = serde_json::json!(v); }
             if let Some(v) = release { args_val["release"] = serde_json::json!(v); }
             if let Some(v) = dev { args_val["dev"] = serde_json::json!(v); }
-            let resp = ctx.handle.block_on(async {
-                let s = session.lock().await;
-                let registry = s.tool_registry.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("cargo plugin not available"))?;
-                let cwd = s.cwd.clone();
-                let env = s.env.clone();
-                registry.run("cargo", &cmd, &cwd, &env, None, Some(&args_val)).await
-                    .map(|r| Response::ok(r.output))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            })?;
+            let resp = run_registry_tool(ctx, "cargo", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
     }
@@ -797,23 +779,13 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         with_ctx(|ctx| {
-            let session = ctx.session.clone();
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
             if let Some(v) = container { args_val["container"] = serde_json::json!(v); }
             if let Some(v) = tail { args_val["tail"] = serde_json::json!(v); }
             if let Some(v) = file { args_val["file"] = serde_json::json!(v); }
             if let Some(v) = detach { args_val["detach"] = serde_json::json!(v); }
-            let resp = ctx.handle.block_on(async {
-                let s = session.lock().await;
-                let registry = s.tool_registry.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("docker plugin not available"))?;
-                let cwd = s.cwd.clone();
-                let env = s.env.clone();
-                registry.run("docker", &cmd, &cwd, &env, None, Some(&args_val)).await
-                    .map(|r| Response::ok(r.output))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            })?;
+            let resp = run_registry_tool(ctx, "docker", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
     }
@@ -844,6 +816,9 @@ mod tests {
     use super::*;
     use crate::analytics::AnalyticsStore;
     use crate::config::Config;
+    use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolRegistry, ToolResult};
+    use std::collections::HashMap;
+    use std::path::Path;
 
     fn test_session() -> Arc<Mutex<Session>> {
         let dir = tempfile::tempdir().unwrap();
@@ -946,6 +921,92 @@ result = True
             stats.total_calls >= 2,
             "expected at least write_file + read_file calls, got {}",
             stats.total_calls
+        );
+        assert!(
+            stats.per_tool.contains_key("script:write_file"),
+            "expected script:write_file in per_tool stats"
+        );
+        assert!(
+            stats.per_tool.contains_key("script:read_file"),
+            "expected script:read_file in per_tool stats"
+        );
+    }
+
+    struct MockScriptToolPlugin {
+        descriptor: ToolDescriptor,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlugin for MockScriptToolPlugin {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        async fn run_command(
+            &self,
+            command: &str,
+            _cwd: &Path,
+            _env: &HashMap<String, String>,
+            _stdin_data: Option<&[u8]>,
+            _args: Option<&serde_json::Value>,
+        ) -> Result<ToolResult, String> {
+            Ok(ToolResult {
+                tool: self.descriptor.id.clone(),
+                command: command.to_string(),
+                exit_code: 0,
+                output: serde_json::json!({"ok": true}),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_script_records_plugin_shortcuts_in_analytics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let db_path = dir.path().join("script_analytics.db");
+        let analytics = Arc::new(AnalyticsStore::new(&db_path, 30).unwrap());
+        session.analytics = Some(analytics.clone());
+
+        let mut commands = HashMap::new();
+        commands.insert(
+            "status".to_string(),
+            ToolCommand {
+                bin: "true".to_string(),
+                args: vec![],
+                output: "json".to_string(),
+            },
+        );
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(Arc::new(MockScriptToolPlugin {
+                descriptor: ToolDescriptor {
+                    id: "git".to_string(),
+                    commands,
+                    source_pattern: None,
+                    manifest: None,
+                    diagnostics_format: "json".to_string(),
+                    supports_quickfix: false,
+                    quickfix_format: None,
+                },
+            }))
+            .await;
+        session.tool_registry = Some(registry);
+        let session = Arc::new(Mutex::new(session));
+
+        let result = execute(r#"git("status")"#, session, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(result.value, serde_json::Value::Null);
+
+        assert!(
+            analytics.wait_until_quiet(Duration::from_secs(1)).await,
+            "analytics writes should drain promptly"
+        );
+        let stats = analytics.session_summary();
+        assert!(
+            stats.per_tool.contains_key("script:git"),
+            "expected script:git analytics entry for plugin shortcut"
         );
     }
 
