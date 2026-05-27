@@ -9,3 +9,6 @@ claude_api_key.env
 .env.*
 *.log
 .DS_Store
+
+# graphify local incremental-build state (per-machine, not portable)
+graphify-out/cache/
