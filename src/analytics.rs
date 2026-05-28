@@ -118,12 +118,10 @@ CREATE INDEX IF NOT EXISTS idx_tc_session ON tool_calls(session_id);
 impl AnalyticsStore {
     pub fn new(db_path: &Path, retention_days: u64) -> Result<Self, String> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create analytics dir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create analytics dir: {e}"))?;
         }
 
-        let conn = Connection::open(db_path)
-            .map_err(|e| format!("open analytics db: {e}"))?;
+        let conn = Connection::open(db_path).map_err(|e| format!("open analytics db: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(|e| format!("pragma: {e}"))?;
@@ -164,9 +162,7 @@ impl AnalyticsStore {
     /// panic mid-update — so `into_inner()` returns the still-valid
     /// guard. See vikunja #254.
     fn stats_lock(&self) -> std::sync::MutexGuard<'_, SessionStats> {
-        self.session_stats
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.session_stats.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Same poison-tolerant pattern for the SQLite connection mutex.
@@ -198,10 +194,7 @@ impl AnalyticsStore {
                 stats.batch_calls += 1;
             }
 
-            let tool = stats
-                .per_tool
-                .entry(rec.tool_name.clone())
-                .or_default();
+            let tool = stats.per_tool.entry(rec.tool_name.clone()).or_default();
             tool.calls += 1;
             tool.response_tokens += rec.response_tokens;
             tool.saved_tokens += rec.saved_tokens;
@@ -243,8 +236,7 @@ impl AnalyticsStore {
                 stats.total_calls % 100 == 0
             };
             if should_cleanup {
-                let cutoff = Utc::now()
-                    - chrono::Duration::days(self.retention_days as i64);
+                let cutoff = Utc::now() - chrono::Duration::days(self.retention_days as i64);
                 let _ = db.execute(
                     "DELETE FROM tool_calls WHERE timestamp < ?1",
                     params![cutoff.to_rfc3339()],
@@ -303,10 +295,8 @@ impl AnalyticsStore {
         let cutoff = Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        let (total_calls, total_req, total_resp, total_saved, sessions): (
-            u64, u64, u64, i64, u64,
-        ) = db
-            .query_row(
+        let (total_calls, total_req, total_resp, total_saved, sessions): (u64, u64, u64, i64, u64) =
+            db.query_row(
                 "SELECT COALESCE(COUNT(*), 0),
                         COALESCE(SUM(request_tokens), 0),
                         COALESCE(SUM(response_tokens), 0),
@@ -754,9 +744,7 @@ mod tests {
             store.record_async(sample_record(&format!("tool_{i}")));
         }
 
-        let drained = store
-            .wait_until_quiet(Duration::from_secs(5))
-            .await;
+        let drained = store.wait_until_quiet(Duration::from_secs(5)).await;
         assert!(drained, "wait_until_quiet must succeed within budget");
         assert_eq!(
             store.pending_writes(),
@@ -776,9 +764,7 @@ mod tests {
     async fn wait_until_quiet_returns_immediately_when_idle() {
         let (_dir, store) = test_store();
         let start = Instant::now();
-        let drained = store
-            .wait_until_quiet(Duration::from_secs(1))
-            .await;
+        let drained = store.wait_until_quiet(Duration::from_secs(1)).await;
         assert!(drained);
         assert!(
             start.elapsed() < Duration::from_millis(50),
@@ -798,9 +784,7 @@ mod tests {
         store.pending_writes.fetch_add(1, Ordering::SeqCst);
 
         let start = Instant::now();
-        let drained = store
-            .wait_until_quiet(Duration::from_millis(100))
-            .await;
+        let drained = store.wait_until_quiet(Duration::from_millis(100)).await;
         assert!(!drained, "must report failure when deadline elapses");
         assert!(
             start.elapsed() >= Duration::from_millis(100),

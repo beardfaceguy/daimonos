@@ -245,9 +245,7 @@ async fn docker_compose_up(
     cwd: &Path,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let file = args
-        .and_then(|a| a.get("file"))
-        .and_then(|v| v.as_str());
+    let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
 
     let detach = args
         .and_then(|a| a.get("detach"))
@@ -293,9 +291,7 @@ async fn docker_compose_down(
     cwd: &Path,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let file = args
-        .and_then(|a| a.get("file"))
-        .and_then(|v| v.as_str());
+    let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
 
     let mut docker_args: Vec<&str> = vec!["compose"];
 
@@ -333,9 +329,7 @@ async fn docker_compose_ps(
     cwd: &Path,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let file = args
-        .and_then(|a| a.get("file"))
-        .and_then(|v| v.as_str());
+    let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
 
     let mut docker_args: Vec<&str> = vec!["compose"];
 
@@ -404,9 +398,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_registers_in_registry() {
         let registry = ToolRegistry::new();
-        registry
-            .register(Arc::new(DockerPlugin::new()))
-            .await;
+        registry.register(Arc::new(DockerPlugin::new())).await;
 
         let tools = registry.list().await;
         assert!(tools.iter().any(|t| t.id == "docker"));
@@ -421,14 +413,18 @@ mod tests {
         let desc = plugin.descriptor();
         assert_eq!(desc.id, "docker");
         let expected = [
-            "ps", "logs", "exec", "images", "inspect", "stop",
-            "compose_up", "compose_down", "compose_ps",
+            "ps",
+            "logs",
+            "exec",
+            "images",
+            "inspect",
+            "stop",
+            "compose_up",
+            "compose_down",
+            "compose_ps",
         ];
         for cmd in &expected {
-            assert!(
-                desc.commands.contains_key(*cmd),
-                "missing command: {cmd}"
-            );
+            assert!(desc.commands.contains_key(*cmd), "missing command: {cmd}");
         }
     }
 

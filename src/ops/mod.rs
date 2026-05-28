@@ -1,7 +1,7 @@
-mod exec_ops;
-pub mod exec_filter;
-mod file_ops;
 mod diff_ops;
+pub mod exec_filter;
+mod exec_ops;
+mod file_ops;
 mod schema;
 mod snap_ops;
 mod tool_ops;

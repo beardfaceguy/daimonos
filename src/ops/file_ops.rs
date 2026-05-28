@@ -249,9 +249,15 @@ async fn ls_recurse(
         entries.push(e);
 
         if is_dir && depth > 1 {
-            let _ =
-                Box::pin(ls_recurse(root, &entry.path(), depth - 1, show_all, stat, entries))
-                    .await;
+            let _ = Box::pin(ls_recurse(
+                root,
+                &entry.path(),
+                depth - 1,
+                show_all,
+                stat,
+                entries,
+            ))
+            .await;
         }
     }
 
@@ -1012,8 +1018,14 @@ mod tests {
         assert!(r.ok);
         let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
         let entry = entries.iter().find(|e| e["n"] == "f.txt").unwrap();
-        assert!(entry.get("m").is_none(), "should NOT have mode field by default");
-        assert!(entry.get("t").is_none(), "should NOT have mtime field by default");
+        assert!(
+            entry.get("m").is_none(),
+            "should NOT have mode field by default"
+        );
+        assert!(
+            entry.get("t").is_none(),
+            "should NOT have mtime field by default"
+        );
     }
 
     #[tokio::test]
@@ -1140,7 +1152,10 @@ mod tests {
         assert!(names.contains(&"src"));
         assert!(names.contains(&"Cargo.toml"));
         assert!(!names.contains(&"target"), "target should be skipped");
-        assert!(!names.contains(&"node_modules"), "node_modules should be skipped");
+        assert!(
+            !names.contains(&"node_modules"),
+            "node_modules should be skipped"
+        );
         assert!(!names.contains(&".git"), ".git is hidden AND in skip list");
     }
 

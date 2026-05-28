@@ -952,8 +952,14 @@ mod tests {
         assert!(!commits.is_empty());
         let hash = commits[0]["h"].as_str().unwrap();
         assert!(hash.len() <= 12, "should be a short hash, got: {hash}");
-        assert!(commits[0].get("a").is_some(), "should have author field 'a'");
-        assert!(commits[0].get("m").is_some(), "should have message field 'm'");
+        assert!(
+            commits[0].get("a").is_some(),
+            "should have author field 'a'"
+        );
+        assert!(
+            commits[0].get("m").is_some(),
+            "should have message field 'm'"
+        );
         assert!(commits[0].get("d").is_some(), "should have date field 'd'");
     }
 

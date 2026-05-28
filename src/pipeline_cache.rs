@@ -385,7 +385,12 @@ mod tests {
         let (_dir, cache, _lock) = temp_cache();
         for i in 0..2000 {
             cache
-                .put(&format!("tool_{i}"), &format!("cmd_{i}"), json!({"i": i}), 0)
+                .put(
+                    &format!("tool_{i}"),
+                    &format!("cmd_{i}"),
+                    json!({"i": i}),
+                    0,
+                )
                 .await;
         }
         let state = cache.inner.read().await;
@@ -413,7 +418,12 @@ mod tests {
 
         for i in 0..20 {
             cache
-                .put(&format!("tool_{i}"), &format!("cmd_{i}"), json!({"i": i}), 0)
+                .put(
+                    &format!("tool_{i}"),
+                    &format!("cmd_{i}"),
+                    json!({"i": i}),
+                    0,
+                )
                 .await;
         }
 
@@ -476,7 +486,10 @@ mod tests {
             "least-recently-used 'b' must be evicted"
         );
         assert!(cache.get("t", "c").await.is_some(), "'c' must survive");
-        assert!(cache.get("t", "d").await.is_some(), "just-inserted 'd' must be present");
+        assert!(
+            cache.get("t", "d").await.is_some(),
+            "just-inserted 'd' must be present"
+        );
 
         let state = cache.inner.read().await;
         assert_eq!(state.entries.len(), 3, "cache size must remain at the cap");
@@ -558,9 +571,7 @@ mod tests {
     /// = "linux")]`, so the lock is also Linux-only.
     #[cfg(target_os = "linux")]
     fn inotify_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        INOTIFY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        INOTIFY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Counts the number of active inotify watch descriptors held by the

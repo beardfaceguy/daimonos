@@ -197,8 +197,7 @@ async fn parse_git_redirect(
     let rest = &args[1..];
 
     match subcommand {
-        "status" | "log" | "diff" | "branch" | "add" | "commit" | "push" | "pull"
-        | "checkout" => {}
+        "status" | "log" | "diff" | "branch" | "add" | "commit" | "push" | "pull" | "checkout" => {}
         _ => return None,
     }
 
@@ -430,8 +429,7 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
     if session.cfg.process.exec_plugin_redirect {
         if args.is_empty() {
             if let Some(registry) = &session.tool_registry {
-                if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await
-                {
+                if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
                     return resp;
                 }
             }
@@ -459,9 +457,7 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
     let max = session.cfg.process.exec_output_max_chars;
 
     if session.cfg.process.exec_output_filters {
-        if let Some(filtered) =
-            exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit)
-        {
+        if let Some(filtered) = exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit) {
             let mut resp = json!({
                 "exit": exit,
                 "out": cap_output(&filtered.out, max),
@@ -555,18 +551,15 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
     let output_path = proc.output_path.clone();
     let tail_n = session.cfg.process.poll_tail_lines;
 
-    let tail = tokio::fs::read_to_string(&output_path)
-        .await
-        .ok()
-        .map(|s| {
-            let lines: Vec<&str> = s.lines().collect();
-            let start = if lines.len() > tail_n {
-                lines.len() - tail_n
-            } else {
-                0
-            };
-            lines[start..].join("\n")
-        });
+    let tail = tokio::fs::read_to_string(&output_path).await.ok().map(|s| {
+        let lines: Vec<&str> = s.lines().collect();
+        let start = if lines.len() > tail_n {
+            lines.len() - tail_n
+        } else {
+            0
+        };
+        lines[start..].join("\n")
+    });
 
     match status {
         Ok(Some(exit)) => {
@@ -788,8 +781,7 @@ mod tests {
         .await;
         assert!(bg_resp.ok, "bg failed: {:?}", bg_resp.m);
         let pid = bg_resp.d.unwrap()["pid"].as_u64().unwrap() as i64;
-        let log_path =
-            std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
+        let log_path = std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
 
         let out_file = dir.path().join("out.txt");
         let mut appeared = false;
@@ -805,8 +797,8 @@ mod tests {
             "bg subprocess never wrote out.txt within 2s (likely never ran or env not propagated)"
         );
 
-        let written = std::fs::read_to_string(&out_file)
-            .expect("bg subprocess should have created out.txt");
+        let written =
+            std::fs::read_to_string(&out_file).expect("bg subprocess should have created out.txt");
         assert_eq!(
             written.trim(),
             "kv_value",
@@ -1213,7 +1205,8 @@ mod tests {
 
         let r = ToolRegistry::new();
         if plugins::cargo::is_available() {
-            r.register(Arc::new(plugins::cargo::CargoPlugin::new())).await;
+            r.register(Arc::new(plugins::cargo::CargoPlugin::new()))
+                .await;
         }
         if plugins::git::is_available() {
             r.register(Arc::new(plugins::git::GitPlugin::new())).await;
@@ -1258,10 +1251,7 @@ mod tests {
         let d = r.d.unwrap();
         assert_eq!(d["exit"], 0);
         let out = d["out"].as_str().unwrap();
-        assert!(
-            d.get("via").is_some(),
-            "should have 'via: plugin' marker"
-        );
+        assert!(d.get("via").is_some(), "should have 'via: plugin' marker");
         assert!(out.contains("passed") || out.contains("ok"), "got: {out}");
         assert!(
             !out.contains("running 1 test"),
@@ -1342,8 +1332,10 @@ mod tests {
         assert_eq!(d["via"], "plugin");
         // Plugin returns structured JSON with clean/modified/untracked fields
         let out = d["out"].as_str().unwrap();
-        assert!(out.contains("clean") || out.contains("modified") || out.contains("untracked"),
-            "got: {out}");
+        assert!(
+            out.contains("clean") || out.contains("modified") || out.contains("untracked"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1443,7 +1435,9 @@ mod tests {
 
         let mut s = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
         let registry = Arc::new(ToolRegistry::new());
-        registry.register(Arc::new(plugins::cargo::CargoPlugin::new())).await;
+        registry
+            .register(Arc::new(plugins::cargo::CargoPlugin::new()))
+            .await;
         s.tool_registry = Some(registry);
 
         let r = exec(
@@ -1558,7 +1552,10 @@ mod tests {
             },
         )
         .await;
-        assert!(r.ok, "exec call itself must succeed (failure is in subprocess)");
+        assert!(
+            r.ok,
+            "exec call itself must succeed (failure is in subprocess)"
+        );
         assert!(
             r.meta.filter_applied,
             "recognized command must set meta.filter_applied; meta = {:?}",

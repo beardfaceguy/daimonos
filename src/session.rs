@@ -8,8 +8,8 @@ use crate::tool_runner::ToolRegistry;
 use crate::tools;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Process-global counter for background-process IDs. Shared across all
 /// `Session` instances in the same daemon process so concurrent sessions
@@ -383,7 +383,10 @@ mod tests {
         let s = test_session("/workspace");
         let expected = tools::initial_exposed_tools();
         for name in &expected {
-            assert!(s.exposed_tools.contains(name), "tool {name} should be exposed");
+            assert!(
+                s.exposed_tools.contains(name),
+                "tool {name} should be exposed"
+            );
         }
     }
 
@@ -391,7 +394,10 @@ mod tests {
     fn on_demand_tools_hidden_by_default() {
         let s = test_session("/workspace");
         for name in tools::on_demand_names() {
-            assert!(!s.exposed_tools.contains(name), "on-demand tool {name} should be hidden until activated");
+            assert!(
+                !s.exposed_tools.contains(name),
+                "on-demand tool {name} should be hidden until activated"
+            );
         }
     }
 
@@ -419,7 +425,10 @@ mod tests {
         let before = s.exposed_tools.len();
         s.activate_all_tools();
         for name in tools::on_demand_names() {
-            assert!(s.exposed_tools.contains(name), "activate_all should add {name}");
+            assert!(
+                s.exposed_tools.contains(name),
+                "activate_all should add {name}"
+            );
         }
         assert!(s.exposed_tools.len() > before);
     }

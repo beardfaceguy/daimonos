@@ -14,7 +14,12 @@ impl GhPlugin {
     pub fn new() -> Self {
         let mut commands = HashMap::new();
         for name in [
-            "pr_view", "pr_list", "pr_create", "pr_diff", "pr_checks", "api",
+            "pr_view",
+            "pr_list",
+            "pr_create",
+            "pr_diff",
+            "pr_checks",
+            "api",
         ] {
             commands.insert(
                 name.to_string(),
@@ -128,7 +133,14 @@ async fn gh_pr_list(
     let json_fields = "number,title,state,author,url,headRefName";
     let limit_str = limit.to_string();
     let mut gh_args = vec![
-        "pr", "list", "--state", state, "--limit", &limit_str, "--json", json_fields,
+        "pr",
+        "list",
+        "--state",
+        state,
+        "--limit",
+        &limit_str,
+        "--json",
+        json_fields,
     ];
 
     let author_owned;
@@ -231,10 +243,7 @@ async fn gh_pr_checks(
     }))
 }
 
-async fn gh_api(
-    cwd: &Path,
-    args: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+async fn gh_api(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
     let endpoint = args
         .and_then(|a| a.get("endpoint"))
         .and_then(|v| v.as_str())

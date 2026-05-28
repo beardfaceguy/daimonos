@@ -98,8 +98,14 @@ async fn cargo_test(
 ) -> Result<serde_json::Value, String> {
     let mut cargo_args = vec!["test"];
 
-    let pkg = args.and_then(|a| a.get("package")).and_then(|v| v.as_str()).map(String::from);
-    let filter = args.and_then(|a| a.get("filter")).and_then(|v| v.as_str()).map(String::from);
+    let pkg = args
+        .and_then(|a| a.get("package"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let filter = args
+        .and_then(|a| a.get("filter"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let lib = args
         .and_then(|a| a.get("lib"))
         .and_then(|v| v.as_bool())
@@ -196,7 +202,10 @@ async fn cargo_diagnostics(
 ) -> Result<serde_json::Value, String> {
     let mut cargo_args = vec![subcommand, "--message-format=json"];
 
-    let pkg = args.and_then(|a| a.get("package")).and_then(|v| v.as_str()).map(String::from);
+    let pkg = args
+        .and_then(|a| a.get("package"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let release = args
         .and_then(|a| a.get("release"))
         .and_then(|v| v.as_bool())
@@ -268,12 +277,19 @@ fn extract_span_location(message: &serde_json::Value) -> (Option<String>, Option
     // Prefer the primary span
     let span = spans
         .iter()
-        .find(|s| s.get("is_primary").and_then(|p| p.as_bool()).unwrap_or(false))
+        .find(|s| {
+            s.get("is_primary")
+                .and_then(|p| p.as_bool())
+                .unwrap_or(false)
+        })
         .or_else(|| spans.first());
 
     match span {
         Some(s) => {
-            let file = s.get("file_name").and_then(|f| f.as_str()).map(String::from);
+            let file = s
+                .get("file_name")
+                .and_then(|f| f.as_str())
+                .map(String::from);
             let line = s.get("line_start").and_then(|l| l.as_i64());
             (file, line)
         }
@@ -288,7 +304,10 @@ async fn cargo_fmt(
 ) -> Result<serde_json::Value, String> {
     let mut cargo_args = vec!["fmt", "--check"];
 
-    let pkg = args.and_then(|a| a.get("package")).and_then(|v| v.as_str()).map(String::from);
+    let pkg = args
+        .and_then(|a| a.get("package"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     if let Some(ref p) = pkg {
         append_package_arg(&mut cargo_args, p);
     }

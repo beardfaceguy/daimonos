@@ -17,9 +17,7 @@ pub struct FilteredOutput {
 
 fn ansi_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]|\r").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]|\r").unwrap())
 }
 
 pub fn strip_ansi(text: &str) -> String {
@@ -190,7 +188,10 @@ fn filter_test_output(stdout: &str, stderr: &str, exit_code: i32) -> FilteredOut
         }
 
         // Go test results
-        if trimmed.starts_with("ok ") || trimmed.starts_with("FAIL\t") || trimmed.starts_with("--- FAIL") {
+        if trimmed.starts_with("ok ")
+            || trimmed.starts_with("FAIL\t")
+            || trimmed.starts_with("--- FAIL")
+        {
             if trimmed.starts_with("ok ") {
                 summary_lines.push(trimmed.to_string());
             } else {
@@ -227,7 +228,10 @@ fn filter_test_output(stdout: &str, stderr: &str, exit_code: i32) -> FilteredOut
             out.push('\n');
         }
         if failure_lines.len() > 30 {
-            out.push_str(&format!("... +{} more failure lines\n", failure_lines.len() - 30));
+            out.push_str(&format!(
+                "... +{} more failure lines\n",
+                failure_lines.len() - 30
+            ));
         }
     }
 
@@ -471,7 +475,10 @@ mod tests {
     #[test]
     fn classify_install() {
         assert_eq!(classify("pip install requests"), ExecFilter::Install);
-        assert_eq!(classify("pip3 install -r requirements.txt"), ExecFilter::Install);
+        assert_eq!(
+            classify("pip3 install -r requirements.txt"),
+            ExecFilter::Install
+        );
         assert_eq!(classify("npm install"), ExecFilter::Install);
         assert_eq!(classify("npm i express"), ExecFilter::Install);
         assert_eq!(classify("yarn add lodash"), ExecFilter::Install);
@@ -633,7 +640,8 @@ Successfully installed requests-2.31.0 certifi-2024.2.2
 
     #[test]
     fn install_filter_failure() {
-        let stderr = "ERROR: Could not find a version that satisfies the requirement nonexistent-pkg\n";
+        let stderr =
+            "ERROR: Could not find a version that satisfies the requirement nonexistent-pkg\n";
         let result = filter_install_output("", stderr, 1);
         assert!(result.out.contains("FAILED"));
         assert!(result.out.contains("Could not find"));
@@ -694,7 +702,12 @@ error: aborting due to previous error
 
     #[test]
     fn filter_exec_applies_to_cargo_test() {
-        let result = filter_exec_output("cargo test", "test result: ok. 3 passed; 0 failed; 0 ignored\n", "", 0);
+        let result = filter_exec_output(
+            "cargo test",
+            "test result: ok. 3 passed; 0 failed; 0 ignored\n",
+            "",
+            0,
+        );
         assert!(result.is_some());
         let filtered = result.unwrap();
         assert!(filtered.out.contains("3 passed"));
