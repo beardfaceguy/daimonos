@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+.cursor/
+docs/
+tests/
+benchmarks/
+distro/
+mcpb/
+*.md
+claude_api_key.env
+daimonos.toml
+.idea/
+.vscode/
