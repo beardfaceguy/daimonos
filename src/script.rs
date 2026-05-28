@@ -399,6 +399,7 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
                     was_filtered: resp.meta.filter_applied,
                     read_dedup: resp.meta.read_dedup,
                     batch_size,
+                    external_session_id: s.external_session_id.clone(),
                 };
                 analytics.record_async(record);
             }
@@ -433,6 +434,7 @@ fn run_registry_tool(
         let cwd = s.cwd.clone();
         let env = s.env.clone();
         let analytics = s.analytics.clone();
+        let external_session_id = s.external_session_id.clone();
 
         let resp = if let Some(registry) = s.tool_registry.as_ref() {
             match registry
@@ -459,6 +461,7 @@ fn run_registry_tool(
                 was_filtered: resp.meta.filter_applied,
                 read_dedup: resp.meta.read_dedup,
                 batch_size: 1,
+                external_session_id,
             };
             analytics.record_async(record);
         }

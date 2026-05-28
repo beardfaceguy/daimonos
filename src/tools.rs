@@ -472,15 +472,31 @@ pub fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "session_stats",
             tier: ToolTier::Terse,
-            description: "Token analytics. Scopes: session (current totals), history (cross-session), daily (trend).",
+            description: "Token analytics. Scopes: session (current totals), history (cross-session), daily (trend). Optional external_session_id filters history/daily to a single agent-runtime session id.",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "enum": ["session", "history", "daily"], "description": "Default: session"},
-                    "days": {"type": "integer", "description": "history/daily: lookback days (default 30)"}
+                    "days": {"type": "integer", "description": "history/daily: lookback days (default 30)"},
+                    "external_session_id": {"type": "string", "description": "history/daily: restrict to this agent-runtime session id"}
                 }
             }),
             to_request: None, // needs session.analytics access
+            context_check: None,
+        },
+
+        ToolDef {
+            name: "set_external_session_id",
+            tier: ToolTier::Terse,
+            description: "Attach an agent-runtime session id (e.g. claude `--session-id` UUID) to every subsequent analytics row from this connection. Use to correlate daimonos analytics with the agent's own usage logs. Pass an empty string to clear.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Agent-runtime session identifier; empty string clears."}
+                },
+                "required": ["id"]
+            }),
+            to_request: None, // mutates session directly
             context_check: None,
         },
 

@@ -147,6 +147,7 @@ async fn dispatch_tool(
             was_filtered,
             read_dedup,
             batch_size: 1,
+            external_session_id: session.external_session_id.clone(),
         };
 
         // Use the tracked spawn so the idle watchdog can drain in-flight
@@ -251,17 +252,36 @@ async fn dispatch_tool_inner(
 
             let scope = tools::get_str(args, "scope").unwrap_or_else(|| "session".into());
             let days = tools::get_i64(args, "days").unwrap_or(30) as u64;
+            let external_filter = tools::get_str(args, "external_session_id")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             match scope.as_str() {
                 "session" => {
+                    // Wrap the in-memory SessionStats in a JSON object that
+                    // also surfaces the live external_session_id so the
+                    // caller can confirm what `set_external_session_id` /
+                    // the env-var bootstrap actually attached.
                     let stats = analytics.session_summary();
-                    ok_text(serde_json::to_string(&stats).unwrap_or_default())
+                    let mut value = serde_json::to_value(&stats).unwrap_or_default();
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "external_session_id".to_string(),
+                            match &session.external_session_id {
+                                Some(id) => json!(id),
+                                None => Value::Null,
+                            },
+                        );
+                    }
+                    ok_text(serde_json::to_string(&value).unwrap_or_default())
                 }
-                "history" => match analytics.history_summary(days) {
-                    Ok(summary) => ok_text(serde_json::to_string(&summary).unwrap_or_default()),
-                    Err(e) => err_text(format!("history query: {e}")),
-                },
-                "daily" => match analytics.daily_trend(days) {
+                "history" => {
+                    match analytics.history_summary_filtered(days, external_filter.as_deref()) {
+                        Ok(summary) => ok_text(serde_json::to_string(&summary).unwrap_or_default()),
+                        Err(e) => err_text(format!("history query: {e}")),
+                    }
+                }
+                "daily" => match analytics.daily_trend_filtered(days, external_filter.as_deref()) {
                     Ok(trend) => ok_text(serde_json::to_string(&trend).unwrap_or_default()),
                     Err(e) => err_text(format!("daily query: {e}")),
                 },
@@ -269,6 +289,27 @@ async fn dispatch_tool_inner(
                     "unknown scope: {scope}. Use session, history, or daily"
                 )),
             }
+        }
+
+        "set_external_session_id" => {
+            let id = match get_str(args, "id") {
+                Some(s) => s,
+                None => return err_text("set_external_session_id requires 'id' argument".into()),
+            };
+            let trimmed = id.trim().to_string();
+            let previous = session.external_session_id.clone();
+            session.external_session_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.clone())
+            };
+            ok_text(
+                serde_json::to_string(&json!({
+                    "external_session_id": session.external_session_id,
+                    "previous": previous,
+                }))
+                .unwrap_or_default(),
+            )
         }
 
         "workspace_info" => {
@@ -300,6 +341,7 @@ async fn dispatch_tool_inner(
                 None => None,
             };
 
+            let external_session_id = session.external_session_id.clone();
             let analytics_summary = session.analytics.as_ref().map(|a| {
                 let s = a.session_summary();
                 let mut j = json!({
@@ -314,6 +356,11 @@ async fn dispatch_tool_inner(
                 if let Some(p) = a.db_path() {
                     if let Some(obj) = j.as_object_mut() {
                         obj.insert("db_path".to_string(), json!(p.to_string_lossy()));
+                    }
+                }
+                if let Some(id) = external_session_id {
+                    if let Some(obj) = j.as_object_mut() {
+                        obj.insert("external_session_id".to_string(), json!(id));
                     }
                 }
                 j
@@ -855,6 +902,11 @@ pub async fn run_mcp_server(
     session.tool_registry = Some(tool_reg);
     session.pipeline_cache = Some(pcache);
     session.analytics = analytics;
+    // Bootstrap the agent-runtime session id from the launch environment
+    // so analytics rows can be correlated post-hoc with tools like
+    // `claude --session-id $SID`. The MCP `set_external_session_id` tool
+    // can override this mid-session.
+    session.external_session_id = analytics::read_agent_session_id_env();
 
     let instructions = build_instructions(&workspace).await;
     let handler = DaimonosHandler::new(session, last_activity);
@@ -1187,5 +1239,129 @@ mod tests {
         let instructions = build_instructions(dir.path()).await;
         assert!(instructions.contains("Top-level dirs:"));
         assert!(instructions.contains("src"));
+    }
+
+    // --- external_session_id correlation (vikunja #43) ---
+
+    /// `set_external_session_id` must mutate the session field, surface
+    /// the previous value, and treat an empty string as a clear.
+    #[tokio::test]
+    async fn set_external_session_id_updates_and_clears() {
+        use crate::config::Config;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        assert!(session.external_session_id.is_none());
+
+        let result = dispatch_tool_inner(
+            &mut session,
+            "set_external_session_id",
+            &json!({"id": "claude-sid-XYZ"}),
+        )
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["external_session_id"], json!("claude-sid-XYZ"));
+        assert_eq!(payload["previous"], Value::Null);
+        assert_eq!(
+            session.external_session_id.as_deref(),
+            Some("claude-sid-XYZ")
+        );
+
+        let result =
+            dispatch_tool_inner(&mut session, "set_external_session_id", &json!({"id": ""}))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["external_session_id"], Value::Null);
+        assert_eq!(payload["previous"], json!("claude-sid-XYZ"));
+        assert!(session.external_session_id.is_none());
+    }
+
+    /// The `session_stats` session-scope response must echo the live
+    /// `external_session_id` so callers can confirm what was attached.
+    #[tokio::test]
+    async fn session_stats_session_scope_includes_external_session_id() {
+        use crate::config::Config;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let analytics_dir = TempDir::new().unwrap();
+        let analytics =
+            Arc::new(AnalyticsStore::new(&analytics_dir.path().join("a.db"), 90).unwrap());
+        session.analytics = Some(analytics);
+        session.external_session_id = Some("agent-sid-123".to_string());
+
+        let result =
+            dispatch_tool_inner(&mut session, "session_stats", &json!({"scope": "session"}))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["external_session_id"], json!("agent-sid-123"));
+        assert!(payload.get("total_calls").is_some());
+    }
+
+    /// History/daily scopes must accept an `external_session_id` filter
+    /// and forward it to the underlying SQL — verified end-to-end by
+    /// recording rows under two different ids and asserting the filtered
+    /// scope returns only the matching subset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_stats_history_scope_filters_by_external_session_id() {
+        use crate::config::Config;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let analytics_dir = TempDir::new().unwrap();
+        let analytics =
+            Arc::new(AnalyticsStore::new(&analytics_dir.path().join("a.db"), 90).unwrap());
+
+        let make_record = |tool: &str, ext: &str| ToolCallRecord {
+            tool_name: tool.into(),
+            command: None,
+            request_tokens: 10,
+            response_tokens: 5,
+            saved_tokens: 0,
+            savings_pct: 0.0,
+            exec_time_ms: 1,
+            was_redirect: false,
+            was_filtered: false,
+            read_dedup: false,
+            batch_size: 1,
+            external_session_id: Some(ext.to_string()),
+        };
+        analytics.record(&make_record("read_file", "sid-A"));
+        analytics.record(&make_record("read_file", "sid-A"));
+        analytics.record(&make_record("read_file", "sid-B"));
+
+        session.analytics = Some(analytics);
+
+        let result = dispatch_tool_inner(
+            &mut session,
+            "session_stats",
+            &json!({"scope": "history", "external_session_id": "sid-A"}),
+        )
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["total_calls"], json!(2));
+
+        let result = dispatch_tool_inner(
+            &mut session,
+            "session_stats",
+            &json!({"scope": "history", "external_session_id": "sid-B"}),
+        )
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["total_calls"], json!(1));
+
+        let result =
+            dispatch_tool_inner(&mut session, "session_stats", &json!({"scope": "history"}))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["total_calls"], json!(3));
     }
 }

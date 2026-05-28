@@ -237,6 +237,46 @@ If you see `"status":"failed"` or no `mcp__daimonos__*` lines, common causes:
 
 ---
 
+## Correlating tokens with the Claude Code runtime
+
+Claude Code's `stream-json` output reports per-turn `usage.input_tokens`
+and `usage.output_tokens` for the model, while daimonos's analytics
+records per-tool-call request/response token estimates. Joining the
+two lets you see how much of a turn's token cost came from tool I/O
+versus model reasoning.
+
+Daimonos's `external_session_id` column is the join key. Pass the same
+UUID to both sides:
+
+```bash
+SID=$(uuidgen)
+
+DAIMONOS_AGENT_SESSION_ID=$SID claude --session-id "$SID" \
+    --mcp-config .cursor/mcp.json --strict-mcp-config --tools "" \
+    --output-format stream-json -p "Refactor the login flow" \
+  > run.jsonl
+
+# daimonos's view of just this session
+daimonos --stats --session-id "$SID"
+
+# or via the MCP tool, if you're already connected:
+#   session_stats {"scope": "history", "external_session_id": "<sid>"}
+```
+
+How the id reaches daimonos:
+
+- **Bootstrap** — `DAIMONOS_AGENT_SESSION_ID` is read once at MCP server
+  startup. Easiest path when you control the launch (CI, harness,
+  shell wrappers).
+- **Mid-session** — call `set_external_session_id({"id": "<sid>"})`
+  from the agent. Useful when daimonos is launched by an editor
+  (Claude Code Desktop, Cursor) and the user can't set environment
+  variables on its subprocess. Pass `""` to clear.
+
+Confirmation: the `session_stats` tool's `session` scope echoes the
+live `external_session_id` so the model can verify the link before
+committing to a long task.
+
 ## Benchmarking
 
 The `benchmarks/` directory includes a full benchmark harness for comparing

@@ -48,6 +48,13 @@ pub struct Session {
     /// from list_tools responses — the model already has them in context.
     pub used_tools: HashSet<String>,
     pub analytics: Option<Arc<AnalyticsStore>>,
+    /// Optional caller-supplied identifier for the agent-runtime session
+    /// driving this connection (e.g. `claude --session-id <uuid>`).
+    /// Bootstrapped from `DAIMONOS_AGENT_SESSION_ID` at startup, can be
+    /// updated mid-session via the `set_external_session_id` MCP tool.
+    /// Threaded onto every `ToolCallRecord` so the analytics DB can be
+    /// joined post-hoc with the agent's own usage logs (vikunja #43).
+    pub external_session_id: Option<String>,
     /// Out-of-band metadata produced by the most recent `ops::dispatch` call.
     /// Populated by the MCP layer right before it converts the `Response`
     /// into a `CallToolResult` and consumed by the analytics layer in the
@@ -81,6 +88,7 @@ impl Session {
             exposed_tools: tools::initial_exposed_tools(),
             used_tools: HashSet::new(),
             analytics: None,
+            external_session_id: None,
             last_response_meta: ResponseMeta::default(),
         }
     }

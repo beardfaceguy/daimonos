@@ -97,6 +97,14 @@ struct Cli {
     /// Print token analytics summary and exit
     #[arg(long, default_value_t = false)]
     stats: bool,
+
+    /// With --stats, restrict the report to a single agent-runtime
+    /// session id (matches whatever `set_external_session_id` /
+    /// `DAIMONOS_AGENT_SESSION_ID` set on the recording side).
+    /// Useful with claude / cursor session ids: `daimonos --stats
+    /// --session-id $SID`.
+    #[arg(long)]
+    session_id: Option<String>,
 }
 
 #[tokio::main]
@@ -200,7 +208,10 @@ async fn main() -> anyhow::Result<()> {
         }
         match analytics::AnalyticsStore::open_readonly(&db_path) {
             Ok(store) => {
-                let report = store.format_stats_report(cfg.analytics.retention_days);
+                let report = store.format_stats_report_filtered(
+                    cfg.analytics.retention_days,
+                    cli.session_id.as_deref(),
+                );
                 eprint!("{report}");
             }
             Err(e) => eprintln!("Failed to open analytics: {e}"),
@@ -308,6 +319,7 @@ async fn handle_connection(
     session.tool_registry = Some(tool_reg);
     session.pipeline_cache = Some(pcache);
     session.analytics = analytics;
+    session.external_session_id = analytics::read_agent_session_id_env();
     let mut line = String::new();
 
     loop {

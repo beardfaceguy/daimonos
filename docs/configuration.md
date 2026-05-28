@@ -111,6 +111,68 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `[analytics]` — Token & Latency Tracking
+
+Daimonos records every MCP tool call (request/response token estimates,
+execution time, redirect/filter/dedup signals) to a SQLite database for
+cross-session reporting. Disable to opt out entirely.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Master switch. When `false`, nothing is tracked and the SQLite file is never opened. |
+| `db_path` | `~/.daimonos/analytics.db` | Path to the SQLite store. Created on first run with WAL mode. |
+| `retention_days` | `90` | Records older than this are auto-pruned roughly every 100 inserts. |
+
+```toml
+[analytics]
+enabled = true
+# db_path = "~/.daimonos/analytics.db"
+retention_days = 90
+```
+
+The data is exposed three ways:
+
+- **`session_stats` MCP tool** — query `session`, `history`, or `daily`
+  scope. The `session` scope echoes the live `external_session_id` so
+  the agent can confirm correlation is wired up. `history` and `daily`
+  accept an optional `external_session_id` argument that filters the
+  result set to a single agent-runtime session.
+- **`workspace_info` MCP tool** — includes a compact `analytics`
+  summary block (calls / req_tokens / resp_tokens / saved_tokens /
+  redirects / filters / dedup_hits / db_path / external_session_id).
+- **`daimonos --stats`** — human-readable report. Pass
+  `--session-id <id>` to filter the history/daily blocks to a single
+  agent-runtime session id (useful with
+  `claude --session-id $SID` / `DAIMONOS_AGENT_SESSION_ID=$SID`).
+
+### Correlating with agent-runtime sessions
+
+Daimonos's analytics rows include an optional `external_session_id`
+column so per-tool-call tokens can be joined post-hoc with the agent's
+own usage logs. Two ways to attach the id:
+
+1. **Bootstrap from environment** — set `DAIMONOS_AGENT_SESSION_ID`
+   before launching daimonos. The MCP server reads it once at startup
+   and stamps every analytics row in that connection with that id.
+   Most useful when you control the launch (CI, benchmark harnesses,
+   `claude --session-id $SID`).
+2. **Mid-session via MCP tool** — call
+   `set_external_session_id({"id": "<sid>"})`. Subsequent rows pick up
+   the new id. Pass `""` to clear. Useful when the agent is launched
+   by an editor (Cursor, Claude Code Desktop) and the user can't set
+   environment variables on the daimonos subprocess.
+
+```bash
+# Bench-harness pattern: same UUID on both sides.
+SID=$(uuidgen)
+DAIMONOS_AGENT_SESSION_ID=$SID claude --session-id "$SID" \
+    --mcp-config .cursor/mcp.json --strict-mcp-config \
+    --tools "" "Refactor the login flow"
+
+# Later, query just this session's daimonos-side cost:
+daimonos --stats --session-id "$SID"
+```
+
 ### `[discord]` — Discord Integration Foundation
 
 These settings define bot-token auth, allowlists, and token-budget limits for
@@ -167,6 +229,7 @@ These are not part of the config file but affect daimonos behavior:
 |----------|-------------|
 | `DAIMONOS_IDLE_TIMEOUT_SECS` | Overrides `[mcp] idle_timeout_secs` when set to a parseable integer. `0` disables the idle watchdog. Used by tests. |
 | `DAIMONOS_LOG_STARTUP` | When non-empty and not `0` / `false` / `no`, enables MCP stderr startup diagnostics before config load (same family as `--verbose` / `[mcp] startup_logs`). |
+| `DAIMONOS_AGENT_SESSION_ID` | Optional agent-runtime session id (e.g. a UUID matching `claude --session-id`). When set, every analytics row recorded by this daimonos process is tagged with this id, and `daimonos --stats --session-id <id>` / `session_stats {external_session_id: <id>}` will filter to it. The `set_external_session_id` MCP tool can override this at runtime. |
 | `DISCORD_BOT_TOKEN` | Default Discord bot token variable when `[discord].bot_token_env_var` is unchanged. |
 | `PATH` | Daimonos inherits the launching process's `PATH` for exec/bg commands |
 

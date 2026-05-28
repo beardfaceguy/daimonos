@@ -12,6 +12,56 @@ pub fn estimate_tokens(chars: usize) -> u64 {
     (chars as f64 / 4.0).ceil() as u64
 }
 
+/// Read the `DAIMONOS_AGENT_SESSION_ID` environment variable if set to a
+/// non-empty value. Used at MCP/socket startup so agents (e.g.
+/// `claude --session-id $SID`) can pre-attach a runtime session
+/// identifier that gets recorded with every analytics row.
+pub fn read_agent_session_id_env() -> Option<String> {
+    std::env::var("DAIMONOS_AGENT_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Decoder for the row tuple shared between filtered and unfiltered
+/// `history_summary` queries.
+fn history_totals_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, u64, u64, i64, u64)> {
+    Ok((
+        row.get::<_, i64>(0)? as u64,
+        row.get::<_, i64>(1)? as u64,
+        row.get::<_, i64>(2)? as u64,
+        row.get::<_, i64>(3)?,
+        row.get::<_, i64>(4)? as u64,
+    ))
+}
+
+/// Build SQL for `history_summary_filtered`. Returns `(totals_sql,
+/// breakdown_sql)`. When an external session id is supplied both queries
+/// gain a second positional parameter (`?2`) for `external_session_id`.
+fn build_filtered_history_sql(external_session_id: Option<&str>) -> (String, String) {
+    let extra = if external_session_id.is_some() {
+        " AND external_session_id = ?2"
+    } else {
+        ""
+    };
+    let totals = format!(
+        "SELECT COALESCE(COUNT(*), 0),
+                COALESCE(SUM(request_tokens), 0),
+                COALESCE(SUM(response_tokens), 0),
+                COALESCE(SUM(saved_tokens), 0),
+                COALESCE(COUNT(DISTINCT session_id), 0)
+         FROM tool_calls WHERE timestamp >= ?1{extra}"
+    );
+    let breakdown = format!(
+        "SELECT tool_name, COUNT(*) as cnt,
+                SUM(saved_tokens) as saved,
+                AVG(savings_pct) as avg_pct
+         FROM tool_calls WHERE timestamp >= ?1{extra}
+         GROUP BY tool_name ORDER BY saved DESC LIMIT 10"
+    );
+    (totals, breakdown)
+}
+
 /// Anonymize a command string to first 3 words for privacy.
 fn anonymize_command(cmd: &str) -> String {
     cmd.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
@@ -30,6 +80,11 @@ pub struct ToolCallRecord {
     pub was_filtered: bool,
     pub read_dedup: bool,
     pub batch_size: u32,
+    /// Optional caller-supplied identifier for the agent-side runtime
+    /// session (e.g. `claude --session-id <uuid>`). Persisted alongside
+    /// each call so analytics can be correlated post-hoc with the
+    /// agent's own usage logs (vikunja #43).
+    pub external_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -108,12 +163,36 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     was_redirect INTEGER NOT NULL DEFAULT 0,
     was_filtered INTEGER NOT NULL DEFAULT 0,
     read_dedup INTEGER NOT NULL DEFAULT 0,
-    batch_size INTEGER NOT NULL DEFAULT 1
+    batch_size INTEGER NOT NULL DEFAULT 1,
+    external_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tc_timestamp ON tool_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tc_tool ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tc_session ON tool_calls(session_id);
 ";
+
+/// Idempotently bring an existing analytics DB up to the current schema.
+/// `CREATE TABLE IF NOT EXISTS` won't add columns to a pre-existing table,
+/// so columns added after the initial release ship as ALTER TABLEs here.
+/// Any "duplicate column name" error is treated as success (column already
+/// exists) — every other SQLite error is surfaced.
+fn migrate_schema(conn: &Connection) -> Result<(), String> {
+    let migrations = [
+        "ALTER TABLE tool_calls ADD COLUMN external_session_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_tc_external_session ON tool_calls(external_session_id)",
+    ];
+    for sql in migrations {
+        if let Err(e) = conn.execute_batch(sql) {
+            let msg = e.to_string();
+            // SQLite returns "duplicate column name: …" when the column
+            // is already present from a prior migration / fresh CREATE.
+            if !msg.contains("duplicate column name") {
+                return Err(format!("schema migration ({sql}): {msg}"));
+            }
+        }
+    }
+    Ok(())
+}
 
 impl AnalyticsStore {
     pub fn new(db_path: &Path, retention_days: u64) -> Result<Self, String> {
@@ -128,6 +207,8 @@ impl AnalyticsStore {
 
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| format!("schema migration: {e}"))?;
+
+        migrate_schema(&conn)?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -210,8 +291,9 @@ impl AnalyticsStore {
         let _ = db.execute(
             "INSERT INTO tool_calls (timestamp, session_id, tool_name, command,
              request_tokens, response_tokens, saved_tokens, savings_pct,
-             exec_time_ms, was_redirect, was_filtered, read_dedup, batch_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             exec_time_ms, was_redirect, was_filtered, read_dedup, batch_size,
+             external_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 now,
                 self.session_id,
@@ -226,6 +308,7 @@ impl AnalyticsStore {
                 rec.was_filtered as i32,
                 rec.read_dedup as i32,
                 rec.batch_size as i32,
+                rec.external_session_id.as_deref(),
             ],
         );
 
@@ -291,53 +374,52 @@ impl AnalyticsStore {
     }
 
     pub fn history_summary(&self, days: u64) -> Result<HistorySummary, String> {
+        self.history_summary_filtered(days, None)
+    }
+
+    /// Same as `history_summary` but optionally restricted to a single
+    /// agent-runtime session via `external_session_id`. Useful for
+    /// post-hoc correlation with claude/cursor session logs.
+    pub fn history_summary_filtered(
+        &self,
+        days: u64,
+        external_session_id: Option<&str>,
+    ) -> Result<HistorySummary, String> {
         let db = self.db_lock();
         let cutoff = Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
+        let (totals_sql, breakdown_sql) = build_filtered_history_sql(external_session_id);
+
         let (total_calls, total_req, total_resp, total_saved, sessions): (u64, u64, u64, i64, u64) =
-            db.query_row(
-                "SELECT COALESCE(COUNT(*), 0),
-                        COALESCE(SUM(request_tokens), 0),
-                        COALESCE(SUM(response_tokens), 0),
-                        COALESCE(SUM(saved_tokens), 0),
-                        COALESCE(COUNT(DISTINCT session_id), 0)
-                 FROM tool_calls WHERE timestamp >= ?1",
-                params![cutoff_str],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get::<_, i64>(2)? as u64,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)? as u64,
-                    ))
-                },
-            )
+            if let Some(ext) = external_session_id {
+                db.query_row(&totals_sql, params![cutoff_str, ext], history_totals_row)
+            } else {
+                db.query_row(&totals_sql, params![cutoff_str], history_totals_row)
+            }
             .map_err(|e| format!("history query: {e}"))?;
 
         let mut stmt = db
-            .prepare(
-                "SELECT tool_name, COUNT(*) as cnt,
-                        SUM(saved_tokens) as saved,
-                        AVG(savings_pct) as avg_pct
-                 FROM tool_calls WHERE timestamp >= ?1
-                 GROUP BY tool_name ORDER BY saved DESC LIMIT 10",
-            )
+            .prepare(&breakdown_sql)
             .map_err(|e| format!("tool breakdown: {e}"))?;
 
-        let top_tools = stmt
-            .query_map(params![cutoff_str], |row| {
-                Ok(ToolSavings {
-                    tool: row.get(0)?,
-                    calls: row.get::<_, i64>(1)? as u64,
-                    saved_tokens: row.get(2)?,
-                    avg_savings_pct: row.get(3)?,
-                })
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ToolSavings> {
+            Ok(ToolSavings {
+                tool: row.get(0)?,
+                calls: row.get::<_, i64>(1)? as u64,
+                saved_tokens: row.get(2)?,
+                avg_savings_pct: row.get(3)?,
             })
-            .map_err(|e| format!("tool map: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+        };
+
+        let top_tools: Vec<ToolSavings> = if let Some(ext) = external_session_id {
+            stmt.query_map(params![cutoff_str, ext], map_row)
+        } else {
+            stmt.query_map(params![cutoff_str], map_row)
+        }
+        .map_err(|e| format!("tool map: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
 
         Ok(HistorySummary {
             days,
@@ -351,31 +433,49 @@ impl AnalyticsStore {
     }
 
     pub fn daily_trend(&self, days: u64) -> Result<Vec<DailyStats>, String> {
+        self.daily_trend_filtered(days, None)
+    }
+
+    pub fn daily_trend_filtered(
+        &self,
+        days: u64,
+        external_session_id: Option<&str>,
+    ) -> Result<Vec<DailyStats>, String> {
         let db = self.db_lock();
         let cutoff = Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        let mut stmt = db
-            .prepare(
-                "SELECT DATE(timestamp) as day, COUNT(*),
-                        SUM(response_tokens), SUM(saved_tokens)
-                 FROM tool_calls WHERE timestamp >= ?1
-                 GROUP BY day ORDER BY day",
-            )
-            .map_err(|e| format!("daily trend: {e}"))?;
+        let sql = if external_session_id.is_some() {
+            "SELECT DATE(timestamp) as day, COUNT(*),
+                    SUM(response_tokens), SUM(saved_tokens)
+             FROM tool_calls WHERE timestamp >= ?1 AND external_session_id = ?2
+             GROUP BY day ORDER BY day"
+        } else {
+            "SELECT DATE(timestamp) as day, COUNT(*),
+                    SUM(response_tokens), SUM(saved_tokens)
+             FROM tool_calls WHERE timestamp >= ?1
+             GROUP BY day ORDER BY day"
+        };
 
-        let rows = stmt
-            .query_map(params![cutoff_str], |row| {
-                Ok(DailyStats {
-                    date: row.get(0)?,
-                    calls: row.get::<_, i64>(1)? as u64,
-                    response_tokens: row.get::<_, i64>(2)? as u64,
-                    saved_tokens: row.get(3)?,
-                })
+        let mut stmt = db.prepare(sql).map_err(|e| format!("daily trend: {e}"))?;
+
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DailyStats> {
+            Ok(DailyStats {
+                date: row.get(0)?,
+                calls: row.get::<_, i64>(1)? as u64,
+                response_tokens: row.get::<_, i64>(2)? as u64,
+                saved_tokens: row.get(3)?,
             })
-            .map_err(|e| format!("daily map: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+        };
+
+        let rows = if let Some(ext) = external_session_id {
+            stmt.query_map(params![cutoff_str, ext], map_row)
+        } else {
+            stmt.query_map(params![cutoff_str], map_row)
+        }
+        .map_err(|e| format!("daily map: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
 
         Ok(rows)
     }
@@ -385,29 +485,40 @@ impl AnalyticsStore {
         db.path().map(PathBuf::from)
     }
 
-    /// Format a CLI-friendly stats report.
-    pub fn format_stats_report(&self, days: u64) -> String {
+    /// Format a CLI-friendly stats report. Pass an `external_session_id`
+    /// to restrict the history/daily blocks to a single agent-runtime
+    /// session id; pass `None` for an unfiltered report. The
+    /// current-session block is hidden when filtering, since the
+    /// in-memory session stats aren't keyed by external session id —
+    /// use the filtered history block below instead.
+    pub fn format_stats_report_filtered(
+        &self,
+        days: u64,
+        external_session_id: Option<&str>,
+    ) -> String {
         let mut out = String::new();
 
-        // Session stats
-        let session = self.session_summary();
-        if session.total_calls > 0 {
-            out.push_str("=== Current Session ===\n");
-            out.push_str(&format!(
-                "  Calls: {}  Request tokens: {}  Response tokens: {}  Saved: {}\n",
-                session.total_calls,
-                session.total_request_tokens,
-                session.total_response_tokens,
-                session.total_saved_tokens
-            ));
-            out.push_str(&format!(
-                "  Redirects (L1): {}  Filters (L2): {}  Dedup hits: {}\n\n",
-                session.redirect_hits, session.filter_hits, session.dedup_hits
-            ));
+        if let Some(ext) = external_session_id {
+            out.push_str(&format!("=== Filter ===\n  external_session_id: {ext}\n\n"));
+        } else {
+            let session = self.session_summary();
+            if session.total_calls > 0 {
+                out.push_str("=== Current Session ===\n");
+                out.push_str(&format!(
+                    "  Calls: {}  Request tokens: {}  Response tokens: {}  Saved: {}\n",
+                    session.total_calls,
+                    session.total_request_tokens,
+                    session.total_response_tokens,
+                    session.total_saved_tokens
+                ));
+                out.push_str(&format!(
+                    "  Redirects (L1): {}  Filters (L2): {}  Dedup hits: {}\n\n",
+                    session.redirect_hits, session.filter_hits, session.dedup_hits
+                ));
+            }
         }
 
-        // History
-        if let Ok(history) = self.history_summary(days) {
+        if let Ok(history) = self.history_summary_filtered(days, external_session_id) {
             out.push_str(&format!("=== Last {days} Days ===\n"));
             out.push_str(&format!(
                 "  Sessions: {}  Total calls: {}  Tokens saved: {}\n",
@@ -425,8 +536,7 @@ impl AnalyticsStore {
             }
         }
 
-        // Daily trend
-        if let Ok(daily) = self.daily_trend(7) {
+        if let Ok(daily) = self.daily_trend_filtered(7, external_session_id) {
             if !daily.is_empty() {
                 out.push_str("\n  Last 7 days:\n");
                 for d in &daily {
@@ -467,6 +577,7 @@ mod tests {
             was_filtered: false,
             read_dedup: false,
             batch_size: 1,
+            external_session_id: None,
         }
     }
 
@@ -507,6 +618,7 @@ mod tests {
             was_filtered: false,
             read_dedup: false,
             batch_size: 1,
+            external_session_id: None,
         });
 
         let stats = store.session_summary();
@@ -676,7 +788,7 @@ mod tests {
         let (_dir, store) = test_store();
         store.record(&sample_record("read_file"));
 
-        let report = store.format_stats_report(30);
+        let report = store.format_stats_report_filtered(30, None);
         assert!(report.contains("Current Session"));
         assert!(report.contains("Calls: 1"));
     }
@@ -794,5 +906,203 @@ mod tests {
 
         // Cleanup so the test doesn't leak the bumped counter.
         store.pending_writes.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    // --- external_session_id correlation (vikunja #43) ---
+    //
+    // Threads an agent-runtime session id through every analytics row and
+    // exposes it as a query filter so post-hoc correlation with
+    // claude/cursor session logs is a single SQL `WHERE` clause.
+
+    fn record_with_external(tool: &str, ext: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            external_session_id: ext.map(String::from),
+            ..sample_record(tool)
+        }
+    }
+
+    #[test]
+    fn record_persists_external_session_id_column() {
+        let (_dir, store) = test_store();
+        store.record(&record_with_external("read_file", Some("agent-sid-A")));
+        store.record(&record_with_external("write_file", None));
+
+        let db = store.db_lock();
+        let rows: Vec<(String, Option<String>)> = db
+            .prepare("SELECT tool_name, external_session_id FROM tool_calls ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "read_file");
+        assert_eq!(rows[0].1.as_deref(), Some("agent-sid-A"));
+        assert_eq!(rows[1].0, "write_file");
+        assert_eq!(rows[1].1, None);
+    }
+
+    #[test]
+    fn history_summary_filtered_isolates_one_external_session() {
+        let (_dir, store) = test_store();
+        for _ in 0..3 {
+            store.record(&record_with_external("read_file", Some("sid-A")));
+        }
+        for _ in 0..5 {
+            store.record(&record_with_external("read_file", Some("sid-B")));
+        }
+        store.record(&record_with_external("read_file", None));
+
+        let unfiltered = store.history_summary(30).unwrap();
+        assert_eq!(unfiltered.total_calls, 9);
+
+        let only_a = store.history_summary_filtered(30, Some("sid-A")).unwrap();
+        assert_eq!(only_a.total_calls, 3);
+
+        let only_b = store.history_summary_filtered(30, Some("sid-B")).unwrap();
+        assert_eq!(only_b.total_calls, 5);
+
+        let nonexistent = store
+            .history_summary_filtered(30, Some("does-not-exist"))
+            .unwrap();
+        assert_eq!(nonexistent.total_calls, 0);
+    }
+
+    #[test]
+    fn daily_trend_filtered_isolates_one_external_session() {
+        let (_dir, store) = test_store();
+        store.record(&record_with_external("read_file", Some("sid-A")));
+        store.record(&record_with_external("read_file", Some("sid-A")));
+        store.record(&record_with_external("read_file", Some("sid-B")));
+
+        let only_a = store.daily_trend_filtered(7, Some("sid-A")).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].calls, 2);
+
+        let only_b = store.daily_trend_filtered(7, Some("sid-B")).unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].calls, 1);
+    }
+
+    #[test]
+    fn format_stats_report_filtered_includes_filter_banner() {
+        let (_dir, store) = test_store();
+        store.record(&record_with_external("read_file", Some("sid-A")));
+        store.record(&record_with_external("read_file", Some("sid-B")));
+
+        let filtered = store.format_stats_report_filtered(30, Some("sid-A"));
+        assert!(filtered.contains("external_session_id: sid-A"));
+        // Filtered reports skip the in-memory "Current Session" block,
+        // since session stats aren't keyed by external session id.
+        assert!(!filtered.contains("Current Session"));
+
+        let unfiltered = store.format_stats_report_filtered(30, None);
+        assert!(unfiltered.contains("Current Session"));
+        assert!(!unfiltered.contains("external_session_id:"));
+    }
+
+    /// Schema migration must be idempotent: a DB created with the current
+    /// `SCHEMA_SQL` will still have `migrate_schema` run on every open,
+    /// and the duplicate `ADD COLUMN` must not fail. (Older DBs created
+    /// before the column existed get the column added on first open.)
+    #[test]
+    fn schema_migration_idempotent_on_fresh_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("idempotent.db");
+
+        // Open once — runs SCHEMA_SQL (which already has the column) plus
+        // migrate_schema (which tries to ADD COLUMN again and must
+        // tolerate the "duplicate column" error).
+        let _store = AnalyticsStore::new(&db_path, 90).unwrap();
+        // Re-open — confirms the migration is safe to run a second time
+        // against an already-current DB.
+        let _store = AnalyticsStore::new(&db_path, 90).unwrap();
+    }
+
+    /// Older DBs (pre-vikunja-#43) won't have the column. Simulate by
+    /// creating a table with the historical schema and confirm
+    /// `AnalyticsStore::new` brings it forward without data loss.
+    #[test]
+    fn schema_migration_adds_column_to_legacy_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tool_calls (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    command TEXT,
+                    request_tokens INTEGER NOT NULL,
+                    response_tokens INTEGER NOT NULL,
+                    saved_tokens INTEGER NOT NULL,
+                    savings_pct REAL NOT NULL,
+                    exec_time_ms INTEGER NOT NULL,
+                    was_redirect INTEGER NOT NULL DEFAULT 0,
+                    was_filtered INTEGER NOT NULL DEFAULT 0,
+                    read_dedup INTEGER NOT NULL DEFAULT 0,
+                    batch_size INTEGER NOT NULL DEFAULT 1
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tool_calls (timestamp, session_id, tool_name,
+                 request_tokens, response_tokens, saved_tokens, savings_pct,
+                 exec_time_ms)
+                 VALUES ('2024-01-01T00:00:00Z', 'old', 'read_file', 10, 5, 0, 0.0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = AnalyticsStore::new(&db_path, 90).unwrap();
+        store.record(&record_with_external("write_file", Some("sid-new")));
+
+        let history = store.history_summary(36500).unwrap();
+        assert!(
+            history.total_calls >= 2,
+            "legacy row + new row must coexist after migration"
+        );
+
+        let only_new = store
+            .history_summary_filtered(36500, Some("sid-new"))
+            .unwrap();
+        assert_eq!(only_new.total_calls, 1);
+    }
+
+    #[test]
+    fn read_agent_session_id_env_returns_none_for_empty() {
+        // Use a uniquely named test var so we don't fight the global
+        // env namespace with concurrent tests. We're not exercising the
+        // real `DAIMONOS_AGENT_SESSION_ID` here — that's covered by the
+        // pytest layer where each subprocess has an isolated environment.
+        // This unit test just pins the empty/whitespace handling.
+        std::env::remove_var("DAIMONOS_AGENT_SESSION_ID");
+        assert!(read_agent_session_id_env().is_none());
+
+        std::env::set_var("DAIMONOS_AGENT_SESSION_ID", "");
+        assert!(
+            read_agent_session_id_env().is_none(),
+            "empty string must be treated as unset"
+        );
+
+        std::env::set_var("DAIMONOS_AGENT_SESSION_ID", "   ");
+        assert!(
+            read_agent_session_id_env().is_none(),
+            "whitespace-only must be treated as unset"
+        );
+
+        std::env::set_var("DAIMONOS_AGENT_SESSION_ID", "  abc-123  ");
+        assert_eq!(
+            read_agent_session_id_env().as_deref(),
+            Some("abc-123"),
+            "value must be trimmed"
+        );
+
+        std::env::remove_var("DAIMONOS_AGENT_SESSION_ID");
     }
 }
