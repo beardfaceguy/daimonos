@@ -121,6 +121,7 @@ Pick the setup guide for your AI tool:
 - [Cline](cline-setup.md) (VS Code extension)
 - [Gemini CLI](gemini-cli-setup.md)
 - [Zed Editor](zed-setup.md)
+- [Discord integration](discord-setup.md) (bot token, allowlists, read-only tools)
 - [Other tools](other-tools-setup.md) (Claude Desktop, ChatGPT, Continue.dev, BoltAI, etc.)
 
 For tuning behavior: [Configuration reference](configuration.md)

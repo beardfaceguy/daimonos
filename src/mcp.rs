@@ -121,6 +121,17 @@ async fn dispatch_tool(
 
         let command = match name {
             "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
+            "discord" => {
+                let base = tools::get_str(args, "command");
+                let tag = tools::get_str(args, "analytics_tag");
+                match (base, tag) {
+                    (Some(cmd), Some(t)) if !t.trim().is_empty() => {
+                        Some(format!("{cmd}:{}", t.trim()))
+                    }
+                    (Some(cmd), _) => Some(cmd),
+                    _ => None,
+                }
+            }
             _ => None,
         };
 
@@ -302,10 +313,7 @@ async fn dispatch_tool_inner(
                 });
                 if let Some(p) = a.db_path() {
                     if let Some(obj) = j.as_object_mut() {
-                        obj.insert(
-                            "db_path".to_string(),
-                            json!(p.to_string_lossy()),
-                        );
+                        obj.insert("db_path".to_string(), json!(p.to_string_lossy()));
                     }
                 }
                 j
@@ -489,6 +497,39 @@ async fn dispatch_tool_inner(
                     ok_text(text)
                 }
                 Err(e) => err_text(format!("docker {command}: {e}")),
+            }
+        }
+
+        "discord" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("discord requires 'command' argument".into()),
+            };
+
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("discord", &command, &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("discord {command}: {e}")),
             }
         }
 
@@ -985,6 +1026,7 @@ mod tests {
         assert!(names.contains(&"list_all_tools"));
         assert!(names.contains(&"get_tool_schema"));
         assert!(names.contains(&"git"));
+        assert!(names.contains(&"discord"));
         assert!(names.contains(&"docker"));
         assert!(names.contains(&"snapshot"));
     }

@@ -370,6 +370,26 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "discord",
+            tier: ToolTier::Terse,
+            description: "Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["list_guilds", "list_channels", "read_messages", "search_messages"]},
+                    "guild_id": {"type": "string", "description": "list_channels: allowlisted guild id"},
+                    "channel_id": {"type": "string", "description": "read_messages: allowlisted channel id"},
+                    "query": {"type": "string", "description": "search_messages: case-insensitive substring query"},
+                    "limit": {"type": "integer", "description": "read_messages/search_messages: max messages to fetch (clamped by config)"},
+                    "analytics_tag": {"type": "string", "description": "Optional analytics tag suffix for session_stats attribution"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None,
+            context_check: None,
+        },
+
+        ToolDef {
             name: "snapshot",
             tier: ToolTier::Terse,
             description: "Workspace snapshots. Actions: create (returns id), restore (rolls back), list, delete.",
@@ -630,6 +650,7 @@ mod tests {
         assert!(names.contains(&"get_tool_schema"));
         assert!(names.contains(&"execute_script"));
         assert!(names.contains(&"git"));
+        assert!(names.contains(&"discord"));
         assert!(names.contains(&"snapshot"));
     }
 
@@ -644,16 +665,32 @@ mod tests {
     #[test]
     fn all_tools_have_descriptions() {
         for tool in all_tools() {
-            assert!(!tool.description.is_empty(), "tool '{}' has no description", tool.name);
+            assert!(
+                !tool.description.is_empty(),
+                "tool '{}' has no description",
+                tool.name
+            );
         }
     }
 
     #[test]
     fn tier_classification() {
         let tools = all_tools();
-        let full: Vec<&str> = tools.iter().filter(|t| t.tier == ToolTier::Full).map(|t| t.name).collect();
-        let terse: Vec<&str> = tools.iter().filter(|t| t.tier == ToolTier::Terse).map(|t| t.name).collect();
-        let on_demand: Vec<&str> = tools.iter().filter(|t| t.tier == ToolTier::OnDemand).map(|t| t.name).collect();
+        let full: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.tier == ToolTier::Full)
+            .map(|t| t.name)
+            .collect();
+        let terse: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.tier == ToolTier::Terse)
+            .map(|t| t.name)
+            .collect();
+        let on_demand: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.tier == ToolTier::OnDemand)
+            .map(|t| t.name)
+            .collect();
 
         assert!(full.contains(&"read_file"));
         assert!(full.contains(&"exec"));

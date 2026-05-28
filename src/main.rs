@@ -117,6 +117,13 @@ async fn main() -> anyhow::Result<()> {
         &workspace,
         quiet_cfg_stderr,
     ));
+    if let Err(e) = cfg.validate() {
+        eprintln!(
+            "config: validation error: {}",
+            cfg.discord.redact_sensitive(&e)
+        );
+        std::process::exit(2);
+    }
     let startup_logs = startup_logs_early || cfg.mcp.startup_logs;
     // When MCP runs without startup diagnostics, avoid benign stderr lines —
     // Cursor surfaces subprocess stderr as `[error]` even for informational text.
@@ -168,6 +175,15 @@ async fn main() -> anyhow::Result<()> {
         if !mcp_quiet_stderr {
             eprintln!("auto-registered gh tool plugin");
         }
+    }
+
+    tool_reg
+        .register(Arc::new(plugins::discord::DiscordPlugin::new(
+            cfg.discord.clone(),
+        )))
+        .await;
+    if !mcp_quiet_stderr {
+        eprintln!("auto-registered discord tool plugin");
     }
 
     let pcache = Arc::new(pipeline_cache::PipelineCache::with_config(

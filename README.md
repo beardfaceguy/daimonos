@@ -173,6 +173,7 @@ close it. No daemon to manage, no background service.
 - [Cline](docs/cline-setup.md) (VS Code extension)
 - [Gemini CLI](docs/gemini-cli-setup.md)
 - [Zed Editor](docs/zed-setup.md)
+- [Discord integration](docs/discord-setup.md) (bot token, allowlists, read-only tools)
 - [Other tools](docs/other-tools-setup.md) (Claude Desktop, ChatGPT, Continue.dev, BoltAI, etc.)
 
 ## What's included

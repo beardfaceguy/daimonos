@@ -15,6 +15,7 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
+    pub discord: DiscordConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -111,11 +112,56 @@ pub struct McpConfig {
     pub startup_logs: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct DiscordConfig {
+    /// Enables Discord integration features. When false, Discord settings are ignored.
+    pub enabled: bool,
+    /// Environment variable name that contains the Discord bot token.
+    pub bot_token_env_var: String,
+    /// Base URL for the Discord REST API.
+    pub api_base_url: String,
+    /// Allowed guild IDs. Empty means deny by default until explicitly configured.
+    pub allow_guild_ids: Vec<String>,
+    /// Allowed channel IDs. Empty means deny by default until explicitly configured.
+    pub allow_channel_ids: Vec<String>,
+    /// Hard cap for read/search message count per call.
+    pub max_messages_per_call: usize,
+    /// Max UTF-8 chars per message body retained in responses.
+    pub max_message_chars: usize,
+    /// Max UTF-8 chars for total serialized response payload.
+    pub max_response_chars: usize,
+    /// Keep write actions disabled by default.
+    pub read_only_default: bool,
+    /// Max retry attempts on Discord API 429 responses.
+    pub rate_limit_max_retries: usize,
+    /// Hard cap for per-retry sleep duration in milliseconds.
+    pub rate_limit_max_sleep_ms: u64,
+}
+
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 600,
             startup_logs: false,
+        }
+    }
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_env_var: "DISCORD_BOT_TOKEN".to_string(),
+            api_base_url: "https://discord.com/api/v10".to_string(),
+            allow_guild_ids: Vec::new(),
+            allow_channel_ids: Vec::new(),
+            max_messages_per_call: 100,
+            max_message_chars: 4_000,
+            max_response_chars: 32_000,
+            read_only_default: true,
+            rate_limit_max_retries: 2,
+            rate_limit_max_sleep_ms: 10_000,
         }
     }
 }
@@ -225,6 +271,117 @@ impl IndexConfig {
     }
 }
 
+impl Config {
+    pub fn validate(&self) -> Result<(), String> {
+        self.discord.validate()
+    }
+}
+
+impl DiscordConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_valid_env_var_name(&self.bot_token_env_var) {
+            return Err(format!(
+                "discord.bot_token_env_var must be a valid env var name, got '{}'",
+                self.bot_token_env_var
+            ));
+        }
+        if !(self.api_base_url.starts_with("http://") || self.api_base_url.starts_with("https://"))
+        {
+            return Err(format!(
+                "discord.api_base_url must start with http:// or https://, got '{}'",
+                self.api_base_url
+            ));
+        }
+
+        if self.max_messages_per_call == 0 {
+            return Err("discord.max_messages_per_call must be > 0".to_string());
+        }
+        if self.max_message_chars == 0 {
+            return Err("discord.max_message_chars must be > 0".to_string());
+        }
+        if self.max_response_chars == 0 {
+            return Err("discord.max_response_chars must be > 0".to_string());
+        }
+        if self.rate_limit_max_sleep_ms == 0 {
+            return Err("discord.rate_limit_max_sleep_ms must be > 0".to_string());
+        }
+
+        for guild in &self.allow_guild_ids {
+            if !is_valid_discord_snowflake(guild) {
+                return Err(format!(
+                    "discord.allow_guild_ids has invalid snowflake id '{}'",
+                    guild
+                ));
+            }
+        }
+        for channel in &self.allow_channel_ids {
+            if !is_valid_discord_snowflake(channel) {
+                return Err(format!(
+                    "discord.allow_channel_ids has invalid snowflake id '{}'",
+                    channel
+                ));
+            }
+        }
+
+        if self.enabled {
+            self.resolve_bot_token().map(|_| ())?;
+        }
+        Ok(())
+    }
+
+    pub fn resolve_bot_token(&self) -> Result<String, String> {
+        let raw = std::env::var(&self.bot_token_env_var).map_err(|_| {
+            format!(
+                "discord.enabled=true but env var '{}' is not set",
+                self.bot_token_env_var
+            )
+        })?;
+        if raw.trim().is_empty() {
+            return Err(format!(
+                "discord.enabled=true but env var '{}' is empty",
+                self.bot_token_env_var
+            ));
+        }
+        Ok(raw)
+    }
+
+    pub fn is_guild_allowed(&self, guild_id: &str) -> bool {
+        self.allow_guild_ids.iter().any(|id| id == guild_id)
+    }
+
+    pub fn is_channel_allowed(&self, channel_id: &str) -> bool {
+        self.allow_channel_ids.iter().any(|id| id == channel_id)
+    }
+
+    pub fn redact_sensitive(&self, text: &str) -> String {
+        match std::env::var(&self.bot_token_env_var) {
+            Ok(token) => redact_secret(text, &token),
+            Err(_) => text.to_string(),
+        }
+    }
+}
+
+fn is_valid_discord_snowflake(value: &str) -> bool {
+    let len = value.len();
+    (17..=20).contains(&len) && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+pub fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    text.replace(secret, "[REDACTED]")
+}
+
 fn default_skip_extensions() -> Vec<String> {
     [
         "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg", "mp3", "mp4", "avi", "mov",
@@ -300,6 +457,9 @@ mod tests {
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
+        assert!(!cfg.discord.enabled);
+        assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
+        assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
         assert!(!cfg.mcp.startup_logs);
         assert!(cfg.tools.is_empty());
     }
@@ -379,6 +539,87 @@ source_pattern = "*.rs"
         assert!(cfg.tools.contains_key("mytest"));
         assert_eq!(cfg.tools["mytest"].bin, "/usr/bin/test");
         assert_eq!(cfg.tools["mytest"].source_pattern.as_deref(), Some("*.rs"));
+    }
+
+    #[test]
+    fn parse_toml_with_discord_config() {
+        let toml_str = r#"
+[discord]
+enabled = true
+bot_token_env_var = "MY_DISCORD_TOKEN"
+api_base_url = "https://discord.com/api/v10"
+allow_guild_ids = ["123456789012345678"]
+allow_channel_ids = ["223456789012345678"]
+max_messages_per_call = 50
+max_message_chars = 2000
+max_response_chars = 16000
+read_only_default = true
+rate_limit_max_retries = 3
+rate_limit_max_sleep_ms = 5000
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.discord.enabled);
+        assert_eq!(cfg.discord.bot_token_env_var, "MY_DISCORD_TOKEN");
+        assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
+        assert!(cfg.discord.is_guild_allowed("123456789012345678"));
+        assert!(cfg.discord.is_channel_allowed("223456789012345678"));
+        assert_eq!(cfg.discord.max_messages_per_call, 50);
+        assert_eq!(cfg.discord.rate_limit_max_retries, 3);
+        assert_eq!(cfg.discord.rate_limit_max_sleep_ms, 5000);
+    }
+
+    #[test]
+    fn discord_validation_requires_token_when_enabled() {
+        let mut cfg = Config::default();
+        cfg.discord.enabled = true;
+        cfg.discord.bot_token_env_var = "DAIMONOS_TEST_DISCORD_TOKEN_MISSING".to_string();
+        std::env::remove_var(&cfg.discord.bot_token_env_var);
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("DAIMONOS_TEST_DISCORD_TOKEN_MISSING"));
+    }
+
+    #[test]
+    fn discord_validation_rejects_invalid_allowlist_ids() {
+        let mut cfg = Config::default();
+        cfg.discord.enabled = false;
+        cfg.discord.allow_channel_ids = vec!["not-a-snowflake".to_string()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("discord.allow_channel_ids"));
+    }
+
+    #[test]
+    fn discord_validation_rejects_invalid_api_base_url() {
+        let mut cfg = Config::default();
+        cfg.discord.api_base_url = "discord.local/api".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("discord.api_base_url"));
+    }
+
+    #[test]
+    fn discord_validation_rejects_zero_rate_limit_sleep_cap() {
+        let mut cfg = Config::default();
+        cfg.discord.rate_limit_max_sleep_ms = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("discord.rate_limit_max_sleep_ms"));
+    }
+
+    #[test]
+    fn redact_secret_hides_token_value() {
+        let redacted = redact_secret("token=abc123", "abc123");
+        assert_eq!(redacted, "token=[REDACTED]");
+    }
+
+    #[test]
+    fn discord_redact_sensitive_hides_env_token() {
+        let cfg = Config::default();
+        std::env::set_var(&cfg.discord.bot_token_env_var, "discord-super-secret");
+        let redacted = cfg
+            .discord
+            .redact_sensitive("auth failed: discord-super-secret");
+        std::env::remove_var(&cfg.discord.bot_token_env_var);
+        assert!(!redacted.contains("discord-super-secret"));
+        assert!(redacted.contains("[REDACTED]"));
     }
 }
 

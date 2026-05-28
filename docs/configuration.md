@@ -111,6 +111,41 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `[discord]` — Discord Integration Foundation
+
+These settings define bot-token auth, allowlists, and token-budget limits for
+Discord integration. Phase 1 defaults are conservative: integration disabled,
+deny-by-default allowlists, and read-only behavior.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enables Discord integration behavior and startup validation |
+| `bot_token_env_var` | `"DISCORD_BOT_TOKEN"` | Env var name used to load the bot token |
+| `api_base_url` | `"https://discord.com/api/v10"` | Discord REST API base URL |
+| `allow_guild_ids` | `[]` | Explicitly allowed guild IDs (Discord snowflakes) |
+| `allow_channel_ids` | `[]` | Explicitly allowed channel IDs (Discord snowflakes) |
+| `max_messages_per_call` | `100` | Max messages returned by a single read/search call |
+| `max_message_chars` | `4000` | Per-message text truncation cap |
+| `max_response_chars` | `32000` | Total response payload cap for Discord tool output |
+| `read_only_default` | `true` | Keeps write-style actions disabled by default |
+| `rate_limit_max_retries` | `2` | Max retry attempts when Discord responds with HTTP 429 |
+| `rate_limit_max_sleep_ms` | `10000` | Max per-retry sleep duration (ms) when honoring retry hints |
+
+```toml
+[discord]
+enabled = false
+bot_token_env_var = "DISCORD_BOT_TOKEN"
+api_base_url = "https://discord.com/api/v10"
+allow_guild_ids = []
+allow_channel_ids = []
+max_messages_per_call = 100
+max_message_chars = 4_000
+max_response_chars = 32_000
+read_only_default = true
+rate_limit_max_retries = 2
+rate_limit_max_sleep_ms = 10_000
+```
+
 ### `[tools.<id>]` — Tool Plugins (Advanced)
 
 Register external tools for the tool runner system. Most users don't need
@@ -132,6 +167,7 @@ These are not part of the config file but affect daimonos behavior:
 |----------|-------------|
 | `DAIMONOS_IDLE_TIMEOUT_SECS` | Overrides `[mcp] idle_timeout_secs` when set to a parseable integer. `0` disables the idle watchdog. Used by tests. |
 | `DAIMONOS_LOG_STARTUP` | When non-empty and not `0` / `false` / `no`, enables MCP stderr startup diagnostics before config load (same family as `--verbose` / `[mcp] startup_logs`). |
+| `DISCORD_BOT_TOKEN` | Default Discord bot token variable when `[discord].bot_token_env_var` is unchanged. |
 | `PATH` | Daimonos inherits the launching process's `PATH` for exec/bg commands |
 
 ## Performance Tuning Tips

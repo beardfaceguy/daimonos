@@ -252,7 +252,6 @@ fn run_starlark(
     })
 }
 
-
 /// Convert a Starlark value to serde_json::Value.
 fn starlark_to_json<'v>(val: StarlarkValue<'v>, heap: &'v Heap) -> Value {
     if val.is_none() {
@@ -425,7 +424,9 @@ fn run_registry_tool(
     args_val: &Value,
 ) -> Result<Response, anyhow::Error> {
     let started = std::time::Instant::now();
-    let request_chars = serde_json::to_string(args_val).map(|s| s.len()).unwrap_or(0);
+    let request_chars = serde_json::to_string(args_val)
+        .map(|s| s.len())
+        .unwrap_or(0);
 
     let resp = ctx.handle.block_on(async {
         let s = ctx.session.lock().await;
@@ -500,7 +501,10 @@ fn json_to_starlark_dict<'v>(val: &Value, heap: &'v Heap) -> anyhow::Result<Dict
     }
 }
 
-fn response_to_starlark_val<'v>(resp: Response, heap: &'v Heap) -> anyhow::Result<StarlarkValue<'v>> {
+fn response_to_starlark_val<'v>(
+    resp: Response,
+    heap: &'v Heap,
+) -> anyhow::Result<StarlarkValue<'v>> {
     if !resp.ok {
         let msg = resp.m.unwrap_or_else(|| "unknown error".into());
         return Err(anyhow::anyhow!("{}", msg));
@@ -583,11 +587,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         response_to_starlark_dict(resp, heap)
     }
 
-    fn write_file<'v>(
-        path: &str,
-        content: &str,
-        heap: &'v Heap,
-    ) -> anyhow::Result<Dict<'v>> {
+    fn write_file<'v>(path: &str, content: &str, heap: &'v Heap) -> anyhow::Result<Dict<'v>> {
         let args = serde_json::json!({"path": path, "content": content});
         let resp = dispatch_tool_by_name("write_file", &args)?;
         response_to_starlark_dict(resp, heap)
@@ -626,7 +626,11 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
         let a: Option<Vec<String>> = args.and_then(|a| {
-            if a.items.is_empty() { None } else { Some(a.items) }
+            if a.items.is_empty() {
+                None
+            } else {
+                Some(a.items)
+            }
         });
         let tool_args = serde_json::json!({"command": command, "args": a, "cwd": cwd});
         let resp = dispatch_tool_by_name("exec", &tool_args)?;
@@ -669,14 +673,30 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         with_ctx(|ctx| {
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
-            if let Some(v) = limit { args_val["limit"] = serde_json::json!(v); }
-            if let Some(v) = oneline { args_val["oneline"] = serde_json::json!(v); }
-            if let Some(v) = path { args_val["path"] = serde_json::json!(v); }
-            if let Some(v) = message { args_val["message"] = serde_json::json!(v); }
-            if let Some(v) = all { args_val["all"] = serde_json::json!(v); }
-            if let Some(v) = branch { args_val["branch"] = serde_json::json!(v); }
-            if let Some(v) = create { args_val["create"] = serde_json::json!(v); }
-            if let Some(v) = mode { args_val["mode"] = serde_json::json!(v); }
+            if let Some(v) = limit {
+                args_val["limit"] = serde_json::json!(v);
+            }
+            if let Some(v) = oneline {
+                args_val["oneline"] = serde_json::json!(v);
+            }
+            if let Some(v) = path {
+                args_val["path"] = serde_json::json!(v);
+            }
+            if let Some(v) = message {
+                args_val["message"] = serde_json::json!(v);
+            }
+            if let Some(v) = all {
+                args_val["all"] = serde_json::json!(v);
+            }
+            if let Some(v) = branch {
+                args_val["branch"] = serde_json::json!(v);
+            }
+            if let Some(v) = create {
+                args_val["create"] = serde_json::json!(v);
+            }
+            if let Some(v) = mode {
+                args_val["mode"] = serde_json::json!(v);
+            }
             let resp = run_registry_tool(ctx, "git", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
@@ -699,16 +719,36 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         with_ctx(|ctx| {
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
-            if let Some(v) = number { args_val["number"] = serde_json::json!(v); }
-            if let Some(v) = state { args_val["state"] = serde_json::json!(v); }
-            if let Some(v) = limit { args_val["limit"] = serde_json::json!(v); }
-            if let Some(v) = author { args_val["author"] = serde_json::json!(v); }
-            if let Some(v) = title { args_val["title"] = serde_json::json!(v); }
-            if let Some(v) = body { args_val["body"] = serde_json::json!(v); }
-            if let Some(v) = base { args_val["base"] = serde_json::json!(v); }
-            if let Some(v) = draft { args_val["draft"] = serde_json::json!(v); }
-            if let Some(v) = endpoint { args_val["endpoint"] = serde_json::json!(v); }
-            if let Some(v) = method { args_val["method"] = serde_json::json!(v); }
+            if let Some(v) = number {
+                args_val["number"] = serde_json::json!(v);
+            }
+            if let Some(v) = state {
+                args_val["state"] = serde_json::json!(v);
+            }
+            if let Some(v) = limit {
+                args_val["limit"] = serde_json::json!(v);
+            }
+            if let Some(v) = author {
+                args_val["author"] = serde_json::json!(v);
+            }
+            if let Some(v) = title {
+                args_val["title"] = serde_json::json!(v);
+            }
+            if let Some(v) = body {
+                args_val["body"] = serde_json::json!(v);
+            }
+            if let Some(v) = base {
+                args_val["base"] = serde_json::json!(v);
+            }
+            if let Some(v) = draft {
+                args_val["draft"] = serde_json::json!(v);
+            }
+            if let Some(v) = endpoint {
+                args_val["endpoint"] = serde_json::json!(v);
+            }
+            if let Some(v) = method {
+                args_val["method"] = serde_json::json!(v);
+            }
             let resp = run_registry_tool(ctx, "gh", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
@@ -726,11 +766,21 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         with_ctx(|ctx| {
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
-            if let Some(v) = package { args_val["package"] = serde_json::json!(v); }
-            if let Some(v) = filter { args_val["filter"] = serde_json::json!(v); }
-            if let Some(v) = lib { args_val["lib"] = serde_json::json!(v); }
-            if let Some(v) = release { args_val["release"] = serde_json::json!(v); }
-            if let Some(v) = dev { args_val["dev"] = serde_json::json!(v); }
+            if let Some(v) = package {
+                args_val["package"] = serde_json::json!(v);
+            }
+            if let Some(v) = filter {
+                args_val["filter"] = serde_json::json!(v);
+            }
+            if let Some(v) = lib {
+                args_val["lib"] = serde_json::json!(v);
+            }
+            if let Some(v) = release {
+                args_val["release"] = serde_json::json!(v);
+            }
+            if let Some(v) = dev {
+                args_val["dev"] = serde_json::json!(v);
+            }
             let resp = run_registry_tool(ctx, "cargo", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
@@ -746,23 +796,25 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
             let scope = scope.to_string();
             let resp = ctx.handle.block_on(async {
                 let s = session.lock().await;
-                let analytics = s.analytics.as_ref()
+                let analytics = s
+                    .analytics
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("analytics not enabled"))?;
                 match scope.as_str() {
                     "session" => {
                         let stats = analytics.session_summary();
-                        Ok(Response::ok(serde_json::to_value(&stats).unwrap_or_default()))
+                        Ok(Response::ok(
+                            serde_json::to_value(&stats).unwrap_or_default(),
+                        ))
                     }
-                    "history" => {
-                        analytics.history_summary(days.unwrap_or(30) as u64)
-                            .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
-                            .map_err(|e| anyhow::anyhow!("{e}"))
-                    }
-                    "daily" => {
-                        analytics.daily_trend(days.unwrap_or(30) as u64)
-                            .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
-                            .map_err(|e| anyhow::anyhow!("{e}"))
-                    }
+                    "history" => analytics
+                        .history_summary(days.unwrap_or(30) as u64)
+                        .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                    "daily" => analytics
+                        .daily_trend(days.unwrap_or(30) as u64)
+                        .map(|s| Response::ok(serde_json::to_value(&s).unwrap_or_default()))
+                        .map_err(|e| anyhow::anyhow!("{e}")),
                     _ => Err(anyhow::anyhow!("unknown scope: {scope}")),
                 }
             })?;
@@ -781,11 +833,51 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         with_ctx(|ctx| {
             let cmd = command.to_string();
             let mut args_val = serde_json::json!({"command": cmd});
-            if let Some(v) = container { args_val["container"] = serde_json::json!(v); }
-            if let Some(v) = tail { args_val["tail"] = serde_json::json!(v); }
-            if let Some(v) = file { args_val["file"] = serde_json::json!(v); }
-            if let Some(v) = detach { args_val["detach"] = serde_json::json!(v); }
+            if let Some(v) = container {
+                args_val["container"] = serde_json::json!(v);
+            }
+            if let Some(v) = tail {
+                args_val["tail"] = serde_json::json!(v);
+            }
+            if let Some(v) = file {
+                args_val["file"] = serde_json::json!(v);
+            }
+            if let Some(v) = detach {
+                args_val["detach"] = serde_json::json!(v);
+            }
             let resp = run_registry_tool(ctx, "docker", &cmd, &args_val)?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
+    fn discord<'v>(
+        command: &str,
+        #[starlark(require = named)] guild_id: Option<&str>,
+        #[starlark(require = named)] channel_id: Option<&str>,
+        #[starlark(require = named)] query: Option<&str>,
+        #[starlark(require = named)] limit: Option<i64>,
+        #[starlark(require = named)] analytics_tag: Option<&str>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = guild_id {
+                args_val["guild_id"] = serde_json::json!(v);
+            }
+            if let Some(v) = channel_id {
+                args_val["channel_id"] = serde_json::json!(v);
+            }
+            if let Some(v) = query {
+                args_val["query"] = serde_json::json!(v);
+            }
+            if let Some(v) = limit {
+                args_val["limit"] = serde_json::json!(v);
+            }
+            if let Some(v) = analytics_tag {
+                args_val["analytics_tag"] = serde_json::json!(v);
+            }
+            let resp = run_registry_tool(ctx, "discord", &cmd, &args_val)?;
             response_to_starlark_dict(resp, heap)
         })
     }
@@ -805,6 +897,7 @@ pub fn tool_signatures() -> String {
         "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
         "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
         "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
+        "def discord(command: str, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
         "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
     ];
@@ -829,7 +922,9 @@ mod tests {
     #[tokio::test]
     async fn execute_simple_expression() {
         let session = test_session();
-        let result = execute("result = 1 + 2", session, Duration::from_secs(5)).await.unwrap();
+        let result = execute("result = 1 + 2", session, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!(3));
     }
 
@@ -837,14 +932,18 @@ mod tests {
     async fn execute_string_result() {
         let session = test_session();
         let code = r#"result = "hello" + " world""#;
-        let result = execute(code, session, Duration::from_secs(5)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!("hello world"));
     }
 
     #[tokio::test]
     async fn execute_no_result_returns_null() {
         let session = test_session();
-        let result = execute("x = 42", session, Duration::from_secs(5)).await.unwrap();
+        let result = execute("x = 42", session, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!(null));
     }
 
@@ -855,7 +954,9 @@ mod tests {
 x = {"a": 1, "b": [2, 3]}
 result = x
 "#;
-        let result = execute(code, session, Duration::from_secs(5)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!({"a": 1, "b": [2, 3]}));
     }
 
@@ -867,7 +968,9 @@ print("hello")
 print("world")
 result = True
 "#;
-        let result = execute(code, session, Duration::from_secs(5)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(result.logs, vec!["hello", "world"]);
         assert_eq!(result.value, serde_json::json!(true));
     }
@@ -878,7 +981,10 @@ result = True
         let result = execute("def (", session, Duration::from_secs(5)).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("parse error"), "expected parse error, got: {err}");
+        assert!(
+            err.contains("parse error"),
+            "expected parse error, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -887,7 +993,9 @@ result = True
         // Starlark doesn't have sleep, but a very tight loop would take too long
         // to actually timeout. Just verify the timeout path with a short timeout.
         let code = "result = 42";
-        let result = execute(code, session, Duration::from_millis(5000)).await.unwrap();
+        let result = execute(code, session, Duration::from_millis(5000))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!(42));
     }
 
@@ -909,7 +1017,9 @@ read_file(path="hello.txt")
 result = True
 "#;
 
-        let result = execute(code, session, Duration::from_secs(2)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(2))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!(true));
 
         assert!(
@@ -1171,7 +1281,9 @@ write_file("test.txt", "hello starlark")
 data = read_file("test.txt")
 result = data["content"]
 "#;
-        let result = execute(code, session, Duration::from_secs(10)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!("hello starlark"));
     }
 
@@ -1185,7 +1297,9 @@ result = data["content"]
 r = exec("echo hello from starlark")
 result = r["out"]
 "#;
-        let result = execute(code, session, Duration::from_secs(10)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .unwrap();
         assert_eq!(result.value, serde_json::json!("hello from starlark"));
     }
 
@@ -1202,7 +1316,9 @@ data = read_file("a.txt")
 lines = data["lines"]
 result = {"lines": lines, "status": "ok"}
 "#;
-        let result = execute(code, session, Duration::from_secs(10)).await.unwrap();
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .unwrap();
         let val = result.value;
         assert_eq!(val["lines"], 3);
         assert_eq!(val["status"], "ok");
@@ -1219,6 +1335,7 @@ result = {"lines": lines, "status": "ok"}
         assert!(sigs.contains("ls"));
         assert!(sigs.contains("snapshot"));
         assert!(sigs.contains("git"));
+        assert!(sigs.contains("discord"));
     }
 
     #[test]

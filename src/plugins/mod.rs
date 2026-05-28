@@ -1,4 +1,5 @@
 pub mod cargo;
+pub mod discord;
 pub mod docker;
 pub mod generic_cli;
 pub mod gh;

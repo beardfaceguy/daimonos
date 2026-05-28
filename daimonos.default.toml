@@ -80,6 +80,26 @@ idle_timeout_secs = 600
 # or set true here for diagnostics.
 startup_logs = false
 
+[discord]
+# Enable Discord integration tools. Defaults to false (off).
+enabled = false
+# Environment variable that holds the bot token.
+bot_token_env_var = "DISCORD_BOT_TOKEN"
+# Discord REST API base URL.
+api_base_url = "https://discord.com/api/v10"
+# Explicit allowlists. Empty means deny-by-default until configured.
+allow_guild_ids = []
+allow_channel_ids = []
+# Hard caps to keep responses token-bounded.
+max_messages_per_call = 100
+max_message_chars = 4_000
+max_response_chars = 32_000
+# Keep write actions disabled unless explicitly enabled later.
+read_only_default = true
+# Retry behavior for Discord API 429 responses.
+rate_limit_max_retries = 2
+rate_limit_max_sleep_ms = 10_000
+
 [pipeline_cache]
 # The pipeline cache invalidates tool results when workspace files change.
 # It registers one inotify watch per source-tree directory (after filtering

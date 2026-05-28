@@ -223,6 +223,37 @@ def test_docker_tool_always_visible(daimonos):
 
 
 # ============================================================
+# Discord plugin tests
+# ============================================================
+
+
+def test_discord_tool_visible(daimonos):
+    """discord tool appears in listing (plugin registration is config-driven)."""
+    tools = daimonos.list_tools()
+    tool_names = [t["name"] for t in tools]
+    assert "discord" in tool_names
+
+
+def test_discord_disabled_by_default(daimonos):
+    """discord calls fail with a clear error unless [discord].enabled is true."""
+    result = daimonos.call_tool("discord", {"command": "list_guilds"})
+    assert result.get("isError") is True
+    text = result["content"][0]["text"]
+    assert "disabled" in text
+
+
+def test_discord_search_messages_disabled_by_default(daimonos):
+    """search_messages is available on the tool surface but blocked when disabled."""
+    result = daimonos.call_tool(
+        "discord",
+        {"command": "search_messages", "channel_id": "123456789012345678", "query": "deploy"},
+    )
+    assert result.get("isError") is True
+    text = result["content"][0]["text"]
+    assert "disabled" in text
+
+
+# ============================================================
 # Starlark integration tests
 # ============================================================
 
