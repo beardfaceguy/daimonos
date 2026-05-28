@@ -10,5 +10,8 @@ claude_api_key.env
 *.log
 .DS_Store
 
+# Ad-hoc dev/provisioning artifacts (AWS instance dumps, etc.)
+instance_contents_log.txt
+
 # graphify local incremental-build state (per-machine, not portable)
 graphify-out/cache/
