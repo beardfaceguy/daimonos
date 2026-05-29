@@ -914,7 +914,7 @@ pub async fn run_mcp_server(
     let server_details = InitializeResult {
         server_info: Implementation {
             name: "daimonos".into(),
-            version: "0.1.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             title: Some("Daimonos".into()),
             description: Some(
                 "Agent-optimized OS layer with structured file, exec, and search operations".into(),

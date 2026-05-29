@@ -1,6 +1,23 @@
 """Tests for MCP initialize handshake and tool listing."""
 
+import os
+import re
 import subprocess
+
+
+def _expected_version() -> str:
+    """Read the daimonos package version from `Cargo.toml` so this test
+    moves in lockstep with the binary instead of pinning a string. Both
+    the MCP `serverInfo.version` and the opcode-schema `version` field
+    are now wired to `env!("CARGO_PKG_VERSION")` at compile time, so
+    asserting against `Cargo.toml` catches any drift in either layer."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo_root, "Cargo.toml"), encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r'\s*version\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    raise RuntimeError("could not parse [package].version from Cargo.toml")
 
 
 def test_initialize_returns_server_info(daimonos_binary, tmp_path):
@@ -29,7 +46,7 @@ def test_initialize_returns_server_info(daimonos_binary, tmp_path):
         assert "result" in resp
         result = resp["result"]
         assert result["serverInfo"]["name"] == "daimonos"
-        assert result["serverInfo"]["version"] == "0.1.0"
+        assert result["serverInfo"]["version"] == _expected_version()
         assert "protocolVersion" in result
         assert "capabilities" in result
         assert "tools" in result["capabilities"]

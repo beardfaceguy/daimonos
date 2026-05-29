@@ -169,7 +169,7 @@ pub fn schema(op: &Op) -> Response {
         }
     } else {
         Response::ok(json!({
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "ops": registry,
         }))
     }
@@ -209,7 +209,7 @@ mod tests {
             "should list at least 20 opcodes, got {}",
             ops.len()
         );
-        assert_eq!(data["version"], "0.1.0");
+        assert_eq!(data["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
