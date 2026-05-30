@@ -51,6 +51,32 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Va
         "writers_of" => Ok(records_json(store.writers_of(str_arg(args, "resource")?)?)),
         "blast_radius" => Ok(records_json(store.blast_radius(str_arg(args, "hash")?)?)),
         "open_questions" => Ok(records_json(store.open_questions()?)),
+        "orient" => {
+            // One bundled call (vs many round-trips): task-matching defs with their
+            // intent/open-questions, their outgoing edges, and their dependents.
+            let task = str_arg(args, "task")?;
+            let top: Vec<_> = store.find(task)?.into_iter().take(12).collect();
+            let mut matches = Vec::new();
+            let mut edges = Vec::new();
+            let mut dependents = std::collections::BTreeSet::new();
+            for rec in &top {
+                matches.push(record_json(rec));
+                for e in store.neighbors(&rec.node.hash, None, Direction::Out)? {
+                    edges.push(edge_json(&e));
+                }
+                for dep in store.blast_radius(&rec.node.hash)? {
+                    if let Some(n) = dep.node.name {
+                        dependents.insert(n);
+                    }
+                }
+            }
+            Ok(json!({
+                "task": task,
+                "matches": matches,
+                "edges": edges,
+                "dependents": dependents.into_iter().collect::<Vec<_>>(),
+            }))
+        }
         "check" => {
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("draft");
             let v = store.check_completeness()?;
@@ -162,5 +188,19 @@ mod tests {
         // check: authenticate has no purpose yet -> incomplete
         let chk = run(ws, "check", &json!({"mode": "commit"}), "t0").unwrap();
         assert_eq!(chk["complete"], json!(false));
+    }
+
+    #[test]
+    fn orient_bundles_matches_and_edges() {
+        let tmp = workspace();
+        let ws = tmp.path();
+        run(ws, "index", &json!({}), "t0").unwrap();
+        let o = run(ws, "orient", &json!({"task": "authenticate"}), "t0").unwrap();
+        assert!(o["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == json!("authenticate")));
+        assert!(o["edges"].is_array());
     }
 }
