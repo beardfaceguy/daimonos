@@ -95,17 +95,21 @@ pub fn spawn_watcher(workspace: PathBuf, quiet: bool) {
 /// pipeline_cache::start_watcher): walk with the `ignore` crate, skip
 /// build/vcs/`.kgl` dirs, cap total watches. The change closure ignores events
 /// under `.kgl/` so our own store writes can't self-trigger a rebuild loop.
+/// A change is relevant unless it's entirely under our own `.kgl/` store dir —
+/// guards against a rebuild's own writes self-triggering the watcher.
+fn relevant_event(paths: &[PathBuf]) -> bool {
+    paths
+        .iter()
+        .any(|p| !p.components().any(|c| c.as_os_str() == ".kgl"))
+}
+
 fn build_watcher(workspace: &Path, dirty: Arc<AtomicBool>) -> Option<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             if !(event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove()) {
                 return;
             }
-            let relevant = event
-                .paths
-                .iter()
-                .any(|p| !p.components().any(|c| c.as_os_str() == ".kgl"));
-            if relevant {
+            if relevant_event(&event.paths) {
                 dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -200,5 +204,39 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         let dirty = Arc::new(AtomicBool::new(false));
         assert!(build_watcher(tmp.path(), dirty).is_some());
+    }
+
+    #[test]
+    fn relevant_event_ignores_kgl_store_writes() {
+        // our own .kgl/ writes must not count (else the rebuild self-triggers)
+        assert!(!relevant_event(&[PathBuf::from("/ws/.kgl/kgl.db")]));
+        assert!(!relevant_event(&[])); // pathless events ignored
+        // real source changes are relevant, even if mixed with a .kgl write
+        assert!(relevant_event(&[PathBuf::from("/ws/src/a.rs")]));
+        assert!(relevant_event(&[
+            PathBuf::from("/ws/.kgl/kgl.db"),
+            PathBuf::from("/ws/src/a.rs"),
+        ]));
+    }
+
+    #[test]
+    fn watcher_flags_dirty_on_file_change() {
+        // Timing-tolerant: a write in a watched dir should flip `dirty` within
+        // a few seconds (inotify delivery is async).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let _w = build_watcher(tmp.path(), dirty.clone()).expect("watcher built");
+        std::thread::sleep(Duration::from_millis(300)); // let the watch arm
+        std::fs::write(tmp.path().join("src").join("f.txt"), b"x").unwrap();
+        let mut flipped = false;
+        for _ in 0..50 {
+            if dirty.load(Ordering::Relaxed) {
+                flipped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(flipped, "watcher did not flag dirty on a file change");
     }
 }
