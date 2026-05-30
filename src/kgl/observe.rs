@@ -30,7 +30,7 @@ pub fn record_file_op(
         return Ok(());
     };
     let resource = file_urn(workspace, path);
-    let store = KglStore::open(&workspace.join(".kgl").join("kgl.db"))?;
+    let store = KglStore::open_workspace(workspace)?;
     store.record_observation(session_id, kind, &resource, now)
 }
 
@@ -55,7 +55,7 @@ mod tests {
         let ws = tmp.path();
         record_file_op(ws, "sess-9", "write_file", &json!({"path": "src/a.rs"}), "t0").unwrap();
 
-        let store = KglStore::open(&ws.join(".kgl").join("kgl.db")).unwrap();
+        let store = KglStore::open_workspace(ws).unwrap();
         let urn = format!("file://{}", ws.join("src/a.rs").to_string_lossy());
         let w = store.writers_of(&urn).unwrap();
         assert!(w.iter().any(|r| r.node.name.as_deref() == Some("sess-9")));

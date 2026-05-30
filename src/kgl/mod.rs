@@ -14,6 +14,7 @@
 //! `plugins::x07` scaffolding precedent.
 #![allow(dead_code)]
 
+pub mod assert;
 pub mod model;
 pub mod observe;
 pub mod query;

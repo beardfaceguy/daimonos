@@ -10,17 +10,13 @@ use crate::kgl::substrate_graphify::GraphifySubstrate;
 use crate::kgl::substrate_x07::X07Substrate;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-
-fn store_path(workspace: &Path) -> PathBuf {
-    workspace.join(".kgl").join("kgl.db")
-}
+use std::path::Path;
 
 /// Dispatch one query action against the workspace's KGL store. `now` is an
 /// ISO-8601 timestamp supplied by the host (used as the index run stamp; KGL
 /// never invents time).
 pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Value> {
-    let mut store = KglStore::open(&store_path(workspace))?;
+    let mut store = KglStore::open_workspace(workspace)?;
     match action {
         "index" => {
             // Substrate is swappable: x07 (default) reads .x07.json sources;
@@ -42,7 +38,7 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Va
             let kind = args
                 .get("kind")
                 .and_then(|v| v.as_str())
-                .and_then(parse_edge_kind);
+                .and_then(EdgeKind::from_wire);
             let dir = match args.get("dir").and_then(|v| v.as_str()).unwrap_or("out") {
                 "in" => Direction::In,
                 "both" => Direction::Both,
@@ -75,10 +71,6 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("kgl_query: missing string arg '{key}'"))
-}
-
-fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
-    serde_json::from_value(Value::String(s.to_string())).ok()
 }
 
 fn node_json(n: &DefNode) -> Value {

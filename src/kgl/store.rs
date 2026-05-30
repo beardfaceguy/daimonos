@@ -70,6 +70,12 @@ impl KglStore {
         Ok(s)
     }
 
+    /// Open (creating if needed) the KGL store for a workspace at the canonical
+    /// `<workspace>/.kgl/kgl.db`. Single source of truth for the store path.
+    pub fn open_workspace(workspace: &Path) -> Result<Self> {
+        Self::open(&workspace.join(".kgl").join("kgl.db"))
+    }
+
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS kgl_node (
@@ -256,9 +262,15 @@ impl KglStore {
             Some(p) => Some(serde_json::to_string(p)?),
             None => None,
         };
+        // Atomic dedupe: identical declared edges must not pile up (an agent
+        // re-asserting the same edge is a no-op), matching record_observation.
         self.conn.execute(
             "INSERT INTO kgl_edge (from_hash,to_ref,kind,derivation,confidence,provenance_json)
-             VALUES (?1,?2,?3,'declared',1.0,?4)",
+             SELECT ?1,?2,?3,'declared',1.0,?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM kgl_edge
+                 WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='declared'
+             )",
             params![from, to, enum_str(&kind), pj],
         )?;
         Ok(())
@@ -282,26 +294,24 @@ impl KglStore {
              ON CONFLICT(hash) DO UPDATE SET valid_as_of=excluded.valid_as_of",
             params![shash, session_id, now],
         )?;
-        let exists: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM kgl_edge
-             WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='declared'",
-            params![shash, resource, enum_str(&kind)],
-            |r| r.get(0),
+        let prov = serde_json::to_string(&Provenance {
+            authored_by: "daimonos:observed".into(),
+            session_id: session_id.into(),
+            timestamp: now.into(),
+            assumptions: vec![],
+            supersedes: vec![],
+        })?;
+        // Atomic dedupe: insert only if no identical observed edge exists (a
+        // single statement, so concurrent observers can't double-insert).
+        self.conn.execute(
+            "INSERT INTO kgl_edge (from_hash,to_ref,kind,derivation,confidence,provenance_json)
+             SELECT ?1,?2,?3,'declared',1.0,?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM kgl_edge
+                 WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='declared'
+             )",
+            params![shash, resource, enum_str(&kind), prov],
         )?;
-        if exists == 0 {
-            let prov = serde_json::to_string(&Provenance {
-                authored_by: "daimonos:observed".into(),
-                session_id: session_id.into(),
-                timestamp: now.into(),
-                assumptions: vec![],
-                supersedes: vec![],
-            })?;
-            self.conn.execute(
-                "INSERT INTO kgl_edge (from_hash,to_ref,kind,derivation,confidence,provenance_json)
-                 VALUES (?1,?2,?3,'declared',1.0,?4)",
-                params![shash, resource, enum_str(&kind), prov],
-            )?;
-        }
         Ok(())
     }
 

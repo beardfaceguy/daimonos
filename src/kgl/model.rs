@@ -60,6 +60,14 @@ pub enum EdgeKind {
     Reads,
 }
 
+impl EdgeKind {
+    /// Parse the canonical wire string (serde snake_case, e.g. "depends_on")
+    /// into an `EdgeKind`. Single parser shared by the query/assert layers.
+    pub fn from_wire(s: &str) -> Option<EdgeKind> {
+        serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    }
+}
+
 /// How an edge was established — lets a reading agent distinguish
 /// "the compiler proved this" from "an agent claimed this".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
