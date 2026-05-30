@@ -125,3 +125,38 @@ def daimonos(daimonos_binary, tmp_path):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+@pytest.fixture
+def daimonos_observe(daimonos_binary, tmp_path):
+    """Like `daimonos`, but with KGL observed-provenance capture enabled
+    (DAIMONOS_KGL_OBSERVE=1)."""
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp", "-w", str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "DAIMONOS_KGL_OBSERVE": "1"},
+    )
+    client = DaimonosClient(proc, str(tmp_path))
+    init_resp = client.send_raw({
+        "jsonrpc": "2.0",
+        "id": client._next_id(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1.0.0"},
+        },
+    })
+    assert "result" in init_resp, f"initialize failed: {init_resp}"
+    client.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    yield client
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()

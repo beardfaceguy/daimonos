@@ -34,6 +34,14 @@ pub fn record_file_op(
     store.record_observation(session_id, kind, &resource, now)
 }
 
+/// Whether observed-provenance capture is enabled (env `DAIMONOS_KGL_OBSERVE`).
+/// Shared by the MCP-direct hook and the script-dispatch hook. Off by default.
+pub fn enabled() -> bool {
+    std::env::var("DAIMONOS_KGL_OBSERVE")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+}
+
 fn file_urn(workspace: &Path, path: &str) -> String {
     let p = Path::new(path);
     let abs = if p.is_absolute() {

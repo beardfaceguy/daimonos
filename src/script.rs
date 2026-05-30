@@ -411,11 +411,36 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 
 /// Dispatch a tool call by name, using the tools registry to map args → Request.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
-    match tools::build_request(name, args) {
-        Some(Ok(request)) => dispatch_request(request, name),
-        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
-        None => Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
+    let resp = match tools::build_request(name, args) {
+        Some(Ok(request)) => dispatch_request(request, name)?,
+        Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
+        None => return Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
+    };
+    // KGL observed-provenance: capture script-driven file ops the same way the
+    // MCP-direct path does. Gated off by default; best-effort (never affects the
+    // tool result). This is the Starlark layer feeding the graph.
+    if resp.ok
+        && matches!(name, "write_file" | "edit_file" | "read_file")
+        && crate::kgl::observe::enabled()
+    {
+        record_script_observation(name, args);
     }
+    Ok(resp)
+}
+
+/// Best-effort: record a script-driven file op as an observed KGL edge, reading
+/// the session's workspace + id from the tool context.
+fn record_script_observation(name: &str, args: &serde_json::Value) {
+    let _ = with_ctx(|ctx| {
+        let (ws, sid) = ctx.handle.block_on(async {
+            let s = ctx.session.lock().await;
+            (s.workspace.clone(), s.external_session_id.clone())
+        });
+        let now = chrono::Utc::now().to_rfc3339();
+        let sid = sid.unwrap_or_else(|| "unknown".to_string());
+        let _ = crate::kgl::observe::record_file_op(&ws, &sid, name, args, &now);
+        Ok(())
+    });
 }
 
 fn run_registry_tool(
