@@ -162,6 +162,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+
+        // A2: keep the graph fresh within the session via a debounced file watcher.
+        kgl::autoindex::spawn_watcher(workspace.clone(), mcp_quiet_stderr);
     }
 
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());

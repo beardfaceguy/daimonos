@@ -12,7 +12,18 @@ use crate::kgl::substrate::Substrate;
 use crate::kgl::substrate_graphify::GraphifySubstrate;
 use crate::kgl::substrate_x07::X07Substrate;
 use anyhow::Result;
-use std::path::Path;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Directories never worth watching (build/vcs churn + our own store).
+const WATCH_SKIP_DIRS: &[&str] = &["target", ".git", ".jj", "node_modules", ".kgl"];
+/// Hard cap on inotify watches so we never exhaust fs.inotify.max_user_watches.
+const MAX_WATCHES: usize = 4096;
+/// Debounce window: coalesce change bursts into at most one rebuild per tick.
+const DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Whether startup auto-indexing is enabled (env `DAIMONOS_KGL_AUTOINDEX`).
 pub fn enabled() -> bool {
@@ -52,6 +63,83 @@ pub fn run_startup(workspace: &Path, now: &str) -> Result<Option<(&'static str, 
     let mut store = KglStore::open_workspace(workspace)?;
     let (nodes, edges) = store.populate(sub.as_ref(), workspace, now)?;
     Ok(Some((name, nodes, edges)))
+}
+
+/// Spawn a background thread that watches `workspace` and rebuilds the KGL graph
+/// (debounced) when files change, keeping it fresh within a session. Owns the
+/// watcher for the process lifetime; best-effort; gated by the caller. Because
+/// `kgl_query` opens the store fresh per call, background rebuilds are picked up
+/// automatically with no handler/session changes.
+pub fn spawn_watcher(workspace: PathBuf, quiet: bool) {
+    let _ = std::thread::Builder::new()
+        .name("kgl-watch".to_string())
+        .spawn(move || {
+            let dirty = Arc::new(AtomicBool::new(false));
+            let Some(_watcher) = build_watcher(&workspace, dirty.clone()) else {
+                if !quiet {
+                    eprintln!("kgl: file watcher not started (no dirs registered)");
+                }
+                return;
+            };
+            loop {
+                std::thread::sleep(DEBOUNCE);
+                if dirty.swap(false, Ordering::Relaxed) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = run_startup(&workspace, &now);
+                }
+            }
+        });
+}
+
+/// Build a non-recursive watch per surviving directory (mirrors
+/// pipeline_cache::start_watcher): walk with the `ignore` crate, skip
+/// build/vcs/`.kgl` dirs, cap total watches. The change closure ignores events
+/// under `.kgl/` so our own store writes can't self-trigger a rebuild loop.
+fn build_watcher(workspace: &Path, dirty: Arc<AtomicBool>) -> Option<RecommendedWatcher> {
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            if !(event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove()) {
+                return;
+            }
+            let relevant = event
+                .paths
+                .iter()
+                .any(|p| !p.components().any(|c| c.as_os_str() == ".kgl"));
+            if relevant {
+                dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .ok()?;
+
+    let mut watched = 0usize;
+    for entry in ignore::WalkBuilder::new(workspace)
+        .hidden(true)
+        .git_ignore(true)
+        .filter_entry(|e| {
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !WATCH_SKIP_DIRS.iter().any(|d| *d == name.as_ref())
+        })
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if watched >= MAX_WATCHES {
+            break;
+        }
+        if watcher.watch(entry.path(), RecursiveMode::NonRecursive).is_ok() {
+            watched += 1;
+        }
+    }
+    if watched == 0 {
+        return None;
+    }
+    Some(watcher)
 }
 
 #[cfg(test)]
@@ -104,5 +192,13 @@ mod tests {
     fn run_startup_no_substrate_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(run_startup(tmp.path(), "t0").unwrap().is_none());
+    }
+
+    #[test]
+    fn build_watcher_registers_over_a_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let dirty = Arc::new(AtomicBool::new(false));
+        assert!(build_watcher(tmp.path(), dirty).is_some());
     }
 }
