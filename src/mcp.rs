@@ -785,6 +785,22 @@ impl ServerHandler for DaimonosHandler {
 
 /// Build dynamic instructions that include workspace-specific context
 /// so the model has useful information without a separate tool call.
+/// Orientation hint nudging agents to query the KGL graph first (and to record
+/// intent as they work). Only emitted when KGL auto-indexing is on, so the
+/// graph actually exists. Pure (takes the gate) so it's testable without env.
+fn kgl_instructions_hint(kgl_enabled: bool) -> Option<&'static str> {
+    if !kgl_enabled {
+        return None;
+    }
+    Some(
+        "KGL graph: this workspace has a queryable code+intent knowledge graph. To orient before \
+         reading source, call kgl_query {query:'orient', args:{task:'<topic>'}} — one call returns \
+         matching defs + their intent/open-questions + edges + dependents. Record intent / \
+         provenance / contracts as you work with kgl_assert. Reading source still finds latent \
+         issues the graph hasn't been told about.",
+    )
+}
+
 async fn build_instructions(workspace: &std::path::Path) -> String {
     let mut parts = vec![
         "Use daimonos tools, not built-in equivalents.".to_string(),
@@ -797,6 +813,10 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
         "Starlark tool functions for execute_script:\n{}",
         script::tool_signatures()
     ));
+
+    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled()) {
+        parts.push(hint.to_string());
+    }
 
     // Detect primary language / project type from manifest files
     let markers: &[(&str, &str)] = &[
@@ -1255,6 +1275,14 @@ mod tests {
             code_mode_tools.len() == 3,
             "code-mode surface should be 3 tools"
         );
+    }
+
+    #[test]
+    fn kgl_hint_is_gated_and_mentions_orient() {
+        assert!(kgl_instructions_hint(false).is_none());
+        let hint = kgl_instructions_hint(true).expect("hint when enabled");
+        assert!(hint.contains("orient"));
+        assert!(hint.contains("kgl_assert"));
     }
 
     #[tokio::test]
