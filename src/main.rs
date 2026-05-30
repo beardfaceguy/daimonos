@@ -147,6 +147,23 @@ async fn main() -> anyhow::Result<()> {
     ));
     ws_index.spawn_reindex();
 
+    // KGL startup auto-index (gated, best-effort): mirror the trigram index's
+    // one-shot startup build so a fresh agent session gets a current graph
+    // without a manual `kgl_query index`. Runs on a blocking task; never blocks
+    // or breaks startup. Off unless DAIMONOS_KGL_AUTOINDEX is set.
+    if kgl::autoindex::enabled() {
+        let kgl_ws = workspace.clone();
+        let quiet = mcp_quiet_stderr;
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().to_rfc3339();
+            if let Ok(Some((sub, nodes, edges))) = kgl::autoindex::run_startup(&kgl_ws, &now) {
+                if !quiet {
+                    eprintln!("kgl: startup index — {nodes} nodes / {edges} edges via {sub}");
+                }
+            }
+        });
+    }
+
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());
     config::register_tools(&cfg, &tool_reg, mcp_quiet_stderr).await;
 
