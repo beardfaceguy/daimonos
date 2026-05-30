@@ -267,6 +267,28 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "kgl_query",
+            tier: ToolTier::Full,
+            description: "Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "enum": ["index", "node", "neighbors", "find", "writers_of", "blast_radius", "open_questions", "check"]
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
+                    }
+                },
+                "required": ["query"]
+            }),
+            to_request: None, // KGL store access handled in mcp.rs
+            context_check: None,
+        },
+
+        ToolDef {
             name: "list_tool_signatures",
             tier: ToolTier::OnDemand,
             description: "Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions.",
