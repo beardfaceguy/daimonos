@@ -202,7 +202,12 @@ impl KglStore {
         }
 
         // Prune orphans (nodes not seen this run) and any now-dangling edges.
-        tx.execute("DELETE FROM kgl_node WHERE valid_as_of != ?1", params![run_stamp])?;
+        // Never prune observed (daimonos-substrate) nodes: re-indexing the code
+        // graph must not wipe session/provenance nodes recorded by observation.
+        tx.execute(
+            "DELETE FROM kgl_node WHERE valid_as_of != ?1 AND substrate != 'daimonos'",
+            params![run_stamp],
+        )?;
         tx.execute(
             "DELETE FROM kgl_edge WHERE from_hash NOT IN (SELECT hash FROM kgl_node)",
             [],
@@ -256,6 +261,47 @@ impl KglStore {
              VALUES (?1,?2,?3,'declared',1.0,?4)",
             params![from, to, enum_str(&kind), pj],
         )?;
+        Ok(())
+    }
+
+    /// Record an OBSERVED action by an agent session: upsert a session node and
+    /// add a reads/mutates edge to the touched resource URN. This is the
+    /// observed-not-authored provenance KGL is uniquely positioned to capture
+    /// (daimonos sees every tool call). Deduped per (session, resource, kind).
+    pub fn record_observation(
+        &self,
+        session_id: &str,
+        kind: EdgeKind,
+        resource: &str,
+        now: &str,
+    ) -> Result<()> {
+        let shash = format!("session:{session_id}");
+        self.conn.execute(
+            "INSERT INTO kgl_node (hash,kind,name,substrate,touches_io,mutates_state,valid_as_of)
+             VALUES (?1,'session',?2,'daimonos',0,0,?3)
+             ON CONFLICT(hash) DO UPDATE SET valid_as_of=excluded.valid_as_of",
+            params![shash, session_id, now],
+        )?;
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM kgl_edge
+             WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='declared'",
+            params![shash, resource, enum_str(&kind)],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            let prov = serde_json::to_string(&Provenance {
+                authored_by: "daimonos:observed".into(),
+                session_id: session_id.into(),
+                timestamp: now.into(),
+                assumptions: vec![],
+                supersedes: vec![],
+            })?;
+            self.conn.execute(
+                "INSERT INTO kgl_edge (from_hash,to_ref,kind,derivation,confidence,provenance_json)
+                 VALUES (?1,?2,?3,'declared',1.0,?4)",
+                params![shash, resource, enum_str(&kind), prov],
+            )?;
+        }
         Ok(())
     }
 
@@ -667,5 +713,37 @@ mod tests {
         }
         let v = store.check_completeness().unwrap();
         assert!(v.is_empty(), "expected no violations, got {v:?}");
+    }
+
+    #[test]
+    fn observation_records_session_and_writers() {
+        let store = KglStore::open_in_memory().unwrap();
+        store.record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t0").unwrap();
+        store.record_observation("sess-7", EdgeKind::Reads, "file:///ws/b.rs", "t0").unwrap();
+        // dedupe: identical observation again -> still one edge
+        store.record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t1").unwrap();
+
+        let w = store.writers_of("file:///ws/a.rs").unwrap();
+        assert!(w.iter().any(|r| r.node.name.as_deref() == Some("sess-7")));
+
+        let sh = "session:sess-7".to_string();
+        let edges = store.neighbors(&sh, None, Direction::Out).unwrap();
+        assert_eq!(edges.len(), 2); // one mutates + one reads (deduped)
+    }
+
+    #[test]
+    fn reindex_preserves_observations() {
+        // Observed session nodes/edges must survive a code re-index (prune guard).
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let mut store = KglStore::open_in_memory().unwrap();
+        store.populate(&X07Substrate, tmp.path(), "r1").unwrap();
+        store.record_observation("sess-1", EdgeKind::Mutates, "file:///ws/x", "t0").unwrap();
+        store.populate(&X07Substrate, tmp.path(), "r2").unwrap(); // re-index code
+        let w = store.writers_of("file:///ws/x").unwrap();
+        assert!(
+            w.iter().any(|r| r.node.name.as_deref() == Some("sess-1")),
+            "observation should survive code re-index"
+        );
     }
 }

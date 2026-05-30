@@ -18,6 +18,9 @@ pub enum SubstrateKind {
     Zero,
     /// Rust source surfaced via a derived graphify graph (see `substrate_graphify`).
     Rust,
+    /// The daimonos OS runtime itself — source of observed nodes/edges (sessions,
+    /// live state). These are observed ground truth, not authored or derived.
+    Daimonos,
 }
 
 /// The kind of definition a node represents.
@@ -28,6 +31,8 @@ pub enum NodeKind {
     Type,
     Module,
     Const,
+    /// An agent session that acted on the system (observed-provenance node).
+    Session,
 }
 
 /// A node in the knowledge graph: a single content-addressed definition.

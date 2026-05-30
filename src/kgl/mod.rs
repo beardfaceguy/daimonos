@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 pub mod model;
+pub mod observe;
 pub mod query;
 pub mod store;
 pub mod substrate;

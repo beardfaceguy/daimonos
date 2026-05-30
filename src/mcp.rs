@@ -738,8 +738,33 @@ impl ServerHandler for DaimonosHandler {
             return ok_text(serde_json::to_string(&results).unwrap_or_default());
         }
 
-        dispatch_tool(&mut session, &params.name, &args).await
+        let result = dispatch_tool(&mut session, &params.name, &args).await;
+        // Observed-provenance capture (KGL), gated off by default. Records direct
+        // file ops as observed reads/mutates edges from the session. Best-effort:
+        // never affects the tool result.
+        if kgl_observe_enabled() {
+            if let Ok(r) = &result {
+                if !r.is_error.unwrap_or(false) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let sid = session
+                        .external_session_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let ws = session.workspace.clone();
+                    let _ =
+                        crate::kgl::observe::record_file_op(&ws, &sid, &params.name, &args, &now);
+                }
+            }
+        }
+        result
     }
+}
+
+/// Whether KGL observed-provenance capture is enabled (env DAIMONOS_KGL_OBSERVE).
+fn kgl_observe_enabled() -> bool {
+    std::env::var("DAIMONOS_KGL_OBSERVE")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
 }
 
 // --- Proactive workspace context ---
