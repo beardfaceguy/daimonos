@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 pub mod assert;
+pub mod autoindex;
 pub mod model;
 pub mod observe;
 pub mod query;
