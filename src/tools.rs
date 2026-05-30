@@ -279,11 +279,11 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "enum": ["index", "node", "neighbors", "find", "writers_of", "blast_radius", "open_questions", "check"]
+                        "enum": ["index", "orient", "node", "neighbors", "find", "writers_of", "blast_radius", "open_questions", "check"]
                     },
                     "args": {
                         "type": "object",
-                        "description": "node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
+                        "description": "orient needs {task} (one bundled call: matching defs + intent/open-questions + edges + dependents — prefer this for orientation); node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
                     }
                 },
                 "required": ["query"]
