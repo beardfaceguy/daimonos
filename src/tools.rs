@@ -293,6 +293,25 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "kgl_assert",
+            tier: ToolTier::Full,
+            description: "Declare the non-derivable KGL layer for a def: its intent/purpose (+ rationale, open questions), authoring provenance, or a typed edge (reads/mutates/calls/depends_on). This is how an authoring agent records WHY code exists and what it touches — the part no derived graph provides. Get the target def 'hash' from kgl_query find/node.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["intent", "provenance", "declare_edge"]},
+                    "args": {
+                        "type": "object",
+                        "description": "intent: {hash, purpose, rationale?, open_questions?[]}; provenance: {hash, authored_by, session_id?, assumptions?[], supersedes?[]}; declare_edge: {from, to, kind} where kind is one of calls|depends_on|reads|mutates (snake_case)."
+                    }
+                },
+                "required": ["action"]
+            }),
+            to_request: None, // KGL store access handled in mcp.rs
+            context_check: None,
+        },
+
+        ToolDef {
             name: "list_tool_signatures",
             tier: ToolTier::OnDemand,
             description: "Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions.",
