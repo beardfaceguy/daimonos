@@ -672,6 +672,26 @@ impl ServerHandler for DaimonosHandler {
             };
         }
 
+        // kgl_query opens the per-workspace KGL store; only needs the workspace path.
+        if params.name == "kgl_query" {
+            let action = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let qargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let workspace = {
+                let mut s = self.session.lock().await;
+                s.used_tools.insert("kgl_query".into());
+                s.workspace.clone()
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            return match crate::kgl::query::run(&workspace, &action, &qargs, &now) {
+                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => err_text(format!("{e}")),
+            };
+        }
+
         let mut session = self.session.lock().await;
 
         if params.name == "batch" {

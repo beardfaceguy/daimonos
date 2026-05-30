@@ -1,0 +1,25 @@
+//! KGL — the code + OS knowledge-graph layer (v0).
+//!
+//! KGL is NOT a language. It is an enforced, queryable graph of relationships,
+//! intent, and provenance over an agent-first language substrate and (later)
+//! daimonos live OS state. This module is additive: nothing else in the crate
+//! depends on it yet, and it does not alter existing daimonos behavior.
+//!
+//! Build phases (see project tracker): v0 = substrate extraction (this module)
+//! -> SQLite store -> reads/mutates analysis -> `kgl_query` MCP tool ->
+//! completeness enforcement -> orient demo.
+//!
+//! `dead_code` is allowed crate-locally here because v0 lands the data model and
+//! extraction before their consumers (store / MCP tool) exist — mirroring the
+//! `plugins::x07` scaffolding precedent.
+#![allow(dead_code)]
+
+pub mod model;
+pub mod query;
+pub mod store;
+pub mod substrate;
+pub mod substrate_graphify;
+pub mod substrate_x07;
+
+#[cfg(test)]
+mod demo;

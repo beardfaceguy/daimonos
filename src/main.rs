@@ -1,6 +1,7 @@
 mod analytics;
 mod config;
 mod index;
+mod kgl;
 mod mcp;
 mod ops;
 mod pipeline_cache;
