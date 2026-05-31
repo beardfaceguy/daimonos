@@ -331,8 +331,9 @@ def test_pytest_collect(daimonos):
     result = daimonos.call_tool("pytest", {"command": "collect"})
     data = _parse(result)
     assert data["ok"] is True
-    assert data["count"] >= 2
+    assert len(data["tests"]) >= 2
     assert any("test_pass" in t for t in data["tests"])
+    assert "count" not in data, "redundant count field must be omitted"
 
 
 def test_pytest_tool_visible_with_tests_dir(daimonos):

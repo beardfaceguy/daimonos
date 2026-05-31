@@ -91,48 +91,7 @@ async fn pytest_run(
     cwd: &Path,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let path = args
-        .and_then(|a| a.get("path"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let filter = args
-        .and_then(|a| a.get("filter"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let markers = args
-        .and_then(|a| a.get("markers"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let failfast = args
-        .and_then(|a| a.get("failfast"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let verbose = args
-        .and_then(|a| a.get("verbose"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // Use `--tb=line` for compact one-line failure summaries; `-q` to suppress the
-    // per-test progress dots and headers, but keep the FAILED/ERROR summary.
-    let mut pytest_args: Vec<String> = vec!["--tb=line".into(), "-q".into(), "--no-header".into()];
-    if verbose {
-        pytest_args.push("-v".into());
-    }
-    if failfast {
-        pytest_args.push("-x".into());
-    }
-    if let Some(ref f) = filter {
-        pytest_args.push("-k".into());
-        pytest_args.push(f.clone());
-    }
-    if let Some(ref m) = markers {
-        pytest_args.push("-m".into());
-        pytest_args.push(m.clone());
-    }
-    if let Some(ref p) = path {
-        pytest_args.push(p.clone());
-    }
-
+    let pytest_args = build_run_args(args);
     let arg_refs: Vec<&str> = pytest_args.iter().map(|s| s.as_str()).collect();
     let (stdout, stderr, success) = run_pytest(cwd, &arg_refs).await?;
     let combined = format!("{stdout}\n{stderr}");
@@ -155,6 +114,55 @@ async fn pytest_run(
     }
 
     Ok(result)
+}
+
+/// Build the argv for `pytest run` from the JSON args object.
+/// Default: `--no-header --tb=line -q` for compact, parseable output.
+/// When `verbose=true`: drop `-q` and add `-v`. pytest's verbosity counter
+/// cancels `-q` against `-v`, so passing both is silently a no-op.
+fn build_run_args(args: Option<&serde_json::Value>) -> Vec<String> {
+    let path = args
+        .and_then(|a| a.get("path"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let filter = args
+        .and_then(|a| a.get("filter"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let markers = args
+        .and_then(|a| a.get("markers"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let failfast = args
+        .and_then(|a| a.get("failfast"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let verbose = args
+        .and_then(|a| a.get("verbose"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut out: Vec<String> = vec!["--no-header".into(), "--tb=line".into()];
+    if verbose {
+        out.push("-v".into());
+    } else {
+        out.push("-q".into());
+    }
+    if failfast {
+        out.push("-x".into());
+    }
+    if let Some(ref f) = filter {
+        out.push("-k".into());
+        out.push(f.clone());
+    }
+    if let Some(ref m) = markers {
+        out.push("-m".into());
+        out.push(m.clone());
+    }
+    if let Some(ref p) = path {
+        out.push(p.clone());
+    }
+    out
 }
 
 async fn pytest_collect(
@@ -191,7 +199,6 @@ async fn pytest_collect(
     Ok(json!({
         "ok": success,
         "tests": tests,
-        "count": tests.len(),
     }))
 }
 
@@ -397,6 +404,43 @@ ERROR tests/test_qux.py::test_setup - fixture failed
         assert_eq!(collect_failed_tests(out).len(), 0);
     }
 
+    #[test]
+    fn build_run_args_default_is_quiet() {
+        let args = build_run_args(None);
+        assert!(args.contains(&"-q".to_string()));
+        assert!(!args.contains(&"-v".to_string()));
+        assert!(args.contains(&"--no-header".to_string()));
+        assert!(args.contains(&"--tb=line".to_string()));
+    }
+
+    #[test]
+    fn build_run_args_verbose_drops_quiet() {
+        // Regression for review feedback: `-q` and `-v` cancel in pytest's
+        // verbosity counter, so the plugin must send `-v` *without* `-q`.
+        let v = json!({"verbose": true});
+        let args = build_run_args(Some(&v));
+        assert!(args.contains(&"-v".to_string()));
+        assert!(
+            !args.contains(&"-q".to_string()),
+            "verbose=true must NOT pass -q (cancels -v): args={args:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_args_failfast_and_filters() {
+        let v = json!({
+            "failfast": true,
+            "filter": "test_add",
+            "markers": "not slow",
+            "path": "tests/test_x.py",
+        });
+        let args = build_run_args(Some(&v));
+        assert!(args.contains(&"-x".to_string()));
+        assert!(args.windows(2).any(|w| w == ["-k", "test_add"]));
+        assert!(args.windows(2).any(|w| w == ["-m", "not slow"]));
+        assert!(args.contains(&"tests/test_x.py".to_string()));
+    }
+
     #[tokio::test]
     async fn plugin_run_passing() {
         if !is_available() {
@@ -483,6 +527,13 @@ ERROR tests/test_qux.py::test_setup - fixture failed
         assert!(tests
             .iter()
             .any(|t| t.as_str().unwrap().contains("test_add")));
+        // AGENTS.md "Compact responses" rule: redundant `count` on arrays
+        // must be omitted (callers can use array length).
+        assert!(
+            result.output.get("count").is_none(),
+            "collect output must not include redundant `count` field; got {}",
+            result.output
+        );
     }
 
     #[tokio::test]
