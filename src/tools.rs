@@ -371,6 +371,34 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "pytest",
+            tier: ToolTier::Terse,
+            description: "Python test runner. Commands: run (passed/failed/skipped + failure ids), collect (--collect-only test ids).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["run", "collect"]},
+                    "path": {"type": "string", "description": "Test file or directory (default: pytest's auto-discovery)"},
+                    "filter": {"type": "string", "description": "run: -k expression (test name selector)"},
+                    "markers": {"type": "string", "description": "run: -m expression (marker selector)"},
+                    "verbose": {"type": "boolean", "description": "run: -v flag"},
+                    "failfast": {"type": "boolean", "description": "run: -x flag (stop on first failure)"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None, // uses ToolRegistry plugin
+            context_check: Some(|ws| {
+                ws.join("pytest.ini").exists()
+                    || ws.join("pyproject.toml").exists()
+                    || ws.join("setup.py").exists()
+                    || ws.join("setup.cfg").exists()
+                    || ws.join("tox.ini").exists()
+                    || ws.join("conftest.py").exists()
+                    || ws.join("tests").is_dir()
+            }),
+        },
+
+        ToolDef {
             name: "gh",
             tier: ToolTier::Terse,
             description: "GitHub CLI. Commands: pr_view, pr_list, pr_create, pr_diff, pr_checks, api.",

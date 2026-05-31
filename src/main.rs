@@ -206,6 +206,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if plugins::pytest::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::pytest::PytestPlugin::new()))
+            .await;
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered pytest tool plugin");
+        }
+    }
+
     tool_reg
         .register(Arc::new(plugins::discord::DiscordPlugin::new(
             cfg.discord.clone(),
