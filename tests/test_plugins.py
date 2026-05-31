@@ -223,6 +223,121 @@ def test_docker_tool_always_visible(daimonos):
 
 
 # ============================================================
+# Pytest plugin tests
+# ============================================================
+
+
+def _create_pytest_project(ws, body=None, name="test_plug.py"):
+    """Drop a tests/ directory with a single test file in the workspace."""
+    tests_dir = os.path.join(ws, "tests")
+    os.makedirs(tests_dir, exist_ok=True)
+    body = body if body is not None else (
+        "def test_pass():\n    assert 1 + 1 == 2\n\n"
+        "def test_str():\n    assert 'hi'.upper() == 'HI'\n"
+    )
+    with open(os.path.join(tests_dir, name), "w") as f:
+        f.write(body)
+    open(os.path.join(tests_dir, "__init__.py"), "w").close()
+
+
+def _pytest_available():
+    return subprocess.run(
+        ["pytest", "--version"], capture_output=True
+    ).returncode == 0
+
+
+def test_pytest_run_passing(daimonos):
+    """pytest run on all-passing tests reports passed count and ok=true."""
+    if not _pytest_available():
+        import pytest
+        pytest.skip("pytest not on PATH")
+    _create_pytest_project(daimonos.workspace)
+    result = daimonos.call_tool("pytest", {"command": "run"})
+    data = _parse(result)
+    assert data["ok"] is True, f"expected ok, got: {data}"
+    assert data["passed"] == 2
+    assert data["failed"] == 0
+    assert "failures" not in data or len(data["failures"]) == 0
+
+
+def test_pytest_run_with_failure(daimonos):
+    """pytest run reports structured failure ids when a test fails."""
+    if not _pytest_available():
+        import pytest
+        pytest.skip("pytest not on PATH")
+    _create_pytest_project(
+        daimonos.workspace,
+        body=(
+            "def test_pass():\n    assert True\n\n"
+            "def test_fail():\n    assert 1 == 2\n\n"
+            "def test_skip():\n    import pytest\n    pytest.skip('not yet')\n"
+        ),
+    )
+    result = daimonos.call_tool("pytest", {"command": "run"})
+    data = _parse(result)
+    assert data["ok"] is False
+    assert data["passed"] == 1
+    assert data["failed"] == 1
+    assert data["skipped"] == 1
+    failures = data.get("failures", [])
+    assert len(failures) == 1
+    assert "test_fail" in failures[0]
+
+
+def test_pytest_run_with_filter(daimonos):
+    """pytest run with -k filter selects a subset."""
+    if not _pytest_available():
+        import pytest
+        pytest.skip("pytest not on PATH")
+    _create_pytest_project(daimonos.workspace)
+    result = daimonos.call_tool("pytest", {"command": "run", "filter": "test_pass"})
+    data = _parse(result)
+    assert data["ok"] is True
+    assert data["passed"] == 1
+
+
+def test_pytest_collect(daimonos):
+    """pytest collect returns the list of discovered test ids."""
+    if not _pytest_available():
+        import pytest
+        pytest.skip("pytest not on PATH")
+    _create_pytest_project(daimonos.workspace)
+    result = daimonos.call_tool("pytest", {"command": "collect"})
+    data = _parse(result)
+    assert data["ok"] is True
+    assert data["count"] >= 2
+    assert any("test_pass" in t for t in data["tests"])
+
+
+def test_pytest_tool_visible_with_tests_dir(daimonos):
+    """pytest tool appears when a tests/ directory exists."""
+    _create_pytest_project(daimonos.workspace)
+    tools = daimonos.list_tools()
+    tool_names = [t["name"] for t in tools]
+    assert "pytest" in tool_names
+
+
+def test_pytest_tool_hidden_without_python_context(daimonos):
+    """pytest tool is hidden when no Python project markers are present."""
+    tools = daimonos.list_tools()
+    tool_names = [t["name"] for t in tools]
+    assert "pytest" not in tool_names
+
+
+def test_pytest_via_starlark(daimonos):
+    """pytest tool works through execute_script Starlark binding."""
+    if not _pytest_available():
+        import pytest
+        pytest.skip("pytest not on PATH")
+    _create_pytest_project(daimonos.workspace)
+    code = 'result = pytest("run")'
+    result = daimonos.call_tool("execute_script", {"code": code})
+    data = _parse(result)
+    assert data["result"]["ok"] is True
+    assert data["result"]["passed"] == 2
+
+
+# ============================================================
 # Discord plugin tests
 # ============================================================
 

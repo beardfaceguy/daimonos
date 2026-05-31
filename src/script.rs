@@ -814,6 +814,38 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         })
     }
 
+    fn pytest<'v>(
+        command: &str,
+        #[starlark(require = named)] path: Option<&str>,
+        #[starlark(require = named)] filter: Option<&str>,
+        #[starlark(require = named)] markers: Option<&str>,
+        #[starlark(require = named)] verbose: Option<bool>,
+        #[starlark(require = named)] failfast: Option<bool>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = path {
+                args_val["path"] = serde_json::json!(v);
+            }
+            if let Some(v) = filter {
+                args_val["filter"] = serde_json::json!(v);
+            }
+            if let Some(v) = markers {
+                args_val["markers"] = serde_json::json!(v);
+            }
+            if let Some(v) = verbose {
+                args_val["verbose"] = serde_json::json!(v);
+            }
+            if let Some(v) = failfast {
+                args_val["failfast"] = serde_json::json!(v);
+            }
+            let resp = run_registry_tool(ctx, "pytest", &cmd, &args_val)?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
     fn session_stats<'v>(
         #[starlark(require = named, default = "session")] scope: &str,
         #[starlark(require = named)] days: Option<i64>,
@@ -924,6 +956,7 @@ pub fn tool_signatures() -> String {
         "def git(command: str, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
         "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
         "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
+        "def pytest(command: str, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
         "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
         "def discord(command: str, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
         "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",
