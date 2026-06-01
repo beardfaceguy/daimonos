@@ -379,9 +379,9 @@ mod tests {
     fn extract_trigrams_from_content() {
         let mut trigrams = HashMap::new();
         extract_trigrams(b"abcde", 0, &mut trigrams);
-        assert!(trigrams.contains_key(&[b'a', b'b', b'c']));
-        assert!(trigrams.contains_key(&[b'b', b'c', b'd']));
-        assert!(trigrams.contains_key(&[b'c', b'd', b'e']));
+        assert!(trigrams.contains_key(b"abc"));
+        assert!(trigrams.contains_key(b"bcd"));
+        assert!(trigrams.contains_key(b"cde"));
         assert_eq!(trigrams.len(), 3);
     }
 
@@ -396,7 +396,7 @@ mod tests {
     fn extract_trigrams_deduplicates_per_file() {
         let mut trigrams = HashMap::new();
         extract_trigrams(b"aaaa", 0, &mut trigrams);
-        assert_eq!(trigrams[&[b'a', b'a', b'a']].len(), 1);
+        assert_eq!(trigrams[b"aaa"].len(), 1);
     }
 
     #[test]

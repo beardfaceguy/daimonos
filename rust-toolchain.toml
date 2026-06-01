@@ -1,0 +1,9 @@
+[toolchain]
+# Pinned so CI (and local dev) use a fixed Rust release. `cargo clippy
+# --all-targets -- -D warnings` had been failing because CI used
+# `dtolnay/rust-toolchain@stable`, which floats to the newest stable and
+# enables newly-added clippy lints on code that was clean when written.
+# Bump deliberately (and re-run clippy) rather than drifting.
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

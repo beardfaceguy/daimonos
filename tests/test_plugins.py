@@ -4,7 +4,31 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+
+import pytest
+
+
+def _gh_authenticated() -> bool:
+    """True only if the `gh` CLI is installed AND authenticated. The gh plugin
+    tests below call the live GitHub API; without auth (e.g. in CI, where no
+    token is wired to the plugin) `gh` returns a non-JSON error string and the
+    tests can't run meaningfully, so they are skipped rather than failed."""
+    if shutil.which("gh") is None:
+        return False
+    try:
+        return subprocess.run(
+            ["gh", "auth", "status"], capture_output=True, timeout=10
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+requires_gh_auth = pytest.mark.skipif(
+    not _gh_authenticated(),
+    reason="gh CLI not authenticated; skipping live GitHub API tests",
+)
 
 
 def _parse(result):
@@ -140,6 +164,7 @@ def test_cargo_tool_hidden_without_manifest(daimonos):
 # ============================================================
 
 
+@requires_gh_auth
 def test_gh_pr_list(daimonos):
     """gh pr_list returns structured PR listing."""
     ws = daimonos.workspace
@@ -158,6 +183,7 @@ def test_gh_pr_list(daimonos):
     assert isinstance(data["prs"], list)
 
 
+@requires_gh_auth
 def test_gh_api_endpoint(daimonos):
     """gh api calls a GitHub API endpoint and returns JSON."""
     ws = daimonos.workspace
@@ -267,6 +293,7 @@ def test_cargo_via_starlark(daimonos):
     assert data["result"]["ok"] is True
 
 
+@requires_gh_auth
 def test_gh_via_starlark(daimonos):
     """gh tool works through execute_script Starlark binding."""
     ws = daimonos.workspace

@@ -167,7 +167,7 @@ async fn parse_cargo_redirect(
         }
     }
 
-    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+    let extra = if plugin_args.as_object().is_none_or(|o| o.is_empty()) {
         None
     } else {
         Some(plugin_args)
@@ -256,7 +256,7 @@ async fn parse_git_redirect(
         }
     }
 
-    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+    let extra = if plugin_args.as_object().is_none_or(|o| o.is_empty()) {
         None
     } else {
         Some(plugin_args)
@@ -329,7 +329,7 @@ async fn parse_gh_redirect(
         }
     }
 
-    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+    let extra = if plugin_args.as_object().is_none_or(|o| o.is_empty()) {
         None
     } else {
         Some(plugin_args)
@@ -394,7 +394,7 @@ async fn parse_docker_redirect(
         }
     }
 
-    let extra = if plugin_args.as_object().map_or(true, |o| o.is_empty()) {
+    let extra = if plugin_args.as_object().is_none_or(|o| o.is_empty()) {
         None
     } else {
         Some(plugin_args)
@@ -426,12 +426,10 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
 
     // Layer 1: try redirecting through a native plugin for structured output.
     // Pass the merged env so per-call kv reaches the plugin too.
-    if session.cfg.process.exec_plugin_redirect {
-        if args.is_empty() {
-            if let Some(registry) = &session.tool_registry {
-                if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
-                    return resp;
-                }
+    if session.cfg.process.exec_plugin_redirect && args.is_empty() {
+        if let Some(registry) = &session.tool_registry {
+            if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
+                return resp;
             }
         }
     }

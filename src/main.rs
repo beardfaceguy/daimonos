@@ -302,6 +302,10 @@ async fn run_socket_server(
     }
 }
 
+// Per-connection handler threads the daemon's shared services (index, config,
+// tool registry, pipeline cache, analytics) into the session; grouping them
+// into a struct would only move the argument list elsewhere.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     workspace: PathBuf,

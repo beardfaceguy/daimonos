@@ -577,6 +577,9 @@ fn builtin_functions(builder: &mut GlobalsBuilder) {
 
 // --- Starlark tool function bindings ---
 
+// The `#[starlark_module]` macro expands to a registration fn whose arity is
+// the sum of all bound functions' params; clippy counts that synthetic total.
+#[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn tool_functions(builder: &mut GlobalsBuilder) {
     fn read_file<'v>(

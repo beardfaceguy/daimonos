@@ -275,6 +275,12 @@ impl PipelineCache {
 }
 
 #[cfg(test)]
+// These async tests intentionally hold the `inotify_test_lock()` guard (a
+// std Mutex serializing inotify-dependent tests, vikunja #257) across `.await`
+// points for the test's duration; dropping it early would defeat the
+// serialization. The lint's concern (runtime stalls on a contended lock) does
+// not apply to a test-only serialization guard.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use serde_json::json;
