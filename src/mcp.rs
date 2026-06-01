@@ -700,7 +700,7 @@ impl ServerHandler for DaimonosHandler {
                     }
                     ok_text(serde_json::to_string(&resp).unwrap_or_default())
                 }
-                Err(e) => err_text(format!("{e}")),
+                Err(e) => err_text(e.to_string()),
             };
         }
 

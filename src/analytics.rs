@@ -316,7 +316,7 @@ impl AnalyticsStore {
         if self.retention_days > 0 {
             let should_cleanup: bool = {
                 let stats = self.stats_lock();
-                stats.total_calls % 100 == 0
+                stats.total_calls.is_multiple_of(100)
             };
             if should_cleanup {
                 let cutoff = Utc::now() - chrono::Duration::days(self.retention_days as i64);

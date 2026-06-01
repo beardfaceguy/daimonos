@@ -1203,7 +1203,7 @@ mod tests {
         .await;
         assert!(r.ok);
         let d = r.d.unwrap();
-        assert!(d["matches"].as_array().unwrap().len() >= 1);
+        assert!(!d["matches"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -4,6 +4,10 @@ use std::path::Path;
 
 use crate::protocol::{self, Op, Request};
 
+/// Maps MCP args JSON to a protocol Request. Factored out of `ToolDef` so the
+/// field type stays readable (clippy::type_complexity).
+pub type ToRequestFn = fn(&Value) -> Result<Request, String>;
+
 // --- Argument extraction helpers (used by to_request fns and mcp.rs) ---
 
 pub fn get_str(args: &Value, key: &str) -> Option<String> {
@@ -54,7 +58,7 @@ pub struct ToolDef {
     pub schema: Value,
     /// Maps MCP args JSON to a protocol Request. None for special tools
     /// that need session access or custom handling (git, set_cwd, etc.).
-    pub to_request: Option<fn(&Value) -> Result<Request, String>>,
+    pub to_request: Option<ToRequestFn>,
     /// If set, tool is omitted from list_tools when the check returns false.
     pub context_check: Option<fn(&Path) -> bool>,
 }

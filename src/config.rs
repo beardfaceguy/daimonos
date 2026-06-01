@@ -444,6 +444,44 @@ fn dirs_next() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
 }
 
+/// Register tools from config into the tool registry.
+pub async fn register_tools(cfg: &Config, registry: &ToolRegistry, quiet_stderr: bool) {
+    for (id, tool_cfg) in &cfg.tools {
+        if id == "x07" {
+            let plugin = Arc::new(X07Plugin::new(&tool_cfg.bin));
+            if !quiet_stderr {
+                eprintln!("tools: registered x07 plugin ({})", tool_cfg.bin);
+            }
+            registry.register(plugin).await;
+        } else {
+            use crate::tool_runner::{ToolCommand, ToolDescriptor};
+            let mut commands = HashMap::new();
+            commands.insert(
+                "run".to_string(),
+                ToolCommand {
+                    bin: tool_cfg.bin.clone(),
+                    args: Vec::new(),
+                    output: "json".to_string(),
+                },
+            );
+            let descriptor = ToolDescriptor {
+                id: id.clone(),
+                commands,
+                source_pattern: tool_cfg.source_pattern.clone(),
+                manifest: tool_cfg.manifest.clone(),
+                diagnostics_format: "json".to_string(),
+                supports_quickfix: false,
+                quickfix_format: None,
+            };
+            let plugin = Arc::new(GenericCliPlugin::new(descriptor));
+            if !quiet_stderr {
+                eprintln!("tools: registered generic plugin '{}'", id);
+            }
+            registry.register(plugin).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,43 +658,5 @@ rate_limit_max_sleep_ms = 5000
         std::env::remove_var(&cfg.discord.bot_token_env_var);
         assert!(!redacted.contains("discord-super-secret"));
         assert!(redacted.contains("[REDACTED]"));
-    }
-}
-
-/// Register tools from config into the tool registry.
-pub async fn register_tools(cfg: &Config, registry: &ToolRegistry, quiet_stderr: bool) {
-    for (id, tool_cfg) in &cfg.tools {
-        if id == "x07" {
-            let plugin = Arc::new(X07Plugin::new(&tool_cfg.bin));
-            if !quiet_stderr {
-                eprintln!("tools: registered x07 plugin ({})", tool_cfg.bin);
-            }
-            registry.register(plugin).await;
-        } else {
-            use crate::tool_runner::{ToolCommand, ToolDescriptor};
-            let mut commands = HashMap::new();
-            commands.insert(
-                "run".to_string(),
-                ToolCommand {
-                    bin: tool_cfg.bin.clone(),
-                    args: Vec::new(),
-                    output: "json".to_string(),
-                },
-            );
-            let descriptor = ToolDescriptor {
-                id: id.clone(),
-                commands,
-                source_pattern: tool_cfg.source_pattern.clone(),
-                manifest: tool_cfg.manifest.clone(),
-                diagnostics_format: "json".to_string(),
-                supports_quickfix: false,
-                quickfix_format: None,
-            };
-            let plugin = Arc::new(GenericCliPlugin::new(descriptor));
-            if !quiet_stderr {
-                eprintln!("tools: registered generic plugin '{}'", id);
-            }
-            registry.register(plugin).await;
-        }
     }
 }
