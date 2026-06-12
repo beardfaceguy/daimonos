@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::index::WorkspaceIndex;
 use crate::ops;
 use crate::pipeline_cache::PipelineCache;
@@ -611,13 +611,14 @@ impl ServerHandler for DaimonosHandler {
         let all = tools::tool_definitions();
         let workspace = &session.workspace;
 
+        let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
         let visible: Vec<Tool> = all
             .into_iter()
             .filter(|t| session.exposed_tools.contains(&t.name))
             .filter(|t| tools::passes_context_check(&t.name, workspace))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
-                if tools::has_full_schema(&t.name) && !already_used {
+                if tools::expose_full_schema_in_list(&t.name, full_tool_schemas, already_used) {
                     t
                 } else {
                     Tool {

@@ -606,11 +606,21 @@ pub fn on_demand_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Returns true if this tool should have its full inputSchema in list_tools.
+/// Returns true if this tool is Full-tier (always gets schema in list_tools).
 pub fn has_full_schema(name: &str) -> bool {
     all_tools()
         .iter()
         .any(|t| t.name == name && t.tier == ToolTier::Full)
+}
+
+/// Whether `list_tools` should include the full inputSchema for this tool.
+pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_used: bool) -> bool {
+    if full_tool_schemas {
+        return all_tools().iter().any(|t| {
+            t.name == name && (t.tier == ToolTier::Full || t.tier == ToolTier::Terse)
+        });
+    }
+    has_full_schema(name) && !already_used
 }
 
 /// Returns false if the tool has a context check that fails for this workspace.
@@ -738,6 +748,16 @@ mod tests {
         assert!(!has_full_schema("git"));
         assert!(!has_full_schema("snapshot"));
         assert!(!has_full_schema("ls"));
+    }
+
+    #[test]
+    fn expose_full_schema_in_list_respects_mode() {
+        assert!(expose_full_schema_in_list("read_file", false, false));
+        assert!(!expose_full_schema_in_list("read_file", false, true));
+        assert!(!expose_full_schema_in_list("git", false, false));
+        assert!(expose_full_schema_in_list("git", true, false));
+        assert!(expose_full_schema_in_list("git", true, true));
+        assert!(!expose_full_schema_in_list("diff_files", true, false));
     }
 
     #[test]
