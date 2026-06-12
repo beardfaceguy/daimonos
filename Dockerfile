@@ -12,6 +12,9 @@
 #
 # The container reads MCP requests from stdin and writes responses to
 # stdout, so `-i` is required. Mount your project at /workspace.
+#
+# Glama releases: add a build step `ENV DAIMONOS_MCP_FULL_SCHEMAS=1` so
+# list_tools exposes full JSON Schemas for Terse-tier tools (TDQS scoring).
 
 # ---- build stage ----
 FROM rust:1-bookworm AS build

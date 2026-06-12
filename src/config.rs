@@ -110,6 +110,12 @@ pub struct McpConfig {
     /// Use `--verbose`, set `[mcp] startup_logs = true`, or export
     /// `DAIMONOS_LOG_STARTUP=1` to restore stderr diagnostics.
     pub startup_logs: bool,
+    /// When `true`, `list_tools` returns full JSON Schemas for Terse-tier
+    /// tools (git, cargo, docker, etc.) instead of empty `{type: object}`.
+    /// Default off to save tokens in editor sessions. Enable for Glama
+    /// introspection via `[mcp] full_tool_schemas = true` or
+    /// `DAIMONOS_MCP_FULL_SCHEMAS=1`.
+    pub full_tool_schemas: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -144,8 +150,21 @@ impl Default for McpConfig {
         Self {
             idle_timeout_secs: 600,
             startup_logs: false,
+            full_tool_schemas: false,
         }
     }
+}
+
+/// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.
+/// Env `DAIMONOS_MCP_FULL_SCHEMAS` (`1`/`true`/`yes`/`on`) wins over config.
+pub fn effective_full_tool_schemas(cfg: &Config) -> bool {
+    if let Ok(raw) = std::env::var("DAIMONOS_MCP_FULL_SCHEMAS") {
+        return matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    cfg.mcp.full_tool_schemas
 }
 
 impl Default for DiscordConfig {
@@ -499,6 +518,7 @@ mod tests {
         assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
         assert!(!cfg.mcp.startup_logs);
+        assert!(!cfg.mcp.full_tool_schemas);
         assert!(cfg.tools.is_empty());
     }
 
@@ -511,6 +531,17 @@ mod tests {
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.index.max_depth, 20);
         assert!(!cfg.mcp.startup_logs);
+        assert!(!cfg.mcp.full_tool_schemas);
+    }
+
+    #[test]
+    fn effective_full_tool_schemas_env_overrides_config() {
+        let cfg = Config::default();
+        std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "1");
+        assert!(effective_full_tool_schemas(&cfg));
+        std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "false");
+        assert!(!effective_full_tool_schemas(&cfg));
+        std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
     }
 
     #[test]

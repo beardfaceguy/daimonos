@@ -79,6 +79,11 @@ idle_timeout_secs = 600
 # MCP subprocess stderr as errors). Use `--verbose`, export DAIMONOS_LOG_STARTUP=1,
 # or set true here for diagnostics.
 startup_logs = false
+# When true, list_tools includes full JSON Schemas for Terse-tier plugin tools
+# (git, cargo, docker, …). Default false to save tokens. Glama introspection
+# expects full schemas — set true here or export DAIMONOS_MCP_FULL_SCHEMAS=1
+# in the Glama Dockerfile build (recommended for release scoring only).
+full_tool_schemas = false
 
 [discord]
 # Enable Discord integration tools. Defaults to false (off).
