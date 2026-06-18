@@ -8,6 +8,23 @@ max_depth = 20
 max_file_size = 1_000_000
 # Bytes to sniff for null bytes when detecting binary files
 binary_sniff_bytes = 512
+# Hard cap on indexed files. The walk stops once this many files are
+# collected, bounding index memory on very large monorepos. Also used as the
+# budget for the over-broad-root preflight below. 0 disables the cap.
+max_files = 50_000
+# Gate eager indexing on a signal instead of a path blocklist. A root larger
+# than the max_files preflight budget is auto-indexed only if it looks like a
+# real project (a project_markers entry is present at the root). This stops
+# daimonos from crawling an over-broad root (e.g. $HOME, a NAS mount) that an
+# editor inherited as cwd. Small roots are always indexed. A gated root gets
+# an empty index; an explicit -w or an MCP roots handshake re-roots normally.
+guard_overbroad_roots = true
+# Filenames that mark a root as a real project for the gate above.
+project_markers = [
+  ".git", ".hg", ".svn",
+  "Cargo.toml", "package.json", "pyproject.toml", "go.mod",
+  "Gemfile", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile",
+]
 # File extensions to skip during indexing (known binary formats)
 skip_extensions = [
   "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg",
