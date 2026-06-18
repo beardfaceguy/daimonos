@@ -154,9 +154,12 @@ async fn main() -> anyhow::Result<()> {
     if kgl::autoindex::enabled() {
         let kgl_ws = workspace.clone();
         let quiet = mcp_quiet_stderr;
+        let startup_cfg = cfg.kgl.clone();
         tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().to_rfc3339();
-            if let Ok(Some((sub, nodes, edges))) = kgl::autoindex::run_startup(&kgl_ws, &now) {
+            if let Ok(Some((sub, nodes, edges))) =
+                kgl::autoindex::run_startup(&kgl_ws, &now, &startup_cfg)
+            {
                 if !quiet {
                     eprintln!("kgl: startup index — {nodes} nodes / {edges} edges via {sub}");
                 }
@@ -164,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
         // A2: keep the graph fresh within the session via a debounced file watcher.
-        kgl::autoindex::spawn_watcher(workspace.clone(), mcp_quiet_stderr);
+        kgl::autoindex::spawn_watcher(workspace.clone(), mcp_quiet_stderr, cfg.kgl.clone());
     }
 
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());

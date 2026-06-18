@@ -16,6 +16,7 @@ pub struct Config {
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
     pub discord: DiscordConfig,
+    pub kgl: KglConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -153,6 +154,47 @@ impl Default for McpConfig {
             full_tool_schemas: false,
         }
     }
+}
+
+/// Tunables for the KGL (knowledge-graph) layer. KGL itself is gated on
+/// `DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE`; these values govern its
+/// SQLite access and the background file-watcher when it is enabled.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct KglConfig {
+    /// SQLite busy-timeout in milliseconds applied to every KGL store
+    /// connection. The autoindex watcher writes on its own connection while
+    /// `kgl_query` / `kgl_assert` use separate ones; a non-zero busy timeout
+    /// (with WAL journaling) lets a connection wait briefly for a lock instead
+    /// of surfacing `SQLITE_BUSY` as a tool error.
+    pub busy_timeout_ms: u64,
+    /// Hard cap on inotify watches the KGL file-watcher may register, so it
+    /// never exhausts `fs.inotify.max_user_watches`.
+    pub max_watches: usize,
+    /// Debounce window in seconds: coalesce change bursts into at most one
+    /// graph rebuild per tick.
+    pub debounce_secs: u64,
+    /// Directory base names never walked when detecting/indexing a substrate or
+    /// registering watches (build/vcs churn + our own store).
+    pub skip_dirs: Vec<String>,
+}
+
+impl Default for KglConfig {
+    fn default() -> Self {
+        Self {
+            busy_timeout_ms: 5_000,
+            max_watches: 4_096,
+            debounce_secs: 2,
+            skip_dirs: default_kgl_skip_dirs(),
+        }
+    }
+}
+
+fn default_kgl_skip_dirs() -> Vec<String> {
+    ["target", ".git", ".jj", "node_modules", ".kgl"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.
@@ -504,6 +546,11 @@ pub async fn register_tools(cfg: &Config, registry: &ToolRegistry, quiet_stderr:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global environment variables so the
+    /// parallel test runner can't observe a half-applied env mutation.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config_values() {
@@ -519,6 +566,10 @@ mod tests {
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
         assert!(!cfg.mcp.startup_logs);
         assert!(!cfg.mcp.full_tool_schemas);
+        assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
+        assert_eq!(cfg.kgl.max_watches, 4_096);
+        assert_eq!(cfg.kgl.debounce_secs, 2);
+        assert!(cfg.kgl.skip_dirs.iter().any(|d| d == "node_modules"));
         assert!(cfg.tools.is_empty());
     }
 
@@ -532,10 +583,16 @@ mod tests {
         assert_eq!(cfg.index.max_depth, 20);
         assert!(!cfg.mcp.startup_logs);
         assert!(!cfg.mcp.full_tool_schemas);
+        assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
+        assert_eq!(cfg.kgl.max_watches, 4_096);
     }
 
     #[test]
     fn effective_full_tool_schemas_env_overrides_config() {
+        // Process-global env is shared across the parallel test runner, so
+        // serialize the (set -> assert -> restore) sequence against any other
+        // test that mutates the same variable.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config::default();
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "1");
         assert!(effective_full_tool_schemas(&cfg));

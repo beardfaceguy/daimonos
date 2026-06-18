@@ -432,13 +432,17 @@ fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Respons
 /// the session's workspace + id from the tool context.
 fn record_script_observation(name: &str, args: &serde_json::Value) {
     let _ = with_ctx(|ctx| {
-        let (ws, sid) = ctx.handle.block_on(async {
+        let (ws, sid, kcfg) = ctx.handle.block_on(async {
             let s = ctx.session.lock().await;
-            (s.workspace.clone(), s.external_session_id.clone())
+            (
+                s.workspace.clone(),
+                s.external_session_id.clone(),
+                s.cfg.kgl.clone(),
+            )
         });
         let now = chrono::Utc::now().to_rfc3339();
         let sid = sid.unwrap_or_else(|| "unknown".to_string());
-        let _ = crate::kgl::observe::record_file_op(&ws, &sid, name, args, &now);
+        let _ = crate::kgl::observe::record_file_op(&ws, &sid, name, args, &now, &kcfg);
         Ok(())
     });
 }

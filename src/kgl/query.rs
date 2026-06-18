@@ -3,6 +3,7 @@
 //! completeness), returning JSON shaped so an agent can orient WITHOUT reading
 //! source. Wired into the MCP layer as the `kgl_query` tool.
 
+use crate::config::KglConfig;
 use crate::kgl::model::{DefNode, Edge, EdgeKind};
 use crate::kgl::store::{Direction, KglStore, NodeRecord, Violation};
 use crate::kgl::substrate::Substrate;
@@ -15,17 +16,38 @@ use std::path::Path;
 /// Dispatch one query action against the workspace's KGL store. `now` is an
 /// ISO-8601 timestamp supplied by the host (used as the index run stamp; KGL
 /// never invents time).
-pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Value> {
-    let mut store = KglStore::open_workspace(workspace)?;
+pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglConfig) -> Result<Value> {
+    let mut store = KglStore::open_workspace_with(workspace, cfg)?;
     match action {
         "index" => {
-            // Substrate is swappable: x07 (default) reads .x07.json sources;
-            // graphify reads a derived graphify-out/graph.json (real codebases).
-            let which = args.get("substrate").and_then(|v| v.as_str()).unwrap_or("x07");
-            let sub: Box<dyn Substrate> = match which {
-                "graphify" => Box::new(GraphifySubstrate),
-                _ => Box::new(X07Substrate),
-            };
+            // Substrate is swappable: x07 reads .x07.json sources; graphify reads
+            // a derived graphify-out/graph.json (real codebases). When the caller
+            // omits `substrate`, auto-detect exactly like startup (graphify if a
+            // graph.json exists, else x07) — never blindly default to x07, which
+            // on a graphify-only workspace would run an empty scan whose prune
+            // wipes the existing graph and its agent metadata.
+            let (which, sub): (&str, Box<dyn Substrate>) =
+                match args.get("substrate").and_then(|v| v.as_str()) {
+                    Some("graphify") => ("graphify", Box::new(GraphifySubstrate)),
+                    Some("x07") => ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))),
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "kgl_query: unknown substrate '{other}' (expected x07|graphify)"
+                        ))
+                    }
+                    None => match crate::kgl::autoindex::detect(workspace, cfg) {
+                        Some(pair) => pair,
+                        None => {
+                            return Ok(json!({
+                                "indexed": false,
+                                "substrate": Value::Null,
+                                "nodes": 0,
+                                "edges": 0,
+                                "reason": "no substrate detected (no graphify-out/graph.json or *.x07.json)",
+                            }))
+                        }
+                    },
+                };
             let (nodes, edges) = store.populate(sub.as_ref(), workspace, now)?;
             Ok(json!({ "indexed": true, "substrate": which, "nodes": nodes, "edges": edges }))
         }
@@ -161,12 +183,12 @@ mod tests {
         let tmp = workspace();
         let ws = tmp.path();
 
-        let idx = run(ws, "index", &json!({}), "t0").unwrap();
+        let idx = run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
         assert_eq!(idx["indexed"], json!(true));
         assert!(idx["nodes"].as_u64().unwrap() >= 2);
 
         // find by name returns the authenticate node
-        let found = run(ws, "find", &json!({"q": "authenticate"}), "t0").unwrap();
+        let found = run(ws, "find", &json!({"q": "authenticate"}), "t0", &KglConfig::default()).unwrap();
         let arr = found.as_array().unwrap();
         assert!(arr.iter().any(|r| r["name"] == json!("authenticate")));
 
@@ -178,7 +200,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let nb = run(ws, "neighbors", &json!({"hash": hash, "kind": "reads"}), "t0").unwrap();
+        let nb = run(ws, "neighbors", &json!({"hash": hash, "kind": "reads"}), "t0", &KglConfig::default()).unwrap();
         assert!(nb
             .as_array()
             .unwrap()
@@ -186,7 +208,7 @@ mod tests {
             .any(|e| e["to"] == json!("file:///etc/users.db")));
 
         // check: authenticate has no purpose yet -> incomplete
-        let chk = run(ws, "check", &json!({"mode": "commit"}), "t0").unwrap();
+        let chk = run(ws, "check", &json!({"mode": "commit"}), "t0", &KglConfig::default()).unwrap();
         assert_eq!(chk["complete"], json!(false));
     }
 
@@ -194,13 +216,45 @@ mod tests {
     fn orient_bundles_matches_and_edges() {
         let tmp = workspace();
         let ws = tmp.path();
-        run(ws, "index", &json!({}), "t0").unwrap();
-        let o = run(ws, "orient", &json!({"task": "authenticate"}), "t0").unwrap();
+        run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
+        let o = run(ws, "orient", &json!({"task": "authenticate"}), "t0", &KglConfig::default()).unwrap();
         assert!(o["matches"]
             .as_array()
             .unwrap()
             .iter()
             .any(|m| m["name"] == json!("authenticate")));
         assert!(o["edges"].is_array());
+    }
+
+    #[test]
+    fn index_without_substrate_detects_graphify_not_x07() {
+        // Blocker regression at the tool boundary: `index` with no substrate on
+        // a graphify-only workspace must pick graphify, not run an empty x07
+        // scan (whose prune would wipe the graph).
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("graphify-out")).unwrap();
+        std::fs::write(
+            ws.join("graphify-out").join("graph.json"),
+            r#"{"nodes":[{"id":"n1","label":".foo()","file_type":"code","source_file":"src/a.rs"}],"links":[]}"#,
+        )
+        .unwrap();
+        let idx = run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
+        assert_eq!(idx["substrate"], json!("graphify"));
+        assert_eq!(idx["indexed"], json!(true));
+        assert!(idx["nodes"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn index_with_unknown_substrate_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            tmp.path(),
+            "index",
+            &json!({"substrate": "bogus"}),
+            "t0",
+            &KglConfig::default(),
+        );
+        assert!(r.is_err());
     }
 }

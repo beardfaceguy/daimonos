@@ -79,6 +79,9 @@ pub enum Derivation {
     Inferred,
     /// Asserted by the authoring agent via the metadata channel.
     Declared,
+    /// Observed by daimonos watching an agent act (e.g. a file tool call).
+    /// Distinct from `Declared`: the agent did the thing, it didn't claim it.
+    Observed,
 }
 
 /// A typed edge between a node and another node or a resource.
