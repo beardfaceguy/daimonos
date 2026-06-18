@@ -81,6 +81,16 @@ impl PipelineCache {
     }
 
     pub fn with_config(watch_path: &Path, cfg: &PipelineCacheConfig) -> Self {
+        Self::with_config_watching(watch_path, cfg, true)
+    }
+
+    /// Like [`with_config`], but `watch=false` skips installing the inotify
+    /// watcher entirely. Used for over-broad roots (home/system dirs) where
+    /// a recursive-equivalent watch would burn through the inotify watch cap
+    /// over thousands of unrelated directories. With no watcher the cache is
+    /// never invalidated by filesystem changes — acceptable on a guarded
+    /// root, which is not a real project the agent is actively editing.
+    pub fn with_config_watching(watch_path: &Path, cfg: &PipelineCacheConfig, watch: bool) -> Self {
         let inner = Arc::new(RwLock::new(CacheState {
             entries: HashMap::new(),
             last_invalidated: Instant::now(),
@@ -89,7 +99,11 @@ impl PipelineCache {
         }));
 
         let dirty_flag = Arc::new(AtomicBool::new(false));
-        let watcher = Self::start_watcher(watch_path, dirty_flag.clone(), cfg);
+        let watcher = if watch {
+            Self::start_watcher(watch_path, dirty_flag.clone(), cfg)
+        } else {
+            None
+        };
 
         Self {
             inner,

@@ -140,6 +140,21 @@ async fn main() -> anyhow::Result<()> {
 
     script::configure_max_concurrent(cfg.process.max_script_threads);
 
+    // Over-broad roots (a large directory with no project marker, e.g. $HOME
+    // inherited as cwd) would index gigabytes of unrelated files and exhaust
+    // the inotify watch cap. Detect once and suppress the heavyweight
+    // watchers/indexers; the MCP `roots` handshake (or an explicit `-w`)
+    // re-roots to a real project later.
+    let overbroad = !index::should_eager_index(&workspace, &cfg.index);
+    if overbroad && !mcp_quiet_stderr {
+        eprintln!(
+            "daimonos: workspace {:?} is an over-broad root (large, no project marker); \
+             auto-index and file watching are suppressed. Launch with -w <project> \
+             or let the client advertise MCP roots to index a real project.",
+            workspace
+        );
+    }
+
     let ws_index = Arc::new(index::WorkspaceIndex::new(
         workspace.clone(),
         &cfg.index,
@@ -151,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
     // one-shot startup build so a fresh agent session gets a current graph
     // without a manual `kgl_query index`. Runs on a blocking task; never blocks
     // or breaks startup. Off unless DAIMONOS_KGL_AUTOINDEX is set.
-    if kgl::autoindex::enabled() {
+    if kgl::autoindex::enabled() && !overbroad {
         let kgl_ws = workspace.clone();
         let quiet = mcp_quiet_stderr;
         let startup_cfg = cfg.kgl.clone();
@@ -233,9 +248,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("auto-registered discord tool plugin");
     }
 
-    let pcache = Arc::new(pipeline_cache::PipelineCache::with_config(
+    let pcache = Arc::new(pipeline_cache::PipelineCache::with_config_watching(
         &workspace,
         &cfg.pipeline_cache,
+        !overbroad,
     ));
 
     // Analytics: --stats prints summary and exits
