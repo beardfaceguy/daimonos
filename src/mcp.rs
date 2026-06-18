@@ -4,7 +4,7 @@ use rust_mcp_sdk::mcp_server::{
 };
 use rust_mcp_sdk::schema::{
     CallToolError, CallToolRequestParams, CallToolResult, Implementation, InitializeResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, RpcError, ServerCapabilities,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, Root, RpcError, ServerCapabilities,
     ServerCapabilitiesTools, TextContent, Tool,
 };
 use rust_mcp_sdk::{McpServer, StdioTransport, TransportOptions};
@@ -23,6 +23,7 @@ use crate::pipeline_cache::PipelineCache;
 use crate::protocol::Response;
 use crate::script;
 use crate::session::Session;
+use crate::snapshot::SnapshotStore;
 use crate::tool_runner::ToolRegistry;
 use crate::tools;
 
@@ -32,13 +33,18 @@ pub struct DaimonosHandler {
     /// abandonment. Storing unix-seconds in an `AtomicU64` lets the
     /// watchdog read it without ever blocking on the session mutex.
     last_activity: Arc<AtomicU64>,
+    /// When true, re-root diagnostics are written to stderr. Mirrors the
+    /// server's startup-log gate so MCP-quiet mode stays silent (Cursor
+    /// surfaces subprocess stderr as `[error]`).
+    startup_logs: bool,
 }
 
 impl DaimonosHandler {
-    pub fn new(session: Session, last_activity: Arc<AtomicU64>) -> Self {
+    pub fn new(session: Session, last_activity: Arc<AtomicU64>, startup_logs: bool) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
             last_activity,
+            startup_logs,
         }
     }
 
@@ -668,8 +674,126 @@ fn extract_result_text(result: &CallToolResult) -> String {
         .join("")
 }
 
+/// Decode percent-escapes (`%XX`) in a URI path component. Anything that
+/// isn't a well-formed escape is passed through verbatim, so plain paths
+/// (the common case) are untouched.
+fn percent_decode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Convert an MCP root URI into a filesystem path. The MCP spec requires
+/// roots to use the `file://` scheme; anything else (http, etc.) yields
+/// `None` so the caller falls back to the launch workspace.
+fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///abs/path` -> empty authority, `rest` begins with `/`.
+    // `file://host/abs/path` -> drop the authority and keep from the
+    // first `/`. A bare `file://host` with no path is not a workspace.
+    let path_part = if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        match rest.find('/') {
+            Some(idx) => rest[idx..].to_string(),
+            None => return None,
+        }
+    };
+    if path_part.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(percent_decode(&path_part)))
+}
+
+/// Pick the first client-advertised root that resolves to an existing
+/// directory. Roots are tried in order so the client's preferred root
+/// (listed first) wins. Returns the canonicalized path.
+fn pick_workspace_root(roots: &[Root]) -> Option<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|r| root_uri_to_path(&r.uri))
+        .filter_map(|p| p.canonicalize().ok())
+        .find(|p| p.is_dir())
+}
+
+/// Re-root a live session onto `new_root`: repoint the workspace, working
+/// directory, snapshot store, and trigram index, and drop the read cache
+/// (its keys are canonical paths under the old root). The KGL store path is
+/// derived from `session.workspace` at call time, so it follows automatically.
+/// A fresh `WorkspaceIndex` is spawned because `WorkspaceIndex::root` is
+/// immutable by design — the index owns its root for the life of the build.
+fn apply_reroot(session: &mut Session, new_root: PathBuf) {
+    session.workspace = new_root.clone();
+    session.cwd = new_root.clone();
+    session.snapshot_store = SnapshotStore::new(new_root.clone());
+    session.read_cache.clear();
+    let idx = Arc::new(WorkspaceIndex::new(new_root, &session.cfg.index, false));
+    idx.spawn_reindex();
+    session.index = Some(idx);
+}
+
 #[async_trait]
 impl ServerHandler for DaimonosHandler {
+    /// Honor the MCP `roots` protocol (vikunja #46). After the client
+    /// finishes initialization we ask it for its workspace roots and, if it
+    /// advertises one, re-root the session onto the client's actual project
+    /// instead of whatever `-w`/cwd the launcher hardcoded. Clients that
+    /// don't support roots keep the launch workspace — a pure superset of
+    /// the old behavior.
+    async fn on_initialized(&self, runtime: Arc<dyn McpServer>) {
+        if runtime.client_supports_root_list() != Some(true) {
+            return;
+        }
+        let roots = match runtime.request_root_list(None).await {
+            Ok(r) => r.roots,
+            Err(e) => {
+                if self.startup_logs {
+                    eprintln!("daimonos: roots/list request failed: {e}");
+                }
+                return;
+            }
+        };
+        let new_root = match pick_workspace_root(&roots) {
+            Some(p) => p,
+            None => return,
+        };
+        let mut session = self.session.lock().await;
+        let current = session
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| session.workspace.clone());
+        if new_root == current {
+            return;
+        }
+        if self.startup_logs {
+            eprintln!(
+                "daimonos: re-rooting workspace {:?} -> client root {:?}",
+                current, new_root
+            );
+        }
+        apply_reroot(&mut session, new_root);
+    }
+
     async fn handle_list_tools_request(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1060,7 +1184,7 @@ pub async fn run_mcp_server(
     session.external_session_id = analytics::read_agent_session_id_env();
 
     let instructions = build_instructions(&workspace).await;
-    let handler = DaimonosHandler::new(session, last_activity);
+    let handler = DaimonosHandler::new(session, last_activity, startup_logs);
 
     let server_details = InitializeResult {
         server_info: Implementation {
@@ -1120,6 +1244,111 @@ mod tests {
         let resp = Response::ok(json!({"lines": 10}));
         let result = response_to_result(resp).unwrap();
         assert!(result.is_error.is_none() || !result.is_error.unwrap());
+    }
+
+    // --- MCP roots support (vikunja #46): honor the client's workspace root ---
+
+    fn root(uri: &str) -> Root {
+        Root {
+            meta: None,
+            name: None,
+            uri: uri.into(),
+        }
+    }
+
+    #[test]
+    fn root_uri_to_path_parses_standard_file_uri() {
+        assert_eq!(
+            root_uri_to_path("file:///home/user/proj"),
+            Some(PathBuf::from("/home/user/proj"))
+        );
+    }
+
+    #[test]
+    fn root_uri_to_path_handles_authority_host() {
+        // `file://host/abs` -> drop the authority, keep the absolute path.
+        assert_eq!(
+            root_uri_to_path("file://localhost/srv/work"),
+            Some(PathBuf::from("/srv/work"))
+        );
+    }
+
+    #[test]
+    fn root_uri_to_path_percent_decodes() {
+        assert_eq!(
+            root_uri_to_path("file:///home/user/my%20proj"),
+            Some(PathBuf::from("/home/user/my proj"))
+        );
+    }
+
+    #[test]
+    fn root_uri_to_path_rejects_non_file_schemes() {
+        assert_eq!(root_uri_to_path("https://example.com/x"), None);
+        assert_eq!(root_uri_to_path("file://host"), None);
+        assert_eq!(root_uri_to_path("not-a-uri"), None);
+    }
+
+    #[test]
+    fn pick_workspace_root_picks_first_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let uri = format!("file://{}", canon.display());
+        // First root is bogus (non-existent), second is the real dir, third
+        // is a non-file scheme — picker must skip to the real one.
+        let roots = vec![
+            root("file:///definitely/not/here/zzz"),
+            root(&uri),
+            root("https://example.com"),
+        ];
+        assert_eq!(pick_workspace_root(&roots), Some(canon));
+    }
+
+    #[test]
+    fn pick_workspace_root_none_when_no_valid_root() {
+        let roots = vec![root("https://example.com"), root("file:///no/such/dir/q")];
+        assert_eq!(pick_workspace_root(&roots), None);
+    }
+
+    #[tokio::test]
+    async fn apply_reroot_repoints_workspace_cwd_and_index() {
+        use crate::config::Config;
+
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let new_canon = new.path().canonicalize().unwrap();
+        // A uniquely-named file in the new root so we can prove the index
+        // rebuilt against it (and not the old root).
+        std::fs::write(
+            new.path().join("rerooted_marker.rs"),
+            "fn rerooted_sentinel() {}\n",
+        )
+        .unwrap();
+
+        let mut session = Session::new(old.path().to_path_buf(), Arc::new(Config::default()));
+        // Seed the read cache so we can assert it is cleared on re-root.
+        session
+            .read_cache
+            .insert(old.path().join("stale.txt"), crate::session::ReadCacheEntry { hash: 1, lines: 1 });
+
+        apply_reroot(&mut session, new_canon.clone());
+
+        assert_eq!(session.workspace, new_canon);
+        assert_eq!(session.cwd, new_canon);
+        assert!(session.read_cache.is_empty());
+        assert!(session.index.is_some());
+
+        // The freshly spawned index runs on a blocking task; poll until it
+        // has indexed the marker file in the new root.
+        let idx = session.index.clone().unwrap();
+        let mut found = false;
+        for _ in 0..50 {
+            if !idx.search("rerooted_sentinel", 10).await.is_empty() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(found, "re-rooted index did not pick up new-root file");
     }
 
     // --- ResponseMeta plumbing (vikunja #247): structured analytics signals ---
