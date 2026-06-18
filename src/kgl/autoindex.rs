@@ -7,8 +7,9 @@
 //! sources). This removes the "stale manual snapshot" problem for the common
 //! case: every daemon session starts with a current graph, no manual index.
 
+use crate::config::KglConfig;
 use crate::kgl::store::KglStore;
-use crate::kgl::substrate::Substrate;
+use crate::kgl::substrate::{filtered_walk_builder, Substrate};
 use crate::kgl::substrate_graphify::GraphifySubstrate;
 use crate::kgl::substrate_x07::X07Substrate;
 use anyhow::Result;
@@ -17,13 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Directories never worth watching (build/vcs churn + our own store).
-const WATCH_SKIP_DIRS: &[&str] = &["target", ".git", ".jj", "node_modules", ".kgl"];
-/// Hard cap on inotify watches so we never exhaust fs.inotify.max_user_watches.
-const MAX_WATCHES: usize = 4096;
-/// Debounce window: coalesce change bursts into at most one rebuild per tick.
-const DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Whether startup auto-indexing is enabled (env `DAIMONOS_KGL_AUTOINDEX`).
 pub fn enabled() -> bool {
@@ -34,13 +28,16 @@ pub fn enabled() -> bool {
 
 /// Detect a substrate for the workspace: graphify if `graphify-out/graph.json`
 /// exists (cheap check, common for real repos), else x07 if any `*.x07.json`
-/// file exists, else None (nothing to index).
-fn detect(workspace: &Path) -> Option<(&'static str, Box<dyn Substrate>)> {
+/// file exists, else None (nothing to index). The x07 probe honors
+/// `cfg.skip_dirs` so it never crawls `target/`, `node_modules/`, etc. Public so
+/// the `kgl_query index` tool can default its substrate the same way startup
+/// does (avoids an empty x07 scan pruning a graphify graph).
+pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dyn Substrate>)> {
     if workspace.join("graphify-out").join("graph.json").is_file() {
         return Some(("graphify", Box::new(GraphifySubstrate)));
     }
-    let has_x07 = walkdir::WalkDir::new(workspace)
-        .into_iter()
+    let has_x07 = filtered_walk_builder(workspace, &cfg.skip_dirs)
+        .build()
         .filter_map(|e| e.ok())
         .any(|e| {
             e.path()
@@ -49,18 +46,22 @@ fn detect(workspace: &Path) -> Option<(&'static str, Box<dyn Substrate>)> {
                 .is_some_and(|n| n.ends_with(".x07.json"))
         });
     if has_x07 {
-        return Some(("x07", Box::new(X07Substrate)));
+        return Some(("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))));
     }
     None
 }
 
 /// Build/refresh the KGL graph for `workspace` (best-effort). Returns
 /// `Some((substrate, nodes, edges))` when a substrate was found, else `None`.
-pub fn run_startup(workspace: &Path, now: &str) -> Result<Option<(&'static str, usize, usize)>> {
-    let Some((name, sub)) = detect(workspace) else {
+pub fn run_startup(
+    workspace: &Path,
+    now: &str,
+    cfg: &KglConfig,
+) -> Result<Option<(&'static str, usize, usize)>> {
+    let Some((name, sub)) = detect(workspace, cfg) else {
         return Ok(None);
     };
-    let mut store = KglStore::open_workspace(workspace)?;
+    let mut store = KglStore::open_workspace_with(workspace, cfg)?;
     let (nodes, edges) = store.populate(sub.as_ref(), workspace, now)?;
     Ok(Some((name, nodes, edges)))
 }
@@ -70,22 +71,29 @@ pub fn run_startup(workspace: &Path, now: &str) -> Result<Option<(&'static str, 
 /// watcher for the process lifetime; best-effort; gated by the caller. Because
 /// `kgl_query` opens the store fresh per call, background rebuilds are picked up
 /// automatically with no handler/session changes.
-pub fn spawn_watcher(workspace: PathBuf, quiet: bool) {
+pub fn spawn_watcher(workspace: PathBuf, quiet: bool, cfg: KglConfig) {
     let _ = std::thread::Builder::new()
         .name("kgl-watch".to_string())
         .spawn(move || {
             let dirty = Arc::new(AtomicBool::new(false));
-            let Some(_watcher) = build_watcher(&workspace, dirty.clone()) else {
+            let Some(_watcher) = build_watcher(&workspace, dirty.clone(), &cfg) else {
                 if !quiet {
                     eprintln!("kgl: file watcher not started (no dirs registered)");
                 }
                 return;
             };
+            let debounce = Duration::from_secs(cfg.debounce_secs);
             loop {
-                std::thread::sleep(DEBOUNCE);
+                std::thread::sleep(debounce);
                 if dirty.swap(false, Ordering::Relaxed) {
                     let now = chrono::Utc::now().to_rfc3339();
-                    let _ = run_startup(&workspace, &now);
+                    // Surface rebuild failures (e.g. SQLITE_BUSY, parse errors)
+                    // instead of silently leaving the graph stale.
+                    if let Err(e) = run_startup(&workspace, &now, &cfg) {
+                        if !quiet {
+                            eprintln!("kgl: background re-index failed: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -103,7 +111,11 @@ fn relevant_event(paths: &[PathBuf]) -> bool {
         .any(|p| !p.components().any(|c| c.as_os_str() == ".kgl"))
 }
 
-fn build_watcher(workspace: &Path, dirty: Arc<AtomicBool>) -> Option<RecommendedWatcher> {
+fn build_watcher(
+    workspace: &Path,
+    dirty: Arc<AtomicBool>,
+    cfg: &KglConfig,
+) -> Option<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             if !(event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove()) {
@@ -117,23 +129,14 @@ fn build_watcher(workspace: &Path, dirty: Arc<AtomicBool>) -> Option<Recommended
     .ok()?;
 
     let mut watched = 0usize;
-    for entry in ignore::WalkBuilder::new(workspace)
-        .hidden(true)
-        .git_ignore(true)
-        .filter_entry(|e| {
-            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                return true;
-            }
-            let name = e.file_name().to_string_lossy();
-            !WATCH_SKIP_DIRS.iter().any(|d| *d == name.as_ref())
-        })
+    for entry in filtered_walk_builder(workspace, &cfg.skip_dirs)
         .build()
         .flatten()
     {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if watched >= MAX_WATCHES {
+        if watched >= cfg.max_watches {
             break;
         }
         if watcher.watch(entry.path(), RecursiveMode::NonRecursive).is_ok() {
@@ -153,25 +156,40 @@ mod tests {
 
     #[test]
     fn detect_prefers_graphify_then_x07_then_none() {
+        let cfg = KglConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        assert!(detect(tmp.path()).is_none());
+        assert!(detect(tmp.path(), &cfg).is_none());
 
         std::fs::File::create(tmp.path().join("m.x07.json"))
             .unwrap()
             .write_all(br#"{"module_id":"m","decls":[]}"#)
             .unwrap();
-        assert_eq!(detect(tmp.path()).unwrap().0, "x07");
+        assert_eq!(detect(tmp.path(), &cfg).unwrap().0, "x07");
 
         std::fs::create_dir_all(tmp.path().join("graphify-out")).unwrap();
         std::fs::File::create(tmp.path().join("graphify-out").join("graph.json"))
             .unwrap()
             .write_all(br#"{"nodes":[],"links":[]}"#)
             .unwrap();
-        assert_eq!(detect(tmp.path()).unwrap().0, "graphify");
+        assert_eq!(detect(tmp.path(), &cfg).unwrap().0, "graphify");
+    }
+
+    #[test]
+    fn detect_x07_probe_skips_configured_dirs() {
+        // An .x07.json buried under a skip_dir must not make detect pick x07.
+        let cfg = KglConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::File::create(tmp.path().join("node_modules").join("m.x07.json"))
+            .unwrap()
+            .write_all(br#"{"module_id":"m","decls":[]}"#)
+            .unwrap();
+        assert!(detect(tmp.path(), &cfg).is_none());
     }
 
     #[test]
     fn run_startup_indexes_x07_workspace() {
+        let cfg = KglConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::File::create(tmp.path().join("m.x07.json"))
             .unwrap()
@@ -180,7 +198,7 @@ mod tests {
                     "decls":[{"kind":"defn","name":"foo","params":[],"result":"Unit","body":[]}]}"#,
             )
             .unwrap();
-        let (sub, nodes, _edges) = run_startup(tmp.path(), "t0").unwrap().unwrap();
+        let (sub, nodes, _edges) = run_startup(tmp.path(), "t0", &cfg).unwrap().unwrap();
         assert_eq!(sub, "x07");
         assert!(nodes >= 2); // module + foo
 
@@ -195,7 +213,9 @@ mod tests {
     #[test]
     fn run_startup_no_substrate_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(run_startup(tmp.path(), "t0").unwrap().is_none());
+        assert!(run_startup(tmp.path(), "t0", &KglConfig::default())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -203,7 +223,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         let dirty = Arc::new(AtomicBool::new(false));
-        assert!(build_watcher(tmp.path(), dirty).is_some());
+        assert!(build_watcher(tmp.path(), dirty, &KglConfig::default()).is_some());
     }
 
     #[test]
@@ -226,7 +246,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         let dirty = Arc::new(AtomicBool::new(false));
-        let _w = build_watcher(tmp.path(), dirty.clone()).expect("watcher built");
+        let _w = build_watcher(tmp.path(), dirty.clone(), &KglConfig::default())
+            .expect("watcher built");
         std::thread::sleep(Duration::from_millis(300)); // let the watch arm
         std::fs::write(tmp.path().join("src").join("f.txt"), b"x").unwrap();
         let mut flipped = false;

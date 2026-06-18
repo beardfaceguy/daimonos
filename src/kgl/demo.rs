@@ -11,6 +11,7 @@
 //! through the query API alone. Run with `--nocapture` to see the agent's-eye
 //! view printed as a narrative.
 
+use crate::config::KglConfig;
 use crate::kgl::model::{EdgeKind, Intent, Provenance};
 use crate::kgl::query::run;
 use crate::kgl::store::KglStore;
@@ -68,7 +69,7 @@ fn orient_from_graph_alone() {
     write_module(ws);
 
     // --- 1. Build the graph (what `kgl_query index` does). ---
-    let idx = run(ws, "index", &json!({}), "2026-05-30T00:00:00Z").unwrap();
+    let idx = run(ws, "index", &json!({}), "2026-05-30T00:00:00Z", &KglConfig::default()).unwrap();
     println!("\n[index] {idx}");
     assert_eq!(idx["indexed"], json!(true));
 
@@ -135,29 +136,29 @@ fn orient_from_graph_alone() {
     // ============================================================
 
     // (a) "fix the auth flow" -> what's relevant?
-    let hits = run(ws, "find", &json!({"q": "auth"}), "t").unwrap();
+    let hits = run(ws, "find", &json!({"q": "auth"}), "t", &KglConfig::default()).unwrap();
     println!("[find auth] {:?}", names(&hits));
     assert!(has_name(&hits, "authenticate"));
 
     // (b) what does authenticate call?
     let ah = hash_of("authenticate");
-    let calls = run(ws, "neighbors", &json!({"hash": ah, "kind": "calls", "dir": "out"}), "t").unwrap();
+    let calls = run(ws, "neighbors", &json!({"hash": ah, "kind": "calls", "dir": "out"}), "t", &KglConfig::default()).unwrap();
     println!("[authenticate calls] {} edges", arr(&calls).len());
     assert!(arr(&calls).len() >= 3); // load_user, verify_password, issue_token
 
     // (c) what state does the flow read / mutate?
     let lu = hash_of("load_user");
-    let reads = run(ws, "neighbors", &json!({"hash": lu, "kind": "reads", "dir": "out"}), "t").unwrap();
+    let reads = run(ws, "neighbors", &json!({"hash": lu, "kind": "reads", "dir": "out"}), "t", &KglConfig::default()).unwrap();
     println!("[load_user reads] {:?}", arr(&reads).iter().map(|e| e["to"].clone()).collect::<Vec<_>>());
     assert!(arr(&reads).iter().any(|e| e["to"] == json!("file:///var/users.db")));
 
-    let writers = run(ws, "writers_of", &json!({"resource": "session:store"}), "t").unwrap();
+    let writers = run(ws, "writers_of", &json!({"resource": "session:store"}), "t", &KglConfig::default()).unwrap();
     println!("[writers_of session:store] {:?}", names(&writers));
     assert!(has_name(&writers, "issue_token"));
     assert!(has_name(&writers, "revoke_token"));
 
     // (d) what did prior agents leave unresolved?
-    let oq = run(ws, "open_questions", &json!({}), "t").unwrap();
+    let oq = run(ws, "open_questions", &json!({}), "t", &KglConfig::default()).unwrap();
     println!("[open_questions] {:?}", names(&oq));
     assert!(arr(&oq).iter().any(|r| {
         r["intent"]["open_questions"]
@@ -168,13 +169,13 @@ fn orient_from_graph_alone() {
 
     // (e) blast radius: what breaks if hash_password changes?
     let hp = hash_of("hash_password");
-    let blast = run(ws, "blast_radius", &json!({"hash": hp}), "t").unwrap();
+    let blast = run(ws, "blast_radius", &json!({"hash": hp}), "t", &KglConfig::default()).unwrap();
     println!("[blast_radius hash_password] {:?}", names(&blast));
     assert!(has_name(&blast, "verify_password")); // direct caller
     assert!(has_name(&blast, "authenticate")); // transitive caller
 
     // (f) completeness gate
-    let chk = run(ws, "check", &json!({"mode": "commit"}), "t").unwrap();
+    let chk = run(ws, "check", &json!({"mode": "commit"}), "t", &KglConfig::default()).unwrap();
     println!("[check commit] complete={} blocking={}", chk["complete"], chk["blocking"]);
     // With every def documented and effects accounted for (incl. transitively,
     // e.g. `authenticate`/`logout` whose I/O is via callees), the gate passes.

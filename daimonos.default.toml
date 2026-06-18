@@ -128,6 +128,26 @@ extra_ignore_dirs = []
 # hardcoded cap so existing operators see no behavioral change.
 max_entries = 1024
 
+[kgl]
+# Tunables for the KGL (code+intent knowledge-graph) layer. KGL itself is gated
+# on the DAIMONOS_KGL_AUTOINDEX / DAIMONOS_KGL_OBSERVE environment variables;
+# these values govern its SQLite access and background file-watcher when on.
+#
+# SQLite busy-timeout (ms) applied to every KGL store connection. The autoindex
+# watcher writes on its own connection while kgl_query/kgl_assert use separate
+# ones; a non-zero timeout (with WAL journaling, enabled automatically) lets a
+# connection wait briefly for a lock instead of surfacing SQLITE_BUSY as a tool
+# error.
+busy_timeout_ms = 5000
+# Hard cap on inotify watches the KGL file-watcher may register, so it never
+# exhausts fs.inotify.max_user_watches.
+max_watches = 4096
+# Debounce window (seconds): coalesce change bursts into at most one rebuild.
+debounce_secs = 2
+# Directory base names never walked when detecting/indexing a substrate or
+# registering watches (build/vcs churn + our own store).
+skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl"]
+
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.
 # Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.

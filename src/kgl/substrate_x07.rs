@@ -9,15 +9,26 @@
 //! degrade safely to empty when the body/effect shape is absent or unknown.
 
 use crate::kgl::model::{DefNode, Derivation, Edge, EdgeKind, EffectFacts, NodeKind, SubstrateKind};
-use crate::kgl::substrate::{content_hash, IndexResult, Substrate};
+use crate::kgl::substrate::{content_hash, filtered_walk_builder, IndexResult, Substrate};
 use crate::plugins::x07::parse_x07_module;
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
-use walkdir::WalkDir;
 
-/// Extracts a KGL graph from a workspace of `*.x07.json` files.
-pub struct X07Substrate;
+/// Extracts a KGL graph from a workspace of `*.x07.json` files. Carries the
+/// shared skip-dir list so the walk honors `[kgl] skip_dirs` (and never crawls
+/// `target/`, `node_modules/`, etc.).
+#[derive(Default)]
+pub struct X07Substrate {
+    skip_dirs: Vec<String>,
+}
+
+impl X07Substrate {
+    /// Construct with the configured skip-dir list (from `[kgl] skip_dirs`).
+    pub fn new(skip_dirs: Vec<String>) -> Self {
+        Self { skip_dirs }
+    }
+}
 
 impl Substrate for X07Substrate {
     fn kind(&self) -> SubstrateKind {
@@ -26,7 +37,10 @@ impl Substrate for X07Substrate {
 
     fn index(&self, root: &Path) -> Result<IndexResult> {
         let mut out = IndexResult::default();
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        for entry in filtered_walk_builder(root, &self.skip_dirs)
+            .build()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -326,7 +340,7 @@ mod tests {
             }"#,
         );
 
-        let idx = X07Substrate.index(tmp.path()).unwrap();
+        let idx = X07Substrate::default().index(tmp.path()).unwrap();
 
         let modules: Vec<_> = idx.nodes.iter().filter(|n| n.kind == NodeKind::Module).collect();
         let funcs: Vec<_> = idx.nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
@@ -366,7 +380,7 @@ mod tests {
     #[test]
     fn empty_workspace_yields_empty_graph() {
         let tmp = tempfile::tempdir().unwrap();
-        let idx = X07Substrate.index(tmp.path()).unwrap();
+        let idx = X07Substrate::default().index(tmp.path()).unwrap();
         assert!(idx.nodes.is_empty());
         assert!(idx.edges.is_empty());
     }

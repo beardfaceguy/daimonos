@@ -6,6 +6,7 @@
 //! Capturing script-driven ops (the execute_script path) is the documented
 //! follow-up — and the literal first step of KGL growing out of the Starlark glue.
 
+use crate::config::KglConfig;
 use crate::kgl::model::EdgeKind;
 use crate::kgl::store::KglStore;
 use anyhow::Result;
@@ -20,6 +21,7 @@ pub fn record_file_op(
     tool: &str,
     args: &Value,
     now: &str,
+    cfg: &KglConfig,
 ) -> Result<()> {
     let kind = match tool {
         "write_file" | "edit_file" => EdgeKind::Mutates,
@@ -30,7 +32,7 @@ pub fn record_file_op(
         return Ok(());
     };
     let resource = file_urn(workspace, path);
-    let store = KglStore::open_workspace(workspace)?;
+    let store = KglStore::open_workspace_with(workspace, cfg)?;
     store.record_observation(session_id, kind, &resource, now)
 }
 
@@ -61,7 +63,15 @@ mod tests {
     fn records_write_as_mutates_with_session_provenance() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
-        record_file_op(ws, "sess-9", "write_file", &json!({"path": "src/a.rs"}), "t0").unwrap();
+        record_file_op(
+            ws,
+            "sess-9",
+            "write_file",
+            &json!({"path": "src/a.rs"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
 
         let store = KglStore::open_workspace(ws).unwrap();
         let urn = format!("file://{}", ws.join("src/a.rs").to_string_lossy());
@@ -73,7 +83,15 @@ mod tests {
     fn ignores_non_file_tools() {
         let tmp = tempfile::tempdir().unwrap();
         // no-op (and does not create a store)
-        record_file_op(tmp.path(), "s", "exec", &json!({"command": "ls"}), "t0").unwrap();
+        record_file_op(
+            tmp.path(),
+            "s",
+            "exec",
+            &json!({"command": "ls"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         assert!(!tmp.path().join(".kgl").exists());
     }
 }

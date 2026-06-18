@@ -10,6 +10,7 @@
 //!
 //! Assumes one workspace/root per store (per-workspace `.kgl/kgl.db`).
 
+use crate::config::KglConfig;
 use crate::kgl::model::{
     DefNode, Derivation, Edge, EdgeKind, Intent, NodeKind, Provenance, SubstrateKind,
 };
@@ -21,6 +22,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::Duration;
 
 /// Edge-traversal direction for `neighbors`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,11 +55,27 @@ pub struct KglStore {
 }
 
 impl KglStore {
+    /// Open with the default KGL busy-timeout. Prefer [`Self::open_with`] (or
+    /// [`Self::open_workspace_with`]) on the hot paths so an operator-tuned
+    /// `[kgl] busy_timeout_ms` is honored; this default-valued variant exists
+    /// for tests and call sites without config in hand.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, KglConfig::default().busy_timeout_ms)
+    }
+
+    /// Open (creating parent dirs if needed) with an explicit SQLite
+    /// busy-timeout. Enables WAL journaling so the autoindex watcher's writer
+    /// and the query/assert readers can proceed concurrently; the busy timeout
+    /// makes a contended connection wait briefly instead of erroring
+    /// `SQLITE_BUSY`.
+    pub fn open_with(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path).context("open kgl sqlite store")?;
+        // WAL is a no-op for some VFS/back-ends; best-effort, never fatal.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
         let s = Self { conn };
         s.init()?;
         Ok(s)
@@ -65,15 +83,24 @@ impl KglStore {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        // No WAL for `:memory:`; the busy timeout still applies if a future
+        // shared-cache memory DB is used.
+        conn.busy_timeout(Duration::from_millis(KglConfig::default().busy_timeout_ms))?;
         let s = Self { conn };
         s.init()?;
         Ok(s)
     }
 
     /// Open (creating if needed) the KGL store for a workspace at the canonical
-    /// `<workspace>/.kgl/kgl.db`. Single source of truth for the store path.
+    /// `<workspace>/.kgl/kgl.db`, using the default busy-timeout.
     pub fn open_workspace(workspace: &Path) -> Result<Self> {
-        Self::open(&workspace.join(".kgl").join("kgl.db"))
+        Self::open_workspace_with(workspace, &KglConfig::default())
+    }
+
+    /// Open the workspace store honoring an operator-supplied `[kgl]` config.
+    /// Single source of truth for the store path.
+    pub fn open_workspace_with(workspace: &Path, cfg: &KglConfig) -> Result<Self> {
+        Self::open_with(&workspace.join(".kgl").join("kgl.db"), cfg.busy_timeout_ms)
     }
 
     fn init(&self) -> Result<()> {
@@ -116,6 +143,11 @@ impl KglStore {
         run_stamp: &str,
     ) -> Result<(usize, usize)> {
         let idx = substrate.index(root)?;
+        // The substrate being (re)scanned this run. The orphan prune below is
+        // scoped to this substrate so re-indexing one substrate can never wipe
+        // another's nodes (e.g. an x07 `index` on a graphify workspace) — and
+        // observed `daimonos` nodes are likewise untouched.
+        let active = enum_str(&substrate.kind());
 
         // Name -> hash maps for resolving structural-edge URNs to concrete hashes.
         let mut fn_by_name: HashMap<String, String> = HashMap::new();
@@ -207,12 +239,13 @@ impl KglStore {
             }
         }
 
-        // Prune orphans (nodes not seen this run) and any now-dangling edges.
-        // Never prune observed (daimonos-substrate) nodes: re-indexing the code
-        // graph must not wipe session/provenance nodes recorded by observation.
+        // Prune orphans (nodes of THIS substrate not seen this run) and any
+        // now-dangling edges. Scoping to `active` means a re-index of one
+        // substrate never touches another's nodes, and observed `daimonos`
+        // nodes (sessions/provenance) always survive a code re-index.
         tx.execute(
-            "DELETE FROM kgl_node WHERE valid_as_of != ?1 AND substrate != 'daimonos'",
-            params![run_stamp],
+            "DELETE FROM kgl_node WHERE valid_as_of != ?1 AND substrate = ?2",
+            params![run_stamp, active],
         )?;
         tx.execute(
             "DELETE FROM kgl_edge WHERE from_hash NOT IN (SELECT hash FROM kgl_node)",
@@ -303,12 +336,14 @@ impl KglStore {
         })?;
         // Atomic dedupe: insert only if no identical observed edge exists (a
         // single statement, so concurrent observers can't double-insert).
+        // derivation='observed' keeps these distinct from agent-`declared`
+        // edges at the column level, not just via provenance_json.
         self.conn.execute(
             "INSERT INTO kgl_edge (from_hash,to_ref,kind,derivation,confidence,provenance_json)
-             SELECT ?1,?2,?3,'declared',1.0,?4
+             SELECT ?1,?2,?3,'observed',1.0,?4
              WHERE NOT EXISTS (
                  SELECT 1 FROM kgl_edge
-                 WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='declared'
+                 WHERE from_hash=?1 AND to_ref=?2 AND kind=?3 AND derivation='observed'
              )",
             params![shash, resource, enum_str(&kind), prov],
         )?;
@@ -424,6 +459,12 @@ impl KglStore {
 
         let mut violations = Vec::new();
         for rec in recs {
+            // Observed `daimonos` nodes (agent sessions, live state) are not
+            // authored code defs and carry no intent.purpose by design — they
+            // must not block the completeness/commit gate when observe is on.
+            if rec.node.substrate == SubstrateKind::Daimonos {
+                continue;
+            }
             let purpose_ok = rec
                 .intent
                 .as_ref()
@@ -616,7 +657,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        let (nodes, _edges) = store.populate(&X07Substrate, tmp.path(), "run1").unwrap();
+        let (nodes, _edges) = store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
         assert_eq!(nodes, 3); // module + 2 functions
 
         // the `calls` URN x07fn:checked_add resolved to checked_add's real hash
@@ -644,7 +685,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate, tmp.path(), "run1").unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
 
         let add = store.find("add").unwrap();
         let add_hash = add
@@ -665,8 +706,8 @@ mod tests {
             )
             .unwrap();
 
-        let (n1, e1) = store.populate(&X07Substrate, tmp.path(), "run2").unwrap();
-        let (n2, e2) = store.populate(&X07Substrate, tmp.path(), "run3").unwrap();
+        let (n1, e1) = store.populate(&X07Substrate::default(), tmp.path(), "run2").unwrap();
+        let (n2, e2) = store.populate(&X07Substrate::default(), tmp.path(), "run3").unwrap();
         assert_eq!((n1, e1), (n2, e2)); // idempotent counts
 
         // metadata survived re-population (hash unchanged)
@@ -681,7 +722,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate, tmp.path(), "run1").unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
         // No intent set anywhere -> every node violates purpose.
         let v = store.check_completeness().unwrap();
         assert!(v.iter().any(|x| x.reason.contains("purpose")));
@@ -707,7 +748,7 @@ mod tests {
         )
         .unwrap();
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate, tmp.path(), "r1").unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         // Document every node so only effect-rule (b) violations could remain.
         for rec in store.find("").unwrap() {
             store
@@ -747,13 +788,81 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate, tmp.path(), "r1").unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         store.record_observation("sess-1", EdgeKind::Mutates, "file:///ws/x", "t0").unwrap();
-        store.populate(&X07Substrate, tmp.path(), "r2").unwrap(); // re-index code
+        store.populate(&X07Substrate::default(), tmp.path(), "r2").unwrap(); // re-index code
         let w = store.writers_of("file:///ws/x").unwrap();
         assert!(
             w.iter().any(|r| r.node.name.as_deref() == Some("sess-1")),
             "observation should survive code re-index"
+        );
+    }
+
+    #[test]
+    fn reindex_one_substrate_preserves_another() {
+        // Blocker regression: an x07 `index` over a graphify-derived graph must
+        // NOT wipe the graphify (substrate=rust) nodes or their agent metadata.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("graphify-out")).unwrap();
+        std::fs::write(
+            tmp.path().join("graphify-out").join("graph.json"),
+            r#"{"nodes":[{"id":"n_foo","label":".foo()","file_type":"code","source_file":"src/a.rs"}],"links":[]}"#,
+        )
+        .unwrap();
+        let mut store = KglStore::open_in_memory().unwrap();
+        store
+            .populate(
+                &crate::kgl::substrate_graphify::GraphifySubstrate,
+                tmp.path(),
+                "g1",
+            )
+            .unwrap();
+        store
+            .set_intent(
+                "n_foo",
+                &Intent {
+                    purpose: "does foo".into(),
+                    rationale: None,
+                    open_questions: vec![],
+                },
+            )
+            .unwrap();
+
+        // Re-index with x07 (no *.x07.json present -> empty scan). The old
+        // unscoped prune wiped every non-daimonos node; the scoped prune must
+        // leave the graphify node and its intent intact.
+        store.populate(&X07Substrate::default(), tmp.path(), "x1").unwrap();
+
+        let rec = store.node("n_foo").unwrap();
+        assert!(rec.is_some(), "graphify node wiped by an x07 re-index");
+        assert_eq!(rec.unwrap().intent.unwrap().purpose, "does foo");
+    }
+
+    #[test]
+    fn observed_edges_use_observed_derivation() {
+        // W4: observed edges are distinguishable from agent-declared ones at the
+        // derivation column, not just via provenance_json.
+        let store = KglStore::open_in_memory().unwrap();
+        store
+            .record_observation("s1", EdgeKind::Mutates, "file:///ws/a", "t0")
+            .unwrap();
+        let edges = store.neighbors("session:s1", None, Direction::Out).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].derivation, Derivation::Observed);
+    }
+
+    #[test]
+    fn completeness_ignores_observed_nodes() {
+        // W7: observed session/daimonos nodes have no intent.purpose by design
+        // and must not block the completeness/commit gate.
+        let store = KglStore::open_in_memory().unwrap();
+        store
+            .record_observation("s1", EdgeKind::Mutates, "file:///ws/a", "t0")
+            .unwrap();
+        let v = store.check_completeness().unwrap();
+        assert!(
+            !v.iter().any(|x| x.hash.starts_with("session:")),
+            "observed session node should not be a completeness violation"
         );
     }
 }

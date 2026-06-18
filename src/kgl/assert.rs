@@ -3,6 +3,7 @@
 //! edges) that no substrate provides. Pairs with `observe` (which captures the
 //! OBSERVED). Wired into the MCP layer as the `kgl_assert` tool.
 
+use crate::config::KglConfig;
 use crate::kgl::model::{EdgeKind, Intent, Provenance};
 use crate::kgl::store::KglStore;
 use anyhow::{anyhow, Result};
@@ -11,8 +12,14 @@ use std::path::Path;
 
 /// Apply one assertion to the workspace's KGL store. `now` is a host-supplied
 /// ISO-8601 timestamp (KGL never invents time).
-pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Value> {
-    let store = KglStore::open_workspace(workspace)?;
+pub fn run(
+    workspace: &Path,
+    action: &str,
+    args: &Value,
+    now: &str,
+    cfg: &KglConfig,
+) -> Result<Value> {
+    let store = KglStore::open_workspace_with(workspace, cfg)?;
     match action {
         "intent" => {
             let hash = str_arg(args, "hash")?;
@@ -49,6 +56,13 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str) -> Result<Va
             let to = str_arg(args, "to")?;
             let kind = EdgeKind::from_wire(str_arg(args, "kind")?)
                 .ok_or_else(|| anyhow!("kgl_assert: invalid edge kind (calls|depends_on|reads|mutates)"))?;
+            // Verify the source node exists (mirrors intent/provenance), so a
+            // typo'd `from` hash can't create an orphan edge that later reads as
+            // a real relation. `to` is intentionally NOT checked: it may be a
+            // resource URN (file:///x, secret:..., io:unknown), not a node.
+            if store.node(from)?.is_none() {
+                return Err(anyhow!("kgl_assert: no node with hash '{from}'"));
+            }
             store.add_declared_edge(from, to, kind, None)?;
             Ok(json!({ "action": "declare_edge", "from": from, "to": to, "ok": true }))
         }
@@ -85,7 +99,7 @@ mod tests {
         )
         .unwrap();
         let mut store = KglStore::open(&tmp.path().join(".kgl").join("kgl.db")).unwrap();
-        store.populate(&X07Substrate, tmp.path(), "r1").unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         tmp
     }
 
@@ -111,6 +125,7 @@ mod tests {
             "intent",
             &json!({"hash": foo, "purpose": "does foo", "open_questions": ["q1"]}),
             "t0",
+            &KglConfig::default(),
         )
         .unwrap();
         assert_eq!(out["updated"], json!(true));
@@ -129,10 +144,32 @@ mod tests {
             "declare_edge",
             &json!({"from": foo, "to": "file:///x", "kind": "mutates"}),
             "t0",
+            &KglConfig::default(),
         )
         .unwrap();
         let store = KglStore::open_workspace(ws).unwrap();
         let edges = store.neighbors(&foo, Some(EdgeKind::Mutates), Direction::Out).unwrap();
         assert!(edges.iter().any(|e| e.to == "file:///x"));
+    }
+
+    #[test]
+    fn declare_edge_rejects_unknown_source_node() {
+        // W5: a non-existent `from` hash must error, not create an orphan edge.
+        let tmp = ws_with_graph();
+        let ws = tmp.path();
+        let r = run(
+            ws,
+            "declare_edge",
+            &json!({"from": "deadbeef", "to": "file:///x", "kind": "mutates"}),
+            "t0",
+            &KglConfig::default(),
+        );
+        assert!(r.is_err());
+        // and no edge leaked into the store
+        let store = KglStore::open_workspace(ws).unwrap();
+        let edges = store
+            .neighbors("deadbeef", Some(EdgeKind::Mutates), Direction::Out)
+            .unwrap();
+        assert!(edges.is_empty());
     }
 }

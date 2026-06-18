@@ -11,6 +11,26 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Build an `ignore::WalkBuilder` configured with KGL's shared skip rules:
+/// `.gitignore` honored, hidden entries skipped, plus any directory whose base
+/// name is in `skip_dirs` (build/vcs churn + our own store). Used by substrate
+/// detection, substrate indexing, and the file-watcher so all three traverse
+/// the same set of directories — avoiding pathological walks of `target/`,
+/// `.git/`, `node_modules/`, etc.
+pub fn filtered_walk_builder(root: &Path, skip_dirs: &[String]) -> ignore::WalkBuilder {
+    let skip: Vec<String> = skip_dirs.to_vec();
+    let mut b = ignore::WalkBuilder::new(root);
+    b.hidden(true).git_ignore(true).filter_entry(move |e| {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let name = e.file_name().to_string_lossy();
+            !skip.iter().any(|d| d == name.as_ref())
+        } else {
+            true
+        }
+    });
+    b
+}
+
 /// Everything KGL extracts from a substrate in one pass over a workspace.
 #[derive(Debug, Default)]
 pub struct IndexResult {

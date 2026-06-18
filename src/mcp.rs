@@ -713,13 +713,13 @@ impl ServerHandler for DaimonosHandler {
                 .unwrap_or_default()
                 .to_string();
             let qargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
-            let workspace = {
+            let (workspace, kcfg) = {
                 let mut s = self.session.lock().await;
                 s.used_tools.insert("kgl_query".into());
-                s.workspace.clone()
+                (s.workspace.clone(), s.cfg.kgl.clone())
             };
             let now = chrono::Utc::now().to_rfc3339();
-            return match crate::kgl::query::run(&workspace, &action, &qargs, &now) {
+            return match crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg) {
                 Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
                 Err(e) => err_text(format!("{e}")),
             };
@@ -733,13 +733,13 @@ impl ServerHandler for DaimonosHandler {
                 .unwrap_or_default()
                 .to_string();
             let aargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
-            let workspace = {
+            let (workspace, kcfg) = {
                 let mut s = self.session.lock().await;
                 s.used_tools.insert("kgl_assert".into());
-                s.workspace.clone()
+                (s.workspace.clone(), s.cfg.kgl.clone())
             };
             let now = chrono::Utc::now().to_rfc3339();
-            return match crate::kgl::assert::run(&workspace, &action, &aargs, &now) {
+            return match crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg) {
                 Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
                 Err(e) => err_text(format!("{e}")),
             };
@@ -752,6 +752,14 @@ impl ServerHandler for DaimonosHandler {
                 Some(arr) => arr.clone(),
                 None => return err_text("batch requires 'ops' array".into()),
             };
+
+            // Collect successful file sub-ops to observe AFTER the batch
+            // completes (KGL observe, gated off by default). Recording inside
+            // the loop would do sync SQLite I/O while the session mutex is held;
+            // and the early return below previously skipped the observe hook for
+            // batched ops entirely.
+            let observe_on = crate::kgl::observe::enabled();
+            let mut observed_ops: Vec<(String, Value)> = Vec::new();
 
             let mut results = Vec::with_capacity(ops.len());
             for (i, op_val) in ops.iter().enumerate() {
@@ -779,6 +787,9 @@ impl ServerHandler for DaimonosHandler {
                         if is_err {
                             results.push(json!({"ok": false, "tool": tool, "error": text}));
                         } else {
+                            if observe_on {
+                                observed_ops.push((tool.clone(), sub_args.clone()));
+                            }
                             let parsed: Value = serde_json::from_str(&text).unwrap_or(json!(text));
                             results.push(json!({"ok": true, "tool": tool, "data": parsed}));
                         }
@@ -789,13 +800,30 @@ impl ServerHandler for DaimonosHandler {
                 }
             }
 
-            return ok_text(serde_json::to_string(&results).unwrap_or_default());
+            let payload = serde_json::to_string(&results).unwrap_or_default();
+            if observe_on && !observed_ops.is_empty() {
+                let now = chrono::Utc::now().to_rfc3339();
+                let sid = session
+                    .external_session_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let ws = session.workspace.clone();
+                let kcfg = session.cfg.kgl.clone();
+                drop(session); // release the lock before sync SQLite I/O
+                for (tool, sub_args) in &observed_ops {
+                    let _ = crate::kgl::observe::record_file_op(
+                        &ws, &sid, tool, sub_args, &now, &kcfg,
+                    );
+                }
+            }
+            return ok_text(payload);
         }
 
         let result = dispatch_tool(&mut session, &params.name, &args).await;
         // Observed-provenance capture (KGL), gated off by default. Records direct
         // file ops as observed reads/mutates edges from the session. Best-effort:
-        // never affects the tool result.
+        // never affects the tool result. The session lock is released before the
+        // sync SQLite write so observe can't serialize concurrent requests.
         if crate::kgl::observe::enabled() {
             if let Ok(r) = &result {
                 if !r.is_error.unwrap_or(false) {
@@ -805,8 +833,16 @@ impl ServerHandler for DaimonosHandler {
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
                     let ws = session.workspace.clone();
-                    let _ =
-                        crate::kgl::observe::record_file_op(&ws, &sid, &params.name, &args, &now);
+                    let kcfg = session.cfg.kgl.clone();
+                    drop(session); // release the lock before sync SQLite I/O
+                    let _ = crate::kgl::observe::record_file_op(
+                        &ws,
+                        &sid,
+                        &params.name,
+                        &args,
+                        &now,
+                        &kcfg,
+                    );
                 }
             }
         }
