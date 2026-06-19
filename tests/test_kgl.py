@@ -6,6 +6,7 @@ JSON-RPC against the real binary.
 """
 
 import json
+import os
 
 MODULE = json.dumps(
     {
@@ -108,3 +109,69 @@ def test_kgl_assert_declare_edge(daimonos):
         daimonos.call_tool("kgl_query", {"query": "neighbors", "args": {"hash": h, "kind": "reads"}})
     )
     assert any(e["to"] == "secret:DB_PW" for e in nb)
+
+
+# graphify node-link graph with a single code node (no *.x07.json present).
+GRAPHIFY = json.dumps(
+    {
+        "nodes": [
+            {
+                "id": "n_foo",
+                "label": ".foo()",
+                "file_type": "code",
+                "source_file": "src/a.rs",
+            }
+        ],
+        "links": [],
+    }
+)
+
+
+def test_kgl_index_without_substrate_detects_graphify(daimonos):
+    # Blocker regression at the MCP boundary: `index` with no substrate on a
+    # graphify-only workspace must pick graphify, not run an empty x07 scan.
+    daimonos.call_tool(
+        "write_file", {"path": "graphify-out/graph.json", "content": GRAPHIFY}
+    )
+    idx = _text(daimonos.call_tool("kgl_query", {"query": "index"}))
+    assert idx["indexed"] is True
+    assert idx["substrate"] == "graphify"
+    assert idx["nodes"] >= 1
+
+
+def test_kgl_index_unknown_substrate_errors(daimonos):
+    res = daimonos.call_tool("kgl_query", {"query": "index", "args": {"substrate": "bogus"}})
+    assert res.get("isError") is True
+
+
+def test_kgl_declare_edge_unknown_source_errors(daimonos):
+    # W5: a declared edge from a non-existent node hash must error.
+    _seed(daimonos)
+    res = daimonos.call_tool(
+        "kgl_assert",
+        {"action": "declare_edge", "args": {"from": "deadbeef", "to": "file:///x", "kind": "mutates"}},
+    )
+    assert res.get("isError") is True
+
+
+def test_kgl_batch_write_is_observed(daimonos_observe):
+    # W8 regression: file ops inside a `batch` are observed (the early batch
+    # return used to skip the hook). Seed + index first, then write via batch
+    # and assert the session shows up as a writer of the touched file.
+    daimonos_observe.call_tool("write_file", {"path": "svc.x07.json", "content": MODULE})
+    daimonos_observe.call_tool("kgl_query", {"query": "index"})
+    daimonos_observe.call_tool(
+        "batch",
+        {"ops": [{"tool": "write_file", "arguments": {"path": "note.txt", "content": "hi"}}]},
+    )
+    # observe builds `file://<abs>`; the daemon canonicalizes the workspace, so
+    # match it with realpath (≈ Rust std::fs::canonicalize).
+    ws_real = os.path.realpath(daimonos_observe.workspace)
+    resource = "file://" + ws_real + "/note.txt"
+    writers = _text(
+        daimonos_observe.call_tool(
+            "kgl_query", {"query": "writers_of", "args": {"resource": resource}}
+        )
+    )
+    assert isinstance(writers, list)
+    assert len(writers) >= 1
