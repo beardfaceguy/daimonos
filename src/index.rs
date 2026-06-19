@@ -1,7 +1,7 @@
 use crate::config::IndexConfig;
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -27,6 +27,12 @@ pub struct WorkspaceIndex {
     max_file_size: usize,
     binary_sniff_bytes: usize,
     skip_extensions: HashSet<String>,
+    /// Hard cap on indexed files (0 = unbounded). See `IndexConfig::max_files`.
+    max_files: usize,
+    /// When true, the configured root is "over-broad" (home/system dir) and
+    /// auto-indexing is suppressed — `spawn_reindex` no-ops, leaving an empty
+    /// index. Computed once at construction from `is_overbroad_root`.
+    guard: bool,
     /// When true, print one-line indexer stats to stderr after each reindex.
     /// Disabled in MCP quiet mode so hosts like Cursor don't surface benign
     /// lines as `[error]` (they classify all subprocess stderr as errors).
@@ -76,6 +82,7 @@ pub struct SearchResult {
 
 impl WorkspaceIndex {
     pub fn new(root: PathBuf, cfg: &IndexConfig, log_progress: bool) -> Self {
+        let guard = !should_eager_index(&root, cfg);
         Self {
             root,
             inner: Arc::new(RwLock::new(IndexState::new())),
@@ -84,6 +91,8 @@ impl WorkspaceIndex {
             max_file_size: cfg.max_file_size,
             binary_sniff_bytes: cfg.binary_sniff_bytes,
             skip_extensions: cfg.skip_set(),
+            max_files: cfg.max_files,
+            guard,
             log_progress,
         }
     }
@@ -93,6 +102,22 @@ impl WorkspaceIndex {
     /// incremental update: skips files whose mtime hasn't changed, removes
     /// deleted files, and only re-extracts trigrams for new/modified files.
     pub fn spawn_reindex(&self) {
+        // Over-broad roots are never auto-indexed: a large directory with no
+        // project marker (e.g. $HOME inherited as cwd) would build a
+        // multi-gigabyte trigram index over unrelated files. Leave the index
+        // empty; an explicit -w or an MCP roots re-root replaces this index
+        // with one on a real project.
+        if self.guard {
+            if self.log_progress {
+                eprintln!(
+                    "index: skipping auto-index of over-broad root {:?} (exceeds max_files \
+                     and has no project marker); set -w or use MCP roots to index a real project",
+                    self.root
+                );
+            }
+            return;
+        }
+
         let root = self.root.clone();
         let inner = Arc::clone(&self.inner);
         let reindex_lock = Arc::clone(&self.reindex_lock);
@@ -100,6 +125,7 @@ impl WorkspaceIndex {
         let max_file_size = self.max_file_size;
         let binary_sniff_bytes = self.binary_sniff_bytes;
         let skip_ext = self.skip_extensions.clone();
+        let max_files = self.max_files;
         let log_progress = self.log_progress;
 
         tokio::task::spawn_blocking(move || {
@@ -144,7 +170,12 @@ impl WorkspaceIndex {
                 .max_depth(Some(max_depth))
                 .build();
 
+            let mut capped = false;
             for entry in walker.flatten() {
+                if max_files != 0 && current_files.len() >= max_files {
+                    capped = true;
+                    break;
+                }
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
@@ -177,6 +208,13 @@ impl WorkspaceIndex {
                     .unwrap_or(0);
 
                 current_files.insert(rel, mtime);
+            }
+
+            if capped && log_progress {
+                eprintln!(
+                    "index: file cap reached ({max_files}); indexing first {max_files} files \
+                     only. Tune [index] max_files if your project is larger."
+                );
             }
 
             // Build new state incrementally
@@ -351,6 +389,83 @@ impl WorkspaceIndex {
     }
 }
 
+/// Internal preflight budget used when `max_files` is 0 (cap disabled) so the
+/// over-broad-root probe still has a bound to early-exit against.
+const DEFAULT_EAGER_PROBE: usize = 50_000;
+
+/// Decide whether to eagerly crawl `root` and build a full index, based on a
+/// signal rather than a path blocklist (vikunja #47). The rules:
+///
+/// - Gate disabled (`guard_overbroad_roots == false`) -> always eager.
+/// - Filesystem root (`/`, zero normal components) -> never eager.
+/// - Small enough (a bounded preflight finds <= `budget` files) -> eager,
+///   regardless of what the directory is.
+/// - Larger than the budget -> eager only if it looks like a real project
+///   (a `project_markers` entry exists at the root).
+///
+/// This catches the over-broad case generically — `$HOME`, a NAS mount, a
+/// downloads dir (large, no project marker) all return false — without a
+/// hand-maintained list of paths. The hard `max_files` cap still bounds RSS
+/// for anything that does get indexed.
+pub fn should_eager_index(root: &Path, cfg: &IndexConfig) -> bool {
+    if !cfg.guard_overbroad_roots {
+        return true;
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    // Never eagerly crawl the filesystem root.
+    let normal_components = root
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    if normal_components == 0 {
+        return false;
+    }
+
+    let budget = if cfg.max_files == 0 {
+        DEFAULT_EAGER_PROBE
+    } else {
+        cfg.max_files
+    };
+
+    // Small enough to fully index no matter what it is.
+    if preflight_within_budget(&root, cfg, budget) {
+        return true;
+    }
+
+    // Large: only crawl if it clearly looks like a project.
+    has_project_marker(&root, cfg)
+}
+
+/// True when one of `cfg.project_markers` exists directly under `root`.
+fn has_project_marker(root: &Path, cfg: &IndexConfig) -> bool {
+    cfg.project_markers.iter().any(|m| root.join(m).exists())
+}
+
+/// Bounded preflight: walk `root` (honoring `.gitignore`, hidden files, and
+/// `max_depth`) counting regular files, and early-exit as soon as the count
+/// exceeds `budget`. Returns true when the whole tree fits within `budget`
+/// (i.e. the root is "small"), false once it provably exceeds it. Touches at
+/// most `budget + 1` file entries, so the probe cost is bounded even on a
+/// pathological root.
+fn preflight_within_budget(root: &Path, cfg: &IndexConfig, budget: usize) -> bool {
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .max_depth(Some(cfg.max_depth))
+        .build();
+    let mut count = 0usize;
+    for entry in walker.flatten() {
+        if entry.path().is_file() {
+            count += 1;
+            if count > budget {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn extract_trigrams(content: &[u8], file_id: u32, trigrams: &mut HashMap<Trigram, Vec<u32>>) {
     if content.len() < 3 {
         return;
@@ -501,6 +616,118 @@ mod tests {
         let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
         let results = idx.search("anything", 10).await;
         assert!(results.is_empty());
+    }
+
+    // --- Over-broad root gate tests (vikunja #47) ---
+
+    /// Create `n` plain files under `dir`.
+    fn write_n_files(dir: &Path, n: usize) {
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i}.rs")), format!("fn f{i}() {{}}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn eager_index_small_root_regardless_of_marker() {
+        // A small directory (within budget) is always eagerly indexed, even
+        // with no project marker.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 3);
+        let cfg = IndexConfig {
+            max_files: 50,
+            ..Default::default()
+        };
+        assert!(should_eager_index(dir.path(), &cfg));
+    }
+
+    #[test]
+    fn gate_blocks_large_unmarked_root() {
+        // More files than the budget and no project marker -> not eager.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        let cfg = IndexConfig {
+            max_files: 3,
+            ..Default::default()
+        };
+        assert!(!should_eager_index(dir.path(), &cfg));
+    }
+
+    #[test]
+    fn gate_allows_large_marked_root() {
+        // Same oversized tree, but a project marker at the root opts it in.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let cfg = IndexConfig {
+            max_files: 3,
+            ..Default::default()
+        };
+        assert!(should_eager_index(dir.path(), &cfg));
+    }
+
+    #[test]
+    fn gate_allows_large_root_with_git_dir() {
+        // `.git` is a directory marker, not a file.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cfg = IndexConfig {
+            max_files: 3,
+            ..Default::default()
+        };
+        assert!(should_eager_index(dir.path(), &cfg));
+    }
+
+    #[test]
+    fn gate_never_crawls_filesystem_root() {
+        let cfg = IndexConfig::default();
+        assert!(!should_eager_index(Path::new("/"), &cfg));
+    }
+
+    #[test]
+    fn gate_disabled_always_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        let cfg = IndexConfig {
+            max_files: 3,
+            guard_overbroad_roots: false,
+            ..Default::default()
+        };
+        assert!(should_eager_index(dir.path(), &cfg));
+    }
+
+    #[tokio::test]
+    async fn gated_root_skips_indexing() {
+        // Large + unmarked -> WorkspaceIndex stays empty after spawn_reindex.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        let cfg = IndexConfig {
+            max_files: 3,
+            ..Default::default()
+        };
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, false);
+        idx.spawn_reindex();
+        wait_for_index().await;
+        let stats = idx.stats().await;
+        assert_eq!(stats.files, 0, "gated root must not be auto-indexed");
+    }
+
+    #[tokio::test]
+    async fn max_files_caps_index() {
+        // Marked root so it is eagerly indexed, but the hard cap still bounds
+        // the file count.
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 10);
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let cfg = IndexConfig {
+            max_files: 4,
+            ..Default::default()
+        };
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, false);
+        idx.spawn_reindex();
+        wait_for_index().await;
+        let stats = idx.stats().await;
+        assert_eq!(stats.files, 4, "index must stop at max_files");
     }
 
     // --- Incremental index tests ---

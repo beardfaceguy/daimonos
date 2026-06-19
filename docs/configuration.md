@@ -37,6 +37,24 @@ search. These settings control what gets indexed.
 | `max_file_size` | `1000000` (1 MB) | Skip files larger than this (bytes) |
 | `binary_sniff_bytes` | `512` | Bytes to check for null bytes when detecting binary files |
 | `skip_extensions` | *(see below)* | File extensions to skip (known binary formats) |
+| `max_files` | `50000` | Hard cap on indexed files; the walk stops at this count. Also the preflight budget for `guard_overbroad_roots`. `0` disables the cap |
+| `guard_overbroad_roots` | `true` | Gate eager indexing on a signal: a root larger than the preflight budget is indexed only if it has a `project_markers` entry |
+| `project_markers` | `.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, `pom.xml`, `build.gradle`, `CMakeLists.txt`, `Makefile` | Filenames marking a root as a real project for the gate |
+
+`guard_overbroad_roots` replaces a brittle path blocklist with a property
+check. daimonos runs a bounded preflight walk of the root:
+
+- **Within `max_files`** (small) -> index it, whatever it is.
+- **Larger than `max_files`** -> index it only if a `project_markers` entry
+  is present at the root; otherwise serve with an **empty index**.
+
+This stops daimonos from crawling an over-broad directory it inherited as cwd
+(commonly `$HOME` — an editor window with no project open — but equally a NAS
+mount or a downloads dir), which has been observed to balloon a single
+instance to ~1.3 GB RSS and exhaust the inotify watch cap. The filesystem
+root (`/`) is always skipped. File, exec, and read tools still work on a gated
+root; supplying an explicit `-w` or completing an MCP `roots` handshake
+re-roots the session to a real project and indexes it normally.
 
 The default `skip_extensions` list covers images, audio, video, archives,
 compiled objects, fonts, databases, and office documents. Directories named
