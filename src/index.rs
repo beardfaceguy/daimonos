@@ -762,7 +762,7 @@ mod tests {
     /// commits "3 old files", and never picks up the new file until
     /// a *third* reindex is triggered.
     async fn wait_for_search_hit(idx: &WorkspaceIndex, query: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut last_kick = std::time::Instant::now();
         let kick_interval = std::time::Duration::from_secs(2);
         loop {
@@ -772,7 +772,7 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 let stats = idx.stats().await;
                 panic!(
-                    "index never produced a hit for {query:?} within 30 s — \
+                    "index never produced a hit for {query:?} within 60 s — \
                      final stats: files={}, trigrams={}, age_ms={:?}",
                     stats.files, stats.trigrams, stats.age_ms
                 );

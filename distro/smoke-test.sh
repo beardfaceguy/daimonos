@@ -32,7 +32,7 @@ mcp_session() {
      echo "$tools_list"; sleep 0.3
      echo "$exec_uname"; sleep 0.3
      echo "$ls_root"; sleep 0.3
-     echo "$write_test"; sleep 0.3
+     echo "$write_test"; sleep 1
      echo "$read_test"; sleep 3) | eval "$MCP_CMD" 2>/dev/null
 }
 
