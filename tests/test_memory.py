@@ -93,6 +93,7 @@ def test_exec_memory_bounded(daimonos):
 
 def test_bg_processes_cleaned_up(daimonos):
     """Completed background processes should be removed from the session map."""
+
     for i in range(20):
         daimonos.call_tool("exec", {
             "command": "sh",

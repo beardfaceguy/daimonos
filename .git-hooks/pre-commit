@@ -38,6 +38,29 @@ if command -v cargo >/dev/null 2>&1; then
   cargo clippy --all-targets -- -D warnings || exit 1
 fi
 
+# ── Security gates ───────────────────────────────────────────────────────────
+# gitleaks: scan staged diff for secrets (API keys, tokens, credentials).
+# Install: brew install gitleaks  |  https://github.com/gitleaks/gitleaks/releases
+if command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks..."
+  gitleaks git --pre-commit --redact --staged --verbose || exit 1
+fi
+
+# semgrep: multi-language SAST — catches injection, auth, and unsafe-API patterns.
+# Install: pip install semgrep  |  brew install semgrep
+if command -v semgrep >/dev/null 2>&1; then
+  echo "pre-commit: semgrep..."
+  semgrep scan --config auto --error --quiet || exit 1
+fi
+
+# osv-scanner: flag Cargo dependencies with known CVEs or supply-chain compromises.
+# Install: go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+#          https://github.com/google/osv-scanner/releases
+if command -v osv-scanner >/dev/null 2>&1; then
+  echo "pre-commit: osv-scanner..."
+  osv-scanner scan source --recursive --verbosity=error . || exit 1
+fi
+
 echo "pre-commit: lint gate passed."
 
 # ── Update knowledge graph (graphify) ────────────────────────────────────────
