@@ -808,11 +808,12 @@ impl ServerHandler for DaimonosHandler {
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
                 let ws = session.workspace.clone();
+                let cwd = session.cwd.clone();
                 let kcfg = session.cfg.kgl.clone();
                 drop(session); // release the lock before sync SQLite I/O
                 for (tool, sub_args) in &observed_ops {
                     let _ = crate::kgl::observe::record_file_op(
-                        &ws, &sid, tool, sub_args, &now, &kcfg,
+                        &ws, &cwd, &sid, tool, sub_args, &now, &kcfg,
                     );
                 }
             }
@@ -833,10 +834,12 @@ impl ServerHandler for DaimonosHandler {
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
                     let ws = session.workspace.clone();
+                    let cwd = session.cwd.clone();
                     let kcfg = session.cfg.kgl.clone();
                     drop(session); // release the lock before sync SQLite I/O
                     let _ = crate::kgl::observe::record_file_op(
                         &ws,
+                        &cwd,
                         &sid,
                         &params.name,
                         &args,

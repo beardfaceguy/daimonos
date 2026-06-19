@@ -219,6 +219,7 @@ values govern its SQLite access and background file-watcher when enabled.
 | `busy_timeout_ms` | `5000` | SQLite busy-timeout (ms) on every KGL store connection. With WAL journaling (enabled automatically) this lets the watcher's writer and the `kgl_query`/`kgl_assert` readers wait briefly for a lock instead of erroring with `SQLITE_BUSY`. |
 | `max_watches` | `4096` | Hard cap on inotify watches the KGL file-watcher registers, bounding `fs.inotify.max_user_watches` usage. |
 | `debounce_secs` | `2` | Debounce window for coalescing change bursts into at most one graph rebuild. |
+| `orient_max_matches` | `12` | Max task-matching defs `kgl_query orient` expands in one bundled call (each adds its edges + dependents), bounding the orient response size. |
 | `skip_dirs` | `["target", ".git", ".jj", "node_modules", ".kgl"]` | Directory base names never walked when detecting/indexing a substrate or registering watches. |
 
 ```toml
@@ -226,6 +227,7 @@ values govern its SQLite access and background file-watcher when enabled.
 busy_timeout_ms = 5000
 max_watches = 4096
 debounce_secs = 2
+orient_max_matches = 12
 skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl"]
 ```
 

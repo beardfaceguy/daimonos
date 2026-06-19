@@ -77,7 +77,11 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglCon
             // One bundled call (vs many round-trips): task-matching defs with their
             // intent/open-questions, their outgoing edges, and their dependents.
             let task = str_arg(args, "task")?;
-            let top: Vec<_> = store.find(task)?.into_iter().take(12).collect();
+            let top: Vec<_> = store
+                .find(task)?
+                .into_iter()
+                .take(cfg.orient_max_matches)
+                .collect();
             let mut matches = Vec::new();
             let mut edges = Vec::new();
             let mut dependents = std::collections::BTreeSet::new();
@@ -224,6 +228,48 @@ mod tests {
             .iter()
             .any(|m| m["name"] == json!("authenticate")));
         assert!(o["edges"].is_array());
+    }
+
+    #[test]
+    fn orient_match_count_honors_config_limit() {
+        // Two name-matching defs; a non-default orient_max_matches must bound
+        // the expanded match set (the cap is not just a default).
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::write(
+            ws.join("svc.x07.json"),
+            r#"{"module_id":"svc","schema_version":"1.0","kind":"library","imports":[],
+               "decls":[
+                 {"kind":"defn","name":"auth_login","params":[],"result":"Unit","body":[]},
+                 {"kind":"defn","name":"auth_logout","params":[],"result":"Unit","body":[]}
+               ]}"#,
+        )
+        .unwrap();
+        run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
+
+        let full = run(ws, "orient", &json!({"task": "auth"}), "t0", &KglConfig::default()).unwrap();
+        assert_eq!(
+            full["matches"].as_array().unwrap().len(),
+            2,
+            "both auth_* defs should match by default"
+        );
+
+        let capped = run(
+            ws,
+            "orient",
+            &json!({"task": "auth"}),
+            "t0",
+            &KglConfig {
+                orient_max_matches: 1,
+                ..KglConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            capped["matches"].as_array().unwrap().len(),
+            1,
+            "orient_max_matches=1 must bound the match set"
+        );
     }
 
     #[test]

@@ -174,6 +174,9 @@ pub struct KglConfig {
     /// Debounce window in seconds: coalesce change bursts into at most one
     /// graph rebuild per tick.
     pub debounce_secs: u64,
+    /// Max task-matching defs the `kgl_query orient` bundle expands (each adds
+    /// its edges + dependents), bounding the response size of one orient call.
+    pub orient_max_matches: usize,
     /// Directory base names never walked when detecting/indexing a substrate or
     /// registering watches (build/vcs churn + our own store).
     pub skip_dirs: Vec<String>,
@@ -185,6 +188,7 @@ impl Default for KglConfig {
             busy_timeout_ms: 5_000,
             max_watches: 4_096,
             debounce_secs: 2,
+            orient_max_matches: 12,
             skip_dirs: default_kgl_skip_dirs(),
         }
     }
@@ -569,6 +573,7 @@ mod tests {
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
         assert_eq!(cfg.kgl.max_watches, 4_096);
         assert_eq!(cfg.kgl.debounce_secs, 2);
+        assert_eq!(cfg.kgl.orient_max_matches, 12);
         assert!(cfg.kgl.skip_dirs.iter().any(|d| d == "node_modules"));
         assert!(cfg.tools.is_empty());
     }

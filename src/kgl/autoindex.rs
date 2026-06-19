@@ -33,7 +33,10 @@ pub fn enabled() -> bool {
 /// the `kgl_query index` tool can default its substrate the same way startup
 /// does (avoids an empty x07 scan pruning a graphify graph).
 pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dyn Substrate>)> {
-    if workspace.join("graphify-out").join("graph.json").is_file() {
+    // Only choose graphify when its graph actually has code content. A missing,
+    // empty, or stub graph.json must fall through to x07 — otherwise an empty
+    // graphify index would prune a usable graph built from *.x07.json sources.
+    if graphify_has_code_nodes(&workspace.join("graphify-out").join("graph.json")) {
         return Some(("graphify", Box::new(GraphifySubstrate)));
     }
     let has_x07 = filtered_walk_builder(workspace, &cfg.skip_dirs)
@@ -49,6 +52,26 @@ pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dy
         return Some(("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))));
     }
     None
+}
+
+/// True if the graphify graph file parses and contains at least one `code`
+/// node. Missing/empty/stub graphs return false so `detect` falls through to
+/// x07 rather than picking an empty graphify index whose prune wipes the graph.
+fn graphify_has_code_nodes(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(g) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    g.get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .any(|n| n.get("file_type").and_then(|f| f.as_str()) == Some("code"))
+        })
+        .unwrap_or(false)
 }
 
 /// Build/refresh the KGL graph for `workspace` (best-effort). Returns
@@ -72,7 +95,7 @@ pub fn run_startup(
 /// `kgl_query` opens the store fresh per call, background rebuilds are picked up
 /// automatically with no handler/session changes.
 pub fn spawn_watcher(workspace: PathBuf, quiet: bool, cfg: KglConfig) {
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("kgl-watch".to_string())
         .spawn(move || {
             let dirty = Arc::new(AtomicBool::new(false));
@@ -97,6 +120,11 @@ pub fn spawn_watcher(workspace: PathBuf, quiet: bool, cfg: KglConfig) {
                 }
             }
         });
+    if let Err(e) = spawned {
+        if !quiet {
+            eprintln!("kgl: failed to spawn watcher thread: {e}");
+        }
+    }
 }
 
 /// Build a non-recursive watch per surviving directory (mirrors
@@ -169,9 +197,29 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("graphify-out")).unwrap();
         std::fs::File::create(tmp.path().join("graphify-out").join("graph.json"))
             .unwrap()
-            .write_all(br#"{"nodes":[],"links":[]}"#)
+            .write_all(
+                br#"{"nodes":[{"id":"n1","label":".f()","file_type":"code","source_file":"a.rs"}],"links":[]}"#,
+            )
             .unwrap();
         assert_eq!(detect(tmp.path(), &cfg).unwrap().0, "graphify");
+    }
+
+    #[test]
+    fn detect_falls_through_empty_graphify_to_x07() {
+        // An empty/stub graphify graph must not win over usable x07 sources.
+        let cfg = KglConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("graphify-out")).unwrap();
+        std::fs::write(
+            tmp.path().join("graphify-out").join("graph.json"),
+            br#"{"nodes":[],"links":[]}"#,
+        )
+        .unwrap();
+        std::fs::File::create(tmp.path().join("m.x07.json"))
+            .unwrap()
+            .write_all(br#"{"module_id":"m","decls":[]}"#)
+            .unwrap();
+        assert_eq!(detect(tmp.path(), &cfg).unwrap().0, "x07");
     }
 
     #[test]

@@ -9,11 +9,6 @@
 //! Build phases (see project tracker): v0 = substrate extraction (this module)
 //! -> SQLite store -> reads/mutates analysis -> `kgl_query` MCP tool ->
 //! completeness enforcement -> orient demo.
-//!
-//! `dead_code` is allowed crate-locally here because v0 lands the data model and
-//! extraction before their consumers (store / MCP tool) exist — mirroring the
-//! `plugins::x07` scaffolding precedent.
-#![allow(dead_code)]
 
 pub mod assert;
 pub mod autoindex;
