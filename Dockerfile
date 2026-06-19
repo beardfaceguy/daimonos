@@ -40,4 +40,6 @@ RUN apt-get update \
 COPY --from=build /src/target/release/daimonos /usr/local/bin/daimonos
 
 WORKDIR /workspace
-ENTRYPOINT ["daimonos", "--mcp", "-w", "/workspace"]
+# Intentionally runs as the invoking user (workspace owner) — USER directive
+# would break volume-mounted workspace file ownership at runtime.
+ENTRYPOINT ["daimonos", "--mcp", "-w", "/workspace"] # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint

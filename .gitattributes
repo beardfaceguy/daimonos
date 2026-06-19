@@ -1,0 +1,3 @@
+# Mark graphify knowledge-graph outputs as generated so they are collapsed in
+# GitHub PR diffs and excluded from codeJung reviews.
+graphify-out/** linguist-generated=true

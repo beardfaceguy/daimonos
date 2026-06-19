@@ -411,11 +411,41 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 
 /// Dispatch a tool call by name, using the tools registry to map args → Request.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
-    match tools::build_request(name, args) {
-        Some(Ok(request)) => dispatch_request(request, name),
-        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
-        None => Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
+    let resp = match tools::build_request(name, args) {
+        Some(Ok(request)) => dispatch_request(request, name)?,
+        Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
+        None => return Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
+    };
+    // KGL observed-provenance: capture script-driven file ops the same way the
+    // MCP-direct path does. Gated off by default; best-effort (never affects the
+    // tool result). This is the Starlark layer feeding the graph.
+    if resp.ok
+        && matches!(name, "write_file" | "edit_file" | "read_file")
+        && crate::kgl::observe::enabled()
+    {
+        record_script_observation(name, args);
     }
+    Ok(resp)
+}
+
+/// Best-effort: record a script-driven file op as an observed KGL edge, reading
+/// the session's workspace + id from the tool context.
+fn record_script_observation(name: &str, args: &serde_json::Value) {
+    let _ = with_ctx(|ctx| {
+        let (ws, cwd, sid, kcfg) = ctx.handle.block_on(async {
+            let s = ctx.session.lock().await;
+            (
+                s.workspace.clone(),
+                s.cwd.clone(),
+                s.external_session_id.clone(),
+                s.cfg.kgl.clone(),
+            )
+        });
+        let now = chrono::Utc::now().to_rfc3339();
+        let sid = sid.unwrap_or_else(|| "unknown".to_string());
+        let _ = crate::kgl::observe::record_file_op(&ws, &cwd, &sid, name, args, &now, &kcfg);
+        Ok(())
+    });
 }
 
 fn run_registry_tool(
@@ -792,6 +822,38 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
         })
     }
 
+    fn pytest<'v>(
+        command: &str,
+        #[starlark(require = named)] path: Option<&str>,
+        #[starlark(require = named)] filter: Option<&str>,
+        #[starlark(require = named)] markers: Option<&str>,
+        #[starlark(require = named)] verbose: Option<bool>,
+        #[starlark(require = named)] failfast: Option<bool>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        with_ctx(|ctx| {
+            let cmd = command.to_string();
+            let mut args_val = serde_json::json!({"command": cmd});
+            if let Some(v) = path {
+                args_val["path"] = serde_json::json!(v);
+            }
+            if let Some(v) = filter {
+                args_val["filter"] = serde_json::json!(v);
+            }
+            if let Some(v) = markers {
+                args_val["markers"] = serde_json::json!(v);
+            }
+            if let Some(v) = verbose {
+                args_val["verbose"] = serde_json::json!(v);
+            }
+            if let Some(v) = failfast {
+                args_val["failfast"] = serde_json::json!(v);
+            }
+            let resp = run_registry_tool(ctx, "pytest", &cmd, &args_val)?;
+            response_to_starlark_dict(resp, heap)
+        })
+    }
+
     fn session_stats<'v>(
         #[starlark(require = named, default = "session")] scope: &str,
         #[starlark(require = named)] days: Option<i64>,
@@ -902,6 +964,7 @@ pub fn tool_signatures() -> String {
         "def git(command: str, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
         "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
         "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
+        "def pytest(command: str, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
         "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
         "def discord(command: str, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
         "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",

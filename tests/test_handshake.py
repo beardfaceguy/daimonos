@@ -118,7 +118,6 @@ def test_list_all_tools_returns_catalog(daimonos):
 
 def test_list_tools_have_input_schema(daimonos):
     """Verify all tools have proper input schemas."""
-    import json
 
     # First unlock all tools
     daimonos.call_tool("list_all_tools", {})

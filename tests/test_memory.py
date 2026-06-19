@@ -93,11 +93,9 @@ def test_exec_memory_bounded(daimonos):
 
 def test_bg_processes_cleaned_up(daimonos):
     """Completed background processes should be removed from the session map."""
-    ws = daimonos.workspace
 
-    pids = []
     for i in range(20):
-        result = daimonos.call_tool("exec", {
+        daimonos.call_tool("exec", {
             "command": "sh",
             "args": ["-c", f"echo bg_{i}"],
         })
@@ -105,7 +103,7 @@ def test_bg_processes_cleaned_up(daimonos):
     # Now use bg + poll to test actual background process cleanup.
     # We use the batch tool for efficiency, spawning short-lived bg processes.
     for i in range(20):
-        result = daimonos.call_tool("exec", {
+        daimonos.call_tool("exec", {
             "command": "sh",
             "args": ["-c", "true"],
         })

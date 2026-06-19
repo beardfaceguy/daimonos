@@ -81,14 +81,17 @@ jobs:
           node-version: '20'
 
       - name: Build MCPB bundle
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           npm install -g @anthropic-ai/mcpb
 
           # Determine version from tag or Cargo.toml
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            VERSION="${{ github.event.inputs.tag }}"
+          if [[ "$GH_REF" == refs/tags/v* ]]; then
+            VERSION="${GH_REF#refs/tags/v}"
+          elif [[ -n "$GH_INPUT_TAG" ]]; then
+            VERSION="$GH_INPUT_TAG"
             VERSION="${VERSION#v}"
           else
             VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -178,11 +181,14 @@ jobs:
 
       - name: Determine tag
         id: tag
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          if [[ "$GH_REF" == refs/tags/* ]]; then
+            echo "tag=${GH_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=$GH_INPUT_TAG" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Collect release assets
@@ -221,8 +227,9 @@ jobs:
       - name: Download MCPB bundles and update server.json
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$GH_REF_NAME"
           VERSION="${TAG#v}"
 
           mkdir -p mcpb-release

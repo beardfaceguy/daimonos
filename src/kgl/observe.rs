@@ -1,0 +1,141 @@
+//! Observed-provenance capture: when an agent acts through daimonos, record what
+//! it actually did into the per-workspace KGL graph — observed, not authored.
+//!
+//! v0.1 covers direct file tool calls (write_file/edit_file/read_file). The env
+//! gate and the call site live in the MCP layer so default behavior is unchanged.
+//! Capturing script-driven ops (the execute_script path) is the documented
+//! follow-up — and the literal first step of KGL growing out of the Starlark glue.
+
+use crate::config::KglConfig;
+use crate::kgl::model::EdgeKind;
+use crate::kgl::store::KglStore;
+use anyhow::Result;
+use serde_json::Value;
+use std::path::Path;
+
+/// Record a direct file-tool call as an observed reads/mutates edge from the
+/// session to the touched file. No-op for tools that aren't file ops.
+pub fn record_file_op(
+    workspace: &Path,
+    cwd: &Path,
+    session_id: &str,
+    tool: &str,
+    args: &Value,
+    now: &str,
+    cfg: &KglConfig,
+) -> Result<()> {
+    let kind = match tool {
+        "write_file" | "edit_file" => EdgeKind::Mutates,
+        "read_file" => EdgeKind::Reads,
+        _ => return Ok(()),
+    };
+    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    // Resolve relative paths against `cwd`, matching `Session::resolve_path`
+    // (file tools join `session.cwd`, not the workspace root). The store itself
+    // is per-workspace, so the URN may point outside the workspace after a
+    // `set_cwd` into a subdir — that's correct: it names the file actually
+    // touched.
+    let resource = file_urn(cwd, path);
+    let store = KglStore::open_workspace_with(workspace, cfg)?;
+    store.record_observation(session_id, kind, &resource, now)
+}
+
+/// Whether observed-provenance capture is enabled (env `DAIMONOS_KGL_OBSERVE`).
+/// Shared by the MCP-direct hook and the script-dispatch hook. Off by default.
+pub fn enabled() -> bool {
+    std::env::var("DAIMONOS_KGL_OBSERVE")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+}
+
+fn file_urn(base: &Path, path: &str) -> String {
+    let p = Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    format!("file://{}", abs.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn records_write_as_mutates_with_session_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        record_file_op(
+            ws,
+            ws,
+            "sess-9",
+            "write_file",
+            &json!({"path": "src/a.rs"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
+
+        let store = KglStore::open_workspace(ws).unwrap();
+        let urn = format!("file://{}", ws.join("src/a.rs").to_string_lossy());
+        let w = store.writers_of(&urn).unwrap();
+        assert!(w.iter().any(|r| r.node.name.as_deref() == Some("sess-9")));
+    }
+
+    #[test]
+    fn relative_path_resolves_against_cwd_not_workspace() {
+        // After a set_cwd into a subdir, a relative write touches cwd/<path>;
+        // the observed URN must match that, not workspace/<path>.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let cwd = ws.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        record_file_op(
+            ws,
+            &cwd,
+            "sess-cwd",
+            "write_file",
+            &json!({"path": "a.rs"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
+
+        let store = KglStore::open_workspace(ws).unwrap();
+        let cwd_urn = format!("file://{}", cwd.join("a.rs").to_string_lossy());
+        assert!(
+            store
+                .writers_of(&cwd_urn)
+                .unwrap()
+                .iter()
+                .any(|r| r.node.name.as_deref() == Some("sess-cwd")),
+            "edge should be recorded against cwd/a.rs"
+        );
+        let ws_urn = format!("file://{}", ws.join("a.rs").to_string_lossy());
+        assert!(
+            store.writers_of(&ws_urn).unwrap().is_empty(),
+            "edge must NOT be recorded against workspace/a.rs"
+        );
+    }
+
+    #[test]
+    fn ignores_non_file_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        // no-op (and does not create a store)
+        record_file_op(
+            tmp.path(),
+            tmp.path(),
+            "s",
+            "exec",
+            &json!({"command": "ls"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
+        assert!(!tmp.path().join(".kgl").exists());
+    }
+}

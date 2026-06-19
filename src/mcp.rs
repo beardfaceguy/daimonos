@@ -121,6 +121,8 @@ async fn dispatch_tool(
 
         let command = match name {
             "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
+            "kgl_query" => tools::get_str(args, "query"),
+            "kgl_assert" => tools::get_str(args, "action"),
             "discord" => {
                 let base = tools::get_str(args, "command");
                 let tag = tools::get_str(args, "analytics_tag");
@@ -514,6 +516,39 @@ async fn dispatch_tool_inner(
             }
         }
 
+        "pytest" => {
+            let command = match get_str(args, "command") {
+                Some(c) => c,
+                None => return err_text("pytest requires 'command' argument".into()),
+            };
+
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("pytest", &command, &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("pytest {command}: {e}")),
+            }
+        }
+
         "docker" => {
             let command = match get_str(args, "command") {
                 Some(c) => c,
@@ -577,6 +612,53 @@ async fn dispatch_tool_inner(
                     ok_text(text)
                 }
                 Err(e) => err_text(format!("discord {command}: {e}")),
+            }
+        }
+
+        // kgl_query opens the per-workspace KGL store; only needs the workspace path.
+        // Wrapped in spawn_blocking: SQLite I/O and workspace walks are synchronous
+        // and must not block the shared async executor.
+        "kgl_query" => {
+            let action = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let qargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let workspace = session.workspace.clone();
+            let kcfg = session.cfg.kgl.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            match tokio::task::spawn_blocking(move || {
+                crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg)
+            })
+            .await
+            {
+                Ok(Ok(v)) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Ok(Err(e)) => err_text(format!("{e}")),
+                Err(e) => err_text(format!("kgl_query task panicked: {e}")),
+            }
+        }
+
+        // kgl_assert: agent write path for the non-derivable intent/provenance layer.
+        // Wrapped in spawn_blocking: SQLite I/O must not block the async executor.
+        "kgl_assert" => {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let aargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let workspace = session.workspace.clone();
+            let kcfg = session.cfg.kgl.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            match tokio::task::spawn_blocking(move || {
+                crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg)
+            })
+            .await
+            {
+                Ok(Ok(v)) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Ok(Err(e)) => err_text(format!("{e}")),
+                Err(e) => err_text(format!("kgl_assert task panicked: {e}")),
             }
         }
 
@@ -680,6 +762,14 @@ impl ServerHandler for DaimonosHandler {
                 None => return err_text("batch requires 'ops' array".into()),
             };
 
+            // Collect successful file sub-ops to observe AFTER the batch
+            // completes (KGL observe, gated off by default). Recording inside
+            // the loop would do sync SQLite I/O while the session mutex is held;
+            // and the early return below previously skipped the observe hook for
+            // batched ops entirely.
+            let observe_on = crate::kgl::observe::enabled();
+            let mut observed_ops: Vec<(String, Value)> = Vec::new();
+
             let mut results = Vec::with_capacity(ops.len());
             for (i, op_val) in ops.iter().enumerate() {
                 let tool = match op_val.get("tool").and_then(|v| v.as_str()) {
@@ -706,6 +796,9 @@ impl ServerHandler for DaimonosHandler {
                         if is_err {
                             results.push(json!({"ok": false, "tool": tool, "error": text}));
                         } else {
+                            if observe_on {
+                                observed_ops.push((tool.clone(), sub_args.clone()));
+                            }
                             let parsed: Value = serde_json::from_str(&text).unwrap_or(json!(text));
                             results.push(json!({"ok": true, "tool": tool, "data": parsed}));
                         }
@@ -716,10 +809,60 @@ impl ServerHandler for DaimonosHandler {
                 }
             }
 
-            return ok_text(serde_json::to_string(&results).unwrap_or_default());
+            let payload = serde_json::to_string(&results).unwrap_or_default();
+            if observe_on && !observed_ops.is_empty() {
+                let now = chrono::Utc::now().to_rfc3339();
+                let sid = session
+                    .external_session_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let ws = session.workspace.clone();
+                let cwd = session.cwd.clone();
+                let kcfg = session.cfg.kgl.clone();
+                drop(session); // release the lock before sync SQLite I/O
+                for (tool, sub_args) in &observed_ops {
+                    if let Err(e) = crate::kgl::observe::record_file_op(
+                        &ws, &cwd, &sid, tool, sub_args, &now, &kcfg,
+                    ) {
+                        eprintln!("kgl observe (batch/{tool}): {e}");
+                    }
+                }
+            }
+            return ok_text(payload);
         }
 
-        dispatch_tool(&mut session, &params.name, &args).await
+        let result = dispatch_tool(&mut session, &params.name, &args).await;
+        // Observed-provenance capture (KGL), gated off by default. Records direct
+        // file ops as observed reads/mutates edges from the session. Best-effort:
+        // never affects the tool result. The session lock is released before the
+        // sync SQLite write so observe can't serialize concurrent requests.
+        if crate::kgl::observe::enabled() {
+            if let Ok(r) = &result {
+                if !r.is_error.unwrap_or(false) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let sid = session
+                        .external_session_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let ws = session.workspace.clone();
+                    let cwd = session.cwd.clone();
+                    let kcfg = session.cfg.kgl.clone();
+                    drop(session); // release the lock before sync SQLite I/O
+                    if let Err(e) = crate::kgl::observe::record_file_op(
+                        &ws,
+                        &cwd,
+                        &sid,
+                        &params.name,
+                        &args,
+                        &now,
+                        &kcfg,
+                    ) {
+                        eprintln!("kgl observe ({}): {e}", params.name);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 
@@ -727,6 +870,22 @@ impl ServerHandler for DaimonosHandler {
 
 /// Build dynamic instructions that include workspace-specific context
 /// so the model has useful information without a separate tool call.
+/// Orientation hint nudging agents to query the KGL graph first (and to record
+/// intent as they work). Only emitted when KGL auto-indexing is on, so the
+/// graph actually exists. Pure (takes the gate) so it's testable without env.
+fn kgl_instructions_hint(kgl_enabled: bool) -> Option<&'static str> {
+    if !kgl_enabled {
+        return None;
+    }
+    Some(
+        "KGL graph: this workspace has a queryable code+intent knowledge graph. To orient before \
+         reading source, call kgl_query {query:'orient', args:{task:'<topic>'}} — one call returns \
+         matching defs + their intent/open-questions + edges + dependents. Record intent / \
+         provenance / contracts as you work with kgl_assert. Reading source still finds latent \
+         issues the graph hasn't been told about.",
+    )
+}
+
 async fn build_instructions(workspace: &std::path::Path) -> String {
     let mut parts = vec![
         "Use daimonos tools, not built-in equivalents.".to_string(),
@@ -739,6 +898,10 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
         "Starlark tool functions for execute_script:\n{}",
         script::tool_signatures()
     ));
+
+    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled()) {
+        parts.push(hint.to_string());
+    }
 
     // Detect primary language / project type from manifest files
     let markers: &[(&str, &str)] = &[
@@ -1197,6 +1360,14 @@ mod tests {
             code_mode_tools.len() == 3,
             "code-mode surface should be 3 tools"
         );
+    }
+
+    #[test]
+    fn kgl_hint_is_gated_and_mentions_orient() {
+        assert!(kgl_instructions_hint(false).is_none());
+        let hint = kgl_instructions_hint(true).expect("hint when enabled");
+        assert!(hint.contains("orient"));
+        assert!(hint.contains("kgl_assert"));
     }
 
     #[tokio::test]

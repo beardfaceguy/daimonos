@@ -271,6 +271,47 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "kgl_query",
+            tier: ToolTier::Full,
+            description: "Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "enum": ["index", "orient", "node", "neighbors", "find", "writers_of", "blast_radius", "open_questions", "check"]
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "orient needs {task} (one bundled call: matching defs + intent/open-questions + edges + dependents — prefer this for orientation); node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
+                    }
+                },
+                "required": ["query"]
+            }),
+            to_request: None, // KGL store access handled in mcp.rs
+            context_check: None,
+        },
+
+        ToolDef {
+            name: "kgl_assert",
+            tier: ToolTier::Full,
+            description: "Declare the non-derivable KGL layer for a def: its intent/purpose (+ rationale, open questions), authoring provenance, or a typed edge (reads/mutates/calls/depends_on). This is how an authoring agent records WHY code exists and what it touches — the part no derived graph provides. Get the target def 'hash' from kgl_query find/node.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["intent", "provenance", "declare_edge"]},
+                    "args": {
+                        "type": "object",
+                        "description": "intent: {hash, purpose, rationale?, open_questions?[]}; provenance: {hash, authored_by, session_id?, assumptions?[], supersedes?[]}; declare_edge: {from, to, kind} where kind is one of calls|depends_on|reads|mutates (snake_case)."
+                    }
+                },
+                "required": ["action"]
+            }),
+            to_request: None, // KGL store access handled in mcp.rs
+            context_check: None,
+        },
+
+        ToolDef {
             name: "list_tool_signatures",
             tier: ToolTier::OnDemand,
             description: "Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions.",
@@ -327,6 +368,34 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             to_request: None, // uses ToolRegistry plugin
             context_check: Some(|ws| ws.join("Cargo.toml").exists()),
+        },
+
+        ToolDef {
+            name: "pytest",
+            tier: ToolTier::Terse,
+            description: "Python test runner. Commands: run (passed/failed/skipped + failure ids), collect (--collect-only test ids).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["run", "collect"]},
+                    "path": {"type": "string", "description": "Test file or directory (default: pytest's auto-discovery)"},
+                    "filter": {"type": "string", "description": "run: -k expression (test name selector)"},
+                    "markers": {"type": "string", "description": "run: -m expression (marker selector)"},
+                    "verbose": {"type": "boolean", "description": "run: -v flag"},
+                    "failfast": {"type": "boolean", "description": "run: -x flag (stop on first failure)"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None, // uses ToolRegistry plugin
+            context_check: Some(|ws| {
+                ws.join("pytest.ini").exists()
+                    || ws.join("pyproject.toml").exists()
+                    || ws.join("setup.py").exists()
+                    || ws.join("setup.cfg").exists()
+                    || ws.join("tox.ini").exists()
+                    || ws.join("conftest.py").exists()
+                    || ws.join("tests").is_dir()
+            }),
         },
 
         ToolDef {

@@ -208,6 +208,33 @@ rate_limit_max_retries = 2
 rate_limit_max_sleep_ms = 10_000
 ```
 
+### `[kgl]` — Knowledge-Graph Layer
+
+Tunables for the KGL code+intent knowledge graph. KGL is itself gated on the
+`DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE` environment variables; these
+values govern its SQLite access and background file-watcher when enabled.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `busy_timeout_ms` | `5000` | SQLite busy-timeout (ms) on every KGL store connection. With WAL journaling (enabled automatically) this lets the watcher's writer and the `kgl_query`/`kgl_assert` readers wait briefly for a lock instead of erroring with `SQLITE_BUSY`. |
+| `max_watches` | `4096` | Hard cap on inotify watches the KGL file-watcher registers, bounding `fs.inotify.max_user_watches` usage. |
+| `debounce_secs` | `2` | Debounce window for coalescing change bursts into at most one graph rebuild. |
+| `orient_max_matches` | `12` | Max task-matching defs `kgl_query orient` expands in one bundled call (each adds its edges + dependents), bounding the orient response size. |
+| `find_max` | `200` | SQL LIMIT applied to every `kgl_query find` result set; caps how many nodes a broad LIKE query can materialise in one call. |
+| `blast_radius_max` | `500` | Hard node cap for `blast_radius` BFS; stops dense call graphs from exhausting CPU/memory during a transitive traversal. |
+| `skip_dirs` | `["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]` | Directory base names never walked when detecting/indexing a substrate or registering watches. |
+
+```toml
+[kgl]
+busy_timeout_ms = 5000
+max_watches = 4096
+debounce_secs = 2
+orient_max_matches = 12
+find_max = 200
+blast_radius_max = 500
+skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
+```
+
 ### `[tools.<id>]` — Tool Plugins (Advanced)
 
 Register external tools for the tool runner system. Most users don't need
