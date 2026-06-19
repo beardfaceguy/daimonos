@@ -157,11 +157,17 @@ async fn main() -> anyhow::Result<()> {
         let startup_cfg = cfg.kgl.clone();
         tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().to_rfc3339();
-            if let Ok(Some((sub, nodes, edges))) =
-                kgl::autoindex::run_startup(&kgl_ws, &now, &startup_cfg)
-            {
-                if !quiet {
-                    eprintln!("kgl: startup index — {nodes} nodes / {edges} edges via {sub}");
+            match kgl::autoindex::run_startup(&kgl_ws, &now, &startup_cfg) {
+                Ok(Some((sub, nodes, edges))) => {
+                    if !quiet {
+                        eprintln!("kgl: startup index — {nodes} nodes / {edges} edges via {sub}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("kgl: startup index failed: {e}");
+                    }
                 }
             }
         });

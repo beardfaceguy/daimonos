@@ -175,3 +175,30 @@ def test_kgl_batch_write_is_observed(daimonos_observe):
     )
     assert isinstance(writers, list)
     assert len(writers) >= 1
+
+
+def test_kgl_observe_resolves_relative_path_against_cwd(daimonos_observe):
+    # Observe regression: after set_cwd into a subdir, a relative write touches
+    # cwd/<path>; the observed edge must be recorded against cwd/<path>, not
+    # workspace/<path>, or writers_of returns nothing / points at a ghost file.
+    daimonos_observe.call_tool("write_file", {"path": "svc.x07.json", "content": MODULE})
+    daimonos_observe.call_tool("kgl_query", {"query": "index"})
+    daimonos_observe.call_tool("exec", {"command": "mkdir -p sub"})
+    daimonos_observe.call_tool("set_cwd", {"path": "sub"})
+    daimonos_observe.call_tool("write_file", {"path": "note.txt", "content": "hi"})
+
+    ws_real = os.path.realpath(daimonos_observe.workspace)
+    cwd_resource = "file://" + ws_real + "/sub/note.txt"
+    ws_resource = "file://" + ws_real + "/note.txt"
+    cwd_writers = _text(
+        daimonos_observe.call_tool(
+            "kgl_query", {"query": "writers_of", "args": {"resource": cwd_resource}}
+        )
+    )
+    ws_writers = _text(
+        daimonos_observe.call_tool(
+            "kgl_query", {"query": "writers_of", "args": {"resource": ws_resource}}
+        )
+    )
+    assert len(cwd_writers) >= 1, "edge should be recorded against cwd/sub/note.txt"
+    assert ws_writers == [], "edge must NOT be recorded against workspace/note.txt"

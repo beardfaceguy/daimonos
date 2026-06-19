@@ -17,6 +17,7 @@ use std::path::Path;
 /// session to the touched file. No-op for tools that aren't file ops.
 pub fn record_file_op(
     workspace: &Path,
+    cwd: &Path,
     session_id: &str,
     tool: &str,
     args: &Value,
@@ -31,7 +32,12 @@ pub fn record_file_op(
     let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
         return Ok(());
     };
-    let resource = file_urn(workspace, path);
+    // Resolve relative paths against `cwd`, matching `Session::resolve_path`
+    // (file tools join `session.cwd`, not the workspace root). The store itself
+    // is per-workspace, so the URN may point outside the workspace after a
+    // `set_cwd` into a subdir — that's correct: it names the file actually
+    // touched.
+    let resource = file_urn(cwd, path);
     let store = KglStore::open_workspace_with(workspace, cfg)?;
     store.record_observation(session_id, kind, &resource, now)
 }
@@ -44,12 +50,12 @@ pub fn enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn file_urn(workspace: &Path, path: &str) -> String {
+fn file_urn(base: &Path, path: &str) -> String {
     let p = Path::new(path);
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        workspace.join(p)
+        base.join(p)
     };
     format!("file://{}", abs.to_string_lossy())
 }
@@ -64,6 +70,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         record_file_op(
+            ws,
             ws,
             "sess-9",
             "write_file",
@@ -80,10 +87,47 @@ mod tests {
     }
 
     #[test]
+    fn relative_path_resolves_against_cwd_not_workspace() {
+        // After a set_cwd into a subdir, a relative write touches cwd/<path>;
+        // the observed URN must match that, not workspace/<path>.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let cwd = ws.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        record_file_op(
+            ws,
+            &cwd,
+            "sess-cwd",
+            "write_file",
+            &json!({"path": "a.rs"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
+
+        let store = KglStore::open_workspace(ws).unwrap();
+        let cwd_urn = format!("file://{}", cwd.join("a.rs").to_string_lossy());
+        assert!(
+            store
+                .writers_of(&cwd_urn)
+                .unwrap()
+                .iter()
+                .any(|r| r.node.name.as_deref() == Some("sess-cwd")),
+            "edge should be recorded against cwd/a.rs"
+        );
+        let ws_urn = format!("file://{}", ws.join("a.rs").to_string_lossy());
+        assert!(
+            store.writers_of(&ws_urn).unwrap().is_empty(),
+            "edge must NOT be recorded against workspace/a.rs"
+        );
+    }
+
+    #[test]
     fn ignores_non_file_tools() {
         let tmp = tempfile::tempdir().unwrap();
         // no-op (and does not create a store)
         record_file_op(
+            tmp.path(),
             tmp.path(),
             "s",
             "exec",

@@ -59,6 +59,7 @@ impl KglStore {
     /// [`Self::open_workspace_with`]) on the hot paths so an operator-tuned
     /// `[kgl] busy_timeout_ms` is honored; this default-valued variant exists
     /// for tests and call sites without config in hand.
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with(path, KglConfig::default().busy_timeout_ms)
     }
@@ -81,6 +82,7 @@ impl KglStore {
         Ok(s)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         // No WAL for `:memory:`; the busy timeout still applies if a future
@@ -92,7 +94,10 @@ impl KglStore {
     }
 
     /// Open (creating if needed) the KGL store for a workspace at the canonical
-    /// `<workspace>/.kgl/kgl.db`, using the default busy-timeout.
+    /// `<workspace>/.kgl/kgl.db`, using the default busy-timeout. Test-only
+    /// convenience; production paths thread `[kgl]` config via
+    /// [`Self::open_workspace_with`].
+    #[cfg(test)]
     pub fn open_workspace(workspace: &Path) -> Result<Self> {
         Self::open_workspace_with(workspace, &KglConfig::default())
     }
@@ -168,10 +173,16 @@ impl KglStore {
 
         let tx = self.conn.transaction()?;
 
-        // Recomputed each run; Declared edges are preserved.
+        // Recompute ONLY this substrate's structural edges. An edge's substrate
+        // is that of its `from_hash` node, so scope the delete to nodes of the
+        // active substrate. This preserves declared/observed edges AND other
+        // substrates' derived/inferred edges — re-indexing x07 must not strip
+        // graphify's structural edges (or vice-versa).
         tx.execute(
-            "DELETE FROM kgl_edge WHERE derivation IN ('derived','inferred')",
-            [],
+            "DELETE FROM kgl_edge
+             WHERE derivation IN ('derived','inferred')
+               AND from_hash IN (SELECT hash FROM kgl_node WHERE substrate = ?1)",
+            params![active],
         )?;
 
         // Upsert nodes. intent_json/provenance_json are intentionally NOT in the
@@ -247,8 +258,22 @@ impl KglStore {
             "DELETE FROM kgl_node WHERE valid_as_of != ?1 AND substrate = ?2",
             params![run_stamp, active],
         )?;
+        // Drop edges left dangling by the node prune, at BOTH ends:
+        //  - `from_hash` always names a def node, so any missing one is dangling.
+        //  - `to_ref` is a node hash/id for node-to-node edges (calls/depends_on)
+        //    but a resource URN for reads/mutates (file://, secret:, io:, …) or an
+        //    unresolved x07fn:/x07mod: target. Resource/URN refs carry a scheme
+        //    separator (`:`); a `to_ref` without one is a node id, so prune it
+        //    when its node is gone. This catches declared/observed edges whose
+        //    target node was pruned, without deleting legitimate resource edges.
         tx.execute(
             "DELETE FROM kgl_edge WHERE from_hash NOT IN (SELECT hash FROM kgl_node)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM kgl_edge
+             WHERE to_ref NOT LIKE '%:%'
+               AND to_ref NOT IN (SELECT hash FROM kgl_node)",
             [],
         )?;
 
@@ -806,7 +831,12 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("graphify-out")).unwrap();
         std::fs::write(
             tmp.path().join("graphify-out").join("graph.json"),
-            r#"{"nodes":[{"id":"n_foo","label":".foo()","file_type":"code","source_file":"src/a.rs"}],"links":[]}"#,
+            r#"{"nodes":[
+                {"id":"n_foo","label":".foo()","file_type":"code","source_file":"src/a.rs"},
+                {"id":"n_bar","label":".bar()","file_type":"code","source_file":"src/a.rs"}
+            ],"links":[
+                {"relation":"calls","source":"n_foo","target":"n_bar","confidence_score":1.0}
+            ]}"#,
         )
         .unwrap();
         let mut store = KglStore::open_in_memory().unwrap();
@@ -828,14 +858,83 @@ mod tests {
             )
             .unwrap();
 
-        // Re-index with x07 (no *.x07.json present -> empty scan). The old
-        // unscoped prune wiped every non-daimonos node; the scoped prune must
-        // leave the graphify node and its intent intact.
+        // Re-index with x07 (no *.x07.json present -> empty scan). The prune
+        // must leave the graphify node, its intent, AND its structural edge
+        // intact — re-indexing one substrate must not strip another's edges.
         store.populate(&X07Substrate::default(), tmp.path(), "x1").unwrap();
 
         let rec = store.node("n_foo").unwrap();
         assert!(rec.is_some(), "graphify node wiped by an x07 re-index");
         assert_eq!(rec.unwrap().intent.unwrap().purpose, "does foo");
+        let calls = store
+            .neighbors("n_foo", Some(EdgeKind::Calls), Direction::Out)
+            .unwrap();
+        assert!(
+            calls.iter().any(|e| e.to == "n_bar"),
+            "graphify structural edge stripped by an x07 re-index"
+        );
+    }
+
+    #[test]
+    fn prune_removes_edges_to_pruned_nodes_but_keeps_resource_edges() {
+        // A declared edge to another node must be removed when that node is
+        // pruned, but a declared edge to a resource URN must survive.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::File::create(tmp.path().join("m.x07.json"))
+            .unwrap()
+            .write_all(
+                br#"{"module_id":"m","schema_version":"1.0","kind":"library","imports":[],
+                    "decls":[
+                      {"kind":"defn","name":"foo","params":[],"result":"Unit","body":[]},
+                      {"kind":"defn","name":"bar","params":[],"result":"Unit","body":[]}
+                    ]}"#,
+            )
+            .unwrap();
+        let mut store = KglStore::open_in_memory().unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
+        let foo = store
+            .find("foo")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node.name.as_deref() == Some("foo"))
+            .unwrap()
+            .node
+            .hash;
+        let bar = store
+            .find("bar")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node.name.as_deref() == Some("bar"))
+            .unwrap()
+            .node
+            .hash;
+        // foo -> bar (node target) and foo -> secret:KEY (resource target)
+        store
+            .add_declared_edge(&foo, &bar, EdgeKind::DependsOn, None)
+            .unwrap();
+        store
+            .add_declared_edge(&foo, "secret:KEY", EdgeKind::Reads, None)
+            .unwrap();
+
+        // Re-index a workspace where `bar` is gone -> bar node pruned.
+        std::fs::write(
+            tmp.path().join("m.x07.json"),
+            r#"{"module_id":"m","schema_version":"1.0","kind":"library","imports":[],
+               "decls":[{"kind":"defn","name":"foo","params":[],"result":"Unit","body":[]}]}"#,
+        )
+        .unwrap();
+        store.populate(&X07Substrate::default(), tmp.path(), "r2").unwrap();
+
+        assert!(store.node(&bar).unwrap().is_none(), "bar should be pruned");
+        let out = store.neighbors(&foo, None, Direction::Out).unwrap();
+        assert!(
+            !out.iter().any(|e| e.to == bar),
+            "declared edge to pruned node should be removed"
+        );
+        assert!(
+            out.iter().any(|e| e.to == "secret:KEY"),
+            "declared edge to a resource URN must survive the prune"
+        );
     }
 
     #[test]

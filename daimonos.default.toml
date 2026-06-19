@@ -144,6 +144,9 @@ busy_timeout_ms = 5000
 max_watches = 4096
 # Debounce window (seconds): coalesce change bursts into at most one rebuild.
 debounce_secs = 2
+# Max task-matching defs `kgl_query orient` expands in one bundled call (each
+# adds its outgoing edges + dependents), bounding the orient response size.
+orient_max_matches = 12
 # Directory base names never walked when detecting/indexing a substrate or
 # registering watches (build/vcs churn + our own store).
 skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl"]
