@@ -1,7 +1,6 @@
 """Tests for read_file and write_file MCP tools."""
 
 import json
-import os
 
 
 def test_write_and_read_roundtrip(daimonos):

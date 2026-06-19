@@ -1,8 +1,6 @@
 """Tests for the batch MCP tool."""
 import json
-import os
 
-import pytest
 
 
 def test_batch_read_multiple_files(daimonos, tmp_path):

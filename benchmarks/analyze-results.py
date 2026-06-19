@@ -2,7 +2,6 @@
 """Analyze and compare benchmark results across cursor and daimonos runs."""
 
 import json
-import os
 import sys
 from pathlib import Path
 
