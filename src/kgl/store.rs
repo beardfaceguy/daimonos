@@ -937,6 +937,266 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Substrate-isolation invariant.
+    //
+    // The "destructive prune crossing substrate boundaries" data-loss class
+    // has recurred across multiple rewrites, landing at a new line each time.
+    // Rather than pin a test to one statement, the helper below asserts the
+    // *property* directly: re-indexing ONE substrate must
+    // leave every row that doesn't belong to it byte-for-byte unchanged. Any
+    // future destructive op that crosses a substrate boundary, or wipes
+    // declared/observed/agent data, trips this regardless of where in
+    // `populate` it lives. A mock substrate lets the invariant run over
+    // arbitrary (and hypothetical future) substrate kinds.
+    // ---------------------------------------------------------------------
+
+    struct MockSubstrate {
+        kind: SubstrateKind,
+        nodes: Vec<DefNode>,
+        edges: Vec<Edge>,
+        effects: HashMap<String, crate::kgl::model::EffectFacts>,
+    }
+    impl crate::kgl::substrate::Substrate for MockSubstrate {
+        fn kind(&self) -> SubstrateKind {
+            self.kind
+        }
+        fn index(&self, _root: &Path) -> Result<crate::kgl::substrate::IndexResult> {
+            Ok(crate::kgl::substrate::IndexResult {
+                nodes: self.nodes.clone(),
+                edges: self.edges.clone(),
+                effects: self.effects.clone(),
+            })
+        }
+    }
+
+    fn mock_node(hash: &str, name: &str, sub: SubstrateKind) -> DefNode {
+        DefNode {
+            hash: hash.into(),
+            kind: NodeKind::Function,
+            name: Some(name.into()),
+            substrate: sub,
+            file: Some("src/x".into()),
+            span: None,
+        }
+    }
+
+    fn sub_str(k: SubstrateKind) -> String {
+        serde_json::to_value(k)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// (hash, substrate, full-row-string) for every node, ordered by hash.
+    fn dump_nodes(store: &KglStore) -> Vec<(String, String, String)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT hash,kind,name,substrate,file,span,intent_json,provenance_json,\
+                 touches_io,mutates_state,valid_as_of FROM kgl_node ORDER BY hash",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                let hash: String = r.get(0)?;
+                let sub: String = r.get(3)?;
+                let row = format!(
+                    "{:?}",
+                    (
+                        &hash,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        &sub,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
+                        r.get::<_, String>(10)?,
+                    )
+                );
+                Ok((hash, sub, row))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// (from_hash, full-row-string) for every edge, deterministically ordered.
+    fn dump_edges(store: &KglStore) -> Vec<(String, String)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT from_hash,to_ref,kind,derivation,confidence,provenance_json \
+                 FROM kgl_edge ORDER BY from_hash,to_ref,kind,derivation",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                let from: String = r.get(0)?;
+                let row = format!(
+                    "{:?}",
+                    (
+                        &from,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, f64>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    )
+                );
+                Ok((from, row))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Seed `preserved` (+ agent-authored + observed data), re-index
+    /// `reindexed`, then assert nothing outside `reindexed` changed.
+    fn assert_substrate_isolation(preserved: SubstrateKind, reindexed: SubstrateKind) {
+        assert_ne!(preserved, reindexed);
+        // MockSubstrate::index ignores the root, so no real workspace is needed.
+        let root = Path::new("/");
+        let mut store = KglStore::open_in_memory().unwrap();
+
+        // Seed: 2 preserved nodes, a derived structural edge, and (via effects)
+        // an inferred io edge.
+        let mut effects = HashMap::new();
+        effects.insert(
+            "p2".to_string(),
+            crate::kgl::model::EffectFacts {
+                touches_io: true,
+                mutates_state: true,
+            },
+        );
+        let seed = MockSubstrate {
+            kind: preserved,
+            nodes: vec![
+                mock_node("p1", "p_one", preserved),
+                mock_node("p2", "p_two", preserved),
+            ],
+            edges: vec![Edge {
+                from: "p1".into(),
+                to: "p2".into(),
+                kind: EdgeKind::Calls,
+                derivation: Derivation::Derived,
+                confidence: 1.0,
+            }],
+            effects,
+        };
+        store.populate(&seed, root, "seed").unwrap();
+
+        // Agent-authored + observed data hung off the preserved nodes.
+        store
+            .set_intent(
+                "p1",
+                &Intent {
+                    purpose: "why p1".into(),
+                    rationale: None,
+                    open_questions: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .set_provenance(
+                "p1",
+                &Provenance {
+                    authored_by: "agent".into(),
+                    session_id: "s1".into(),
+                    timestamp: "t".into(),
+                    assumptions: vec![],
+                    supersedes: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .add_declared_edge("p1", "p2", EdgeKind::DependsOn, None)
+            .unwrap();
+        store
+            .add_declared_edge("p1", "secret:DB", EdgeKind::Reads, None)
+            .unwrap();
+        store
+            .record_observation("sess-x", EdgeKind::Mutates, "file:///w/a.rs", "t0")
+            .unwrap();
+
+        // Snapshot everything — none of it belongs to `reindexed` yet.
+        let nodes_before: Vec<String> = dump_nodes(&store)
+            .into_iter()
+            .map(|(_, _, row)| row)
+            .collect();
+        let edges_before: Vec<String> =
+            dump_edges(&store).into_iter().map(|(_, row)| row).collect();
+
+        // Re-index the OTHER substrate (disjoint node namespace + its own edge).
+        let reidx = MockSubstrate {
+            kind: reindexed,
+            nodes: vec![
+                mock_node("q1", "q_one", reindexed),
+                mock_node("q2", "q_two", reindexed),
+            ],
+            edges: vec![Edge {
+                from: "q1".into(),
+                to: "q2".into(),
+                kind: EdgeKind::Calls,
+                derivation: Derivation::Derived,
+                confidence: 1.0,
+            }],
+            effects: HashMap::new(),
+        };
+        store.populate(&reidx, root, "reidx").unwrap();
+
+        // Strip the reindexed substrate's own rows; the remainder MUST equal
+        // the pre-reindex snapshot exactly.
+        let b_sub = sub_str(reindexed);
+        let all_nodes = dump_nodes(&store);
+        let b_hashes: HashSet<String> = all_nodes
+            .iter()
+            .filter(|(_, sub, _)| *sub == b_sub)
+            .map(|(h, _, _)| h.clone())
+            .collect();
+        let nodes_after: Vec<String> = all_nodes
+            .into_iter()
+            .filter(|(_, sub, _)| *sub != b_sub)
+            .map(|(_, _, row)| row)
+            .collect();
+        let edges_after: Vec<String> = dump_edges(&store)
+            .into_iter()
+            .filter(|(from, _)| !b_hashes.contains(from))
+            .map(|(_, row)| row)
+            .collect();
+
+        assert_eq!(
+            nodes_before, nodes_after,
+            "re-indexing {reindexed:?} mutated or dropped a {preserved:?}/daimonos NODE"
+        );
+        assert_eq!(
+            edges_before, edges_after,
+            "re-indexing {reindexed:?} mutated or dropped a \
+             {preserved:?}/daimonos/declared/observed EDGE"
+        );
+    }
+
+    #[test]
+    fn reindex_isolates_rust_from_x07() {
+        assert_substrate_isolation(SubstrateKind::Rust, SubstrateKind::X07);
+    }
+
+    #[test]
+    fn reindex_isolates_x07_from_rust() {
+        assert_substrate_isolation(SubstrateKind::X07, SubstrateKind::Rust);
+    }
+
+    #[test]
+    fn reindex_isolates_future_substrate_kinds() {
+        // Hypothetical future substrates behind the same trait must isolate too,
+        // so a new backend can't silently reintroduce the cross-substrate wipe.
+        assert_substrate_isolation(SubstrateKind::X07, SubstrateKind::Tacit);
+        assert_substrate_isolation(SubstrateKind::Tacit, SubstrateKind::Zero);
+        assert_substrate_isolation(SubstrateKind::Zero, SubstrateKind::Rust);
+    }
+
     #[test]
     fn observed_edges_use_observed_derivation() {
         // W4: observed edges are distinguishable from agent-declared ones at the
