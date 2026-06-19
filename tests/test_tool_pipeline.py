@@ -6,8 +6,6 @@ exercise the error paths and verify correct MCP routing. The happy paths are
 covered by Rust unit tests in tool_runner.rs and ops/tool_ops.rs.
 """
 
-import json
-import pytest
 
 
 class TestToolPipeline:

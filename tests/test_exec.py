@@ -233,7 +233,6 @@ def test_exec_plugin_redirect_cargo_test(daimonos):
 
 def test_exec_plugin_redirect_git_status(daimonos):
     """exec('git status') should redirect through native git plugin."""
-    import os, subprocess
     # Init a git repo in the workspace
     daimonos.call_tool("exec", {"command": "git init"})
     daimonos.call_tool("exec", {
