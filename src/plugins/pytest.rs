@@ -6,6 +6,11 @@ use tokio::process::Command;
 
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
 
+/// Output cap (chars) applied to each pytest run before parsing. Mirrors the
+/// default of `config.process.exec_output_max_chars` for consistency. A noisy
+/// test run would otherwise return arbitrarily large plugin output.
+const MAX_OUTPUT_CHARS: usize = 100_000;
+
 /// Pytest plugin: runs Python tests via the `pytest` binary and returns
 /// structured pass/fail counts plus a list of failed test ids.
 ///
@@ -58,7 +63,7 @@ impl ToolPlugin for PytestPlugin {
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
     ) -> Result<ToolResult, String> {
-        let output = match command {
+        let (output, success) = match command {
             "run" => pytest_run(cwd, args).await?,
             "collect" => pytest_collect(cwd, args).await?,
             _ => return Err(format!("unknown pytest command: {command}")),
@@ -67,7 +72,7 @@ impl ToolPlugin for PytestPlugin {
         Ok(ToolResult {
             tool: "pytest".into(),
             command: command.into(),
-            exit_code: 0,
+            exit_code: if success { 0 } else { 1 },
             output,
             stderr: String::new(),
         })
@@ -82,15 +87,35 @@ async fn run_pytest(cwd: &Path, args: &[&str]) -> Result<(String, String, bool),
         .await
         .map_err(|e| format!("pytest exec: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = cap_output(String::from_utf8_lossy(&output.stdout).into_owned());
+    let stderr = cap_output(String::from_utf8_lossy(&output.stderr).into_owned());
     Ok((stdout, stderr, output.status.success()))
+}
+
+/// Truncate `s` to `MAX_OUTPUT_CHARS`, keeping the first half and last half
+/// with a notice in the middle (mirrors exec_filter truncation style).
+fn cap_output(s: String) -> String {
+    if s.len() <= MAX_OUTPUT_CHARS {
+        return s;
+    }
+    let half = MAX_OUTPUT_CHARS / 2;
+    let head = &s[..half];
+    // Find a char boundary going backwards from `half` into the tail.
+    let tail_start = s.len() - half;
+    let tail_start = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i >= tail_start)
+        .unwrap_or(s.len());
+    let tail = &s[tail_start..];
+    let truncated_chars = s.len() - MAX_OUTPUT_CHARS;
+    format!("{head}\n[... {truncated_chars} chars truncated ...]\n{tail}")
 }
 
 async fn pytest_run(
     cwd: &Path,
     args: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+) -> Result<(serde_json::Value, bool), String> {
     let pytest_args = build_run_args(args);
     let arg_refs: Vec<&str> = pytest_args.iter().map(|s| s.as_str()).collect();
     let (stdout, stderr, success) = run_pytest(cwd, &arg_refs).await?;
@@ -106,6 +131,9 @@ async fn pytest_run(
         "skipped": summary.skipped,
         "errors": summary.errors,
     });
+    if summary.deselected > 0 {
+        result["deselected"] = json!(summary.deselected);
+    }
     if let Some(d) = summary.duration_s {
         result["duration_s"] = json!(d);
     }
@@ -113,7 +141,7 @@ async fn pytest_run(
         result["failures"] = json!(failures);
     }
 
-    Ok(result)
+    Ok((result, success))
 }
 
 /// Build the argv for `pytest run` from the JSON args object.
@@ -168,7 +196,7 @@ fn build_run_args(args: Option<&serde_json::Value>) -> Vec<String> {
 async fn pytest_collect(
     cwd: &Path,
     args: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+) -> Result<(serde_json::Value, bool), String> {
     let path = args
         .and_then(|a| a.get("path"))
         .and_then(|v| v.as_str())
@@ -196,10 +224,13 @@ async fn pytest_collect(
         }
     }
 
-    Ok(json!({
-        "ok": success,
-        "tests": tests,
-    }))
+    Ok((
+        json!({
+            "ok": success,
+            "tests": tests,
+        }),
+        success,
+    ))
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -207,6 +238,8 @@ struct PytestSummary {
     passed: i64,
     failed: i64,
     skipped: i64,
+    /// Tests excluded by `-k`/`-m` filters; never ran, so reported separately.
+    deselected: i64,
     errors: i64,
     duration_s: Option<f64>,
 }
@@ -246,7 +279,8 @@ fn parse_pytest_summary(output: &str) -> PytestSummary {
                 match w {
                     "passed" => summary.passed = n,
                     "failed" => summary.failed = n,
-                    "skipped" | "deselected" => summary.skipped = n,
+                    "skipped" => summary.skipped = n,
+                    "deselected" => summary.deselected = n,
                     "error" | "errors" => summary.errors = n,
                     _ => {}
                 }
@@ -380,6 +414,18 @@ tests/test_foo.py ...                                                    [100%]
         assert_eq!(s.passed, 0);
         assert_eq!(s.failed, 0);
         assert_eq!(s.duration_s, Some(0.01));
+    }
+
+    #[tokio::test]
+    async fn parse_summary_deselected_not_folded_into_skipped() {
+        // `deselected` means filtered out by -k/-m; they were never run, so
+        // they must not inflate `skipped`.
+        let out =
+            "==================== 3 passed, 2 deselected in 0.03s ====================\n";
+        let s = parse_pytest_summary(out);
+        assert_eq!(s.passed, 3);
+        assert_eq!(s.skipped, 0, "deselected must not inflate skipped");
+        assert_eq!(s.deselected, 2);
     }
 
     #[tokio::test]

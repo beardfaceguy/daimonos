@@ -13,12 +13,9 @@ fi
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "pre-commit: shellcheck..."
-  # Discover tracked shell scripts at commit time: keeps the hook small, never
-  # goes stale, and excludes untracked/vendored trees (e.g. buildroot output).
-  sh_files=$(git ls-files '*.sh' '*.bash')
-  if [ -n "$sh_files" ]; then
-    echo "$sh_files" | xargs shellcheck --severity=error || exit 1
-  fi
+  # Discover tracked shell scripts at commit time. Use NUL-delimited output +
+  # xargs -0 so paths containing spaces are passed correctly.
+  git ls-files -z '*.sh' '*.bash' | xargs -0 -r shellcheck --severity=error || exit 1
 fi
 
 # eslint only applies when the repo actually has a JS/TS lint config. daimonos
@@ -34,8 +31,12 @@ if command -v npx >/dev/null 2>&1 && have_eslint_config; then
   npx eslint --max-warnings=0 . || exit 1
 fi
 
-echo "pre-commit: cargo clippy..."
-cargo clippy --all-targets -- -D warnings || exit 1
+# Guard cargo clippy the same way as ruff/shellcheck: skip on environments
+# without cargo (CI images, non-Rust contributors, doc-only commits).
+if command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo clippy..."
+  cargo clippy --all-targets -- -D warnings || exit 1
+fi
 
 echo "pre-commit: lint gate passed."
 
@@ -65,12 +66,20 @@ else
     echo "pre-commit: re-extracting $FILE_COUNT changed code file(s)..."
 
     cd "$REPO_ROOT"
-    # Scoped incremental update: re-extract ONLY the staged code files and merge
-    # them into the existing graph. We deliberately do NOT call
-    # `graphify update <root>` here: on this repo it rescans the whole tree
-    # (target/, vendored buildroot, benchmark workspaces) — ~90s and it balloons
-    # the committed graph from ~1.8k to ~50k nodes. Best-effort: the pipe to sed
-    # swallows the exit status so a graphify failure never blocks the commit.
+
+    # Write the staged file list to a temp file so $REPO_ROOT and individual
+    # filenames are never shell-interpolated into the Python -c string — avoids
+    # SyntaxError or code injection from paths containing quotes, backslashes,
+    # $, or triple-quotes.
+    GRAPHIFY_STAGED_LIST="$(mktemp)"
+    GRAPHIFY_REPO_FILE="$(mktemp)"
+    printf '%s\n' "$REPO_ROOT" > "$GRAPHIFY_REPO_FILE"
+    printf '%s\n' "$STAGED_CODE" > "$GRAPHIFY_STAGED_LIST"
+    trap 'rm -f "$GRAPHIFY_STAGED_LIST" "$GRAPHIFY_REPO_FILE"' EXIT
+
+    # Run the incremental update; capture its exit status explicitly so the
+    # pipe through sed (for indented output) does not swallow failures.
+    GRAPHIFY_OK=0
     "$GRAPHIFY_PYTHON" -c "
 import json, sys
 from graphify.extract import extract
@@ -81,8 +90,8 @@ from graphify.report import generate
 from graphify.export import to_json
 from pathlib import Path
 
-repo = Path('$REPO_ROOT')
-staged = '''$STAGED_CODE'''.strip().splitlines()
+repo = Path(open(sys.argv[1]).read().strip())
+staged = [l for l in open(sys.argv[2]).read().splitlines() if l.strip()]
 code_files = [repo / f for f in staged if (repo / f).exists()]
 if not code_files:
     print('pre-commit: no valid staged files found.')
@@ -102,23 +111,24 @@ for cid in communities:
         labels[cid] = f'Community {cid}'
 cohesion = score_all(G, communities)
 
-detection = {'total_files': G.number_of_nodes(), 'total_words': 0, 'files': {}}
 gods = god_nodes(G)
 surprises = surprising_connections(G, communities)
 questions = suggest_questions(G, communities, labels)
-report = generate(G, communities, cohesion, labels, gods, surprises, detection, {'input': 0, 'output': 0}, '.', suggested_questions=questions)
+report = generate(G, communities, cohesion, labels, gods, surprises, {}, {'input': 0, 'output': 0}, '.', suggested_questions=questions)
 (repo / 'graphify-out/GRAPH_REPORT.md').write_text(report, encoding='utf-8')
 to_json(G, communities, str(repo / 'graphify-out/graph.json'))
 (repo / 'graphify-out/.graphify_labels.json').write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding='utf-8')
 print(f'pre-commit: graph updated — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges')
-" 2>&1 | sed 's/^/  /'
+" "$GRAPHIFY_REPO_FILE" "$GRAPHIFY_STAGED_LIST" 2>&1 | sed 's/^/  /' || GRAPHIFY_OK=1
 
-    # Stage the artifacts the scoped update regenerates so they ride along in
-    # this commit. Only these three are rewritten by the incremental path;
-    # never fail the commit on this.
-    git add "$REPO_ROOT/graphify-out/graph.json" \
-            "$REPO_ROOT/graphify-out/GRAPH_REPORT.md" \
-            "$REPO_ROOT/graphify-out/.graphify_labels.json" 2>/dev/null || true
-    echo "pre-commit: graphify-out/ changes staged."
+    if [[ "$GRAPHIFY_OK" -ne 0 ]]; then
+      echo "pre-commit: graphify update failed — skipping graph staging." >&2
+    else
+      # Stage the artifacts only when the update succeeded.
+      git add "$REPO_ROOT/graphify-out/graph.json" \
+              "$REPO_ROOT/graphify-out/GRAPH_REPORT.md" \
+              "$REPO_ROOT/graphify-out/.graphify_labels.json" 2>/dev/null || true
+      echo "pre-commit: graphify-out/ changes staged."
+    fi
   fi
 fi

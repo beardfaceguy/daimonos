@@ -121,6 +121,8 @@ async fn dispatch_tool(
 
         let command = match name {
             "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
+            "kgl_query" => tools::get_str(args, "query"),
+            "kgl_assert" => tools::get_str(args, "action"),
             "discord" => {
                 let base = tools::get_str(args, "command");
                 let tag = tools::get_str(args, "analytics_tag");
@@ -613,6 +615,40 @@ async fn dispatch_tool_inner(
             }
         }
 
+        // kgl_query opens the per-workspace KGL store; only needs the workspace path.
+        "kgl_query" => {
+            let action = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let qargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let workspace = session.workspace.clone();
+            let kcfg = session.cfg.kgl.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            match crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg) {
+                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => err_text(format!("{e}")),
+            }
+        }
+
+        // kgl_assert: agent write path for the non-derivable intent/provenance layer.
+        "kgl_assert" => {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let aargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
+            let workspace = session.workspace.clone();
+            let kcfg = session.cfg.kgl.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            match crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg) {
+                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => err_text(format!("{e}")),
+            }
+        }
+
         _ => Err(CallToolError::unknown_tool(name.to_string())),
     }
 }
@@ -705,46 +741,6 @@ impl ServerHandler for DaimonosHandler {
             };
         }
 
-        // kgl_query opens the per-workspace KGL store; only needs the workspace path.
-        if params.name == "kgl_query" {
-            let action = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let qargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
-            let (workspace, kcfg) = {
-                let mut s = self.session.lock().await;
-                s.used_tools.insert("kgl_query".into());
-                (s.workspace.clone(), s.cfg.kgl.clone())
-            };
-            let now = chrono::Utc::now().to_rfc3339();
-            return match crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg) {
-                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
-                Err(e) => err_text(format!("{e}")),
-            };
-        }
-
-        // kgl_assert: agent write path for the non-derivable intent/provenance layer.
-        if params.name == "kgl_assert" {
-            let action = args
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let aargs = args.get("args").cloned().unwrap_or_else(|| json!({}));
-            let (workspace, kcfg) = {
-                let mut s = self.session.lock().await;
-                s.used_tools.insert("kgl_assert".into());
-                (s.workspace.clone(), s.cfg.kgl.clone())
-            };
-            let now = chrono::Utc::now().to_rfc3339();
-            return match crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg) {
-                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
-                Err(e) => err_text(format!("{e}")),
-            };
-        }
-
         let mut session = self.session.lock().await;
 
         if params.name == "batch" {
@@ -812,9 +808,11 @@ impl ServerHandler for DaimonosHandler {
                 let kcfg = session.cfg.kgl.clone();
                 drop(session); // release the lock before sync SQLite I/O
                 for (tool, sub_args) in &observed_ops {
-                    let _ = crate::kgl::observe::record_file_op(
+                    if let Err(e) = crate::kgl::observe::record_file_op(
                         &ws, &cwd, &sid, tool, sub_args, &now, &kcfg,
-                    );
+                    ) {
+                        eprintln!("kgl observe (batch/{tool}): {e}");
+                    }
                 }
             }
             return ok_text(payload);
@@ -837,7 +835,7 @@ impl ServerHandler for DaimonosHandler {
                     let cwd = session.cwd.clone();
                     let kcfg = session.cfg.kgl.clone();
                     drop(session); // release the lock before sync SQLite I/O
-                    let _ = crate::kgl::observe::record_file_op(
+                    if let Err(e) = crate::kgl::observe::record_file_op(
                         &ws,
                         &cwd,
                         &sid,
@@ -845,7 +843,9 @@ impl ServerHandler for DaimonosHandler {
                         &args,
                         &now,
                         &kcfg,
-                    );
+                    ) {
+                        eprintln!("kgl observe ({}): {e}", params.name);
+                    }
                 }
             }
         }

@@ -77,7 +77,7 @@ fn orient_from_graph_alone() {
     let store = KglStore::open(&ws.join(".kgl").join("kgl.db")).unwrap();
     let hash_of = |name: &str| -> String {
         store
-            .find(name)
+            .find(name, usize::MAX)
             .unwrap()
             .into_iter()
             .find(|r| r.node.name.as_deref() == Some(name))

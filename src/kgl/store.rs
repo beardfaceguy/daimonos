@@ -406,14 +406,18 @@ impl KglStore {
     }
 
     /// Fuzzy orientation entry: nodes whose name or intent purpose contains `q`.
-    pub fn find(&self, q: &str) -> Result<Vec<NodeRecord>> {
+    /// `limit` caps the result set size; pass `usize::MAX` for effectively
+    /// unlimited (internal/test callers that already scope their queries).
+    pub fn find(&self, q: &str, limit: usize) -> Result<Vec<NodeRecord>> {
         let needle = format!("%{}%", q.to_lowercase());
         let sql = format!(
             "{NODE_SELECT} WHERE lower(IFNULL(name,'')) LIKE ?1 \
-             OR lower(IFNULL(intent_json,'')) LIKE ?1"
+             OR lower(IFNULL(intent_json,'')) LIKE ?1 \
+             LIMIT ?2"
         );
+        let lim = limit.min(i64::MAX as usize) as i64;
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![needle], |r| Ok(row_to_record(r)))?;
+        let rows = stmt.query_map(params![needle, lim], |r| Ok(row_to_record(r)))?;
         collect_records(rows)
     }
 
@@ -430,7 +434,10 @@ impl KglStore {
 
     /// Transitive set of nodes that (directly or indirectly) depend on / call
     /// `hash` — what breaks if it changes. Computed on demand (not materialized).
-    pub fn blast_radius(&self, hash: &str) -> Result<Vec<NodeRecord>> {
+    /// `max_nodes` caps how many dependent nodes are collected before the BFS
+    /// is truncated; pass `usize::MAX` for internal/test callers that need the
+    /// full set on small graphs.
+    pub fn blast_radius(&self, hash: &str, max_nodes: usize) -> Result<Vec<NodeRecord>> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
         queue.push_back(hash.to_string());
@@ -438,6 +445,9 @@ impl KglStore {
         let mut result_hashes: Vec<String> = Vec::new();
 
         while let Some(cur) = queue.pop_front() {
+            if result_hashes.len() >= max_nodes {
+                break;
+            }
             let mut stmt = self.conn.prepare(
                 "SELECT from_hash FROM kgl_edge \
                  WHERE to_ref=?1 AND kind IN ('calls','depends_on')",
@@ -447,6 +457,9 @@ impl KglStore {
                 .filter_map(|r| r.ok())
                 .collect();
             for d in dependents {
+                if result_hashes.len() >= max_nodes {
+                    break;
+                }
                 if seen.insert(d.clone()) {
                     result_hashes.push(d.clone());
                     queue.push_back(d);
@@ -686,7 +699,7 @@ mod tests {
         assert_eq!(nodes, 3); // module + 2 functions
 
         // the `calls` URN x07fn:checked_add resolved to checked_add's real hash
-        let add = store.find("add").unwrap();
+        let add = store.find("add", usize::MAX).unwrap();
         let add_fn = add
             .iter()
             .find(|r| r.node.name.as_deref() == Some("add"))
@@ -712,7 +725,7 @@ mod tests {
         let mut store = KglStore::open_in_memory().unwrap();
         store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
 
-        let add = store.find("add").unwrap();
+        let add = store.find("add", usize::MAX).unwrap();
         let add_hash = add
             .iter()
             .find(|r| r.node.name.as_deref() == Some("add"))
@@ -775,7 +788,7 @@ mod tests {
         let mut store = KglStore::open_in_memory().unwrap();
         store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         // Document every node so only effect-rule (b) violations could remain.
-        for rec in store.find("").unwrap() {
+        for rec in store.find("", usize::MAX).unwrap() {
             store
                 .set_intent(
                     &rec.node.hash,
@@ -893,7 +906,7 @@ mod tests {
         let mut store = KglStore::open_in_memory().unwrap();
         store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         let foo = store
-            .find("foo")
+            .find("foo", usize::MAX)
             .unwrap()
             .into_iter()
             .find(|r| r.node.name.as_deref() == Some("foo"))
@@ -901,7 +914,7 @@ mod tests {
             .node
             .hash;
         let bar = store
-            .find("bar")
+            .find("bar", usize::MAX)
             .unwrap()
             .into_iter()
             .find(|r| r.node.name.as_deref() == Some("bar"))

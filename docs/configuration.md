@@ -220,7 +220,9 @@ values govern its SQLite access and background file-watcher when enabled.
 | `max_watches` | `4096` | Hard cap on inotify watches the KGL file-watcher registers, bounding `fs.inotify.max_user_watches` usage. |
 | `debounce_secs` | `2` | Debounce window for coalescing change bursts into at most one graph rebuild. |
 | `orient_max_matches` | `12` | Max task-matching defs `kgl_query orient` expands in one bundled call (each adds its edges + dependents), bounding the orient response size. |
-| `skip_dirs` | `["target", ".git", ".jj", "node_modules", ".kgl"]` | Directory base names never walked when detecting/indexing a substrate or registering watches. |
+| `find_max` | `200` | SQL LIMIT applied to every `kgl_query find` result set; caps how many nodes a broad LIKE query can materialise in one call. |
+| `blast_radius_max` | `500` | Hard node cap for `blast_radius` BFS; stops dense call graphs from exhausting CPU/memory during a transitive traversal. |
+| `skip_dirs` | `["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]` | Directory base names never walked when detecting/indexing a substrate or registering watches. |
 
 ```toml
 [kgl]
@@ -228,7 +230,9 @@ busy_timeout_ms = 5000
 max_watches = 4096
 debounce_secs = 2
 orient_max_matches = 12
-skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl"]
+find_max = 200
+blast_radius_max = 500
+skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 ```
 
 ### `[tools.<id>]` — Tool Plugins (Advanced)
