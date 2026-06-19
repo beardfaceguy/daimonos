@@ -10,7 +10,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Node.js LTS (Claude Code CLI requires it)
 if ! command -v node &>/dev/null; then
     echo "Installing Node.js..."
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - # nosemgrep: bash.curl.security.curl-pipe-bash.curl-pipe-bash
     sudo apt-get install -y nodejs
 fi
 

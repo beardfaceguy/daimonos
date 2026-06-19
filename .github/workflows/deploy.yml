@@ -135,15 +135,17 @@ jobs:
           echo "key_name=$KEY_NAME" >> "$GITHUB_ENV"
 
       - name: Launch ephemeral instance
+        env:
+          AMI_ID: ${{ needs.deploy.outputs.ami_id }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
         run: |
-          AMI_ID="${{ needs.deploy.outputs.ami_id }}"
           SG=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=daimonos-sg" \
             --query 'SecurityGroups[0].GroupId' --output text)
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
-            --instance-type "${{ inputs.instance_type }}" \
+            --instance-type "$INSTANCE_TYPE" \
             --key-name "$key_name" \
             --security-group-ids "$SG" \
             --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \

@@ -28,8 +28,13 @@ impl Substrate for GraphifySubstrate {
     fn index(&self, root: &Path) -> Result<IndexResult> {
         let mut out = IndexResult::default();
         let path = root.join("graphify-out").join("graph.json");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return Ok(out); // no graphify graph present -> empty; degrade safely
+        let content = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            // File absent — no graphify substrate; caller falls back gracefully.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            // File present but unreadable: propagate so populate aborts rather
+            // than treating an IO failure as "no nodes" and pruning the graph.
+            Err(e) => return Err(e.into()),
         };
         let g: Value = serde_json::from_str(&content)?;
 

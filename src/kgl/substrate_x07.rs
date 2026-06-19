@@ -11,7 +11,7 @@
 use crate::kgl::model::{DefNode, Derivation, Edge, EdgeKind, EffectFacts, NodeKind, SubstrateKind};
 use crate::kgl::substrate::{content_hash, filtered_walk_builder, IndexResult, Substrate};
 use crate::plugins::x07::parse_x07_module;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::Path;
 
@@ -37,6 +37,8 @@ impl Substrate for X07Substrate {
 
     fn index(&self, root: &Path) -> Result<IndexResult> {
         let mut out = IndexResult::default();
+        let mut total = 0usize;
+        let mut skipped = 0usize;
         for entry in filtered_walk_builder(root, &self.skip_dirs)
             .build()
             .filter_map(|e| e.ok())
@@ -49,11 +51,22 @@ impl Substrate for X07Substrate {
             if !name.ends_with(".x07.json") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
+            total += 1;
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("kgl x07: skipping unreadable {:?}: {e}", path);
+                    skipped += 1;
+                    continue;
+                }
             };
-            let Ok(ast) = serde_json::from_str::<Value>(&content) else {
-                continue;
+            let ast = match serde_json::from_str::<Value>(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("kgl x07: skipping unparseable {:?}: {e}", path);
+                    skipped += 1;
+                    continue;
+                }
             };
             let rel = path
                 .strip_prefix(root)
@@ -61,6 +74,14 @@ impl Substrate for X07Substrate {
                 .to_string_lossy()
                 .to_string();
             index_module(&ast, &rel, &mut out);
+        }
+        // If every x07.json file failed, propagate an error rather than returning
+        // an empty IndexResult that would cause populate() to prune all nodes.
+        if total > 0 && skipped == total {
+            return Err(anyhow!(
+                "kgl x07: all {total} .x07.json file(s) failed to read/parse; \
+                 aborting index to prevent graph prune. Check file permissions."
+            ));
         }
         Ok(out)
     }

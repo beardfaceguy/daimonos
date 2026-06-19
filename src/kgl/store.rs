@@ -409,10 +409,16 @@ impl KglStore {
     /// `limit` caps the result set size; pass `usize::MAX` for effectively
     /// unlimited (internal/test callers that already scope their queries).
     pub fn find(&self, q: &str, limit: usize) -> Result<Vec<NodeRecord>> {
-        let needle = format!("%{}%", q.to_lowercase());
+        if q.is_empty() {
+            return Ok(vec![]);
+        }
+        // Escape SQL LIKE metacharacters so user input doesn't silently change
+        // match semantics (e.g. "get%" must match literally, not "get anything").
+        let escaped = q.to_lowercase().replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        let needle = format!("%{escaped}%");
         let sql = format!(
-            "{NODE_SELECT} WHERE lower(IFNULL(name,'')) LIKE ?1 \
-             OR lower(IFNULL(intent_json,'')) LIKE ?1 \
+            "{NODE_SELECT} WHERE lower(IFNULL(name,'')) LIKE ?1 ESCAPE '\\' \
+             OR lower(IFNULL(intent_json,'')) LIKE ?1 ESCAPE '\\' \
              LIMIT ?2"
         );
         let lim = limit.min(i64::MAX as usize) as i64;
@@ -528,10 +534,11 @@ impl KglStore {
         Ok(violations)
     }
 
-    /// True if `start`, or any node reachable from it via `calls` edges, has a
-    /// reads/mutates edge. A def whose I/O happens entirely through callees thus
-    /// satisfies completeness rule (b): the touched state is still discoverable
-    /// by following the call chain. Cycle-guarded.
+    /// True if `start`, or any node reachable from it via `calls` or
+    /// `depends_on` edges, has a reads/mutates edge. A def whose I/O happens
+    /// entirely through callees or dependencies satisfies completeness rule (b):
+    /// the touched state is still discoverable by following the dependency chain.
+    /// Cycle-guarded.
     fn has_reachable_io_edge(&self, start: &str) -> Result<bool> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
@@ -546,9 +553,12 @@ impl KglStore {
             if direct > 0 {
                 return Ok(true);
             }
-            let mut stmt = self
-                .conn
-                .prepare("SELECT to_ref FROM kgl_edge WHERE from_hash=?1 AND kind='calls'")?;
+            // Walk both `calls` and `depends_on` — I/O can be reached through
+            // either edge kind (a module that depends_on an I/O helper is just as
+            // reachable as one that calls it directly).
+            let mut stmt = self.conn.prepare(
+                "SELECT to_ref FROM kgl_edge WHERE from_hash=?1 AND kind IN ('calls','depends_on')",
+            )?;
             let callees: Vec<String> = stmt
                 .query_map(params![cur], |r| r.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
@@ -788,17 +798,15 @@ mod tests {
         let mut store = KglStore::open_in_memory().unwrap();
         store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
         // Document every node so only effect-rule (b) violations could remain.
-        for rec in store.find("", usize::MAX).unwrap() {
-            store
-                .set_intent(
-                    &rec.node.hash,
-                    &Intent {
-                        purpose: "documented".into(),
-                        rationale: None,
-                        open_questions: vec![],
-                    },
-                )
-                .unwrap();
+        // Use check_completeness() to enumerate all nodes rather than find(""),
+        // since find("") is intentionally blocked (empty query matches nothing).
+        let intent = Intent {
+            purpose: "documented".into(),
+            rationale: None,
+            open_questions: vec![],
+        };
+        for v in store.check_completeness().unwrap() {
+            store.set_intent(&v.hash, &intent).unwrap();
         }
         let v = store.check_completeness().unwrap();
         assert!(v.is_empty(), "expected no violations, got {v:?}");

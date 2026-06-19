@@ -616,6 +616,8 @@ async fn dispatch_tool_inner(
         }
 
         // kgl_query opens the per-workspace KGL store; only needs the workspace path.
+        // Wrapped in spawn_blocking: SQLite I/O and workspace walks are synchronous
+        // and must not block the shared async executor.
         "kgl_query" => {
             let action = args
                 .get("query")
@@ -626,13 +628,19 @@ async fn dispatch_tool_inner(
             let workspace = session.workspace.clone();
             let kcfg = session.cfg.kgl.clone();
             let now = chrono::Utc::now().to_rfc3339();
-            match crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg) {
-                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
-                Err(e) => err_text(format!("{e}")),
+            match tokio::task::spawn_blocking(move || {
+                crate::kgl::query::run(&workspace, &action, &qargs, &now, &kcfg)
+            })
+            .await
+            {
+                Ok(Ok(v)) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Ok(Err(e)) => err_text(format!("{e}")),
+                Err(e) => err_text(format!("kgl_query task panicked: {e}")),
             }
         }
 
         // kgl_assert: agent write path for the non-derivable intent/provenance layer.
+        // Wrapped in spawn_blocking: SQLite I/O must not block the async executor.
         "kgl_assert" => {
             let action = args
                 .get("action")
@@ -643,9 +651,14 @@ async fn dispatch_tool_inner(
             let workspace = session.workspace.clone();
             let kcfg = session.cfg.kgl.clone();
             let now = chrono::Utc::now().to_rfc3339();
-            match crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg) {
-                Ok(v) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
-                Err(e) => err_text(format!("{e}")),
+            match tokio::task::spawn_blocking(move || {
+                crate::kgl::assert::run(&workspace, &action, &aargs, &now, &kcfg)
+            })
+            .await
+            {
+                Ok(Ok(v)) => ok_text(serde_json::to_string(&v).unwrap_or_default()),
+                Ok(Err(e)) => err_text(format!("{e}")),
+                Err(e) => err_text(format!("kgl_assert task panicked: {e}")),
             }
         }
 

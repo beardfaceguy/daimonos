@@ -241,7 +241,7 @@ def load_task(task_id: str):
     """
     sys.path.insert(0, str(HERE))
     try:
-        mod = importlib.import_module(f"tasks.{task_id}")
+        mod = importlib.import_module(f"tasks.{task_id}")  # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
     finally:
         sys.path.pop(0)
     required = ("ID", "DESCRIPTION", "setup", "run_iteration")

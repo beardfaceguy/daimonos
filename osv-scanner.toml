@@ -1,0 +1,23 @@
+# osv-scanner.toml — acknowledged advisories with no upstream fix available.
+# Review periodically; remove entries once a patched version is released.
+
+# derivative 2.2.0 (proc-macro via starlark): abandoned crate, unsound derive
+# impl. Used only at compile time; not present in the final binary.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"
+reason = "No fix available; proc-macro only, not present in final binary."
+
+# fxhash 0.2.1 (via starlark_map): unmaintained, no fix upstream.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0057"
+reason = "No fix available; transitively pulled by starlark, no known exploitable path."
+
+# instant 0.1.13 (via notify): unmaintained dependency, no fix upstream.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+reason = "No fix available; transitively pulled by notify crate."
+
+# paste 1.0.15 (proc-macro via starlark): no fix available upstream.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "No fix available; proc-macro only, not present in final binary."
