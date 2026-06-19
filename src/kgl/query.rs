@@ -69,16 +69,18 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglCon
             let edges = store.neighbors(hash, kind, dir)?;
             Ok(json!(edges.iter().map(edge_json).collect::<Vec<_>>()))
         }
-        "find" => Ok(records_json(store.find(str_arg(args, "q")?)?)),
+        "find" => Ok(records_json(store.find(str_arg(args, "q")?, cfg.find_max)?)),
         "writers_of" => Ok(records_json(store.writers_of(str_arg(args, "resource")?)?)),
-        "blast_radius" => Ok(records_json(store.blast_radius(str_arg(args, "hash")?)?)),
+        "blast_radius" => Ok(records_json(
+            store.blast_radius(str_arg(args, "hash")?, cfg.blast_radius_max)?,
+        )),
         "open_questions" => Ok(records_json(store.open_questions()?)),
         "orient" => {
             // One bundled call (vs many round-trips): task-matching defs with their
             // intent/open-questions, their outgoing edges, and their dependents.
             let task = str_arg(args, "task")?;
             let top: Vec<_> = store
-                .find(task)?
+                .find(task, cfg.find_max)?
                 .into_iter()
                 .take(cfg.orient_max_matches)
                 .collect();
@@ -90,7 +92,7 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglCon
                 for e in store.neighbors(&rec.node.hash, None, Direction::Out)? {
                     edges.push(edge_json(&e));
                 }
-                for dep in store.blast_radius(&rec.node.hash)? {
+                for dep in store.blast_radius(&rec.node.hash, cfg.blast_radius_max)? {
                     if let Some(n) = dep.node.name {
                         dependents.insert(n);
                     }

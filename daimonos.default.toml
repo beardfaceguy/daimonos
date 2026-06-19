@@ -147,9 +147,15 @@ debounce_secs = 2
 # Max task-matching defs `kgl_query orient` expands in one bundled call (each
 # adds its outgoing edges + dependents), bounding the orient response size.
 orient_max_matches = 12
+# SQL LIMIT for kgl_query find results: caps how many nodes a broad LIKE query
+# can materialise from the graph in one call.
+find_max = 200
+# Hard node cap for blast_radius BFS: stops dense call graphs from exhausting
+# CPU/memory during an unbounded transitive traversal.
+blast_radius_max = 500
 # Directory base names never walked when detecting/indexing a substrate or
 # registering watches (build/vcs churn + our own store).
-skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl"]
+skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.

@@ -106,7 +106,7 @@ mod tests {
     fn foo_hash(ws: &Path) -> String {
         KglStore::open_workspace(ws)
             .unwrap()
-            .find("foo")
+            .find("foo", usize::MAX)
             .unwrap()
             .into_iter()
             .find(|r| r.node.name.as_deref() == Some("foo"))

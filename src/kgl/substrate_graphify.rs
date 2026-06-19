@@ -177,7 +177,7 @@ mod tests {
         let mut store = KglStore::open_in_memory().unwrap();
         let (nodes, edges) = store.populate(&GraphifySubstrate, Path::new("."), "real").unwrap();
         println!("\n[graphify->kgl] daimonos Rust graph: {nodes} nodes, {edges} edges");
-        let hits = store.find("config").unwrap();
+        let hits = store.find("config", usize::MAX).unwrap();
         println!(
             "find 'config' -> {} nodes (e.g. {:?})",
             hits.len(),
@@ -187,7 +187,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         if let Some(first) = hits.first() {
-            let blast = store.blast_radius(&first.node.hash).unwrap();
+            let blast = store.blast_radius(&first.node.hash, usize::MAX).unwrap();
             println!(
                 "blast_radius({:?}) -> {} dependents",
                 first.node.name, blast.len()

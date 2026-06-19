@@ -165,6 +165,12 @@ fn build_watcher(
             continue;
         }
         if watched >= cfg.max_watches {
+            eprintln!(
+                "kgl watcher: max_watches ({}) reached — directories beyond this point will \
+                 not be watched; changes there will leave the graph stale until the next \
+                 manual index. Raise kgl.max_watches in daimonos.toml if needed.",
+                cfg.max_watches
+            );
             break;
         }
         if watcher.watch(entry.path(), RecursiveMode::NonRecursive).is_ok() {
@@ -252,7 +258,7 @@ mod tests {
 
         let store = KglStore::open_workspace(tmp.path()).unwrap();
         assert!(store
-            .find("foo")
+            .find("foo", usize::MAX)
             .unwrap()
             .iter()
             .any(|r| r.node.name.as_deref() == Some("foo")));
