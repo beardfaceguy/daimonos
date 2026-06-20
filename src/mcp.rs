@@ -24,6 +24,7 @@ use crate::protocol::Response;
 use crate::script;
 use crate::session::Session;
 use crate::tool_runner::ToolRegistry;
+use crate::tool_facade;
 use crate::tools;
 
 pub struct DaimonosHandler {
@@ -172,21 +173,10 @@ async fn dispatch_tool_inner(
     }
     session.used_tools.insert(name.to_string());
 
-    // Registry-based dispatch: if the tool has a to_request mapping, use it
-    if let Some(result) = tools::build_request(name, args) {
-        match result {
-            Ok(request) => {
-                let resp = ops::dispatch(session, request).await;
-                // Stash structured response metadata for the analytics layer.
-                // Doing this here (rather than substring-matching the wire
-                // text in `dispatch_tool`) avoids brittle false positives
-                // when tool output happens to contain `"via":"plugin"` or
-                // `"unchanged":true` as user data.
-                session.last_response_meta = resp.meta.clone();
-                return response_to_result(resp);
-            }
-            Err(e) => return err_text(e),
-        }
+    // Registry-based dispatch: route ops-backed tools through the facade.
+    if let Some(resp) = tool_facade::invoke(session, name, args).await {
+        session.last_response_meta = resp.meta.clone();
+        return response_to_result(resp);
     }
 
     // Special tools that need session access or custom handling

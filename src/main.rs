@@ -11,6 +11,7 @@ mod script;
 mod session;
 mod snapshot;
 mod tool_runner;
+mod tool_facade;
 mod tools;
 
 use clap::Parser;
