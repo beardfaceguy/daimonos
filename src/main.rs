@@ -10,6 +10,7 @@ mod protocol;
 mod script;
 mod session;
 mod snapshot;
+mod providers;
 mod tool_runner;
 mod tool_facade;
 mod tools;
