@@ -12,6 +12,7 @@ mod session;
 mod snapshot;
 mod agent;
 mod agent_cmd;
+mod safety;
 mod providers;
 mod tool_runner;
 mod tool_facade;
@@ -166,8 +167,17 @@ async fn main() -> anyhow::Result<()> {
         }
         let llm = providers::anthropic::AnthropicProvider::from_env()
             .map_err(|e| anyhow::anyhow!("provider init: {e}"))?;
-        let args = agent_cmd::AgentCmdArgs { task, model, dry_run };
-        let result = agent_cmd::run_agent(&llm, &workspace, &args, &mut std::io::stdout()).await?;
+        let args = agent_cmd::AgentCmdArgs {
+            task,
+            model,
+            dry_run,
+            safety: Some(safety::SafetyPolicy {
+                approval_mode: safety::ApprovalMode::Interactive,
+                approve_fn: Some(safety::SafetyPolicy::stdin_approve_fn()),
+                ..safety::SafetyPolicy::default()
+            }),
+        };
+        let result = agent_cmd::run_agent(&llm, &workspace, args, &mut std::io::stdout()).await?;
         if result.stop_reason == providers::StopReason::Error {
             let msg = result.error_message.as_deref().unwrap_or("unknown error");
             eprintln!("agent error: {msg}");

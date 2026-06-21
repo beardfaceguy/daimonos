@@ -9,6 +9,7 @@ use anyhow::Result;
 use crate::agent::{AgentConfig, AgentResult};
 use crate::config::Config;
 use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, ToolSchema};
+use crate::safety::SafetyPolicy;
 use crate::session::Session;
 use crate::tool_facade;
 
@@ -16,16 +17,19 @@ pub struct AgentCmdArgs {
     pub task: String,
     pub model: Option<String>,
     pub dry_run: bool,
+    /// Safety policy (denylist/allowlist/approval mode). `None` = no restrictions.
+    pub safety: Option<SafetyPolicy>,
 }
 
 /// Run the agent subcommand.
 ///
-/// `provider` is injected so tests can substitute a mock.
+/// Takes `args` by value so the optional `SafetyPolicy` can be consumed into
+/// the `before_tool_call` hook without cloning.
 /// Only assistant text blocks are written to `out`; thinking blocks are suppressed.
 pub async fn run_agent(
     provider: &dyn LlmProvider,
     workspace: &Path,
-    args: &AgentCmdArgs,
+    args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
     let schemas = tool_facade::active_schemas(workspace);
@@ -46,11 +50,13 @@ pub async fn run_agent(
         .map(|s| ToolSchema { name: s.name, description: s.description, input_schema: s.input_schema })
         .collect();
 
-    let model = args.model.clone().unwrap_or_else(|| "claude-opus-4-8".to_string());
+    let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
+    let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let config = AgentConfig {
         system: Some(default_system_prompt()),
         tools,
         opts: CompleteOpts { model, ..CompleteOpts::default() },
+        before_tool_call,
         ..AgentConfig::default()
     };
 
@@ -141,7 +147,7 @@ mod tests {
     }
 
     fn args(task: &str) -> AgentCmdArgs {
-        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false }
+        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None }
     }
 
     // --- dry-run ---
@@ -149,17 +155,17 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_call_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true };
+        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), &a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
     }
 
     #[tokio::test]
     async fn dry_run_prints_task_in_output() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true };
+        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), &a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("my task"), "output should mention the task: {s}");
     }
@@ -167,9 +173,9 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_tool_count() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true };
+        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), &a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("tool"), "output should mention tools: {s}");
     }
@@ -181,7 +187,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("task complete")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &args("do a thing"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), args("do a thing"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("task complete"), "text block should appear in output: {s}");
     }
@@ -191,7 +197,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("assistant reply")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &args("user task prompt"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), args("user task prompt"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("user task prompt"), "user message should not appear in output: {s}");
         assert!(s.contains("assistant reply"));
@@ -210,7 +216,7 @@ mod tests {
             usage: Usage::default(),
         }]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &args("think"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), args("think"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("internal thoughts"), "thinking should be hidden: {s}");
         assert!(s.contains("visible answer"));
@@ -223,7 +229,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("ok")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &args("go"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), args("go"), &mut out).await.unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-opus-4-8");
     }
@@ -236,9 +242,10 @@ mod tests {
             task: "go".into(),
             model: Some("claude-haiku-4-5".into()),
             dry_run: false,
+            safety: None,
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), a, &mut out).await.unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-haiku-4-5");
     }
@@ -260,7 +267,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = SchemaCapture(Mutex::new(Vec::new()));
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), &args("check tools"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), args("check tools"), &mut out).await.unwrap();
         let counts = provider.0.lock().unwrap();
         assert!(*counts.first().unwrap() > 0, "agent loop should include tools in Context");
     }
@@ -272,8 +279,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
         let mut out = Vec::new();
-        let result = run_agent(&provider, dir.path(), &args("go"), &mut out).await.unwrap();
+        let result = run_agent(&provider, dir.path(), args("go"), &mut out).await.unwrap();
         assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("api down"));
+    }
+
+    // --- safety policy wiring ---
+
+    #[tokio::test]
+    async fn safety_policy_blocks_denied_tool_before_provider_sees_it() {
+        use crate::safety::SafetyPolicy;
+        use crate::agent::BeforeHookResult;
+
+        // Verify that a denied tool gets a Block result from the hook
+        let policy = SafetyPolicy {
+            denied_commands: vec!["exec".into()],
+            ..SafetyPolicy::default()
+        };
+        let hook = policy.into_before_hook();
+        let info = crate::agent::ToolCallInfo {
+            id: "t1".into(),
+            name: "exec".into(),
+            input: serde_json::json!({}),
+        };
+        assert!(matches!(hook(&info), BeforeHookResult::Block(_)));
     }
 }
