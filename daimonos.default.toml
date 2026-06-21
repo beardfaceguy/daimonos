@@ -187,3 +187,20 @@ skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 # bin = "cargo"
 # source_pattern = "**/*.rs"
 # manifest = "Cargo.toml"
+
+[agent]
+# LLM provider. Supported: "openrouter", "anthropic".
+provider = "openrouter"
+# API base URL. Override for proxies or alternative endpoints.
+base_url = "https://openrouter.ai/api/v1"
+# Default model sent to the provider (overridable via --model flag).
+model = "claude-opus-4-8"
+# Environment variable holding the API key.
+api_key_env = "OPENROUTER_API_KEY"
+# Tool-call approval mode: "auto" (no prompts), "interactive" (prompt on
+# destructive tools), or "paranoid" (prompt on every tool call).
+approval_mode = "interactive"
+# Tools always approved without a prompt (approval_mode = "interactive" only).
+allowed_commands = []
+# Tools hard-blocked regardless of approval mode.
+denied_commands = []

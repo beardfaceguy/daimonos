@@ -160,10 +160,13 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
-    if let Some(Commands::Agent { task, model, provider, dry_run }) = cli.command {
-        if provider != "anthropic" {
-            eprintln!("unsupported provider: {provider} (only 'anthropic' is available)");
-            std::process::exit(2);
+    if let Some(Commands::Agent { task, model, provider: _provider, dry_run }) = cli.command {
+        // Fail fast if the API key is missing — before any network I/O.
+        if !dry_run {
+            cfg.agent.resolve_api_key().map_err(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }).ok();
         }
         let llm = providers::anthropic::AnthropicProvider::from_env()
             .map_err(|e| anyhow::anyhow!("provider init: {e}"))?;
@@ -175,15 +178,17 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        let effective_model = model.unwrap_or_else(|| cfg.agent.model.clone());
+        let approve_fn = if cfg.agent.approval_mode == "auto" {
+            None
+        } else {
+            Some(safety::SafetyPolicy::stdin_approve_fn())
+        };
         let args = agent_cmd::AgentCmdArgs {
             task,
-            model,
+            model: Some(effective_model),
             dry_run,
-            safety: Some(safety::SafetyPolicy {
-                approval_mode: safety::ApprovalMode::Interactive,
-                approve_fn: Some(safety::SafetyPolicy::stdin_approve_fn()),
-                ..safety::SafetyPolicy::default()
-            }),
+            safety: Some(cfg.agent.to_safety_policy(approve_fn)),
             analytics: analytics_store,
         };
         let result = agent_cmd::run_agent(&llm, &workspace, args, &mut std::io::stdout()).await?;
