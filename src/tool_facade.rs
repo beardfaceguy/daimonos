@@ -124,6 +124,70 @@ mod tests {
         assert!(names.contains(&"git".to_string()));
     }
 
+    #[test]
+    fn active_schemas_excludes_cargo_without_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(!names.contains(&"cargo".to_string()));
+    }
+
+    #[test]
+    fn active_schemas_includes_cargo_when_cargo_toml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"cargo".to_string()));
+    }
+
+    #[test]
+    fn active_schemas_excludes_docker_without_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(!names.contains(&"docker".to_string()));
+    }
+
+    #[test]
+    fn active_schemas_includes_docker_when_dockerfile_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM ubuntu").unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"docker".to_string()));
+    }
+
+    #[test]
+    fn active_schemas_includes_docker_when_compose_yml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "version: '3'").unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"docker".to_string()));
+    }
+
+    #[test]
+    fn active_schemas_includes_docker_when_compose_yaml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yaml"), "version: '3'").unwrap();
+        let names: Vec<_> = active_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"docker".to_string()));
+    }
+
     // --- invoke ---
 
     #[tokio::test]

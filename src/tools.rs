@@ -439,7 +439,11 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["command"]
             }),
             to_request: None,
-            context_check: None,
+            context_check: Some(|ws| {
+                ws.join("Dockerfile").exists()
+                    || ws.join("docker-compose.yml").exists()
+                    || ws.join("docker-compose.yaml").exists()
+            }),
         },
 
         ToolDef {
