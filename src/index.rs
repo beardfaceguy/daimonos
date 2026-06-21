@@ -247,15 +247,22 @@ impl WorkspaceIndex {
                 trigrams.retain(|_, entries| !entries.is_empty());
             }
 
-            // Old ID -> new ID mapping for files that survived
+            // Old ID -> new ID mapping for files that survived unchanged.
             let mut id_remap: HashMap<u32, u32> = HashMap::new();
+            // Files that need content re-extraction: (rel, mtime, old_id_to_evict)
+            // old_id_to_evict is Some for modified files (old trigrams must be
+            // removed), None for newly added files.
+            let mut to_extract: Vec<(String, u64, Option<u32>)> = Vec::new();
 
+            // Pass 1: classify each file as skipped/updated/added.
+            // Only push SKIPPED files into new_files here. New and updated files
+            // are deferred to Pass 3 (after binary/size checks) so they don't
+            // inflate new_files if their content turns out to be unindexable.
             for (rel, &mtime) in &current_files {
-                let file_id = new_files.len() as u32;
-
                 if let Some(&(old_id, old_mtime)) = prev_paths.get(rel) {
                     if mtime == old_mtime && !is_first_index {
-                        // Unchanged — keep existing trigrams, just remap the ID
+                        // Unchanged — keep existing trigrams, remap old_id → new pos
+                        let file_id = new_files.len() as u32;
                         id_remap.insert(old_id, file_id);
                         new_files.push(rel.clone());
                         new_mtimes.push(mtime);
@@ -263,33 +270,28 @@ impl WorkspaceIndex {
                         skipped += 1;
                         continue;
                     }
-                    // Modified — remove old trigrams, re-extract
-                    for entries in trigrams.values_mut() {
-                        entries.retain(|id| *id != old_id);
-                    }
+                    // Modified — schedule old trigram removal and re-extraction
+                    to_extract.push((rel.clone(), mtime, Some(old_id)));
                     updated += 1;
                 } else {
+                    // New file — schedule extraction
+                    to_extract.push((rel.clone(), mtime, None));
                     added += 1;
                 }
-
-                // Read and index the file
-                let path = root.join(rel);
-                let content = match std::fs::read(&path) {
-                    Ok(c) if c.len() <= max_file_size => c,
-                    _ => continue,
-                };
-
-                if content.iter().take(binary_sniff_bytes).any(|&b| b == 0) {
-                    continue;
-                }
-
-                new_files.push(rel.clone());
-                new_mtimes.push(mtime);
-                new_path_to_id.insert(rel.clone(), file_id);
-                extract_trigrams(&content, file_id, &mut trigrams);
             }
 
-            // Remap old file IDs to new file IDs in trigram entries
+            // Pass 2: remove old trigrams for modified files.
+            // All old_ids are now known and cannot collide with new file_ids
+            // (new_files still only contains skipped files at this point).
+            for (_, _, old_id_opt) in &to_extract {
+                if let Some(oid) = old_id_opt {
+                    for entries in trigrams.values_mut() {
+                        entries.retain(|id| id != oid);
+                    }
+                }
+            }
+
+            // Remap old file IDs to new file IDs in trigram entries.
             if !id_remap.is_empty() {
                 for entries in trigrams.values_mut() {
                     for id in entries.iter_mut() {
@@ -298,6 +300,25 @@ impl WorkspaceIndex {
                         }
                     }
                 }
+            }
+
+            // Pass 3: extract trigrams for new and modified files.
+            // file_ids are assigned here, AFTER id_remap, so they cannot
+            // collide with any old_id that was used as a remap source.
+            for (rel, mtime, _) in &to_extract {
+                let path = root.join(rel);
+                let content = match std::fs::read(&path) {
+                    Ok(c) if c.len() <= max_file_size => c,
+                    _ => continue,
+                };
+                if content.iter().take(binary_sniff_bytes).any(|&b| b == 0) {
+                    continue;
+                }
+                let file_id = new_files.len() as u32;
+                new_files.push(rel.clone());
+                new_mtimes.push(*mtime);
+                new_path_to_id.insert(rel.clone(), file_id);
+                extract_trigrams(&content, file_id, &mut trigrams);
             }
 
             // Clean up any empty trigram entries
