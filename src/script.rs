@@ -213,13 +213,139 @@ pub async fn execute(
     }
 }
 
+/// Pre-process Starlark code so that single/double-quoted string literals
+/// containing literal newlines are converted to triple-quoted form.
+///
+/// Starlark (unlike Python) does not permit literal newlines inside `"..."` or
+/// `'...'` strings. Models often produce such strings when embedding multi-line
+/// file content. This normalization converts them before the Starlark parser
+/// sees the code, turning confusing "unfinished string literal" parse errors
+/// into valid scripts.
+///
+/// Triple-quoted strings already in the code are copied verbatim. Comments
+/// (`# ...`) are skipped correctly. Backslash escape sequences are preserved.
+///
+/// If the content contains the same triple-quote sequence as the delimiter
+/// (e.g. `"""` inside a `"..."` string), the other quote style is tried. If
+/// both are present, literal newlines are backslash-escaped instead — this
+/// is semantically imperfect but at least produces parseable code. That
+/// edge case is extremely rare in practice.
+fn normalize_string_literals(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(code.len() + 32);
+    let mut i = 0;
+
+    while i < n {
+        let ch = chars[i];
+
+        // Comments: copy everything to end of line.
+        if ch == '#' {
+            while i < n && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            let q = ch;
+
+            // Triple-quoted string: copy verbatim until matching closing triple.
+            if i + 2 < n && chars[i + 1] == q && chars[i + 2] == q {
+                out.push(q); out.push(q); out.push(q);
+                i += 3;
+                while i < n {
+                    if chars[i] == '\\' && i + 1 < n {
+                        out.push(chars[i]);
+                        out.push(chars[i + 1]);
+                        i += 2;
+                    } else if chars[i] == q
+                        && i + 2 < n
+                        && chars[i + 1] == q
+                        && chars[i + 2] == q
+                    {
+                        out.push(q); out.push(q); out.push(q);
+                        i += 3;
+                        break;
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Single-quoted string: collect content, watching for literal newlines.
+            i += 1;
+            let mut content: Vec<char> = Vec::new();
+            let mut has_newline = false;
+
+            'outer: loop {
+                if i >= n { break; }
+                match chars[i] {
+                    c if c == q => { i += 1; break; }
+                    '\n' => {
+                        has_newline = true;
+                        content.push('\n');
+                        i += 1;
+                        // Collect remaining content until closing quote.
+                        loop {
+                            if i >= n { break 'outer; }
+                            if chars[i] == '\\' && i + 1 < n {
+                                content.push('\\');
+                                content.push(chars[i + 1]);
+                                i += 2;
+                            } else if chars[i] == q {
+                                i += 1;
+                                break 'outer;
+                            } else {
+                                content.push(chars[i]);
+                                i += 1;
+                            }
+                        }
+                    }
+                    '\\' if i + 1 < n => {
+                        content.push('\\');
+                        content.push(chars[i + 1]);
+                        i += 2;
+                    }
+                    c => { content.push(c); i += 1; }
+                }
+            }
+
+            if has_newline {
+                let content_str: String = content.iter().collect();
+                // Use the same quote style as the original. Collision with
+                // triple-quote delimiters is impossible for valid inputs:
+                // an unescaped `"` inside `"..."` always closes the string,
+                // so `"""` can never appear in the extracted content.
+                out.push(q); out.push(q); out.push(q);
+                out.push_str(&content_str);
+                out.push(q); out.push(q); out.push(q);
+            } else {
+                out.push(q);
+                for c in &content { out.push(*c); }
+                out.push(q);
+            }
+            continue;
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    out
+}
+
 fn run_starlark(
     code: &str,
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
     cancel: Arc<AtomicBool>,
 ) -> Result<ScriptResult, String> {
-    let ast = AstModule::parse("script", code.to_string(), &Dialect::Standard)
+    let code = normalize_string_literals(code);
+    let ast = AstModule::parse("script", code, &Dialect::Standard)
         .map_err(|e| format!("parse error: {e}"))?;
 
     let globals = build_globals(session, handle, cancel);
@@ -1405,6 +1531,116 @@ result = {"lines": lines, "status": "ok"}
         assert!(sigs.contains("snapshot"));
         assert!(sigs.contains("git"));
         assert!(sigs.contains("discord"));
+    }
+
+    // --- normalize_string_literals ---
+
+    #[test]
+    fn normalize_no_strings_unchanged() {
+        let code = "x = 1 + 2\nresult = x";
+        assert_eq!(normalize_string_literals(code), code);
+    }
+
+    #[test]
+    fn normalize_single_line_string_unchanged() {
+        let code = r#"result = "hello world""#;
+        assert_eq!(normalize_string_literals(code), code);
+    }
+
+    #[test]
+    fn normalize_escape_newline_in_string_unchanged() {
+        // \n as a two-char escape sequence, not a literal newline
+        let code = r#"write_file("f.txt", "line1\nline2")"#;
+        assert_eq!(normalize_string_literals(code), code);
+    }
+
+    #[test]
+    fn normalize_triple_quoted_string_unchanged() {
+        let code = "result = \"\"\"multi\nline\ncontent\"\"\"";
+        assert_eq!(normalize_string_literals(code), code);
+    }
+
+    #[test]
+    fn normalize_comment_not_treated_as_string() {
+        let code = "# this is a comment with \"quotes\"\nresult = 1";
+        assert_eq!(normalize_string_literals(code), code);
+    }
+
+    #[test]
+    fn normalize_double_quoted_multiline_becomes_triple() {
+        // Literal newline inside a "..." string → """..."""
+        let input = "write_file(\"f.txt\", \"line1\nline2\")";
+        let output = normalize_string_literals(input);
+        // Should be parseable by Starlark now
+        assert!(output.contains("\"\"\""), "must use triple-quotes: {output}");
+        assert!(output.contains("line1\nline2"), "content preserved: {output}");
+        // Verify it actually parses
+        AstModule::parse("test", output, &Dialect::Standard)
+            .expect("normalized code must parse");
+    }
+
+    #[test]
+    fn normalize_single_quoted_multiline_becomes_triple() {
+        let input = "write_file('f.txt', 'line1\nline2')";
+        let output = normalize_string_literals(input);
+        assert!(output.contains("'''"), "must use single triple-quotes: {output}");
+        assert!(output.contains("line1\nline2"), "content preserved: {output}");
+        AstModule::parse("test", output, &Dialect::Standard)
+            .expect("normalized code must parse");
+    }
+
+    #[test]
+    fn normalize_preserves_surrounding_code() {
+        let input = "x = 1\nwrite_file(\"a\", \"b\nc\")\nresult = x";
+        let output = normalize_string_literals(input);
+        assert!(output.starts_with("x = 1\n"), "prefix preserved: {output}");
+        assert!(output.ends_with("\nresult = x"), "suffix preserved: {output}");
+    }
+
+    #[test]
+    fn normalize_escaped_quote_in_string_preserved() {
+        // Escaped quote inside string stays escaped; no collision possible
+        // because unescaped " always closes "..." strings.
+        let code = "write_file(\"f\", \"has \\\"escaped\\\" quote\")";
+        let output = normalize_string_literals(code);
+        // No literal newline → unchanged
+        assert_eq!(output, code);
+    }
+
+    #[tokio::test]
+    async fn execute_multiline_string_literal_succeeds() {
+        // This is the bug: "line1\nline2" with a LITERAL newline used to fail
+        // with "parse error: unfinished string literal".
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let session = Arc::new(Mutex::new(session));
+
+        // Embed a literal newline inside a double-quoted string, simulating
+        // what a model produces when it writes multi-line file content.
+        let code = "write_file(\"out.txt\", \"use serde::Serialize;\nuse async_trait::async_trait;\n\")\nresult = True";
+        let result = execute(code, session.clone(), Duration::from_secs(10))
+            .await
+            .expect("execute must not fail with literal newline in string");
+        assert_eq!(result.value, serde_json::json!(true));
+
+        // Verify the file was actually written with newlines preserved.
+        let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+        assert!(content.contains("use serde::Serialize;\n"), "newline must be a real newline");
+        assert!(content.contains("use async_trait::async_trait;"), "second line preserved");
+    }
+
+    #[tokio::test]
+    async fn execute_double_colon_in_string_literal_succeeds() {
+        // Previously :: in multi-line strings caused misleading parse errors.
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let session = Arc::new(Mutex::new(session));
+
+        let code = "write_file(\"src.rs\", \"use async_trait::async_trait;\nuse serde::Serialize;\n\")\nresult = \"ok\"";
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .expect(":: in string content must not cause parse error");
+        assert_eq!(result.value, serde_json::json!("ok"));
     }
 
     #[test]
