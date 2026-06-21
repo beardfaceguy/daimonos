@@ -5,7 +5,7 @@
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2405 nodes · 4559 edges · 150 communities (131 shown, 19 thin omitted)
+- 2405 nodes · 4563 edges · 150 communities (131 shown, 19 thin omitted)
 - Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 47 edges (avg confidence: 0.89)
 - Token cost: 0 input · 0 output
 
@@ -291,7 +291,7 @@ Nodes (30): analytics.rs, plugins/cargo.rs, config.rs, tests/conftest.py, Daimon
 
 ### Community 22 - "Community 22"
 Cohesion: 0.17
-Nodes (26): AgentResult, SafetyPolicy, AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_model_is_opus_48(), default_system_prompt() (+18 more)
+Nodes (25): AgentResult, SafetyPolicy, AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_model_is_opus_48(), default_system_prompt() (+17 more)
 
 ### Community 23 - "Community 23"
 Cohesion: 0.16
@@ -398,20 +398,20 @@ Cohesion: 0.17
 Nodes (17): ACPI Hardware Discovery (CONFIG_ACPI), CLA-208 Migration Issue, CLA-214 Documentation Issue, CLA-215 Import Snapshot Issue, CLA-216 Magic SysRq Issue, ENA Network Driver (CONFIG_ENA_ETHERNET), AWS Nitro Kernel Configuration Guide, KVM Guest Support (+9 more)
 
 ### Community 49 - "Community 49"
+Cohesion: 0.22
+Nodes (12): CompleteOpts, Context, LlmProvider, LlmResponse, end_turn_with_text(), MockProvider, model_override_is_used(), PanicProvider (+4 more)
+
+### Community 50 - "Community 50"
 Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
 
-### Community 50 - "Community 50"
+### Community 51 - "Community 51"
 Cohesion: 0.11
 Nodes (17): Tests for token analytics and session_stats tool (CLA-297)., session_stats should appear in the default tool list (Terse tier)., History scope queries SQLite for cross-session data., Daily scope returns trend data., Invalid scope returns an error., workspace_info should include an analytics summary after tool calls., After a few tool calls, session_stats should report non-zero totals., Reading the same file twice should trigger a dedup hit in analytics. (+9 more)
 
-### Community 51 - "Community 51"
+### Community 52 - "Community 52"
 Cohesion: 0.14
 Nodes (17): ops/diff_ops.rs, ops/exec_filter.rs, ops/exec_ops.rs, ops/file_ops.rs, mcp.rs, ops/mod.rs, ops/schema.rs, ops/snap_ops.rs (+9 more)
-
-### Community 52 - "Community 52"
-Cohesion: 0.24
-Nodes (11): CompleteOpts, Context, LlmProvider, LlmResponse, end_turn_with_text(), MockProvider, PanicProvider, Mutex (+3 more)
 
 ### Community 53 - "Community 53"
 Cohesion: 0.27
@@ -728,11 +728,11 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `CLA-208 Migration Issue` and `CLA-208 Alpine to Buildroot Migration`?**
   _Edge tagged AMBIGUOUS (relation: semantically_similar_to) - confidence is low._
 - **Why does `Daimonos Project` connect `Community 24` to `Community 76`, `Community 21`, `Community 120`, `Community 26`, `Community 27`, `Community 124`?**
-  _High betweenness centrality (0.141) - this node is a cross-community bridge._
+  _High betweenness centrality (0.143) - this node is a cross-community bridge._
 - **Why does `Path` connect `Community 4` to `Community 36`, `Community 72`, `Community 9`, `Community 13`, `Community 25`?**
+  _High betweenness centrality (0.127) - this node is a cross-community bridge._
+- **Why does `Benchmarks README` connect `Community 76` to `Community 108`, `Community 24`, `Community 4`, `Community 52`?**
   _High betweenness centrality (0.125) - this node is a cross-community bridge._
-- **Why does `Benchmarks README` connect `Community 76` to `Community 108`, `Community 24`, `Community 51`, `Community 4`?**
-  _High betweenness centrality (0.123) - this node is a cross-community bridge._
 - **What connects `$schema`, `name`, `title` to the rest of the system?**
   _606 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Community 0` be split into smaller, more focused modules?**
