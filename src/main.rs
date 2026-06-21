@@ -11,12 +11,13 @@ mod script;
 mod session;
 mod snapshot;
 mod agent;
+mod agent_cmd;
 mod providers;
 mod tool_runner;
 mod tool_facade;
 mod tools;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -69,6 +70,24 @@ fn env_requests_mcp_startup_logs() -> bool {
     }
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the agent on a one-shot task and exit
+    Agent {
+        /// Task description for the agent
+        task: String,
+        /// Model override (default: claude-opus-4-8)
+        #[arg(long)]
+        model: Option<String>,
+        /// LLM provider to use (default: anthropic)
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Print available tools and task without calling the API
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
 #[derive(Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 struct Cli {
@@ -109,6 +128,9 @@ struct Cli {
     /// --session-id $SID`.
     #[arg(long)]
     session_id: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
 #[tokio::main]
@@ -136,6 +158,24 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
+    if let Some(Commands::Agent { task, model, provider, dry_run }) = cli.command {
+        if provider != "anthropic" {
+            eprintln!("unsupported provider: {provider} (only 'anthropic' is available)");
+            std::process::exit(2);
+        }
+        let llm = providers::anthropic::AnthropicProvider::from_env()
+            .map_err(|e| anyhow::anyhow!("provider init: {e}"))?;
+        let args = agent_cmd::AgentCmdArgs { task, model, dry_run };
+        let result = agent_cmd::run_agent(&llm, &workspace, &args, &mut std::io::stdout()).await?;
+        if result.stop_reason == providers::StopReason::Error {
+            let msg = result.error_message.as_deref().unwrap_or("unknown error");
+            eprintln!("agent error: {msg}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let startup_logs = startup_logs_early || cfg.mcp.startup_logs;
     // When MCP runs without startup diagnostics, avoid benign stderr lines —
     // Cursor surfaces subprocess stderr as `[error]` even for informational text.
