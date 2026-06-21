@@ -12,6 +12,21 @@ pub fn estimate_tokens(chars: usize) -> u64 {
     (chars as f64 / 4.0).ceil() as u64
 }
 
+/// Compute `(saved_tokens, savings_pct)` from raw and filtered char counts.
+///
+/// Returns `(0, 0.0)` when `unfiltered_chars == 0` (no baseline available)
+/// or when the filtered output is not smaller than the raw output.
+pub fn compute_savings(unfiltered_chars: usize, response_chars: usize) -> (i64, f64) {
+    if unfiltered_chars == 0 || response_chars >= unfiltered_chars {
+        return (0, 0.0);
+    }
+    let raw_tokens = estimate_tokens(unfiltered_chars);
+    let ret_tokens = estimate_tokens(response_chars);
+    let saved = (raw_tokens - ret_tokens) as i64;
+    let pct = saved as f64 / raw_tokens as f64 * 100.0;
+    (saved, pct)
+}
+
 /// Read the `DAIMONOS_AGENT_SESSION_ID` environment variable if set to a
 /// non-empty value. Used at MCP/socket startup so agents (e.g.
 /// `claude --session-id $SID`) can pre-attach a runtime session
@@ -673,6 +688,38 @@ impl AnalyticsStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // --- compute_savings ---
+
+    #[test]
+    fn compute_savings_zero_when_no_baseline() {
+        let (saved, pct) = compute_savings(0, 100);
+        assert_eq!(saved, 0);
+        assert_eq!(pct, 0.0);
+    }
+
+    #[test]
+    fn compute_savings_zero_when_not_smaller() {
+        let (saved, pct) = compute_savings(100, 100);
+        assert_eq!(saved, 0);
+        assert_eq!(pct, 0.0);
+    }
+
+    #[test]
+    fn compute_savings_positive_when_compressed() {
+        // 4000 raw chars ≈ 1000 tokens; 40 returned chars ≈ 10 tokens → 990 saved
+        let (saved, pct) = compute_savings(4000, 40);
+        assert!(saved > 0, "saved_tokens must be positive");
+        assert!(pct > 0.0 && pct <= 100.0, "savings_pct must be in (0, 100]");
+    }
+
+    #[test]
+    fn compute_savings_pct_matches_token_ratio() {
+        // 800 raw chars = 200 tokens; 400 returned chars = 100 tokens → 50% saved
+        let (saved, pct) = compute_savings(800, 400);
+        assert_eq!(saved, 100);
+        assert!((pct - 50.0).abs() < 0.01, "expected ~50%, got {pct}");
+    }
 
     fn test_store() -> (TempDir, AnalyticsStore) {
         let dir = TempDir::new().unwrap();

@@ -29,7 +29,8 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
                 "unchanged": true,
                 "lines": total_lines,
             }))
-            .read_dedup();
+            .read_dedup()
+            .with_unfiltered_chars(content.len());
         }
         session.update_read_cache(path, &content);
     }

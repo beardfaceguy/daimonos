@@ -144,13 +144,15 @@ async fn dispatch_tool(
             _ => None,
         };
 
+        let (saved_tokens, savings_pct) =
+            analytics::compute_savings(meta.unfiltered_chars, response_chars);
         let record = ToolCallRecord {
             tool_name: name.to_string(),
             command,
             request_tokens: analytics::estimate_tokens(request_chars),
             response_tokens: analytics::estimate_tokens(response_chars),
-            saved_tokens: 0, // baseline comparison not available at this layer
-            savings_pct: 0.0,
+            saved_tokens,
+            savings_pct,
             exec_time_ms: elapsed_ms,
             was_redirect,
             was_filtered,
@@ -1754,5 +1756,64 @@ mod tests {
                 .unwrap();
         let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
         assert_eq!(payload["total_calls"], json!(3));
+    }
+
+    // --- saved_tokens wiring ---
+
+    async fn session_with_analytics(dir: &std::path::Path) -> (Session, Arc<crate::analytics::AnalyticsStore>) {
+        let db = dir.join("analytics.db");
+        let store = Arc::new(crate::analytics::AnalyticsStore::new(&db, 90).unwrap());
+        let mut cfg = crate::config::Config::default();
+        cfg.analytics.enabled = true;
+        let mut session = Session::new(dir.to_path_buf(), Arc::new(cfg));
+        session.analytics = Some(store.clone());
+        (session, store)
+    }
+
+    #[tokio::test]
+    async fn read_dedup_records_positive_saved_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "hello world this is a file with some content\n".repeat(20);
+        std::fs::write(dir.path().join("dup.txt"), &content).unwrap();
+        let (mut session, store) = session_with_analytics(dir.path()).await;
+
+        let args = json!({"path": "dup.txt"});
+        // First read — cache miss, nothing saved
+        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        // Second read — dedup hit; saved_tokens should reflect suppressed content
+        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+
+        // Give the async record write a moment to land
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stats = store.session_summary();
+        assert!(
+            stats.total_saved_tokens > 0,
+            "read_dedup must record saved_tokens > 0; got {}",
+            stats.total_saved_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_exec_records_positive_saved_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, store) = session_with_analytics(dir.path()).await;
+
+        // `make --version` is recognized by exec_filter and returns compact JSON
+        let args = json!({"command": "make", "args": ["--version"]});
+        let result = dispatch_tool(&mut session, "exec", &args).await.unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        // Only assert saved_tokens if filtering actually fired
+        if payload.get("out").map(|v| v.is_string()).unwrap_or(false)
+            && payload["out"].as_str().unwrap_or("").len() < 200
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let stats = store.session_summary();
+            assert!(
+                stats.total_saved_tokens > 0,
+                "filter_applied exec must record saved_tokens > 0; got {}",
+                stats.total_saved_tokens
+            );
+        }
     }
 }

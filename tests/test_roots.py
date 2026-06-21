@@ -22,8 +22,6 @@ import subprocess
 import threading
 import time
 
-import pytest
-
 
 class RootsAwareClient:
     """A minimal MCP client that can answer server-initiated requests.

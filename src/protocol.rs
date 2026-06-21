@@ -62,6 +62,10 @@ pub struct ResponseMeta {
     /// `session.read_cache` and returned the compact `{"unchanged": true}`
     /// payload instead of the file body.
     pub read_dedup: bool,
+    /// Character count of the raw/uncompressed content that was suppressed
+    /// by dedup or filtering. Zero when no compression occurred. Used by
+    /// the analytics layer to compute `saved_tokens` and `savings_pct`.
+    pub unfiltered_chars: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +117,13 @@ impl Response {
     /// Mark this response as a read-cache deduplication hit.
     pub fn read_dedup(mut self) -> Self {
         self.meta.read_dedup = true;
+        self
+    }
+
+    /// Record the raw character count that was suppressed by dedup or
+    /// filtering so the analytics layer can compute token savings.
+    pub fn with_unfiltered_chars(mut self, chars: usize) -> Self {
+        self.meta.unfiltered_chars = chars;
         self
     }
 }

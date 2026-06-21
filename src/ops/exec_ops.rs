@@ -456,6 +456,7 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
 
     if session.cfg.process.exec_output_filters {
         if let Some(filtered) = exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit) {
+            let raw_chars = stdout.len() + stderr.len();
             let mut resp = json!({
                 "exit": exit,
                 "out": cap_output(&filtered.out, max),
@@ -463,7 +464,7 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
             if !filtered.err.is_empty() {
                 resp["err"] = json!(cap_output(&filtered.err, max));
             }
-            return Response::ok(resp).filter_applied();
+            return Response::ok(resp).filter_applied().with_unfiltered_chars(raw_chars);
         }
     }
 

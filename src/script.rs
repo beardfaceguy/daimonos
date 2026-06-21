@@ -513,13 +513,16 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
             let mut s = session.lock().await;
             let resp = ops::dispatch(&mut s, request).await;
             if let Some(analytics) = s.analytics.clone() {
+                let resp_chars = response_chars(&resp);
+                let (saved_tokens, savings_pct) =
+                    analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
                 let record = ToolCallRecord {
                     tool_name: format!("script:{label}"),
                     command,
                     request_tokens: analytics::estimate_tokens(request_chars),
-                    response_tokens: analytics::estimate_tokens(response_chars(&resp)),
-                    saved_tokens: 0,
-                    savings_pct: 0.0,
+                    response_tokens: analytics::estimate_tokens(resp_chars),
+                    saved_tokens,
+                    savings_pct,
                     exec_time_ms: started.elapsed().as_millis() as u64,
                     was_redirect: resp.meta.redirect_via_plugin,
                     was_filtered: resp.meta.filter_applied,
@@ -605,13 +608,16 @@ fn run_registry_tool(
         };
 
         if let Some(analytics) = analytics {
+            let resp_chars = response_chars(&resp);
+            let (saved_tokens, savings_pct) =
+                analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
             let record = ToolCallRecord {
                 tool_name: format!("script:{tool_id}"),
                 command: Some(command.to_string()),
                 request_tokens: analytics::estimate_tokens(request_chars),
-                response_tokens: analytics::estimate_tokens(response_chars(&resp)),
-                saved_tokens: 0,
-                savings_pct: 0.0,
+                response_tokens: analytics::estimate_tokens(resp_chars),
+                saved_tokens,
+                savings_pct,
                 exec_time_ms: started.elapsed().as_millis() as u64,
                 was_redirect: resp.meta.redirect_via_plugin,
                 was_filtered: resp.meta.filter_applied,
