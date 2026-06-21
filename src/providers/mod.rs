@@ -69,6 +69,18 @@ pub enum StopReason {
     MaxTokens,
 }
 
+impl StopReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::ToolUse => "tool_use",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+            StopReason::MaxTokens => "max_tokens",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ThinkingLevel {
     Off,
@@ -185,6 +197,15 @@ mod tests {
         let m = Message::assistant("hi");
         assert_eq!(m.role, Role::Assistant);
         assert!(matches!(&m.content[0], ContentBlock::Text(t) if t == "hi"));
+    }
+
+    #[test]
+    fn stop_reason_as_str_is_snake_case() {
+        assert_eq!(StopReason::EndTurn.as_str(), "end_turn");
+        assert_eq!(StopReason::ToolUse.as_str(), "tool_use");
+        assert_eq!(StopReason::Error.as_str(), "error");
+        assert_eq!(StopReason::Aborted.as_str(), "aborted");
+        assert_eq!(StopReason::MaxTokens.as_str(), "max_tokens");
     }
 
     #[test]

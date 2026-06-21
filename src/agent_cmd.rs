@@ -79,7 +79,7 @@ pub async fn run_agent(
             cache_read_tokens: result.usage.cache_read,
             cache_write_tokens: result.usage.cache_write,
             cost_usd: result.usage.cost.total_usd,
-            stop_reason: format!("{:?}", result.stop_reason),
+            stop_reason: result.stop_reason.as_str().to_string(),
             turns,
         });
     }
