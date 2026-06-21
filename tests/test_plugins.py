@@ -241,8 +241,18 @@ def test_docker_images(daimonos):
     assert isinstance(data["images"], list)
 
 
-def test_docker_tool_always_visible(daimonos):
-    """docker tool appears in listing regardless of workspace type."""
+def test_docker_tool_hidden_without_dockerfile(daimonos):
+    """docker tool is hidden when workspace has no Dockerfile or compose file."""
+    tools = daimonos.list_tools()
+    tool_names = [t["name"] for t in tools]
+    assert "docker" not in tool_names
+
+
+def test_docker_tool_visible_with_dockerfile(daimonos):
+    """docker tool appears when Dockerfile is present in workspace."""
+    ws = daimonos.workspace
+    with open(os.path.join(ws, "Dockerfile"), "w") as f:
+        f.write("FROM ubuntu\n")
     tools = daimonos.list_tools()
     tool_names = [t["name"] for t in tools]
     assert "docker" in tool_names
