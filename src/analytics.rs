@@ -135,6 +135,30 @@ pub struct DailyStats {
     pub saved_tokens: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentRunRecord {
+    pub external_session_id: Option<String>,
+    /// First 200 chars of the task (for reporting), never full task text.
+    pub task_prefix: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+    pub stop_reason: String,
+    pub turns: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AgentRunsSummary {
+    pub total_runs: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_write_tokens: u64,
+    pub total_cost_usd: f64,
+}
+
 pub struct AnalyticsStore {
     db: Mutex<Connection>,
     session_id: String,
@@ -169,6 +193,22 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS idx_tc_timestamp ON tool_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tc_tool ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tc_session ON tool_calls(session_id);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    external_session_id TEXT,
+    task_prefix TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    stop_reason TEXT NOT NULL,
+    turns INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ar_timestamp ON agent_runs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ar_session ON agent_runs(session_id);
 ";
 
 /// Idempotently bring an existing analytics DB up to the current schema.
@@ -330,6 +370,59 @@ impl AnalyticsStore {
 
     pub fn session_summary(&self) -> SessionStats {
         self.stats_lock().clone()
+    }
+
+    /// Persist actual LLM usage from one completed agent session.
+    /// Field names mirror the neutral `Usage` type — no provider vocabulary.
+    pub fn record_agent_run(&self, rec: &AgentRunRecord) {
+        let now = Utc::now().to_rfc3339();
+        let db = self.db_lock();
+        let _ = db.execute(
+            "INSERT INTO agent_runs (timestamp, session_id, external_session_id,
+             task_prefix, input_tokens, output_tokens, cache_read_tokens,
+             cache_write_tokens, cost_usd, stop_reason, turns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                now,
+                self.session_id,
+                rec.external_session_id.as_deref(),
+                rec.task_prefix,
+                rec.input_tokens as i64,
+                rec.output_tokens as i64,
+                rec.cache_read_tokens as i64,
+                rec.cache_write_tokens as i64,
+                rec.cost_usd,
+                rec.stop_reason,
+                rec.turns as i32,
+            ],
+        );
+    }
+
+    pub fn agent_runs_summary(&self, days: u64) -> Result<AgentRunsSummary, String> {
+        let db = self.db_lock();
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        db.query_row(
+            "SELECT COALESCE(COUNT(*), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM agent_runs WHERE timestamp >= ?1",
+            params![cutoff_str],
+            |row| {
+                Ok(AgentRunsSummary {
+                    total_runs: row.get::<_, i64>(0)? as u64,
+                    total_input_tokens: row.get::<_, i64>(1)? as u64,
+                    total_output_tokens: row.get::<_, i64>(2)? as u64,
+                    total_cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                    total_cache_write_tokens: row.get::<_, i64>(4)? as u64,
+                    total_cost_usd: row.get::<_, f64>(5)?,
+                })
+            },
+        )
+        .map_err(|e| format!("agent_runs_summary: {e}"))
     }
 
     /// Spawn an asynchronous SQLite write for this record. Tracks the task
@@ -545,6 +638,30 @@ impl AnalyticsStore {
                         d.date, d.calls, d.response_tokens, d.saved_tokens
                     ));
                 }
+            }
+        }
+
+        if let Ok(ar) = self.agent_runs_summary(days) {
+            if ar.total_runs > 0 {
+                out.push_str(&format!("\n=== Agent Runs (last {days} days) ===\n"));
+                out.push_str(&format!(
+                    "  Runs: {}  Input: {}  Output: {}  Cache read: {}  Cache write: {}\n",
+                    ar.total_runs,
+                    ar.total_input_tokens,
+                    ar.total_output_tokens,
+                    ar.total_cache_read_tokens,
+                    ar.total_cache_write_tokens,
+                ));
+                let denominator = ar.total_input_tokens + ar.total_cache_read_tokens;
+                let hit_rate = if denominator > 0 {
+                    ar.total_cache_read_tokens as f64 / denominator as f64 * 100.0
+                } else {
+                    0.0
+                };
+                out.push_str(&format!(
+                    "  Cache hit rate: {:.1}%  Total cost: ${:.4}\n",
+                    hit_rate, ar.total_cost_usd
+                ));
             }
         }
 
@@ -1072,6 +1189,181 @@ mod tests {
             .history_summary_filtered(36500, Some("sid-new"))
             .unwrap();
         assert_eq!(only_new.total_calls, 1);
+    }
+
+    // --- agent_runs table (#877) ---
+
+    fn sample_agent_run() -> AgentRunRecord {
+        AgentRunRecord {
+            external_session_id: None,
+            task_prefix: "test task".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read_tokens: 200,
+            cache_write_tokens: 100,
+            cost_usd: 0.0125,
+            stop_reason: "end_turn".into(),
+            turns: 3,
+        }
+    }
+
+    #[test]
+    fn record_agent_run_persists_to_db() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&sample_agent_run());
+
+        let db = store.db_lock();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn record_agent_run_stores_all_token_fields() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&AgentRunRecord {
+            input_tokens: 1111,
+            output_tokens: 2222,
+            cache_read_tokens: 333,
+            cache_write_tokens: 44,
+            ..sample_agent_run()
+        });
+
+        let db = store.db_lock();
+        let (inp, out, cr, cw): (i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                 FROM agent_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 1111);
+        assert_eq!(out, 2222);
+        assert_eq!(cr, 333);
+        assert_eq!(cw, 44);
+    }
+
+    #[test]
+    fn record_agent_run_stores_cost_and_stop_reason() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&AgentRunRecord {
+            cost_usd: 0.5678,
+            stop_reason: "max_tokens".into(),
+            ..sample_agent_run()
+        });
+
+        let db = store.db_lock();
+        let (cost, reason): (f64, String) = db
+            .query_row(
+                "SELECT cost_usd, stop_reason FROM agent_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!((cost - 0.5678).abs() < 1e-9);
+        assert_eq!(reason, "max_tokens");
+    }
+
+    #[test]
+    fn record_agent_run_stores_external_session_id() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&AgentRunRecord {
+            external_session_id: Some("ext-session-xyz".into()),
+            ..sample_agent_run()
+        });
+
+        let db = store.db_lock();
+        let ext: Option<String> = db
+            .query_row("SELECT external_session_id FROM agent_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ext.as_deref(), Some("ext-session-xyz"));
+    }
+
+    #[test]
+    fn agent_runs_summary_aggregates_correctly() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&AgentRunRecord {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read_tokens: 200,
+            cache_write_tokens: 100,
+            cost_usd: 0.01,
+            ..sample_agent_run()
+        });
+        store.record_agent_run(&AgentRunRecord {
+            input_tokens: 2000,
+            output_tokens: 1000,
+            cache_read_tokens: 400,
+            cache_write_tokens: 200,
+            cost_usd: 0.02,
+            ..sample_agent_run()
+        });
+
+        let summary = store.agent_runs_summary(30).unwrap();
+        assert_eq!(summary.total_runs, 2);
+        assert_eq!(summary.total_input_tokens, 3000);
+        assert_eq!(summary.total_output_tokens, 1500);
+        assert_eq!(summary.total_cache_read_tokens, 600);
+        assert_eq!(summary.total_cache_write_tokens, 300);
+        assert!((summary.total_cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn agent_runs_summary_empty_returns_zeros() {
+        let (_dir, store) = test_store();
+        let summary = store.agent_runs_summary(30).unwrap();
+        assert_eq!(summary.total_runs, 0);
+        assert_eq!(summary.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn stats_report_includes_agent_runs_section() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&sample_agent_run());
+
+        let report = store.format_stats_report_filtered(30, None);
+        assert!(report.contains("Agent Runs"), "report must include Agent Runs section: {report}");
+        assert!(report.contains("Runs: 1"));
+    }
+
+    #[test]
+    fn stats_report_shows_cache_hit_rate() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&AgentRunRecord {
+            input_tokens: 800,
+            cache_read_tokens: 200,
+            ..sample_agent_run()
+        });
+
+        let report = store.format_stats_report_filtered(30, None);
+        // cache hit rate = 200 / (800 + 200) * 100 = 20.0%
+        assert!(report.contains("20.0%"), "cache hit rate must appear in report: {report}");
+    }
+
+    #[test]
+    fn stats_report_hides_agent_runs_section_when_no_runs() {
+        let (_dir, store) = test_store();
+        store.record(&sample_record("read_file"));
+
+        let report = store.format_stats_report_filtered(30, None);
+        assert!(!report.contains("Agent Runs"), "agent runs section must be hidden when no runs: {report}");
+    }
+
+    #[test]
+    fn agent_runs_table_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("reopen_test.db");
+
+        {
+            let store = AnalyticsStore::new(&db_path, 90).unwrap();
+            store.record_agent_run(&sample_agent_run());
+        }
+
+        let store2 = AnalyticsStore::new(&db_path, 90).unwrap();
+        let summary = store2.agent_runs_summary(30).unwrap();
+        assert_eq!(summary.total_runs, 1, "agent run must survive DB reopen");
     }
 
     #[test]

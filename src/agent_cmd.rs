@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::agent::{AgentConfig, AgentResult};
+use crate::analytics::{AgentRunRecord, AnalyticsStore};
 use crate::config::Config;
 use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, ToolSchema};
 use crate::safety::SafetyPolicy;
@@ -19,6 +20,8 @@ pub struct AgentCmdArgs {
     pub dry_run: bool,
     /// Safety policy (denylist/allowlist/approval mode). `None` = no restrictions.
     pub safety: Option<SafetyPolicy>,
+    /// Analytics store for recording actual token usage. `None` = no recording.
+    pub analytics: Option<Arc<AnalyticsStore>>,
 }
 
 /// Run the agent subcommand.
@@ -65,6 +68,22 @@ pub async fn run_agent(
     let initial = vec![Message::user(&args.task)];
     let result = crate::agent::run(provider, &mut session, initial, &config).await;
 
+    if let Some(store) = args.analytics {
+        let task_prefix: String = args.task.chars().take(200).collect();
+        let turns = result.messages.len().saturating_sub(1) as u32;
+        store.record_agent_run(&AgentRunRecord {
+            external_session_id: None,
+            task_prefix,
+            input_tokens: result.usage.input,
+            output_tokens: result.usage.output,
+            cache_read_tokens: result.usage.cache_read,
+            cache_write_tokens: result.usage.cache_write,
+            cost_usd: result.usage.cost.total_usd,
+            stop_reason: format!("{:?}", result.stop_reason),
+            turns,
+        });
+    }
+
     for msg in &result.messages {
         if matches!(msg.role, Role::Assistant) {
             for block in &msg.content {
@@ -87,6 +106,7 @@ fn default_system_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::AnalyticsStore;
     use crate::providers::{CompleteOpts, Context, LlmResponse, Usage};
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -147,7 +167,7 @@ mod tests {
     }
 
     fn args(task: &str) -> AgentCmdArgs {
-        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None }
+        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None, analytics: None }
     }
 
     // --- dry-run ---
@@ -155,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_call_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None };
+        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
     }
@@ -163,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_task_in_output() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None };
+        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -173,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_tool_count() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None };
+        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -243,6 +263,7 @@ mod tests {
             model: Some("claude-haiku-4-5".into()),
             dry_run: false,
             safety: None,
+            analytics: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), a, &mut out).await.unwrap();
@@ -282,6 +303,49 @@ mod tests {
         let result = run_agent(&provider, dir.path(), args("go"), &mut out).await.unwrap();
         assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("api down"));
+    }
+
+    // --- analytics wiring ---
+
+    #[tokio::test]
+    async fn analytics_record_agent_run_called_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_analytics.db");
+        let store = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
+
+        let provider = MockProvider::new(vec![end_turn_with_text("done")]);
+        let a = AgentCmdArgs {
+            task: "test analytics wiring".into(),
+            model: None,
+            dry_run: false,
+            safety: None,
+            analytics: Some(Arc::clone(&store)),
+        };
+        let mut out = Vec::new();
+        run_agent(&provider, dir.path(), a, &mut out).await.unwrap();
+
+        let summary = store.agent_runs_summary(1).unwrap();
+        assert_eq!(summary.total_runs, 1, "one agent run must be recorded in analytics");
+    }
+
+    #[tokio::test]
+    async fn analytics_not_called_on_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_analytics.db");
+        let store = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
+
+        let a = AgentCmdArgs {
+            task: "dry run task".into(),
+            model: None,
+            dry_run: true,
+            safety: None,
+            analytics: Some(Arc::clone(&store)),
+        };
+        let mut out = Vec::new();
+        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
+
+        let summary = store.agent_runs_summary(1).unwrap();
+        assert_eq!(summary.total_runs, 0, "dry-run must not record an agent run");
     }
 
     // --- safety policy wiring ---

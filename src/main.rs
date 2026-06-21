@@ -167,6 +167,14 @@ async fn main() -> anyhow::Result<()> {
         }
         let llm = providers::anthropic::AnthropicProvider::from_env()
             .map_err(|e| anyhow::anyhow!("provider init: {e}"))?;
+        let analytics_store = if cfg.analytics.enabled {
+            let db_path = cfg.analytics.resolved_db_path();
+            analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
         let args = agent_cmd::AgentCmdArgs {
             task,
             model,
@@ -176,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 approve_fn: Some(safety::SafetyPolicy::stdin_approve_fn()),
                 ..safety::SafetyPolicy::default()
             }),
+            analytics: analytics_store,
         };
         let result = agent_cmd::run_agent(&llm, &workspace, args, &mut std::io::stdout()).await?;
         if result.stop_reason == providers::StopReason::Error {
