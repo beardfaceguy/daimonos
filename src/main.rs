@@ -18,6 +18,7 @@ mod tool_runner;
 mod tool_facade;
 mod tools;
 
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -161,15 +162,50 @@ async fn main() -> anyhow::Result<()> {
     }
     // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
     if let Some(Commands::Agent { task, model, provider: _provider, dry_run }) = cli.command {
-        // Fail fast if the API key is missing — before any network I/O.
-        if !dry_run {
-            cfg.agent.resolve_api_key().map_err(|e| {
-                eprintln!("{e}");
-                std::process::exit(2);
-            }).ok();
+        // In dry-run mode we never call complete(), so skip provider init and key resolution.
+        struct DryRunProvider;
+        #[async_trait]
+        impl providers::LlmProvider for DryRunProvider {
+            async fn complete(
+                &self,
+                _: &providers::Context,
+                _: &providers::CompleteOpts,
+            ) -> providers::LlmResponse {
+                unreachable!("complete() called in dry-run mode")
+            }
         }
-        let llm = providers::anthropic::AnthropicProvider::from_env()
-            .map_err(|e| anyhow::anyhow!("provider init: {e}"))?;
+
+        let llm: Box<dyn providers::LlmProvider> = if dry_run {
+            Box::new(DryRunProvider)
+        } else {
+            match cfg.agent.provider.as_str() {
+                "openrouter" => {
+                    match providers::openrouter::OpenRouterProvider::from_config(&cfg.agent) {
+                        Ok(p) => Box::new(p),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                "anthropic" => {
+                    match providers::anthropic::AnthropicProvider::from_env() {
+                        Ok(p) => Box::new(p),
+                        Err(e) => {
+                            eprintln!("provider init: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "unsupported provider: {other} (valid: openrouter, anthropic)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        };
+
         let analytics_store = if cfg.analytics.enabled {
             let db_path = cfg.analytics.resolved_db_path();
             analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
@@ -191,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
             safety: Some(cfg.agent.to_safety_policy(approve_fn)),
             analytics: analytics_store,
         };
-        let result = agent_cmd::run_agent(&llm, &workspace, args, &mut std::io::stdout()).await?;
+        let result = agent_cmd::run_agent(llm.as_ref(), &workspace, args, &mut std::io::stdout()).await?;
         if result.stop_reason == providers::StopReason::Error {
             let msg = result.error_message.as_deref().unwrap_or("unknown error");
             eprintln!("agent error: {msg}");
