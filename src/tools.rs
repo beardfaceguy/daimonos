@@ -482,6 +482,22 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "npm",
+            tier: ToolTier::Terse,
+            description: "npm package manager. Commands: install, run, test, build, audit. Returns {exit, ok, stdout, stderr} or {clean, vulnerabilities, findings} for audit. Auto-registered when npm is on PATH.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["install", "run", "test", "build", "audit"], "description": "npm command to run"},
+                    "script": {"type": "string", "description": "Script name for 'run' command (e.g. lint, dev)"}
+                },
+                "required": ["command"]
+            }),
+            to_request: None, // uses NpmPlugin via ToolRegistry
+            context_check: None,
+        },
+
+        ToolDef {
             name: "discord",
             tier: ToolTier::Terse,
             description: "Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages.",

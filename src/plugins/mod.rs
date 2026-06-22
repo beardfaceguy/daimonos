@@ -5,6 +5,7 @@ pub mod docker;
 pub mod generic_cli;
 pub mod gh;
 pub mod git;
+pub mod npm;
 pub mod pytest;
 pub mod shellcheck;
 pub mod x07;
