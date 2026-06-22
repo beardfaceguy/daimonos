@@ -113,6 +113,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     mcp: bool,
 
+    /// Run as MCP server over a Unix socket (per-workspace shared daemon)
+    #[arg(long)]
+    mcp_socket: Option<PathBuf>,
+
     /// Emit informational stderr during MCP startup (config source, plugins,
     /// indexer stats, idle watchdog). Cursor classifies MCP subprocess stderr
     /// as errors in the UI; omit this flag unless you are debugging daimonos.
@@ -434,6 +438,17 @@ async fn main() -> anyhow::Result<()> {
             startup_logs,
         )
         .await
+    } else if let Some(mcp_sock) = cli.mcp_socket {
+        run_mcp_socket_server(
+            mcp_sock,
+            workspace,
+            cfg,
+            ws_index,
+            tool_reg,
+            pcache,
+            analytics_store,
+        )
+        .await
     } else {
         run_socket_server(
             cli,
@@ -445,6 +460,50 @@ async fn main() -> anyhow::Result<()> {
             analytics_store,
         )
         .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mcp_socket_server(
+    sock_path: PathBuf,
+    workspace: PathBuf,
+    cfg: Arc<config::Config>,
+    ws_index: Arc<index::WorkspaceIndex>,
+    tool_reg: Arc<tool_runner::ToolRegistry>,
+    pcache: Arc<pipeline_cache::PipelineCache>,
+    analytics: Option<Arc<analytics::AnalyticsStore>>,
+) -> anyhow::Result<()> {
+    if sock_path.exists() {
+        std::fs::remove_file(&sock_path)?;
+    }
+
+    let listener = UnixListener::bind(&sock_path)?;
+    eprintln!(
+        "daimonos MCP socket listening on {:?} (workspace: {:?})",
+        sock_path, workspace
+    );
+
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let ws = workspace.clone();
+        let cfg_c = cfg.clone();
+        let idx = ws_index.clone();
+        let tr = tool_reg.clone();
+        let pc = pcache.clone();
+        let an = analytics.clone();
+
+        tokio::spawn(async move {
+            let mut session = session::Session::new(ws, cfg_c);
+            session.index = Some(idx);
+            session.tool_registry = Some(tr);
+            session.pipeline_cache = Some(pc);
+            session.analytics = an;
+            session.external_session_id = analytics::read_agent_session_id_env();
+
+            if let Err(e) = mcp::serve_one_mcp(stream, session).await {
+                eprintln!("mcp socket connection error: {e}");
+            }
+        });
     }
 }
 

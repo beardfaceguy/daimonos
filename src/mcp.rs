@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
@@ -1328,6 +1329,123 @@ pub async fn run_mcp_server(
         .start()
         .await
         .map_err(|e| anyhow::anyhow!("mcp server: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// MCP-over-socket: serve one connection with a fresh Session
+// ---------------------------------------------------------------------------
+
+fn socket_jsonrpc_ok(id: Option<Value>, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn socket_jsonrpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn socket_list_tools_json(session: &Session) -> Vec<Value> {
+    let all = tools::tool_definitions();
+    let workspace = &session.workspace;
+    let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
+    all.into_iter()
+        .filter(|t| session.exposed_tools.contains(&t.name))
+        .filter(|t| tools::passes_context_check(&t.name, workspace))
+        .map(|t| {
+            let already_used = session.used_tools.contains(&t.name);
+            let t = if tools::expose_full_schema_in_list(&t.name, full_tool_schemas, already_used) {
+                t
+            } else {
+                Tool {
+                    input_schema: serde_json::from_value(json!({"type": "object"}))
+                        .unwrap_or(t.input_schema),
+                    ..t
+                }
+            };
+            serde_json::to_value(&t).unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+fn socket_call_tool_to_json(
+    result: std::result::Result<CallToolResult, CallToolError>,
+) -> Value {
+    match result {
+        Ok(r) => serde_json::to_value(&r).unwrap_or(json!({"content": [], "isError": false})),
+        Err(e) => json!({
+            "content": [{"type": "text", "text": format!("{e}")}],
+            "isError": true,
+        }),
+    }
+}
+
+/// Serve one MCP session over an already-connected `UnixStream`.
+///
+/// Each connection owns a freshly-constructed `Session` so sessions are
+/// fully isolated: cwd, read-cache, used-tools, and analytics are not
+/// shared across concurrent connections.
+pub async fn serve_one_mcp(
+    stream: tokio::net::UnixStream,
+    mut session: Session,
+) -> anyhow::Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    let instructions = build_instructions(&session.workspace).await;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let req: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let id = req.get("id").cloned();
+        let method = req
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let response_opt: Option<Value> = match method.as_str() {
+            "initialize" => Some(socket_jsonrpc_ok(
+                id,
+                json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {
+                        "name": "daimonos",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "instructions": instructions,
+                }),
+            )),
+            "notifications/initialized" => None,
+            "tools/list" => {
+                let tools_json = socket_list_tools_json(&session);
+                Some(socket_jsonrpc_ok(id, json!({"tools": tools_json})))
+            }
+            "tools/call" => {
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                let result = dispatch_tool(&mut session, &name, &args).await;
+                Some(socket_jsonrpc_ok(id, socket_call_tool_to_json(result)))
+            }
+            "ping" => Some(socket_jsonrpc_ok(id, json!({}))),
+            _ => Some(socket_jsonrpc_error(id, -32601, &format!("method not found: {method}"))),
+        };
+
+        if let Some(resp) = response_opt {
+            let mut out = serde_json::to_string(&resp)?;
+            out.push('\n');
+            writer.write_all(out.as_bytes()).await?;
+            writer.flush().await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
