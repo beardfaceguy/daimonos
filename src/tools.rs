@@ -447,6 +447,25 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "curl",
+            tier: ToolTier::Terse,
+            description: "HTTP request. Returns {status, headers, body (capped 16KB), timing_ms, url, method}. Auto-registered when curl is on PATH.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Request URL (required)"},
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "description": "HTTP method (default: GET)"},
+                    "headers": {"type": "object", "description": "Request headers as key-value pairs, e.g. Content-Type: application/json"},
+                    "body": {"type": "string", "description": "Request body"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default: 10)"}
+                },
+                "required": ["url"]
+            }),
+            to_request: None, // uses CurlPlugin via ToolRegistry
+            context_check: None,
+        },
+
+        ToolDef {
             name: "discord",
             tier: ToolTier::Terse,
             description: "Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages.",

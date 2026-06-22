@@ -580,6 +580,34 @@ async fn dispatch_tool_inner(
             }
         }
 
+        "curl" => {
+            let registry = match &session.tool_registry {
+                Some(r) => r,
+                None => return err_text("tool registry not available".into()),
+            };
+
+            let cwd = session.cwd.clone();
+            let env = session.env.clone();
+
+            let extra = if !args.is_null() {
+                Some(args.clone())
+            } else {
+                None
+            };
+            let extra_ref = extra.as_ref();
+
+            match registry
+                .run("curl", "request", &cwd, &env, None, extra_ref)
+                .await
+            {
+                Ok(result) => {
+                    let text = serde_json::to_string(&result.output).unwrap_or_default();
+                    ok_text(text)
+                }
+                Err(e) => err_text(format!("curl: {e}")),
+            }
+        }
+
         "discord" => {
             let command = match get_str(args, "command") {
                 Some(c) => c,

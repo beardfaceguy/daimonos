@@ -342,6 +342,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if plugins::curl::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::curl::CurlPlugin::new()))
+            .await;
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered curl tool plugin");
+        }
+    }
+
     tool_reg
         .register(Arc::new(plugins::discord::DiscordPlugin::new(
             cfg.discord.clone(),
