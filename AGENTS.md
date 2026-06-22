@@ -30,6 +30,10 @@ cargo, docker, snapshots, and workspace introspection.
 - Use non-daimonos tools only when the target system is external to the
   workspace (for example Vikunja, GitHub, Atlassian, or web search).
 
+> **Note:** The workspace is the default base for relative paths and the
+> trigram search index. It is **not** a filesystem boundary — daimonos can
+> read, write, and exec any path on the system. There is no confinement.
+
 ## What is Daimonos?
 
 Daimonos is a **bare-metal operating system purpose-built for AI agents**. The
