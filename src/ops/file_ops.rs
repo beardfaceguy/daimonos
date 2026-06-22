@@ -154,18 +154,32 @@ const SKIP_DIRS: &[&str] = &[
     "dist",
 ];
 
+struct LsOpts<'a> {
+    show_all: bool,
+    stat: bool,
+    glob_pat: Option<&'a glob::Pattern>,
+    type_filter: Option<i64>,
+}
+
 pub async fn ls(session: &Session, op: &Op) -> Response {
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
         None => session.cwd.clone(),
     };
 
-    let show_all = op.g.as_deref() == Some("all");
-    let stat = op.g.as_deref() == Some("stat");
     let depth = op.n.unwrap_or(1).clamp(1, 5) as usize;
+    let glob_owned: Option<glob::Pattern> =
+        op.q.as_deref().and_then(|p| glob::Pattern::new(p).ok());
+    let opts = LsOpts {
+        show_all: op.g.as_deref() == Some("all"),
+        stat: op.g.as_deref() == Some("stat"),
+        glob_pat: glob_owned.as_ref(),
+        // op.n2: 1 = files only, 2 = dirs only, None/other = all
+        type_filter: op.n2,
+    };
 
     let mut entries = Vec::new();
-    if let Err(e) = ls_recurse(&path, &path, depth, show_all, stat, &mut entries).await {
+    if let Err(e) = ls_recurse(&path, &path, depth, &opts, &mut entries).await {
         return Response::err(4, &format!("ls: {e}"));
     }
 
@@ -182,8 +196,7 @@ async fn ls_recurse(
     root: &std::path::Path,
     path: &std::path::Path,
     depth: usize,
-    show_all: bool,
-    stat: bool,
+    opts: &LsOpts<'_>,
     entries: &mut Vec<serde_json::Value>,
 ) -> Result<(), String> {
     let mut dir = tokio::fs::read_dir(path).await.map_err(|e| {
@@ -196,7 +209,7 @@ async fn ls_recurse(
 
     while let Ok(Some(entry)) = dir.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !show_all && name.starts_with('.') {
+        if !opts.show_all && name.starts_with('.') {
             continue;
         }
 
@@ -233,7 +246,7 @@ async fn ls_recurse(
             e["l"] = json!(true);
         }
 
-        if stat {
+        if opts.stat {
             if let Some(ref m) = meta {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = m.permissions().mode();
@@ -247,18 +260,21 @@ async fn ls_recurse(
             }
         }
 
-        entries.push(e);
+        // Apply type filter (dirs always recurse regardless)
+        let passes_type = match opts.type_filter {
+            Some(1) => !is_dir,
+            Some(2) => is_dir,
+            _ => true,
+        };
+        // Apply glob filter: match against the entry's filename component
+        let passes_glob = opts.glob_pat.map(|pat| pat.matches(&name)).unwrap_or(true);
+
+        if passes_type && passes_glob {
+            entries.push(e);
+        }
 
         if is_dir && depth > 1 {
-            let _ = Box::pin(ls_recurse(
-                root,
-                &entry.path(),
-                depth - 1,
-                show_all,
-                stat,
-                entries,
-            ))
-            .await;
+            let _ = Box::pin(ls_recurse(root, &entry.path(), depth - 1, opts, entries)).await;
         }
     }
 
@@ -1483,6 +1499,172 @@ mod tests {
             "second read of unchanged content must set meta.read_dedup"
         );
         assert_eq!(second.d.as_ref().unwrap()["unchanged"], true);
+    }
+
+    // --- ls glob / type-filter tests (#36) ---
+
+    #[tokio::test]
+    async fn ls_glob_filter_returns_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("main.py"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                q: Some("*.rs".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"main.rs"));
+        assert!(names.contains(&"lib.rs"));
+        assert!(!names.contains(&"main.py"), "main.py should be filtered by glob");
+    }
+
+    #[tokio::test]
+    async fn ls_glob_no_match_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::write(dir.path().join("main.py"), "").unwrap();
+        std::fs::write(dir.path().join("lib.py"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                q: Some("*.rs".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        assert!(entries.is_empty(), "no entries should match *.rs");
+    }
+
+    #[tokio::test]
+    async fn ls_type_filter_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::write(dir.path().join("file.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n2: Some(1), // files only
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"file.txt"));
+        assert!(
+            !names.contains(&"subdir"),
+            "subdir should be excluded by type=files"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_type_filter_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::write(dir.path().join("file.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n2: Some(2), // dirs only
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(
+            !names.contains(&"file.txt"),
+            "file.txt should be excluded by type=dirs"
+        );
+        assert!(names.contains(&"subdir"));
+    }
+
+    #[tokio::test]
+    async fn ls_glob_recursive_finds_nested_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.py"), "").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n: Some(3),
+                q: Some("*.rs".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"src/main.rs"), "should find nested .rs file");
+        assert!(!names.contains(&"src/lib.py"), "should not find .py files");
+        assert!(!names.contains(&"readme.md"), "should not find .md files");
+        assert!(
+            !names.contains(&"src"),
+            "src dir doesn't match *.rs, should not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_glob_and_type_combined() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.py"), "").unwrap();
+        std::fs::write(dir.path().join("notes.rs"), "").unwrap();
+
+        let r = ls(
+            &s,
+            &Op {
+                c: 3,
+                n: Some(3),
+                q: Some("*.rs".into()),
+                n2: Some(1), // files only
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
+        assert!(names.contains(&"src/main.rs"), "nested .rs file matches");
+        assert!(names.contains(&"notes.rs"), "top-level .rs file matches");
+        assert!(!names.contains(&"src/lib.py"), ".py filtered by glob");
+        assert!(!names.contains(&"src"), "src dir filtered by type=files");
     }
 
     #[tokio::test]

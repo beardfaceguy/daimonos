@@ -1007,6 +1007,7 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
         "Use daimonos tools, not built-in equivalents.".to_string(),
         "If your plan requires 2+ tool calls, use execute_script instead — write a Starlark script that calls the tool functions and sets `result`. This is faster and cheaper than sequential calls. Only call individual tools when you need exactly one operation.".to_string(),
         "Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].".to_string(),
+        "File discovery: use ls(glob=\"*.ext\", type=\"f\", depth=N) instead of exec find — ls auto-excludes .git/node_modules/target/__pycache__ and returns structured JSON.".to_string(),
         format!("Workspace: {}", workspace.display()),
     ];
 

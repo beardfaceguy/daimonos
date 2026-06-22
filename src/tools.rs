@@ -517,12 +517,14 @@ pub fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "ls",
             tier: ToolTier::Terse,
-            description: "List directory. Returns [{n,d,s}]. Skips .git/node_modules/target. Use stat=true for permissions+mtime.",
+            description: "List directory. Returns [{n,d,s}]. Skips .git/node_modules/target/__pycache__. Use glob to filter by filename pattern (e.g. *.rs), type to restrict to files (f) or dirs (d).",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Dir path (default: cwd)"},
                     "depth": {"type": "integer", "description": "Depth 1-5 (default: 1)"},
+                    "glob": {"type": "string", "description": "Filename glob filter, e.g. *.rs or test_*.py"},
+                    "type": {"type": "string", "enum": ["f", "d"], "description": "f=files only, d=dirs only"},
                     "all": {"type": "boolean", "description": "Show dotfiles"},
                     "stat": {"type": "boolean", "description": "Add mode+mtime"}
                 }
@@ -535,10 +537,17 @@ pub fn all_tools() -> Vec<ToolDef> {
                 } else {
                     None
                 };
+                let type_filter = match args.get("type").and_then(|v| v.as_str()) {
+                    Some("f") => Some(1),
+                    Some("d") => Some(2),
+                    _ => None,
+                };
                 Ok(Request::Single(Op {
                     c: protocol::op::LS,
                     p: get_str(args, "path"),
                     n: get_i64(args, "depth"),
+                    q: get_str(args, "glob"),
+                    n2: type_filter,
                     g: flag,
                     ..Default::default()
                 }))
