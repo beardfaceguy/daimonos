@@ -466,6 +466,22 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "shellcheck",
+            tier: ToolTier::Terse,
+            description: "Lint shell scripts via shellcheck. Returns {clean, diagnostics:[{file,line,col,level,code,message}]}. Auto-registered when shellcheck is on PATH.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Path to a single script to check"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Paths to multiple scripts to check"},
+                    "shell": {"type": "string", "enum": ["bash", "sh", "dash", "ksh"], "description": "Shell dialect (default: bash)"}
+                }
+            }),
+            to_request: None, // uses ShellcheckPlugin via ToolRegistry
+            context_check: None,
+        },
+
+        ToolDef {
             name: "discord",
             tier: ToolTier::Terse,
             description: "Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages.",

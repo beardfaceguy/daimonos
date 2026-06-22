@@ -351,6 +351,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if plugins::shellcheck::is_available() {
+        tool_reg
+            .register(Arc::new(plugins::shellcheck::ShellcheckPlugin::new()))
+            .await;
+        if !mcp_quiet_stderr {
+            eprintln!("auto-registered shellcheck tool plugin");
+        }
+    }
+
     tool_reg
         .register(Arc::new(plugins::discord::DiscordPlugin::new(
             cfg.discord.clone(),

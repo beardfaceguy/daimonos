@@ -6,4 +6,5 @@ pub mod generic_cli;
 pub mod gh;
 pub mod git;
 pub mod pytest;
+pub mod shellcheck;
 pub mod x07;
