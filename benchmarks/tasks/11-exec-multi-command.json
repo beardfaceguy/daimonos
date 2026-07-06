@@ -2,7 +2,10 @@
   "id": "11-exec-multi-command",
   "name": "Multi-command shell workflow",
   "category": "exec_filter",
-  "applies_to": ["cursor", "daimonos"],
+  "applies_to": [
+    "cursor",
+    "daimonos"
+  ],
   "prompt": "I need a quick health check on this project. Run these commands in the shell and give me a one-paragraph summary: `cargo test`, `cargo clippy`, `git status`, and `git log --oneline -5`. Tell me if tests pass, if there are lint issues, and what the recent git history looks like.",
   "expected_behavior": "Agent runs four commands via exec/shell and synthesizes results. In daimonos mode, L1 redirects all four commands through native plugins. Baseline returns verbose raw output for each.",
   "success_criteria": [
@@ -11,5 +14,32 @@
     "Reports git status",
     "Reports recent commit history",
     "Summary is concise"
+  ],
+  "checks": [
+    {
+      "type": "response",
+      "all": [
+        "test",
+        "clippy"
+      ]
+    },
+    {
+      "type": "response",
+      "any": [
+        "git",
+        "commit"
+      ],
+      "min": 1
+    },
+    {
+      "type": "response",
+      "any": [
+        "pass",
+        "ok",
+        "succe",
+        "clean"
+      ],
+      "min": 1
+    }
   ]
 }

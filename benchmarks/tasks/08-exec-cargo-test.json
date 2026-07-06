@@ -2,12 +2,32 @@
   "id": "08-exec-cargo-test",
   "name": "Run cargo test via shell and summarize",
   "category": "exec_filter",
-  "applies_to": ["cursor", "daimonos"],
+  "applies_to": [
+    "cursor",
+    "daimonos"
+  ],
   "prompt": "Run `cargo test` in the shell and tell me: how many tests passed, how many failed, and list any failures with their error messages. Also run `cargo build` and tell me if it succeeded or if there were any warnings.",
   "expected_behavior": "Agent runs cargo test and cargo build via exec/shell. Reports 15 tests passing, 0 failures. Reports build succeeded with no errors. In daimonos mode, L1 redirect intercepts these exec calls and returns structured JSON from the cargo plugin.",
   "success_criteria": [
     "Reports correct test count",
     "Reports all tests passing",
     "Reports build success"
+  ],
+  "checks": [
+    {
+      "type": "response",
+      "all": [
+        "15",
+        "pass"
+      ]
+    },
+    {
+      "type": "response",
+      "any": [
+        "build",
+        "compil"
+      ],
+      "min": 1
+    }
   ]
 }

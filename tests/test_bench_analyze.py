@@ -119,3 +119,39 @@ def test_aggregate_tracks_success_rate_and_contamination(analyzer, tmp_path):
     t1 = stats["t1"]
     assert t1["success_rate"] == 0.5
     assert t1["contaminated_runs"] == 1
+
+
+# --- correctness gate (#929) ----------------------------------------------
+
+
+def test_aggregate_excludes_incorrect_runs_from_metrics(analyzer, tmp_path):
+    r1 = _write_run(tmp_path, "20260706-100000-daimonos-r1", {"t1": {"output_tokens": 100, "correct": True}})
+    r2 = _write_run(tmp_path, "20260706-100100-daimonos-r2", {"t1": {"output_tokens": 900, "correct": False}})
+    stats = analyzer.aggregate([r1, r2])
+    t1 = stats["t1"]
+    # the incorrect run's tokens must not pollute the mean
+    assert t1["output_tokens"]["mean"] == 100
+    assert t1["n"] == 2  # but it still counts as a run
+
+
+def test_aggregate_correct_rate(analyzer, tmp_path):
+    r1 = _write_run(tmp_path, "20260706-100000-daimonos-r1", {"t1": {"correct": True}})
+    r2 = _write_run(tmp_path, "20260706-100100-daimonos-r2", {"t1": {"correct": False}})
+    stats = analyzer.aggregate([r1, r2])
+    assert stats["t1"]["correct_rate"] == 0.5
+
+
+def test_aggregate_backcompat_runs_without_correct_field(analyzer, tmp_path):
+    # pre-#929 result files have no `correct` key: include them, rate 1.0
+    r1 = _write_run(tmp_path, "20260706-100000-daimonos-r1", {"t1": {"output_tokens": 100}})
+    stats = analyzer.aggregate([r1])
+    assert stats["t1"]["correct_rate"] == 1.0
+    assert stats["t1"]["output_tokens"]["mean"] == 100
+
+
+def test_aggregate_all_incorrect_falls_back_to_all_rows(analyzer, tmp_path):
+    # if every run failed checks, still produce stats (flagged by rate=0)
+    r1 = _write_run(tmp_path, "20260706-100000-daimonos-r1", {"t1": {"output_tokens": 100, "correct": False}})
+    stats = analyzer.aggregate([r1])
+    assert stats["t1"]["correct_rate"] == 0.0
+    assert stats["t1"]["output_tokens"]["mean"] == 100

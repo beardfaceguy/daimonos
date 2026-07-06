@@ -214,6 +214,13 @@ console.log('       tokens: ' + summary.total_tokens.toLocaleString() +
   ') | tools: ' + tcDetail + ' | cost: \$' + costUsd.toFixed(4) +
   ' | wall: ' + wallMs.toLocaleString() + 'ms');
 " "$raw_file" "$out_file" "$task_id" "$task_name" "$MODE" "$wall_ms"
+
+  # Correctness gate (#929): evaluate the task's machine-checkable success
+  # criteria against the final response and the workspace state (must run
+  # before the next task's reset). Stamps checks_passed/checks_total/correct
+  # into the summary; best-effort so a checker bug can't abort the suite.
+  node "$SCRIPT_DIR/check-task.js" "$task_file" "$raw_file" "$WORKSPACE" "$out_file" \
+    || echo "       WARN: check-task.js failed for $task_id"
 }
 
 run_number=1

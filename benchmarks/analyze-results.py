@@ -71,8 +71,14 @@ def aggregate(run_dirs: list[Path]) -> dict:
     stats = {}
     for task_id, rows in per_task.items():
         entry: dict = {"n": len(rows), "task_name": rows[0].get("task_name", task_id)}
+        # Correctness gate (#929): runs whose checks failed must not shape the
+        # metric stats — savings on a broken run don't count. `correct` absent
+        # or null (pre-gate data, or tasks without checks) counts as correct.
+        correct_rows = [r for r in rows if r.get("correct") is not False]
+        entry["correct_rate"] = len(correct_rows) / len(rows)
+        metric_rows = correct_rows or rows  # all-failed: report, flagged by rate=0
         for metric in NUMERIC_METRICS:
-            vals = [row.get(metric) or 0 for row in rows]
+            vals = [row.get(metric) or 0 for row in metric_rows]
             entry[metric] = {
                 "mean": sum(vals) / len(vals),
                 "min": min(vals),
@@ -98,14 +104,14 @@ def print_report(arm_stats: dict[str, dict]):
     all_tasks = sorted({t for s in arm_stats.values() for t in s})
 
     print("\n" + "=" * 118)
-    print(f"{'Task':<32} {'Arm':<15} {'n':>2} {'Out Tok':>20} {'Tools':>14} {'Cost $':>16} {'Wall ms':>16} {'OK':>5}")
+    print(f"{'Task':<32} {'Arm':<15} {'n':>2} {'Out Tok':>20} {'Tools':>14} {'Cost $':>16} {'Wall ms':>14} {'OK|✓':>7}")
     print("=" * 118)
     for task_id in all_tasks:
         for arm, stats in arm_stats.items():
             t = stats.get(task_id)
             if not t:
                 continue
-            ok = f"{t['success_rate'] * 100:.0f}%"
+            ok = f"{t['success_rate'] * 100:.0f}|{t.get('correct_rate', 1.0) * 100:.0f}"
             if t["contaminated_runs"]:
                 ok += "!"
             cost = t["cost_usd"]
@@ -117,8 +123,8 @@ def print_report(arm_stats: dict[str, dict]):
                 f" {_fmt_spread(t['output_tokens'], 20)}"
                 f" {_fmt_spread(t['tool_calls'], 14)}"
                 f" {cost_s:>16}"
-                f" {_fmt_spread(t['wall_ms'], 16)}"
-                f" {ok:>5}"
+                f" {_fmt_spread(t['wall_ms'], 14)}"
+                f" {ok:>7}"
             )
         print("-" * 118)
 
@@ -169,6 +175,15 @@ def print_report(arm_stats: dict[str, dict]):
     for arm, count in contaminated.items():
         if count:
             print(f"\nWARNING: {count} contaminated run(s) in {arm} — isolation failed; numbers unreliable.")
+
+    for arm, stats in arm_stats.items():
+        failed_tasks = [t["task_name"] for t in stats.values() if t.get("correct_rate", 1.0) < 1.0]
+        if failed_tasks:
+            print(
+                f"\nNOTE: {arm} had runs that failed correctness checks on: "
+                + ", ".join(sorted(failed_tasks))
+                + " — those runs are excluded from metric stats (OK|✓ column shows rates)."
+            )
 
 
 def main():

@@ -2,12 +2,41 @@
   "id": "06-git-status",
   "name": "Check git status and history",
   "category": "git",
-  "applies_to": ["cursor", "daimonos"],
+  "applies_to": [
+    "cursor",
+    "daimonos"
+  ],
   "prompt": "Check the git status of this project. How many commits are there? What was the most recent commit message? Are there any uncommitted changes?",
-  "expected_behavior": "Agent checks git status and log, reports 3 commits, most recent message about .gitignore, and no uncommitted changes (clean working tree).",
+  "expected_behavior": "Agent checks git status and log, reports 7 commits, most recent commit message 'Initial benchmark workspace', and no uncommitted changes (clean working tree).",
   "success_criteria": [
     "Reports correct number of commits",
     "Reports correct most recent commit message",
     "Correctly identifies clean/dirty working tree status"
+  ],
+  "checks": [
+    {
+      "type": "response",
+      "any": [
+        "7\\s+commit",
+        "commits[^0-9]{0,6}7"
+      ],
+      "min": 1
+    },
+    {
+      "type": "response",
+      "all": [
+        "initial benchmark workspace"
+      ]
+    },
+    {
+      "type": "response",
+      "any": [
+        "clean",
+        "no uncommitted",
+        "nothing to commit",
+        "no changes"
+      ],
+      "min": 1
+    }
   ]
 }
