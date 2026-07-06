@@ -202,3 +202,30 @@ def test_kgl_observe_resolves_relative_path_against_cwd(daimonos_observe):
     )
     assert len(cwd_writers) >= 1, "edge should be recorded against cwd/sub/note.txt"
     assert ws_writers == [], "edge must NOT be recorded against workspace/note.txt"
+
+# --- context gating (#936 prefix diet): kgl tools hidden unless a store exists ---
+
+
+def test_kgl_tools_hidden_from_list_without_store(daimonos):
+    """Fresh workspace has no .kgl/ — the kgl tools must not spend prefix tokens."""
+    names = [t["name"] for t in daimonos.list_tools()]
+    assert "kgl_query" not in names, f"kgl_query should be gated; got {names}"
+    assert "kgl_assert" not in names, f"kgl_assert should be gated; got {names}"
+
+
+def test_kgl_tools_listed_once_store_exists(daimonos, tmp_path):
+    """context_check is evaluated per list_tools call, so a store created
+    mid-session surfaces the tools without a restart."""
+    (tmp_path / ".kgl").mkdir()
+    names = [t["name"] for t in daimonos.list_tools()]
+    assert "kgl_query" in names
+    assert "kgl_assert" in names
+
+
+def test_kgl_tools_still_callable_while_hidden(daimonos):
+    """Gating hides the tools from list_tools but must not block dispatch —
+    `kgl_query index` is the bootstrap that creates the store."""
+    result = daimonos.call_tool("kgl_query", {"query": "index"})
+    text = result["content"][0]["text"]
+    assert text.strip(), "kgl_query index returned empty response while hidden"
+    assert not result.get("isError"), f"kgl_query index failed while hidden: {text}"

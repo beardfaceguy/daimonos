@@ -289,7 +289,10 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["query"]
             }),
             to_request: None, // KGL store access handled in mcp.rs
-            context_check: None,
+            // #936 prefix diet: heaviest tool in the prefix and niche — only
+            // list it where a KGL store exists. Still callable while hidden
+            // (dispatch auto-activates), so `kgl_query index` bootstraps fine.
+            context_check: Some(|ws| ws.join(".kgl").exists()),
         },
 
         ToolDef {
@@ -308,7 +311,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["action"]
             }),
             to_request: None, // KGL store access handled in mcp.rs
-            context_check: None,
+            context_check: Some(|ws| ws.join(".kgl").exists()),
         },
 
         ToolDef {
@@ -940,6 +943,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(passes_context_check("read_file", dir.path()));
         assert!(passes_context_check("nonexistent_tool", dir.path()));
+    }
+
+    #[test]
+    fn context_check_kgl_gated_on_store_dir() {
+        // #936 prefix diet: the kgl pair is the heaviest prefix content
+        // (1.6k chars) and niche — only list it where a store exists.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!passes_context_check("kgl_query", dir.path()));
+        assert!(!passes_context_check("kgl_assert", dir.path()));
+        std::fs::create_dir(dir.path().join(".kgl")).unwrap();
+        assert!(passes_context_check("kgl_query", dir.path()));
+        assert!(passes_context_check("kgl_assert", dir.path()));
     }
 
     #[test]
