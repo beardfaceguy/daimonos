@@ -28,7 +28,7 @@ TASK_FILTER="${2:-}"
 RUN_TAG="${BENCH_TAG:-}"
 
 if [ -z "$MODE" ]; then
-  echo "Usage: $0 <baseline|daimonos> [task-id]"
+  echo "Usage: $0 <baseline|baseline-terse|daimonos> [task-id]"
   echo ""
   echo "Environment variables:"
   echo "  BENCH_MODEL     Model alias or slug (default: opus)"
@@ -37,8 +37,8 @@ if [ -z "$MODE" ]; then
   exit 1
 fi
 
-if [ "$MODE" != "baseline" ] && [ "$MODE" != "daimonos" ]; then
-  echo "Error: mode must be 'baseline' or 'daimonos'"
+if [ "$MODE" != "baseline" ] && [ "$MODE" != "baseline-terse" ] && [ "$MODE" != "daimonos" ]; then
+  echo "Error: mode must be 'baseline', 'baseline-terse', or 'daimonos'"
   exit 1
 fi
 
@@ -87,7 +87,7 @@ run_task() {
   fi
 
   check_mode="$MODE"
-  [ "$check_mode" = "baseline" ] && check_mode="cursor"
+  case "$check_mode" in baseline*) check_mode="cursor" ;; esac
   case "$applies_to" in
     *"$check_mode"*) ;;
     *)
@@ -105,9 +105,15 @@ run_task() {
   # Build claude CLI arguments (POSIX-compatible, no bash arrays)
   CLAUDE_ARGS="-p --output-format stream-json --verbose --model $MODEL"
   CLAUDE_ARGS="$CLAUDE_ARGS --dangerously-skip-permissions --no-session-persistence --bare"
+  # Arm isolation: every arm gets --strict-mcp-config so only servers named in
+  # an explicit --mcp-config load. Baseline arms pass no --mcp-config, which
+  # guarantees zero MCP servers — without this, a user-scope daimonos
+  # registration would silently contaminate the baseline arm (the exact bug
+  # that produced ponytail's false ~4% result; see vikunja #926).
+  CLAUDE_ARGS="$CLAUDE_ARGS --strict-mcp-config"
 
   if [ "$MODE" = "daimonos" ]; then
-    CLAUDE_ARGS="$CLAUDE_ARGS --mcp-config $MCP_CONFIG --strict-mcp-config"
+    CLAUDE_ARGS="$CLAUDE_ARGS --mcp-config $MCP_CONFIG"
     task_category="$(json_field "$task_file" category)"
     if [ "$task_category" = "exec_filter" ]; then
       # exec_filter tasks: force exec tool usage to exercise L1/L2 filtering
@@ -115,6 +121,12 @@ run_task() {
     else
       CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Use daimonos MCP tools, not built-in equivalents. If your plan requires 2+ tool calls, use execute_script to run them as a single Starlark script — tool functions are already available (see server instructions for signatures). Only call individual tools for single-operation tasks. Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
     fi
+  elif [ "$MODE" = "baseline-terse" ]; then
+    # Prompt-symmetry control arm (vikunja #925): baseline tools + the SAME
+    # terse-style directive the daimonos arm carries, minus the tool-routing
+    # sentences. daimonos-vs-baseline-terse isolates the tools-only effect;
+    # ponytail's caveman control showed terse-prose alone moves tokens.
+    CLAUDE_ARGS="$CLAUDE_ARGS --append-system-prompt \"Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].\""
   fi
 
   start_s="$(date +%s)"
@@ -176,6 +188,10 @@ for (var i = 0; i < events.length; i++) {
 var inputTokens = usage.input_tokens || 0;
 var outputTokens = usage.output_tokens || 0;
 
+// Contamination canary (vikunja #926): a non-daimonos arm that reaches any
+// mcp__daimonos__ tool means the isolation failed and the run's numbers lie.
+var contaminated = (mode !== 'daimonos') && mcpToolCalls > 0;
+
 var summary = {
   task_id: taskId, task_name: taskName, mode: mode,
   wall_ms: wallMs, duration_ms: durationMs, duration_api_ms: durationApiMs,
@@ -186,10 +202,16 @@ var summary = {
   total_tokens: inputTokens + outputTokens,
   tool_calls: toolCalls, mcp_tool_calls: mcpToolCalls,
   builtin_tool_calls: builtinToolCalls,
-  is_error: isError, success: !isError
+  is_error: isError, success: !isError && !contaminated,
+  contaminated: contaminated
 };
 
 fs.writeFileSync(outFile, JSON.stringify(summary, null, 2));
+
+if (contaminated) {
+  console.log('       *** CONTAMINATED: ' + mode + ' arm made ' + mcpToolCalls +
+    ' daimonos MCP call(s) — isolation failed, run marked invalid ***');
+}
 
 var tcDetail = mode === 'daimonos'
   ? 'mcp:' + mcpToolCalls + ' builtin:' + builtinToolCalls
