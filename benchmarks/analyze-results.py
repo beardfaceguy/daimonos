@@ -1,13 +1,37 @@
 #!/usr/bin/env python3
-"""Analyze and compare benchmark results across cursor and daimonos runs."""
+"""Analyze benchmark results across arms (baseline, baseline-terse, daimonos).
+
+Aggregates every matching run per arm — including BENCH_RUNS-produced
+-r1..-rN directories — and reports per-task means with min/max spread, so a
+delta can be read against its run-to-run noise instead of a single sample.
+
+Usage:
+  python3 analyze-results.py <results-dir> [tag]
+
+With a tag, only runs whose name matches <arm>-<tag> (or <arm>-<tag>-rN) are
+included; without one, only untagged runs (<arm> or <arm>-rN).
+"""
 
 import json
+import re
 import sys
 from pathlib import Path
 
+ARMS = ["baseline", "baseline-terse", "daimonos"]
+ARM_ALIASES = {"baseline": ["baseline", "cursor"]}
+NUMERIC_METRICS = [
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "tool_calls",
+    "mcp_tool_calls",
+    "cost_usd",
+    "wall_ms",
+]
+
 
 def load_run(run_dir: Path) -> dict:
-    """Load all task results from a run directory."""
+    """Load all task summaries from one run directory."""
     results = {}
     for f in sorted(run_dir.glob("*.json")):
         if f.name.endswith(".raw.jsonl"):
@@ -17,152 +41,159 @@ def load_run(run_dir: Path) -> dict:
     return results
 
 
-def find_runs(results_dir: Path, mode: str, tag: str = "") -> list[Path]:
-    """Find run directories for a given mode and optional tag."""
-    aliases = [mode]
-    if mode == "baseline":
-        aliases.append("cursor")
+def find_arm_runs(results_dir: Path, arm: str, tag: str = "") -> list[Path]:
+    """All run dirs belonging to (arm, tag), including -rN repetitions."""
+    aliases = ARM_ALIASES.get(arm, [arm])
     runs = []
-    for d in sorted(results_dir.iterdir()):
+    for d in sorted(Path(results_dir).iterdir()):
         if not d.is_dir():
             continue
-        name = d.name
-        parts = name.split("-", 2)  # date-time-rest
+        parts = d.name.split("-", 2)  # <date>-<time>-<rest>
         if len(parts) < 3:
             continue
         rest = parts[2]
         for alias in aliases:
-            if tag:
-                if rest == f"{alias}-{tag}":
-                    runs.append(d)
-            else:
-                if rest == alias:
-                    runs.append(d)
+            base = f"{alias}-{tag}" if tag else alias
+            if rest == base or re.fullmatch(re.escape(base) + r"-r\d+", rest):
+                runs.append(d)
+                break
     return runs
 
 
-def latest_run(run_dirs: list[Path]) -> Path | None:
-    return run_dirs[-1] if run_dirs else None
+def aggregate(run_dirs: list[Path]) -> dict:
+    """Per-task cross-run statistics: mean/min/max per metric, success rate,
+    contaminated-run count, and n (runs that included the task)."""
+    per_task: dict[str, list[dict]] = {}
+    for rd in run_dirs:
+        for task_id, data in load_run(rd).items():
+            per_task.setdefault(task_id, []).append(data)
+
+    stats = {}
+    for task_id, rows in per_task.items():
+        entry: dict = {"n": len(rows), "task_name": rows[0].get("task_name", task_id)}
+        for metric in NUMERIC_METRICS:
+            vals = [row.get(metric) or 0 for row in rows]
+            entry[metric] = {
+                "mean": sum(vals) / len(vals),
+                "min": min(vals),
+                "max": max(vals),
+            }
+        entry["success_rate"] = sum(1 for r in rows if r.get("success")) / len(rows)
+        entry["contaminated_runs"] = sum(1 for r in rows if r.get("contaminated"))
+        stats[task_id] = entry
+    return stats
 
 
-def print_comparison(baseline_results: dict, daimonos_results: dict):
-    all_tasks = sorted(set(list(baseline_results.keys()) + list(daimonos_results.keys())))
+def _fmt_spread(m: dict, width: int = 0) -> str:
+    """mean with min–max spread when runs disagree, e.g. `210 (180–240)`."""
+    mean, lo, hi = m["mean"], m["min"], m["max"]
+    s = f"{mean:,.0f}"
+    if hi != lo:
+        s += f" ({lo:,.0f}–{hi:,.0f})"
+    return s.rjust(width) if width else s
 
-    print("\n" + "=" * 130)
-    print(f"{'Task':<35} {'Mode':<10} {'Out Tok':>8} {'Cache R':>9} {'Cache W':>9} {'Tools':>6} {'MCP':>5} {'Cost':>8} {'Wall ms':>9} {'OK':>4}")
-    print("=" * 130)
 
+def print_report(arm_stats: dict[str, dict]):
+    """arm_stats: arm name -> aggregate() output (only arms with data)."""
+    all_tasks = sorted({t for s in arm_stats.values() for t in s})
+
+    print("\n" + "=" * 118)
+    print(f"{'Task':<32} {'Arm':<15} {'n':>2} {'Out Tok':>20} {'Tools':>14} {'Cost $':>16} {'Wall ms':>16} {'OK':>5}")
+    print("=" * 118)
     for task_id in all_tasks:
-        b = baseline_results.get(task_id)
-        d = daimonos_results.get(task_id)
+        for arm, stats in arm_stats.items():
+            t = stats.get(task_id)
+            if not t:
+                continue
+            ok = f"{t['success_rate'] * 100:.0f}%"
+            if t["contaminated_runs"]:
+                ok += "!"
+            cost = t["cost_usd"]
+            cost_s = f"{cost['mean']:.4f}"
+            if cost["max"] != cost["min"]:
+                cost_s += f" ±{(cost['max'] - cost['min']) / 2:.4f}"
+            print(
+                f"{t['task_name'][:32]:<32} {arm:<15} {t['n']:>2}"
+                f" {_fmt_spread(t['output_tokens'], 20)}"
+                f" {_fmt_spread(t['tool_calls'], 14)}"
+                f" {cost_s:>16}"
+                f" {_fmt_spread(t['wall_ms'], 16)}"
+                f" {ok:>5}"
+            )
+        print("-" * 118)
 
-        if b:
-            cost_str = f"${b.get('cost_usd', 0):.4f}"
-            print(f"{b['task_name'][:35]:<35} {'baseline':<10} {b['output_tokens']:>8,} {b['cache_read_tokens']:>9,} {b['cache_write_tokens']:>9,} {b['tool_calls']:>6} {'':>5} {cost_str:>8} {b['wall_ms']:>9,} {'Y' if b['success'] else 'N':>4}")
-
-        if d:
-            mcp = d.get('mcp_tool_calls', 0)
-            cost_str = f"${d.get('cost_usd', 0):.4f}"
-            print(f"{d['task_name'][:35]:<35} {'daimonos':<10} {d['output_tokens']:>8,} {d['cache_read_tokens']:>9,} {d['cache_write_tokens']:>9,} {d['tool_calls']:>6} {mcp:>5} {cost_str:>8} {d['wall_ms']:>9,} {'Y' if d['success'] else 'N':>4}")
-
-        if b and d:
-            out_diff = d["output_tokens"] - b["output_tokens"]
-            cache_diff = d["cache_read_tokens"] - b["cache_read_tokens"]
-            tool_diff = d["tool_calls"] - b["tool_calls"]
-            wall_diff = d["wall_ms"] - b["wall_ms"]
-            out_pct = (out_diff / b["output_tokens"] * 100) if b["output_tokens"] > 0 else 0
-            cost_diff = d.get("cost_usd", 0) - b.get("cost_usd", 0)
-            cost_str = f"${cost_diff:+.4f}"
-            print(f"{'  delta':<35} {'':10} {out_diff:>+8,} {cache_diff:>+9,} {'':>9} {tool_diff:>+6} {'':>5} {cost_str:>8} {wall_diff:>+9,} {f'{out_pct:+.0f}%':>4}")
-
-        print("-" * 130)
-
-    print("\n" + "=" * 80)
-    print("AGGREGATE (comparable tasks only)")
-    print("=" * 80)
-
-    shared_tasks = sorted(set(baseline_results.keys()) & set(daimonos_results.keys()))
-    if not shared_tasks:
-        print("No comparable tasks found.")
+    # Aggregate over tasks present in every arm, so sums are comparable.
+    shared = sorted(set.intersection(*(set(s) for s in arm_stats.values())))
+    if not shared or len(arm_stats) < 2:
+        print("\nNo shared tasks across arms; skipping aggregate comparison.")
         return
 
-    b_out = sum(baseline_results[t]["output_tokens"] for t in shared_tasks)
-    d_out = sum(daimonos_results[t]["output_tokens"] for t in shared_tasks)
-    b_cache = sum(baseline_results[t]["cache_read_tokens"] for t in shared_tasks)
-    d_cache = sum(daimonos_results[t]["cache_read_tokens"] for t in shared_tasks)
-    b_tools = sum(baseline_results[t]["tool_calls"] for t in shared_tasks)
-    d_tools = sum(daimonos_results[t]["tool_calls"] for t in shared_tasks)
-    d_mcp = sum(daimonos_results[t].get("mcp_tool_calls", 0) for t in shared_tasks)
-    b_wall = sum(baseline_results[t]["wall_ms"] for t in shared_tasks)
-    d_wall = sum(daimonos_results[t]["wall_ms"] for t in shared_tasks)
-    b_cost = sum(baseline_results[t].get("cost_usd", 0) for t in shared_tasks)
-    d_cost = sum(daimonos_results[t].get("cost_usd", 0) for t in shared_tasks)
+    def totals(stats):
+        return {m: sum(stats[t][m]["mean"] for t in shared) for m in NUMERIC_METRICS}
 
-    print(f"\n{'Metric':<25} {'Baseline':>12} {'Daimonos':>12} {'Delta':>12} {'Change':>10}")
-    print("-" * 71)
-    print(f"{'Output tokens':<25} {b_out:>12,} {d_out:>12,} {d_out - b_out:>+12,} {(d_out - b_out) / b_out * 100 if b_out else 0:>+9.1f}%")
-    print(f"{'Cache read tokens':<25} {b_cache:>12,} {d_cache:>12,} {d_cache - b_cache:>+12,} {(d_cache - b_cache) / b_cache * 100 if b_cache else 0:>+9.1f}%")
-    print(f"{'Tool calls':<25} {b_tools:>12,} {d_tools:>12,} {d_tools - b_tools:>+12,} {(d_tools - b_tools) / b_tools * 100 if b_tools else 0:>+9.1f}%")
-    print(f"{'  of which MCP':<25} {'':>12} {d_mcp:>12,}")
-    print(f"{'Actual cost (USD)':<25} {f'${b_cost:.4f}':>12} {f'${d_cost:.4f}':>12} {f'${d_cost - b_cost:+.4f}':>12} {(d_cost - b_cost) / b_cost * 100 if b_cost else 0:>+9.1f}%")
-    print(f"{'Wall time (ms)':<25} {b_wall:>12,} {d_wall:>12,} {d_wall - b_wall:>+12,} {(d_wall - b_wall) / b_wall * 100 if b_wall else 0:>+9.1f}%")
+    arm_totals = {arm: totals(stats) for arm, stats in arm_stats.items()}
 
-    print(f"\nComparable tasks: {len(shared_tasks)}")
-    if d_mcp > 0:
-        print(f"MCP tool adoption: {d_mcp}/{d_tools} tool calls ({d_mcp/d_tools*100:.0f}%) were daimonos MCP tools")
+    print("\n" + "=" * 96)
+    print(f"AGGREGATE — mean per run, summed over {len(shared)} shared task(s)")
+    print("=" * 96)
+    header = f"{'Metric':<22}" + "".join(f"{arm:>18}" for arm in arm_totals)
+    print(header)
+    print("-" * 96)
+    for metric in ["output_tokens", "cache_read_tokens", "tool_calls", "cost_usd", "wall_ms"]:
+        row = f"{metric:<22}"
+        for arm in arm_totals:
+            v = arm_totals[arm][metric]
+            row += f"{v:>18,.4f}" if metric == "cost_usd" else f"{v:>18,.0f}"
+        print(row)
 
-    if d_cost < b_cost and b_cost > 0:
-        print(f"Daimonos saves ${b_cost - d_cost:.4f} ({(b_cost - d_cost) / b_cost * 100:.1f}% cheaper)")
-    elif b_cost > 0:
-        print(f"Daimonos costs ${d_cost - b_cost:.4f} more ({(d_cost - b_cost) / b_cost * 100:.1f}% more)")
+    if "daimonos" in arm_totals:
+        d = arm_totals["daimonos"]
+        print()
+        for ref_arm in arm_totals:
+            if ref_arm == "daimonos":
+                continue
+            r = arm_totals[ref_arm]
+            deltas = []
+            for metric, label in [("output_tokens", "out tok"), ("cost_usd", "cost"), ("wall_ms", "wall")]:
+                if r[metric]:
+                    pct = (d[metric] - r[metric]) / r[metric] * 100
+                    deltas.append(f"{label} {pct:+.1f}%")
+            print(f"daimonos vs {ref_arm}: " + ", ".join(deltas))
+        if "baseline-terse" in arm_totals:
+            print("(daimonos vs baseline-terse isolates the tools-only effect; vs baseline includes the prompt.)")
 
-    print(f"\n{'Task':<35} {'Out Tok Delta':>14} {'Cost Delta':>12} {'MCP/Total':>10}")
-    print("-" * 75)
-    for t in shared_tasks:
-        b = baseline_results[t]
-        d = daimonos_results[t]
-        out_d = d["output_tokens"] - b["output_tokens"]
-        out_pct = (out_d / b["output_tokens"] * 100) if b["output_tokens"] else 0
-        cost_d = d.get("cost_usd", 0) - b.get("cost_usd", 0)
-        mcp_ratio = f"{d.get('mcp_tool_calls',0)}/{d['tool_calls']}"
-        print(f"{b['task_name'][:35]:<35} {out_d:>+8,} ({out_pct:>+5.1f}%) {f'${cost_d:+.4f}':>12} {mcp_ratio:>10}")
+    contaminated = {
+        arm: sum(t["contaminated_runs"] for t in stats.values())
+        for arm, stats in arm_stats.items()
+    }
+    for arm, count in contaminated.items():
+        if count:
+            print(f"\nWARNING: {count} contaminated run(s) in {arm} — isolation failed; numbers unreliable.")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 analyze-results.py <results-dir> [baseline-run] [daimonos-run]")
-        print("\nIf run names are omitted, uses the most recent run of each mode.")
+        print("Usage: python3 analyze-results.py <results-dir> [tag]")
         sys.exit(1)
 
     results_dir = Path(sys.argv[1])
-    tag = ""
+    tag = sys.argv[2] if len(sys.argv) >= 3 else ""
 
-    if len(sys.argv) >= 4:
-        baseline_dir = results_dir / sys.argv[2]
-        daimonos_dir = results_dir / sys.argv[3]
-    elif len(sys.argv) >= 3:
-        tag = sys.argv[2]
-        baseline_dir = latest_run(find_runs(results_dir, "baseline", tag))
-        daimonos_dir = latest_run(find_runs(results_dir, "daimonos", tag))
-    else:
-        baseline_dir = latest_run(find_runs(results_dir, "baseline"))
-        daimonos_dir = latest_run(find_runs(results_dir, "daimonos"))
+    arm_stats = {}
+    for arm in ARMS:
+        runs = find_arm_runs(results_dir, arm, tag)
+        if runs:
+            arm_stats[arm] = aggregate(runs)
+            print(f"{arm}: {len(runs)} run(s) — {', '.join(r.name for r in runs)}")
 
-    baseline_results = load_run(baseline_dir) if baseline_dir and baseline_dir.exists() else {}
-    daimonos_results = load_run(daimonos_dir) if daimonos_dir and daimonos_dir.exists() else {}
-
-    if not baseline_results and not daimonos_results:
-        print("No results found. Run benchmarks first:")
-        print("  ./run-benchmark.sh baseline")
-        print("  ./run-benchmark.sh daimonos")
+    if not arm_stats:
+        print("No results found. Run benchmarks first, e.g.:")
+        print("  BENCH_RUNS=4 ./run-benchmark.sh baseline")
+        print("  BENCH_RUNS=4 ./run-benchmark.sh baseline-terse")
+        print("  BENCH_RUNS=4 ./run-benchmark.sh daimonos")
         sys.exit(1)
 
-    if baseline_dir and baseline_results:
-        print(f"Baseline run: {baseline_dir.name}")
-    if daimonos_dir and daimonos_results:
-        print(f"Daimonos run: {daimonos_dir.name}")
-
-    print_comparison(baseline_results, daimonos_results)
+    print_report(arm_stats)
 
 
 if __name__ == "__main__":

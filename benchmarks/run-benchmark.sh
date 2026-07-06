@@ -26,11 +26,13 @@ fi
 MODE="${1:-}"
 TASK_FILTER="${2:-}"
 RUN_TAG="${BENCH_TAG:-}"
+RUNS="${BENCH_RUNS:-1}"
 
 if [ -z "$MODE" ]; then
   echo "Usage: $0 <baseline|baseline-terse|daimonos> [task-id]"
   echo ""
   echo "Environment variables:"
+  echo "  BENCH_RUNS      Repeat the suite N times, one -rN-tagged run dir each (default: 1)"
   echo "  BENCH_MODEL     Model alias or slug (default: opus)"
   echo "  CLAUDE_BIN      Path to claude CLI (default: ~/.local/bin/claude)"
   echo "  DAIMONOS_BIN    Path to daimonos binary (default: ../target/release/daimonos)"
@@ -42,20 +44,11 @@ if [ "$MODE" != "baseline" ] && [ "$MODE" != "baseline-terse" ] && [ "$MODE" != 
   exit 1
 fi
 
-if [ -n "$RUN_TAG" ]; then
-  RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}-${RUN_TAG}"
-else
-  RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}"
-fi
-RUN_DIR="$RESULTS_DIR/$RUN_ID"
-mkdir -p "$RUN_DIR"
-
-echo "=== Benchmark Run ==="
-echo "Mode:      $MODE"
-echo "Model:     $MODEL"
-echo "Run ID:    $RUN_ID"
-echo "Workspace: $WORKSPACE"
-echo ""
+# RUN_ID/RUN_DIR are (re)computed per repetition inside the driver loop at
+# the bottom of this file; with BENCH_RUNS>1 each repetition gets its own
+# -rN-suffixed run directory so the analyzer can aggregate across them.
+RUN_ID=""
+RUN_DIR=""
 
 # Use node for JSON parsing (available on both Ubuntu and daimonos)
 json_field() {
@@ -223,13 +216,42 @@ console.log('       tokens: ' + summary.total_tokens.toLocaleString() +
 " "$raw_file" "$out_file" "$task_id" "$task_name" "$MODE" "$wall_ms"
 }
 
-for task_file in "$TASKS_DIR"/*.json; do
-  run_task "$task_file"
+run_number=1
+while [ "$run_number" -le "$RUNS" ]; do
+  if [ "$RUNS" -gt 1 ]; then
+    if [ -n "$RUN_TAG" ]; then
+      effective_tag="${RUN_TAG}-r${run_number}"
+    else
+      effective_tag="r${run_number}"
+    fi
+  else
+    effective_tag="$RUN_TAG"
+  fi
+
+  if [ -n "$effective_tag" ]; then
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}-${effective_tag}"
+  else
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODE}"
+  fi
+  RUN_DIR="$RESULTS_DIR/$RUN_ID"
+  mkdir -p "$RUN_DIR"
+
+  echo "=== Benchmark Run ($run_number/$RUNS) ==="
+  echo "Mode:      $MODE"
+  echo "Model:     $MODEL"
+  echo "Run ID:    $RUN_ID"
+  echo "Workspace: $WORKSPACE"
+  echo ""
+
+  for task_file in "$TASKS_DIR"/*.json; do
+    run_task "$task_file"
+  done
+
+  echo ""
+  run_number=$((run_number + 1))
 done
 
-echo ""
-echo "=== Run complete ==="
-echo "Raw output: $RUN_DIR/"
+echo "=== All runs complete ==="
 echo ""
 echo "To analyze results, run:"
 echo "  python3 $SCRIPT_DIR/analyze-results.py $RESULTS_DIR"
