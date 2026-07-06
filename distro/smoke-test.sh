@@ -28,12 +28,34 @@ mcp_session() {
     local write_test='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"smoke-test.txt","content":"hello from smoke test"}}}'
     local read_test='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"smoke-test.txt"}}}'
 
-    (echo "$init"; sleep 0.5; echo "$notif"; sleep 0.3
-     echo "$tools_list"; sleep 0.3
-     echo "$exec_uname"; sleep 0.3
-     echo "$ls_root"; sleep 0.3
-     echo "$write_test"; sleep 1
-     echo "$read_test"; sleep 3) | eval "$MCP_CMD" 2>/dev/null
+    local out_file
+    out_file=$(mktemp)
+
+    # Response-driven pacing: after sending each request, wait (bounded) for
+    # its response to land in $out_file before sending the next / closing
+    # stdin. The previous fixed-sleep version closed stdin 3s after the last
+    # request, which truncated the session on slow CI runners (flaked on
+    # run 28815096979: read_file response missed the window).
+    (
+        send_and_wait() {
+            local req="$1" id="$2" i=0
+            echo "$req"
+            while [ "$i" -lt 120 ] && ! grep -q "\"id\":${id}," "$out_file" 2>/dev/null; do
+                sleep 0.25
+                i=$((i + 1))
+            done
+        }
+        send_and_wait "$init" 1
+        echo "$notif"
+        send_and_wait "$tools_list" 2
+        send_and_wait "$exec_uname" 3
+        send_and_wait "$ls_root" 4
+        send_and_wait "$write_test" 5
+        send_and_wait "$read_test" 6
+    ) | eval "$MCP_CMD" >"$out_file" 2>/dev/null
+
+    cat "$out_file"
+    rm -f "$out_file"
 }
 
 check_response() {
