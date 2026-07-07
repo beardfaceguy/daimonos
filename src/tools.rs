@@ -641,6 +641,21 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
 
         ToolDef {
+            name: "set_verbosity",
+            tier: ToolTier::Terse,
+            description: "Set this session's output verbosity: full (default, most detail), compact (tighter caps), terse (minimum viable — counts, exit codes, first error). Trades tool-output tokens for detail. Returns {verbosity, previous}.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "level": {"type": "string", "enum": ["full", "compact", "terse"], "description": "Target verbosity level."}
+                },
+                "required": ["level"]
+            }),
+            to_request: None, // mutates session directly
+            context_check: None,
+        },
+
+        ToolDef {
             name: "list_all_tools",
             tier: ToolTier::Terse,
             description: "Show all available tools including extended ones (diff, pipelines, repair). Call once to unlock them.",

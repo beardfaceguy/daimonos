@@ -17,6 +17,7 @@ mod providers;
 mod tool_runner;
 mod tool_facade;
 mod tools;
+mod verbosity;
 
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
@@ -499,6 +500,7 @@ async fn run_mcp_socket_server(
             session.pipeline_cache = Some(pc);
             session.analytics = an;
             session.external_session_id = analytics::read_agent_session_id_env();
+            session.verbosity = config::effective_verbosity(&session.cfg);
 
             if let Err(e) = mcp::serve_one_mcp(stream, session).await {
                 eprintln!("mcp socket connection error: {e}");
@@ -568,6 +570,7 @@ async fn handle_connection(
     session.pipeline_cache = Some(pcache);
     session.analytics = analytics;
     session.external_session_id = analytics::read_agent_session_id_env();
+    session.verbosity = config::effective_verbosity(&session.cfg);
     let mut line = String::new();
 
     loop {

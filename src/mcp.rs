@@ -273,6 +273,10 @@ async fn dispatch_tool_inner(
                                 None => Value::Null,
                             },
                         );
+                        obj.insert(
+                            "verbosity".to_string(),
+                            json!(session.verbosity.as_str()),
+                        );
                     }
                     ok_text(serde_json::to_string(&value).unwrap_or_default())
                 }
@@ -308,6 +312,32 @@ async fn dispatch_tool_inner(
                 serde_json::to_string(&json!({
                     "external_session_id": session.external_session_id,
                     "previous": previous,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+
+        "set_verbosity" => {
+            let level = match get_str(args, "level") {
+                Some(s) => s,
+                None => return err_text("set_verbosity requires 'level' argument".into()),
+            };
+            let parsed = match crate::verbosity::Verbosity::from_input(&level) {
+                Some(v) => v,
+                None => {
+                    return err_text(format!(
+                        "unknown verbosity level: {:?}. Use one of {:?}",
+                        level,
+                        crate::verbosity::Verbosity::valid_names()
+                    ))
+                }
+            };
+            let previous = session.verbosity;
+            session.verbosity = parsed;
+            ok_text(
+                serde_json::to_string(&json!({
+                    "verbosity": session.verbosity.as_str(),
+                    "previous": previous.as_str(),
                 }))
                 .unwrap_or_default(),
             )
@@ -380,6 +410,7 @@ async fn dispatch_tool_inner(
             if let Some(a) = analytics_summary {
                 info["analytics"] = a;
             }
+            info["verbosity"] = json!(session.verbosity.as_str());
 
             response_to_result(Response::ok(info))
         }
@@ -1278,6 +1309,10 @@ pub async fn run_mcp_server(
     // `claude --session-id $SID`. The MCP `set_external_session_id` tool
     // can override this mid-session.
     session.external_session_id = analytics::read_agent_session_id_env();
+    // Apply the DAIMONOS_MCP_VERBOSITY env override here at the startup edge
+    // rather than inside Session::new, so the constructor stays free of
+    // process-global env reads (vikunja #181).
+    session.verbosity = config::effective_verbosity(&session.cfg);
 
     let instructions = build_instructions(&workspace).await;
     let handler = DaimonosHandler::new(session, last_activity, startup_logs);
@@ -1901,6 +1936,94 @@ mod tests {
         let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
         assert_eq!(payload["external_session_id"], json!("agent-sid-123"));
         assert!(payload.get("total_calls").is_some());
+    }
+
+    // --- verbosity dial (vikunja #181) ---
+
+    /// `set_verbosity` must mutate the session level and surface the previous
+    /// value, mirroring `set_external_session_id`'s contract.
+    #[tokio::test]
+    async fn set_verbosity_updates_and_reports_previous() {
+        use crate::config::Config;
+        use crate::verbosity::Verbosity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        // Pin a known starting point independent of any ambient env override.
+        session.verbosity = Verbosity::Full;
+
+        let result = dispatch_tool_inner(&mut session, "set_verbosity", &json!({"level": "terse"}))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["verbosity"], json!("terse"));
+        assert_eq!(payload["previous"], json!("full"));
+        assert_eq!(session.verbosity, Verbosity::Terse);
+
+        let result =
+            dispatch_tool_inner(&mut session, "set_verbosity", &json!({"level": "compact"}))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["verbosity"], json!("compact"));
+        assert_eq!(payload["previous"], json!("terse"));
+        assert_eq!(session.verbosity, Verbosity::Compact);
+    }
+
+    /// An unrecognized level is rejected and leaves the session unchanged.
+    #[tokio::test]
+    async fn set_verbosity_rejects_unknown_level() {
+        use crate::config::Config;
+        use crate::verbosity::Verbosity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        session.verbosity = Verbosity::Full;
+
+        let result = dispatch_tool_inner(&mut session, "set_verbosity", &json!({"level": "loud"}))
+            .await
+            .unwrap();
+        assert!(extract_result_text(&result).contains("unknown verbosity level"));
+        assert_eq!(session.verbosity, Verbosity::Full);
+    }
+
+    /// The `session_stats` session scope must echo the active verbosity level.
+    #[tokio::test]
+    async fn session_stats_session_scope_includes_verbosity() {
+        use crate::config::Config;
+        use crate::verbosity::Verbosity;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        session.verbosity = Verbosity::Compact;
+        let analytics_dir = TempDir::new().unwrap();
+        session.analytics =
+            Some(Arc::new(AnalyticsStore::new(&analytics_dir.path().join("a.db"), 90).unwrap()));
+
+        let result =
+            dispatch_tool_inner(&mut session, "session_stats", &json!({"scope": "session"}))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["verbosity"], json!("compact"));
+    }
+
+    /// `workspace_info` must surface the active verbosity level.
+    #[tokio::test]
+    async fn workspace_info_includes_verbosity() {
+        use crate::config::Config;
+        use crate::verbosity::Verbosity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        session.verbosity = Verbosity::Terse;
+
+        let result = dispatch_tool_inner(&mut session, "workspace_info", &json!({}))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&extract_result_text(&result)).unwrap();
+        assert_eq!(payload["verbosity"], json!("terse"));
     }
 
     /// History/daily scopes must accept an `external_session_id` filter

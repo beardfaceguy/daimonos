@@ -61,6 +61,13 @@ pub struct Session {
     /// same dispatch turn. Replaces brittle substring matching on the
     /// serialized response text.
     pub last_response_meta: ResponseMeta,
+    /// Per-session output verbosity level (vikunja #181). `Session::new` sets
+    /// this from the config default only (`cfg.mcp.default_verbosity`); the
+    /// `DAIMONOS_MCP_VERBOSITY` env override is applied at the server startup
+    /// edges via `config::effective_verbosity`, keeping this constructor free
+    /// of process-global env reads (which would otherwise race with env-mutating
+    /// tests). Switchable mid-session via the `set_verbosity` tool.
+    pub verbosity: crate::verbosity::Verbosity,
 }
 
 pub struct BgProcess {
@@ -73,6 +80,7 @@ impl Session {
         let cwd = workspace.clone();
         let env = Self::build_initial_env(&cfg);
         let snapshot_store = SnapshotStore::new(workspace.clone());
+        let verbosity = cfg.mcp.default_verbosity;
         Self {
             workspace,
             cwd,
@@ -90,6 +98,7 @@ impl Session {
             analytics: None,
             external_session_id: None,
             last_response_meta: ResponseMeta::default(),
+            verbosity,
         }
     }
 
@@ -384,6 +393,18 @@ mod tests {
                 "PATH should not contain nonexistent dirs"
             );
         }
+    }
+
+    #[test]
+    fn new_uses_config_default_verbosity() {
+        // Session::new must read only cfg.mcp.default_verbosity (no process env),
+        // so it cannot race with env-mutating tests (vikunja #181; codejung
+        // finding). The DAIMONOS_MCP_VERBOSITY override is applied at the server
+        // startup edges, not in this constructor.
+        let mut cfg = Config::default();
+        cfg.mcp.default_verbosity = crate::verbosity::Verbosity::Terse;
+        let s = Session::new(PathBuf::from("/workspace"), Arc::new(cfg));
+        assert_eq!(s.verbosity, crate::verbosity::Verbosity::Terse);
     }
 
     #[test]
