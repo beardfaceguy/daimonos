@@ -31,7 +31,11 @@ cd "$SCRIPT_DIR" || exit 1
 ./setup-mcp.sh || { echo "RESULT: SETUP_FAIL"; exit 1; }
 
 echo "--- smoke gate (1 daimonos task) ---"
-BENCH_TAG="${TAG}-smoke" ./run-benchmark.sh daimonos 01 || { echo "RESULT: SMOKE_RUN_FAIL"; exit 1; }
+# BENCH_RUNS=1: the smoke gate is a single 1-task wiring check, and the
+# smoke_dir glob below expects one un-suffixed dir. Without pinning this, an
+# ambient BENCH_RUNS>1 makes run-benchmark.sh emit -rN dirs, the glob misses
+# them, and the gate false-fails (vikunja #945).
+BENCH_RUNS=1 BENCH_TAG="${TAG}-smoke" ./run-benchmark.sh daimonos 01 || { echo "RESULT: SMOKE_RUN_FAIL"; exit 1; }
 smoke_dir=$(ls -td results/*-daimonos-"${TAG}"-smoke 2>/dev/null | head -1)
 python3 - "$smoke_dir/01-read-understand.json" <<'PYEOF' || { echo "RESULT: SMOKE_GATE_FAIL"; exit 1; }
 import json, sys

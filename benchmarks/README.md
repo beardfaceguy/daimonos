@@ -30,6 +30,33 @@ terse verbosity (`DAIMONOS_MCP_VERBOSITY=terse`), so the prefix-diet levers
 `daimonos-terse vs baseline-terse` is the tools-only effect *with* those levers;
 `daimonos-terse vs daimonos` is the lever delta itself (#945).
 
+## Runtime & cost expectations (measured)
+
+Measured 2026-07-07 on the full four-arm gated suite (`./run-all-arms.sh`,
+`BENCH_RUNS=4`, model `opus`, CLI 2.1.143) — 168 task-runs total (baseline and
+baseline-terse run 10 tasks each, daimonos and daimonos-terse 11 each, ×4 runs):
+
+| Checkpoint | Elapsed (arms) | Progress |
+|---|--:|--:|
+| T0 | ~+3 min  | 7.1%  (12/168) |
+| T1 | ~+13 min | 36.9% (62/168) |
+| T2 | ~+23 min | 67.3% (113/168) |
+| done | ~+35.5 min | 100% (168/168) |
+
+- **Throughput ≈ 5 task-runs/min, roughly linear across all arms.** Tool-op
+  tasks are uniformly short; daimonos's MCP overhead shows up in cost/turns
+  per task, not wall-clock throughput — so the "daimonos arms are slower"
+  intuition does *not* hold for total run time here.
+- **Rule of thumb: ~0.2 min per task-run, ~9 min per arm at `BENCH_RUNS=4`.**
+  Scales linearly with `BENCH_RUNS` and the number of arms.
+- **Arms wall ≈ 35 min (measured 35.5); end-to-end ≈ 37–40 min** for a 4-arm
+  `BENCH_RUNS=4` run. Add **~3–5 min for a cold release build** (skip if
+  `target/` is warm); setup + smoke gate is ~1 min.
+- **Cost ≈ $5–6** for the 4-arm run (the earlier 3-arm gated run was ~$4.20).
+
+Plan a full run at **~40 minutes**, not the hour-plus it might feel like — an
+early ad-hoc estimate of ~1.5h was ~2.7× too high because these tasks are short.
+
 **Latest results and methodology: [results/2026-07-06-gated-three-arm.md](results/2026-07-06-gated-three-arm.md)**
 (the pre-2026-07 numbers below and any “~27% savings” figures are superseded).
 
