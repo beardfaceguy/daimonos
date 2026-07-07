@@ -87,10 +87,19 @@ impl ToolPlugin for GhPlugin {
             _ => return Err(format!("unknown gh command: {command}")),
         };
 
+        // `raw` surfaces the real gh exit code inside its payload; reflect it on
+        // the ToolResult too so consumers reading `exit_code` aren't misled. Every
+        // other command returns Err on a non-zero exit (via `?` above), so any
+        // success path reached here is genuinely exit 0.
+        let exit_code = if command == "raw" {
+            output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32
+        } else {
+            0
+        };
         Ok(ToolResult {
             tool: "gh".into(),
             command: command.into(),
-            exit_code: 0,
+            exit_code,
             output,
             stderr: String::new(),
         })
@@ -301,6 +310,26 @@ async fn run_gh_owned(cwd: &Path, args: &[String]) -> Result<String, String> {
     run_gh(cwd, &refs).await
 }
 
+/// Max bytes of stdout/stderr retained from a `raw` invocation before
+/// truncation, bounding tool-output size and memory (vikunja #943).
+const MAX_RAW_OUTPUT: usize = 100_000;
+
+/// Truncate `s` to at most `max` bytes on a char boundary. Returns the possibly
+/// truncated string and whether truncation happened; appends a marker when cut.
+fn cap_str(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        format!("{}\n[truncated {} bytes]", &s[..end], s.len() - end),
+        true,
+    )
+}
+
 // --- raw passthrough: any gh subcommand, present or future ---
 
 /// Build the gh argv for `raw` from the `args` string array.
@@ -339,14 +368,20 @@ async fn gh_raw(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_js
         .output()
         .await
         .map_err(|e| format!("gh exec: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout_val = serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .unwrap_or_else(|_| json!(stdout));
+    let (stdout, stdout_truncated) = cap_str(&String::from_utf8_lossy(&output.stdout), MAX_RAW_OUTPUT);
+    let (stderr, stderr_truncated) = cap_str(&String::from_utf8_lossy(&output.stderr), MAX_RAW_OUTPUT);
+    // Parse stdout as JSON only when returned intact — a truncated buffer isn't
+    // valid JSON, so surface it as a string in that case.
+    let stdout_val = if stdout_truncated {
+        json!(stdout)
+    } else {
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|_| json!(stdout))
+    };
     Ok(json!({
         "exit_code": output.status.code().unwrap_or(-1),
         "stdout": stdout_val,
         "stderr": stderr.trim(),
+        "truncated": stdout_truncated || stderr_truncated,
     }))
 }
 
@@ -386,7 +421,10 @@ async fn gh_pr_merge(
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let out = run_gh_owned(cwd, &pr_merge_argv(args)?).await?;
-    Ok(json!({ "merged": true, "output": out.trim() }))
+    // Return gh's own output rather than a synthesized boolean; gh exits non-zero
+    // (surfaced as an error above) when it cannot merge, so success == the merge
+    // message it printed.
+    Ok(json!({ "output": out.trim() }))
 }
 
 fn pr_checkout_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
@@ -402,7 +440,7 @@ async fn gh_pr_checkout(
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let out = run_gh_owned(cwd, &pr_checkout_argv(args)?).await?;
-    Ok(json!({ "checked_out": true, "output": out.trim() }))
+    Ok(json!({ "output": out.trim() }))
 }
 
 // --- run_list / run_view ---
@@ -661,6 +699,24 @@ mod tests {
         assert!(raw_argv(Some(&json!({}))).is_err());
         assert!(raw_argv(Some(&json!({"args": []}))).is_err());
         assert!(raw_argv(Some(&json!({"args": ["ok", 3]}))).is_err());
+    }
+
+    #[test]
+    fn cap_str_truncates_only_when_over_limit() {
+        let (s, cut) = cap_str("hello", 100);
+        assert_eq!(s, "hello");
+        assert!(!cut);
+        let (s, cut) = cap_str("abcdefghij", 4);
+        assert!(cut);
+        assert!(s.starts_with("abcd"));
+        assert!(s.contains("[truncated 6 bytes]"));
+    }
+
+    #[test]
+    fn cap_str_respects_char_boundaries() {
+        // 'é' is 2 bytes; cutting at byte 1 must back off to a boundary, not panic.
+        let (_s, cut) = cap_str("é", 1);
+        assert!(cut);
     }
 
     #[test]
