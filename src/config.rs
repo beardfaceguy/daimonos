@@ -18,7 +18,6 @@ pub struct Config {
     pub mcp: McpConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
-    pub agent: AgentSettings,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -107,104 +106,9 @@ pub struct ProcessConfig {
 /// in `daimonos.default.toml`.
 pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
 
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
-pub struct AgentSettings {
-    /// LLM provider. Supported: "openrouter", "anthropic".
-    pub provider: String,
-    /// API base URL. Override for proxies or to point at a different endpoint.
-    pub base_url: String,
-    /// Default model name passed to the provider.
-    pub model: String,
-    /// Name of the environment variable holding the API key.
-    pub api_key_env: String,
-    /// Tool-call approval mode for the interactive safety layer.
-    /// One of: "auto", "interactive", "paranoid".
-    pub approval_mode: String,
-    /// Tools always permitted without interactive approval.
-    pub allowed_commands: Vec<String>,
-    /// Tools that are hard-blocked regardless of approval mode.
-    pub denied_commands: Vec<String>,
-}
-
-impl Default for AgentSettings {
-    fn default() -> Self {
-        Self {
-            provider: "openrouter".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            model: "claude-opus-4-8".to_string(),
-            api_key_env: "OPENROUTER_API_KEY".to_string(),
-            approval_mode: "interactive".to_string(),
-            allowed_commands: Vec::new(),
-            denied_commands: Vec::new(),
-        }
-    }
-}
-
-impl AgentSettings {
-    pub fn validate(&self) -> Result<(), String> {
-        match self.provider.as_str() {
-            "openrouter" | "anthropic" => {}
-            other => {
-                return Err(format!(
-                    "agent.provider '{}' is not supported; valid values: openrouter, anthropic",
-                    other
-                ))
-            }
-        }
-        match self.approval_mode.as_str() {
-            "auto" | "interactive" | "paranoid" => {}
-            other => {
-                return Err(format!(
-                    "agent.approval_mode '{}' is not valid; valid values: auto, interactive, paranoid",
-                    other
-                ))
-            }
-        }
-        if !is_valid_env_var_name(&self.api_key_env) {
-            return Err(format!(
-                "agent.api_key_env '{}' is not a valid environment variable name",
-                self.api_key_env
-            ));
-        }
-        Ok(())
-    }
-
-    /// Read the API key from the configured environment variable.
-    /// Returns an error if the variable is unset or empty.
-    pub fn resolve_api_key(&self) -> Result<String, String> {
-        let key = std::env::var(&self.api_key_env).map_err(|_| {
-            format!(
-                "agent: env var '{}' is not set (required for provider '{}')",
-                self.api_key_env, self.provider
-            )
-        })?;
-        if key.trim().is_empty() {
-            return Err(format!("agent: env var '{}' is set but empty", self.api_key_env));
-        }
-        Ok(key)
-    }
-
-    /// Build a `SafetyPolicy` from the config section.
-    /// Pass `approve_fn = Some(SafetyPolicy::stdin_approve_fn())` for
-    /// interactive mode, or `None` for headless/auto contexts.
-    pub fn to_safety_policy(
-        &self,
-        approve_fn: Option<crate::safety::ApproveFn>,
-    ) -> crate::safety::SafetyPolicy {
-        let approval_mode = match self.approval_mode.as_str() {
-            "auto" => crate::safety::ApprovalMode::Auto,
-            "paranoid" => crate::safety::ApprovalMode::Paranoid,
-            _ => crate::safety::ApprovalMode::Interactive,
-        };
-        crate::safety::SafetyPolicy {
-            approval_mode,
-            allowed_commands: self.allowed_commands.clone(),
-            denied_commands: self.denied_commands.clone(),
-            approve_fn,
-        }
-    }
-}
+// Agent connection config lives in the agent env file, loaded by the
+// `agent_env` module (vikunja #949) — it is intentionally NOT part of the TOML
+// Config (which governs the MCP server, indexer, kgl, ...). See src/agent_env.rs.
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -490,7 +394,6 @@ impl IndexConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        self.agent.validate()?;
         self.discord.validate()
     }
 }
@@ -733,142 +636,7 @@ mod tests {
     /// parallel test runner can't observe a half-applied env mutation.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    // --- AgentSettings (#878) ---
-
-    #[test]
-    fn default_agent_settings_are_openrouter() {
-        let s = AgentSettings::default();
-        assert_eq!(s.provider, "openrouter");
-        assert_eq!(s.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(s.model, "claude-opus-4-8");
-        assert_eq!(s.api_key_env, "OPENROUTER_API_KEY");
-        assert_eq!(s.approval_mode, "interactive");
-        assert!(s.allowed_commands.is_empty());
-        assert!(s.denied_commands.is_empty());
-    }
-
-    #[test]
-    fn agent_settings_default_validates_ok() {
-        assert!(AgentSettings::default().validate().is_ok());
-    }
-
-    #[test]
-    fn agent_settings_invalid_provider_fails_validation() {
-        let s = AgentSettings { provider: "ollama".into(), ..AgentSettings::default() };
-        let err = s.validate().unwrap_err();
-        assert!(err.contains("agent.provider"), "error must name the field: {err}");
-        assert!(err.contains("ollama"), "error must echo the bad value: {err}");
-    }
-
-    #[test]
-    fn agent_settings_invalid_approval_mode_fails_validation() {
-        let s = AgentSettings { approval_mode: "yolo".into(), ..AgentSettings::default() };
-        let err = s.validate().unwrap_err();
-        assert!(err.contains("agent.approval_mode"), "error must name the field: {err}");
-    }
-
-    #[test]
-    fn agent_settings_invalid_api_key_env_fails_validation() {
-        let s = AgentSettings { api_key_env: "not valid!".into(), ..AgentSettings::default() };
-        let err = s.validate().unwrap_err();
-        assert!(err.contains("agent.api_key_env"), "error must name the field: {err}");
-    }
-
-    #[test]
-    fn agent_settings_anthropic_provider_validates_ok() {
-        let s = AgentSettings {
-            provider: "anthropic".into(),
-            api_key_env: "ANTHROPIC_API_KEY".into(),
-            ..AgentSettings::default()
-        };
-        assert!(s.validate().is_ok());
-    }
-
-    #[test]
-    fn agent_settings_resolve_api_key_from_env() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TEST_AGENT_API_KEY_878", "sk-test-abc123");
-        let s = AgentSettings {
-            api_key_env: "TEST_AGENT_API_KEY_878".into(),
-            ..AgentSettings::default()
-        };
-        assert_eq!(s.resolve_api_key().unwrap(), "sk-test-abc123");
-        std::env::remove_var("TEST_AGENT_API_KEY_878");
-    }
-
-    #[test]
-    fn agent_settings_resolve_api_key_missing_var_returns_err() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("TEST_AGENT_MISSING_878");
-        let s = AgentSettings {
-            api_key_env: "TEST_AGENT_MISSING_878".into(),
-            ..AgentSettings::default()
-        };
-        let err = s.resolve_api_key().unwrap_err();
-        assert!(err.contains("TEST_AGENT_MISSING_878"), "error must name the var: {err}");
-    }
-
-    #[test]
-    fn agent_settings_resolve_api_key_empty_var_returns_err() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TEST_AGENT_EMPTY_878", "   ");
-        let s = AgentSettings {
-            api_key_env: "TEST_AGENT_EMPTY_878".into(),
-            ..AgentSettings::default()
-        };
-        let err = s.resolve_api_key().unwrap_err();
-        assert!(err.contains("empty"), "error must say empty: {err}");
-        std::env::remove_var("TEST_AGENT_EMPTY_878");
-    }
-
-    #[test]
-    fn agent_settings_to_safety_policy_maps_approval_mode() {
-        use crate::safety::ApprovalMode;
-        let auto = AgentSettings { approval_mode: "auto".into(), ..AgentSettings::default() };
-        assert!(matches!(auto.to_safety_policy(None).approval_mode, ApprovalMode::Auto));
-
-        let paranoid = AgentSettings { approval_mode: "paranoid".into(), ..AgentSettings::default() };
-        assert!(matches!(paranoid.to_safety_policy(None).approval_mode, ApprovalMode::Paranoid));
-
-        let interactive = AgentSettings { approval_mode: "interactive".into(), ..AgentSettings::default() };
-        assert!(matches!(interactive.to_safety_policy(None).approval_mode, ApprovalMode::Interactive));
-    }
-
-    #[test]
-    fn agent_settings_to_safety_policy_threads_lists() {
-        let s = AgentSettings {
-            allowed_commands: vec!["read_file".into()],
-            denied_commands: vec!["exec".into()],
-            ..AgentSettings::default()
-        };
-        let policy = s.to_safety_policy(None);
-        assert_eq!(policy.allowed_commands, vec!["read_file"]);
-        assert_eq!(policy.denied_commands, vec!["exec"]);
-    }
-
-    #[test]
-    fn agent_toml_section_parses() {
-        let toml = r#"
-[agent]
-provider = "anthropic"
-base_url = "https://api.anthropic.com"
-model = "claude-haiku-4-5"
-api_key_env = "ANTHROPIC_API_KEY"
-approval_mode = "auto"
-allowed_commands = ["read_file", "search"]
-denied_commands = ["exec"]
-"#;
-        let cfg: Config = toml::from_str(toml).expect("agent section must parse");
-        assert_eq!(cfg.agent.provider, "anthropic");
-        assert_eq!(cfg.agent.base_url, "https://api.anthropic.com");
-        assert_eq!(cfg.agent.model, "claude-haiku-4-5");
-        assert_eq!(cfg.agent.api_key_env, "ANTHROPIC_API_KEY");
-        assert_eq!(cfg.agent.approval_mode, "auto");
-        assert_eq!(cfg.agent.allowed_commands, vec!["read_file", "search"]);
-        assert_eq!(cfg.agent.denied_commands, vec!["exec"]);
-    }
-
-    #[test]
+        #[test]
     fn default_config_values() {
         let cfg = Config::default();
         assert_eq!(cfg.index.max_depth, 20);
@@ -891,10 +659,6 @@ denied_commands = ["exec"]
         assert!(cfg.kgl.skip_dirs.iter().any(|d| d == "node_modules"));
         assert!(cfg.kgl.skip_dirs.iter().any(|d| d == "graphify-out"));
         assert!(cfg.tools.is_empty());
-        assert_eq!(cfg.agent.provider, "openrouter");
-        assert_eq!(cfg.agent.model, "claude-opus-4-8");
-        assert_eq!(cfg.agent.api_key_env, "OPENROUTER_API_KEY");
-        assert_eq!(cfg.agent.approval_mode, "interactive");
     }
 
     #[test]
@@ -909,9 +673,6 @@ denied_commands = ["exec"]
         assert!(!cfg.mcp.full_tool_schemas);
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
         assert_eq!(cfg.kgl.max_watches, 4_096);
-        assert_eq!(cfg.agent.provider, "openrouter");
-        assert_eq!(cfg.agent.model, "claude-opus-4-8");
-        assert_eq!(cfg.agent.approval_mode, "interactive");
     }
 
     #[test]
