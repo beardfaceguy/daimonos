@@ -82,9 +82,9 @@ enum Commands {
         /// Model override (default: claude-opus-4-8)
         #[arg(long)]
         model: Option<String>,
-        /// LLM provider to use (default: anthropic)
-        #[arg(long, default_value = "anthropic")]
-        provider: String,
+        /// LLM provider override (default: from [agent] config)
+        #[arg(long)]
+        provider: Option<String>,
         /// Print available tools and task without calling the API
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
-    if let Some(Commands::Agent { task, model, provider: _provider, dry_run }) = cli.command {
+    if let Some(Commands::Agent { task, model, provider, dry_run }) = cli.command {
         // In dry-run mode we never call complete(), so skip provider init and key resolution.
         struct DryRunProvider;
         #[async_trait]
@@ -180,10 +180,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Provider precedence: --provider flag overrides [agent] config (vikunja
+        // #948). Mirrors --model, which overrides cfg.agent.model.
+        let effective_provider = provider.unwrap_or_else(|| cfg.agent.provider.clone());
         let llm: Box<dyn providers::LlmProvider> = if dry_run {
             Box::new(DryRunProvider)
         } else {
-            match cfg.agent.provider.as_str() {
+            match effective_provider.as_str() {
                 "openrouter" => {
                     match providers::openrouter::OpenRouterProvider::from_config(&cfg.agent) {
                         Ok(p) => Box::new(p),
