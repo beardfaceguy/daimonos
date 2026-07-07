@@ -1309,6 +1309,10 @@ pub async fn run_mcp_server(
     // `claude --session-id $SID`. The MCP `set_external_session_id` tool
     // can override this mid-session.
     session.external_session_id = analytics::read_agent_session_id_env();
+    // Apply the DAIMONOS_MCP_VERBOSITY env override here at the startup edge
+    // rather than inside Session::new, so the constructor stays free of
+    // process-global env reads (vikunja #181).
+    session.verbosity = config::effective_verbosity(&session.cfg);
 
     let instructions = build_instructions(&workspace).await;
     let handler = DaimonosHandler::new(session, last_activity, startup_logs);
