@@ -128,6 +128,10 @@ def print_report(arm_stats: dict[str, dict]):
             )
         print("-" * 118)
 
+    # Safety surfacing must not depend on how many arms were analyzed — a
+    # single-arm run with contaminated results still has to warn loudly.
+    _print_warnings(arm_stats)
+
     # Aggregate over tasks present in every arm, so sums are comparable.
     shared = sorted(set.intersection(*(set(s) for s in arm_stats.values())))
     if not shared or len(arm_stats) < 2:
@@ -168,13 +172,12 @@ def print_report(arm_stats: dict[str, dict]):
         if "baseline-terse" in arm_totals:
             print("(daimonos vs baseline-terse isolates the tools-only effect; vs baseline includes the prompt.)")
 
-    contaminated = {
-        arm: sum(t["contaminated_runs"] for t in stats.values())
-        for arm, stats in arm_stats.items()
-    }
-    for arm, count in contaminated.items():
-        if count:
-            print(f"\nWARNING: {count} contaminated run(s) in {arm} — isolation failed; numbers unreliable.")
+
+def _print_warnings(arm_stats: dict):
+    for arm, stats in arm_stats.items():
+        contaminated = sum(t["contaminated_runs"] for t in stats.values())
+        if contaminated:
+            print(f"\nWARNING: {contaminated} contaminated run(s) in {arm} — isolation failed; numbers unreliable.")
 
     for arm, stats in arm_stats.items():
         failed_tasks = [t["task_name"] for t in stats.values() if t.get("correct_rate", 1.0) < 1.0]

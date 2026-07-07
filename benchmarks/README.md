@@ -8,18 +8,24 @@ identical coding tasks using Cursor's built-in tools vs. daimonos MCP tools.
 ## Quick start
 
 ```bash
-# 1. Build daimonos and set up MCP config for the benchmark workspace
+# Full gated three-arm run (build, MCP setup, smoke gate, then
+# baseline / baseline-terse / daimonos at BENCH_RUNS each, then analysis):
+./run-all-arms.sh gated
+
+# Or run a single arm (baseline | baseline-terse | daimonos):
 ./setup-mcp.sh
+BENCH_RUNS=4 ./run-benchmark.sh daimonos
 
-# 2. Run the benchmark with Cursor's native tools (no daimonos MCP)
-./run-benchmark.sh cursor
-
-# 3. Run the benchmark routing through daimonos MCP tools
-./run-benchmark.sh daimonos
-
-# 4. Compare results
-python3 analyze-results.py results/
+# Analyze a tag across arms (means with min–max spread, correctness-gated):
+python3 analyze-results.py results/ gated
 ```
+
+`baseline-terse` is the prompt-control arm: built-in tools plus the same
+terse-style directive the daimonos arm carries. `daimonos vs baseline-terse`
+isolates the tools-only effect; `daimonos vs baseline` is the deployed effect.
+
+**Latest results and methodology: [results/2026-07-06-gated-three-arm.md](results/2026-07-06-gated-three-arm.md)**
+(the pre-2026-07 numbers below and any “~27% savings” figures are superseded).
 
 ## Structure
 

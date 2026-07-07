@@ -2,7 +2,9 @@
 tests/target/
 __pycache__/
 *.pyc
-/benchmarks/results/
+# benchmark run data stays local; committed writeups (*.md) are the record
+/benchmarks/results/*
+!/benchmarks/results/*.md
 /benchmarks/workspace/
 /benchmarks/server-bench/results/
 claude_api_key.env
