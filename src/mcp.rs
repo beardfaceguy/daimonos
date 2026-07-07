@@ -931,21 +931,14 @@ impl ServerHandler for DaimonosHandler {
         let workspace = &session.workspace;
 
         let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
+        let verbosity = session.verbosity;
         let visible: Vec<Tool> = all
             .into_iter()
             .filter(|t| session.exposed_tools.contains(&t.name))
             .filter(|t| tools::passes_context_check(&t.name, workspace))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
-                if tools::expose_full_schema_in_list(&t.name, full_tool_schemas, already_used) {
-                    t
-                } else {
-                    Tool {
-                        input_schema: serde_json::from_value(json!({"type": "object"}))
-                            .unwrap_or(t.input_schema),
-                        ..t
-                    }
-                }
+                tools::render_list_tool(t, verbosity, full_tool_schemas, already_used)
             })
             .collect();
         Ok(ListToolsResult {
@@ -1382,20 +1375,13 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
     let all = tools::tool_definitions();
     let workspace = &session.workspace;
     let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
+    let verbosity = session.verbosity;
     all.into_iter()
         .filter(|t| session.exposed_tools.contains(&t.name))
         .filter(|t| tools::passes_context_check(&t.name, workspace))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
-            let t = if tools::expose_full_schema_in_list(&t.name, full_tool_schemas, already_used) {
-                t
-            } else {
-                Tool {
-                    input_schema: serde_json::from_value(json!({"type": "object"}))
-                        .unwrap_or(t.input_schema),
-                    ..t
-                }
-            };
+            let t = tools::render_list_tool(t, verbosity, full_tool_schemas, already_used);
             serde_json::to_value(&t).unwrap_or(Value::Null)
         })
         .collect()
