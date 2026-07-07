@@ -1,5 +1,8 @@
 #!/bin/sh
-# Full three-arm gated benchmark (#178): baseline / baseline-terse / daimonos.
+# Full gated benchmark (#178, #945): baseline / baseline-terse / daimonos /
+# daimonos-terse. The daimonos-terse arm runs the MCP server at terse verbosity
+# (DAIMONOS_MCP_VERBOSITY=terse) so the prefix-diet levers (#936) actually apply,
+# letting us measure them against the Full daimonos arm and baseline-terse.
 #
 # Order of operations:
 #   1. Fresh release build (benchmark measures current code, not a stale binary)
@@ -39,7 +42,7 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 status=ok
-for arm in baseline baseline-terse daimonos; do
+for arm in baseline baseline-terse daimonos daimonos-terse; do
     echo "--- arm: $arm (n=$RUNS) ---"
     BENCH_RUNS="$RUNS" BENCH_TAG="$TAG" ./run-benchmark.sh "$arm" || status="arm_fail:$arm"
 done

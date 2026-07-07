@@ -8,11 +8,11 @@ identical coding tasks using Cursor's built-in tools vs. daimonos MCP tools.
 ## Quick start
 
 ```bash
-# Full gated three-arm run (build, MCP setup, smoke gate, then
-# baseline / baseline-terse / daimonos at BENCH_RUNS each, then analysis):
+# Full gated run (build, MCP setup, smoke gate, then baseline /
+# baseline-terse / daimonos / daimonos-terse at BENCH_RUNS each, then analysis):
 ./run-all-arms.sh gated
 
-# Or run a single arm (baseline | baseline-terse | daimonos):
+# Or run a single arm (baseline | baseline-terse | daimonos | daimonos-terse):
 ./setup-mcp.sh
 BENCH_RUNS=4 ./run-benchmark.sh daimonos
 
@@ -23,6 +23,12 @@ python3 analyze-results.py results/ gated
 `baseline-terse` is the prompt-control arm: built-in tools plus the same
 terse-style directive the daimonos arm carries. `daimonos vs baseline-terse`
 isolates the tools-only effect; `daimonos vs baseline` is the deployed effect.
+
+`daimonos-terse` is the same as the daimonos arm but runs the MCP server at
+terse verbosity (`DAIMONOS_MCP_VERBOSITY=terse`), so the prefix-diet levers
+(#936: kgl context-gating, terse tool descriptions) actually apply.
+`daimonos-terse vs baseline-terse` is the tools-only effect *with* those levers;
+`daimonos-terse vs daimonos` is the lever delta itself (#945).
 
 **Latest results and methodology: [results/2026-07-06-gated-three-arm.md](results/2026-07-06-gated-three-arm.md)**
 (the pre-2026-07 numbers below and any “~27% savings” figures are superseded).

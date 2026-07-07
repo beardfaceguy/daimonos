@@ -29,7 +29,7 @@ RUN_TAG="${BENCH_TAG:-}"
 RUNS="${BENCH_RUNS:-1}"
 
 if [ -z "$MODE" ]; then
-  echo "Usage: $0 <baseline|baseline-terse|daimonos> [task-id]"
+  echo "Usage: $0 <baseline|baseline-terse|daimonos|daimonos-terse> [task-id]"
   echo ""
   echo "Environment variables:"
   echo "  BENCH_RUNS      Repeat the suite N times, one -rN-tagged run dir each (default: 1)"
@@ -39,9 +39,21 @@ if [ -z "$MODE" ]; then
   exit 1
 fi
 
-if [ "$MODE" != "baseline" ] && [ "$MODE" != "baseline-terse" ] && [ "$MODE" != "daimonos" ]; then
-  echo "Error: mode must be 'baseline', 'baseline-terse', or 'daimonos'"
+if [ "$MODE" != "baseline" ] && [ "$MODE" != "baseline-terse" ] && [ "$MODE" != "daimonos" ] && [ "$MODE" != "daimonos-terse" ]; then
+  echo "Error: mode must be 'baseline', 'baseline-terse', 'daimonos', or 'daimonos-terse'"
   exit 1
+fi
+
+# Prefix-diet lever validation (#945): the daimonos-terse arm runs the MCP
+# server at terse verbosity so levers 1+3 (kgl context-gating, terse tool
+# descriptions) actually apply. The plain daimonos arm runs at Full (today's
+# default). The daimonos server inherits this env — the workspace
+# .cursor/mcp.json sets no env block — and effective_verbosity() reads it at
+# startup.
+if [ "$MODE" = "daimonos-terse" ]; then
+  export DAIMONOS_MCP_VERBOSITY=terse
+else
+  unset DAIMONOS_MCP_VERBOSITY 2>/dev/null || true
 fi
 
 # RUN_ID/RUN_DIR are (re)computed per repetition inside the driver loop at
@@ -80,7 +92,10 @@ run_task() {
   fi
 
   check_mode="$MODE"
-  case "$check_mode" in baseline*) check_mode="cursor" ;; esac
+  case "$check_mode" in
+    baseline*) check_mode="cursor" ;;
+    daimonos*) check_mode="daimonos" ;;
+  esac
   case "$applies_to" in
     *"$check_mode"*) ;;
     *)
@@ -105,7 +120,7 @@ run_task() {
   # that produced ponytail's false ~4% result; see vikunja #926).
   CLAUDE_ARGS="$CLAUDE_ARGS --strict-mcp-config"
 
-  if [ "$MODE" = "daimonos" ]; then
+  if [ "$MODE" = "daimonos" ] || [ "$MODE" = "daimonos-terse" ]; then
     CLAUDE_ARGS="$CLAUDE_ARGS --mcp-config $MCP_CONFIG"
     task_category="$(json_field "$task_file" category)"
     if [ "$task_category" = "exec_filter" ]; then
@@ -183,7 +198,7 @@ var outputTokens = usage.output_tokens || 0;
 
 // Contamination canary (vikunja #926): a non-daimonos arm that reaches any
 // mcp__daimonos__ tool means the isolation failed and the run's numbers lie.
-var contaminated = (mode !== 'daimonos') && mcpToolCalls > 0;
+var contaminated = (mode.indexOf('daimonos') !== 0) && mcpToolCalls > 0;
 
 var summary = {
   task_id: taskId, task_name: taskName, mode: mode,
@@ -206,7 +221,7 @@ if (contaminated) {
     ' daimonos MCP call(s) — isolation failed, run marked invalid ***');
 }
 
-var tcDetail = mode === 'daimonos'
+var tcDetail = mode.indexOf('daimonos') === 0
   ? 'mcp:' + mcpToolCalls + ' builtin:' + builtinToolCalls
   : '' + toolCalls;
 console.log('       tokens: ' + summary.total_tokens.toLocaleString() +

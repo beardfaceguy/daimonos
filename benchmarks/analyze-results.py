@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-ARMS = ["baseline", "baseline-terse", "daimonos"]
+ARMS = ["baseline", "baseline-terse", "daimonos", "daimonos-terse"]
 ARM_ALIASES = {"baseline": ["baseline", "cursor"]}
 NUMERIC_METRICS = [
     "output_tokens",
@@ -156,20 +156,30 @@ def print_report(arm_stats: dict[str, dict]):
             row += f"{v:>18,.4f}" if metric == "cost_usd" else f"{v:>18,.0f}"
         print(row)
 
-    if "daimonos" in arm_totals:
-        d = arm_totals["daimonos"]
+    # Report deltas for each daimonos* arm (Full and the verbosity-dialed
+    # daimonos-terse) against every other arm, so both the tools-only effect and
+    # the prefix-diet lever delta (daimonos-terse vs daimonos) are visible.
+    subjects = [a for a in arm_totals if a.startswith("daimonos")]
+    if subjects:
         print()
-        for ref_arm in arm_totals:
-            if ref_arm == "daimonos":
-                continue
-            r = arm_totals[ref_arm]
-            deltas = []
-            for metric, label in [("output_tokens", "out tok"), ("cost_usd", "cost"), ("wall_ms", "wall")]:
-                if r[metric]:
-                    pct = (d[metric] - r[metric]) / r[metric] * 100
-                    deltas.append(f"{label} {pct:+.1f}%")
-            print(f"daimonos vs {ref_arm}: " + ", ".join(deltas))
-        if "baseline-terse" in arm_totals:
+        for subj in subjects:
+            d = arm_totals[subj]
+            for ref_arm in arm_totals:
+                if ref_arm == subj:
+                    continue
+                r = arm_totals[ref_arm]
+                deltas = []
+                for metric, label in [("output_tokens", "out tok"), ("cost_usd", "cost"), ("wall_ms", "wall")]:
+                    if r[metric]:
+                        pct = (d[metric] - r[metric]) / r[metric] * 100
+                        deltas.append(f"{label} {pct:+.1f}%")
+                print(f"{subj} vs {ref_arm}: " + ", ".join(deltas))
+        if "daimonos-terse" in arm_totals and "baseline-terse" in arm_totals:
+            print(
+                "(daimonos-terse vs baseline-terse: tools-only effect WITH the prefix-diet"
+                " levers applied; daimonos-terse vs daimonos: the lever delta itself.)"
+            )
+        elif "daimonos" in arm_totals and "baseline-terse" in arm_totals:
             print("(daimonos vs baseline-terse isolates the tools-only effect; vs baseline includes the prompt.)")
 
 
