@@ -194,6 +194,72 @@ fn parse_test_summary(line: &str) -> Option<(i64, i64, i64)> {
     Some((passed, failed, ignored))
 }
 
+/// Parsed result of a `cargo --message-format=json` run.
+struct CargoParse {
+    errors: Vec<serde_json::Value>,
+    warnings: Vec<serde_json::Value>,
+    /// True if cargo recompiled at least one crate this run (any
+    /// `compiler-artifact` with `fresh:false`); false means every artifact was
+    /// fresh — a no-op build that produced no new binary. Lets callers tell an
+    /// up-to-date `ok:true` from one that actually rebuilt (vikunja #946).
+    rebuilt: bool,
+}
+
+/// Parse a cargo JSON message stream into diagnostics plus whether anything was
+/// actually (re)compiled. Pure over captured stdout so it is unit-testable.
+fn parse_cargo_json(stdout: &str) -> CargoParse {
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    let mut warnings: Vec<serde_json::Value> = Vec::new();
+    let mut rebuilt = false;
+
+    for line in stdout.lines() {
+        let msg: serde_json::Value = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        match msg.get("reason").and_then(|r| r.as_str()) {
+            Some("compiler-artifact") => {
+                // fresh:false == this crate was recompiled this run.
+                if msg.get("fresh").and_then(|f| f.as_bool()) == Some(false) {
+                    rebuilt = true;
+                }
+            }
+            Some("compiler-message") => {
+                let message = match msg.get("message") {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let level = message.get("level").and_then(|l| l.as_str()).unwrap_or("");
+                let text = message
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (file, line_num) = extract_span_location(message);
+                let mut diag = json!({"message": text});
+                if let Some(f) = file {
+                    diag["file"] = json!(f);
+                }
+                if let Some(l) = line_num {
+                    diag["line"] = json!(l);
+                }
+                match level {
+                    "error" => errors.push(diag),
+                    "warning" => warnings.push(diag),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    CargoParse {
+        errors,
+        warnings,
+        rebuilt,
+    }
+}
+
 /// Run `cargo build/check/clippy` with `--message-format=json` and parse compiler diagnostics.
 async fn cargo_diagnostics(
     cwd: &Path,
@@ -219,50 +285,19 @@ async fn cargo_diagnostics(
     }
 
     let (stdout, _stderr, success) = run_cargo(cwd, &cargo_args).await?;
+    let parsed = parse_cargo_json(&stdout);
 
-    let mut errors: Vec<serde_json::Value> = Vec::new();
-    let mut warnings: Vec<serde_json::Value> = Vec::new();
-
-    for line in stdout.lines() {
-        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
-            if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
-                continue;
-            }
-            let message = match msg.get("message") {
-                Some(m) => m,
-                None => continue,
-            };
-            let level = message.get("level").and_then(|l| l.as_str()).unwrap_or("");
-            let text = message
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let (file, line_num) = extract_span_location(message);
-
-            let mut diag = json!({"message": text});
-            if let Some(f) = file {
-                diag["file"] = json!(f);
-            }
-            if let Some(l) = line_num {
-                diag["line"] = json!(l);
-            }
-
-            match level {
-                "error" => errors.push(diag),
-                "warning" => warnings.push(diag),
-                _ => {}
-            }
-        }
+    // `rebuilt` distinguishes a real recompile from a cargo no-op: `ok:true`
+    // with `rebuilt:false` means cargo considered the tree up-to-date and left
+    // the existing artifact in place — which can be stale if a fingerprint quirk
+    // (e.g. mtime skew after git ops) fooled cargo. Surfacing it lets a caller
+    // that needs a guaranteed-fresh binary notice (vikunja #946).
+    let mut result = json!({"ok": success, "rebuilt": parsed.rebuilt});
+    if !parsed.errors.is_empty() {
+        result["errors"] = json!(parsed.errors);
     }
-
-    let mut result = json!({"ok": success});
-    if !errors.is_empty() {
-        result["errors"] = json!(errors);
-    }
-    if !warnings.is_empty() {
-        result["warnings"] = json!(warnings);
+    if !parsed.warnings.is_empty() {
+        result["warnings"] = json!(parsed.warnings);
     }
     Ok(result)
 }
@@ -374,6 +409,46 @@ mod tests {
     use super::*;
     use crate::tool_runner::ToolRegistry;
     use std::sync::Arc;
+
+    #[test]
+    fn parse_cargo_json_flags_recompile_vs_noop() {
+        // vikunja #946: an all-fresh (no-op) build must report rebuilt=false so
+        // ok:true can't be mistaken for "a new binary was produced".
+        let noop = concat!(
+            r#"{"reason":"compiler-artifact","fresh":true}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#
+        );
+        assert!(!parse_cargo_json(noop).rebuilt);
+
+        let did = concat!(
+            r#"{"reason":"compiler-artifact","fresh":true}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","fresh":false}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#
+        );
+        assert!(parse_cargo_json(did).rebuilt);
+    }
+
+    #[test]
+    fn parse_cargo_json_collects_diagnostics_and_ignores_junk() {
+        let out = concat!(
+            r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused variable","spans":[]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","spans":[{"file_name":"src/x.rs","line_start":7,"is_primary":true}]}}"#,
+            "\n",
+            "not json at all",
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#
+        );
+        let p = parse_cargo_json(out);
+        assert_eq!(p.warnings.len(), 1);
+        assert_eq!(p.errors.len(), 1);
+        assert_eq!(p.errors[0]["file"], "src/x.rs");
+        assert_eq!(p.errors[0]["line"], 7);
+        assert!(!p.rebuilt);
+    }
 
     fn minimal_cargo_toml() -> &'static str {
         r#"[package]
