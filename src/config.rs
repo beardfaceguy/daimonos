@@ -1,6 +1,7 @@
 use crate::plugins::generic_cli::GenericCliPlugin;
 use crate::plugins::x07::X07Plugin;
 use crate::tool_runner::ToolRegistry;
+use crate::verbosity::Verbosity;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -239,6 +240,11 @@ pub struct McpConfig {
     /// introspection via `[mcp] full_tool_schemas = true` or
     /// `DAIMONOS_MCP_FULL_SCHEMAS=1`.
     pub full_tool_schemas: bool,
+    /// Default per-session output verbosity level (vikunja #181): one of
+    /// `full` (today's behavior), `compact`, `terse`. Overridable at startup
+    /// via `DAIMONOS_MCP_VERBOSITY`; changeable mid-session via the
+    /// `set_verbosity` tool. Lower levels trade tool-output detail for tokens.
+    pub default_verbosity: Verbosity,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -274,6 +280,7 @@ impl Default for McpConfig {
             idle_timeout_secs: 600,
             startup_logs: false,
             full_tool_schemas: false,
+            default_verbosity: Verbosity::Full,
         }
     }
 }
@@ -341,6 +348,18 @@ pub fn effective_full_tool_schemas(cfg: &Config) -> bool {
         );
     }
     cfg.mcp.full_tool_schemas
+}
+
+/// Effective per-session default verbosity (vikunja #181). Env
+/// `DAIMONOS_MCP_VERBOSITY` (`full`/`compact`/`terse`, case-insensitive) wins
+/// over config; an unrecognized env value falls back to the config value.
+pub fn effective_verbosity(cfg: &Config) -> Verbosity {
+    if let Ok(raw) = std::env::var("DAIMONOS_MCP_VERBOSITY") {
+        if let Some(v) = Verbosity::from_input(&raw) {
+            return v;
+        }
+    }
+    cfg.mcp.default_verbosity
 }
 
 impl Default for DiscordConfig {
@@ -907,6 +926,40 @@ denied_commands = ["exec"]
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "false");
         assert!(!effective_full_tool_schemas(&cfg));
         std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
+    }
+
+    #[test]
+    fn default_verbosity_is_full() {
+        let cfg = Config::default();
+        assert_eq!(cfg.mcp.default_verbosity, Verbosity::Full);
+    }
+
+    #[test]
+    fn effective_verbosity_env_overrides_config() {
+        // Serialize the (set -> assert -> restore) sequence against any other
+        // test mutating process-global env (see effective_full_tool_schemas).
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::default();
+        cfg.mcp.default_verbosity = Verbosity::Full;
+
+        std::env::set_var("DAIMONOS_MCP_VERBOSITY", "terse");
+        assert_eq!(effective_verbosity(&cfg), Verbosity::Terse);
+        std::env::set_var("DAIMONOS_MCP_VERBOSITY", "COMPACT");
+        assert_eq!(effective_verbosity(&cfg), Verbosity::Compact);
+
+        // Unrecognized env value falls back to the config value.
+        std::env::set_var("DAIMONOS_MCP_VERBOSITY", "loud");
+        assert_eq!(effective_verbosity(&cfg), Verbosity::Full);
+
+        std::env::remove_var("DAIMONOS_MCP_VERBOSITY");
+        assert_eq!(effective_verbosity(&cfg), Verbosity::Full);
+    }
+
+    #[test]
+    fn mcp_default_verbosity_parses_from_toml() {
+        let toml = "[mcp]\ndefault_verbosity = \"terse\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.mcp.default_verbosity, Verbosity::Terse);
     }
 
     #[test]

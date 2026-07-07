@@ -17,6 +17,7 @@ mod providers;
 mod tool_runner;
 mod tool_facade;
 mod tools;
+mod verbosity;
 
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};

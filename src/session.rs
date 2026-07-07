@@ -61,6 +61,10 @@ pub struct Session {
     /// same dispatch turn. Replaces brittle substring matching on the
     /// serialized response text.
     pub last_response_meta: ResponseMeta,
+    /// Per-session output verbosity level (vikunja #181). Initialized from
+    /// `config::effective_verbosity` (config default + `DAIMONOS_MCP_VERBOSITY`
+    /// env override) and switchable mid-session via the `set_verbosity` tool.
+    pub verbosity: crate::verbosity::Verbosity,
 }
 
 pub struct BgProcess {
@@ -73,6 +77,7 @@ impl Session {
         let cwd = workspace.clone();
         let env = Self::build_initial_env(&cfg);
         let snapshot_store = SnapshotStore::new(workspace.clone());
+        let verbosity = crate::config::effective_verbosity(&cfg);
         Self {
             workspace,
             cwd,
@@ -90,6 +95,7 @@ impl Session {
             analytics: None,
             external_session_id: None,
             last_response_meta: ResponseMeta::default(),
+            verbosity,
         }
     }
 
