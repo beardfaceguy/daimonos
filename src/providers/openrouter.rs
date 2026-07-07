@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::config::AgentSettings;
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role,
     StopReason, ToolSchema, Usage,
@@ -19,11 +18,6 @@ impl OpenRouterProvider {
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
         Ok(Self { api_key, base_url, client })
-    }
-
-    pub fn from_config(settings: &AgentSettings) -> Result<Self, String> {
-        let api_key = settings.resolve_api_key()?;
-        Self::new(api_key, settings.base_url.clone())
     }
 }
 

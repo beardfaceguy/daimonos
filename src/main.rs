@@ -12,6 +12,7 @@ mod session;
 mod snapshot;
 mod agent;
 mod agent_cmd;
+mod agent_env;
 mod safety;
 mod providers;
 mod tool_runner;
@@ -82,12 +83,16 @@ enum Commands {
         /// Model override (default: claude-opus-4-8)
         #[arg(long)]
         model: Option<String>,
-        /// LLM provider to use (default: anthropic)
-        #[arg(long, default_value = "anthropic")]
-        provider: String,
+        /// LLM provider override (default: from the agent env file)
+        #[arg(long)]
+        provider: Option<String>,
         /// Print available tools and task without calling the API
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
+        /// ~/.config/daimonos/agent.env)
+        #[arg(long)]
+        agent_env: Option<std::path::PathBuf>,
     },
 }
 
@@ -166,8 +171,9 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
-    if let Some(Commands::Agent { task, model, provider: _provider, dry_run }) = cli.command {
-        // In dry-run mode we never call complete(), so skip provider init and key resolution.
+    if let Some(Commands::Agent { task, model, provider, dry_run, agent_env }) = cli.command {
+        // Dry-run prints tools + task without calling the API, so it needs
+        // neither the agent env file nor a provider/key.
         struct DryRunProvider;
         #[async_trait]
         impl providers::LlmProvider for DryRunProvider {
@@ -180,34 +186,56 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let llm: Box<dyn providers::LlmProvider> = if dry_run {
-            Box::new(DryRunProvider)
-        } else {
-            match cfg.agent.provider.as_str() {
-                "openrouter" => {
-                    match providers::openrouter::OpenRouterProvider::from_config(&cfg.agent) {
-                        Ok(p) => Box::new(p),
-                        Err(e) => {
-                            eprintln!("{e}");
-                            std::process::exit(2);
-                        }
-                    }
-                }
-                "anthropic" => {
-                    match providers::anthropic::AnthropicProvider::from_env() {
-                        Ok(p) => Box::new(p),
-                        Err(e) => {
-                            eprintln!("provider init: {e}");
-                            std::process::exit(2);
-                        }
-                    }
-                }
-                other => {
-                    eprintln!(
-                        "unsupported provider: {other} (valid: openrouter, anthropic)"
-                    );
+        if dry_run {
+            let args = agent_cmd::AgentCmdArgs {
+                task,
+                model,
+                dry_run: true,
+                safety: None,
+                analytics: None,
+            };
+            let result =
+                agent_cmd::run_agent(&DryRunProvider, &workspace, args, &mut std::io::stdout())
+                    .await?;
+            if result.stop_reason == providers::StopReason::Error {
+                let msg = result.error_message.as_deref().unwrap_or("unknown error");
+                eprintln!("agent error: {msg}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+
+        // Real run: agent connection config comes from the agent env file and is
+        // REQUIRED — error out if the file or any value is missing (vikunja #949).
+        let agent = match agent_env::AgentEnv::load(agent_env) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("agent config: {e}");
+                std::process::exit(2);
+            }
+        };
+        // --provider / --model flags override the env-file values (#948).
+        let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+        let effective_model = model.unwrap_or_else(|| agent.model.clone());
+
+        let llm: Box<dyn providers::LlmProvider> = match effective_provider.as_str() {
+            "openrouter" => match providers::openrouter::OpenRouterProvider::new(
+                agent.api_key.clone(),
+                agent.base_url.clone(),
+            ) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    eprintln!("provider init: {e}");
                     std::process::exit(2);
                 }
+            },
+            "anthropic" => Box::new(
+                providers::anthropic::AnthropicProvider::new(agent.api_key.clone())
+                    .with_base_url(agent.base_url.clone()),
+            ),
+            other => {
+                eprintln!("unsupported provider: {other} (valid: openrouter, anthropic)");
+                std::process::exit(2);
             }
         };
 
@@ -219,8 +247,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let effective_model = model.unwrap_or_else(|| cfg.agent.model.clone());
-        let approve_fn = if cfg.agent.approval_mode == "auto" {
+        let approve_fn = if agent.approval_mode == "auto" {
             None
         } else {
             Some(safety::SafetyPolicy::stdin_approve_fn())
@@ -228,8 +255,8 @@ async fn main() -> anyhow::Result<()> {
         let args = agent_cmd::AgentCmdArgs {
             task,
             model: Some(effective_model),
-            dry_run,
-            safety: Some(cfg.agent.to_safety_policy(approve_fn)),
+            dry_run: false,
+            safety: Some(agent.to_safety_policy(approve_fn)),
             analytics: analytics_store,
         };
         let result = agent_cmd::run_agent(llm.as_ref(), &workspace, args, &mut std::io::stdout()).await?;
