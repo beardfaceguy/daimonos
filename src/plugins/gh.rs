@@ -240,9 +240,11 @@ async fn gh_pr_diff(
     }
 
     let out = run_gh(cwd, &gh_args).await?;
+    let (diff, truncated) = cap_str(&out, MAX_GH_OUTPUT);
 
     Ok(json!({
-        "diff": out,
+        "diff": diff,
+        "truncated": truncated,
     }))
 }
 
@@ -310,9 +312,9 @@ async fn run_gh_owned(cwd: &Path, args: &[String]) -> Result<String, String> {
     run_gh(cwd, &refs).await
 }
 
-/// Max bytes of stdout/stderr retained from a `raw` invocation before
-/// truncation, bounding tool-output size and memory (vikunja #943).
-const MAX_RAW_OUTPUT: usize = 100_000;
+/// Max bytes of any single gh command's captured output retained before
+/// truncation, bounding tool-output size and memory (vikunja #943, #944).
+const MAX_GH_OUTPUT: usize = 100_000;
 
 /// Truncate `s` to at most `max` bytes on a char boundary. Returns the possibly
 /// truncated string and whether truncation happened; appends a marker when cut.
@@ -368,8 +370,8 @@ async fn gh_raw(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_js
         .output()
         .await
         .map_err(|e| format!("gh exec: {e}"))?;
-    let (stdout, stdout_truncated) = cap_str(&String::from_utf8_lossy(&output.stdout), MAX_RAW_OUTPUT);
-    let (stderr, stderr_truncated) = cap_str(&String::from_utf8_lossy(&output.stderr), MAX_RAW_OUTPUT);
+    let (stdout, stdout_truncated) = cap_str(&String::from_utf8_lossy(&output.stdout), MAX_GH_OUTPUT);
+    let (stderr, stderr_truncated) = cap_str(&String::from_utf8_lossy(&output.stderr), MAX_GH_OUTPUT);
     // Parse stdout as JSON only when returned intact — a truncated buffer isn't
     // valid JSON, so surface it as a string in that case.
     let stdout_val = if stdout_truncated {
