@@ -783,6 +783,74 @@ pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_u
     has_full_schema(name) && !already_used
 }
 
+/// A shorter description for `name`, used at verbosity levels below `Full` to
+/// shrink the list_tools prefix (vikunja #936 lever 3). Returns `None` for tools
+/// whose full description is already terse — callers fall back to the full one.
+///
+/// Terse variants deliberately KEEP the subcommand list for multiplexer tools
+/// (git/cargo/gh/docker/...): at low verbosity the inputSchema is stripped from
+/// list_tools, so dropping the command names would just push the agent to call
+/// `get_tool_schema` more (extra activation round-trips), defeating the saving.
+pub fn terse_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "read_file" => "Read file → {content, lines}.",
+        "workspace_info" => "Workspace info: session, root listing, index stats.",
+        "exec" => "Run command → {exit, out, err?}.",
+        "batch" => "Run 2+ independent tools in one call; get_tool_schema for shape.",
+        "execute_script" => {
+            "Run a Starlark script; all tools as functions; returns `result`. Cheaper than sequential calls."
+        }
+        "get_tool_schema" => "Get full inputSchema for tool(s) before use.",
+        "git" => "Git: status, log, diff, branch, add, commit, push, pull, checkout.",
+        "cargo" => "Cargo: test, build, check, clippy, fmt, add.",
+        "pytest" => "Python tests: run, collect.",
+        "gh" => {
+            "GitHub: pr_view/list/create/diff/checks/merge/checkout, run_list/view, issue_list/view/create/comment, api, raw."
+        }
+        "docker" => "Docker: ps, logs, exec, images, inspect, stop, compose_up/down/ps.",
+        "npm" => "npm: install, run, test, build, audit.",
+        "curl" => "HTTP request → {status, headers, body, timing_ms}.",
+        "shellcheck" => "Lint shell scripts → {clean, diagnostics}.",
+        "discord" => "Discord read-only: list_guilds, list_channels, read_messages, search_messages.",
+        "snapshot" => "Workspace snapshots: create, restore, list, delete.",
+        "ls" => "List dir → [{n,d,s}]; skips vcs/build dirs; glob/type filters.",
+        "session_stats" => "Token analytics: session, history, daily.",
+        "set_external_session_id" => "Attach agent-runtime session id to analytics rows.",
+        "set_verbosity" => "Set output verbosity: full|compact|terse.",
+        "list_all_tools" => "Unlock extended tools (diff, pipelines, repair).",
+        "kgl_query" => {
+            "Query KGL graph: find defs, deps, calls, state, open questions, blast radius; index/check."
+        }
+        "kgl_assert" => "Declare KGL layer for a def: intent, provenance, or typed edge.",
+        _ => return None,
+    })
+}
+
+/// Render one tool definition for a list_tools response under the session's
+/// verbosity + schema policy: swap in a terse description below `Full`, then
+/// strip the inputSchema unless this tool should advertise it.
+pub fn render_list_tool(
+    mut t: rust_mcp_sdk::schema::Tool,
+    verbosity: crate::verbosity::Verbosity,
+    full_tool_schemas: bool,
+    already_used: bool,
+) -> rust_mcp_sdk::schema::Tool {
+    if verbosity != crate::verbosity::Verbosity::Full {
+        if let Some(d) = terse_description(&t.name) {
+            t.description = Some(d.to_string());
+        }
+    }
+    if expose_full_schema_in_list(&t.name, full_tool_schemas, already_used) {
+        t
+    } else {
+        rust_mcp_sdk::schema::Tool {
+            input_schema: serde_json::from_value(json!({"type": "object"}))
+                .unwrap_or(t.input_schema),
+            ..t
+        }
+    }
+}
+
 /// Returns false if the tool has a context check that fails for this workspace.
 pub fn passes_context_check(name: &str, workspace: &Path) -> bool {
     all_tools()
@@ -989,5 +1057,86 @@ mod tests {
             assert!(!tool.name.is_empty());
             assert!(tool.description.is_some());
         }
+    }
+
+    // --- verbosity-parameterized descriptions (#936 lever 3) ---
+
+    #[test]
+    fn terse_descriptions_are_shorter_and_curated_only() {
+        for t in all_tools() {
+            if let Some(terse) = terse_description(t.name) {
+                assert!(
+                    terse.len() < t.description.len(),
+                    "terse desc for {} not shorter ({} >= {})",
+                    t.name,
+                    terse.len(),
+                    t.description.len()
+                );
+            }
+        }
+        assert!(terse_description("does_not_exist").is_none());
+        // Already-short descriptions need no terse variant.
+        assert!(terse_description("write_file").is_none());
+    }
+
+    #[test]
+    fn terse_multiplexer_descriptions_keep_subcommands() {
+        // Dropping command names at low verbosity would force extra
+        // get_tool_schema round-trips; guard against over-trimming.
+        assert!(terse_description("git").unwrap().contains("commit"));
+        assert!(terse_description("git").unwrap().contains("push"));
+        assert!(terse_description("cargo").unwrap().contains("clippy"));
+        assert!(terse_description("docker").unwrap().contains("compose"));
+        let gh = terse_description("gh").unwrap();
+        assert!(gh.contains("merge") && gh.contains("raw"));
+    }
+
+    #[test]
+    fn render_list_tool_swaps_description_below_full() {
+        use crate::verbosity::Verbosity;
+        let git = || tool_definitions().into_iter().find(|t| t.name == "git").unwrap();
+
+        let orig = git().description.clone();
+        let full = render_list_tool(git(), Verbosity::Full, false, false);
+        assert_eq!(full.description, orig, "Full verbosity must keep the full description");
+
+        let terse = render_list_tool(git(), Verbosity::Terse, false, false);
+        assert_eq!(terse.description.as_deref(), terse_description("git"));
+        assert!(terse.description.unwrap().len() < full.description.unwrap().len());
+
+        // A tool without a terse variant is unchanged even below Full.
+        let wf = || {
+            tool_definitions()
+                .into_iter()
+                .find(|t| t.name == "write_file")
+                .unwrap()
+        };
+        let wf_full = render_list_tool(wf(), Verbosity::Full, false, false);
+        let wf_terse = render_list_tool(wf(), Verbosity::Terse, false, false);
+        assert_eq!(wf_full.description, wf_terse.description);
+    }
+
+    #[test]
+    fn description_block_shrinks_meaningfully_at_terse() {
+        let full_bytes: usize = tool_definitions()
+            .iter()
+            .map(|t| t.description.as_deref().unwrap_or("").len())
+            .sum();
+        let terse_bytes: usize = tool_definitions()
+            .iter()
+            .map(|t| {
+                terse_description(&t.name)
+                    .map(|s| s.len())
+                    .unwrap_or_else(|| t.description.as_deref().unwrap_or("").len())
+            })
+            .sum();
+        let reduction = 100.0 * (1.0 - terse_bytes as f64 / full_bytes as f64);
+        eprintln!(
+            "description block: full {full_bytes} B, terse {terse_bytes} B ({reduction:.1}% smaller)"
+        );
+        assert!(
+            reduction > 15.0,
+            "terse description block should be >15% smaller, got {reduction:.1}%"
+        );
     }
 }
