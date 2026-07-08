@@ -178,6 +178,101 @@ pub async fn run(
     }
 }
 
+// --- Stateful multi-turn session (project #183, task #956) ---
+
+/// One turn's outcome from [`AgentSession::prompt`].
+#[allow(dead_code)]
+pub struct TurnResult {
+    /// Concatenated text of the final assistant message this turn.
+    pub text: String,
+    /// Token/cost usage for THIS turn.
+    pub usage: Usage,
+    pub stop_reason: StopReason,
+    pub error_message: Option<String>,
+}
+
+/// A stateful, re-promptable agent conversation wrapping the one-shot [`run`]
+/// loop: holds the provider, the tool `Session`, the loop config (incl. the
+/// safety hook), and the running message history + accumulated usage. Shared
+/// core for the REPL and ACP frontends (project #183).
+///
+/// `#[allow(dead_code)]`: wired into the binary by the `daimonos chat` REPL in
+/// task #955; exercised by unit tests until then.
+#[allow(dead_code)]
+pub struct AgentSession {
+    provider: Box<dyn LlmProvider>,
+    tool_session: Session,
+    config: AgentConfig,
+    messages: Vec<Message>,
+    total_usage: Usage,
+}
+
+#[allow(dead_code)]
+impl AgentSession {
+    pub fn new(provider: Box<dyn LlmProvider>, tool_session: Session, config: AgentConfig) -> Self {
+        AgentSession {
+            provider,
+            tool_session,
+            config,
+            messages: Vec::new(),
+            total_usage: Usage::default(),
+        }
+    }
+
+    /// Send a user message, run the tool loop to completion, and return this
+    /// turn's assistant text + usage. History and accumulated usage persist for
+    /// the next prompt.
+    pub async fn prompt(&mut self, user_text: impl Into<String>) -> TurnResult {
+        self.messages.push(Message::user(user_text));
+        let history = std::mem::take(&mut self.messages);
+        let result = run(self.provider.as_ref(), &mut self.tool_session, history, &self.config).await;
+        self.total_usage = accumulate_usage(std::mem::take(&mut self.total_usage), result.usage.clone());
+        let text = last_assistant_text(&result.messages);
+        self.messages = result.messages;
+        TurnResult {
+            text,
+            usage: result.usage,
+            stop_reason: result.stop_reason,
+            error_message: result.error_message,
+        }
+    }
+
+    /// Full conversation history so far.
+    pub fn history(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Usage accumulated across every turn this session.
+    pub fn total_usage(&self) -> &Usage {
+        &self.total_usage
+    }
+
+    /// Reset the conversation (e.g. REPL `/clear`); cumulative usage is kept.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+}
+
+/// Concatenate the `Text` blocks of the last assistant message in `messages`.
+#[allow(dead_code)]
+fn last_assistant_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +331,63 @@ mod tests {
 
     fn session_in(dir: &std::path::Path) -> Session {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
+    }
+
+    // --- AgentSession (multi-turn, project #183) ---
+
+    #[tokio::test]
+    async fn session_prompt_returns_assistant_text_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![end_turn_resp()]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("hi").await;
+        assert_eq!(turn.text, "done");
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        assert_eq!(sess.history().len(), 2); // user + assistant
+    }
+
+    #[tokio::test]
+    async fn session_accumulates_history_and_usage_across_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![end_turn_resp(), end_turn_resp()]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        sess.prompt("first").await;
+        assert_eq!(sess.history().len(), 2);
+        sess.prompt("second").await;
+        assert_eq!(sess.history().len(), 4, "history must persist across prompts");
+        // each end_turn_resp reports mock_usage(100, 50)
+        assert_eq!(sess.total_usage().input, 200);
+        assert_eq!(sess.total_usage().output, 100);
+    }
+
+    #[tokio::test]
+    async fn session_tool_call_turn_roundtrips_then_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "read_file", json!({"path": "f.txt"})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("read f.txt").await;
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        assert_eq!(turn.text, "done");
+        // user, assistant(toolcall), user(toolresult), assistant(end) = 4
+        assert_eq!(sess.history().len(), 4);
+        assert!(matches!(sess.history()[1].content[0], ContentBlock::ToolCall { .. }));
+        assert!(matches!(sess.history()[2].content[0], ContentBlock::ToolResult { .. }));
+    }
+
+    #[tokio::test]
+    async fn session_clear_resets_history_keeps_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![end_turn_resp()]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        sess.prompt("hi").await;
+        assert_eq!(sess.history().len(), 2);
+        sess.clear();
+        assert_eq!(sess.history().len(), 0);
+        assert_eq!(sess.total_usage().input, 100, "cumulative usage kept after clear");
     }
 
     // --- accumulate_usage ---
