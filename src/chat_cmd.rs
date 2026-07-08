@@ -67,15 +67,24 @@ pub fn build_agent_config(workspace: &Path, model: String, safety: Option<Safety
     }
 }
 
+/// Build the tool-facing `Session` for a chat REPL from the already-loaded
+/// CLI/project config (vikunja #958), instead of a hardcoded
+/// `Config::default()` that would silently ignore user-configured settings
+/// (verbosity, `process.extra_path`, MCP settings, etc.).
+fn build_tool_session(workspace: &Path, cfg: Arc<Config>) -> Session {
+    Session::new(workspace.to_path_buf(), cfg)
+}
+
 /// Run the interactive `daimonos chat` REPL to completion (`/exit` or Ctrl-D).
 pub async fn run_chat(
     provider: Box<dyn LlmProvider>,
     workspace: &Path,
+    cfg: Arc<Config>,
     model: String,
     safety: Option<SafetyPolicy>,
 ) -> anyhow::Result<()> {
     let config = build_agent_config(workspace, model, safety);
-    let tool_session = Session::new(workspace.to_path_buf(), Arc::new(Config::default()));
+    let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
 
     let mut line_editor = Reedline::create();
@@ -238,5 +247,22 @@ mod tests {
         let policy = SafetyPolicy { denied_commands: vec!["exec".into()], ..SafetyPolicy::default() };
         let config = build_agent_config(dir.path(), "m".to_string(), Some(policy));
         assert!(config.before_tool_call.is_some());
+    }
+
+    // --- build_tool_session (vikunja #958) ---
+
+    #[test]
+    fn tool_session_uses_provided_cfg_not_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.mcp.default_verbosity = crate::verbosity::Verbosity::Terse;
+        assert_ne!(
+            cfg.mcp.default_verbosity,
+            Config::default().mcp.default_verbosity,
+            "test setup must pick a non-default verbosity to prove threading"
+        );
+
+        let session = build_tool_session(dir.path(), Arc::new(cfg));
+        assert_eq!(session.verbosity, crate::verbosity::Verbosity::Terse);
     }
 }

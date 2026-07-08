@@ -27,11 +27,15 @@ pub struct AgentCmdArgs {
 /// Run the agent subcommand.
 ///
 /// Takes `args` by value so the optional `SafetyPolicy` can be consumed into
-/// the `before_tool_call` hook without cloning.
+/// the `before_tool_call` hook without cloning. `cfg` is the already-loaded
+/// CLI/project config (vikunja #958) — the tool `Session` is built from it
+/// instead of `Config::default()`, so user-configured settings (verbosity,
+/// process/extra_path, MCP settings, etc.) apply to agent tool calls too.
 /// Only assistant text blocks are written to `out`; thinking blocks are suppressed.
 pub async fn run_agent(
     provider: &dyn LlmProvider,
     workspace: &Path,
+    cfg: Arc<Config>,
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
@@ -63,7 +67,6 @@ pub async fn run_agent(
         ..AgentConfig::default()
     };
 
-    let cfg = Arc::new(Config::default());
     let mut session = Session::new(workspace.to_path_buf(), cfg);
     let initial = vec![Message::user(&args.task)];
     let result = crate::agent::run(provider, &mut session, initial, &config).await;
@@ -184,6 +187,10 @@ mod tests {
         AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None, analytics: None }
     }
 
+    fn default_cfg() -> Arc<Config> {
+        Arc::new(Config::default())
+    }
+
     // --- system prompt ---
 
     #[test]
@@ -208,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
     }
 
     #[tokio::test]
@@ -216,7 +223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("my task"), "output should mention the task: {s}");
     }
@@ -226,7 +233,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None, analytics: None };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("tool"), "output should mention tools: {s}");
     }
@@ -238,7 +245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("task complete")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), args("do a thing"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("do a thing"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("task complete"), "text block should appear in output: {s}");
     }
@@ -248,7 +255,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("assistant reply")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), args("user task prompt"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("user task prompt"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("user task prompt"), "user message should not appear in output: {s}");
         assert!(s.contains("assistant reply"));
@@ -267,7 +274,7 @@ mod tests {
             usage: Usage::default(),
         }]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), args("think"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("think"), &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("internal thoughts"), "thinking should be hidden: {s}");
         assert!(s.contains("visible answer"));
@@ -280,7 +287,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("ok")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), args("go"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out).await.unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-opus-4-8");
     }
@@ -297,7 +304,7 @@ mod tests {
             analytics: None,
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-haiku-4-5");
     }
@@ -319,7 +326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = SchemaCapture(Mutex::new(Vec::new()));
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), args("check tools"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("check tools"), &mut out).await.unwrap();
         let counts = provider.0.lock().unwrap();
         assert!(*counts.first().unwrap() > 0, "agent loop should include tools in Context");
     }
@@ -331,7 +338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
         let mut out = Vec::new();
-        let result = run_agent(&provider, dir.path(), args("go"), &mut out).await.unwrap();
+        let result = run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out).await.unwrap();
         assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("api down"));
     }
@@ -353,7 +360,7 @@ mod tests {
             analytics: Some(Arc::clone(&store)),
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
 
         let summary = store.agent_runs_summary(1).unwrap();
         assert_eq!(summary.total_runs, 1, "one agent run must be recorded in analytics");
@@ -373,7 +380,7 @@ mod tests {
             analytics: Some(Arc::clone(&store)),
         };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
 
         let summary = store.agent_runs_summary(1).unwrap();
         assert_eq!(summary.total_runs, 0, "dry-run must not record an agent run");
@@ -398,5 +405,55 @@ mod tests {
             input: serde_json::json!({}),
         };
         assert!(matches!(hook(&info), BeforeHookResult::Block(_)));
+    }
+
+    // --- cfg wiring (vikunja #958) ---
+
+    #[tokio::test]
+    async fn run_agent_uses_provided_cfg_for_tool_session() {
+        // The tool `Session` must be built from the `cfg` passed into
+        // `run_agent`, not a hardcoded `Config::default()`. Prove it by
+        // putting a probe executable only on `cfg.process.extra_path` and
+        // having the agent's `exec` tool call resolve it via PATH.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let probe = bin_dir.path().join("cfg_probe_958");
+        std::fs::write(&probe, "#!/bin/sh\necho cfg-wired\n").unwrap();
+        std::fs::set_permissions(&probe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.process.extra_path = vec![bin_dir.path().to_string_lossy().to_string()];
+
+        let provider = MockProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::ToolCall {
+                    id: "t1".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"command": "cfg_probe_958"}),
+                }],
+                stop_reason: crate::providers::StopReason::ToolUse,
+                error_message: None,
+                usage: Usage::default(),
+            },
+            end_turn_with_text("done"),
+        ]);
+        let mut out = Vec::new();
+        let result = run_agent(&provider, dir.path(), Arc::new(cfg), args("run probe"), &mut out)
+            .await
+            .unwrap();
+
+        let tool_result_text = result
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("expected a ToolResult block");
+        assert!(
+            tool_result_text.contains("cfg-wired"),
+            "exec should resolve cfg_probe_958 via cfg.process.extra_path: {tool_result_text}"
+        );
     }
 }
