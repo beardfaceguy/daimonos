@@ -97,7 +97,7 @@ pub async fn run_agent(
     Ok(result)
 }
 
-fn default_system_prompt() -> String {
+pub(crate) fn default_system_prompt() -> String {
     "\
 You are Daimonos, an agent-optimized assistant. Use the available tools to complete the task.
 
