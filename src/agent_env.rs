@@ -120,7 +120,20 @@ impl AgentEnv {
         })
     }
 
-    /// Build a `SafetyPolicy` from the approval mode + allow/deny lists.
+    /// Global path for persisted "always" (Y) approvals, fixed at
+    /// ~/.config/daimonos/agent-approvals (independent of the agent env file).
+    pub fn approvals_path() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h)
+                .join(".config")
+                .join("daimonos")
+                .join("agent-approvals")
+        })
+    }
+
+    /// Build a `SafetyPolicy` from the approval mode + allow/deny lists, seeding
+    /// the auto-approve set from the persisted approvals file so previously
+    /// "always"-approved tools skip the prompt.
     pub fn to_safety_policy(
         &self,
         approve_fn: Option<crate::safety::ApproveFn>,
@@ -130,11 +143,18 @@ impl AgentEnv {
             "paranoid" => crate::safety::ApprovalMode::Paranoid,
             _ => crate::safety::ApprovalMode::Interactive,
         };
+        let approvals_path = Self::approvals_path();
+        let seed = approvals_path
+            .as_ref()
+            .map(|p| crate::safety::load_approvals(p))
+            .unwrap_or_default();
         crate::safety::SafetyPolicy {
             approval_mode,
             allowed_commands: self.allowed_commands.clone(),
             denied_commands: self.denied_commands.clone(),
             approve_fn,
+            auto_approve: std::sync::Arc::new(std::sync::Mutex::new(seed)),
+            approvals_path,
         }
     }
 }
