@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use reedline::{DefaultPrompt, Reedline, Signal};
+use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 
 use crate::agent::{AgentConfig, AgentSession};
 use crate::agent_cmd::default_system_prompt;
@@ -13,11 +13,13 @@ use crate::tool_facade;
 
 const HELP_TEXT: &str = "\
 Commands:
-  /exit    quit the chat session
-  /clear   reset conversation history (cumulative usage is kept)
-  /usage   show cumulative token usage for this session
-  /help    show this message
+  /exit, exit, quit   quit the chat session
+  /clear              reset conversation history (cumulative usage is kept)
+  /usage              show cumulative token usage for this session
+  /help               show this message
 Ctrl-C aborts the in-flight turn without quitting; Ctrl-D quits.";
+
+const CTRL_C_IDLE_HINT: &str = "(use /exit, exit, or Ctrl-D to quit)";
 
 /// One parsed line of `daimonos chat` REPL input.
 #[derive(Debug, PartialEq, Eq)]
@@ -31,13 +33,20 @@ pub enum ChatCommand {
 
 /// Parse one line of REPL input. Everything that isn't a recognized slash
 /// command becomes a `Prompt` (trimmed; may be empty for a blank line).
+///
+/// Bare `exit`/`quit` (no leading slash) are also accepted as `Exit`, since
+/// that's the first thing most people type to leave a REPL.
 pub fn parse_line(line: &str) -> ChatCommand {
-    match line.trim() {
-        "/exit" => ChatCommand::Exit,
+    let trimmed = line.trim();
+    match trimmed {
+        "/exit" | "/quit" => ChatCommand::Exit,
         "/clear" => ChatCommand::Clear,
         "/help" => ChatCommand::Help,
         "/usage" => ChatCommand::Usage,
-        other => ChatCommand::Prompt(other.to_string()),
+        other => match other.to_ascii_lowercase().as_str() {
+            "exit" | "quit" => ChatCommand::Exit,
+            _ => ChatCommand::Prompt(other.to_string()),
+        },
     }
 }
 
@@ -70,7 +79,9 @@ pub async fn run_chat(
     let mut session = AgentSession::new(provider, tool_session, config);
 
     let mut line_editor = Reedline::create();
-    let prompt = DefaultPrompt::default();
+    // Distinct "*D*" left segment so the REPL prompt is never mistaken for a
+    // regular shell prompt (which the default reedline cwd-based prompt resembles).
+    let prompt = DefaultPrompt::new(DefaultPromptSegment::Basic("*D*".to_string()), DefaultPromptSegment::Empty);
 
     println!("daimonos chat — type /help for commands, Ctrl-D to quit.");
 
@@ -109,7 +120,10 @@ pub async fn run_chat(
                     }
                 }
             },
-            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlC) => {
+                eprintln!("{CTRL_C_IDLE_HINT}");
+                continue;
+            }
             Ok(Signal::CtrlD) => break,
             Ok(_) => continue,
             Err(e) => {
@@ -131,6 +145,26 @@ mod tests {
     #[test]
     fn parses_exit() {
         assert_eq!(parse_line("/exit"), ChatCommand::Exit);
+    }
+
+    #[test]
+    fn parses_slash_quit() {
+        assert_eq!(parse_line("/quit"), ChatCommand::Exit);
+    }
+
+    #[test]
+    fn parses_bare_exit() {
+        assert_eq!(parse_line("exit"), ChatCommand::Exit);
+    }
+
+    #[test]
+    fn parses_bare_quit() {
+        assert_eq!(parse_line("quit"), ChatCommand::Exit);
+    }
+
+    #[test]
+    fn parses_bare_exit_case_insensitively() {
+        assert_eq!(parse_line("EXIT"), ChatCommand::Exit);
     }
 
     #[test]
