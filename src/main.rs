@@ -13,6 +13,7 @@ mod snapshot;
 mod agent;
 mod agent_cmd;
 mod agent_env;
+mod chat_cmd;
 mod safety;
 mod providers;
 mod tool_runner;
@@ -74,6 +75,35 @@ fn env_requests_mcp_startup_logs() -> bool {
     }
 }
 
+/// Build the LLM provider for the `agent`/`chat` subcommands from the
+/// effective (flag-overridden) provider name and the loaded agent env config.
+/// Exits the process on an unsupported provider name or provider init failure.
+fn build_llm_provider(
+    effective_provider: &str,
+    agent: &agent_env::AgentEnv,
+) -> Box<dyn providers::LlmProvider> {
+    match effective_provider {
+        "openrouter" => match providers::openrouter::OpenRouterProvider::new(
+            agent.api_key.clone(),
+            agent.base_url.clone(),
+        ) {
+            Ok(p) => Box::new(p),
+            Err(e) => {
+                eprintln!("provider init: {e}");
+                std::process::exit(2);
+            }
+        },
+        "anthropic" => Box::new(
+            providers::anthropic::AnthropicProvider::new(agent.api_key.clone())
+                .with_base_url(agent.base_url.clone()),
+        ),
+        other => {
+            eprintln!("unsupported provider: {other} (valid: openrouter, anthropic)");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the agent on a one-shot task and exit
@@ -89,6 +119,19 @@ enum Commands {
         /// Print available tools and task without calling the API
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
+        /// ~/.config/daimonos/agent.env)
+        #[arg(long)]
+        agent_env: Option<std::path::PathBuf>,
+    },
+    /// Start an interactive chat REPL over a stateful agent session
+    Chat {
+        /// Model override (default: from the agent env file)
+        #[arg(long)]
+        model: Option<String>,
+        /// LLM provider override (default: from the agent env file)
+        #[arg(long)]
+        provider: Option<String>,
         /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
         /// ~/.config/daimonos/agent.env)
         #[arg(long)]
@@ -170,33 +213,78 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    // Dispatch `daimonos agent "<task>"` early — no index/watcher/plugin setup needed.
-    if let Some(Commands::Agent { task, model, provider, dry_run, agent_env }) = cli.command {
-        // Dry-run prints tools + task without calling the API, so it needs
-        // neither the agent env file nor a provider/key.
-        struct DryRunProvider;
-        #[async_trait]
-        impl providers::LlmProvider for DryRunProvider {
-            async fn complete(
-                &self,
-                _: &providers::Context,
-                _: &providers::CompleteOpts,
-            ) -> providers::LlmResponse {
-                unreachable!("complete() called in dry-run mode")
+    // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
+    // index/watcher/plugin setup needed.
+    match cli.command {
+        Some(Commands::Agent { task, model, provider, dry_run, agent_env }) => {
+            // Dry-run prints tools + task without calling the API, so it needs
+            // neither the agent env file nor a provider/key.
+            struct DryRunProvider;
+            #[async_trait]
+            impl providers::LlmProvider for DryRunProvider {
+                async fn complete(
+                    &self,
+                    _: &providers::Context,
+                    _: &providers::CompleteOpts,
+                ) -> providers::LlmResponse {
+                    unreachable!("complete() called in dry-run mode")
+                }
             }
-        }
 
-        if dry_run {
+            if dry_run {
+                let args = agent_cmd::AgentCmdArgs {
+                    task,
+                    model,
+                    dry_run: true,
+                    safety: None,
+                    analytics: None,
+                };
+                let result =
+                    agent_cmd::run_agent(&DryRunProvider, &workspace, args, &mut std::io::stdout())
+                        .await?;
+                if result.stop_reason == providers::StopReason::Error {
+                    let msg = result.error_message.as_deref().unwrap_or("unknown error");
+                    eprintln!("agent error: {msg}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+
+            // Real run: agent connection config comes from the agent env file and is
+            // REQUIRED — error out if the file or any value is missing (vikunja #949).
+            let agent = match agent_env::AgentEnv::load(agent_env) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("agent config: {e}");
+                    std::process::exit(2);
+                }
+            };
+            // --provider / --model flags override the env-file values (#948).
+            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+            let effective_model = model.unwrap_or_else(|| agent.model.clone());
+            let llm = build_llm_provider(&effective_provider, &agent);
+
+            let analytics_store = if cfg.analytics.enabled {
+                let db_path = cfg.analytics.resolved_db_path();
+                analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
+                    .ok()
+                    .map(Arc::new)
+            } else {
+                None
+            };
+            let approve_fn = if agent.approval_mode == "auto" {
+                None
+            } else {
+                Some(safety::SafetyPolicy::stdin_approve_fn())
+            };
             let args = agent_cmd::AgentCmdArgs {
                 task,
-                model,
-                dry_run: true,
-                safety: None,
-                analytics: None,
+                model: Some(effective_model),
+                dry_run: false,
+                safety: Some(agent.to_safety_policy(approve_fn)),
+                analytics: analytics_store,
             };
-            let result =
-                agent_cmd::run_agent(&DryRunProvider, &workspace, args, &mut std::io::stdout())
-                    .await?;
+            let result = agent_cmd::run_agent(llm.as_ref(), &workspace, args, &mut std::io::stdout()).await?;
             if result.stop_reason == providers::StopReason::Error {
                 let msg = result.error_message.as_deref().unwrap_or("unknown error");
                 eprintln!("agent error: {msg}");
@@ -204,68 +292,27 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-
-        // Real run: agent connection config comes from the agent env file and is
-        // REQUIRED — error out if the file or any value is missing (vikunja #949).
-        let agent = match agent_env::AgentEnv::load(agent_env) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("agent config: {e}");
-                std::process::exit(2);
-            }
-        };
-        // --provider / --model flags override the env-file values (#948).
-        let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-        let effective_model = model.unwrap_or_else(|| agent.model.clone());
-
-        let llm: Box<dyn providers::LlmProvider> = match effective_provider.as_str() {
-            "openrouter" => match providers::openrouter::OpenRouterProvider::new(
-                agent.api_key.clone(),
-                agent.base_url.clone(),
-            ) {
-                Ok(p) => Box::new(p),
+        Some(Commands::Chat { model, provider, agent_env }) => {
+            let agent = match agent_env::AgentEnv::load(agent_env) {
+                Ok(a) => a,
                 Err(e) => {
-                    eprintln!("provider init: {e}");
+                    eprintln!("agent config: {e}");
                     std::process::exit(2);
                 }
-            },
-            "anthropic" => Box::new(
-                providers::anthropic::AnthropicProvider::new(agent.api_key.clone())
-                    .with_base_url(agent.base_url.clone()),
-            ),
-            other => {
-                eprintln!("unsupported provider: {other} (valid: openrouter, anthropic)");
-                std::process::exit(2);
-            }
-        };
-
-        let analytics_store = if cfg.analytics.enabled {
-            let db_path = cfg.analytics.resolved_db_path();
-            analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
-                .ok()
-                .map(Arc::new)
-        } else {
-            None
-        };
-        let approve_fn = if agent.approval_mode == "auto" {
-            None
-        } else {
-            Some(safety::SafetyPolicy::stdin_approve_fn())
-        };
-        let args = agent_cmd::AgentCmdArgs {
-            task,
-            model: Some(effective_model),
-            dry_run: false,
-            safety: Some(agent.to_safety_policy(approve_fn)),
-            analytics: analytics_store,
-        };
-        let result = agent_cmd::run_agent(llm.as_ref(), &workspace, args, &mut std::io::stdout()).await?;
-        if result.stop_reason == providers::StopReason::Error {
-            let msg = result.error_message.as_deref().unwrap_or("unknown error");
-            eprintln!("agent error: {msg}");
-            std::process::exit(1);
+            };
+            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+            let effective_model = model.unwrap_or_else(|| agent.model.clone());
+            let llm = build_llm_provider(&effective_provider, &agent);
+            let approve_fn = if agent.approval_mode == "auto" {
+                None
+            } else {
+                Some(safety::SafetyPolicy::stdin_approve_fn())
+            };
+            let safety = agent.to_safety_policy(approve_fn);
+            chat_cmd::run_chat(llm, &workspace, effective_model, Some(safety)).await?;
+            return Ok(());
         }
-        return Ok(());
+        None => {}
     }
 
     let startup_logs = startup_logs_early || cfg.mcp.startup_logs;

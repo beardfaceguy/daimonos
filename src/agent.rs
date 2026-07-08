@@ -181,7 +181,6 @@ pub async fn run(
 // --- Stateful multi-turn session (project #183, task #956) ---
 
 /// One turn's outcome from [`AgentSession::prompt`].
-#[allow(dead_code)]
 pub struct TurnResult {
     /// Concatenated text of the final assistant message this turn.
     pub text: String,
@@ -195,10 +194,6 @@ pub struct TurnResult {
 /// loop: holds the provider, the tool `Session`, the loop config (incl. the
 /// safety hook), and the running message history + accumulated usage. Shared
 /// core for the REPL and ACP frontends (project #183).
-///
-/// `#[allow(dead_code)]`: wired into the binary by the `daimonos chat` REPL in
-/// task #955; exercised by unit tests until then.
-#[allow(dead_code)]
 pub struct AgentSession {
     provider: Box<dyn LlmProvider>,
     tool_session: Session,
@@ -207,7 +202,6 @@ pub struct AgentSession {
     total_usage: Usage,
 }
 
-#[allow(dead_code)]
 impl AgentSession {
     pub fn new(provider: Box<dyn LlmProvider>, tool_session: Session, config: AgentConfig) -> Self {
         AgentSession {
@@ -222,9 +216,13 @@ impl AgentSession {
     /// Send a user message, run the tool loop to completion, and return this
     /// turn's assistant text + usage. History and accumulated usage persist for
     /// the next prompt.
+    ///
+    /// Cancel-safe: `self.messages` is only overwritten after `run` completes,
+    /// so dropping this future mid-await (e.g. a REPL Ctrl-C abort) leaves the
+    /// session's history untouched instead of losing it to a half-finished turn.
     pub async fn prompt(&mut self, user_text: impl Into<String>) -> TurnResult {
-        self.messages.push(Message::user(user_text));
-        let history = std::mem::take(&mut self.messages);
+        let mut history = self.messages.clone();
+        history.push(Message::user(user_text));
         let result = run(self.provider.as_ref(), &mut self.tool_session, history, &self.config).await;
         self.total_usage = accumulate_usage(std::mem::take(&mut self.total_usage), result.usage.clone());
         let text = last_assistant_text(&result.messages);
@@ -254,7 +252,6 @@ impl AgentSession {
 }
 
 /// Concatenate the `Text` blocks of the last assistant message in `messages`.
-#[allow(dead_code)]
 fn last_assistant_text(messages: &[Message]) -> String {
     messages
         .iter()
