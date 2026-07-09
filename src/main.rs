@@ -10,6 +10,7 @@ mod protocol;
 mod script;
 mod session;
 mod snapshot;
+mod acp_cmd;
 mod agent;
 mod agent_cmd;
 mod agent_env;
@@ -126,6 +127,20 @@ enum Commands {
     },
     /// Start an interactive chat REPL over a stateful agent session
     Chat {
+        /// Model override (default: from the agent env file)
+        #[arg(long)]
+        model: Option<String>,
+        /// LLM provider override (default: from the agent env file)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
+        /// ~/.config/daimonos/agent.env)
+        #[arg(long)]
+        agent_env: Option<std::path::PathBuf>,
+    },
+    /// Run a native Agent Client Protocol engine over stdio (for Zed and
+    /// other ACP editors)
+    Acp {
         /// Model override (default: from the agent env file)
         #[arg(long)]
         model: Option<String>,
@@ -338,6 +353,20 @@ async fn main() -> anyhow::Result<()> {
             };
             let safety = agent.to_safety_policy(approve_fn);
             chat_cmd::run_chat(llm, &workspace, Arc::clone(&cfg), effective_model, Some(safety), token_log).await?;
+            return Ok(());
+        }
+        Some(Commands::Acp { model, provider, agent_env }) => {
+            let agent = match agent_env::AgentEnv::load(agent_env) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("agent config: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+            let effective_model = model.unwrap_or_else(|| agent.model.clone());
+            let llm = build_llm_provider(&effective_provider, &agent);
+            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, token_log).await?;
             return Ok(());
         }
         None => {}

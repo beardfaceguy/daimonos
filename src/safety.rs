@@ -13,6 +13,13 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "exec", "write_file", "edit_file", "git", "docker", "cargo", "gh",
 ];
 
+/// Whether `name` is in the destructive-tools list (exec, write_file, etc.) —
+/// shared with other approval surfaces (e.g. the ACP engine's permission
+/// requests) so "which tools need approval" stays defined in one place.
+pub fn is_destructive_tool(name: &str) -> bool {
+    DESTRUCTIVE_TOOLS.contains(&name)
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ApprovalMode {
     /// No prompts — only denylist/allowlist enforcement.
@@ -74,8 +81,19 @@ impl Default for SafetyPolicy {
 
 impl SafetyPolicy {
     /// Consume the policy and return a `BeforeHook` closure for the agent loop.
+    /// `decide` below does no real async work (the stdin approval prompt is a
+    /// local blocking read, not a network round-trip), so this just wraps its
+    /// synchronous result in an already-resolved future — `BeforeHook` is
+    /// async purely so other callers (e.g. the ACP engine's
+    /// `session/request_permission`) can await a real round-trip.
     pub fn into_before_hook(self) -> BeforeHook {
         Box::new(move |info: &ToolCallInfo| {
+            let result = self.decide(info);
+            Box::pin(std::future::ready(result))
+        })
+    }
+
+    fn decide(&self, info: &ToolCallInfo) -> BeforeHookResult {
             let name = info.name.as_str();
 
             // Denylist — hard block, no override (beats auto-approve).
@@ -136,7 +154,6 @@ impl SafetyPolicy {
             }
 
             BeforeHookResult::Allow
-        })
     }
 
     /// Convenience: stdin-backed approval prompt for production use.
@@ -202,80 +219,96 @@ mod tests {
         ToolCallInfo { id: "t1".into(), name: name.into(), input }
     }
 
-    fn allow(policy: SafetyPolicy, name: &str) -> bool {
-        matches!(policy.into_before_hook()(&info(name)), BeforeHookResult::Allow)
+    async fn allow(policy: SafetyPolicy, name: &str) -> bool {
+        matches!(policy.into_before_hook()(&info(name)).await, BeforeHookResult::Allow)
     }
 
-    fn block_reason(policy: SafetyPolicy, name: &str) -> String {
-        match policy.into_before_hook()(&info(name)) {
+    async fn block_reason(policy: SafetyPolicy, name: &str) -> String {
+        match policy.into_before_hook()(&info(name)).await {
             BeforeHookResult::Block(r) => r,
             BeforeHookResult::Allow => panic!("expected Block, got Allow"),
         }
     }
 
-    // --- denylist ---
+    // --- is_destructive_tool ---
 
     #[test]
-    fn denied_tool_is_blocked() {
+    fn destructive_tools_are_flagged() {
+        for name in ["exec", "write_file", "edit_file", "git", "docker", "cargo", "gh"] {
+            assert!(is_destructive_tool(name), "{name} should be destructive");
+        }
+    }
+
+    #[test]
+    fn safe_tools_are_not_flagged() {
+        for name in ["read_file", "search", "ls"] {
+            assert!(!is_destructive_tool(name), "{name} should not be destructive");
+        }
+    }
+
+    // --- denylist ---
+
+    #[tokio::test]
+    async fn denied_tool_is_blocked() {
         let policy = SafetyPolicy {
             denied_commands: vec!["exec".into()],
             ..SafetyPolicy::default()
         };
-        let reason = block_reason(policy, "exec");
+        let reason = block_reason(policy, "exec").await;
         assert!(reason.contains("denied-commands"), "{reason}");
     }
 
-    #[test]
-    fn non_denied_tool_is_allowed() {
+    #[tokio::test]
+    async fn non_denied_tool_is_allowed() {
         let policy = SafetyPolicy {
             denied_commands: vec!["exec".into()],
             ..SafetyPolicy::default()
         };
-        assert!(allow(policy, "read_file"));
+        assert!(allow(policy, "read_file").await);
     }
 
-    #[test]
-    fn denied_overrides_allowlist() {
+    #[tokio::test]
+    async fn denied_overrides_allowlist() {
         let policy = SafetyPolicy {
             allowed_commands: vec!["exec".into()],
             denied_commands: vec!["exec".into()],
             ..SafetyPolicy::default()
         };
-        let reason = block_reason(policy, "exec");
+        let reason = block_reason(policy, "exec").await;
         assert!(reason.contains("denied-commands"), "{reason}");
     }
 
     // --- allowlist ---
 
-    #[test]
-    fn allowlist_blocks_unlisted_tool() {
+    #[tokio::test]
+    async fn allowlist_blocks_unlisted_tool() {
         let policy = SafetyPolicy {
             allowed_commands: vec!["read_file".into()],
             ..SafetyPolicy::default()
         };
-        let reason = block_reason(policy, "exec");
+        let reason = block_reason(policy, "exec").await;
         assert!(reason.contains("allowed-commands"), "{reason}");
     }
 
-    #[test]
-    fn allowlist_permits_listed_tool() {
+    #[tokio::test]
+    async fn allowlist_permits_listed_tool() {
         let policy = SafetyPolicy {
             allowed_commands: vec!["read_file".into()],
             ..SafetyPolicy::default()
         };
-        assert!(allow(policy, "read_file"));
+        assert!(allow(policy, "read_file").await);
     }
 
-    #[test]
-    fn empty_allowlist_permits_any_tool() {
+    #[tokio::test]
+    async fn empty_allowlist_permits_any_tool() {
         let policy = SafetyPolicy::default();
-        assert!(allow(policy, "exec"));
+        assert!(allow(policy, "exec").await);
     }
 
     // --- approval modes ---
 
-    #[test]
-    fn auto_mode_never_calls_approve_fn() {
+    #[tokio::test]
+    async fn auto_mode_never_calls_approve_fn() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = called.clone();
         let policy = SafetyPolicy {
@@ -287,12 +320,12 @@ mod tests {
             ..SafetyPolicy::default()
         };
         let hook = policy.into_before_hook();
-        hook(&info("exec"));
+        hook(&info("exec")).await;
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[test]
-    fn interactive_mode_prompts_for_destructive_tool() {
+    #[tokio::test]
+    async fn interactive_mode_prompts_for_destructive_tool() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = called.clone();
         let policy = SafetyPolicy {
@@ -303,12 +336,12 @@ mod tests {
             })),
             ..SafetyPolicy::default()
         };
-        policy.into_before_hook()(&info("exec"));
+        policy.into_before_hook()(&info("exec")).await;
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[test]
-    fn interactive_mode_skips_prompt_for_safe_tool() {
+    #[tokio::test]
+    async fn interactive_mode_skips_prompt_for_safe_tool() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = called.clone();
         let policy = SafetyPolicy {
@@ -319,12 +352,12 @@ mod tests {
             })),
             ..SafetyPolicy::default()
         };
-        policy.into_before_hook()(&info("read_file"));
+        policy.into_before_hook()(&info("read_file")).await;
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[test]
-    fn paranoid_mode_prompts_for_safe_tool() {
+    #[tokio::test]
+    async fn paranoid_mode_prompts_for_safe_tool() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = called.clone();
         let policy = SafetyPolicy {
@@ -335,43 +368,43 @@ mod tests {
             })),
             ..SafetyPolicy::default()
         };
-        policy.into_before_hook()(&info("read_file"));
+        policy.into_before_hook()(&info("read_file")).await;
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[test]
-    fn approve_fn_deny_blocks_call() {
+    #[tokio::test]
+    async fn approve_fn_deny_blocks_call() {
         let policy = SafetyPolicy {
             approval_mode: ApprovalMode::Interactive,
             approve_fn: Some(Box::new(|_, _| ApprovalDecision::Deny)),
             ..SafetyPolicy::default()
         };
-        let reason = block_reason(policy, "exec");
+        let reason = block_reason(policy, "exec").await;
         assert!(reason.contains("declined"), "{reason}");
     }
 
-    #[test]
-    fn approve_fn_once_permits_call() {
+    #[tokio::test]
+    async fn approve_fn_once_permits_call() {
         let policy = SafetyPolicy {
             approval_mode: ApprovalMode::Interactive,
             approve_fn: Some(Box::new(|_, _| ApprovalDecision::Once)),
             ..SafetyPolicy::default()
         };
-        assert!(allow(policy, "exec"));
+        assert!(allow(policy, "exec").await);
     }
 
-    #[test]
-    fn no_approve_fn_defaults_to_allow() {
+    #[tokio::test]
+    async fn no_approve_fn_defaults_to_allow() {
         let policy = SafetyPolicy {
             approval_mode: ApprovalMode::Paranoid,
             approve_fn: None,
             ..SafetyPolicy::default()
         };
-        assert!(allow(policy, "read_file"));
+        assert!(allow(policy, "read_file").await);
     }
 
-    #[test]
-    fn approve_fn_receives_tool_name_and_input() {
+    #[tokio::test]
+    async fn approve_fn_receives_tool_name_and_input() {
         let captured = Arc::new(Mutex::new((String::new(), json!(null))));
         let cap = captured.clone();
         let policy = SafetyPolicy {
@@ -383,7 +416,7 @@ mod tests {
             ..SafetyPolicy::default()
         };
         let i = info_with("exec", json!({"command": "ls"}));
-        policy.into_before_hook()(&i);
+        policy.into_before_hook()(&i).await;
         let (name, input) = &*captured.lock().unwrap();
         assert_eq!(name, "exec");
         assert_eq!(input["command"], "ls");
@@ -391,8 +424,8 @@ mod tests {
 
     // --- "always" approvals (three-way prompt + persistence) ---
 
-    #[test]
-    fn always_skips_next_prompt_and_persists() {
+    #[tokio::test]
+    async fn always_skips_next_prompt_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-approvals");
         let auto = Arc::new(Mutex::new(HashSet::new()));
@@ -409,16 +442,16 @@ mod tests {
             ..SafetyPolicy::default()
         };
         let hook = policy.into_before_hook();
-        assert!(matches!(hook(&info("write_file")), BeforeHookResult::Allow));
+        assert!(matches!(hook(&info("write_file")).await, BeforeHookResult::Allow));
         // Second call: auto-approved now, prompt must NOT fire again.
-        assert!(matches!(hook(&info("write_file")), BeforeHookResult::Allow));
+        assert!(matches!(hook(&info("write_file")).await, BeforeHookResult::Allow));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(auto.lock().unwrap().contains("write_file"));
         assert!(load_approvals(&path).contains("write_file"), "must persist to file");
     }
 
-    #[test]
-    fn seeded_auto_approve_skips_prompt() {
+    #[tokio::test]
+    async fn seeded_auto_approve_skips_prompt() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = called.clone();
         let policy = SafetyPolicy {
@@ -430,19 +463,19 @@ mod tests {
             })),
             ..SafetyPolicy::default()
         };
-        assert!(allow(policy, "exec"));
+        assert!(allow(policy, "exec").await);
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "prompt must be skipped");
     }
 
-    #[test]
-    fn denied_beats_auto_approve() {
+    #[tokio::test]
+    async fn denied_beats_auto_approve() {
         let policy = SafetyPolicy {
             approval_mode: ApprovalMode::Interactive,
             denied_commands: vec!["exec".into()],
             auto_approve: Arc::new(Mutex::new(HashSet::from(["exec".to_string()]))),
             ..SafetyPolicy::default()
         };
-        let reason = block_reason(policy, "exec");
+        let reason = block_reason(policy, "exec").await;
         assert!(reason.contains("denied-commands"), "{reason}");
     }
 
