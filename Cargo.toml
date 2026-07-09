@@ -32,6 +32,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 eventsource-stream = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 keyring = { version = "3", optional = true }
 reedline = "0.49"
 

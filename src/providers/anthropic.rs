@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role,
-    StopReason, ThinkingLevel, Usage,
+    StopReason, StreamEvent, ThinkingLevel, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -25,6 +25,7 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -260,6 +261,118 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         tools,
         messages,
         thinking,
+        stream: false,
+    }
+}
+
+// --- Streaming (vikunja #957) ---
+
+/// One in-progress content block, tracked by SSE `index` from
+/// `content_block_start` through `content_block_delta`/`_stop`.
+enum PartialBlock {
+    Text(String),
+    Thinking(String),
+    ToolUse { id: String, name: String, partial_json: String },
+}
+
+/// Accumulates Anthropic's `message_start`/`content_block_*`/`message_delta`
+/// SSE event stream into the same `LlmResponse` shape `complete` builds from
+/// one JSON body, while surfacing text/thinking deltas live via `on_data`.
+#[derive(Default)]
+struct StreamState {
+    blocks: Vec<PartialBlock>,
+    stop_reason: Option<String>,
+    usage: AnthropicUsage,
+}
+
+impl Default for PartialBlock {
+    fn default() -> Self {
+        PartialBlock::Text(String::new())
+    }
+}
+
+impl StreamState {
+    /// Feed one decoded SSE `data:` JSON payload. Returns text/thinking
+    /// deltas to forward live; tool-call inputs accumulate silently and only
+    /// appear in the final `finish()` response.
+    fn on_data(&mut self, data: &Value) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        match data["type"].as_str() {
+            Some("message_start") => {
+                if let Ok(u) = serde_json::from_value(data["message"]["usage"].clone()) {
+                    self.usage = u;
+                }
+            }
+            Some("content_block_start") => {
+                let idx = data["index"].as_u64().unwrap_or(0) as usize;
+                let cb = &data["content_block"];
+                let block = match cb["type"].as_str() {
+                    Some("thinking") => PartialBlock::Thinking(String::new()),
+                    Some("tool_use") => PartialBlock::ToolUse {
+                        id: cb["id"].as_str().unwrap_or_default().to_string(),
+                        name: cb["name"].as_str().unwrap_or_default().to_string(),
+                        partial_json: String::new(),
+                    },
+                    _ => PartialBlock::Text(String::new()),
+                };
+                while self.blocks.len() <= idx {
+                    self.blocks.push(PartialBlock::default());
+                }
+                self.blocks[idx] = block;
+            }
+            Some("content_block_delta") => {
+                let idx = data["index"].as_u64().unwrap_or(0) as usize;
+                let delta = &data["delta"];
+                if let Some(block) = self.blocks.get_mut(idx) {
+                    match (block, delta["type"].as_str()) {
+                        (PartialBlock::Text(t), Some("text_delta")) => {
+                            let piece = delta["text"].as_str().unwrap_or_default();
+                            t.push_str(piece);
+                            events.push(StreamEvent::TextDelta(piece.to_string()));
+                        }
+                        (PartialBlock::Thinking(t), Some("thinking_delta")) => {
+                            let piece = delta["thinking"].as_str().unwrap_or_default();
+                            t.push_str(piece);
+                            events.push(StreamEvent::ThinkingDelta(piece.to_string()));
+                        }
+                        (PartialBlock::ToolUse { partial_json, .. }, Some("input_json_delta")) => {
+                            partial_json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(sr) = data["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(sr.to_string());
+                }
+                if let Some(out) = data["usage"]["output_tokens"].as_u64() {
+                    self.usage.output_tokens = out;
+                }
+            }
+            _ => {}
+        }
+        events
+    }
+
+    fn finish(self, model: &str) -> LlmResponse {
+        let content = self
+            .blocks
+            .into_iter()
+            .filter_map(|b| match b {
+                PartialBlock::Text(t) if t.is_empty() => None,
+                PartialBlock::Text(t) => Some(ContentBlock::Text(t)),
+                PartialBlock::Thinking(t) => Some(ContentBlock::Thinking(t)),
+                PartialBlock::ToolUse { id, name, partial_json } => {
+                    let input: Value = serde_json::from_str(&partial_json)
+                        .unwrap_or_else(|_| Value::Object(Default::default()));
+                    Some(ContentBlock::ToolCall { id, name, input })
+                }
+            })
+            .collect();
+        let stop_reason = map_stop_reason(self.stop_reason.as_deref());
+        let usage = map_usage(self.usage, model);
+        LlmResponse { content, stop_reason, error_message: None, usage }
     }
 }
 
@@ -336,6 +449,65 @@ impl LlmProvider for AnthropicProvider {
         let usage = map_usage(raw.usage, &opts.model);
 
         LlmResponse { content, stop_reason, error_message: None, usage }
+    }
+
+    async fn stream(
+        &self,
+        ctx: &Context,
+        opts: &CompleteOpts,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> LlmResponse {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let mut request = build_request(ctx, opts);
+        request.stream = true;
+
+        let result = self.client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await;
+
+        let resp = match result {
+            Err(e) => return LlmResponse::error(format!("network error: {e}")),
+            Ok(r) => r,
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return LlmResponse::error(format!("API {status}: {body}"));
+        }
+
+        let mut events = resp.bytes_stream().eventsource();
+        let mut state = StreamState::default();
+
+        while let Some(event) = events.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => return LlmResponse::error(format!("stream error: {e}")),
+            };
+            if event.event == "ping" {
+                continue;
+            }
+            let data: Value = match serde_json::from_str(&event.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if data["type"] == "error" {
+                let msg = data["error"]["message"].as_str().unwrap_or("unknown stream error");
+                return LlmResponse::error(format!("API error: {msg}"));
+            }
+            for ev in state.on_data(&data) {
+                on_event(ev);
+            }
+        }
+
+        state.finish(&opts.model)
     }
 }
 
@@ -612,5 +784,83 @@ mod tests {
             "data": "opaque"
         })).unwrap();
         assert!(block.into_content().is_none());
+    }
+
+    // --- StreamState (vikunja #957) ---
+
+    #[test]
+    fn stream_text_deltas_accumulate_and_emit() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}));
+        state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+        let e1 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}}));
+        let e2 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}}));
+        assert_eq!(e1, vec![StreamEvent::TextDelta("hel".to_string())]);
+        assert_eq!(e2, vec![StreamEvent::TextDelta("lo".to_string())]);
+        state.on_data(&json!({"type": "content_block_stop", "index": 0}));
+        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}));
+        let resp = state.finish("claude-haiku-4-5");
+        assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hello"));
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert_eq!(resp.usage.input, 10);
+        assert_eq!(resp.usage.output, 5);
+    }
+
+    #[test]
+    fn stream_thinking_deltas_emit_and_accumulate() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}));
+        let ev = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "reasoning..."}}));
+        assert_eq!(ev, vec![StreamEvent::ThinkingDelta("reasoning...".to_string())]);
+        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}));
+        let resp = state.finish("claude-haiku-4-5");
+        assert!(matches!(&resp.content[0], ContentBlock::Thinking(t) if t == "reasoning..."));
+    }
+
+    #[test]
+    fn stream_tool_use_input_json_accumulates_silently() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}
+        }));
+        let ev1 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}));
+        let ev2 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"a.txt\"}"}}));
+        assert!(ev1.is_empty(), "tool input deltas must not be emitted as stream events");
+        assert!(ev2.is_empty());
+        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}));
+        let resp = state.finish("claude-haiku-4-5");
+        assert!(matches!(
+            &resp.content[0],
+            ContentBlock::ToolCall { id, name, input } if id == "toolu_1" && name == "read_file" && input["path"] == "a.txt"
+        ));
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn stream_multiple_blocks_by_index() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+        state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "checking"}}));
+        state.on_data(&json!({"type": "content_block_stop", "index": 0}));
+        state.on_data(&json!({
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "exec", "input": {}}
+        }));
+        state.on_data(&json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}}));
+        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}));
+        let resp = state.finish("claude-haiku-4-5");
+        assert_eq!(resp.content.len(), 2);
+        assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "checking"));
+        assert!(matches!(&resp.content[1], ContentBlock::ToolCall { name, .. } if name == "exec"));
+    }
+
+    #[test]
+    fn stream_empty_text_block_omitted_from_content() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}));
+        let resp = state.finish("claude-haiku-4-5");
+        assert!(resp.content.is_empty(), "an empty text block should not appear in content");
     }
 }

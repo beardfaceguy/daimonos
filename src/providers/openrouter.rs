@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role,
-    StopReason, ToolSchema, Usage,
+    StopReason, StreamEvent, ToolSchema, Usage,
 };
 
 pub struct OpenRouterProvider {
@@ -67,6 +67,148 @@ impl LlmProvider for OpenRouterProvider {
         }
 
         parse_response(&resp_body)
+    }
+
+    async fn stream(
+        &self,
+        ctx: &Context,
+        opts: &CompleteOpts,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> LlmResponse {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        let tools = tools_to_wire(&ctx.tools);
+
+        let mut body = json!({
+            "model": opts.model,
+            "messages": messages,
+            "max_tokens": opts.max_tokens,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        let resp = match self.client.post(&url).bearer_auth(&self.api_key).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => return LlmResponse::error(format!("openrouter request failed: {e}")),
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return LlmResponse::error(format!("openrouter {status}: {body_text}"));
+        }
+
+        let mut events = resp.bytes_stream().eventsource();
+        let mut state = StreamState::default();
+
+        while let Some(event) = events.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => return LlmResponse::error(format!("openrouter stream error: {e}")),
+            };
+            if event.data == "[DONE]" {
+                break;
+            }
+            let chunk: Value = match serde_json::from_str(&event.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for ev in state.on_chunk(&chunk) {
+                on_event(ev);
+            }
+        }
+
+        state.finish()
+    }
+}
+
+// --- Streaming (vikunja #957) ---
+
+#[derive(Default, Clone)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Accumulates OpenAI-format streaming chunks (`choices[0].delta`) into the
+/// same `LlmResponse` shape `parse_response` builds from one JSON body.
+#[derive(Default)]
+struct StreamState {
+    text: String,
+    tool_calls: Vec<PartialToolCall>,
+    finish_reason: Option<String>,
+    usage: Value,
+}
+
+impl StreamState {
+    /// Feed one decoded `data:` JSON chunk. Returns text deltas to forward
+    /// live; tool-call arguments accumulate silently.
+    fn on_chunk(&mut self, chunk: &Value) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                self.usage = u.clone();
+            }
+        }
+
+        let choice = &chunk["choices"][0];
+        if let Some(fr) = choice["finish_reason"].as_str() {
+            self.finish_reason = Some(fr.to_string());
+        }
+
+        let delta = &choice["delta"];
+        if let Some(piece) = delta["content"].as_str() {
+            if !piece.is_empty() {
+                self.text.push_str(piece);
+                events.push(StreamEvent::TextDelta(piece.to_string()));
+            }
+        }
+
+        if let Some(tool_calls) = delta["tool_calls"].as_array() {
+            for tc in tool_calls {
+                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                while self.tool_calls.len() <= idx {
+                    self.tool_calls.push(PartialToolCall::default());
+                }
+                let slot = &mut self.tool_calls[idx];
+                if let Some(id) = tc["id"].as_str() {
+                    slot.id = id.to_string();
+                }
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    slot.name = name.to_string();
+                }
+                if let Some(args) = tc["function"]["arguments"].as_str() {
+                    slot.arguments.push_str(args);
+                }
+            }
+        }
+
+        events
+    }
+
+    fn finish(self) -> LlmResponse {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text(self.text));
+        }
+        for tc in self.tool_calls {
+            let input: Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            content.push(ContentBlock::ToolCall { id: tc.id, name: tc.name, input });
+        }
+        let stop_reason = map_finish_reason(self.finish_reason.as_deref());
+        let usage = parse_usage(&self.usage);
+        LlmResponse { content, stop_reason, error_message: None, usage }
     }
 }
 
@@ -485,5 +627,78 @@ mod tests {
         assert_eq!(map_finish_reason(Some("content_filter")), StopReason::Error);
         assert_eq!(map_finish_reason(Some("unknown_future")), StopReason::Error);
         assert_eq!(map_finish_reason(None), StopReason::Error);
+    }
+
+    // --- StreamState (vikunja #957) ---
+
+    #[test]
+    fn stream_text_deltas_accumulate_and_emit() {
+        let mut state = StreamState::default();
+        let e1 = state.on_chunk(&json!({"choices": [{"delta": {"content": "hel"}, "finish_reason": null}]}));
+        let e2 = state.on_chunk(&json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": null}]}));
+        assert_eq!(e1, vec![StreamEvent::TextDelta("hel".to_string())]);
+        assert_eq!(e2, vec![StreamEvent::TextDelta("lo".to_string())]);
+        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}}));
+        let resp = state.finish();
+        assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hello"));
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert_eq!(resp.usage.input, 10);
+        assert_eq!(resp.usage.output, 2);
+    }
+
+    #[test]
+    fn stream_empty_content_delta_not_emitted() {
+        let mut state = StreamState::default();
+        let ev = state.on_chunk(&json!({"choices": [{"delta": {"content": ""}, "finish_reason": null}]}));
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn stream_tool_call_arguments_accumulate_silently() {
+        let mut state = StreamState::default();
+        let ev1 = state.on_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "exec", "arguments": ""}}]}, "finish_reason": null}]
+        }));
+        let ev2 = state.on_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"command\":"}}]}, "finish_reason": null}]
+        }));
+        let ev3 = state.on_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"ls\"}"}}]}, "finish_reason": "tool_calls"}]
+        }));
+        assert!(ev1.is_empty());
+        assert!(ev2.is_empty());
+        assert!(ev3.is_empty());
+        let resp = state.finish();
+        assert!(matches!(
+            &resp.content[0],
+            ContentBlock::ToolCall { id, name, input } if id == "call_1" && name == "exec" && input["command"] == "ls"
+        ));
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn stream_multiple_tool_calls_tracked_by_index() {
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"index": 1, "id": "call_b", "function": {"name": "exec", "arguments": "{}"}}
+            ]}, "finish_reason": null}]
+        }));
+        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}));
+        let resp = state.finish();
+        assert_eq!(resp.content.len(), 2);
+        assert!(matches!(&resp.content[0], ContentBlock::ToolCall { name, .. } if name == "read_file"));
+        assert!(matches!(&resp.content[1], ContentBlock::ToolCall { name, .. } if name == "exec"));
+    }
+
+    #[test]
+    fn stream_no_usage_chunk_defaults_to_zero() {
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}));
+        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+        let resp = state.finish();
+        assert_eq!(resp.usage.input, 0);
+        assert_eq!(resp.usage.output, 0);
     }
 }
