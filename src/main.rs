@@ -239,9 +239,14 @@ async fn main() -> anyhow::Result<()> {
                     safety: None,
                     analytics: None,
                 };
-                let result =
-                    agent_cmd::run_agent(&DryRunProvider, &workspace, args, &mut std::io::stdout())
-                        .await?;
+                let result = agent_cmd::run_agent(
+                    &DryRunProvider,
+                    &workspace,
+                    Arc::clone(&cfg),
+                    args,
+                    &mut std::io::stdout(),
+                )
+                .await?;
                 if result.stop_reason == providers::StopReason::Error {
                     let msg = result.error_message.as_deref().unwrap_or("unknown error");
                     eprintln!("agent error: {msg}");
@@ -284,7 +289,9 @@ async fn main() -> anyhow::Result<()> {
                 safety: Some(agent.to_safety_policy(approve_fn)),
                 analytics: analytics_store,
             };
-            let result = agent_cmd::run_agent(llm.as_ref(), &workspace, args, &mut std::io::stdout()).await?;
+            let result =
+                agent_cmd::run_agent(llm.as_ref(), &workspace, Arc::clone(&cfg), args, &mut std::io::stdout())
+                    .await?;
             if result.stop_reason == providers::StopReason::Error {
                 let msg = result.error_message.as_deref().unwrap_or("unknown error");
                 eprintln!("agent error: {msg}");
@@ -309,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(safety::SafetyPolicy::stdin_approve_fn())
             };
             let safety = agent.to_safety_policy(approve_fn);
-            chat_cmd::run_chat(llm, &workspace, effective_model, Some(safety)).await?;
+            chat_cmd::run_chat(llm, &workspace, Arc::clone(&cfg), effective_model, Some(safety)).await?;
             return Ok(());
         }
         None => {}
