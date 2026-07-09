@@ -492,6 +492,7 @@ dependencies = [
  "chrono",
  "clap",
  "eventsource-stream",
+ "futures-util",
  "glob",
  "grep-matcher",
  "grep-regex",

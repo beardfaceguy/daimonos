@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::protocol::Response;
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role,
-    StopReason, ToolSchema, Usage,
+    StopReason, StreamEvent, ToolSchema, Usage,
 };
 use crate::session::Session;
 use crate::tool_facade;
@@ -30,6 +30,8 @@ pub enum AfterHookResult {
 
 pub type BeforeHook = Box<dyn Fn(&ToolCallInfo) -> BeforeHookResult + Send + Sync>;
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
+/// Invoked with each `StreamEvent` as a turn streams in (vikunja #957).
+pub type StreamHook = Box<dyn Fn(StreamEvent) + Send + Sync>;
 
 // --- Config and Result ---
 
@@ -40,6 +42,7 @@ pub struct AgentConfig {
     pub opts: CompleteOpts,
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
+    pub on_stream_event: Option<StreamHook>,
 }
 
 pub struct AgentResult {
@@ -96,7 +99,10 @@ pub async fn run(
             stable_prefix_len: 0,
         };
 
-        let resp = provider.complete(&ctx, &config.opts).await;
+        let resp = match &config.on_stream_event {
+            Some(hook) => provider.stream(&ctx, &config.opts, &mut |ev| hook(ev)).await,
+            None => provider.stream(&ctx, &config.opts, &mut |_| {}).await,
+        };
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
 
         // Assistant turn appended BEFORE tool results (Anthropic API requirement)
@@ -424,6 +430,75 @@ mod tests {
     fn content_falls_back_to_message() {
         let resp = Response::err(3, "tool failed");
         assert_eq!(response_to_content(resp), "tool failed");
+    }
+
+    // --- streaming (vikunja #957) ---
+
+    struct StreamingMockProvider {
+        events: Vec<StreamEvent>,
+        response: LlmResponse,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingMockProvider {
+        async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            panic!("StreamingMockProvider expects stream(), not complete()");
+        }
+
+        async fn stream(
+            &self,
+            _ctx: &Context,
+            _opts: &CompleteOpts,
+            on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> LlmResponse {
+            for ev in self.events.clone() {
+                on_event(ev);
+            }
+            LlmResponse {
+                content: self.response.content.clone(),
+                stop_reason: self.response.stop_reason.clone(),
+                error_message: self.response.error_message.clone(),
+                usage: self.response.usage.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_forwards_stream_events_to_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let provider = StreamingMockProvider {
+            events: vec![
+                StreamEvent::TextDelta("hel".into()),
+                StreamEvent::TextDelta("lo".into()),
+            ],
+            response: end_turn_resp(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let config = AgentConfig {
+            on_stream_event: Some(Box::new(move |ev| seen_clone.lock().unwrap().push(ev))),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, &mut s, vec![Message::user("hi")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![StreamEvent::TextDelta("hel".into()), StreamEvent::TextDelta("lo".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_without_hook_still_calls_stream_and_ignores_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let provider = StreamingMockProvider {
+            events: vec![StreamEvent::TextDelta("x".into())],
+            response: end_turn_resp(),
+        };
+        let result = run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
     }
 
     // --- run loop ---

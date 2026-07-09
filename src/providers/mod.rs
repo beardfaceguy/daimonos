@@ -138,14 +138,67 @@ impl Default for CompleteOpts {
     }
 }
 
+/// An incremental piece of a turn, emitted while a provider streams a
+/// response. Only text/thinking are streamed live today — tool-call inputs
+/// are still accumulated atomically into the final `LlmResponse`, since a
+/// terminal REPL has no use for partial JSON arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    TextDelta(String),
+    ThinkingDelta(String),
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse;
+
+    /// Like `complete`, but invokes `on_event` with each `StreamEvent` as it
+    /// arrives, before returning the same final `LlmResponse` `complete`
+    /// would produce. Default: no incremental events, just delegates to
+    /// `complete` — so providers (and test doubles) that don't override this
+    /// keep working unchanged.
+    async fn stream(
+        &self,
+        ctx: &Context,
+        opts: &CompleteOpts,
+        _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> LlmResponse {
+        self.complete(ctx, opts).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StaticProvider(LlmResponse);
+
+    #[async_trait]
+    impl LlmProvider for StaticProvider {
+        async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            self.0.clone()
+        }
+    }
+
+    fn dummy_ctx() -> Context {
+        Context { messages: vec![], system: None, tools: vec![], stable_prefix_len: 0 }
+    }
+
+    #[tokio::test]
+    async fn default_stream_delegates_to_complete() {
+        let provider = StaticProvider(LlmResponse {
+            content: vec![ContentBlock::Text("hi".into())],
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            usage: Usage::default(),
+        });
+        let mut events = Vec::new();
+        let resp = provider
+            .stream(&dummy_ctx(), &CompleteOpts::default(), &mut |e| events.push(e))
+            .await;
+        assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hi"));
+        assert!(events.is_empty(), "default stream() must not synthesize events");
+    }
 
     #[test]
     fn llm_response_error_sets_fields() {

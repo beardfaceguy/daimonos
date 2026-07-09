@@ -6,7 +6,7 @@ use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use crate::agent::{AgentConfig, AgentSession};
 use crate::agent_cmd::default_system_prompt;
 use crate::config::Config;
-use crate::providers::{CompleteOpts, LlmProvider, ToolSchema};
+use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
 use crate::tool_facade;
@@ -52,7 +52,10 @@ pub fn parse_line(line: &str) -> ChatCommand {
 
 /// Build the [`AgentConfig`] for a chat session, mirroring
 /// `agent_cmd::run_agent`'s construction (system prompt, active tool schemas,
-/// model, and safety hook).
+/// model, and safety hook), plus a stream hook that prints assistant text
+/// deltas live as they arrive (vikunja #957) — thinking/tool-call deltas are
+/// captured by the provider but not rendered, matching prior non-streaming
+/// behavior where thinking was never shown in the REPL.
 pub fn build_agent_config(workspace: &Path, model: String, safety: Option<SafetyPolicy>) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
@@ -63,6 +66,13 @@ pub fn build_agent_config(workspace: &Path, model: String, safety: Option<Safety
         tools,
         opts: CompleteOpts { model, ..CompleteOpts::default() },
         before_tool_call: safety.map(|p| p.into_before_hook()),
+        on_stream_event: Some(Box::new(|ev| {
+            if let StreamEvent::TextDelta(text) = ev {
+                use std::io::Write;
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+        })),
         ..AgentConfig::default()
     }
 }
@@ -119,8 +129,10 @@ pub async fn run_chat(
                             if let Some(err) = &turn.error_message {
                                 eprintln!("[error] {err}");
                             }
+                            // Text was already printed live via on_stream_event;
+                            // just close out the line it was streamed on.
                             if !turn.text.is_empty() {
-                                println!("{}", turn.text);
+                                println!();
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
@@ -232,6 +244,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = build_agent_config(dir.path(), "m".to_string(), None);
         assert!(!config.tools.is_empty(), "chat session should expose tools like the agent subcommand");
+    }
+
+    #[test]
+    fn config_wires_stream_hook_for_live_text_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = build_agent_config(dir.path(), "m".to_string(), None);
+        assert!(config.on_stream_event.is_some(), "chat session should stream text deltas live");
     }
 
     #[test]
