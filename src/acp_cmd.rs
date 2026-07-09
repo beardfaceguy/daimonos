@@ -94,40 +94,56 @@ fn send_notification(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, u
     let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
 }
 
-/// Send `session/request_permission` and await the client's answer.
-/// Must be sent via the *current* dispatch's connection handle (see
-/// [`CurrentConnection`]) — a handle captured at `session/new` time and
-/// reused later for a request does not get its response routed back
-/// correctly by this SDK.
+/// Send `session/request_permission` and await the client's answer,
+/// applying the operator's decision to `safety` (persisting an "always
+/// allow" choice the same way the stdin prompt does). Must be sent via the
+/// *current* dispatch's connection handle (see [`CurrentConnection`]) — a
+/// handle captured at `session/new` time and reused later for a request
+/// does not get its response routed back correctly by this SDK.
 async fn request_permission(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     info: &ToolCallInfo,
+    safety: &crate::safety::SafetyPolicy,
 ) -> BeforeHookResult {
     let update = ToolCallUpdate::new(
         info.id.clone(),
         ToolCallUpdateFields::new().raw_input(Some(info.input.clone())),
     );
     let options = vec![
-        PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new("allow_always", "Always Allow", PermissionOptionKind::AllowAlways),
         PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), update, options);
     match cx.send_request(request).block_task().await {
         Ok(response) => match response.outcome {
-            RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "allow" => {
-                BeforeHookResult::Allow
+            RequestPermissionOutcome::Selected(sel) => match sel.option_id.to_string().as_str() {
+                "allow_once" => BeforeHookResult::Allow,
+                "allow_always" => {
+                    safety.remember_always(&info.name);
+                    BeforeHookResult::Allow
+                }
+                _ => BeforeHookResult::Block(format!("permission denied for '{}'", info.name)),
+            },
+            RequestPermissionOutcome::Cancelled => {
+                BeforeHookResult::Block(format!("permission request cancelled for '{}'", info.name))
             }
-            _ => BeforeHookResult::Block(format!("permission denied for '{}'", info.name)),
+            _ => BeforeHookResult::Block(format!("unrecognized permission outcome for '{}'", info.name)),
         },
         Err(_) => BeforeHookResult::Block(format!("permission request failed for '{}'", info.name)),
     }
 }
 
-fn build_before_tool_call_hook(connection: CurrentConnection, session_id: SessionId) -> BeforeHook {
+fn build_before_tool_call_hook(
+    connection: CurrentConnection,
+    session_id: SessionId,
+    safety: Arc<crate::safety::SafetyPolicy>,
+) -> BeforeHook {
     Box::new(move |info: &ToolCallInfo| {
         let connection = Arc::clone(&connection);
         let session_id = session_id.clone();
+        let safety = Arc::clone(&safety);
         Box::pin(async move {
             let Some(cx) = current_cx(&connection) else {
                 return BeforeHookResult::Block("no active ACP connection".to_string());
@@ -139,10 +155,15 @@ fn build_before_tool_call_hook(connection: CurrentConnection, session_id: Sessio
                 .raw_input(Some(info.input.clone()));
             send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
 
-            let decision = if crate::safety::is_destructive_tool(&info.name) {
-                request_permission(&cx, &session_id, info).await
-            } else {
-                BeforeHookResult::Allow
+            // Denylist/allowlist/approval-mode gating first (same policy
+            // `daimonos agent`/`daimonos chat` enforce) — only tools that
+            // actually need a prompt go through session/request_permission.
+            let decision = match safety.gate(&info.name) {
+                crate::safety::Gate::Block(reason) => BeforeHookResult::Block(reason),
+                crate::safety::Gate::Allow => BeforeHookResult::Allow,
+                crate::safety::Gate::NeedsApproval => {
+                    request_permission(&cx, &session_id, info, &safety).await
+                }
             };
 
             let status = match &decision {
@@ -198,6 +219,7 @@ fn build_agent_config(
     model: String,
     connection: CurrentConnection,
     session_id: SessionId,
+    safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
@@ -208,7 +230,7 @@ fn build_agent_config(
         system: Some(default_system_prompt()),
         tools,
         opts: CompleteOpts { model, ..CompleteOpts::default() },
-        before_tool_call: Some(build_before_tool_call_hook(Arc::clone(&connection), session_id.clone())),
+        before_tool_call: Some(build_before_tool_call_hook(Arc::clone(&connection), session_id.clone(), safety)),
         after_tool_call: Some(build_after_tool_call_hook(Arc::clone(&connection), session_id.clone())),
         on_stream_event: Some(build_stream_hook(connection, session_id)),
         token_log: token_log.map(|path| TokenLogConfig { path, label: "acp".to_string() }),
@@ -249,14 +271,20 @@ async fn run_prompt_turn(
     model: &str,
     text: String,
 ) -> AcpStopReason {
-    // Refresh the shared connection handle with *this* dispatch's cx before
-    // running the turn — see `CurrentConnection`'s doc comment for why.
+    // Acquire exclusive access to the session *before* publishing this
+    // turn's connection/cancel handles — otherwise a second overlapping
+    // session/prompt call (for the same session) could overwrite the
+    // in-flight turn's routing/cancellation handle while both are still
+    // waiting on this same lock.
+    let mut guard = state.session.lock().await;
+
+    // Now that we hold the lock, refresh the shared connection handle with
+    // *this* dispatch's cx — see `CurrentConnection`'s doc comment for why.
     *state.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
 
     let notify = Arc::new(tokio::sync::Notify::new());
     *state.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
-    let mut guard = state.session.lock().await;
     let Some(agent_session) = guard.as_mut() else {
         return AcpStopReason::Refusal;
     };
@@ -285,6 +313,7 @@ fn build_agent(
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
@@ -294,6 +323,7 @@ fn build_agent(
         connection: Arc::new(StdMutex::new(None)),
     });
     let provider = Arc::new(std::sync::Mutex::new(Some(provider)));
+    let safety = Arc::new(safety);
 
     AcpAgentRole
         .builder()
@@ -311,15 +341,17 @@ fn build_agent(
             let workspace = workspace.clone();
             let cfg = Arc::clone(&cfg);
             let model = model.clone();
+            let safety = Arc::clone(&safety);
             let token_log = token_log.clone();
             let provider = Arc::clone(&provider);
-            move |_req: NewSessionRequest,
+            move |req: NewSessionRequest,
                   responder: agent_client_protocol::Responder<NewSessionResponse>,
                   cx: ConnectionTo<AcpClientRole>| {
                 let state = Arc::clone(&state);
-                let workspace = workspace.clone();
+                let workspace_fallback = workspace.clone();
                 let cfg = Arc::clone(&cfg);
                 let model = model.clone();
+                let safety = Arc::clone(&safety);
                 let token_log = token_log.clone();
                 let provider = Arc::clone(&provider);
                 async move {
@@ -329,15 +361,21 @@ fn build_agent(
                             "daimonos acp v1 supports only one session per process",
                         ));
                     };
+                    // Use the client-provided project root, not the CLI's
+                    // own cwd — Zed passes the actual project it wants this
+                    // session to operate on.
+                    let session_workspace =
+                        if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
                     *state.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx);
                     let config = build_agent_config(
-                        &workspace,
+                        &session_workspace,
                         model,
                         Arc::clone(&state.connection),
                         session_id.clone(),
+                        safety,
                         token_log,
                     );
-                    let tool_session = Session::new(workspace.clone(), cfg);
+                    let tool_session = Session::new(session_workspace, cfg);
                     let agent_session = AgentSession::new(provider, tool_session, config);
                     *state.session.lock().await = Some(agent_session);
                     responder.respond(NewSessionResponse::new(session_id))
@@ -411,9 +449,10 @@ pub async fn run_acp(
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    build_agent(provider, workspace, cfg, model, token_log)
+    build_agent(provider, workspace, cfg, model, safety, token_log)
         .connect_to(Stdio::new())
         .await?;
     Ok(())
@@ -516,7 +555,14 @@ mod tests {
     async fn acp_initialize_session_new_prompt_flow() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Box::new(MockProvider::new(vec![end_turn_resp("hello from daimonos")]));
-        let agent = build_agent(provider, dir.path(), Arc::new(Config::default()), "test-model".to_string(), None);
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
@@ -574,7 +620,14 @@ mod tests {
     async fn acp_second_session_new_errors_v1_single_session() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Box::new(MockProvider::new(vec![end_turn_resp("ok")]));
-        let agent = build_agent(provider, dir.path(), Arc::new(Config::default()), "test-model".to_string(), None);
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
 
         let result = AcpClientRole
             .builder()
@@ -601,7 +654,14 @@ mod tests {
     async fn acp_session_cancel_aborts_inflight_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let provider: Box<dyn LlmProvider> = Box::new(SlowProvider);
-        let agent = build_agent(provider, dir.path(), Arc::new(Config::default()), "test-model".to_string(), None);
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
 
         let stop_reason = AcpClientRole
             .builder()
@@ -648,7 +708,17 @@ mod tests {
             tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
             end_turn_resp("done"),
         ]));
-        let agent = build_agent(provider, dir.path(), Arc::new(Config::default()), "test-model".to_string(), None);
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            },
+            None,
+        );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
@@ -717,6 +787,166 @@ mod tests {
             vec![ToolCallStatus::InProgress, ToolCallStatus::Completed],
             "got: {updates:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_denied_tool_blocks_without_asking_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
+            end_turn_resp("done"),
+        ]));
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy {
+                denied_commands: vec!["exec".into()],
+                ..crate::safety::SafetyPolicy::default()
+            },
+            None,
+        );
+
+        let permission_requests_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&permission_requests_seen);
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: agent_client_protocol::schema::v1::RequestPermissionRequest,
+                             responder,
+                             _cx| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let option_id = request.options.first().map(|o| o.option_id.clone()).unwrap();
+                    responder.respond(agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(
+                            agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(option_id),
+                        ),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        new_session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            permission_requests_seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a denylisted tool must not even ask for permission"
+        );
+        let updates = updates.lock().unwrap();
+        let statuses: Vec<ToolCallStatus> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.status,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec![ToolCallStatus::Failed], "got: {updates:?}");
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_uses_client_provided_cwd() {
+        // `build_agent`'s own `workspace` argument points at a directory
+        // with no marker file; the *session's* cwd (from NewSessionRequest,
+        // as a real ACP client like Zed would send) points at one that
+        // does. If the session correctly uses the client-provided cwd
+        // instead of build_agent's own workspace, the read_file tool call
+        // succeeds.
+        let build_agent_workspace = tempfile::tempdir().unwrap();
+        let session_workspace = tempfile::tempdir().unwrap();
+        std::fs::write(session_workspace.path().join("marker.txt"), "found me").unwrap();
+
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("t1", "read_file", serde_json::json!({"path": "marker.txt"})),
+            end_turn_resp("done"),
+        ]));
+        let agent = build_agent(
+            provider,
+            build_agent_workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
+
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(session_workspace.path()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        new_session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let updates = updates.lock().unwrap();
+        let completed_with_marker = updates.iter().any(|u| match u {
+            SessionUpdate::ToolCallUpdate(tcu) => tcu
+                .fields
+                .content
+                .as_ref()
+                .is_some_and(|c| format!("{c:?}").contains("found me")),
+            _ => false,
+        });
+        assert!(completed_with_marker, "tool should have read marker.txt from the session's cwd: {updates:?}");
     }
 
     // --- pure mapping helpers ---

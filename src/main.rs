@@ -366,7 +366,11 @@ async fn main() -> anyhow::Result<()> {
             let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
             let effective_model = model.unwrap_or_else(|| agent.model.clone());
             let llm = build_llm_provider(&effective_provider, &agent);
-            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, token_log).await?;
+            // No approve_fn: ACP asks the client via session/request_permission,
+            // not a stdin prompt — the denylist/allowlist/approval-mode gating
+            // (SafetyPolicy::gate) still applies the same as agent/chat.
+            let safety = agent.to_safety_policy(None);
+            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, safety, token_log).await?;
             return Ok(());
         }
         None => {}

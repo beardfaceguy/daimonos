@@ -79,7 +79,56 @@ impl Default for SafetyPolicy {
     }
 }
 
+/// Result of the non-interactive gating logic (denylist/allowlist/
+/// approval-mode/auto-approve), *before* any "ask the operator" step.
+/// Shared by every approval surface (the stdin prompt, the ACP engine's
+/// `session/request_permission`, ...) so denylist/allowlist/mode
+/// enforcement lives in exactly one place instead of being reimplemented
+/// per surface.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    Block(String),
+    Allow,
+    NeedsApproval,
+}
+
 impl SafetyPolicy {
+    /// Non-interactive gating decision for `name`: denylist/allowlist first
+    /// (deterministic, no prompt involved), then approval-mode + the
+    /// in-session/persisted auto-approve set. Does not call `approve_fn` —
+    /// callers that get `NeedsApproval` are responsible for asking (however
+    /// they ask) and applying the operator's decision themselves.
+    pub fn gate(&self, name: &str) -> Gate {
+        if self.denied_commands.iter().any(|d| d == name) {
+            return Gate::Block(format!("blocked by policy: '{name}' is in the denied-commands list"));
+        }
+        if !self.allowed_commands.is_empty() && !self.allowed_commands.iter().any(|a| a == name) {
+            return Gate::Block(format!("blocked by policy: '{name}' is not in the allowed-commands list"));
+        }
+        let needs_approval = match self.approval_mode {
+            ApprovalMode::Auto => false,
+            ApprovalMode::Interactive => DESTRUCTIVE_TOOLS.contains(&name),
+            ApprovalMode::Paranoid => true,
+        };
+        if !needs_approval {
+            return Gate::Allow;
+        }
+        if self.auto_approve.lock().unwrap_or_else(|p| p.into_inner()).contains(name) {
+            return Gate::Allow;
+        }
+        Gate::NeedsApproval
+    }
+
+    /// Record an "always approve" decision for `name`: adds it to the
+    /// in-session auto-approve set and persists it to `approvals_path` if
+    /// configured. Shared by every approval surface.
+    pub fn remember_always(&self, name: &str) {
+        self.auto_approve.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string());
+        if let Some(path) = &self.approvals_path {
+            persist_approval(path, name);
+        }
+    }
+
     /// Consume the policy and return a `BeforeHook` closure for the agent loop.
     /// `decide` below does no real async work (the stdin approval prompt is a
     /// local blocking read, not a network round-trip), so this just wraps its
@@ -94,66 +143,27 @@ impl SafetyPolicy {
     }
 
     fn decide(&self, info: &ToolCallInfo) -> BeforeHookResult {
-            let name = info.name.as_str();
-
-            // Denylist — hard block, no override (beats auto-approve).
-            if self.denied_commands.iter().any(|d| d == name) {
-                return BeforeHookResult::Block(format!(
-                    "blocked by policy: '{name}' is in the denied-commands list"
-                ));
-            }
-
-            // Allowlist — if non-empty, tool must be present.
-            if !self.allowed_commands.is_empty()
-                && !self.allowed_commands.iter().any(|a| a == name)
-            {
-                return BeforeHookResult::Block(format!(
-                    "blocked by policy: '{name}' is not in the allowed-commands list"
-                ));
-            }
-
-            let needs_approval = match self.approval_mode {
-                ApprovalMode::Auto => false,
-                ApprovalMode::Interactive => DESTRUCTIVE_TOOLS.contains(&name),
-                ApprovalMode::Paranoid => true,
-            };
-
-            if needs_approval {
-                // Previously "always"-approved (persisted or earlier this
-                // session) → skip the prompt.
-                if self
-                    .auto_approve
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .contains(name)
-                {
-                    return BeforeHookResult::Allow;
-                }
-
+        let name = info.name.as_str();
+        match self.gate(name) {
+            Gate::Block(reason) => BeforeHookResult::Block(reason),
+            Gate::Allow => BeforeHookResult::Allow,
+            Gate::NeedsApproval => {
                 let decision = match self.approve_fn.as_ref() {
                     Some(f) => f(name, &info.input),
                     None => ApprovalDecision::Once, // no approve_fn → default allow
                 };
                 match decision {
-                    ApprovalDecision::Deny => {
-                        return BeforeHookResult::Block(format!(
-                            "blocked: operator declined approval for '{name}'"
-                        ));
-                    }
-                    ApprovalDecision::Once => {}
+                    ApprovalDecision::Deny => BeforeHookResult::Block(format!(
+                        "blocked: operator declined approval for '{name}'"
+                    )),
+                    ApprovalDecision::Once => BeforeHookResult::Allow,
                     ApprovalDecision::Always => {
-                        self.auto_approve
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(name.to_string());
-                        if let Some(path) = &self.approvals_path {
-                            persist_approval(path, name);
-                        }
+                        self.remember_always(name);
+                        BeforeHookResult::Allow
                     }
                 }
             }
-
-            BeforeHookResult::Allow
+        }
     }
 
     /// Convenience: stdin-backed approval prompt for production use.
@@ -244,6 +254,55 @@ mod tests {
         for name in ["read_file", "search", "ls"] {
             assert!(!is_destructive_tool(name), "{name} should not be destructive");
         }
+    }
+
+    // --- gate / remember_always (vikunja #954: shared with ACP) ---
+
+    #[test]
+    fn gate_blocks_denied_tool_without_asking() {
+        let policy = SafetyPolicy { denied_commands: vec!["exec".into()], ..SafetyPolicy::default() };
+        assert!(matches!(policy.gate("exec"), Gate::Block(r) if r.contains("denied-commands")));
+    }
+
+    #[test]
+    fn gate_blocks_tool_not_in_allowlist() {
+        let policy = SafetyPolicy { allowed_commands: vec!["read_file".into()], ..SafetyPolicy::default() };
+        assert!(matches!(policy.gate("exec"), Gate::Block(r) if r.contains("allowed-commands")));
+    }
+
+    #[test]
+    fn gate_allows_non_destructive_tool_in_interactive_mode() {
+        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        assert_eq!(policy.gate("read_file"), Gate::Allow);
+    }
+
+    #[test]
+    fn gate_needs_approval_for_destructive_tool_in_interactive_mode() {
+        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn gate_auto_mode_never_needs_approval() {
+        let policy = SafetyPolicy { approval_mode: ApprovalMode::Auto, ..SafetyPolicy::default() };
+        assert_eq!(policy.gate("exec"), Gate::Allow);
+    }
+
+    #[test]
+    fn gate_respects_previously_remembered_always() {
+        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
+        policy.remember_always("exec");
+        assert_eq!(policy.gate("exec"), Gate::Allow);
+    }
+
+    #[test]
+    fn remember_always_persists_to_approvals_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-approvals");
+        let policy = SafetyPolicy { approvals_path: Some(path.clone()), ..SafetyPolicy::default() };
+        policy.remember_always("write_file");
+        assert!(load_approvals(&path).contains("write_file"));
     }
 
     // --- denylist ---

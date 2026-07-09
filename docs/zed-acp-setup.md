@@ -77,4 +77,16 @@ To pin a specific model/provider or agent env file, pass the same flags
 - Verify the binary works standalone first: `daimonos agent "say hi"`.
 - `--debug-tokens` logs per-call token usage to
   `~/.config/daimonos/token-debug.log` if you want to inspect usage
-  independent of Zed's own display.
+  independent of Zed's own display. Pass it in `args`, same as any other
+  flag:
+
+  ```json
+  {
+    "agent_servers": {
+      "daimonos": {
+        "command": "daimonos",
+        "args": ["acp", "--debug-tokens"]
+      }
+    }
+  }
+  ```
