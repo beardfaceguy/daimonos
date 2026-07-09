@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 
-use crate::agent::{AgentConfig, AgentSession};
+use crate::agent::{AgentConfig, AgentSession, TokenLogConfig};
 use crate::agent_cmd::default_system_prompt;
 use crate::config::Config;
 use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema};
@@ -56,7 +56,12 @@ pub fn parse_line(line: &str) -> ChatCommand {
 /// deltas live as they arrive (vikunja #957) — thinking/tool-call deltas are
 /// captured by the provider but not rendered, matching prior non-streaming
 /// behavior where thinking was never shown in the REPL.
-pub fn build_agent_config(workspace: &Path, model: String, safety: Option<SafetyPolicy>) -> AgentConfig {
+pub fn build_agent_config(
+    workspace: &Path,
+    model: String,
+    safety: Option<SafetyPolicy>,
+    token_log: Option<std::path::PathBuf>,
+) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
         .map(|s| ToolSchema { name: s.name, description: s.description, input_schema: s.input_schema })
@@ -73,6 +78,7 @@ pub fn build_agent_config(workspace: &Path, model: String, safety: Option<Safety
                 let _ = std::io::stdout().flush();
             }
         })),
+        token_log: token_log.map(|path| TokenLogConfig { path, label: "chat".to_string() }),
         ..AgentConfig::default()
     }
 }
@@ -92,8 +98,9 @@ pub async fn run_chat(
     cfg: Arc<Config>,
     model: String,
     safety: Option<SafetyPolicy>,
+    token_log: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let config = build_agent_config(workspace, model, safety);
+    let config = build_agent_config(workspace, model, safety, token_log);
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
 
@@ -228,35 +235,52 @@ mod tests {
     #[test]
     fn config_uses_given_model() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "claude-haiku-4-5".to_string(), None);
+        let config = build_agent_config(dir.path(), "claude-haiku-4-5".to_string(), None, None);
         assert_eq!(config.opts.model, "claude-haiku-4-5");
     }
 
     #[test]
     fn config_has_system_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "m".to_string(), None);
+        let config = build_agent_config(dir.path(), "m".to_string(), None, None);
         assert!(config.system.is_some());
     }
 
     #[test]
     fn config_includes_tool_schemas() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "m".to_string(), None);
+        let config = build_agent_config(dir.path(), "m".to_string(), None, None);
         assert!(!config.tools.is_empty(), "chat session should expose tools like the agent subcommand");
     }
 
     #[test]
     fn config_wires_stream_hook_for_live_text_deltas() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "m".to_string(), None);
+        let config = build_agent_config(dir.path(), "m".to_string(), None, None);
         assert!(config.on_stream_event.is_some(), "chat session should stream text deltas live");
+    }
+
+    #[test]
+    fn config_has_no_token_log_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = build_agent_config(dir.path(), "m".to_string(), None, None);
+        assert!(config.token_log.is_none());
+    }
+
+    #[test]
+    fn config_wires_token_log_with_chat_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("tokens.log");
+        let config = build_agent_config(dir.path(), "m".to_string(), None, Some(log_path.clone()));
+        let log_cfg = config.token_log.expect("--debug-tokens should wire a TokenLogConfig");
+        assert_eq!(log_cfg.path, log_path);
+        assert_eq!(log_cfg.label, "chat");
     }
 
     #[test]
     fn config_has_no_before_hook_without_safety_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "m".to_string(), None);
+        let config = build_agent_config(dir.path(), "m".to_string(), None, None);
         assert!(config.before_tool_call.is_none());
     }
 
@@ -264,7 +288,7 @@ mod tests {
     fn config_wires_safety_policy_into_before_hook() {
         let dir = tempfile::tempdir().unwrap();
         let policy = SafetyPolicy { denied_commands: vec!["exec".into()], ..SafetyPolicy::default() };
-        let config = build_agent_config(dir.path(), "m".to_string(), Some(policy));
+        let config = build_agent_config(dir.path(), "m".to_string(), Some(policy), None);
         assert!(config.before_tool_call.is_some());
     }
 

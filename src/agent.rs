@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+
 use serde_json::Value;
 
 use crate::protocol::Response;
@@ -33,6 +35,13 @@ pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + 
 /// Invoked with each `StreamEvent` as a turn streams in (vikunja #957).
 pub type StreamHook = Box<dyn Fn(StreamEvent) + Send + Sync>;
 
+/// `--debug-tokens` config: where to append one JSON line per LLM API call,
+/// and which subcommand (`agent`/`chat`/...) is logging it.
+pub struct TokenLogConfig {
+    pub path: PathBuf,
+    pub label: String,
+}
+
 // --- Config and Result ---
 
 #[derive(Default)]
@@ -43,6 +52,7 @@ pub struct AgentConfig {
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
     pub on_stream_event: Option<StreamHook>,
+    pub token_log: Option<TokenLogConfig>,
 }
 
 pub struct AgentResult {
@@ -80,6 +90,31 @@ fn response_to_content(resp: Response) -> String {
     }
 }
 
+/// Render one `--debug-tokens` log line for a single LLM API call.
+fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
+    serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "cmd": label,
+        "model": model,
+        "input": usage.input,
+        "output": usage.output,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+        "cost_usd": usage.cost.total_usd,
+    })
+    .to_string()
+}
+
+/// Best-effort append of one token-usage line. Never panics or propagates
+/// I/O errors — a debug log must not be able to break the agent loop.
+fn log_token_usage(cfg: &TokenLogConfig, model: &str, usage: &Usage) {
+    use std::io::Write;
+    let line = token_log_line(&cfg.label, model, usage);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&cfg.path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 // --- Main loop ---
 
 pub async fn run(
@@ -104,6 +139,9 @@ pub async fn run(
             None => provider.stream(&ctx, &config.opts, &mut |_| {}).await,
         };
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
+        if let Some(log_cfg) = &config.token_log {
+            log_token_usage(log_cfg, &config.opts.model, &resp.usage);
+        }
 
         // Assistant turn appended BEFORE tool results (Anthropic API requirement)
         messages.push(Message { role: Role::Assistant, content: resp.content.clone() });
@@ -391,6 +429,78 @@ mod tests {
         sess.clear();
         assert_eq!(sess.history().len(), 0);
         assert_eq!(sess.total_usage().input, 100, "cumulative usage kept after clear");
+    }
+
+    // --- token_log (vikunja: --debug-tokens) ---
+
+    #[test]
+    fn token_log_line_has_expected_fields() {
+        let usage = Usage {
+            input: 120,
+            output: 45,
+            cache_read: 3,
+            cache_write: 7,
+            cost: Cost { total_usd: 0.0012, ..Cost::default() },
+        };
+        let line = token_log_line("chat", "claude-haiku-4-5", &usage);
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["cmd"], "chat");
+        assert_eq!(parsed["model"], "claude-haiku-4-5");
+        assert_eq!(parsed["input"], 120);
+        assert_eq!(parsed["output"], 45);
+        assert_eq!(parsed["cache_read"], 3);
+        assert_eq!(parsed["cache_write"], 7);
+        assert_eq!(parsed["cost_usd"], 0.0012);
+        assert!(parsed["ts"].is_string(), "must include a timestamp");
+    }
+
+    #[test]
+    fn log_token_usage_appends_one_line_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TokenLogConfig { path: dir.path().join("tokens.log"), label: "agent".to_string() };
+        log_token_usage(&cfg, "m1", &mock_usage(10, 5));
+        log_token_usage(&cfg, "m1", &mock_usage(20, 8));
+        let content = std::fs::read_to_string(&cfg.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "each call should append exactly one line");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["input"], 10);
+        assert_eq!(second["input"], 20);
+    }
+
+    #[test]
+    fn log_token_usage_creates_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TokenLogConfig { path: dir.path().join("nested_does_not_exist_yet.log"), label: "agent".to_string() };
+        log_token_usage(&cfg, "m1", &mock_usage(1, 1));
+        assert!(cfg.path.exists());
+    }
+
+    #[tokio::test]
+    async fn run_writes_token_log_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("tokens.log");
+        let mut s = session_in(dir.path());
+        let provider = MockProvider::new(vec![end_turn_resp()]);
+        let config = AgentConfig {
+            token_log: Some(TokenLogConfig { path: log_path.clone(), label: "agent".to_string() }),
+            ..AgentConfig::default()
+        };
+        run(&provider, &mut s, vec![Message::user("hi")], &config).await;
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert!(content.contains("\"cmd\":\"agent\""));
+    }
+
+    #[tokio::test]
+    async fn run_does_not_write_token_log_when_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("tokens.log");
+        let mut s = session_in(dir.path());
+        let provider = MockProvider::new(vec![end_turn_resp()]);
+        run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        assert!(!log_path.exists());
     }
 
     // --- accumulate_usage ---

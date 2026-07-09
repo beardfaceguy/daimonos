@@ -184,8 +184,25 @@ struct Cli {
     #[arg(long)]
     session_id: Option<String>,
 
+    /// Log per-LLM-call token usage (input/output/cache/cost) as one JSON
+    /// line per call to ~/.config/daimonos/token-debug.log. Applies to
+    /// `agent` and `chat`.
+    #[arg(long, default_value_t = false)]
+    debug_tokens: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Resolve the fixed `--debug-tokens` log path, creating its parent
+/// directory if missing. Returns `None` (silently) if `$HOME` can't be
+/// resolved or the directory can't be created — a debug log must not be
+/// able to block startup.
+fn debug_tokens_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let dir = home.join(".config/daimonos");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("token-debug.log"))
 }
 
 #[tokio::main]
@@ -197,6 +214,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     session::enhance_process_path();
+
+    let token_log = if cli.debug_tokens { debug_tokens_log_path() } else { None };
 
     let workspace = std::fs::canonicalize(&cli.workspace)?;
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
@@ -238,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                     dry_run: true,
                     safety: None,
                     analytics: None,
+                    token_log: token_log.clone(),
                 };
                 let result = agent_cmd::run_agent(
                     &DryRunProvider,
@@ -288,6 +308,7 @@ async fn main() -> anyhow::Result<()> {
                 dry_run: false,
                 safety: Some(agent.to_safety_policy(approve_fn)),
                 analytics: analytics_store,
+                token_log: token_log.clone(),
             };
             let result =
                 agent_cmd::run_agent(llm.as_ref(), &workspace, Arc::clone(&cfg), args, &mut std::io::stdout())
@@ -316,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(safety::SafetyPolicy::stdin_approve_fn())
             };
             let safety = agent.to_safety_policy(approve_fn);
-            chat_cmd::run_chat(llm, &workspace, Arc::clone(&cfg), effective_model, Some(safety)).await?;
+            chat_cmd::run_chat(llm, &workspace, Arc::clone(&cfg), effective_model, Some(safety), token_log).await?;
             return Ok(());
         }
         None => {}
