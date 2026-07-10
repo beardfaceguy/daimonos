@@ -292,6 +292,13 @@ impl AgentSession {
         &self.messages
     }
 
+    /// Replace the conversation history, e.g. restoring a persisted ACP
+    /// session on `session/load` after a process restart. Cumulative usage is
+    /// left untouched (it's a fresh process, so there's none to preserve).
+    pub fn set_history(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     /// Usage accumulated across every turn this session.
     pub fn total_usage(&self) -> &Usage {
         &self.total_usage
