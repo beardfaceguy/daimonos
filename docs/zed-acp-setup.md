@@ -15,12 +15,15 @@ used together.
 
 ## Setup
 
-Add daimonos under the `agent_servers` key in Zed's `settings.json`:
+Add daimonos under the `agent_servers` key in Zed's `settings.json`. The
+`"type": "custom"` field is required — Zed tags each agent-server entry by
+type, and omitting it produces a `Missing property "type"` error:
 
 ```json
 {
   "agent_servers": {
     "daimonos": {
+      "type": "custom",
       "command": "daimonos",
       "args": ["acp"]
     }
@@ -34,6 +37,7 @@ If daimonos isn't on your `PATH`, use the absolute path:
 {
   "agent_servers": {
     "daimonos": {
+      "type": "custom",
       "command": "/usr/local/bin/daimonos",
       "args": ["acp"]
     }
@@ -48,6 +52,7 @@ To pin a specific model/provider or agent env file, pass the same flags
 {
   "agent_servers": {
     "daimonos": {
+      "type": "custom",
       "command": "daimonos",
       "args": ["acp", "--model", "claude-opus-4-8", "--agent-env", "/path/to/agent.env"]
     }
@@ -84,6 +89,7 @@ To pin a specific model/provider or agent env file, pass the same flags
   {
     "agent_servers": {
       "daimonos": {
+        "type": "custom",
         "command": "daimonos",
         "args": ["acp", "--debug-tokens"]
       }
