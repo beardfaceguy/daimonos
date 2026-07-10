@@ -374,6 +374,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+            // Whether the user explicitly passed --model: on --resume, an
+            // explicit flag wins, otherwise the resumed session's saved model
+            // is preferred (vikunja #963).
+            let model_explicit = model.is_some();
             let effective_model = model.unwrap_or_else(|| agent.model.clone());
             let llm = build_llm_provider(&effective_provider, &agent);
             let approve_fn = if agent.approval_mode == "auto" {
@@ -387,6 +391,7 @@ async fn main() -> anyhow::Result<()> {
                 &workspace,
                 Arc::clone(&cfg),
                 effective_model,
+                model_explicit,
                 Some(safety),
                 token_log,
                 sessions_dir,

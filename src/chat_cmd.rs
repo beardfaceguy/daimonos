@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
-use crate::session_store::{SessionStore, SessionSummary};
+use crate::session_store::{PersistedSession, SessionStore, SessionSummary};
 use crate::tool_facade;
 
 const HELP_TEXT: &str = "\
@@ -92,13 +92,25 @@ fn build_tool_session(workspace: &Path, cfg: Arc<Config>) -> Session {
     Session::new(workspace.to_path_buf(), cfg)
 }
 
-/// Load a saved session's history for `--resume`, erroring (rather than
-/// silently starting fresh) if the id isn't found — mirrors the ACP
-/// `session/load` "no session found" decision (vikunja #961).
-fn load_resume(store: Option<&SessionStore>, id: &str) -> anyhow::Result<Vec<Message>> {
+/// Load a saved session for `--resume`, erroring (rather than silently
+/// starting fresh) if the id isn't found — mirrors the ACP `session/load`
+/// "no session found" decision (vikunja #961).
+fn load_resume(store: Option<&SessionStore>, id: &str) -> anyhow::Result<PersistedSession> {
     match store.and_then(|s| s.load(id)) {
-        Some(record) => Ok(record.messages),
+        Some(record) => Ok(record),
         None => anyhow::bail!("no saved chat session with id '{id}' (try `daimonos chat --list`)"),
+    }
+}
+
+/// Pick the model for a (possibly resumed) chat session: an explicit
+/// `--model` always wins; otherwise a resumed session prefers the model it
+/// was saved on; otherwise the launch default (flag-or-env) stands. (The
+/// terminal REPL has no live model picker — that's the ACP/Zed frontend — so
+/// this is the only place a resumed session's model is honored.)
+fn resolve_model(launch_model: &str, model_explicit: bool, resumed_model: Option<&str>) -> String {
+    match resumed_model {
+        Some(saved) if !model_explicit => saved.to_string(),
+        _ => launch_model.to_string(),
     }
 }
 
@@ -153,12 +165,13 @@ pub async fn run_chat(
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    model_explicit: bool,
     safety: Option<SafetyPolicy>,
     token_log: Option<std::path::PathBuf>,
     sessions_dir: Option<PathBuf>,
     resume: Option<String>,
 ) -> anyhow::Result<()> {
-    let config = build_agent_config(workspace, model, safety, token_log);
+    let config = build_agent_config(workspace, model.clone(), safety, token_log);
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
 
@@ -171,10 +184,13 @@ pub async fn run_chat(
     // On --resume, restore the prior history and echo the transcript so the
     // user sees where they left off before the next prompt.
     if let Some(id) = &resume {
-        let history = load_resume(store.as_ref(), id)?;
-        print!("{}", render_transcript(&history));
-        session.set_history(history);
-        println!("[resumed session {id}]");
+        let record = load_resume(store.as_ref(), id)?;
+        print!("{}", render_transcript(&record.messages));
+        // Prefer the model the session was saved on, unless --model was passed.
+        let resolved = resolve_model(&model, model_explicit, Some(&record.model));
+        session.set_history(record.messages);
+        session.set_model(resolved.as_str());
+        println!("[resumed session {id} (model: {resolved})]");
     }
 
     let mut line_editor = Reedline::create();
@@ -398,14 +414,26 @@ mod tests {
     // --- session persistence / resume (vikunja #963) ---
 
     #[test]
-    fn load_resume_returns_saved_history() {
+    fn load_resume_returns_saved_record() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
-        store.save("sess-1", "m", &[Message::user("prior question"), Message::assistant("prior answer")]);
+        store.save("sess-1", "saved-model", &[Message::user("prior question"), Message::assistant("prior answer")]);
 
-        let history = load_resume(Some(&store), "sess-1").expect("saved session should resume");
-        assert_eq!(history.len(), 2);
-        assert!(matches!(&history[0].content[0], ContentBlock::Text(t) if t == "prior question"));
+        let record = load_resume(Some(&store), "sess-1").expect("saved session should resume");
+        assert_eq!(record.messages.len(), 2);
+        assert_eq!(record.model, "saved-model");
+        assert!(matches!(&record.messages[0].content[0], ContentBlock::Text(t) if t == "prior question"));
+    }
+
+    #[test]
+    fn resolve_model_prefers_saved_unless_flag_explicit() {
+        // Resuming, no explicit --model: use the model the session was saved on.
+        assert_eq!(resolve_model("launch-default", false, Some("saved-model")), "saved-model");
+        // Resuming, explicit --model: the flag wins over the saved model.
+        assert_eq!(resolve_model("flag-model", true, Some("saved-model")), "flag-model");
+        // Fresh session (no resume): the launch model stands, explicit or not.
+        assert_eq!(resolve_model("launch-default", false, None), "launch-default");
+        assert_eq!(resolve_model("flag-model", true, None), "flag-model");
     }
 
     #[test]
