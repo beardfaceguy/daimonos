@@ -6,14 +6,17 @@
 //! lifecycle + permission requests + live usage reporting via
 //! `session/update`. Cancellable via `session/cancel`. Multiple concurrent
 //! sessions (Zed keeps one process across chat threads) and `session/load`
-//! (thread refocus — replays in-memory history) are supported. Out of
-//! scope: cross-process resume (needs on-disk session persistence) and the
-//! `fs/*`/`terminal/*` client-proxy methods — daimonos has its own
-//! file/exec tools and doesn't need to shell out through the client for them.
+//! (thread refocus / reopen) are supported — the latter replays history from
+//! memory when the session is still live, or from on-disk persistence after
+//! a process restart (mirroring how Zed's native providers restore history).
+//! Out of scope: the `fs/*`/`terminal/*` client-proxy methods — daimonos has
+//! its own file/exec tools and doesn't need to shell out through the client.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+
+use serde::{Deserialize, Serialize};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock,
@@ -85,6 +88,78 @@ struct SessionHandle {
     current_model: CurrentModel,
 }
 
+/// Version tag on the persisted-session JSON, so a future on-disk format
+/// change can be detected and old files ignored rather than mis-parsed.
+const SESSION_PERSIST_VERSION: u32 = 1;
+
+/// One session's on-disk record: enough to rebuild the thread on a
+/// cross-process `session/load` (history + the model it was on).
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    version: u32,
+    session_id: String,
+    model: String,
+    messages: Vec<crate::providers::Message>,
+}
+
+/// On-disk store for ACP session history. Zed persists ACP session ids in its
+/// own metadata DB and, after a restart, calls `session/load` with an id
+/// minted in a previous daimonos process. In-memory replay can't serve that
+/// (the process is gone), so — mirroring how Zed's native providers restore
+/// full history from their local store — we persist each session to a JSON
+/// file (one per id, rewritten after every completed prompt turn) and reload
+/// it on `session/load`.
+#[derive(Clone)]
+struct SessionStore {
+    dir: PathBuf,
+}
+
+impl SessionStore {
+    /// Filename for a session id, or `None` if the id has characters unsafe as
+    /// a path component. Our ids are UUIDs; this only guards a hostile or
+    /// malformed id against path traversal / collisions.
+    fn file_name(session_id: &SessionId) -> Option<String> {
+        let id = session_id.to_string();
+        let safe =
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        safe.then(|| format!("{id}.json"))
+    }
+
+    /// Persist a session's history. Best-effort: a write failure is logged to
+    /// stderr and never fails the prompt turn.
+    fn save(&self, session_id: &SessionId, model: &str, messages: &[crate::providers::Message]) {
+        let Some(name) = Self::file_name(session_id) else { return };
+        let record = PersistedSession {
+            version: SESSION_PERSIST_VERSION,
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            messages: messages.to_vec(),
+        };
+        if let Err(e) = self.write_atomic(&name, &record) {
+            eprintln!("acp: failed to persist session {session_id}: {e}");
+        }
+    }
+
+    fn write_atomic(&self, name: &str, record: &PersistedSession) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let json = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        // Write to a temp file then rename, so a crash mid-write can't leave a
+        // truncated JSON file that would fail to load.
+        let tmp = self.dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, self.dir.join(name))
+    }
+
+    /// Load a persisted session, or `None` if absent / unreadable / a version
+    /// we don't recognise (all treated as "not resumable", never an error).
+    fn load(&self, session_id: &SessionId) -> Option<PersistedSession> {
+        let name = Self::file_name(session_id)?;
+        let bytes = std::fs::read(self.dir.join(name)).ok()?;
+        let record: PersistedSession = serde_json::from_slice(&bytes).ok()?;
+        (record.version == SESSION_PERSIST_VERSION).then_some(record)
+    }
+}
+
 /// Shared engine state across all sessions on one process.
 struct AcpState {
     /// Active sessions keyed by id. The map lock is held only briefly to
@@ -97,6 +172,9 @@ struct AcpState {
     models: Vec<String>,
     /// The model a new session starts on.
     default_model: String,
+    /// On-disk session persistence for cross-process `session/load` resume.
+    /// `None` disables persistence (used by tests that don't exercise it).
+    store: Option<SessionStore>,
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -326,6 +404,7 @@ async fn run_prompt_turn(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     text: String,
+    store: Option<&SessionStore>,
 ) -> AcpStopReason {
     // Acquire exclusive access to this session *before* publishing the
     // turn's connection/cancel handles — otherwise a second overlapping
@@ -349,8 +428,18 @@ async fn run_prompt_turn(
         turn = agent_session.prompt(text) => Some(turn),
         _ = notify.notified() => None,
     };
+
+    // Snapshot the updated history while we still hold the session lock, so we
+    // can persist it after releasing the lock (cross-process session/load
+    // resume). A cancelled turn leaves history unchanged (prompt is
+    // cancel-safe), so we only persist on completion.
+    let history_snapshot = outcome.as_ref().map(|_| agent_session.history().to_vec());
     drop(agent_session);
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+    if let (Some(store), Some(messages)) = (store, history_snapshot) {
+        store.save(session_id, &model, &messages);
+    }
 
     match outcome {
         Some(turn) => {
@@ -440,6 +529,7 @@ fn replay_history(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, hist
 /// Build the fully-configured ACP agent, ready to `.connect_to(transport)`.
 /// Split out from [`run_acp`] so tests can connect it to an in-process
 /// [`AcpClientRole`] builder instead of real stdio.
+#[allow(clippy::too_many_arguments)]
 fn build_agent(
     make_provider: ProviderFactory,
     workspace: &Path,
@@ -448,6 +538,7 @@ fn build_agent(
     models: Vec<String>,
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
+    sessions_dir: Option<PathBuf>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
     let state = Arc::new(AcpState {
@@ -455,6 +546,7 @@ fn build_agent(
         make_provider,
         models,
         default_model: model,
+        store: sessions_dir.map(|dir| SessionStore { dir }),
     });
 
     AcpAgentRole
@@ -520,12 +612,17 @@ fn build_agent(
             }
         }, agent_client_protocol::on_receive_request!())
         .on_receive_request({
-            // session/load (vikunja #961): Zed calls this to reopen a thread
-            // on window refocus. Known id (process still alive) → replay the
-            // session's in-memory history as session/update notifications so
-            // Zed rebuilds the thread view. Unknown id (process respawned;
-            // we have no on-disk persistence) → create a fresh usable session
-            // under that id rather than error or fabricate resumed history.
+            // session/load (vikunja #961): Zed reopens a thread by calling
+            // this. We resolve the session in the same three states Zed's own
+            // native providers do (see agent/src/agent.rs open_thread):
+            //   1. still live in memory (window-switch)  → replay in-memory
+            //   2. not in memory but persisted on disk (process restarted) →
+            //      restore history from disk, then replay
+            //   3. neither  → error, exactly as native's load_thread does for
+            //      an id not in its store ("no thread found"). We do NOT
+            //      fabricate an empty "resumed" thread.
+            // Either way, replayed `session/update`s rebuild the thread; Zed
+            // registers it before this RPC returns so the notifications land.
             let state = Arc::clone(&state);
             let workspace = workspace.clone();
             let cfg = Arc::clone(&cfg);
@@ -542,38 +639,52 @@ fn build_agent(
                 async move {
                     let session_id = req.session_id.clone();
                     let existing = state.sessions.lock().await.get(&session_id).cloned();
-                    let current_model = match existing {
-                        Some(handle) => {
-                            // Process still alive: replay the in-memory
-                            // history. Zed registers the thread before this
-                            // RPC returns, so replay notifications land.
-                            let agent_session = handle.session.lock().await;
+                    let current_model = if let Some(handle) = existing {
+                        // 1. Live in memory: replay the in-memory history.
+                        let agent_session = handle.session.lock().await;
+                        replay_history(&cx, &session_id, agent_session.history());
+                        drop(agent_session);
+                        handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                    } else if let Some(record) =
+                        state.store.as_ref().and_then(|s| s.load(&session_id))
+                    {
+                        // 2. Persisted on disk (process was restarted):
+                        // rebuild the session, seed its history + model, then
+                        // replay so Zed reconstructs the thread.
+                        let session_workspace =
+                            if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
+                        let handle = match build_session_handle(
+                            &state,
+                            &cfg,
+                            safety,
+                            token_log,
+                            session_id.clone(),
+                            session_workspace,
+                            cx.clone(),
+                        ) {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::util::internal_error(format!("provider init: {e}")),
+                                );
+                            }
+                        };
+                        let model = record.model.clone();
+                        {
+                            let mut agent_session = handle.session.lock().await;
+                            agent_session.set_history(record.messages);
+                            agent_session.set_model(model.clone());
                             replay_history(&cx, &session_id, agent_session.history());
-                            drop(agent_session);
-                            handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone()
                         }
-                        None => {
-                            let session_workspace =
-                                if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
-                            let handle = match build_session_handle(
-                                &state,
-                                &cfg,
-                                safety,
-                                token_log,
-                                session_id.clone(),
-                                session_workspace,
-                                cx,
-                            ) {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    return responder.respond_with_error(
-                                        agent_client_protocol::util::internal_error(format!("provider init: {e}")),
-                                    );
-                                }
-                            };
-                            state.sessions.lock().await.insert(session_id.clone(), handle);
-                            state.default_model.clone()
-                        }
+                        *handle.current_model.lock().unwrap_or_else(|p| p.into_inner()) = model.clone();
+                        state.sessions.lock().await.insert(session_id.clone(), handle);
+                        model
+                    } else {
+                        // 3. Unknown: not live, nothing persisted. Match
+                        // native providers — error rather than fake a resume.
+                        return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                            format!("no session found with id '{session_id}'"),
+                        ));
                     };
                     // Echo the model picker (vikunja #960) with the session's
                     // current model, as session/new does.
@@ -603,7 +714,7 @@ fn build_agent(
                         let stop_reason = match handle {
                             Some(handle) => {
                                 let text = prompt_text(req.prompt);
-                                run_prompt_turn(&handle, &spawn_cx, &session_id, text).await
+                                run_prompt_turn(&handle, &spawn_cx, &session_id, text, state.store.as_ref()).await
                             }
                             None => AcpStopReason::Refusal,
                         };
@@ -687,6 +798,7 @@ fn build_agent(
 /// `make_provider` builds a fresh provider per session (Zed keeps one
 /// process across chat threads); it's validated once up front so a
 /// misconfigured provider fails fast rather than only on the first session.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_acp(
     make_provider: ProviderFactory,
     workspace: &Path,
@@ -695,11 +807,12 @@ pub async fn run_acp(
     models: Vec<String>,
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
+    sessions_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     if let Err(e) = (make_provider)() {
         anyhow::bail!("provider init: {e}");
     }
-    build_agent(make_provider, workspace, cfg, model, models, Arc::new(safety), token_log)
+    build_agent(make_provider, workspace, cfg, model, models, Arc::new(safety), token_log, sessions_dir)
         .connect_to(Stdio::new())
         .await?;
     Ok(())
@@ -817,6 +930,7 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -888,6 +1002,7 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
         );
 
         let (stop_a, stop_b) = AcpClientRole
@@ -943,6 +1058,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
         );
 
@@ -1001,6 +1117,7 @@ mod tests {
                 approval_mode: crate::safety::ApprovalMode::Interactive,
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
         );
 
@@ -1090,6 +1207,7 @@ mod tests {
                 denied_commands: vec!["exec".into()],
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
         );
 
@@ -1184,6 +1302,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
         );
 
@@ -1284,6 +1403,7 @@ mod tests {
             models,
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
         );
 
         let config_options = AcpClientRole
@@ -1332,6 +1452,7 @@ mod tests {
             "model-a".to_string(),
             models,
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
         );
 
@@ -1393,6 +1514,7 @@ mod tests {
             models,
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
         );
 
         let echoed_current = AcpClientRole
@@ -1432,6 +1554,7 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
         );
 
         let load_session = AcpClientRole
@@ -1462,6 +1585,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
         );
 
@@ -1541,13 +1665,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_session_load_unknown_id_creates_fresh_usable_session() {
-        // A respawned process has no in-memory state for the id Zed asks to
-        // load. We create a fresh usable session under that id (rather than
-        // error or fabricate history): it must be promptable, and must NOT
-        // replay any user history it doesn't have.
+    async fn acp_session_load_unknown_id_errors() {
+        // No live session and no persistence: session/load must error, the
+        // same way Zed's native providers reject an id not in their store,
+        // rather than fabricate an empty "resumed" thread.
         let dir = tempfile::tempdir().unwrap();
-        let make_provider = mock_factory(vec![end_turn_resp("fresh-start")]);
+        let make_provider = mock_factory(vec![]);
         let agent = build_agent(
             make_provider,
             dir.path(),
@@ -1556,12 +1679,84 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
+            None,
+        );
+
+        let load_errored = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                // An id that was never created via session/new. Return the raw
+                // result — we expect an error, so we must not `?` it away.
+                let made_up = SessionId::new("never-created-session-id");
+                let result = connection
+                    .send_request(LoadSessionRequest::new(made_up, dir.path()))
+                    .block_task()
+                    .await;
+                Ok(result.is_err())
+            })
+            .await
+            .unwrap();
+
+        assert!(load_errored, "session/load of an unknown id with no persistence must error");
+    }
+
+    #[tokio::test]
+    async fn acp_session_load_resumes_persisted_session_across_processes() {
+        // Cross-process resume (the parity item with native providers): a
+        // session prompted in one `build_agent` is persisted to disk; a SECOND
+        // `build_agent` over the SAME sessions_dir (simulating a Zed restart /
+        // respawned process) must load that history from disk and replay it.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = tempfile::tempdir().unwrap();
+
+        // --- process 1: create a session and prompt it (persists to disk) ---
+        let agent1 = build_agent(
+            mock_factory(vec![end_turn_resp("persisted-answer")]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions_dir.path().to_path_buf()),
+        );
+        let ws1 = dir.path().to_path_buf();
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(agent1, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                let new_session =
+                    connection.send_request(NewSessionRequest::new(ws1)).block_task().await?;
+                let session_id = new_session.session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("persist-me"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(session_id)
+            })
+            .await
+            .unwrap();
+
+        // --- process 2: fresh agent, same sessions_dir, empty in-memory map ---
+        let agent2 = build_agent(
+            mock_factory(vec![]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions_dir.path().to_path_buf()),
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
-
-        let (had_config, stop_reason) = AcpClientRole
+        let ws2 = dir.path().to_path_buf();
+        let load_ok = AcpClientRole
             .builder()
             .on_receive_notification(
                 move |notif: SessionNotification, _cx| {
@@ -1573,31 +1768,47 @@ mod tests {
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
-            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+            .connect_with(agent2, |connection: ConnectionTo<AcpAgentRole>| async move {
                 connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-                // An id that was never created via session/new.
-                let made_up = SessionId::new("never-created-session-id");
-                let load_resp = connection
-                    .send_request(LoadSessionRequest::new(made_up.clone(), dir.path()))
+                let result = connection
+                    .send_request(LoadSessionRequest::new(session_id, ws2))
                     .block_task()
-                    .await?;
-                let prompt_resp = connection
-                    .send_request(PromptRequest::new(
-                        made_up,
-                        vec![AcpContentBlock::Text(TextContent::new("hi"))],
-                    ))
-                    .block_task()
-                    .await?;
-                Ok((load_resp.config_options.is_some(), prompt_resp.stop_reason))
+                    .await;
+                Ok(result.is_ok())
             })
             .await
             .unwrap();
 
-        assert!(had_config, "load of an unknown id must still echo config_options");
-        assert_eq!(stop_reason, AcpStopReason::EndTurn, "fresh session created on load must be promptable");
+        assert!(load_ok, "a persisted session must load in a fresh process");
         let updates = updates.lock().unwrap();
-        let user_chunks = updates.iter().filter(|u| matches!(u, SessionUpdate::UserMessageChunk(_))).count();
-        assert_eq!(user_chunks, 0, "unknown-id load must not fabricate replayed user history: {updates:?}");
+        let user_texts: Vec<String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::UserMessageChunk(c) => match &c.content {
+                    AcpContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let agent_texts: Vec<String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(c) => match &c.content {
+                    AcpContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.iter().any(|t| t == "persist-me"),
+            "cross-process load must replay the persisted user message: {updates:?}"
+        );
+        assert!(
+            agent_texts.iter().any(|t| t == "persisted-answer"),
+            "cross-process load must replay the persisted assistant message: {updates:?}"
+        );
     }
 
     // --- pure mapping helpers ---

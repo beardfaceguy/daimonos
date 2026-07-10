@@ -393,8 +393,22 @@ async fn main() -> anyhow::Result<()> {
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.
             let safety = agent.to_safety_policy(None);
-            acp_cmd::run_acp(make_provider, &workspace, Arc::clone(&cfg), effective_model, models, safety, token_log)
-                .await?;
+            // Persist ACP sessions under ~/.daimonos so session/load can
+            // resume a thread after this process exits and Zed re-requests a
+            // session id from a previous run (see acp_cmd::SessionStore).
+            let sessions_dir = std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".daimonos").join("acp-sessions"));
+            acp_cmd::run_acp(
+                make_provider,
+                &workspace,
+                Arc::clone(&cfg),
+                effective_model,
+                models,
+                safety,
+                token_log,
+                sessions_dir,
+            )
+            .await?;
             return Ok(());
         }
         None => {}
