@@ -441,7 +441,7 @@ mod tests {
             name: "exec".into(),
             input: serde_json::json!({}),
         };
-        assert!(matches!(hook(&info), BeforeHookResult::Block(_)));
+        assert!(matches!(hook(&info).await, BeforeHookResult::Block(_)));
     }
 
     // --- cfg wiring (vikunja #958) ---

@@ -30,7 +30,15 @@ pub enum AfterHookResult {
     Terminate,
 }
 
-pub type BeforeHook = Box<dyn Fn(&ToolCallInfo) -> BeforeHookResult + Send + Sync>;
+/// Async so approval can await a real round-trip (e.g. the ACP engine's
+/// `session/request_permission`), not just a local blocking read. The
+/// future borrows `info` and is always immediately `.await`ed at the call
+/// site, so it doesn't need `'static`.
+pub type BeforeHook = Box<
+    dyn Fn(&ToolCallInfo) -> std::pin::Pin<Box<dyn std::future::Future<Output = BeforeHookResult> + Send + '_>>
+        + Send
+        + Sync,
+>;
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
 /// Invoked with each `StreamEvent` as a turn streams in (vikunja #957).
 pub type StreamHook = Box<dyn Fn(StreamEvent) + Send + Sync>;
@@ -173,7 +181,7 @@ pub async fn run(
                 for (id, name, input) in calls {
                     // before_tool_call hook
                     if let Some(hook) = &config.before_tool_call {
-                        match hook(&ToolCallInfo { id: id.clone(), name: name.clone(), input: input.clone() }) {
+                        match hook(&ToolCallInfo { id: id.clone(), name: name.clone(), input: input.clone() }).await {
                             BeforeHookResult::Allow => {}
                             BeforeHookResult::Block(reason) => {
                                 tool_results.push(ContentBlock::ToolResult {
@@ -725,7 +733,9 @@ mod tests {
             end_turn_resp(),
         ]);
         let config = AgentConfig {
-            before_tool_call: Some(Box::new(|_| BeforeHookResult::Block("not permitted".into()))),
+            before_tool_call: Some(Box::new(|_| {
+                Box::pin(std::future::ready(BeforeHookResult::Block("not permitted".into())))
+            })),
             ..AgentConfig::default()
         };
         let result = run(&provider, &mut s, vec![Message::user("go")], &config).await;
