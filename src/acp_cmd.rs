@@ -16,8 +16,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use serde::{Deserialize, Serialize};
-
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock,
     ContentChunk, Cost as AcpCost, InitializeRequest, InitializeResponse, LoadSessionRequest,
@@ -41,6 +39,7 @@ use crate::agent_cmd::default_system_prompt;
 use crate::config::Config;
 use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema, Usage};
 use crate::session::Session;
+use crate::session_store::SessionStore;
 use crate::tool_facade;
 
 /// One in-flight prompt's cancellation switch. Stored outside the
@@ -86,78 +85,6 @@ struct SessionHandle {
     cancel: CancelSlot,
     connection: CurrentConnection,
     current_model: CurrentModel,
-}
-
-/// Version tag on the persisted-session JSON, so a future on-disk format
-/// change can be detected and old files ignored rather than mis-parsed.
-const SESSION_PERSIST_VERSION: u32 = 1;
-
-/// One session's on-disk record: enough to rebuild the thread on a
-/// cross-process `session/load` (history + the model it was on).
-#[derive(Serialize, Deserialize)]
-struct PersistedSession {
-    version: u32,
-    session_id: String,
-    model: String,
-    messages: Vec<crate::providers::Message>,
-}
-
-/// On-disk store for ACP session history. Zed persists ACP session ids in its
-/// own metadata DB and, after a restart, calls `session/load` with an id
-/// minted in a previous daimonos process. In-memory replay can't serve that
-/// (the process is gone), so — mirroring how Zed's native providers restore
-/// full history from their local store — we persist each session to a JSON
-/// file (one per id, rewritten after every completed prompt turn) and reload
-/// it on `session/load`.
-#[derive(Clone)]
-struct SessionStore {
-    dir: PathBuf,
-}
-
-impl SessionStore {
-    /// Filename for a session id, or `None` if the id has characters unsafe as
-    /// a path component. Our ids are UUIDs; this only guards a hostile or
-    /// malformed id against path traversal / collisions.
-    fn file_name(session_id: &SessionId) -> Option<String> {
-        let id = session_id.to_string();
-        let safe =
-            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        safe.then(|| format!("{id}.json"))
-    }
-
-    /// Persist a session's history. Best-effort: a write failure is logged to
-    /// stderr and never fails the prompt turn.
-    fn save(&self, session_id: &SessionId, model: &str, messages: &[crate::providers::Message]) {
-        let Some(name) = Self::file_name(session_id) else { return };
-        let record = PersistedSession {
-            version: SESSION_PERSIST_VERSION,
-            session_id: session_id.to_string(),
-            model: model.to_string(),
-            messages: messages.to_vec(),
-        };
-        if let Err(e) = self.write_atomic(&name, &record) {
-            eprintln!("acp: failed to persist session {session_id}: {e}");
-        }
-    }
-
-    fn write_atomic(&self, name: &str, record: &PersistedSession) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let json = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-        // Write to a temp file then rename, so a crash mid-write can't leave a
-        // truncated JSON file that would fail to load.
-        let tmp = self.dir.join(format!("{name}.tmp"));
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, self.dir.join(name))
-    }
-
-    /// Load a persisted session, or `None` if absent / unreadable / a version
-    /// we don't recognise (all treated as "not resumable", never an error).
-    fn load(&self, session_id: &SessionId) -> Option<PersistedSession> {
-        let name = Self::file_name(session_id)?;
-        let bytes = std::fs::read(self.dir.join(name)).ok()?;
-        let record: PersistedSession = serde_json::from_slice(&bytes).ok()?;
-        (record.version == SESSION_PERSIST_VERSION).then_some(record)
-    }
 }
 
 /// Shared engine state across all sessions on one process.
@@ -438,7 +365,7 @@ async fn run_prompt_turn(
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     if let (Some(store), Some(messages)) = (store, history_snapshot) {
-        store.save(session_id, &model, &messages);
+        store.save(&session_id.to_string(), &model, &messages);
     }
 
     match outcome {
@@ -546,7 +473,7 @@ fn build_agent(
         make_provider,
         models,
         default_model: model,
-        store: sessions_dir.map(|dir| SessionStore { dir }),
+        store: sessions_dir.map(SessionStore::new),
     });
 
     AcpAgentRole
@@ -646,7 +573,7 @@ fn build_agent(
                         drop(agent_session);
                         handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone()
                     } else if let Some(record) =
-                        state.store.as_ref().and_then(|s| s.load(&session_id))
+                        state.store.as_ref().and_then(|s| s.load(&session_id.to_string()))
                     {
                         // 2. Persisted on disk (process was restarted):
                         // rebuild the session, seed its history + model, then
