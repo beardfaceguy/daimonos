@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
@@ -6,9 +6,10 @@ use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use crate::agent::{AgentConfig, AgentSession, TokenLogConfig};
 use crate::agent_cmd::default_system_prompt;
 use crate::config::Config;
-use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema};
+use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
+use crate::session_store::{PersistedSession, SessionStore, SessionSummary};
 use crate::tool_facade;
 
 const HELP_TEXT: &str = "\
@@ -91,25 +92,113 @@ fn build_tool_session(workspace: &Path, cfg: Arc<Config>) -> Session {
     Session::new(workspace.to_path_buf(), cfg)
 }
 
+/// Load a saved session for `--resume`, erroring (rather than silently
+/// starting fresh) if the id isn't found — mirrors the ACP `session/load`
+/// "no session found" decision (vikunja #961).
+fn load_resume(store: Option<&SessionStore>, id: &str) -> anyhow::Result<PersistedSession> {
+    match store.and_then(|s| s.load(id)) {
+        Some(record) => Ok(record),
+        None => anyhow::bail!("no saved chat session with id '{id}' (try `daimonos chat --list`)"),
+    }
+}
+
+/// Pick the model for a (possibly resumed) chat session: an explicit
+/// `--model` always wins; otherwise a resumed session prefers the model it
+/// was saved on; otherwise the launch default (flag-or-env) stands. (The
+/// terminal REPL has no live model picker — that's the ACP/Zed frontend — so
+/// this is the only place a resumed session's model is honored.)
+fn resolve_model(launch_model: &str, model_explicit: bool, resumed_model: Option<&str>) -> String {
+    match resumed_model {
+        Some(saved) if !model_explicit => saved.to_string(),
+        _ => launch_model.to_string(),
+    }
+}
+
+/// Render a resumed conversation for the terminal so the user sees prior
+/// context on `--resume`. User messages are prefixed with `> `, assistant
+/// text is shown plainly, tool calls are summarized; tool results and
+/// thinking are omitted to keep the recap readable.
+fn render_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text(text) => match message.role {
+                    Role::User => {
+                        out.push_str("> ");
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    Role::Assistant => {
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                },
+                ContentBlock::ToolCall { name, .. } => out.push_str(&format!("[tool: {name}]\n")),
+                ContentBlock::Thinking(_) | ContentBlock::ToolResult { .. } => {}
+            }
+        }
+    }
+    out
+}
+
+/// Format the `daimonos chat --list` output: one line per saved session with
+/// its id, model, message count, and first-user-line label.
+pub fn format_session_list(sessions: &[SessionSummary]) -> String {
+    if sessions.is_empty() {
+        return "no saved chat sessions".to_string();
+    }
+    sessions
+        .iter()
+        .map(|s| {
+            let label = s.first_user_line.as_deref().unwrap_or("(empty)");
+            format!("{}  [{}]  {} msgs  {}", s.id, s.model, s.message_count, label)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Run the interactive `daimonos chat` REPL to completion (`/exit` or Ctrl-D).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat(
     provider: Box<dyn LlmProvider>,
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    model_explicit: bool,
     safety: Option<SafetyPolicy>,
     token_log: Option<std::path::PathBuf>,
+    sessions_dir: Option<PathBuf>,
+    resume: Option<String>,
 ) -> anyhow::Result<()> {
-    let config = build_agent_config(workspace, model, safety, token_log);
+    let config = build_agent_config(workspace, model.clone(), safety, token_log);
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
+
+    // Persist to disk so the conversation can be resumed later (vikunja #963).
+    // `None` disables persistence (tests). A resumed session keeps its id;
+    // a fresh one mints a uuid.
+    let store = sessions_dir.map(SessionStore::new);
+    let session_id = resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // On --resume, restore the prior history and echo the transcript so the
+    // user sees where they left off before the next prompt.
+    if let Some(id) = &resume {
+        let record = load_resume(store.as_ref(), id)?;
+        print!("{}", render_transcript(&record.messages));
+        // Prefer the model the session was saved on, unless --model was passed.
+        let resolved = resolve_model(&model, model_explicit, Some(&record.model));
+        session.set_history(record.messages);
+        session.set_model(resolved.as_str());
+        println!("[resumed session {id} (model: {resolved})]");
+    }
 
     let mut line_editor = Reedline::create();
     // Distinct "*D*" left segment so the REPL prompt is never mistaken for a
     // regular shell prompt (which the default reedline cwd-based prompt resembles).
     let prompt = DefaultPrompt::new(DefaultPromptSegment::Basic("*D*".to_string()), DefaultPromptSegment::Empty);
 
-    println!("daimonos chat — type /help for commands, Ctrl-D to quit.");
+    println!("daimonos chat [{session_id}] — type /help for commands, Ctrl-D to quit.");
 
     loop {
         match line_editor.read_line(&prompt) {
@@ -117,6 +206,9 @@ pub async fn run_chat(
                 ChatCommand::Exit => break,
                 ChatCommand::Clear => {
                     session.clear();
+                    if let Some(store) = &store {
+                        store.save(&session_id, session.model(), session.history());
+                    }
                     println!("[history cleared]");
                 }
                 ChatCommand::Help => println!("{HELP_TEXT}"),
@@ -131,7 +223,7 @@ pub async fn run_chat(
                     if text.is_empty() {
                         continue;
                     }
-                    tokio::select! {
+                    let completed = tokio::select! {
                         turn = session.prompt(text) => {
                             if let Some(err) = &turn.error_message {
                                 eprintln!("[error] {err}");
@@ -141,9 +233,19 @@ pub async fn run_chat(
                             if !turn.text.is_empty() {
                                 println!();
                             }
+                            true
                         }
                         _ = tokio::signal::ctrl_c() => {
                             eprintln!("\n[turn aborted]");
+                            false
+                        }
+                    };
+                    // Persist only a completed turn — an aborted one leaves
+                    // history unchanged (prompt is cancel-safe), so there's
+                    // nothing new to save.
+                    if completed {
+                        if let Some(store) = &store {
+                            store.save(&session_id, session.model(), session.history());
                         }
                     }
                 }
@@ -307,5 +409,92 @@ mod tests {
 
         let session = build_tool_session(dir.path(), Arc::new(cfg));
         assert_eq!(session.verbosity, crate::verbosity::Verbosity::Terse);
+    }
+
+    // --- session persistence / resume (vikunja #963) ---
+
+    #[test]
+    fn load_resume_returns_saved_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("sess-1", "saved-model", &[Message::user("prior question"), Message::assistant("prior answer")]);
+
+        let record = load_resume(Some(&store), "sess-1").expect("saved session should resume");
+        assert_eq!(record.messages.len(), 2);
+        assert_eq!(record.model, "saved-model");
+        assert!(matches!(&record.messages[0].content[0], ContentBlock::Text(t) if t == "prior question"));
+    }
+
+    #[test]
+    fn resolve_model_prefers_saved_unless_flag_explicit() {
+        // Resuming, no explicit --model: use the model the session was saved on.
+        assert_eq!(resolve_model("launch-default", false, Some("saved-model")), "saved-model");
+        // Resuming, explicit --model: the flag wins over the saved model.
+        assert_eq!(resolve_model("flag-model", true, Some("saved-model")), "flag-model");
+        // Fresh session (no resume): the launch model stands, explicit or not.
+        assert_eq!(resolve_model("launch-default", false, None), "launch-default");
+        assert_eq!(resolve_model("flag-model", true, None), "flag-model");
+    }
+
+    #[test]
+    fn load_resume_unknown_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        assert!(
+            load_resume(Some(&store), "nope").is_err(),
+            "resuming an unknown id must error, not start a silent fresh session"
+        );
+    }
+
+    #[test]
+    fn load_resume_without_store_errors() {
+        assert!(load_resume(None, "any").is_err(), "resume with persistence disabled must error");
+    }
+
+    #[test]
+    fn render_transcript_shows_user_and_assistant_skips_noise() {
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking("(hidden)".into()),
+                    ContentBlock::Text("hi there".into()),
+                    ContentBlock::ToolCall {
+                        id: "t1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            // Tool result comes back as a User-role message; must be skipped.
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "file contents".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let out = render_transcript(&messages);
+        assert!(out.contains("> hello"), "user message should be prefixed: {out:?}");
+        assert!(out.contains("hi there"), "assistant text should show: {out:?}");
+        assert!(out.contains("[tool: read_file]"), "tool call should be summarized: {out:?}");
+        assert!(!out.contains("hidden"), "thinking must be omitted: {out:?}");
+        assert!(!out.contains("file contents"), "tool result must be omitted: {out:?}");
+    }
+
+    #[test]
+    fn format_session_list_empty_and_populated() {
+        assert_eq!(format_session_list(&[]), "no saved chat sessions");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("sess-1", "model-x", &[Message::user("do the thing")]);
+        let listed = format_session_list(&store.list());
+        assert!(listed.contains("sess-1"), "list should show the id: {listed:?}");
+        assert!(listed.contains("model-x"), "list should show the model: {listed:?}");
+        assert!(listed.contains("do the thing"), "list should show the label: {listed:?}");
     }
 }

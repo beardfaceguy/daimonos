@@ -9,6 +9,7 @@ mod plugins;
 mod protocol;
 mod script;
 mod session;
+mod session_store;
 mod snapshot;
 mod acp_cmd;
 mod agent;
@@ -146,6 +147,12 @@ enum Commands {
         /// ~/.config/daimonos/agent.env)
         #[arg(long)]
         agent_env: Option<std::path::PathBuf>,
+        /// Resume a saved chat session by id (see --list)
+        #[arg(long)]
+        resume: Option<String>,
+        /// List saved chat sessions and exit
+        #[arg(long, default_value_t = false)]
+        list: bool,
     },
     /// Run a native Agent Client Protocol engine over stdio (for Zed and
     /// other ACP editors)
@@ -344,7 +351,21 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Commands::Chat { model, provider, agent_env }) => {
+        Some(Commands::Chat { model, provider, agent_env, resume, list }) => {
+            // Chat sessions persist under ~/.daimonos so `--resume`/`--list`
+            // can restore a prior conversation (vikunja #963). Separate dir
+            // from acp-sessions to keep the two id namespaces from colliding.
+            let sessions_dir = std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".daimonos").join("chat-sessions"));
+            // --list is a pure query: enumerate saved sessions and exit
+            // without loading the agent env / building a provider.
+            if list {
+                let sessions = sessions_dir
+                    .map(|d| session_store::SessionStore::new(d).list())
+                    .unwrap_or_default();
+                println!("{}", chat_cmd::format_session_list(&sessions));
+                return Ok(());
+            }
             let agent = match agent_env::AgentEnv::load(agent_env) {
                 Ok(a) => a,
                 Err(e) => {
@@ -353,6 +374,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+            // Whether the user explicitly passed --model: on --resume, an
+            // explicit flag wins, otherwise the resumed session's saved model
+            // is preferred (vikunja #963).
+            let model_explicit = model.is_some();
             let effective_model = model.unwrap_or_else(|| agent.model.clone());
             let llm = build_llm_provider(&effective_provider, &agent);
             let approve_fn = if agent.approval_mode == "auto" {
@@ -361,7 +386,18 @@ async fn main() -> anyhow::Result<()> {
                 Some(safety::SafetyPolicy::stdin_approve_fn())
             };
             let safety = agent.to_safety_policy(approve_fn);
-            chat_cmd::run_chat(llm, &workspace, Arc::clone(&cfg), effective_model, Some(safety), token_log).await?;
+            chat_cmd::run_chat(
+                llm,
+                &workspace,
+                Arc::clone(&cfg),
+                effective_model,
+                model_explicit,
+                Some(safety),
+                token_log,
+                sessions_dir,
+                resume,
+            )
+            .await?;
             return Ok(());
         }
         Some(Commands::Acp { model, provider, agent_env }) => {
