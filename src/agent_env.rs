@@ -31,6 +31,11 @@ pub struct AgentEnv {
     pub api_key: String,
     pub allowed_commands: Vec<String>,
     pub denied_commands: Vec<String>,
+    /// Candidate models for the ACP model picker (vikunja #960), from the
+    /// optional `DAIMONOS_AGENT_MODELS` comma-list. `model` (the active one)
+    /// is always present — prepended if the list omits it, and the list is
+    /// deduped preserving first-seen order. Never empty (at minimum `[model]`).
+    pub models: Vec<String>,
 }
 
 impl AgentEnv {
@@ -109,14 +114,18 @@ impl AgentEnv {
             ));
         }
 
+        let model = present("DAIMONOS_AGENT_MODEL").unwrap();
+        let models = candidate_models(&model, parse_list(vars.get("DAIMONOS_AGENT_MODELS")));
+
         Ok(AgentEnv {
             provider,
-            model: present("DAIMONOS_AGENT_MODEL").unwrap(),
+            model,
             base_url: present("DAIMONOS_AGENT_BASE_URL").unwrap(),
             approval_mode,
             api_key: present("DAIMONOS_AGENT_API_KEY").unwrap(),
             allowed_commands: parse_list(vars.get("DAIMONOS_AGENT_ALLOWED_COMMANDS")),
             denied_commands: parse_list(vars.get("DAIMONOS_AGENT_DENIED_COMMANDS")),
+            models,
         })
     }
 
@@ -185,6 +194,25 @@ fn parse_dotenv(content: &str) -> HashMap<String, String> {
     map
 }
 
+/// Build the picker's candidate model list: `current` is always present
+/// (prepended if the configured list omits it), duplicates removed while
+/// preserving first-seen order. Result is never empty.
+fn candidate_models(current: &str, configured: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |m: String| {
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    };
+    if !configured.iter().any(|m| m == current) {
+        push_unique(current.to_string());
+    }
+    for m in configured {
+        push_unique(m);
+    }
+    out
+}
+
 /// Parse an optional comma-separated list into trimmed, non-empty entries.
 fn parse_list(raw: Option<&String>) -> Vec<String> {
     raw.map(|s| {
@@ -222,6 +250,55 @@ mod tests {
         assert_eq!(e.approval_mode, "interactive");
         assert_eq!(e.api_key, "sk-test");
         assert!(e.allowed_commands.is_empty() && e.denied_commands.is_empty());
+        // No DAIMONOS_AGENT_MODELS → picker list is just the active model.
+        assert_eq!(e.models, vec!["anthropic/claude-sonnet-4.6"]);
+    }
+
+    #[test]
+    fn models_list_defaults_to_just_the_active_model() {
+        let e = load_str(&base()).unwrap();
+        assert_eq!(e.models, vec![e.model.clone()]);
+    }
+
+    #[test]
+    fn models_list_includes_configured_and_keeps_order() {
+        let s = base()
+            + "DAIMONOS_AGENT_MODELS=anthropic/claude-sonnet-4.6, anthropic/claude-opus-4.1 ,anthropic/claude-haiku-4.5\n";
+        let e = load_str(&s).unwrap();
+        assert_eq!(
+            e.models,
+            vec![
+                "anthropic/claude-sonnet-4.6",
+                "anthropic/claude-opus-4.1",
+                "anthropic/claude-haiku-4.5",
+            ]
+        );
+    }
+
+    #[test]
+    fn active_model_prepended_when_absent_from_configured_list() {
+        let s = base() + "DAIMONOS_AGENT_MODELS=anthropic/claude-opus-4.1,anthropic/claude-haiku-4.5\n";
+        let e = load_str(&s).unwrap();
+        // active model (sonnet-4.6) not in the configured list → prepended.
+        assert_eq!(
+            e.models,
+            vec![
+                "anthropic/claude-sonnet-4.6",
+                "anthropic/claude-opus-4.1",
+                "anthropic/claude-haiku-4.5",
+            ]
+        );
+    }
+
+    #[test]
+    fn models_list_dedupes_preserving_first_seen() {
+        let s = base()
+            + "DAIMONOS_AGENT_MODELS=anthropic/claude-opus-4.1,anthropic/claude-sonnet-4.6,anthropic/claude-opus-4.1\n";
+        let e = load_str(&s).unwrap();
+        assert_eq!(
+            e.models,
+            vec!["anthropic/claude-opus-4.1", "anthropic/claude-sonnet-4.6"]
+        );
     }
 
     #[test]
