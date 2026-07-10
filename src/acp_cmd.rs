@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock, ContentChunk,
-    Cost as AcpCost, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionNotification,
-    SessionUpdate, StopReason as AcpStopReason, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock,
+    ContentChunk, Cost as AcpCost, InitializeRequest, InitializeResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    StopReason as AcpStopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -53,12 +55,27 @@ type CancelSlot = Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>;
 /// with that call's fresh handle; read fresh by the hooks on each use.
 type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 
+/// The model the user has selected via the ACP model picker (vikunja #960).
+/// A cheap `std::sync::Mutex` separate from the session lock so
+/// `session/set_config_option` can update it instantly without stalling the
+/// dispatch loop or waiting on an in-flight prompt's session lock. Applied
+/// to the session at the top of each `run_prompt_turn`, so a switch takes
+/// effect on the next prompt (you can't change model mid-turn anyway).
+type CurrentModel = Arc<StdMutex<String>>;
+
 /// v1 shared state: one active session at a time.
 struct AcpState {
     session: tokio::sync::Mutex<Option<AgentSession>>,
     cancel: CancelSlot,
     connection: CurrentConnection,
+    current_model: CurrentModel,
+    /// Candidate models for the picker (from `DAIMONOS_AGENT_MODELS`);
+    /// always non-empty (includes the active model).
+    models: Vec<String>,
 }
+
+/// The `SessionConfigId` for the model picker option.
+const MODEL_CONFIG_ID: &str = "model";
 
 /// Map a daimonos tool name to the closest ACP [`ToolKind`] for client UI
 /// (icon/treatment) purposes. Best-effort — unmapped tools fall back to
@@ -211,6 +228,20 @@ fn emit_usage_update(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, m
     send_notification(cx, session_id, SessionUpdate::UsageUpdate(update));
 }
 
+/// Build the single model-picker config option (vikunja #960): a `Select`
+/// of `models`, `category: Model` (the UX hint that makes Zed render it as
+/// the model dropdown), with `current` marked selected. Model id == display
+/// name for v1. Returns the full `config_options` list to advertise.
+fn model_config_options(models: &[String], current: &str) -> Vec<SessionConfigOption> {
+    let options: Vec<SessionConfigSelectOption> = models
+        .iter()
+        .map(|m| SessionConfigSelectOption::new(m.clone(), m.clone()))
+        .collect();
+    let option = SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
+        .category(Some(SessionConfigOptionCategory::Model));
+    vec![option]
+}
+
 /// Build the [`AgentConfig`] for one ACP session — mirrors
 /// `chat_cmd::build_agent_config`, but every hook reports through
 /// `session/update`/`session/request_permission` instead of the terminal.
@@ -268,7 +299,6 @@ async fn run_prompt_turn(
     state: &Arc<AcpState>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    model: &str,
     text: String,
 ) -> AcpStopReason {
     // Acquire exclusive access to the session *before* publishing this
@@ -289,6 +319,12 @@ async fn run_prompt_turn(
         return AcpStopReason::Refusal;
     };
 
+    // Apply the picker's current model selection to the session before the
+    // turn — a model switch made via session/set_config_option takes effect
+    // on the next prompt (vikunja #960).
+    let model = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    agent_session.set_model(model.clone());
+
     let outcome = tokio::select! {
         turn = agent_session.prompt(text) => Some(turn),
         _ = notify.notified() => None,
@@ -298,7 +334,7 @@ async fn run_prompt_turn(
 
     match outcome {
         Some(turn) => {
-            emit_usage_update(cx, session_id, model, &turn.usage);
+            emit_usage_update(cx, session_id, &model, &turn.usage);
             map_stop_reason(turn.stop_reason)
         }
         None => AcpStopReason::Cancelled,
@@ -313,6 +349,7 @@ fn build_agent(
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    models: Vec<String>,
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
 ) -> impl ConnectTo<AcpClientRole> {
@@ -321,6 +358,8 @@ fn build_agent(
         session: tokio::sync::Mutex::new(None),
         cancel: Arc::new(StdMutex::new(None)),
         connection: Arc::new(StdMutex::new(None)),
+        current_model: Arc::new(StdMutex::new(model.clone())),
+        models,
     });
     let provider = Arc::new(std::sync::Mutex::new(Some(provider)));
     let safety = Arc::new(safety);
@@ -378,18 +417,21 @@ fn build_agent(
                     let tool_session = Session::new(session_workspace, cfg);
                     let agent_session = AgentSession::new(provider, tool_session, config);
                     *state.session.lock().await = Some(agent_session);
-                    responder.respond(NewSessionResponse::new(session_id))
+                    // Advertise the model picker (vikunja #960). Current
+                    // selection is read from the shared cell so it survives
+                    // across sessions within the process.
+                    let current = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let config_options = model_config_options(&state.models, &current);
+                    responder.respond(NewSessionResponse::new(session_id).config_options(Some(config_options)))
                 }
             }
         }, agent_client_protocol::on_receive_request!())
         .on_receive_request({
             let state = Arc::clone(&state);
-            let model = model.clone();
             move |req: PromptRequest,
                   responder: agent_client_protocol::Responder<PromptResponse>,
                   cx: ConnectionTo<AcpClientRole>| {
                 let state = Arc::clone(&state);
-                let model = model.clone();
                 async move {
                     // Must use `cx.spawn`, not a bare `tokio::spawn`: requests
                     // sent via `.block_task()` from within this task (e.g. the
@@ -402,11 +444,37 @@ fn build_agent(
                     let _ = cx.spawn(async move {
                         let session_id = req.session_id;
                         let text = prompt_text(req.prompt);
-                        let stop_reason = run_prompt_turn(&state, &spawn_cx, &session_id, &model, text).await;
+                        let stop_reason = run_prompt_turn(&state, &spawn_cx, &session_id, text).await;
                         let _ = responder.respond(PromptResponse::new(stop_reason));
                         Ok(())
                     });
                     Ok(())
+                }
+            }
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request({
+            // Model picker (vikunja #960): the user picked a model in Zed's
+            // dropdown. Update the shared current-model cell (cheap, no
+            // dispatch-loop stall, no wait on an in-flight prompt's session
+            // lock); it's applied to the session on the next prompt turn.
+            let state = Arc::clone(&state);
+            move |req: SetSessionConfigOptionRequest,
+                  responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
+                  _cx: ConnectionTo<AcpClientRole>| {
+                let state = Arc::clone(&state);
+                async move {
+                    if req.config_id.to_string() == MODEL_CONFIG_ID {
+                        if let Some(value) = req.value.as_value_id() {
+                            let picked = value.to_string();
+                            // Only honor a value we actually advertised.
+                            if state.models.iter().any(|m| m == &picked) {
+                                *state.current_model.lock().unwrap_or_else(|p| p.into_inner()) = picked;
+                            }
+                        }
+                    }
+                    let current = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let options = model_config_options(&state.models, &current);
+                    responder.respond(SetSessionConfigOptionResponse::new(options))
                 }
             }
         }, agent_client_protocol::on_receive_request!())
@@ -449,10 +517,11 @@ pub async fn run_acp(
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
+    models: Vec<String>,
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    build_agent(provider, workspace, cfg, model, safety, token_log)
+    build_agent(provider, workspace, cfg, model, models, safety, token_log)
         .connect_to(Stdio::new())
         .await?;
     Ok(())
@@ -560,6 +629,7 @@ mod tests {
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy::default(),
             None,
         );
@@ -625,6 +695,7 @@ mod tests {
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy::default(),
             None,
         );
@@ -659,6 +730,7 @@ mod tests {
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy::default(),
             None,
         );
@@ -713,6 +785,7 @@ mod tests {
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy {
                 approval_mode: crate::safety::ApprovalMode::Interactive,
                 ..crate::safety::SafetyPolicy::default()
@@ -801,6 +874,7 @@ mod tests {
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy {
                 denied_commands: vec!["exec".into()],
                 ..crate::safety::SafetyPolicy::default()
@@ -897,6 +971,7 @@ mod tests {
             build_agent_workspace.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             crate::safety::SafetyPolicy::default(),
             None,
         );
@@ -947,6 +1022,182 @@ mod tests {
             _ => false,
         });
         assert!(completed_with_marker, "tool should have read marker.txt from the session's cwd: {updates:?}");
+    }
+
+    // --- model picker (vikunja #960) ---
+
+    /// Captures the model each turn was sent with (from `CompleteOpts.model`).
+    struct ModelCaptureProvider {
+        seen: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ModelCaptureProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            self.seen.lock().unwrap().push(opts.model.clone());
+            end_turn_resp("ok")
+        }
+    }
+
+    /// Pull the single model `SessionConfigOption` out of a config_options list.
+    fn model_option(
+        options: &[SessionConfigOption],
+    ) -> &SessionConfigOption {
+        options
+            .iter()
+            .find(|o| o.id.to_string() == MODEL_CONFIG_ID)
+            .expect("a 'model' config option should be advertised")
+    }
+
+    fn select_state(option: &SessionConfigOption) -> &agent_client_protocol::schema::v1::SessionConfigSelect {
+        match &option.kind {
+            agent_client_protocol::schema::v1::SessionConfigKind::Select(s) => s,
+            _ => panic!("model option should be a Select"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_advertises_model_config_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![]));
+        let models = vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()];
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "model-a".to_string(),
+            models,
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
+
+        let config_options = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                Ok(new_session.config_options)
+            })
+            .await
+            .unwrap()
+            .expect("session/new should advertise config_options");
+
+        let option = model_option(&config_options);
+        assert_eq!(option.category, Some(SessionConfigOptionCategory::Model));
+        let select = select_state(option);
+        assert_eq!(select.current_value.to_string(), "model-a");
+        let ids: Vec<String> = match &select.options {
+            agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(opts) => {
+                opts.iter().map(|o| o.value.to_string()).collect()
+            }
+            _ => panic!("expected ungrouped options"),
+        };
+        assert_eq!(ids, vec!["model-a", "model-b", "model-c"]);
+    }
+
+    #[tokio::test]
+    async fn acp_set_config_option_switches_model_for_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) });
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "model-a".to_string(),
+            models,
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
+
+        let echoed_current = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let session_id = new_session.session_id;
+
+                // Pick model-b via the picker.
+                let set_resp = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        MODEL_CONFIG_ID,
+                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id("model-b"),
+                    ))
+                    .block_task()
+                    .await?;
+
+                // Then send a prompt — it should run on model-b.
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                Ok(select_state(model_option(&set_resp.config_options)).current_value.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(echoed_current, "model-b", "set_config_option response must echo the new selection");
+        assert_eq!(*seen.lock().unwrap(), vec!["model-b".to_string()], "the prompt turn must use the picked model");
+    }
+
+    #[tokio::test]
+    async fn acp_set_config_option_ignores_unadvertised_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) });
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let agent = build_agent(
+            provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "model-a".to_string(),
+            models,
+            crate::safety::SafetyPolicy::default(),
+            None,
+        );
+
+        let echoed_current = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                let new_session =
+                    connection.send_request(NewSessionRequest::new(dir.path())).block_task().await?;
+                let set_resp = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        new_session.session_id,
+                        MODEL_CONFIG_ID,
+                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id("model-evil"),
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(select_state(model_option(&set_resp.config_options)).current_value.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(echoed_current, "model-a", "an unadvertised model must be ignored, current unchanged");
     }
 
     // --- pure mapping helpers ---

@@ -301,6 +301,18 @@ impl AgentSession {
     pub fn clear(&mut self) {
         self.messages.clear();
     }
+
+    /// Switch the model used for subsequent turns (e.g. the ACP model
+    /// picker, vikunja #960). History and cumulative usage are preserved —
+    /// only the model sent on the next `prompt` changes.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.config.opts.model = model.into();
+    }
+
+    /// The model currently configured for this session.
+    pub fn model(&self) -> &str {
+        &self.config.opts.model
+    }
 }
 
 /// Concatenate the `Text` blocks of the last assistant message in `messages`.
@@ -437,6 +449,37 @@ mod tests {
         sess.clear();
         assert_eq!(sess.history().len(), 0);
         assert_eq!(sess.total_usage().input, 100, "cumulative usage kept after clear");
+    }
+
+    #[tokio::test]
+    async fn session_set_model_changes_model_sent_on_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            opts: CompleteOpts { model: "model-a".to_string(), ..CompleteOpts::default() },
+            ..AgentConfig::default()
+        };
+        // Capture the model the provider actually sees each turn.
+        struct ModelCapture(std::sync::Arc<Mutex<Vec<String>>>);
+        #[async_trait]
+        impl LlmProvider for ModelCapture {
+            async fn complete(&self, _ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+                self.0.lock().unwrap().push(opts.model.clone());
+                end_turn_resp()
+            }
+        }
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ModelCapture(std::sync::Arc::clone(&seen)));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), config);
+        assert_eq!(sess.model(), "model-a");
+
+        sess.prompt("first").await;
+        sess.set_model("model-b");
+        assert_eq!(sess.model(), "model-b");
+        sess.prompt("second").await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["model-a".to_string(), "model-b".to_string()]);
+        // History persists across the model switch (user + asst) x2.
+        assert_eq!(sess.history().len(), 4);
     }
 
     // --- token_log (vikunja: --debug-tokens) ---

@@ -365,12 +365,20 @@ async fn main() -> anyhow::Result<()> {
             };
             let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
             let effective_model = model.unwrap_or_else(|| agent.model.clone());
+            // Candidate models for the picker (vikunja #960): the env's list,
+            // with the effective model (which a --model flag may have
+            // overridden to something outside that list) guaranteed present.
+            let mut models = agent.models.clone();
+            if !models.iter().any(|m| m == &effective_model) {
+                models.insert(0, effective_model.clone());
+            }
             let llm = build_llm_provider(&effective_provider, &agent);
             // No approve_fn: ACP asks the client via session/request_permission,
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.
             let safety = agent.to_safety_policy(None);
-            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, safety, token_log).await?;
+            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, models, safety, token_log)
+                .await?;
             return Ok(());
         }
         None => {}
