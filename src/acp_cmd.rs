@@ -4,8 +4,10 @@
 //!
 //! Scope (v1): one active session at a time, text-only prompts, tool-call
 //! lifecycle + permission requests + live usage reporting via
-//! `session/update`. Cancellable via `session/cancel`. Out of scope for v1:
-//! multiple concurrent sessions, `session/load` (resume), and the
+//! `session/update`. Cancellable via `session/cancel`. Multiple concurrent
+//! sessions (Zed keeps one process across chat threads) and `session/load`
+//! (thread refocus — replays in-memory history) are supported. Out of
+//! scope: cross-process resume (needs on-disk session persistence) and the
 //! `fs/*`/`terminal/*` client-proxy methods — daimonos has its own
 //! file/exec tools and doesn't need to shell out through the client for them.
 
@@ -15,7 +17,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock,
-    ContentChunk, Cost as AcpCost, InitializeRequest, InitializeResponse, NewSessionRequest,
+    ContentChunk, Cost as AcpCost, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionNotification,
@@ -358,6 +361,82 @@ async fn run_prompt_turn(
     }
 }
 
+/// Build a fresh session handle (provider + agent session + per-session
+/// cells) without inserting it into the map. Shared by `session/new` and the
+/// unknown-id branch of `session/load` (a respawned process has no in-memory
+/// state for the requested id).
+#[allow(clippy::too_many_arguments)]
+fn build_session_handle(
+    state: &AcpState,
+    cfg: &Arc<Config>,
+    safety: Arc<crate::safety::SafetyPolicy>,
+    token_log: Option<PathBuf>,
+    session_id: SessionId,
+    session_workspace: PathBuf,
+    cx: ConnectionTo<AcpClientRole>,
+) -> Result<Arc<SessionHandle>, String> {
+    // Build a fresh provider for this session — Zed keeps one process across
+    // multiple chat threads, so we can't reuse a single moved-once provider.
+    let provider = (state.make_provider)()?;
+    let connection: CurrentConnection = Arc::new(StdMutex::new(Some(cx)));
+    let config = build_agent_config(
+        &session_workspace,
+        state.default_model.clone(),
+        Arc::clone(&connection),
+        session_id.clone(),
+        safety,
+        token_log,
+    );
+    let tool_session = Session::new(session_workspace, Arc::clone(cfg));
+    Ok(Arc::new(SessionHandle {
+        session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
+        cancel: Arc::new(StdMutex::new(None)),
+        connection,
+        current_model: Arc::new(StdMutex::new(state.default_model.clone())),
+    }))
+}
+
+/// Replay a loaded session's in-memory history back to the client as
+/// `session/update` notifications, so Zed rebuilds the reopened thread's
+/// view on `session/load`. User text → `UserMessageChunk`, assistant text →
+/// `AgentMessageChunk`, tool calls/results → the `ToolCall`/`ToolCallUpdate`
+/// lifecycle. `Thinking` blocks are dropped (not shown in the thread view).
+fn replay_history(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, history: &[crate::providers::Message]) {
+    use crate::providers::{ContentBlock as CoreBlock, Role};
+    for message in history {
+        for block in &message.content {
+            match block {
+                CoreBlock::Text(text) => {
+                    let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
+                    let update = match message.role {
+                        Role::User => SessionUpdate::UserMessageChunk(chunk),
+                        Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+                    };
+                    send_notification(cx, session_id, update);
+                }
+                CoreBlock::ToolCall { id, name, input } => {
+                    let tool_call = ToolCall::new(id.clone(), name.clone())
+                        .kind(tool_kind_for(name))
+                        .status(ToolCallStatus::InProgress)
+                        .raw_input(Some(input.clone()));
+                    send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call));
+                }
+                CoreBlock::ToolResult { tool_use_id, content, is_error } => {
+                    let status = if *is_error { ToolCallStatus::Failed } else { ToolCallStatus::Completed };
+                    let update = ToolCallUpdate::new(
+                        tool_use_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(Some(status))
+                            .content(Some(vec![AcpContentBlock::Text(TextContent::new(content.clone())).into()])),
+                    );
+                    send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+                }
+                CoreBlock::Thinking(_) => {}
+            }
+        }
+    }
+}
+
 /// Build the fully-configured ACP agent, ready to `.connect_to(transport)`.
 /// Split out from [`run_acp`] so tests can connect it to an in-process
 /// [`AcpClientRole`] builder instead of real stdio.
@@ -384,7 +463,12 @@ fn build_agent(
         .on_receive_request(
             async move |req: InitializeRequest, responder, _cx| {
                 responder.respond(
-                    InitializeResponse::new(req.protocol_version).agent_capabilities(AgentCapabilities::new()),
+                    InitializeResponse::new(req.protocol_version)
+                        // load_session(true): Zed calls session/load to
+                        // reopen a thread on window refocus; without this
+                        // capability it refuses with "Loading or resuming
+                        // sessions is not supported by this agent."
+                        .agent_capabilities(AgentCapabilities::new().load_session(true)),
                 )
             },
             agent_client_protocol::on_receive_request!(),
@@ -405,47 +489,96 @@ fn build_agent(
                 let token_log = token_log.clone();
                 async move {
                     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-                    // Build a fresh provider for this session — Zed keeps one
-                    // process across multiple chat threads, so we can't reuse a
-                    // single moved-once provider.
-                    let provider = match (state.make_provider)() {
-                        Ok(p) => p,
+                    // Use the client-provided project root, not the CLI's
+                    // own cwd — Zed passes the actual project it wants this
+                    // session to operate on.
+                    let session_workspace =
+                        if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
+                    let handle = match build_session_handle(
+                        &state,
+                        &cfg,
+                        safety,
+                        token_log,
+                        session_id.clone(),
+                        session_workspace,
+                        cx,
+                    ) {
+                        Ok(handle) => handle,
                         Err(e) => {
                             return responder.respond_with_error(
                                 agent_client_protocol::util::internal_error(format!("provider init: {e}")),
                             );
                         }
                     };
-                    // Use the client-provided project root, not the CLI's
-                    // own cwd — Zed passes the actual project it wants this
-                    // session to operate on.
-                    let session_workspace =
-                        if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
-
-                    let connection: CurrentConnection = Arc::new(StdMutex::new(Some(cx)));
-                    let handle = Arc::new(SessionHandle {
-                        session: tokio::sync::Mutex::new({
-                            let config = build_agent_config(
-                                &session_workspace,
-                                state.default_model.clone(),
-                                Arc::clone(&connection),
-                                session_id.clone(),
-                                safety,
-                                token_log,
-                            );
-                            let tool_session = Session::new(session_workspace, cfg);
-                            AgentSession::new(provider, tool_session, config)
-                        }),
-                        cancel: Arc::new(StdMutex::new(None)),
-                        connection,
-                        current_model: Arc::new(StdMutex::new(state.default_model.clone())),
-                    });
                     state.sessions.lock().await.insert(session_id.clone(), handle);
 
                     // Advertise the model picker (vikunja #960); new sessions
                     // start on the default model.
                     let config_options = model_config_options(&state.models, &state.default_model);
                     responder.respond(NewSessionResponse::new(session_id).config_options(Some(config_options)))
+                }
+            }
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request({
+            // session/load (vikunja #961): Zed calls this to reopen a thread
+            // on window refocus. Known id (process still alive) → replay the
+            // session's in-memory history as session/update notifications so
+            // Zed rebuilds the thread view. Unknown id (process respawned;
+            // we have no on-disk persistence) → create a fresh usable session
+            // under that id rather than error or fabricate resumed history.
+            let state = Arc::clone(&state);
+            let workspace = workspace.clone();
+            let cfg = Arc::clone(&cfg);
+            let safety = Arc::clone(&safety);
+            let token_log = token_log.clone();
+            move |req: LoadSessionRequest,
+                  responder: agent_client_protocol::Responder<LoadSessionResponse>,
+                  cx: ConnectionTo<AcpClientRole>| {
+                let state = Arc::clone(&state);
+                let workspace_fallback = workspace.clone();
+                let cfg = Arc::clone(&cfg);
+                let safety = Arc::clone(&safety);
+                let token_log = token_log.clone();
+                async move {
+                    let session_id = req.session_id.clone();
+                    let existing = state.sessions.lock().await.get(&session_id).cloned();
+                    let current_model = match existing {
+                        Some(handle) => {
+                            // Process still alive: replay the in-memory
+                            // history. Zed registers the thread before this
+                            // RPC returns, so replay notifications land.
+                            let agent_session = handle.session.lock().await;
+                            replay_history(&cx, &session_id, agent_session.history());
+                            drop(agent_session);
+                            handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                        }
+                        None => {
+                            let session_workspace =
+                                if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
+                            let handle = match build_session_handle(
+                                &state,
+                                &cfg,
+                                safety,
+                                token_log,
+                                session_id.clone(),
+                                session_workspace,
+                                cx,
+                            ) {
+                                Ok(handle) => handle,
+                                Err(e) => {
+                                    return responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(format!("provider init: {e}")),
+                                    );
+                                }
+                            };
+                            state.sessions.lock().await.insert(session_id.clone(), handle);
+                            state.default_model.clone()
+                        }
+                    };
+                    // Echo the model picker (vikunja #960) with the session's
+                    // current model, as session/new does.
+                    let config_options = model_config_options(&state.models, &current_model);
+                    responder.respond(LoadSessionResponse::new().config_options(Some(config_options)))
                 }
             }
         }, agent_client_protocol::on_receive_request!())
@@ -1282,6 +1415,189 @@ mod tests {
             .unwrap();
 
         assert_eq!(echoed_current, "model-a", "an unadvertised model must be ignored, current unchanged");
+    }
+
+    // --- session/load (vikunja #961) ---
+
+    #[tokio::test]
+    async fn acp_advertises_load_session_capability() {
+        // Zed refuses to reopen a thread ("Loading or resuming sessions is
+        // not supported by this agent.") unless load_session is advertised.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+        );
+
+        let load_session = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                let init = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(init.agent_capabilities.load_session)
+            })
+            .await
+            .unwrap();
+
+        assert!(load_session, "agent must advertise load_session so Zed reopens threads");
+    }
+
+    #[tokio::test]
+    async fn acp_session_load_replays_history_for_known_session() {
+        // A live session's in-memory history must be replayed back as
+        // session/update notifications so Zed rebuilds the reopened thread.
+        let dir = tempfile::tempdir().unwrap();
+        let make_provider = mock_factory(vec![end_turn_resp("recalled-text")]);
+        let agent = build_agent(
+            make_provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+        );
+
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let updates_for_closure = Arc::clone(&updates);
+
+        let (config_options, replay_start) = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                let new_session =
+                    connection.send_request(NewSessionRequest::new(dir.path())).block_task().await?;
+                let session_id = new_session.session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("remember-this"))],
+                    ))
+                    .block_task()
+                    .await?;
+                // Everything the client sees from here on is replay.
+                let replay_start = updates_for_closure.lock().unwrap().len();
+                let load_resp = connection
+                    .send_request(LoadSessionRequest::new(session_id, dir.path()))
+                    .block_task()
+                    .await?;
+                Ok((load_resp.config_options, replay_start))
+            })
+            .await
+            .unwrap();
+
+        assert!(config_options.is_some(), "session/load must echo the model-picker config_options");
+
+        let updates = updates.lock().unwrap();
+        let replayed = &updates[replay_start..];
+        // UserMessageChunk is a kind the normal prompt path never emits, so
+        // its presence during load proves replay ran.
+        let user_texts: Vec<String> = replayed
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::UserMessageChunk(c) => match &c.content {
+                    AcpContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.iter().any(|t| t == "remember-this"),
+            "replay must include the historical user message: {replayed:?}"
+        );
+        let agent_texts: Vec<String> = replayed
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(c) => match &c.content {
+                    AcpContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            agent_texts.iter().any(|t| t == "recalled-text"),
+            "replay must include the historical assistant message: {replayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_load_unknown_id_creates_fresh_usable_session() {
+        // A respawned process has no in-memory state for the id Zed asks to
+        // load. We create a fresh usable session under that id (rather than
+        // error or fabricate history): it must be promptable, and must NOT
+        // replay any user history it doesn't have.
+        let dir = tempfile::tempdir().unwrap();
+        let make_provider = mock_factory(vec![end_turn_resp("fresh-start")]);
+        let agent = build_agent(
+            make_provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+        );
+
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let (had_config, stop_reason) = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                // An id that was never created via session/new.
+                let made_up = SessionId::new("never-created-session-id");
+                let load_resp = connection
+                    .send_request(LoadSessionRequest::new(made_up.clone(), dir.path()))
+                    .block_task()
+                    .await?;
+                let prompt_resp = connection
+                    .send_request(PromptRequest::new(
+                        made_up,
+                        vec![AcpContentBlock::Text(TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok((load_resp.config_options.is_some(), prompt_resp.stop_reason))
+            })
+            .await
+            .unwrap();
+
+        assert!(had_config, "load of an unknown id must still echo config_options");
+        assert_eq!(stop_reason, AcpStopReason::EndTurn, "fresh session created on load must be promptable");
+        let updates = updates.lock().unwrap();
+        let user_chunks = updates.iter().filter(|u| matches!(u, SessionUpdate::UserMessageChunk(_))).count();
+        assert_eq!(user_chunks, 0, "unknown-id load must not fabricate replayed user history: {updates:?}");
     }
 
     // --- pure mapping helpers ---
