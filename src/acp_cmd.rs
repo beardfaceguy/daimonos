@@ -9,6 +9,7 @@
 //! `fs/*`/`terminal/*` client-proxy methods — daimonos has its own
 //! file/exec tools and doesn't need to shell out through the client for them.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -63,15 +64,36 @@ type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 /// effect on the next prompt (you can't change model mid-turn anyway).
 type CurrentModel = Arc<StdMutex<String>>;
 
-/// v1 shared state: one active session at a time.
-struct AcpState {
-    session: tokio::sync::Mutex<Option<AgentSession>>,
+/// Builds a fresh `LlmProvider` for a new session. `LlmProvider` isn't
+/// `Clone`, and Zed keeps one `daimonos acp` process alive across multiple
+/// sessions (new chat threads), so we can't move a single provider into one
+/// session — each `session/new` constructs its own.
+pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn LlmProvider>, String> + Send + Sync>;
+
+/// Per-session state. Each session gets its own session lock, cancel slot,
+/// connection cell, and current-model cell, so concurrent sessions (Zed can
+/// run several chat threads against one process) never block or cross-talk
+/// with each other. Shared via `Arc` so a long prompt turn holds only this
+/// handle — not the sessions-map lock.
+struct SessionHandle {
+    session: tokio::sync::Mutex<AgentSession>,
     cancel: CancelSlot,
     connection: CurrentConnection,
     current_model: CurrentModel,
+}
+
+/// Shared engine state across all sessions on one process.
+struct AcpState {
+    /// Active sessions keyed by id. The map lock is held only briefly to
+    /// look up / insert a handle — never across a prompt turn.
+    sessions: tokio::sync::Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
+    /// Builds a provider per new session (see [`ProviderFactory`]).
+    make_provider: ProviderFactory,
     /// Candidate models for the picker (from `DAIMONOS_AGENT_MODELS`);
     /// always non-empty (includes the active model).
     models: Vec<String>,
+    /// The model a new session starts on.
+    default_model: String,
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -293,44 +315,39 @@ fn prompt_text(blocks: Vec<AcpContentBlock>) -> String {
         .join("\n")
 }
 
-/// Run one prompt turn against the active session, racing it against
-/// `session/cancel`. Returns the ACP stop reason.
+/// Run one prompt turn against `handle`, racing it against `session/cancel`.
+/// Returns the ACP stop reason. Holds only this session's own lock, so other
+/// sessions run concurrently unaffected.
 async fn run_prompt_turn(
-    state: &Arc<AcpState>,
+    handle: &Arc<SessionHandle>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     text: String,
 ) -> AcpStopReason {
-    // Acquire exclusive access to the session *before* publishing this
+    // Acquire exclusive access to this session *before* publishing the
     // turn's connection/cancel handles — otherwise a second overlapping
-    // session/prompt call (for the same session) could overwrite the
-    // in-flight turn's routing/cancellation handle while both are still
-    // waiting on this same lock.
-    let mut guard = state.session.lock().await;
+    // session/prompt for the *same* session could overwrite the in-flight
+    // turn's routing/cancellation handle while both wait on this lock.
+    let mut agent_session = handle.session.lock().await;
 
-    // Now that we hold the lock, refresh the shared connection handle with
-    // *this* dispatch's cx — see `CurrentConnection`'s doc comment for why.
-    *state.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
+    // Now that we hold the lock, refresh the connection handle with *this*
+    // dispatch's cx — see `CurrentConnection`'s doc comment for why.
+    *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
 
     let notify = Arc::new(tokio::sync::Notify::new());
-    *state.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
+    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
-    let Some(agent_session) = guard.as_mut() else {
-        return AcpStopReason::Refusal;
-    };
-
-    // Apply the picker's current model selection to the session before the
-    // turn — a model switch made via session/set_config_option takes effect
-    // on the next prompt (vikunja #960).
-    let model = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    // Apply the picker's current model selection before the turn — a switch
+    // made via session/set_config_option takes effect on the next prompt.
+    let model = handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
     agent_session.set_model(model.clone());
 
     let outcome = tokio::select! {
         turn = agent_session.prompt(text) => Some(turn),
         _ = notify.notified() => None,
     };
-    drop(guard);
-    *state.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    drop(agent_session);
+    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     match outcome {
         Some(turn) => {
@@ -345,24 +362,21 @@ async fn run_prompt_turn(
 /// Split out from [`run_acp`] so tests can connect it to an in-process
 /// [`AcpClientRole`] builder instead of real stdio.
 fn build_agent(
-    provider: Box<dyn LlmProvider>,
+    make_provider: ProviderFactory,
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
     models: Vec<String>,
-    safety: crate::safety::SafetyPolicy,
+    safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
     let state = Arc::new(AcpState {
-        session: tokio::sync::Mutex::new(None),
-        cancel: Arc::new(StdMutex::new(None)),
-        connection: Arc::new(StdMutex::new(None)),
-        current_model: Arc::new(StdMutex::new(model.clone())),
+        sessions: tokio::sync::Mutex::new(HashMap::new()),
+        make_provider,
         models,
+        default_model: model,
     });
-    let provider = Arc::new(std::sync::Mutex::new(Some(provider)));
-    let safety = Arc::new(safety);
 
     AcpAgentRole
         .builder()
@@ -379,49 +393,58 @@ fn build_agent(
             let state = Arc::clone(&state);
             let workspace = workspace.clone();
             let cfg = Arc::clone(&cfg);
-            let model = model.clone();
             let safety = Arc::clone(&safety);
             let token_log = token_log.clone();
-            let provider = Arc::clone(&provider);
             move |req: NewSessionRequest,
                   responder: agent_client_protocol::Responder<NewSessionResponse>,
                   cx: ConnectionTo<AcpClientRole>| {
                 let state = Arc::clone(&state);
                 let workspace_fallback = workspace.clone();
                 let cfg = Arc::clone(&cfg);
-                let model = model.clone();
                 let safety = Arc::clone(&safety);
                 let token_log = token_log.clone();
-                let provider = Arc::clone(&provider);
                 async move {
                     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-                    let Some(provider) = provider.lock().unwrap_or_else(|p| p.into_inner()).take() else {
-                        return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            "daimonos acp v1 supports only one session per process",
-                        ));
+                    // Build a fresh provider for this session — Zed keeps one
+                    // process across multiple chat threads, so we can't reuse a
+                    // single moved-once provider.
+                    let provider = match (state.make_provider)() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(format!("provider init: {e}")),
+                            );
+                        }
                     };
                     // Use the client-provided project root, not the CLI's
                     // own cwd — Zed passes the actual project it wants this
                     // session to operate on.
                     let session_workspace =
                         if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
-                    *state.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx);
-                    let config = build_agent_config(
-                        &session_workspace,
-                        model,
-                        Arc::clone(&state.connection),
-                        session_id.clone(),
-                        safety,
-                        token_log,
-                    );
-                    let tool_session = Session::new(session_workspace, cfg);
-                    let agent_session = AgentSession::new(provider, tool_session, config);
-                    *state.session.lock().await = Some(agent_session);
-                    // Advertise the model picker (vikunja #960). Current
-                    // selection is read from the shared cell so it survives
-                    // across sessions within the process.
-                    let current = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let config_options = model_config_options(&state.models, &current);
+
+                    let connection: CurrentConnection = Arc::new(StdMutex::new(Some(cx)));
+                    let handle = Arc::new(SessionHandle {
+                        session: tokio::sync::Mutex::new({
+                            let config = build_agent_config(
+                                &session_workspace,
+                                state.default_model.clone(),
+                                Arc::clone(&connection),
+                                session_id.clone(),
+                                safety,
+                                token_log,
+                            );
+                            let tool_session = Session::new(session_workspace, cfg);
+                            AgentSession::new(provider, tool_session, config)
+                        }),
+                        cancel: Arc::new(StdMutex::new(None)),
+                        connection,
+                        current_model: Arc::new(StdMutex::new(state.default_model.clone())),
+                    });
+                    state.sessions.lock().await.insert(session_id.clone(), handle);
+
+                    // Advertise the model picker (vikunja #960); new sessions
+                    // start on the default model.
+                    let config_options = model_config_options(&state.models, &state.default_model);
                     responder.respond(NewSessionResponse::new(session_id).config_options(Some(config_options)))
                 }
             }
@@ -443,8 +466,14 @@ fn build_agent(
                     let spawn_cx = cx.clone();
                     let _ = cx.spawn(async move {
                         let session_id = req.session_id;
-                        let text = prompt_text(req.prompt);
-                        let stop_reason = run_prompt_turn(&state, &spawn_cx, &session_id, text).await;
+                        let handle = state.sessions.lock().await.get(&session_id).cloned();
+                        let stop_reason = match handle {
+                            Some(handle) => {
+                                let text = prompt_text(req.prompt);
+                                run_prompt_turn(&handle, &spawn_cx, &session_id, text).await
+                            }
+                            None => AcpStopReason::Refusal,
+                        };
                         let _ = responder.respond(PromptResponse::new(stop_reason));
                         Ok(())
                     });
@@ -454,7 +483,7 @@ fn build_agent(
         }, agent_client_protocol::on_receive_request!())
         .on_receive_request({
             // Model picker (vikunja #960): the user picked a model in Zed's
-            // dropdown. Update the shared current-model cell (cheap, no
+            // dropdown. Update this session's current-model cell (cheap, no
             // dispatch-loop stall, no wait on an in-flight prompt's session
             // lock); it's applied to the session on the next prompt turn.
             let state = Arc::clone(&state);
@@ -463,16 +492,23 @@ fn build_agent(
                   _cx: ConnectionTo<AcpClientRole>| {
                 let state = Arc::clone(&state);
                 async move {
-                    if req.config_id.to_string() == MODEL_CONFIG_ID {
-                        if let Some(value) = req.value.as_value_id() {
-                            let picked = value.to_string();
-                            // Only honor a value we actually advertised.
-                            if state.models.iter().any(|m| m == &picked) {
-                                *state.current_model.lock().unwrap_or_else(|p| p.into_inner()) = picked;
+                    let handle = state.sessions.lock().await.get(&req.session_id).cloned();
+                    // Current value defaults to the session's start model if
+                    // the session is unknown (shouldn't happen from a real
+                    // client, but keep the echo sensible).
+                    let mut current = state.default_model.clone();
+                    if let Some(handle) = handle {
+                        if req.config_id.to_string() == MODEL_CONFIG_ID {
+                            if let Some(value) = req.value.as_value_id() {
+                                let picked = value.to_string();
+                                // Only honor a value we actually advertised.
+                                if state.models.iter().any(|m| m == &picked) {
+                                    *handle.current_model.lock().unwrap_or_else(|p| p.into_inner()) = picked;
+                                }
                             }
                         }
+                        current = handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     }
-                    let current = state.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     let options = model_config_options(&state.models, &current);
                     responder.respond(SetSessionConfigOptionResponse::new(options))
                 }
@@ -480,11 +516,14 @@ fn build_agent(
         }, agent_client_protocol::on_receive_request!())
         .on_receive_notification({
             let state = Arc::clone(&state);
-            move |_notif: CancelNotification, _cx| {
+            move |notif: CancelNotification, _cx| {
                 let state = Arc::clone(&state);
                 async move {
-                    if let Some(notify) = state.cancel.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                        notify.notify_one();
+                    let handle = state.sessions.lock().await.get(&notif.session_id).cloned();
+                    if let Some(handle) = handle {
+                        if let Some(notify) = handle.cancel.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                            notify.notify_one();
+                        }
                     }
                     Ok(())
                 }
@@ -512,8 +551,11 @@ fn build_agent(
 }
 
 /// Run the `daimonos acp` engine to completion (until stdin closes).
+/// `make_provider` builds a fresh provider per session (Zed keeps one
+/// process across chat threads); it's validated once up front so a
+/// misconfigured provider fails fast rather than only on the first session.
 pub async fn run_acp(
-    provider: Box<dyn LlmProvider>,
+    make_provider: ProviderFactory,
     workspace: &Path,
     cfg: Arc<Config>,
     model: String,
@@ -521,7 +563,10 @@ pub async fn run_acp(
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    build_agent(provider, workspace, cfg, model, models, safety, token_log)
+    if let Err(e) = (make_provider)() {
+        anyhow::bail!("provider init: {e}");
+    }
+    build_agent(make_provider, workspace, cfg, model, models, Arc::new(safety), token_log)
         .connect_to(Stdio::new())
         .await?;
     Ok(())
@@ -544,6 +589,13 @@ mod tests {
         fn new(responses: Vec<crate::providers::LlmResponse>) -> Self {
             MockProvider { responses: StdMutex::new(VecDeque::from(responses)) }
         }
+    }
+
+    /// A `ProviderFactory` that yields a fresh `MockProvider` (with a fresh
+    /// copy of `responses`) per session — matches how the real engine builds
+    /// one provider per `session/new`.
+    fn mock_factory(responses: Vec<crate::providers::LlmResponse>) -> ProviderFactory {
+        Arc::new(move || Ok(Box::new(MockProvider::new(responses.clone())) as Box<dyn LlmProvider>))
     }
 
     #[async_trait]
@@ -623,14 +675,14 @@ mod tests {
     #[tokio::test]
     async fn acp_initialize_session_new_prompt_flow() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = Box::new(MockProvider::new(vec![end_turn_resp("hello from daimonos")]));
+        let make_provider = mock_factory(vec![end_turn_resp("hello from daimonos")]);
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
@@ -687,51 +739,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_second_session_new_errors_v1_single_session() {
+    async fn acp_supports_multiple_sessions_per_process() {
+        // Zed keeps one `daimonos acp` process across chat threads and sends
+        // a fresh session/new per thread. Both sessions must work and prompt
+        // independently on the same process.
         let dir = tempfile::tempdir().unwrap();
-        let provider = Box::new(MockProvider::new(vec![end_turn_resp("ok")]));
+        // The factory yields a fresh provider per session, each scripted with
+        // one end-turn response.
+        let make_provider = mock_factory(vec![end_turn_resp("hi")]);
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
-        let result = AcpClientRole
+        let (stop_a, stop_b) = AcpClientRole
             .builder()
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                connection
+                let s1 = connection
                     .send_request(NewSessionRequest::new(dir.path()))
                     .block_task()
                     .await?;
-                // Second session/new: v1 only supports one session per process.
-                let second = connection.send_request(NewSessionRequest::new(dir.path())).block_task().await;
-                Ok(second.is_err())
+                // A second session/new must succeed (no more single-session limit).
+                let s2 = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                assert_ne!(s1.session_id, s2.session_id, "sessions must have distinct ids");
+
+                // Both sessions can prompt.
+                let a = connection
+                    .send_request(PromptRequest::new(
+                        s1.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                let b = connection
+                    .send_request(PromptRequest::new(
+                        s2.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok((a.stop_reason, b.stop_reason))
             })
             .await
             .unwrap();
 
-        assert!(result, "a second session/new must fail in the v1 single-session engine");
+        assert_eq!(stop_a, AcpStopReason::EndTurn);
+        assert_eq!(stop_b, AcpStopReason::EndTurn);
     }
 
     #[tokio::test]
     async fn acp_session_cancel_aborts_inflight_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let provider: Box<dyn LlmProvider> = Box::new(SlowProvider);
+        let make_provider: ProviderFactory = Arc::new(|| Ok(Box::new(SlowProvider)));
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
@@ -776,20 +854,20 @@ mod tests {
     async fn acp_destructive_tool_call_requests_permission_and_allows() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
-        let provider = Box::new(MockProvider::new(vec![
+        let make_provider = mock_factory(vec![
             tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
             end_turn_resp("done"),
-        ]));
+        ]);
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy {
+            Arc::new(crate::safety::SafetyPolicy {
                 approval_mode: crate::safety::ApprovalMode::Interactive,
                 ..crate::safety::SafetyPolicy::default()
-            },
+            }),
             None,
         );
 
@@ -865,20 +943,20 @@ mod tests {
     #[tokio::test]
     async fn acp_denied_tool_blocks_without_asking_permission() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = Box::new(MockProvider::new(vec![
+        let make_provider = mock_factory(vec![
             tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
             end_turn_resp("done"),
-        ]));
+        ]);
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy {
+            Arc::new(crate::safety::SafetyPolicy {
                 denied_commands: vec!["exec".into()],
                 ..crate::safety::SafetyPolicy::default()
-            },
+            }),
             None,
         );
 
@@ -962,17 +1040,17 @@ mod tests {
         let session_workspace = tempfile::tempdir().unwrap();
         std::fs::write(session_workspace.path().join("marker.txt"), "found me").unwrap();
 
-        let provider = Box::new(MockProvider::new(vec![
+        let make_provider = mock_factory(vec![
             tool_call_resp("t1", "read_file", serde_json::json!({"path": "marker.txt"})),
             end_turn_resp("done"),
-        ]));
+        ]);
         let agent = build_agent(
-            provider,
+            make_provider,
             build_agent_workspace.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
             vec!["test-model".to_string()],
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
@@ -1063,15 +1141,15 @@ mod tests {
     #[tokio::test]
     async fn acp_session_new_advertises_model_config_options() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = Box::new(MockProvider::new(vec![]));
+        let make_provider = mock_factory(vec![]);
         let models = vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()];
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "model-a".to_string(),
             models,
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
@@ -1109,15 +1187,18 @@ mod tests {
     async fn acp_set_config_option_switches_model_for_next_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(StdMutex::new(Vec::new()));
-        let provider = Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) });
+        let make_provider: ProviderFactory = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move || Ok(Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) })))
+        };
         let models = vec!["model-a".to_string(), "model-b".to_string()];
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "model-a".to_string(),
             models,
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 
@@ -1166,15 +1247,18 @@ mod tests {
     async fn acp_set_config_option_ignores_unadvertised_model() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(StdMutex::new(Vec::new()));
-        let provider = Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) });
+        let make_provider: ProviderFactory = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move || Ok(Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) })))
+        };
         let models = vec!["model-a".to_string(), "model-b".to_string()];
         let agent = build_agent(
-            provider,
+            make_provider,
             dir.path(),
             Arc::new(Config::default()),
             "model-a".to_string(),
             models,
-            crate::safety::SafetyPolicy::default(),
+            Arc::new(crate::safety::SafetyPolicy::default()),
             None,
         );
 

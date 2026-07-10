@@ -76,6 +76,28 @@ fn env_requests_mcp_startup_logs() -> bool {
     }
 }
 
+/// Build the LLM provider from a provider name + connection params.
+/// Fallible variant used by the ACP model factory (which builds one per
+/// session and must not kill the process on error).
+fn try_build_llm_provider(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+) -> Result<Box<dyn providers::LlmProvider>, String> {
+    match provider {
+        "openrouter" => providers::openrouter::OpenRouterProvider::new(
+            api_key.to_string(),
+            base_url.to_string(),
+        )
+        .map(|p| Box::new(p) as Box<dyn providers::LlmProvider>),
+        "anthropic" => Ok(Box::new(
+            providers::anthropic::AnthropicProvider::new(api_key.to_string())
+                .with_base_url(base_url.to_string()),
+        )),
+        other => Err(format!("unsupported provider: {other} (valid: openrouter, anthropic)")),
+    }
+}
+
 /// Build the LLM provider for the `agent`/`chat` subcommands from the
 /// effective (flag-overridden) provider name and the loaded agent env config.
 /// Exits the process on an unsupported provider name or provider init failure.
@@ -83,23 +105,10 @@ fn build_llm_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
 ) -> Box<dyn providers::LlmProvider> {
-    match effective_provider {
-        "openrouter" => match providers::openrouter::OpenRouterProvider::new(
-            agent.api_key.clone(),
-            agent.base_url.clone(),
-        ) {
-            Ok(p) => Box::new(p),
-            Err(e) => {
-                eprintln!("provider init: {e}");
-                std::process::exit(2);
-            }
-        },
-        "anthropic" => Box::new(
-            providers::anthropic::AnthropicProvider::new(agent.api_key.clone())
-                .with_base_url(agent.base_url.clone()),
-        ),
-        other => {
-            eprintln!("unsupported provider: {other} (valid: openrouter, anthropic)");
+    match try_build_llm_provider(effective_provider, &agent.api_key, &agent.base_url) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(2);
         }
     }
@@ -372,12 +381,19 @@ async fn main() -> anyhow::Result<()> {
             if !models.iter().any(|m| m == &effective_model) {
                 models.insert(0, effective_model.clone());
             }
-            let llm = build_llm_provider(&effective_provider, &agent);
+            // Provider factory: builds a fresh provider per session, since Zed
+            // keeps one `daimonos acp` process across multiple chat threads.
+            let make_provider: acp_cmd::ProviderFactory = {
+                let provider = effective_provider.clone();
+                let api_key = agent.api_key.clone();
+                let base_url = agent.base_url.clone();
+                Arc::new(move || try_build_llm_provider(&provider, &api_key, &base_url))
+            };
             // No approve_fn: ACP asks the client via session/request_permission,
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.
             let safety = agent.to_safety_policy(None);
-            acp_cmd::run_acp(llm, &workspace, Arc::clone(&cfg), effective_model, models, safety, token_log)
+            acp_cmd::run_acp(make_provider, &workspace, Arc::clone(&cfg), effective_model, models, safety, token_log)
                 .await?;
             return Ok(());
         }
