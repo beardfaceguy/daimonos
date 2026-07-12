@@ -16,6 +16,7 @@ mod agent;
 mod agent_cmd;
 mod agent_env;
 mod chat_cmd;
+mod compaction;
 mod safety;
 mod providers;
 mod tool_runner;
@@ -396,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
                 token_log,
                 sessions_dir,
                 resume,
+                agent.compaction.clone(),
             )
             .await?;
             return Ok(());
@@ -443,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
                 safety,
                 token_log,
                 sessions_dir,
+                agent.compaction.clone(),
             )
             .await?;
             return Ok(());

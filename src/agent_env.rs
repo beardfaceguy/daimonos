@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::compaction::CompactionPolicy;
+
 /// Required scalar keys — `daimonos agent` refuses to run if any is absent/empty.
 const REQUIRED: &[&str] = &[
     "DAIMONOS_AGENT_PROVIDER",
@@ -19,10 +21,21 @@ const REQUIRED: &[&str] = &[
     "DAIMONOS_AGENT_BASE_URL",
     "DAIMONOS_AGENT_APPROVAL_MODE",
     "DAIMONOS_AGENT_API_KEY",
+    // ADR-002: compaction must be an explicit choice — no default in code.
+    "DAIMONOS_AGENT_COMPACTION",
+];
+
+/// Numeric keys required when `DAIMONOS_AGENT_COMPACTION=on` (ADR-002: no
+/// values in code — the budget math comes entirely from the env file).
+const COMPACTION_REQUIRED: &[&str] = &[
+    "DAIMONOS_AGENT_COMPACTION_HIGH_WATER",
+    "DAIMONOS_AGENT_COMPACTION_LOW_WATER",
+    "DAIMONOS_AGENT_CONTEXT_WINDOW",
+    "DAIMONOS_AGENT_OUTPUT_RESERVATION",
 ];
 
 /// Validated agent connection config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentEnv {
     pub provider: String,
     pub model: String,
@@ -36,6 +49,8 @@ pub struct AgentEnv {
     /// is always present — prepended if the list omits it, and the list is
     /// deduped preserving first-seen order. Never empty (at minimum `[model]`).
     pub models: Vec<String>,
+    /// Context/window compaction (ADR-002). `None` = explicitly `off`.
+    pub compaction: Option<CompactionPolicy>,
 }
 
 impl AgentEnv {
@@ -116,6 +131,7 @@ impl AgentEnv {
 
         let model = present("DAIMONOS_AGENT_MODEL").unwrap();
         let models = candidate_models(&model, parse_list(vars.get("DAIMONOS_AGENT_MODELS")));
+        let compaction = parse_compaction(vars, path)?;
 
         Ok(AgentEnv {
             provider,
@@ -126,6 +142,7 @@ impl AgentEnv {
             allowed_commands: parse_list(vars.get("DAIMONOS_AGENT_ALLOWED_COMMANDS")),
             denied_commands: parse_list(vars.get("DAIMONOS_AGENT_DENIED_COMMANDS")),
             models,
+            compaction,
         })
     }
 
@@ -165,6 +182,89 @@ impl AgentEnv {
             auto_approve: std::sync::Arc::new(std::sync::Mutex::new(seed)),
             approvals_path,
         }
+    }
+}
+
+/// Parse the ADR-002 compaction keys. `DAIMONOS_AGENT_COMPACTION` itself is
+/// in [`REQUIRED`] (checked by the caller); `on` additionally requires every
+/// [`COMPACTION_REQUIRED`] numeric key — there are deliberately no default
+/// values in code. Validation: `0 < low_water < high_water < 1`,
+/// `context_window > 0`, `output_reservation < context_window`.
+fn parse_compaction(
+    vars: &HashMap<String, String>,
+    path: &Path,
+) -> Result<Option<CompactionPolicy>, String> {
+    let present = |k: &str| {
+        vars.get(k).map(|v| v.trim()).filter(|v| !v.is_empty()).map(|v| v.to_string())
+    };
+    // Caller has verified presence (REQUIRED).
+    let switch = present("DAIMONOS_AGENT_COMPACTION").unwrap();
+    match switch.as_str() {
+        "off" => Ok(None),
+        "on" => {
+            let missing: Vec<&str> = COMPACTION_REQUIRED
+                .iter()
+                .copied()
+                .filter(|k| present(k).is_none())
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "agent env file {}: DAIMONOS_AGENT_COMPACTION=on also requires: {}",
+                    path.display(),
+                    missing.join(", ")
+                ));
+            }
+            let num = |k: &str| -> Result<f64, String> {
+                let raw = present(k).unwrap();
+                raw.parse::<f64>().map_err(|_| {
+                    format!("agent env file {}: {k} '{raw}' is not a number", path.display())
+                })
+            };
+            let int = |k: &str| -> Result<u64, String> {
+                let raw = present(k).unwrap();
+                raw.parse::<u64>().map_err(|_| {
+                    format!("agent env file {}: {k} '{raw}' is not a whole number of tokens", path.display())
+                })
+            };
+            let high_water = num("DAIMONOS_AGENT_COMPACTION_HIGH_WATER")?;
+            let low_water = num("DAIMONOS_AGENT_COMPACTION_LOW_WATER")?;
+            let context_window = int("DAIMONOS_AGENT_CONTEXT_WINDOW")?;
+            let output_reservation = int("DAIMONOS_AGENT_OUTPUT_RESERVATION")?;
+
+            if !(low_water > 0.0 && low_water < high_water && high_water < 1.0) {
+                return Err(format!(
+                    "agent env file {}: compaction watermarks must satisfy 0 < LOW_WATER < HIGH_WATER < 1 (got low={low_water}, high={high_water})",
+                    path.display()
+                ));
+            }
+            if context_window == 0 {
+                return Err(format!(
+                    "agent env file {}: DAIMONOS_AGENT_CONTEXT_WINDOW must be > 0",
+                    path.display()
+                ));
+            }
+            if output_reservation >= context_window {
+                return Err(format!(
+                    "agent env file {}: DAIMONOS_AGENT_OUTPUT_RESERVATION ({output_reservation}) must be smaller than DAIMONOS_AGENT_CONTEXT_WINDOW ({context_window})",
+                    path.display()
+                ));
+            }
+
+            Ok(Some(CompactionPolicy {
+                high_water,
+                low_water,
+                context_window,
+                output_reservation,
+                // Optional: unset → the session's main model / built-in
+                // prompt template (referential fallbacks, not magic numbers).
+                summary_model: present("DAIMONOS_AGENT_SUMMARY_MODEL"),
+                summary_prompt: present("DAIMONOS_AGENT_SUMMARY_PROMPT"),
+            }))
+        }
+        other => Err(format!(
+            "agent env file {}: DAIMONOS_AGENT_COMPACTION '{other}' invalid (valid: on, off)",
+            path.display()
+        )),
     }
 }
 
@@ -233,8 +333,17 @@ mod tests {
          DAIMONOS_AGENT_MODEL=anthropic/claude-sonnet-4.6\n\
          DAIMONOS_AGENT_BASE_URL=https://openrouter.ai/api/v1\n\
          DAIMONOS_AGENT_APPROVAL_MODE=interactive\n\
-         DAIMONOS_AGENT_API_KEY=sk-test\n"
+         DAIMONOS_AGENT_API_KEY=sk-test\n\
+         DAIMONOS_AGENT_COMPACTION=off\n"
             .to_string()
+    }
+
+    fn compaction_on() -> String {
+        base().replace("DAIMONOS_AGENT_COMPACTION=off", "DAIMONOS_AGENT_COMPACTION=on")
+            + "DAIMONOS_AGENT_COMPACTION_HIGH_WATER=0.75\n\
+               DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.5\n\
+               DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n\
+               DAIMONOS_AGENT_OUTPUT_RESERVATION=8192\n"
     }
 
     fn load_str(s: &str) -> Result<AgentEnv, String> {
@@ -307,7 +416,8 @@ mod tests {
                  DAIMONOS_AGENT_MODEL='claude-opus-4-8'\n\
                  DAIMONOS_AGENT_BASE_URL=https://api.anthropic.com\n\
                  DAIMONOS_AGENT_APPROVAL_MODE=auto\n\
-                 DAIMONOS_AGENT_API_KEY=abc\n";
+                 DAIMONOS_AGENT_API_KEY=abc\n\
+                 DAIMONOS_AGENT_COMPACTION=off\n";
         let e = load_str(s).unwrap();
         assert_eq!(e.provider, "anthropic");
         assert_eq!(e.model, "claude-opus-4-8");
@@ -342,6 +452,95 @@ mod tests {
         assert!(load_str(&s).unwrap_err().contains("unsupported"));
         let s = base().replace("APPROVAL_MODE=interactive", "APPROVAL_MODE=yolo");
         assert!(load_str(&s).unwrap_err().contains("invalid"));
+    }
+
+    // --- compaction config (ADR-002, vikunja #962) ---
+
+    #[test]
+    fn compaction_off_parses_to_none() {
+        assert_eq!(load_str(&base()).unwrap().compaction, None);
+    }
+
+    #[test]
+    fn compaction_key_is_required() {
+        let s = base().replace("DAIMONOS_AGENT_COMPACTION=off\n", "");
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("DAIMONOS_AGENT_COMPACTION"), "{err}");
+    }
+
+    #[test]
+    fn compaction_invalid_switch_value_errors() {
+        let s = base().replace("COMPACTION=off", "COMPACTION=maybe");
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("invalid") && err.contains("maybe"), "{err}");
+    }
+
+    #[test]
+    fn compaction_on_parses_full_policy() {
+        let p = load_str(&compaction_on()).unwrap().compaction.expect("policy");
+        assert_eq!(p.high_water, 0.75);
+        assert_eq!(p.low_water, 0.5);
+        assert_eq!(p.context_window, 200_000);
+        assert_eq!(p.output_reservation, 8192);
+        assert_eq!(p.summary_model, None);
+        assert_eq!(p.summary_prompt, None);
+        assert_eq!(p.budget(), 191_808);
+    }
+
+    #[test]
+    fn compaction_on_requires_all_numeric_keys_and_names_missing() {
+        let s = compaction_on()
+            .replace("DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.5\n", "")
+            .replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("DAIMONOS_AGENT_COMPACTION_LOW_WATER"), "{err}");
+        assert!(err.contains("DAIMONOS_AGENT_CONTEXT_WINDOW"), "{err}");
+        assert!(!err.contains("HIGH_WATER"), "present key must not be flagged: {err}");
+        assert!(err.contains("<test>"), "error must name the file path: {err}");
+    }
+
+    #[test]
+    fn compaction_off_ignores_missing_numeric_keys() {
+        // off → the numeric knobs are not required.
+        assert!(load_str(&base()).unwrap().compaction.is_none());
+    }
+
+    #[test]
+    fn compaction_rejects_bad_watermark_ordering() {
+        for (low, high) in [("0.8", "0.75"), ("0.75", "0.75"), ("0.0", "0.75"), ("0.5", "1.0")] {
+            let s = compaction_on()
+                .replace("HIGH_WATER=0.75", &format!("HIGH_WATER={high}"))
+                .replace("LOW_WATER=0.5", &format!("LOW_WATER={low}"));
+            let err = load_str(&s).unwrap_err();
+            assert!(err.contains("0 < LOW_WATER < HIGH_WATER < 1"), "low={low} high={high}: {err}");
+        }
+    }
+
+    #[test]
+    fn compaction_rejects_non_numeric_values() {
+        let s = compaction_on().replace("HIGH_WATER=0.75", "HIGH_WATER=lots");
+        assert!(load_str(&s).unwrap_err().contains("not a number"));
+        let s = compaction_on().replace("CONTEXT_WINDOW=200000", "CONTEXT_WINDOW=2e5");
+        assert!(load_str(&s).unwrap_err().contains("not a whole number"));
+    }
+
+    #[test]
+    fn compaction_rejects_reservation_at_or_above_window() {
+        let s = compaction_on().replace("OUTPUT_RESERVATION=8192", "OUTPUT_RESERVATION=200000");
+        assert!(load_str(&s).unwrap_err().contains("must be smaller"));
+        let s = compaction_on().replace("CONTEXT_WINDOW=200000", "CONTEXT_WINDOW=0");
+        // window 0 → the window>0 check fires (reservation check would too).
+        assert!(load_str(&s).is_err());
+    }
+
+    #[test]
+    fn compaction_optional_summary_keys_are_captured() {
+        let s = compaction_on()
+            + "DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5\n\
+               DAIMONOS_AGENT_SUMMARY_PROMPT=Summarize tersely.\n";
+        let p = load_str(&s).unwrap().compaction.unwrap();
+        assert_eq!(p.summary_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+        assert_eq!(p.summary_prompt.as_deref(), Some("Summarize tersely."));
     }
 
     #[test]

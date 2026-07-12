@@ -25,6 +25,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     stream: bool,
 }
 
@@ -263,6 +265,12 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         None
     };
 
+    // Anthropic rejects a custom temperature when thinking is enabled —
+    // drop it in that combination (core expresses intent, the provider
+    // translates; ADR-001). The only setter today is the compaction
+    // summarizer, which runs with thinking Off.
+    let temperature = if thinking.is_some() { None } else { opts.temperature };
+
     AnthropicRequest {
         model: opts.model.clone(),
         max_tokens: opts.max_tokens,
@@ -270,6 +278,7 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         tools,
         messages,
         thinking,
+        temperature,
         stream: false,
     }
 }
@@ -691,6 +700,39 @@ mod tests {
         assert!(json.get("top_p").is_none(), "top_p must not appear");
         assert!(json.get("top_k").is_none(), "top_k must not appear");
         assert!(json.get("budget_tokens").is_none(), "budget_tokens must not appear");
+    }
+
+    #[test]
+    fn build_request_explicit_temperature_is_sent_when_thinking_off() {
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None, tools: vec![], stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            thinking: ThinkingLevel::Off,
+            temperature: Some(0.0),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["temperature"], 0.0);
+    }
+
+    #[test]
+    fn build_request_drops_temperature_when_thinking_enabled() {
+        // Anthropic rejects a custom temperature alongside thinking; the
+        // provider must drop it rather than send an invalid request.
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None, tools: vec![], stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-4-8".to_string(), // supports adaptive thinking
+            temperature: Some(0.0),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert!(json.get("temperature").is_none(), "temperature must be dropped with thinking on");
     }
 
     #[test]

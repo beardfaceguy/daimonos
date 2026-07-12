@@ -26,6 +26,11 @@ pub struct AgentCmdArgs {
     pub token_log: Option<std::path::PathBuf>,
 }
 
+// NOTE: no compaction policy here — ADR-002 compaction operates BETWEEN
+// turns of a multi-turn AgentSession, and a one-shot `daimonos agent` run is
+// a single turn (there is never an older turn to evict). Intra-run
+// compaction for a single long tool loop is explicit ADR-002 future work.
+
 /// Run the agent subcommand.
 ///
 /// Takes `args` by value so the optional `SafetyPolicy` can be consumed into
@@ -51,6 +56,8 @@ pub async fn run_agent(
             usage: Default::default(),
             stop_reason: crate::providers::StopReason::Aborted,
             error_message: Some("dry-run".to_string()),
+            last_call_usage: Default::default(),
+            context_overflow: false,
         });
     }
 
@@ -159,6 +166,7 @@ mod tests {
                 model: opts.model.clone(),
                 max_tokens: opts.max_tokens,
                 thinking: opts.thinking.clone(),
+                temperature: opts.temperature,
             });
             self.responses
                 .lock()

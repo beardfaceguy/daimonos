@@ -79,6 +79,38 @@ Selecting a model in the dropdown applies to the next message you send.
 If `DAIMONOS_AGENT_MODELS` is unset, the dropdown just shows the single
 active model.
 
+## Context compaction (required config)
+
+Long conversations eventually exceed the model's context window. daimonos
+can compact them automatically (ADR-002): when the measured prompt size
+crosses a high-water mark, the oldest turns are summarized into one message
+so the conversation keeps fitting. **The agent env file must configure this
+explicitly — there are no defaults in code, and daimonos errors at startup
+if the keys are missing:**
+
+```
+# Master switch — always required (on or off):
+DAIMONOS_AGENT_COMPACTION=on
+
+# Required when on:
+DAIMONOS_AGENT_COMPACTION_HIGH_WATER=0.75   # compact when prompt ≥ 75% of budget
+DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.50    # evict down to ~50% of budget
+DAIMONOS_AGENT_CONTEXT_WINDOW=200000        # your model's window, in tokens
+DAIMONOS_AGENT_OUTPUT_RESERVATION=8192      # tokens reserved for the reply
+
+# Optional:
+DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5  # unset → the main model
+DAIMONOS_AGENT_SUMMARY_PROMPT=...                        # unset → built-in template
+```
+
+The budget is `CONTEXT_WINDOW − OUTPUT_RESERVATION`; watermarks must satisfy
+`0 < LOW < HIGH < 1`. If you use the model picker across models with
+different windows, set `CONTEXT_WINDOW` for the smallest one. The simplest
+valid setup is `DAIMONOS_AGENT_COMPACTION=off` (no other keys needed).
+When a compaction happens, Zed shows a collapsed thought line
+(`[context compacted: N older turn(s) summarized]`); the chat REPL prints
+the equivalent notice.
+
 ## Verify
 
 1. Open Zed's agent panel and select **daimonos** as the agent.
@@ -89,12 +121,13 @@ active model.
 5. If you set `DAIMONOS_AGENT_MODELS`, the model dropdown at the bottom of
    the chat lists your models; picking one applies to the next message.
 
-## Scope (v1)
+## Scope
 
-- One active session per `daimonos acp` process (Zed spawns a fresh
-  process per agent connection, so this matches normal usage).
+- Multiple concurrent sessions per `daimonos acp` process (Zed keeps one
+  process across chat threads), with `session/load` resume — reopening a
+  thread after a window switch or a full Zed restart restores its history
+  (persisted under `~/.daimonos/acp-sessions`).
 - Text-only prompts (image/audio/resource content blocks are ignored).
-- No `session/load` (resuming a previous session) yet.
 - Tool execution and file access are handled entirely by daimonos's own
   tools — the `fs/*`/`terminal/*` client-proxy methods aren't used.
 

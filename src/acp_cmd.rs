@@ -102,6 +102,9 @@ struct AcpState {
     /// On-disk session persistence for cross-process `session/load` resume.
     /// `None` disables persistence (used by tests that don't exercise it).
     store: Option<SessionStore>,
+    /// Context/window compaction policy (ADR-002), engine-wide from the
+    /// agent env; cloned into each session's config. `None` = off.
+    compaction: Option<crate::compaction::CompactionPolicy>,
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -272,6 +275,24 @@ fn model_config_options(models: &[String], current: &str) -> Vec<SessionConfigOp
     vec![option]
 }
 
+/// Surface a compaction as a subtle thought chunk in Zed's thread view
+/// (ADR-002 Q6): no dedicated compaction SessionUpdate exists in schema
+/// 1.4.0, and a thought renders collapsed/greyed — honest without faking
+/// agent output.
+fn build_compaction_hook(
+    connection: CurrentConnection,
+    session_id: SessionId,
+) -> crate::agent::CompactionHook {
+    Box::new(move |event: &crate::compaction::CompactionEvent| {
+        let Some(cx) = current_cx(&connection) else { return };
+        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(format!(
+            "[context compacted: {} older turn(s) summarized]",
+            event.evicted_turns
+        ))));
+        send_notification(&cx, &session_id, SessionUpdate::AgentThoughtChunk(chunk));
+    })
+}
+
 /// Build the [`AgentConfig`] for one ACP session — mirrors
 /// `chat_cmd::build_agent_config`, but every hook reports through
 /// `session/update`/`session/request_permission` instead of the terminal.
@@ -282,6 +303,7 @@ fn build_agent_config(
     session_id: SessionId,
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
+    compaction: Option<crate::compaction::CompactionPolicy>,
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
@@ -293,8 +315,10 @@ fn build_agent_config(
         opts: CompleteOpts { model, ..CompleteOpts::default() },
         before_tool_call: Some(build_before_tool_call_hook(Arc::clone(&connection), session_id.clone(), safety)),
         after_tool_call: Some(build_after_tool_call_hook(Arc::clone(&connection), session_id.clone())),
+        on_compaction: Some(build_compaction_hook(Arc::clone(&connection), session_id.clone())),
         on_stream_event: Some(build_stream_hook(connection, session_id)),
         token_log: token_log.map(|path| TokenLogConfig { path, label: "acp".to_string() }),
+        compaction,
     }
 }
 
@@ -402,6 +426,7 @@ fn build_session_handle(
         session_id.clone(),
         safety,
         token_log,
+        state.compaction.clone(),
     );
     let tool_session = Session::new(session_workspace, Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
@@ -466,6 +491,7 @@ fn build_agent(
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
+    compaction: Option<crate::compaction::CompactionPolicy>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
     let state = Arc::new(AcpState {
@@ -474,6 +500,7 @@ fn build_agent(
         models,
         default_model: model,
         store: sessions_dir.map(SessionStore::new),
+        compaction,
     });
 
     AcpAgentRole
@@ -735,13 +762,24 @@ pub async fn run_acp(
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
+    compaction: Option<crate::compaction::CompactionPolicy>,
 ) -> anyhow::Result<()> {
     if let Err(e) = (make_provider)() {
         anyhow::bail!("provider init: {e}");
     }
-    build_agent(make_provider, workspace, cfg, model, models, Arc::new(safety), token_log, sessions_dir)
-        .connect_to(Stdio::new())
-        .await?;
+    build_agent(
+        make_provider,
+        workspace,
+        cfg,
+        model,
+        models,
+        Arc::new(safety),
+        token_log,
+        sessions_dir,
+        compaction,
+    )
+    .connect_to(Stdio::new())
+    .await?;
     Ok(())
 }
 
@@ -860,6 +898,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -932,6 +971,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let (stop_a, stop_b) = AcpClientRole
@@ -987,6 +1027,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
         );
@@ -1046,6 +1087,7 @@ mod tests {
                 approval_mode: crate::safety::ApprovalMode::Interactive,
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
             None,
         );
@@ -1136,6 +1178,7 @@ mod tests {
                 denied_commands: vec!["exec".into()],
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
             None,
         );
@@ -1231,6 +1274,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
         );
@@ -1333,6 +1377,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let config_options = AcpClientRole
@@ -1381,6 +1426,7 @@ mod tests {
             "model-a".to_string(),
             models,
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
         );
@@ -1444,6 +1490,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let echoed_current = AcpClientRole
@@ -1484,6 +1531,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let load_session = AcpClientRole
@@ -1514,6 +1562,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
         );
@@ -1609,6 +1658,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             None,
+            None,
         );
 
         let load_errored = AcpClientRole
@@ -1649,6 +1699,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions_dir.path().to_path_buf()),
+            None,
         );
         let ws1 = dir.path().to_path_buf();
         let session_id = AcpClientRole
@@ -1680,6 +1731,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions_dir.path().to_path_buf()),
+            None,
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
