@@ -140,8 +140,12 @@ never split a pair.
   unless accuracy proves insufficient.
 - The `CompactionStrategy` seam ships now; the `DAIMONOS_AGENT_COMPACTION_STRATEGY` selector key
   is **not** exposed until a second strategy (Spill) exists — no dead one-value knob.
-- Frontends inherit for free: `AgentEnv` → policy → `run_agent`/`run_chat`/`run_acp` →
-  `build_agent_config` → `AgentConfig`.
+- Frontends inherit for free: `AgentEnv` → policy → `run_chat`/`run_acp` →
+  `build_agent_config` → `AgentConfig`. **Exception (impl note):** the one-shot
+  `daimonos agent` is a *single* turn — between-turns compaction structurally
+  cannot apply (never an older turn to evict), so it takes no policy; a long
+  single tool loop is covered by tool-output truncation + the overflow error,
+  and intra-run compaction remains future work below.
 
 ## Surfacing + persistence (Q6)
 

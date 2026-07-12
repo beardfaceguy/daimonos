@@ -290,8 +290,6 @@ async fn main() -> anyhow::Result<()> {
                     safety: None,
                     analytics: None,
                     token_log: token_log.clone(),
-                    // Dry-run never calls the API, so no compaction either.
-                    compaction: None,
                 };
                 let result = agent_cmd::run_agent(
                     &DryRunProvider,
@@ -343,7 +341,6 @@ async fn main() -> anyhow::Result<()> {
                 safety: Some(agent.to_safety_policy(approve_fn)),
                 analytics: analytics_store,
                 token_log: token_log.clone(),
-                compaction: agent.compaction.clone(),
             };
             let result =
                 agent_cmd::run_agent(llm.as_ref(), &workspace, Arc::clone(&cfg), args, &mut std::io::stdout())

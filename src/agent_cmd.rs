@@ -24,11 +24,12 @@ pub struct AgentCmdArgs {
     pub analytics: Option<Arc<AnalyticsStore>>,
     /// `--debug-tokens` log file path. `None` = no per-call token logging.
     pub token_log: Option<std::path::PathBuf>,
-    /// Context/window compaction policy (ADR-002). `None` = off. A one-shot
-    /// task can still be a long tool-heavy loop, so the agent subcommand
-    /// inherits compaction like the interactive frontends.
-    pub compaction: Option<crate::compaction::CompactionPolicy>,
 }
+
+// NOTE: no compaction policy here — ADR-002 compaction operates BETWEEN
+// turns of a multi-turn AgentSession, and a one-shot `daimonos agent` run is
+// a single turn (there is never an older turn to evict). Intra-run
+// compaction for a single long tool loop is explicit ADR-002 future work.
 
 /// Run the agent subcommand.
 ///
@@ -73,7 +74,6 @@ pub async fn run_agent(
         opts: CompleteOpts { model, ..CompleteOpts::default() },
         before_tool_call,
         token_log: args.token_log.map(|path| TokenLogConfig { path, label: "agent".to_string() }),
-        compaction: args.compaction,
         ..AgentConfig::default()
     };
 
@@ -196,7 +196,7 @@ mod tests {
     }
 
     fn args(task: &str) -> AgentCmdArgs {
-        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None, analytics: None, token_log: None, compaction: None }
+        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None, analytics: None, token_log: None }
     }
 
     fn default_cfg() -> Arc<Config> {
@@ -225,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_call_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None, compaction: None };
+        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
     }
@@ -233,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_task_in_output() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None, compaction: None };
+        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -243,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_tool_count() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None, compaction: None };
+        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -316,7 +316,6 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
-            compaction: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
@@ -360,7 +359,6 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: Some(log_path.clone()),
-            compaction: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
@@ -406,7 +404,6 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
-            compaction: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
@@ -428,7 +425,6 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
-            compaction: None,
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
