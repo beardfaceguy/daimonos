@@ -63,7 +63,11 @@ impl LlmProvider for OpenRouterProvider {
                 .as_str()
                 .unwrap_or("unknown error")
                 .to_string();
-            return LlmResponse::error(format!("openrouter {status}: {msg}"));
+            let full = format!("openrouter {status}: {msg}");
+            if is_context_overflow_error(&msg) {
+                return LlmResponse::context_overflow_error(full);
+            }
+            return LlmResponse::error(full);
         }
 
         parse_response(&resp_body)
@@ -81,12 +85,13 @@ impl LlmProvider for OpenRouterProvider {
         let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
         let tools = tools_to_wire(&ctx.tools);
 
+        // No `stream_options`: OpenRouter deprecated `include_usage` (usage
+        // is now always included in the final SSE chunk automatically).
         let mut body = json!({
             "model": opts.model,
             "messages": messages,
             "max_tokens": opts.max_tokens,
             "stream": true,
-            "stream_options": {"include_usage": true},
         });
 
         if !tools.is_empty() {
@@ -103,7 +108,11 @@ impl LlmProvider for OpenRouterProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            return LlmResponse::error(format!("openrouter {status}: {body_text}"));
+            let full = format!("openrouter {status}: {body_text}");
+            if is_context_overflow_error(&body_text) {
+                return LlmResponse::context_overflow_error(full);
+            }
+            return LlmResponse::error(full);
         }
 
         let mut events = resp.bytes_stream().eventsource();
@@ -208,7 +217,7 @@ impl StreamState {
         }
         let stop_reason = map_finish_reason(self.finish_reason.as_deref());
         let usage = parse_usage(&self.usage);
-        LlmResponse { content, stop_reason, error_message: None, usage }
+        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
     }
 }
 
@@ -348,7 +357,7 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
         }
     }
 
-    LlmResponse { content, stop_reason, error_message: None, usage }
+    LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
 }
 
 pub(crate) fn map_finish_reason(reason: Option<&str>) -> StopReason {
@@ -361,15 +370,41 @@ pub(crate) fn map_finish_reason(reason: Option<&str>) -> StopReason {
 }
 
 fn parse_usage(usage: &Value) -> Usage {
+    // OpenAI-format `prompt_tokens` INCLUDES the cached portions; the cache
+    // counts are sub-details under `prompt_tokens_details`. Canonical `Usage`
+    // semantics (ADR-002) want `input` = NON-cached prompt tokens, so
+    // subtract both details out — keeping the invariant
+    // `Usage::prompt_tokens() == wire prompt_tokens` exact. When the details
+    // are null/absent (vLLM, Ollama, most self-hosted), input = prompt_tokens
+    // and the invariant still holds.
+    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let details = &usage["prompt_tokens_details"];
+    let cache_read = details["cached_tokens"].as_u64().unwrap_or(0);
+    let cache_write = details["cache_write_tokens"].as_u64().unwrap_or(0);
     Usage {
-        input: usage["prompt_tokens"].as_u64().unwrap_or(0),
+        input: prompt.saturating_sub(cache_read).saturating_sub(cache_write),
         output: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
-        cache_write: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_read,
+        cache_write,
         // OpenRouter does not return cost in the usage object; left at zero.
         // Fetch from /api/v1/generation?id={id} if per-run cost is needed.
         cost: Cost::default(),
     }
+}
+
+/// Classify an OpenAI-dialect error body/message as a context-window
+/// overflow (ADR-002 reactive compaction). Provider-local knowledge, per
+/// ADR-001. Phrasings vary by upstream: OpenAI/vLLM/xAI say "maximum
+/// context length", Anthropic-through-OpenRouter passes through "prompt is
+/// too long", llama.cpp says "exceeds the available context", Bedrock-style
+/// says "input is too long".
+pub(crate) fn is_context_overflow_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("maximum context length")
+        || m.contains("context length exceeded")
+        || m.contains("prompt is too long")
+        || m.contains("exceeds the available context")
+        || m.contains("input is too long")
 }
 
 #[cfg(test)]
@@ -587,20 +622,80 @@ mod tests {
 
     #[test]
     fn parse_usage_maps_token_fields() {
+        // Current OpenRouter/OpenAI format: cache counts are sub-details of
+        // prompt_tokens (which INCLUDES them). Canonical semantics subtract
+        // them out of `input` so prompt_tokens() == wire prompt_tokens.
+        let body = json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 194,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 20}
+            }
+        });
+        let resp = parse_response(&body);
+        assert_eq!(resp.usage.input, 144, "input must be the NON-cached prompt tokens");
+        assert_eq!(resp.usage.output, 50);
+        assert_eq!(resp.usage.cache_read, 30);
+        assert_eq!(resp.usage.cache_write, 20);
+        assert_eq!(resp.usage.prompt_tokens(), 194, "invariant: prompt_tokens() == wire prompt_tokens");
+    }
+
+    #[test]
+    fn parse_usage_without_details_keeps_invariant() {
+        // vLLM/Ollama/most self-hosted omit prompt_tokens_details (or send
+        // null): input == prompt_tokens, caches 0, invariant still exact.
+        let body = json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": null}
+        });
+        let resp = parse_response(&body);
+        assert_eq!(resp.usage.input, 100);
+        assert_eq!(resp.usage.cache_read, 0);
+        assert_eq!(resp.usage.cache_write, 0);
+        assert_eq!(resp.usage.prompt_tokens(), 100);
+    }
+
+    #[test]
+    fn parse_usage_ignores_defunct_top_level_cache_fields() {
+        // The old parser read these top-level names; the current wire format
+        // doesn't have them and they must not be picked up if present.
         let body = json!({
             "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
             "usage": {
                 "prompt_tokens": 100,
-                "completion_tokens": 50,
-                "cache_read_input_tokens": 30,
-                "cache_creation_input_tokens": 20
+                "completion_tokens": 5,
+                "cache_read_input_tokens": 999,
+                "cache_creation_input_tokens": 999
             }
         });
         let resp = parse_response(&body);
-        assert_eq!(resp.usage.input, 100);
-        assert_eq!(resp.usage.output, 50);
-        assert_eq!(resp.usage.cache_read, 30);
-        assert_eq!(resp.usage.cache_write, 20);
+        assert_eq!(resp.usage.cache_read, 0);
+        assert_eq!(resp.usage.cache_write, 0);
+        assert_eq!(resp.usage.prompt_tokens(), 100);
+    }
+
+    // --- context-overflow classification (ADR-002, vikunja #964) ---
+
+    #[test]
+    fn overflow_classifier_matches_known_phrasings() {
+        // One per documented upstream dialect.
+        for msg in [
+            "This model's maximum context length is 8192 tokens. However, your messages resulted in 9001 tokens.",
+            "context length exceeded",
+            "prompt is too long: 213462 tokens > 200000 maximum",
+            "the request exceeds the available context size",
+            "Input is too long for requested model",
+        ] {
+            assert!(is_context_overflow_error(msg), "should classify as overflow: {msg}");
+        }
+    }
+
+    #[test]
+    fn overflow_classifier_rejects_other_errors() {
+        for msg in ["rate limit exceeded", "invalid api key", "model not found", "internal server error"] {
+            assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
+        }
     }
 
     #[test]
@@ -700,5 +795,23 @@ mod tests {
         let resp = state.finish();
         assert_eq!(resp.usage.input, 0);
         assert_eq!(resp.usage.output, 0);
+    }
+
+    #[test]
+    fn stream_usage_in_non_final_chunk_is_captured() {
+        // xAI/Grok streaming puts usage in a NON-final chunk (an empty extra
+        // chunk follows). Capture must be position-tolerant: last-seen
+        // non-null usage wins, wherever it appears.
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}));
+        state.on_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 7}
+        }));
+        // Trailing chunk with null usage must NOT clobber the captured one.
+        state.on_chunk(&json!({"choices": [], "usage": null}));
+        let resp = state.finish();
+        assert_eq!(resp.usage.prompt_tokens(), 42);
+        assert_eq!(resp.usage.output, 7);
     }
 }

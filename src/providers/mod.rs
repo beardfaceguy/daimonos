@@ -44,6 +44,13 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
+/// Token usage for one API call, in **canonical semantics** (ADR-002,
+/// sharpening ADR-001's neutral shape): `input` is the *non-cached* prompt
+/// tokens; `cache_read`/`cache_write` are the cached portions. Every
+/// provider maps its own wire fields so these meanings hold — Anthropic's
+/// `input_tokens` already excludes cache; OpenAI-format `prompt_tokens`
+/// *includes* it, so that parser subtracts the `prompt_tokens_details`
+/// sub-counts out of `input`.
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub input: u64,
@@ -51,6 +58,16 @@ pub struct Usage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost: Cost,
+}
+
+impl Usage {
+    /// Total tokens the prompt occupied in the model's context window — the
+    /// number the compaction trigger (ADR-002) compares against the budget.
+    /// Cached tokens still occupy the window, so they count. Thanks to the
+    /// canonical field semantics above, this is correct for every provider.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +117,12 @@ pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
+    /// True when the error is a context-length-exceeded rejection (the
+    /// prompt no longer fits the model's window). Classified by each
+    /// provider at its own boundary — per ADR-001 no provider phrasing
+    /// crosses into core — so the compaction reactive path (ADR-002) can
+    /// know that compacting and retrying will help.
+    pub context_overflow: bool,
     pub usage: Usage,
 }
 
@@ -109,8 +132,14 @@ impl LlmResponse {
             content: vec![],
             stop_reason: StopReason::Error,
             error_message: Some(msg.into()),
+            context_overflow: false,
             usage: Usage::default(),
         }
+    }
+
+    /// An error response classified as a context-window overflow.
+    pub fn context_overflow_error(msg: impl Into<String>) -> Self {
+        LlmResponse { context_overflow: true, ..Self::error(msg) }
     }
 }
 
@@ -191,6 +220,7 @@ mod tests {
             content: vec![ContentBlock::Text("hi".into())],
             stop_reason: StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         });
         let mut events = Vec::new();
@@ -225,6 +255,29 @@ mod tests {
         assert_eq!(u.cache_read, 0);
         assert_eq!(u.cache_write, 0);
         assert_eq!(u.cost.total_usd, 0.0);
+    }
+
+    #[test]
+    fn usage_prompt_tokens_sums_all_window_occupants() {
+        // Canonical semantics: input is non-cached; cached tokens still
+        // occupy the window, so prompt_tokens() counts all three.
+        let u = Usage { input: 100, output: 9, cache_read: 30, cache_write: 20, cost: Cost::default() };
+        assert_eq!(u.prompt_tokens(), 150);
+        assert_eq!(Usage::default().prompt_tokens(), 0);
+    }
+
+    #[test]
+    fn error_constructor_is_not_context_overflow() {
+        assert!(!LlmResponse::error("rate limited").context_overflow);
+    }
+
+    #[test]
+    fn context_overflow_error_constructor_sets_flag() {
+        let r = LlmResponse::context_overflow_error("prompt is too long");
+        assert!(r.context_overflow);
+        assert_eq!(r.stop_reason, StopReason::Error);
+        assert_eq!(r.error_message.as_deref(), Some("prompt is too long"));
+        assert!(r.content.is_empty());
     }
 
     #[test]

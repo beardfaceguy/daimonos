@@ -380,6 +380,7 @@ mod tests {
             content: vec![ContentBlock::Text("done".to_string())],
             stop_reason: StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: mock_usage(100, 50),
         }
     }
@@ -393,6 +394,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             error_message: None,
+            context_overflow: false,
             usage: mock_usage(200, 100),
         }
     }
@@ -626,6 +628,7 @@ mod tests {
                 content: self.response.content.clone(),
                 stop_reason: self.response.stop_reason.clone(),
                 error_message: self.response.error_message.clone(),
+                context_overflow: false,
                 usage: self.response.usage.clone(),
             }
         }
@@ -700,6 +703,7 @@ mod tests {
             content: vec![],
             stop_reason: StopReason::MaxTokens,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         }]);
         let result = run(&provider, &mut s, vec![Message::user("go")], &AgentConfig::default()).await;
@@ -716,6 +720,7 @@ mod tests {
                 content: vec![ContentBlock::Text("done".into())],
                 stop_reason: StopReason::EndTurn,
                 error_message: None,
+                context_overflow: false,
                 usage: mock_usage(300, 150),
             },
         ]);
@@ -824,6 +829,7 @@ mod tests {
             ],
             stop_reason: StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         }]);
         let result = run(&provider, &mut s, vec![Message::user("think")], &AgentConfig::default()).await;

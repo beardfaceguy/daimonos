@@ -197,6 +197,15 @@ pub(crate) fn map_stop_reason(s: Option<&str>) -> StopReason {
     }
 }
 
+/// Classify an Anthropic error body/message as a context-window overflow
+/// (ADR-002 reactive compaction). Provider-local knowledge, per ADR-001.
+/// Anthropic's two phrasings: "prompt is too long: N tokens > M maximum"
+/// and "input length and `max_tokens` exceed context limit".
+pub(crate) fn is_context_overflow_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("prompt is too long") || m.contains("exceed context limit")
+}
+
 fn supports_adaptive_thinking(model: &str) -> bool {
     model.starts_with("claude-opus-4")
         || model.starts_with("claude-sonnet-4-6")
@@ -372,7 +381,7 @@ impl StreamState {
             .collect();
         let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         let usage = map_usage(self.usage, model);
-        LlmResponse { content, stop_reason, error_message: None, usage }
+        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
     }
 }
 
@@ -436,7 +445,11 @@ impl LlmProvider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return LlmResponse::error(format!("API {status}: {body}"));
+            let full = format!("API {status}: {body}");
+            if is_context_overflow_error(&body) {
+                return LlmResponse::context_overflow_error(full);
+            }
+            return LlmResponse::error(full);
         }
 
         let raw: AnthropicResponse = match resp.json().await {
@@ -448,7 +461,7 @@ impl LlmProvider for AnthropicProvider {
         let stop_reason = map_stop_reason(raw.stop_reason.as_deref());
         let usage = map_usage(raw.usage, &opts.model);
 
-        LlmResponse { content, stop_reason, error_message: None, usage }
+        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
     }
 
     async fn stream(
@@ -480,7 +493,11 @@ impl LlmProvider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return LlmResponse::error(format!("API {status}: {body}"));
+            let full = format!("API {status}: {body}");
+            if is_context_overflow_error(&body) {
+                return LlmResponse::context_overflow_error(full);
+            }
+            return LlmResponse::error(full);
         }
 
         let mut events = resp.bytes_stream().eventsource();
@@ -500,7 +517,11 @@ impl LlmProvider for AnthropicProvider {
             };
             if data["type"] == "error" {
                 let msg = data["error"]["message"].as_str().unwrap_or("unknown stream error");
-                return LlmResponse::error(format!("API error: {msg}"));
+                let full = format!("API error: {msg}");
+                if is_context_overflow_error(msg) {
+                    return LlmResponse::context_overflow_error(full);
+                }
+                return LlmResponse::error(full);
             }
             for ev in state.on_data(&data) {
                 on_event(ev);
@@ -560,6 +581,47 @@ mod tests {
         assert_eq!(u.output, 500);
         assert_eq!(u.cache_read, 2_000);
         assert_eq!(u.cache_write, 100);
+    }
+
+    #[test]
+    fn map_usage_matches_canonical_semantics() {
+        // Anthropic's input_tokens already EXCLUDES the cached portions, so
+        // a plain pass-through satisfies the canonical Usage semantics
+        // (ADR-002): prompt_tokens() = input + cache_read + cache_write =
+        // the full window occupancy.
+        let raw = AnthropicUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_input_tokens: 2_000,
+            cache_creation_input_tokens: 100,
+        };
+        let u = map_usage(raw, "claude-opus-4-8");
+        assert_eq!(u.prompt_tokens(), 3_100);
+    }
+
+    // --- context-overflow classification (ADR-002, vikunja #964) ---
+
+    #[test]
+    fn overflow_classifier_matches_anthropic_phrasings() {
+        for msg in [
+            "prompt is too long: 213462 tokens > 200000 maximum",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Prompt is too long"}}"#,
+            "input length and `max_tokens` exceed context limit: 199000 + 8192 > 200000",
+        ] {
+            assert!(is_context_overflow_error(msg), "should classify as overflow: {msg}");
+        }
+    }
+
+    #[test]
+    fn overflow_classifier_rejects_other_anthropic_errors() {
+        for msg in [
+            "rate limit exceeded",
+            "invalid x-api-key",
+            "overloaded_error: Overloaded",
+            "max_tokens: must be greater than 0",
+        ] {
+            assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
+        }
     }
 
     #[test]
