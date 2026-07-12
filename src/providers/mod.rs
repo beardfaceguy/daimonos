@@ -17,8 +17,16 @@ pub enum Role {
 pub enum ContentBlock {
     Text(String),
     Thinking(String),
-    ToolCall { id: String, name: String, input: Value },
-    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,11 +37,17 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Message { role: Role::User, content: vec![ContentBlock::Text(text.into())] }
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(text.into())],
+        }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Message { role: Role::Assistant, content: vec![ContentBlock::Text(text.into())] }
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(text.into())],
+        }
     }
 }
 
@@ -139,7 +153,10 @@ impl LlmResponse {
 
     /// An error response classified as a context-window overflow.
     pub fn context_overflow_error(msg: impl Into<String>) -> Self {
-        LlmResponse { context_overflow: true, ..Self::error(msg) }
+        LlmResponse {
+            context_overflow: true,
+            ..Self::error(msg)
+        }
     }
 }
 
@@ -228,7 +245,12 @@ mod tests {
     }
 
     fn dummy_ctx() -> Context {
-        Context { messages: vec![], system: None, tools: vec![], stable_prefix_len: 0 }
+        Context {
+            messages: vec![],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        }
     }
 
     #[tokio::test]
@@ -242,10 +264,15 @@ mod tests {
         });
         let mut events = Vec::new();
         let resp = provider
-            .stream(&dummy_ctx(), &CompleteOpts::default(), &mut |e| events.push(e))
+            .stream(&dummy_ctx(), &CompleteOpts::default(), &mut |e| {
+                events.push(e)
+            })
             .await;
         assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hi"));
-        assert!(events.is_empty(), "default stream() must not synthesize events");
+        assert!(
+            events.is_empty(),
+            "default stream() must not synthesize events"
+        );
     }
 
     #[tokio::test]
@@ -284,7 +311,13 @@ mod tests {
     fn usage_prompt_tokens_sums_all_window_occupants() {
         // Canonical semantics: input is non-cached; cached tokens still
         // occupy the window, so prompt_tokens() counts all three.
-        let u = Usage { input: 100, output: 9, cache_read: 30, cache_write: 20, cost: Cost::default() };
+        let u = Usage {
+            input: 100,
+            output: 9,
+            cache_read: 30,
+            cache_write: 20,
+            cost: Cost::default(),
+        };
         assert_eq!(u.prompt_tokens(), 150);
         assert_eq!(Usage::default().prompt_tokens(), 0);
     }
@@ -350,7 +383,11 @@ mod tests {
         ];
         for (i, a) in variants.iter().enumerate() {
             for (j, b) in variants.iter().enumerate() {
-                if i == j { assert_eq!(a, b); } else { assert_ne!(a, b); }
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
             }
         }
     }

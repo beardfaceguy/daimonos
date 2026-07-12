@@ -118,9 +118,11 @@ fn estimate_message_tokens(message: &Message) -> u64 {
             ContentBlock::ToolCall { id, name, input } => {
                 id.len() + name.len() + input.to_string().len()
             }
-            ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                tool_use_id.len() + content.len()
-            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => tool_use_id.len() + content.len(),
         })
         .sum();
     chars as u64 / EST_CHARS_PER_TOKEN
@@ -134,7 +136,10 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 /// Estimate for the whole prompt: system + history. Used as the trigger
 /// fallback when no measured usage exists yet.
 pub fn estimate_prompt_tokens(system: Option<&str>, messages: &[Message]) -> u64 {
-    system.map(|s| s.len() as u64 / EST_CHARS_PER_TOKEN).unwrap_or(0) + estimate_tokens(messages)
+    system
+        .map(|s| s.len() as u64 / EST_CHARS_PER_TOKEN)
+        .unwrap_or(0)
+        + estimate_tokens(messages)
 }
 
 // --- Turn segmentation & cut selection ---
@@ -214,10 +219,20 @@ pub fn transcript_for_summary(messages: &[Message]) -> String {
                 ContentBlock::ToolCall { name, input, .. } => {
                     out.push_str(&format!("[tool call: {name} {input}]\n"));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     let capped: String = content.chars().take(SUMMARY_TOOL_RESULT_CAP).collect();
-                    let ellipsis = if content.chars().count() > SUMMARY_TOOL_RESULT_CAP { "…" } else { "" };
-                    let tag = if *is_error { "tool error" } else { "tool result" };
+                    let ellipsis = if content.chars().count() > SUMMARY_TOOL_RESULT_CAP {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    let tag = if *is_error {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    };
                     out.push_str(&format!("[{tag}: {capped}{ellipsis}]\n"));
                 }
                 // Thinking is internal reasoning; the assistant's visible text
@@ -296,7 +311,10 @@ mod tests {
 
     #[test]
     fn budget_saturates_when_reservation_exceeds_window() {
-        let p = CompactionPolicy { output_reservation: 2000, ..policy() };
+        let p = CompactionPolicy {
+            output_reservation: 2000,
+            ..policy()
+        };
         assert_eq!(p.budget(), 0);
     }
 
@@ -318,10 +336,10 @@ mod tests {
     #[test]
     fn estimate_counts_all_block_kinds() {
         let msgs = vec![
-            Message::user(text_of_len(400)),                                  // 100 tokens
+            Message::user(text_of_len(400)), // 100 tokens
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Thinking(text_of_len(200))],       // 50 tokens
+                content: vec![ContentBlock::Thinking(text_of_len(200))], // 50 tokens
             },
         ];
         assert_eq!(estimate_tokens(&msgs), 150);
@@ -361,12 +379,23 @@ mod tests {
         }
         let cut = choose_cut(&msgs, 2000).expect("must evict something");
         // The cut must land on a genuine user-text turn start…
-        assert!(turn_starts(&msgs).contains(&cut), "cut {cut} not a turn start");
+        assert!(
+            turn_starts(&msgs).contains(&cut),
+            "cut {cut} not a turn start"
+        );
         // …so every ToolCall id in the kept tail has its ToolResult there too.
         let kept = &msgs[cut..];
-        let call_ids: Vec<&String> = kept.iter().flat_map(|m| &m.content).filter_map(|b| {
-            if let ContentBlock::ToolCall { id, .. } = b { Some(id) } else { None }
-        }).collect();
+        let call_ids: Vec<&String> = kept
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| {
+                if let ContentBlock::ToolCall { id, .. } = b {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
         for id in call_ids {
             assert!(
                 kept.iter().flat_map(|m| &m.content).any(|b| matches!(
@@ -465,7 +494,9 @@ mod tests {
     fn drop_marker_is_user_role() {
         let m = drop_marker_message();
         assert_eq!(m.role, Role::User);
-        assert!(matches!(&m.content[0], ContentBlock::Text(t) if t.contains("summary unavailable")));
+        assert!(
+            matches!(&m.content[0], ContentBlock::Text(t) if t.contains("summary unavailable"))
+        );
     }
 
     #[test]

@@ -63,7 +63,11 @@ pub async fn run_agent(
 
     let tools: Vec<ToolSchema> = schemas
         .into_iter()
-        .map(|s| ToolSchema { name: s.name, description: s.description, input_schema: s.input_schema })
+        .map(|s| ToolSchema {
+            name: s.name,
+            description: s.description,
+            input_schema: s.input_schema,
+        })
         .collect();
 
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
@@ -71,9 +75,15 @@ pub async fn run_agent(
     let config = AgentConfig {
         system: Some(default_system_prompt()),
         tools,
-        opts: CompleteOpts { model, ..CompleteOpts::default() },
+        opts: CompleteOpts {
+            model,
+            ..CompleteOpts::default()
+        },
         before_tool_call,
-        token_log: args.token_log.map(|path| TokenLogConfig { path, label: "agent".to_string() }),
+        token_log: args.token_log.map(|path| TokenLogConfig {
+            path,
+            label: "agent".to_string(),
+        }),
         ..AgentConfig::default()
     };
 
@@ -127,7 +137,8 @@ Use individual tools only when you need exactly one operation.
 Use `batch` for independent parallel reads/searches when you do not need intermediate results.
 
 Each round-trip is a full inference against growing context — minimize them.
-".to_string()
+"
+    .to_string()
 }
 
 #[cfg(test)]
@@ -196,7 +207,14 @@ mod tests {
     }
 
     fn args(task: &str) -> AgentCmdArgs {
-        AgentCmdArgs { task: task.to_string(), model: None, dry_run: false, safety: None, analytics: None, token_log: None }
+        AgentCmdArgs {
+            task: task.to_string(),
+            model: None,
+            dry_run: false,
+            safety: None,
+            analytics: None,
+            token_log: None,
+        }
     }
 
     fn default_cfg() -> Arc<Config> {
@@ -208,7 +226,10 @@ mod tests {
     #[test]
     fn system_prompt_instructs_execute_script_preference() {
         let p = default_system_prompt();
-        assert!(p.contains("execute_script"), "prompt must mention execute_script");
+        assert!(
+            p.contains("execute_script"),
+            "prompt must mention execute_script"
+        );
         assert!(
             p.contains("sequential") || p.contains("round-trip"),
             "prompt must explain the round-trip rationale"
@@ -225,17 +246,35 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_call_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "do it".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
+        let a = AgentCmdArgs {
+            task: "do it".into(),
+            model: None,
+            dry_run: true,
+            safety: None,
+            analytics: None,
+            token_log: None,
+        };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn dry_run_prints_task_in_output() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "my task".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
+        let a = AgentCmdArgs {
+            task: "my task".into(),
+            model: None,
+            dry_run: true,
+            safety: None,
+            analytics: None,
+            token_log: None,
+        };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("my task"), "output should mention the task: {s}");
     }
@@ -243,9 +282,18 @@ mod tests {
     #[tokio::test]
     async fn dry_run_prints_tool_count() {
         let dir = tempfile::tempdir().unwrap();
-        let a = AgentCmdArgs { task: "go".into(), model: None, dry_run: true, safety: None, analytics: None, token_log: None };
+        let a = AgentCmdArgs {
+            task: "go".into(),
+            model: None,
+            dry_run: true,
+            safety: None,
+            analytics: None,
+            token_log: None,
+        };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("tool"), "output should mention tools: {s}");
     }
@@ -257,9 +305,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("task complete")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), args("do a thing"), &mut out).await.unwrap();
+        run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("do a thing"),
+            &mut out,
+        )
+        .await
+        .unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("task complete"), "text block should appear in output: {s}");
+        assert!(
+            s.contains("task complete"),
+            "text block should appear in output: {s}"
+        );
     }
 
     #[tokio::test]
@@ -267,9 +326,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("assistant reply")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), args("user task prompt"), &mut out).await.unwrap();
+        run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("user task prompt"),
+            &mut out,
+        )
+        .await
+        .unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("user task prompt"), "user message should not appear in output: {s}");
+        assert!(
+            !s.contains("user task prompt"),
+            "user message should not appear in output: {s}"
+        );
         assert!(s.contains("assistant reply"));
     }
 
@@ -287,9 +357,20 @@ mod tests {
             usage: Usage::default(),
         }]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), args("think"), &mut out).await.unwrap();
+        run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("think"),
+            &mut out,
+        )
+        .await
+        .unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("internal thoughts"), "thinking should be hidden: {s}");
+        assert!(
+            !s.contains("internal thoughts"),
+            "thinking should be hidden: {s}"
+        );
         assert!(s.contains("visible answer"));
     }
 
@@ -300,7 +381,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![end_turn_with_text("ok")]);
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out)
+            .await
+            .unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-opus-4-8");
     }
@@ -318,7 +401,9 @@ mod tests {
             token_log: None,
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-haiku-4-5");
     }
@@ -340,9 +425,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = SchemaCapture(Mutex::new(Vec::new()));
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), args("check tools"), &mut out).await.unwrap();
+        run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("check tools"),
+            &mut out,
+        )
+        .await
+        .unwrap();
         let counts = provider.0.lock().unwrap();
-        assert!(*counts.first().unwrap() > 0, "agent loop should include tools in Context");
+        assert!(
+            *counts.first().unwrap() > 0,
+            "agent loop should include tools in Context"
+        );
     }
 
     // --- token log wiring (--debug-tokens) ---
@@ -361,7 +457,9 @@ mod tests {
             token_log: Some(log_path.clone()),
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(content.lines().count(), 1);
         assert!(content.contains("\"cmd\":\"agent\""));
@@ -372,7 +470,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("tokens.log");
         let provider = MockProvider::new(vec![end_turn_with_text("done")]);
-        run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut Vec::new()).await.unwrap();
+        run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("go"),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
         assert!(!log_path.exists());
     }
 
@@ -383,7 +489,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
         let mut out = Vec::new();
-        let result = run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out).await.unwrap();
+        let result = run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out)
+            .await
+            .unwrap();
         assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("api down"));
     }
@@ -406,10 +514,15 @@ mod tests {
             token_log: None,
         };
         let mut out = Vec::new();
-        run_agent(&provider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
 
         let summary = store.agent_runs_summary(1).unwrap();
-        assert_eq!(summary.total_runs, 1, "one agent run must be recorded in analytics");
+        assert_eq!(
+            summary.total_runs, 1,
+            "one agent run must be recorded in analytics"
+        );
     }
 
     #[tokio::test]
@@ -427,18 +540,23 @@ mod tests {
             token_log: None,
         };
         let mut out = Vec::new();
-        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out).await.unwrap();
+        run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
 
         let summary = store.agent_runs_summary(1).unwrap();
-        assert_eq!(summary.total_runs, 0, "dry-run must not record an agent run");
+        assert_eq!(
+            summary.total_runs, 0,
+            "dry-run must not record an agent run"
+        );
     }
 
     // --- safety policy wiring ---
 
     #[tokio::test]
     async fn safety_policy_blocks_denied_tool_before_provider_sees_it() {
-        use crate::safety::SafetyPolicy;
         use crate::agent::BeforeHookResult;
+        use crate::safety::SafetyPolicy;
 
         // Verify that a denied tool gets a Block result from the hook
         let policy = SafetyPolicy {
@@ -466,7 +584,8 @@ mod tests {
         let bin_dir = tempfile::tempdir().unwrap();
         let probe = bin_dir.path().join("cfg_probe_958");
         std::fs::write(&probe, "#!/bin/sh\necho cfg-wired\n").unwrap();
-        std::fs::set_permissions(&probe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&probe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
 
         let mut cfg = Config::default();
         cfg.process.extra_path = vec![bin_dir.path().to_string_lossy().to_string()];
@@ -486,9 +605,15 @@ mod tests {
             end_turn_with_text("done"),
         ]);
         let mut out = Vec::new();
-        let result = run_agent(&provider, dir.path(), Arc::new(cfg), args("run probe"), &mut out)
-            .await
-            .unwrap();
+        let result = run_agent(
+            &provider,
+            dir.path(),
+            Arc::new(cfg),
+            args("run probe"),
+            &mut out,
+        )
+        .await
+        .unwrap();
 
         let tool_result_text = result
             .messages

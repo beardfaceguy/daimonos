@@ -78,7 +78,10 @@ mod tests {
             .map(|s| s.name.clone())
             .collect();
         for od in on_demand {
-            assert!(!names.contains(&od.to_string()), "OnDemand tool {od} leaked into active_schemas");
+            assert!(
+                !names.contains(&od.to_string()),
+                "OnDemand tool {od} leaked into active_schemas"
+            );
         }
     }
 
@@ -87,8 +90,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for schema in active_schemas(dir.path()) {
             assert!(!schema.name.is_empty(), "empty name");
-            assert!(!schema.description.is_empty(), "empty description for {}", schema.name);
-            assert!(schema.input_schema.is_object(), "non-object schema for {}", schema.name);
+            assert!(
+                !schema.description.is_empty(),
+                "empty description for {}",
+                schema.name
+            );
+            assert!(
+                schema.input_schema.is_object(),
+                "non-object schema for {}",
+                schema.name
+            );
         }
     }
 
@@ -98,7 +109,11 @@ mod tests {
         let schemas = active_schemas(dir.path());
         let mut seen = std::collections::HashSet::new();
         for s in &schemas {
-            assert!(seen.insert(s.name.clone()), "duplicate tool name: {}", s.name);
+            assert!(
+                seen.insert(s.name.clone()),
+                "duplicate tool name: {}",
+                s.name
+            );
         }
     }
 
@@ -204,7 +219,9 @@ mod tests {
     async fn invoke_returns_none_for_unknown_tool() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = session_in(dir.path());
-        assert!(invoke(&mut session, "does_not_exist", &json!({})).await.is_none());
+        assert!(invoke(&mut session, "does_not_exist", &json!({}))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -83,7 +83,11 @@ const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
 fn truncate(s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
-        format!("{}...[{} bytes truncated]", &s[..MAX_OUTPUT_BYTES], s.len() - MAX_OUTPUT_BYTES)
+        format!(
+            "{}...[{} bytes truncated]",
+            &s[..MAX_OUTPUT_BYTES],
+            s.len() - MAX_OUTPUT_BYTES
+        )
     } else {
         s
     }
@@ -401,7 +405,10 @@ mod tests {
         assert_eq!(result.output["exit"], 0, "got: {}", result.output);
         assert_eq!(result.output["script"], "greet");
         assert!(
-            result.output["stdout"].as_str().unwrap_or("").contains("hello from npm"),
+            result.output["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello from npm"),
             "got: {}",
             result.output
         );
@@ -423,7 +430,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(result.output["exit"], 0, "expected nonzero exit for missing script; got: {}", result.output);
+        assert_ne!(
+            result.output["exit"], 0,
+            "expected nonzero exit for missing script; got: {}",
+            result.output
+        );
         assert_eq!(result.output["ok"], false);
     }
 }

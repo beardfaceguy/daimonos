@@ -69,7 +69,14 @@ fn orient_from_graph_alone() {
     write_module(ws);
 
     // --- 1. Build the graph (what `kgl_query index` does). ---
-    let idx = run(ws, "index", &json!({}), "2026-05-30T00:00:00Z", &KglConfig::default()).unwrap();
+    let idx = run(
+        ws,
+        "index",
+        &json!({}),
+        "2026-05-30T00:00:00Z",
+        &KglConfig::default(),
+    )
+    .unwrap();
     println!("\n[index] {idx}");
     assert_eq!(idx["indexed"], json!(true));
 
@@ -112,10 +119,26 @@ fn orient_from_graph_alone() {
         h
     };
 
-    declare("authenticate", "Entry point for the auth flow: validate credentials and return a session token", &[]);
-    declare("load_user", "Fetch a user record from the user database by id", &[]);
-    declare("verify_password", "Constant-time check of a password against its stored hash", &[]);
-    declare("hash_password", "Hash a plaintext password (argon2id) for storage/comparison", &[]);
+    declare(
+        "authenticate",
+        "Entry point for the auth flow: validate credentials and return a session token",
+        &[],
+    );
+    declare(
+        "load_user",
+        "Fetch a user record from the user database by id",
+        &[],
+    );
+    declare(
+        "verify_password",
+        "Constant-time check of a password against its stored hash",
+        &[],
+    );
+    declare(
+        "hash_password",
+        "Hash a plaintext password (argon2id) for storage/comparison",
+        &[],
+    );
     let issue = declare(
         "issue_token",
         "Mint a signed session token for an authenticated user",
@@ -123,36 +146,84 @@ fn orient_from_graph_alone() {
     );
     declare("sign", "Sign bytes with the service signing key", &[]);
     let revoke = declare("revoke_token", "Invalidate a session token on logout", &[]);
-    declare("logout", "Log a user out by revoking their active token", &[]);
-    declare("auth.service", "Authentication service: validate credentials, issue and revoke session tokens", &[]);
+    declare(
+        "logout",
+        "Log a user out by revoking their active token",
+        &[],
+    );
+    declare(
+        "auth.service",
+        "Authentication service: validate credentials, issue and revoke session tokens",
+        &[],
+    );
 
     // The session store is mutated through an opaque handle the verb-heuristic
     // can't name, so the authoring agent DECLARES those edges explicitly.
-    store.add_declared_edge(&issue, "session:store", EdgeKind::Mutates, None).unwrap();
-    store.add_declared_edge(&revoke, "session:store", EdgeKind::Mutates, None).unwrap();
+    store
+        .add_declared_edge(&issue, "session:store", EdgeKind::Mutates, None)
+        .unwrap();
+    store
+        .add_declared_edge(&revoke, "session:store", EdgeKind::Mutates, None)
+        .unwrap();
 
     // ============================================================
     // A NEW agent now orients using ONLY kgl_query — no source reads.
     // ============================================================
 
     // (a) "fix the auth flow" -> what's relevant?
-    let hits = run(ws, "find", &json!({"q": "auth"}), "t", &KglConfig::default()).unwrap();
+    let hits = run(
+        ws,
+        "find",
+        &json!({"q": "auth"}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
     println!("[find auth] {:?}", names(&hits));
     assert!(has_name(&hits, "authenticate"));
 
     // (b) what does authenticate call?
     let ah = hash_of("authenticate");
-    let calls = run(ws, "neighbors", &json!({"hash": ah, "kind": "calls", "dir": "out"}), "t", &KglConfig::default()).unwrap();
+    let calls = run(
+        ws,
+        "neighbors",
+        &json!({"hash": ah, "kind": "calls", "dir": "out"}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
     println!("[authenticate calls] {} edges", arr(&calls).len());
     assert!(arr(&calls).len() >= 3); // load_user, verify_password, issue_token
 
     // (c) what state does the flow read / mutate?
     let lu = hash_of("load_user");
-    let reads = run(ws, "neighbors", &json!({"hash": lu, "kind": "reads", "dir": "out"}), "t", &KglConfig::default()).unwrap();
-    println!("[load_user reads] {:?}", arr(&reads).iter().map(|e| e["to"].clone()).collect::<Vec<_>>());
-    assert!(arr(&reads).iter().any(|e| e["to"] == json!("file:///var/users.db")));
+    let reads = run(
+        ws,
+        "neighbors",
+        &json!({"hash": lu, "kind": "reads", "dir": "out"}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
+    println!(
+        "[load_user reads] {:?}",
+        arr(&reads)
+            .iter()
+            .map(|e| e["to"].clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(arr(&reads)
+        .iter()
+        .any(|e| e["to"] == json!("file:///var/users.db")));
 
-    let writers = run(ws, "writers_of", &json!({"resource": "session:store"}), "t", &KglConfig::default()).unwrap();
+    let writers = run(
+        ws,
+        "writers_of",
+        &json!({"resource": "session:store"}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
     println!("[writers_of session:store] {:?}", names(&writers));
     assert!(has_name(&writers, "issue_token"));
     assert!(has_name(&writers, "revoke_token"));
@@ -169,14 +240,31 @@ fn orient_from_graph_alone() {
 
     // (e) blast radius: what breaks if hash_password changes?
     let hp = hash_of("hash_password");
-    let blast = run(ws, "blast_radius", &json!({"hash": hp}), "t", &KglConfig::default()).unwrap();
+    let blast = run(
+        ws,
+        "blast_radius",
+        &json!({"hash": hp}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
     println!("[blast_radius hash_password] {:?}", names(&blast));
     assert!(has_name(&blast, "verify_password")); // direct caller
     assert!(has_name(&blast, "authenticate")); // transitive caller
 
     // (f) completeness gate
-    let chk = run(ws, "check", &json!({"mode": "commit"}), "t", &KglConfig::default()).unwrap();
-    println!("[check commit] complete={} blocking={}", chk["complete"], chk["blocking"]);
+    let chk = run(
+        ws,
+        "check",
+        &json!({"mode": "commit"}),
+        "t",
+        &KglConfig::default(),
+    )
+    .unwrap();
+    println!(
+        "[check commit] complete={} blocking={}",
+        chk["complete"], chk["blocking"]
+    );
     // With every def documented and effects accounted for (incl. transitively,
     // e.g. `authenticate`/`logout` whose I/O is via callees), the gate passes.
     assert_eq!(
@@ -187,5 +275,7 @@ fn orient_from_graph_alone() {
     );
 
     drop(store);
-    println!("\nORIENT DEMO: a new agent answered (a)-(e) from the graph alone — no source read.\n");
+    println!(
+        "\nORIENT DEMO: a new agent answered (a)-(e) from the graph alone — no source read.\n"
+    );
 }

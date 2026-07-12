@@ -7,7 +7,9 @@ use crate::agent::{AgentConfig, AgentSession, TokenLogConfig};
 use crate::agent_cmd::default_system_prompt;
 use crate::compaction::CompactionPolicy;
 use crate::config::Config;
-use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema};
+use crate::providers::{
+    CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema,
+};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
 use crate::session_store::{PersistedSession, SessionStore, SessionSummary};
@@ -67,12 +69,19 @@ pub fn build_agent_config(
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
-        .map(|s| ToolSchema { name: s.name, description: s.description, input_schema: s.input_schema })
+        .map(|s| ToolSchema {
+            name: s.name,
+            description: s.description,
+            input_schema: s.input_schema,
+        })
         .collect();
     AgentConfig {
         system: Some(default_system_prompt()),
         tools,
-        opts: CompleteOpts { model, ..CompleteOpts::default() },
+        opts: CompleteOpts {
+            model,
+            ..CompleteOpts::default()
+        },
         before_tool_call: safety.map(|p| p.into_before_hook()),
         on_stream_event: Some(Box::new(|ev| {
             if let StreamEvent::TextDelta(text) = ev {
@@ -81,12 +90,18 @@ pub fn build_agent_config(
                 let _ = std::io::stdout().flush();
             }
         })),
-        token_log: token_log.map(|path| TokenLogConfig { path, label: "chat".to_string() }),
+        token_log: token_log.map(|path| TokenLogConfig {
+            path,
+            label: "chat".to_string(),
+        }),
         compaction,
         // Informational REPL notice (ADR-002 Q6) — compaction never rewrites
         // what's already on screen, only what gets sent to the model.
         on_compaction: Some(Box::new(|event| {
-            println!("[context compacted — summarized {} older turn(s)]", event.evicted_turns);
+            println!(
+                "[context compacted — summarized {} older turn(s)]",
+                event.evicted_turns
+            );
         })),
         ..AgentConfig::default()
     }
@@ -160,7 +175,10 @@ pub fn format_session_list(sessions: &[SessionSummary]) -> String {
         .iter()
         .map(|s| {
             let label = s.first_user_line.as_deref().unwrap_or("(empty)");
-            format!("{}  [{}]  {} msgs  {}", s.id, s.model, s.message_count, label)
+            format!(
+                "{}  [{}]  {} msgs  {}",
+                s.id, s.model, s.message_count, label
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -188,7 +206,9 @@ pub async fn run_chat(
     // `None` disables persistence (tests). A resumed session keeps its id;
     // a fresh one mints a uuid.
     let store = sessions_dir.map(SessionStore::new);
-    let session_id = resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = resume
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // On --resume, restore the prior history and echo the transcript so the
     // user sees where they left off before the next prompt.
@@ -205,7 +225,10 @@ pub async fn run_chat(
     let mut line_editor = Reedline::create();
     // Distinct "*D*" left segment so the REPL prompt is never mistaken for a
     // regular shell prompt (which the default reedline cwd-based prompt resembles).
-    let prompt = DefaultPrompt::new(DefaultPromptSegment::Basic("*D*".to_string()), DefaultPromptSegment::Empty);
+    let prompt = DefaultPrompt::new(
+        DefaultPromptSegment::Basic("*D*".to_string()),
+        DefaultPromptSegment::Empty,
+    );
 
     println!("daimonos chat [{session_id}] — type /help for commands, Ctrl-D to quit.");
 
@@ -328,12 +351,18 @@ mod tests {
 
     #[test]
     fn plain_text_is_a_prompt() {
-        assert_eq!(parse_line("hello there"), ChatCommand::Prompt("hello there".to_string()));
+        assert_eq!(
+            parse_line("hello there"),
+            ChatCommand::Prompt("hello there".to_string())
+        );
     }
 
     #[test]
     fn unrecognized_slash_command_is_treated_as_a_prompt() {
-        assert_eq!(parse_line("/bogus"), ChatCommand::Prompt("/bogus".to_string()));
+        assert_eq!(
+            parse_line("/bogus"),
+            ChatCommand::Prompt("/bogus".to_string())
+        );
     }
 
     #[test]
@@ -346,7 +375,8 @@ mod tests {
     #[test]
     fn config_uses_given_model() {
         let dir = tempfile::tempdir().unwrap();
-        let config = build_agent_config(dir.path(), "claude-haiku-4-5".to_string(), None, None, None);
+        let config =
+            build_agent_config(dir.path(), "claude-haiku-4-5".to_string(), None, None, None);
         assert_eq!(config.opts.model, "claude-haiku-4-5");
     }
 
@@ -361,14 +391,20 @@ mod tests {
     fn config_includes_tool_schemas() {
         let dir = tempfile::tempdir().unwrap();
         let config = build_agent_config(dir.path(), "m".to_string(), None, None, None);
-        assert!(!config.tools.is_empty(), "chat session should expose tools like the agent subcommand");
+        assert!(
+            !config.tools.is_empty(),
+            "chat session should expose tools like the agent subcommand"
+        );
     }
 
     #[test]
     fn config_wires_stream_hook_for_live_text_deltas() {
         let dir = tempfile::tempdir().unwrap();
         let config = build_agent_config(dir.path(), "m".to_string(), None, None, None);
-        assert!(config.on_stream_event.is_some(), "chat session should stream text deltas live");
+        assert!(
+            config.on_stream_event.is_some(),
+            "chat session should stream text deltas live"
+        );
     }
 
     #[test]
@@ -382,8 +418,16 @@ mod tests {
     fn config_wires_token_log_with_chat_label() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("tokens.log");
-        let config = build_agent_config(dir.path(), "m".to_string(), None, Some(log_path.clone()), None);
-        let log_cfg = config.token_log.expect("--debug-tokens should wire a TokenLogConfig");
+        let config = build_agent_config(
+            dir.path(),
+            "m".to_string(),
+            None,
+            Some(log_path.clone()),
+            None,
+        );
+        let log_cfg = config
+            .token_log
+            .expect("--debug-tokens should wire a TokenLogConfig");
         assert_eq!(log_cfg.path, log_path);
         assert_eq!(log_cfg.label, "chat");
     }
@@ -398,7 +442,10 @@ mod tests {
     #[test]
     fn config_wires_safety_policy_into_before_hook() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = SafetyPolicy { denied_commands: vec!["exec".into()], ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            denied_commands: vec!["exec".into()],
+            ..SafetyPolicy::default()
+        };
         let config = build_agent_config(dir.path(), "m".to_string(), Some(policy), None, None);
         assert!(config.before_tool_call.is_some());
     }
@@ -426,22 +473,40 @@ mod tests {
     fn load_resume_returns_saved_record() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
-        store.save("sess-1", "saved-model", &[Message::user("prior question"), Message::assistant("prior answer")]);
+        store.save(
+            "sess-1",
+            "saved-model",
+            &[
+                Message::user("prior question"),
+                Message::assistant("prior answer"),
+            ],
+        );
 
         let record = load_resume(Some(&store), "sess-1").expect("saved session should resume");
         assert_eq!(record.messages.len(), 2);
         assert_eq!(record.model, "saved-model");
-        assert!(matches!(&record.messages[0].content[0], ContentBlock::Text(t) if t == "prior question"));
+        assert!(
+            matches!(&record.messages[0].content[0], ContentBlock::Text(t) if t == "prior question")
+        );
     }
 
     #[test]
     fn resolve_model_prefers_saved_unless_flag_explicit() {
         // Resuming, no explicit --model: use the model the session was saved on.
-        assert_eq!(resolve_model("launch-default", false, Some("saved-model")), "saved-model");
+        assert_eq!(
+            resolve_model("launch-default", false, Some("saved-model")),
+            "saved-model"
+        );
         // Resuming, explicit --model: the flag wins over the saved model.
-        assert_eq!(resolve_model("flag-model", true, Some("saved-model")), "flag-model");
+        assert_eq!(
+            resolve_model("flag-model", true, Some("saved-model")),
+            "flag-model"
+        );
         // Fresh session (no resume): the launch model stands, explicit or not.
-        assert_eq!(resolve_model("launch-default", false, None), "launch-default");
+        assert_eq!(
+            resolve_model("launch-default", false, None),
+            "launch-default"
+        );
         assert_eq!(resolve_model("flag-model", true, None), "flag-model");
     }
 
@@ -457,7 +522,10 @@ mod tests {
 
     #[test]
     fn load_resume_without_store_errors() {
-        assert!(load_resume(None, "any").is_err(), "resume with persistence disabled must error");
+        assert!(
+            load_resume(None, "any").is_err(),
+            "resume with persistence disabled must error"
+        );
     }
 
     #[test]
@@ -487,11 +555,23 @@ mod tests {
             },
         ];
         let out = render_transcript(&messages);
-        assert!(out.contains("> hello"), "user message should be prefixed: {out:?}");
-        assert!(out.contains("hi there"), "assistant text should show: {out:?}");
-        assert!(out.contains("[tool: read_file]"), "tool call should be summarized: {out:?}");
+        assert!(
+            out.contains("> hello"),
+            "user message should be prefixed: {out:?}"
+        );
+        assert!(
+            out.contains("hi there"),
+            "assistant text should show: {out:?}"
+        );
+        assert!(
+            out.contains("[tool: read_file]"),
+            "tool call should be summarized: {out:?}"
+        );
         assert!(!out.contains("hidden"), "thinking must be omitted: {out:?}");
-        assert!(!out.contains("file contents"), "tool result must be omitted: {out:?}");
+        assert!(
+            !out.contains("file contents"),
+            "tool result must be omitted: {out:?}"
+        );
     }
 
     #[test]
@@ -502,8 +582,17 @@ mod tests {
         let store = SessionStore::new(dir.path().to_path_buf());
         store.save("sess-1", "model-x", &[Message::user("do the thing")]);
         let listed = format_session_list(&store.list());
-        assert!(listed.contains("sess-1"), "list should show the id: {listed:?}");
-        assert!(listed.contains("model-x"), "list should show the model: {listed:?}");
-        assert!(listed.contains("do the thing"), "list should show the label: {listed:?}");
+        assert!(
+            listed.contains("sess-1"),
+            "list should show the id: {listed:?}"
+        );
+        assert!(
+            listed.contains("model-x"),
+            "list should show the model: {listed:?}"
+        );
+        assert!(
+            listed.contains("do the thing"),
+            "list should show the label: {listed:?}"
+        );
     }
 }

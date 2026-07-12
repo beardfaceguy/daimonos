@@ -205,12 +205,14 @@ impl AgentEnv {
                     .context_window(effective_model)
                     .await
                     .filter(|&w| w > 0)
-                    .ok_or_else(|| format!(
-                        "could not determine the context window for model '{effective_model}' \
+                    .ok_or_else(|| {
+                        format!(
+                            "could not determine the context window for model '{effective_model}' \
                          from the provider (network error, unknown model id, or the provider \
                          does not report it). Set DAIMONOS_AGENT_CONTEXT_WINDOW explicitly in \
                          the agent env file, or set DAIMONOS_AGENT_COMPACTION=off."
-                    ))?;
+                        )
+                    })?;
                 if spec.output_reservation >= context_window {
                     return Err(format!(
                         "DAIMONOS_AGENT_OUTPUT_RESERVATION ({}) must be smaller than the \
@@ -283,7 +285,10 @@ fn parse_compaction(
     path: &Path,
 ) -> Result<CompactionConfig, String> {
     let present = |k: &str| {
-        vars.get(k).map(|v| v.trim()).filter(|v| !v.is_empty()).map(|v| v.to_string())
+        vars.get(k)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
     };
     // Caller has verified presence (REQUIRED).
     let switch = present("DAIMONOS_AGENT_COMPACTION").unwrap();
@@ -305,13 +310,19 @@ fn parse_compaction(
             let num = |k: &str| -> Result<f64, String> {
                 let raw = present(k).unwrap();
                 raw.parse::<f64>().map_err(|_| {
-                    format!("agent env file {}: {k} '{raw}' is not a number", path.display())
+                    format!(
+                        "agent env file {}: {k} '{raw}' is not a number",
+                        path.display()
+                    )
                 })
             };
             let int = |k: &str| -> Result<u64, String> {
                 let raw = present(k).unwrap();
                 raw.parse::<u64>().map_err(|_| {
-                    format!("agent env file {}: {k} '{raw}' is not a whole number of tokens", path.display())
+                    format!(
+                        "agent env file {}: {k} '{raw}' is not a whole number of tokens",
+                        path.display()
+                    )
                 })
             };
             let high_water = num("DAIMONOS_AGENT_COMPACTION_HIGH_WATER")?;
@@ -441,8 +452,10 @@ mod tests {
     }
 
     fn compaction_on() -> String {
-        base().replace("DAIMONOS_AGENT_COMPACTION=off", "DAIMONOS_AGENT_COMPACTION=on")
-            + "DAIMONOS_AGENT_COMPACTION_HIGH_WATER=0.75\n\
+        base().replace(
+            "DAIMONOS_AGENT_COMPACTION=off",
+            "DAIMONOS_AGENT_COMPACTION=on",
+        ) + "DAIMONOS_AGENT_COMPACTION_HIGH_WATER=0.75\n\
                DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.5\n\
                DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n\
                DAIMONOS_AGENT_OUTPUT_RESERVATION=8192\n"
@@ -488,7 +501,8 @@ mod tests {
 
     #[test]
     fn active_model_prepended_when_absent_from_configured_list() {
-        let s = base() + "DAIMONOS_AGENT_MODELS=anthropic/claude-opus-4.1,anthropic/claude-haiku-4.5\n";
+        let s =
+            base() + "DAIMONOS_AGENT_MODELS=anthropic/claude-opus-4.1,anthropic/claude-haiku-4.5\n";
         let e = load_str(&s).unwrap();
         // active model (sonnet-4.6) not in the configured list → prepended.
         assert_eq!(
@@ -538,12 +552,18 @@ mod tests {
         ] {
             assert!(err.contains(k), "error should name {k}: {err}");
         }
-        assert!(!err.contains("DAIMONOS_AGENT_PROVIDER"), "present key not flagged: {err}");
+        assert!(
+            !err.contains("DAIMONOS_AGENT_PROVIDER"),
+            "present key not flagged: {err}"
+        );
     }
 
     #[test]
     fn empty_value_counts_as_missing() {
-        let s = base().replace("DAIMONOS_AGENT_API_KEY=sk-test", "DAIMONOS_AGENT_API_KEY=   ");
+        let s = base().replace(
+            "DAIMONOS_AGENT_API_KEY=sk-test",
+            "DAIMONOS_AGENT_API_KEY=   ",
+        );
         let err = load_str(&s).unwrap_err();
         assert!(err.contains("DAIMONOS_AGENT_API_KEY"), "{err}");
     }
@@ -606,9 +626,18 @@ mod tests {
         let err = load_str(&s).unwrap_err();
         assert!(err.contains("DAIMONOS_AGENT_COMPACTION_LOW_WATER"), "{err}");
         assert!(err.contains("DAIMONOS_AGENT_OUTPUT_RESERVATION"), "{err}");
-        assert!(!err.contains("HIGH_WATER"), "present key must not be flagged: {err}");
-        assert!(!err.contains("CONTEXT_WINDOW"), "optional key must not be flagged: {err}");
-        assert!(err.contains("<test>"), "error must name the file path: {err}");
+        assert!(
+            !err.contains("HIGH_WATER"),
+            "present key must not be flagged: {err}"
+        );
+        assert!(
+            !err.contains("CONTEXT_WINDOW"),
+            "optional key must not be flagged: {err}"
+        );
+        assert!(
+            err.contains("<test>"),
+            "error must name the file path: {err}"
+        );
     }
 
     #[test]
@@ -648,7 +677,10 @@ mod tests {
             + "DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5\n";
         match load_str(&s).unwrap().compaction {
             CompactionConfig::NeedsWindow(spec) => {
-                assert_eq!(spec.summary_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+                assert_eq!(
+                    spec.summary_model.as_deref(),
+                    Some("anthropic/claude-haiku-4.5")
+                );
             }
             other => panic!("expected NeedsWindow, got {other:?}"),
         }
@@ -675,7 +707,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_off_yields_none() {
         let env = load_str(&base()).unwrap();
-        let out = env.resolve_compaction(&FakeProvider(Some(200_000)), "m").await.unwrap();
+        let out = env
+            .resolve_compaction(&FakeProvider(Some(200_000)), "m")
+            .await
+            .unwrap();
         assert_eq!(out, None);
     }
 
@@ -683,7 +718,10 @@ mod tests {
     async fn resolve_ready_returns_policy_unchanged_without_querying() {
         let env = load_str(&compaction_on()).unwrap();
         // FakeProvider(None) would fail a lookup — proving Ready never queries.
-        let out = env.resolve_compaction(&FakeProvider(None), "m").await.unwrap();
+        let out = env
+            .resolve_compaction(&FakeProvider(None), "m")
+            .await
+            .unwrap();
         assert_eq!(out.unwrap().context_window, 200_000);
     }
 
@@ -711,7 +749,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("acme/model-x"), "error names the model: {err}");
-        assert!(err.contains("DAIMONOS_AGENT_CONTEXT_WINDOW"), "error names the key: {err}");
+        assert!(
+            err.contains("DAIMONOS_AGENT_CONTEXT_WINDOW"),
+            "error names the key: {err}"
+        );
     }
 
     #[tokio::test]
@@ -728,12 +769,20 @@ mod tests {
 
     #[test]
     fn compaction_rejects_bad_watermark_ordering() {
-        for (low, high) in [("0.8", "0.75"), ("0.75", "0.75"), ("0.0", "0.75"), ("0.5", "1.0")] {
+        for (low, high) in [
+            ("0.8", "0.75"),
+            ("0.75", "0.75"),
+            ("0.0", "0.75"),
+            ("0.5", "1.0"),
+        ] {
             let s = compaction_on()
                 .replace("HIGH_WATER=0.75", &format!("HIGH_WATER={high}"))
                 .replace("LOW_WATER=0.5", &format!("LOW_WATER={low}"));
             let err = load_str(&s).unwrap_err();
-            assert!(err.contains("0 < LOW_WATER < HIGH_WATER < 1"), "low={low} high={high}: {err}");
+            assert!(
+                err.contains("0 < LOW_WATER < HIGH_WATER < 1"),
+                "low={low} high={high}: {err}"
+            );
         }
     }
 
@@ -760,7 +809,10 @@ mod tests {
             + "DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5\n\
                DAIMONOS_AGENT_SUMMARY_PROMPT=Summarize tersely.\n";
         let p = ready_policy(&load_str(&s).unwrap());
-        assert_eq!(p.summary_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+        assert_eq!(
+            p.summary_model.as_deref(),
+            Some("anthropic/claude-haiku-4.5")
+        );
         assert_eq!(p.summary_prompt.as_deref(), Some("Summarize tersely."));
     }
 

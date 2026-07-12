@@ -420,8 +420,7 @@ tests/test_foo.py ...                                                    [100%]
     async fn parse_summary_deselected_not_folded_into_skipped() {
         // `deselected` means filtered out by -k/-m; they were never run, so
         // they must not inflate `skipped`.
-        let out =
-            "==================== 3 passed, 2 deselected in 0.03s ====================\n";
+        let out = "==================== 3 passed, 2 deselected in 0.03s ====================\n";
         let s = parse_pytest_summary(out);
         assert_eq!(s.passed, 3);
         assert_eq!(s.skipped, 0, "deselected must not inflate skipped");

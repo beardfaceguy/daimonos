@@ -776,9 +776,9 @@ pub fn has_full_schema(name: &str) -> bool {
 /// Whether `list_tools` should include the full inputSchema for this tool.
 pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_used: bool) -> bool {
     if full_tool_schemas {
-        return all_tools().iter().any(|t| {
-            t.name == name && (t.tier == ToolTier::Full || t.tier == ToolTier::Terse)
-        });
+        return all_tools()
+            .iter()
+            .any(|t| t.name == name && (t.tier == ToolTier::Full || t.tier == ToolTier::Terse));
     }
     has_full_schema(name) && !already_used
 }
@@ -1094,11 +1094,19 @@ mod tests {
     #[test]
     fn render_list_tool_swaps_description_below_full() {
         use crate::verbosity::Verbosity;
-        let git = || tool_definitions().into_iter().find(|t| t.name == "git").unwrap();
+        let git = || {
+            tool_definitions()
+                .into_iter()
+                .find(|t| t.name == "git")
+                .unwrap()
+        };
 
         let orig = git().description.clone();
         let full = render_list_tool(git(), Verbosity::Full, false, false);
-        assert_eq!(full.description, orig, "Full verbosity must keep the full description");
+        assert_eq!(
+            full.description, orig,
+            "Full verbosity must keep the full description"
+        );
 
         let terse = render_list_tool(git(), Verbosity::Terse, false, false);
         assert_eq!(terse.description.as_deref(), terse_description("git"));

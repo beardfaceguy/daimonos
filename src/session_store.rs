@@ -52,15 +52,19 @@ impl SessionStore {
     /// a path component. Minted ids are UUIDs; this only guards a hostile or
     /// malformed id against path traversal / collisions.
     fn file_name(id: &str) -> Option<String> {
-        let safe =
-            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        let safe = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         safe.then(|| format!("{id}.json"))
     }
 
     /// Persist a session's history. Best-effort: a write failure is logged to
     /// stderr and never fails the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
-        let Some(name) = Self::file_name(id) else { return };
+        let Some(name) = Self::file_name(id) else {
+            return;
+        };
         let record = PersistedSession {
             version: SESSION_PERSIST_VERSION,
             session_id: id.to_string(),
@@ -94,19 +98,28 @@ impl SessionStore {
     /// Summaries of all saved sessions, most-recently-modified first. Files
     /// that don't parse or fail a stat are skipped (best-effort listing).
     pub fn list(&self) -> Vec<SessionSummary> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
         let mut rows: Vec<(std::time::SystemTime, SessionSummary)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(record) = serde_json::from_slice::<PersistedSession>(&bytes) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<PersistedSession>(&bytes) else {
+                continue;
+            };
             if record.version != SESSION_PERSIST_VERSION {
                 continue;
             }
-            let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
             rows.push((
                 mtime,
                 SessionSummary {
@@ -125,12 +138,15 @@ impl SessionStore {
 /// First line of the first user text message in `messages`, trimmed — a
 /// human-recognizable label for a saved session.
 fn first_user_line(messages: &[Message]) -> Option<String> {
-    messages.iter().find(|m| m.role == Role::User).and_then(|m| {
-        m.content.iter().find_map(|b| match b {
-            ContentBlock::Text(t) => t.lines().next().map(|l| l.trim().to_string()),
-            _ => None,
+    messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => t.lines().next().map(|l| l.trim().to_string()),
+                _ => None,
+            })
         })
-    })
 }
 
 #[cfg(test)]
@@ -138,7 +154,10 @@ mod tests {
     use super::*;
 
     fn msgs() -> Vec<Message> {
-        vec![Message::user("first question\nsecond line"), Message::assistant("the answer")]
+        vec![
+            Message::user("first question\nsecond line"),
+            Message::assistant("the answer"),
+        ]
     }
 
     #[test]
@@ -151,7 +170,9 @@ mod tests {
         assert_eq!(loaded.session_id, "abc-123");
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.messages.len(), 2);
-        assert!(matches!(&loaded.messages[0].content[0], ContentBlock::Text(t) if t == "first question\nsecond line"));
+        assert!(
+            matches!(&loaded.messages[0].content[0], ContentBlock::Text(t) if t == "first question\nsecond line")
+        );
     }
 
     #[test]
@@ -182,8 +203,15 @@ mod tests {
             "model": "m",
             "messages": [],
         });
-        std::fs::write(dir.path().join("future.json"), serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(store.load("future").is_none(), "an unrecognized version must not be loaded");
+        std::fs::write(
+            dir.path().join("future.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            store.load("future").is_none(),
+            "an unrecognized version must not be loaded"
+        );
     }
 
     #[test]
@@ -212,6 +240,9 @@ mod tests {
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
             .collect();
-        assert!(leftover.is_empty(), "temp file should have been renamed away");
+        assert!(
+            leftover.is_empty(),
+            "temp file should have been renamed away"
+        );
     }
 }

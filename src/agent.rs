@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::compaction::{self, CompactionEvent, CompactionPolicy, CompactionStrategy};
 use crate::protocol::Response;
 use crate::providers::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role,
-    StopReason, StreamEvent, ThinkingLevel, ToolSchema, Usage,
+    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role, StopReason, StreamEvent,
+    ThinkingLevel, ToolSchema, Usage,
 };
 use crate::session::Session;
 use crate::tool_facade;
@@ -36,7 +36,10 @@ pub enum AfterHookResult {
 /// future borrows `info` and is always immediately `.await`ed at the call
 /// site, so it doesn't need `'static`.
 pub type BeforeHook = Box<
-    dyn Fn(&ToolCallInfo) -> std::pin::Pin<Box<dyn std::future::Future<Output = BeforeHookResult> + Send + '_>>
+    dyn Fn(
+            &ToolCallInfo,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = BeforeHookResult> + Send + '_>>
         + Send
         + Sync,
 >;
@@ -132,7 +135,11 @@ fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
 fn log_token_usage(cfg: &TokenLogConfig, model: &str, usage: &Usage) {
     use std::io::Write;
     let line = token_log_line(&cfg.label, model, usage);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&cfg.path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -160,7 +167,11 @@ fn compaction_log_line(label: &str, event: &CompactionEvent) -> String {
 fn log_compaction_event(cfg: &TokenLogConfig, event: &CompactionEvent) {
     use std::io::Write;
     let line = compaction_log_line(&cfg.label, event);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&cfg.path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -185,7 +196,11 @@ pub async fn run(
         };
 
         let resp = match &config.on_stream_event {
-            Some(hook) => provider.stream(&ctx, &config.opts, &mut |ev| hook(ev)).await,
+            Some(hook) => {
+                provider
+                    .stream(&ctx, &config.opts, &mut |ev| hook(ev))
+                    .await
+            }
             None => provider.stream(&ctx, &config.opts, &mut |_| {}).await,
         };
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
@@ -194,7 +209,10 @@ pub async fn run(
         }
 
         // Assistant turn appended BEFORE tool results (Anthropic API requirement)
-        messages.push(Message { role: Role::Assistant, content: resp.content.clone() });
+        messages.push(Message {
+            role: Role::Assistant,
+            content: resp.content.clone(),
+        });
 
         match resp.stop_reason {
             StopReason::EndTurn
@@ -211,13 +229,17 @@ pub async fn run(
                 };
             }
             StopReason::ToolUse => {
-                let calls: Vec<_> = resp.content.iter().filter_map(|b| {
-                    if let ContentBlock::ToolCall { id, name, input } = b {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    } else {
-                        None
-                    }
-                }).collect();
+                let calls: Vec<_> = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::ToolCall { id, name, input } = b {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
                 let mut tool_results = Vec::new();
                 let mut terminate = false;
@@ -225,7 +247,13 @@ pub async fn run(
                 for (id, name, input) in calls {
                     // before_tool_call hook
                     if let Some(hook) = &config.before_tool_call {
-                        match hook(&ToolCallInfo { id: id.clone(), name: name.clone(), input: input.clone() }).await {
+                        match hook(&ToolCallInfo {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        })
+                        .await
+                        {
                             BeforeHookResult::Allow => {}
                             BeforeHookResult::Block(reason) => {
                                 tool_results.push(ContentBlock::ToolResult {
@@ -239,26 +267,45 @@ pub async fn run(
                     }
 
                     // invoke via facade
-                    let (content, is_error) = match tool_facade::invoke(session, &name, &input).await {
-                        Some(r) => { let ok = r.ok; (response_to_content(r), !ok) }
-                        None => (format!("tool '{name}' not available in agent mode"), true),
-                    };
+                    let (content, is_error) =
+                        match tool_facade::invoke(session, &name, &input).await {
+                            Some(r) => {
+                                let ok = r.ok;
+                                (response_to_content(r), !ok)
+                            }
+                            None => (format!("tool '{name}' not available in agent mode"), true),
+                        };
 
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
                         if matches!(
-                            hook(&ToolCallInfo { id: id.clone(), name: name.clone(), input: input.clone() }, &content, is_error),
+                            hook(
+                                &ToolCallInfo {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone()
+                                },
+                                &content,
+                                is_error
+                            ),
                             AfterHookResult::Terminate
                         ) {
                             terminate = true;
                         }
                     }
 
-                    tool_results.push(ContentBlock::ToolResult { tool_use_id: id, content, is_error });
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content,
+                        is_error,
+                    });
                 }
 
                 if !tool_results.is_empty() {
-                    messages.push(Message { role: Role::User, content: tool_results });
+                    messages.push(Message {
+                        role: Role::User,
+                        content: tool_results,
+                    });
                 }
 
                 if terminate {
@@ -366,8 +413,15 @@ impl AgentSession {
     async fn attempt(&mut self, user_text: &str) -> AgentResult {
         let mut history = self.messages.clone();
         history.push(Message::user(user_text));
-        let result = run(self.provider.as_ref(), &mut self.tool_session, history, &self.config).await;
-        self.total_usage = accumulate_usage(std::mem::take(&mut self.total_usage), result.usage.clone());
+        let result = run(
+            self.provider.as_ref(),
+            &mut self.tool_session,
+            history,
+            &self.config,
+        )
+        .await;
+        self.total_usage =
+            accumulate_usage(std::mem::take(&mut self.total_usage), result.usage.clone());
         self.last_prompt_tokens = result.last_call_usage.prompt_tokens();
         result
     }
@@ -392,10 +446,14 @@ impl AgentSession {
     async fn compact(&mut self) -> Option<CompactionEvent> {
         let policy = self.config.compaction.as_ref()?;
         let cut = compaction::choose_cut(&self.messages, policy.target_tokens())?;
-        let summary_model =
-            policy.summary_model.clone().unwrap_or_else(|| self.config.opts.model.clone());
-        let summary_system =
-            policy.summary_prompt.clone().unwrap_or_else(compaction::default_summary_prompt);
+        let summary_model = policy
+            .summary_model
+            .clone()
+            .unwrap_or_else(|| self.config.opts.model.clone());
+        let summary_system = policy
+            .summary_prompt
+            .clone()
+            .unwrap_or_else(compaction::default_summary_prompt);
 
         let est_tokens_before = compaction::estimate_tokens(&self.messages);
         let evicted = &self.messages[..cut];
@@ -435,7 +493,11 @@ impl AgentSession {
                     .content
                     .iter()
                     .filter_map(|b| {
-                        if let ContentBlock::Text(t) = b { Some(t.as_str()) } else { None }
+                        if let ContentBlock::Text(t) = b {
+                            Some(t.as_str())
+                        } else {
+                            None
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -534,9 +596,9 @@ fn last_assistant_text(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::config::Config;
     use crate::providers::LlmResponse;
+    use async_trait::async_trait;
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -549,20 +611,29 @@ mod tests {
 
     impl MockProvider {
         fn new(responses: Vec<LlmResponse>) -> Self {
-            MockProvider { responses: Mutex::new(VecDeque::from(responses)) }
+            MockProvider {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
         }
     }
 
     #[async_trait]
     impl LlmProvider for MockProvider {
         async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
-            self.responses.lock().unwrap().pop_front()
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
                 .unwrap_or_else(|| LlmResponse::error("MockProvider exhausted"))
         }
     }
 
     fn mock_usage(input: u64, output: u64) -> Usage {
-        Usage { input, output, ..Usage::default() }
+        Usage {
+            input,
+            output,
+            ..Usage::default()
+        }
     }
 
     fn end_turn_resp() -> LlmResponse {
@@ -614,7 +685,11 @@ mod tests {
         sess.prompt("first").await;
         assert_eq!(sess.history().len(), 2);
         sess.prompt("second").await;
-        assert_eq!(sess.history().len(), 4, "history must persist across prompts");
+        assert_eq!(
+            sess.history().len(),
+            4,
+            "history must persist across prompts"
+        );
         // each end_turn_resp reports mock_usage(100, 50)
         assert_eq!(sess.total_usage().input, 200);
         assert_eq!(sess.total_usage().output, 100);
@@ -634,8 +709,14 @@ mod tests {
         assert_eq!(turn.text, "done");
         // user, assistant(toolcall), user(toolresult), assistant(end) = 4
         assert_eq!(sess.history().len(), 4);
-        assert!(matches!(sess.history()[1].content[0], ContentBlock::ToolCall { .. }));
-        assert!(matches!(sess.history()[2].content[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(
+            sess.history()[1].content[0],
+            ContentBlock::ToolCall { .. }
+        ));
+        assert!(matches!(
+            sess.history()[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
     }
 
     #[tokio::test]
@@ -647,14 +728,21 @@ mod tests {
         assert_eq!(sess.history().len(), 2);
         sess.clear();
         assert_eq!(sess.history().len(), 0);
-        assert_eq!(sess.total_usage().input, 100, "cumulative usage kept after clear");
+        assert_eq!(
+            sess.total_usage().input,
+            100,
+            "cumulative usage kept after clear"
+        );
     }
 
     #[tokio::test]
     async fn session_set_model_changes_model_sent_on_next_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let config = AgentConfig {
-            opts: CompleteOpts { model: "model-a".to_string(), ..CompleteOpts::default() },
+            opts: CompleteOpts {
+                model: "model-a".to_string(),
+                ..CompleteOpts::default()
+            },
             ..AgentConfig::default()
         };
         // Capture the model the provider actually sees each turn.
@@ -676,7 +764,10 @@ mod tests {
         assert_eq!(sess.model(), "model-b");
         sess.prompt("second").await;
 
-        assert_eq!(*seen.lock().unwrap(), vec!["model-a".to_string(), "model-b".to_string()]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
         // History persists across the model switch (user + asst) x2.
         assert_eq!(sess.history().len(), 4);
     }
@@ -690,7 +781,10 @@ mod tests {
             output: 45,
             cache_read: 3,
             cache_write: 7,
-            cost: Cost { total_usd: 0.0012, ..Cost::default() },
+            cost: Cost {
+                total_usd: 0.0012,
+                ..Cost::default()
+            },
         };
         let line = token_log_line("chat", "claude-haiku-4-5", &usage);
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -707,7 +801,10 @@ mod tests {
     #[test]
     fn log_token_usage_appends_one_line_per_call() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = TokenLogConfig { path: dir.path().join("tokens.log"), label: "agent".to_string() };
+        let cfg = TokenLogConfig {
+            path: dir.path().join("tokens.log"),
+            label: "agent".to_string(),
+        };
         log_token_usage(&cfg, "m1", &mock_usage(10, 5));
         log_token_usage(&cfg, "m1", &mock_usage(20, 8));
         let content = std::fs::read_to_string(&cfg.path).unwrap();
@@ -722,7 +819,10 @@ mod tests {
     #[test]
     fn log_token_usage_creates_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = TokenLogConfig { path: dir.path().join("nested_does_not_exist_yet.log"), label: "agent".to_string() };
+        let cfg = TokenLogConfig {
+            path: dir.path().join("nested_does_not_exist_yet.log"),
+            label: "agent".to_string(),
+        };
         log_token_usage(&cfg, "m1", &mock_usage(1, 1));
         assert!(cfg.path.exists());
     }
@@ -734,7 +834,10 @@ mod tests {
         let mut s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
         let config = AgentConfig {
-            token_log: Some(TokenLogConfig { path: log_path.clone(), label: "agent".to_string() }),
+            token_log: Some(TokenLogConfig {
+                path: log_path.clone(),
+                label: "agent".to_string(),
+            }),
             ..AgentConfig::default()
         };
         run(&provider, &mut s, vec![Message::user("hi")], &config).await;
@@ -749,7 +852,13 @@ mod tests {
         let log_path = dir.path().join("tokens.log");
         let mut s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
-        run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        run(
+            &provider,
+            &mut s,
+            vec![Message::user("hi")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert!(!log_path.exists());
     }
 
@@ -764,8 +873,22 @@ mod tests {
 
     #[test]
     fn accumulate_sums_cost() {
-        let a = Usage { cost: Cost { input_usd: 1.0, total_usd: 1.5, ..Cost::default() }, ..Usage::default() };
-        let b = Usage { cost: Cost { input_usd: 2.0, total_usd: 3.0, ..Cost::default() }, ..Usage::default() };
+        let a = Usage {
+            cost: Cost {
+                input_usd: 1.0,
+                total_usd: 1.5,
+                ..Cost::default()
+            },
+            ..Usage::default()
+        };
+        let b = Usage {
+            cost: Cost {
+                input_usd: 2.0,
+                total_usd: 3.0,
+                ..Cost::default()
+            },
+            ..Usage::default()
+        };
         let total = accumulate_usage(a, b);
         assert!((total.cost.input_usd - 3.0).abs() < 1e-9);
         assert!((total.cost.total_usd - 4.5).abs() < 1e-9);
@@ -846,7 +969,10 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(
             *seen,
-            vec![StreamEvent::TextDelta("hel".into()), StreamEvent::TextDelta("lo".into())]
+            vec![
+                StreamEvent::TextDelta("hel".into()),
+                StreamEvent::TextDelta("lo".into())
+            ]
         );
     }
 
@@ -858,7 +984,13 @@ mod tests {
             events: vec![StreamEvent::TextDelta("x".into())],
             response: end_turn_resp(),
         };
-        let result = run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("hi")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert_eq!(result.stop_reason, StopReason::EndTurn);
     }
 
@@ -869,7 +1001,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
-        let result = run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("hi")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert_eq!(result.stop_reason, StopReason::EndTurn);
         assert!(result.error_message.is_none());
         assert_eq!(result.messages.len(), 2); // user + assistant
@@ -880,7 +1018,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse::error("API failed")]);
-        let result = run(&provider, &mut s, vec![Message::user("hi")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("hi")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert_eq!(result.stop_reason, StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("API failed"));
     }
@@ -896,7 +1040,13 @@ mod tests {
             context_overflow: false,
             usage: Usage::default(),
         }]);
-        let result = run(&provider, &mut s, vec![Message::user("go")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("go")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert_eq!(result.stop_reason, StopReason::MaxTokens);
     }
 
@@ -914,8 +1064,14 @@ mod tests {
                 usage: mock_usage(300, 150),
             },
         ]);
-        let result = run(&provider, &mut s, vec![Message::user("go")], &AgentConfig::default()).await;
-        assert_eq!(result.usage.input, 500);  // 200 + 300
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("go")],
+            &AgentConfig::default(),
+        )
+        .await;
+        assert_eq!(result.usage.input, 500); // 200 + 300
         assert_eq!(result.usage.output, 250); // 100 + 150
     }
 
@@ -927,13 +1083,25 @@ mod tests {
             tool_call_resp("t1", "nonexistent_tool", json!({})),
             end_turn_resp(),
         ]);
-        let result = run(&provider, &mut s, vec![Message::user("go")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("go")],
+            &AgentConfig::default(),
+        )
+        .await;
         // user, assistant(tool_call), user(tool_result), assistant(end_turn)
         assert_eq!(result.messages.len(), 4);
         assert_eq!(result.messages[1].role, Role::Assistant);
-        assert!(matches!(&result.messages[1].content[0], ContentBlock::ToolCall { .. }));
+        assert!(matches!(
+            &result.messages[1].content[0],
+            ContentBlock::ToolCall { .. }
+        ));
         assert_eq!(result.messages[2].role, Role::User);
-        assert!(matches!(&result.messages[2].content[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(
+            &result.messages[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
     }
 
     #[tokio::test]
@@ -944,7 +1112,13 @@ mod tests {
             tool_call_resp("t1", "does_not_exist", json!({})),
             end_turn_resp(),
         ]);
-        let result = run(&provider, &mut s, vec![Message::user("go")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("go")],
+            &AgentConfig::default(),
+        )
+        .await;
         assert!(matches!(
             &result.messages[2].content[0],
             ContentBlock::ToolResult { is_error: true, .. }
@@ -960,8 +1134,17 @@ mod tests {
             tool_call_resp("t1", "read_file", json!({"path": "test.txt"})),
             end_turn_resp(),
         ]);
-        let result = run(&provider, &mut s, vec![Message::user("read it")], &AgentConfig::default()).await;
-        if let ContentBlock::ToolResult { content, is_error, .. } = &result.messages[2].content[0] {
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("read it")],
+            &AgentConfig::default(),
+        )
+        .await;
+        if let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &result.messages[2].content[0]
+        {
             assert!(!is_error, "real tool should succeed");
             assert!(content.contains("hello agent"));
         } else {
@@ -979,7 +1162,9 @@ mod tests {
         ]);
         let config = AgentConfig {
             before_tool_call: Some(Box::new(|_| {
-                Box::pin(std::future::ready(BeforeHookResult::Block("not permitted".into())))
+                Box::pin(std::future::ready(BeforeHookResult::Block(
+                    "not permitted".into(),
+                )))
             })),
             ..AgentConfig::default()
         };
@@ -1005,7 +1190,11 @@ mod tests {
         };
         let result = run(&provider, &mut s, vec![Message::user("go")], &config).await;
         assert_eq!(result.stop_reason, StopReason::Aborted);
-        assert!(result.error_message.as_deref().unwrap_or("").contains("terminated"));
+        assert!(result
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("terminated"));
     }
 
     #[tokio::test]
@@ -1022,7 +1211,13 @@ mod tests {
             context_overflow: false,
             usage: Usage::default(),
         }]);
-        let result = run(&provider, &mut s, vec![Message::user("think")], &AgentConfig::default()).await;
+        let result = run(
+            &provider,
+            &mut s,
+            vec![Message::user("think")],
+            &AgentConfig::default(),
+        )
+        .await;
         let assistant = &result.messages[1];
         assert_eq!(assistant.content.len(), 2);
         assert!(matches!(&assistant.content[0], ContentBlock::Thinking(t) if t == "my reasoning"));
@@ -1062,7 +1257,10 @@ mod tests {
                 opts.temperature,
                 ctx.system.clone(),
             ));
-            self.responses.lock().unwrap().pop_front()
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
                 .unwrap_or_else(|| LlmResponse::error("RecordingProvider exhausted"))
         }
     }
@@ -1081,7 +1279,10 @@ mod tests {
     }
 
     fn compaction_config(policy: CompactionPolicy) -> AgentConfig {
-        AgentConfig { compaction: Some(policy), ..AgentConfig::default() }
+        AgentConfig {
+            compaction: Some(policy),
+            ..AgentConfig::default()
+        }
     }
 
     fn end_turn_with_usage(text: &str, input: u64) -> LlmResponse {
@@ -1104,13 +1305,16 @@ mod tests {
     async fn proactive_compaction_fires_over_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Box::new(RecordingProvider::new(vec![
-            end_turn_with_usage("a1", 100), // turn 1: under trigger
-            end_turn_with_usage("a2", 700), // turn 2: measured 700 ≥ 600 → arms trigger
+            end_turn_with_usage("a1", 100),         // turn 1: under trigger
+            end_turn_with_usage("a2", 700),         // turn 2: measured 700 ≥ 600 → arms trigger
             end_turn_with_usage("the summary", 50), // summarization call
-            end_turn_with_usage("a3", 100), // turn 3 runs on compacted history
+            end_turn_with_usage("a3", 100),         // turn 3 runs on compacted history
         ]));
-        let mut sess =
-            AgentSession::new(provider, session_in(dir.path()), compaction_config(test_policy()));
+        let mut sess = AgentSession::new(
+            provider,
+            session_in(dir.path()),
+            compaction_config(test_policy()),
+        );
 
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
@@ -1124,14 +1328,24 @@ mod tests {
             "history[0] must be the summary message: {history:?}"
         );
         assert!(
-            !history.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.contains("t1 ")))),
+            !history.iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("t1 ")))),
             "turn 1 must be evicted"
         );
         assert!(
-            history.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.contains("t2 ")))),
+            history.iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("t2 ")))),
             "turn 2 must be kept verbatim"
         );
-        assert_eq!(history.len(), 5, "summary + turn2 (2 msgs) + turn3 (2 msgs): {history:?}");
+        assert_eq!(
+            history.len(),
+            5,
+            "summary + turn2 (2 msgs) + turn3 (2 msgs): {history:?}"
+        );
     }
 
     #[tokio::test]
@@ -1163,15 +1377,24 @@ mod tests {
             end_turn_with_usage("the summary", 50),
             end_turn_with_usage("a3 after retry", 100),
         ]));
-        let mut sess =
-            AgentSession::new(provider, session_in(dir.path()), compaction_config(test_policy()));
+        let mut sess = AgentSession::new(
+            provider,
+            session_in(dir.path()),
+            compaction_config(test_policy()),
+        );
 
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
         let turn = sess.prompt("t3").await;
 
-        assert_eq!(turn.text, "a3 after retry", "the retried turn's answer must come back");
-        assert!(turn.error_message.is_none(), "overflow must be recovered, not surfaced");
+        assert_eq!(
+            turn.text, "a3 after retry",
+            "the retried turn's answer must come back"
+        );
+        assert!(
+            turn.error_message.is_none(),
+            "overflow must be recovered, not surfaced"
+        );
         let history = sess.history();
         assert!(
             matches!(&history[0].content[0], ContentBlock::Text(t) if t.contains("[Summary of earlier conversation")),
@@ -1179,7 +1402,9 @@ mod tests {
         );
         // The failed attempt must not have committed its empty assistant msg.
         assert!(
-            !history.iter().any(|m| m.role == Role::Assistant && m.content.is_empty()),
+            !history
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.is_empty()),
             "failed overflow attempt must not be committed: {history:?}"
         );
     }
@@ -1187,12 +1412,15 @@ mod tests {
     #[tokio::test]
     async fn overflow_without_policy_surfaces_error_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = Box::new(RecordingProvider::new(vec![LlmResponse::context_overflow_error(
-            "prompt is too long",
-        )]));
+        let provider = Box::new(RecordingProvider::new(vec![
+            LlmResponse::context_overflow_error("prompt is too long"),
+        ]));
         let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
         let turn = sess.prompt("hi").await;
-        assert!(turn.error_message.is_some(), "compaction off → the error surfaces as before");
+        assert!(
+            turn.error_message.is_some(),
+            "compaction off → the error surfaces as before"
+        );
     }
 
     #[tokio::test]
@@ -1210,7 +1438,8 @@ mod tests {
             summary_prompt: Some("Custom summary instructions.".to_string()),
             ..test_policy()
         };
-        let mut sess = AgentSession::new(provider, session_in(dir.path()), compaction_config(policy));
+        let mut sess =
+            AgentSession::new(provider, session_in(dir.path()), compaction_config(policy));
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
         sess.prompt("t3").await;
@@ -1236,16 +1465,23 @@ mod tests {
             LlmResponse::error("still down"),      // retry
             end_turn_with_usage("a3", 100),
         ]));
-        let mut sess =
-            AgentSession::new(provider, session_in(dir.path()), compaction_config(test_policy()));
+        let mut sess = AgentSession::new(
+            provider,
+            session_in(dir.path()),
+            compaction_config(test_policy()),
+        );
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
         let turn = sess.prompt("t3").await;
 
-        assert_eq!(turn.text, "a3", "the session must keep working after the fallback");
+        assert_eq!(
+            turn.text, "a3",
+            "the session must keep working after the fallback"
+        );
         assert!(
             matches!(&sess.history()[0].content[0], ContentBlock::Text(t) if t.contains("summary unavailable")),
-            "drop marker must replace the evicted turns: {:?}", sess.history()
+            "drop marker must replace the evicted turns: {:?}",
+            sess.history()
         );
     }
 
@@ -1266,9 +1502,15 @@ mod tests {
         let config = AgentConfig {
             compaction: Some(test_policy()),
             on_compaction: Some(Box::new(move |event| {
-                events_in_hook.lock().unwrap().push((event.evicted_turns, event.fallback_drop));
+                events_in_hook
+                    .lock()
+                    .unwrap()
+                    .push((event.evicted_turns, event.fallback_drop));
             })),
-            token_log: Some(TokenLogConfig { path: log_path.clone(), label: "test".to_string() }),
+            token_log: Some(TokenLogConfig {
+                path: log_path.clone(),
+                label: "test".to_string(),
+            }),
             ..AgentConfig::default()
         };
         let mut sess = AgentSession::new(provider, session_in(dir.path()), config);
@@ -1281,7 +1523,10 @@ mod tests {
         assert_eq!(seen[0], (1, false), "one turn evicted, no fallback");
 
         let log = std::fs::read_to_string(&log_path).unwrap();
-        assert!(log.contains("\"event\":\"compaction\""), "structured event line expected: {log}");
+        assert!(
+            log.contains("\"event\":\"compaction\""),
+            "structured event line expected: {log}"
+        );
         assert!(log.contains("\"strategy\":\"summarize\""), "{log}");
     }
 
@@ -1289,16 +1534,23 @@ mod tests {
     async fn summary_usage_counts_toward_session_total() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Box::new(RecordingProvider::new(vec![
-            end_turn_with_usage("a1", 100),        // +100 input
-            end_turn_with_usage("a2", 700),        // +700
+            end_turn_with_usage("a1", 100),         // +100 input
+            end_turn_with_usage("a2", 700),         // +700
             end_turn_with_usage("the summary", 40), // +40 (summarization call)
-            end_turn_with_usage("a3", 100),        // +100
+            end_turn_with_usage("a3", 100),         // +100
         ]));
-        let mut sess =
-            AgentSession::new(provider, session_in(dir.path()), compaction_config(test_policy()));
+        let mut sess = AgentSession::new(
+            provider,
+            session_in(dir.path()),
+            compaction_config(test_policy()),
+        );
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
         sess.prompt("t3").await;
-        assert_eq!(sess.total_usage().input, 940, "summary call tokens must be counted");
+        assert_eq!(
+            sess.total_usage().input,
+            940,
+            "summary call tokens must be counted"
+        );
     }
 }

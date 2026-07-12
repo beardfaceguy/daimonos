@@ -1526,7 +1526,10 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
         assert!(names.contains(&"main.rs"));
         assert!(names.contains(&"lib.rs"));
-        assert!(!names.contains(&"main.py"), "main.py should be filtered by glob");
+        assert!(
+            !names.contains(&"main.py"),
+            "main.py should be filtered by glob"
+        );
     }
 
     #[tokio::test]
@@ -1628,7 +1631,10 @@ mod tests {
         assert!(r.ok);
         let entries = r.d.unwrap()["entries"].as_array().unwrap().clone();
         let names: Vec<&str> = entries.iter().map(|e| e["n"].as_str().unwrap()).collect();
-        assert!(names.contains(&"src/main.rs"), "should find nested .rs file");
+        assert!(
+            names.contains(&"src/main.rs"),
+            "should find nested .rs file"
+        );
         assert!(!names.contains(&"src/lib.py"), "should not find .py files");
         assert!(!names.contains(&"readme.md"), "should not find .md files");
         assert!(

@@ -92,7 +92,10 @@ impl ToolPlugin for GhPlugin {
         // other command returns Err on a non-zero exit (via `?` above), so any
         // success path reached here is genuinely exit 0.
         let exit_code = if command == "raw" {
-            output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32
+            output
+                .get("exit_code")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32
         } else {
             0
         };
@@ -370,8 +373,10 @@ async fn gh_raw(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_js
         .output()
         .await
         .map_err(|e| format!("gh exec: {e}"))?;
-    let (stdout, stdout_truncated) = cap_str(&String::from_utf8_lossy(&output.stdout), MAX_GH_OUTPUT);
-    let (stderr, stderr_truncated) = cap_str(&String::from_utf8_lossy(&output.stderr), MAX_GH_OUTPUT);
+    let (stdout, stdout_truncated) =
+        cap_str(&String::from_utf8_lossy(&output.stdout), MAX_GH_OUTPUT);
+    let (stderr, stderr_truncated) =
+        cap_str(&String::from_utf8_lossy(&output.stderr), MAX_GH_OUTPUT);
     // Parse stdout as JSON only when returned intact — a truncated buffer isn't
     // valid JSON, so surface it as a string in that case.
     let stdout_val = if stdout_truncated {
@@ -448,7 +453,8 @@ async fn gh_pr_checkout(
 // --- run_list / run_view ---
 
 fn run_list_argv(args: Option<&serde_json::Value>) -> Vec<String> {
-    let fields = "databaseId,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt";
+    let fields =
+        "databaseId,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt";
     let limit = arg_i64(args, "limit").unwrap_or(10).clamp(1, 100);
     let mut v = vec![
         "run".to_string(),
@@ -487,8 +493,8 @@ async fn gh_run_list(
 }
 
 fn run_view_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
-    let id =
-        arg_i64(args, "run_id").ok_or_else(|| "run_view requires 'run_id' (from run_list)".to_string())?;
+    let id = arg_i64(args, "run_id")
+        .ok_or_else(|| "run_view requires 'run_id' (from run_list)".to_string())?;
     let fields = "databaseId,status,conclusion,displayTitle,workflowName,headBranch,event,jobs";
     Ok(vec![
         "run".to_string(),
@@ -597,8 +603,7 @@ async fn gh_issue_create(
 
 fn issue_comment_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
     let n = arg_i64(args, "number").ok_or_else(|| "issue_comment requires 'number'".to_string())?;
-    let body =
-        arg_str(args, "body").ok_or_else(|| "issue_comment requires 'body'".to_string())?;
+    let body = arg_str(args, "body").ok_or_else(|| "issue_comment requires 'body'".to_string())?;
     Ok(vec![
         "issue".to_string(),
         "comment".to_string(),
