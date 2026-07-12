@@ -809,6 +809,7 @@ mod tests {
             content: vec![crate::providers::ContentBlock::Text(text.to_string())],
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: Usage { input: 10, output: 5, ..Usage::default() },
         }
     }
@@ -822,6 +823,7 @@ mod tests {
             }],
             stop_reason: crate::providers::StopReason::ToolUse,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         }
     }

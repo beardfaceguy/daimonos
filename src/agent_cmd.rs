@@ -182,6 +182,7 @@ mod tests {
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         }
     }
@@ -274,6 +275,7 @@ mod tests {
             ],
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
+            context_overflow: false,
             usage: Usage::default(),
         }]);
         let mut out = Vec::new();
@@ -470,6 +472,7 @@ mod tests {
                 }],
                 stop_reason: crate::providers::StopReason::ToolUse,
                 error_message: None,
+                context_overflow: false,
                 usage: Usage::default(),
             },
             end_turn_with_text("done"),
