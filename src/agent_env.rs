@@ -13,6 +13,36 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::compaction::CompactionPolicy;
+use crate::providers::LlmProvider;
+
+/// Compaction settings parsed from the env file when `DAIMONOS_AGENT_CONTEXT_WINDOW`
+/// is omitted (vikunja #965): everything a [`CompactionPolicy`] needs except
+/// the window itself, which is resolved live from the provider in `main.rs`
+/// once the effective (possibly `--model`-overridden) model is known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionSpec {
+    pub high_water: f64,
+    pub low_water: f64,
+    pub output_reservation: u64,
+    pub summary_model: Option<String>,
+    pub summary_prompt: Option<String>,
+}
+
+/// Parsed compaction configuration (ADR-002 amendment, vikunja #965). Keeps
+/// [`CompactionPolicy`] — and therefore `compaction.rs`/`agent.rs` — untouched
+/// by isolating the "window not yet known" state here at the config layer.
+///
+/// - `Off`: `DAIMONOS_AGENT_COMPACTION=off`.
+/// - `Ready`: `on` with `DAIMONOS_AGENT_CONTEXT_WINDOW` present — validated in
+///   full at parse time, byte-for-byte as before this change.
+/// - `NeedsWindow`: `on` with the window omitted — the window (and its
+///   dependent validation) is deferred to [`AgentEnv::resolve_compaction`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactionConfig {
+    Off,
+    Ready(CompactionPolicy),
+    NeedsWindow(CompactionSpec),
+}
 
 /// Required scalar keys — `daimonos agent` refuses to run if any is absent/empty.
 const REQUIRED: &[&str] = &[
@@ -27,10 +57,11 @@ const REQUIRED: &[&str] = &[
 
 /// Numeric keys required when `DAIMONOS_AGENT_COMPACTION=on` (ADR-002: no
 /// values in code — the budget math comes entirely from the env file).
+/// `DAIMONOS_AGENT_CONTEXT_WINDOW` is deliberately NOT here: it is optional
+/// (vikunja #965) and resolved from the provider when omitted.
 const COMPACTION_REQUIRED: &[&str] = &[
     "DAIMONOS_AGENT_COMPACTION_HIGH_WATER",
     "DAIMONOS_AGENT_COMPACTION_LOW_WATER",
-    "DAIMONOS_AGENT_CONTEXT_WINDOW",
     "DAIMONOS_AGENT_OUTPUT_RESERVATION",
 ];
 
@@ -49,8 +80,10 @@ pub struct AgentEnv {
     /// is always present — prepended if the list omits it, and the list is
     /// deduped preserving first-seen order. Never empty (at minimum `[model]`).
     pub models: Vec<String>,
-    /// Context/window compaction (ADR-002). `None` = explicitly `off`.
-    pub compaction: Option<CompactionPolicy>,
+    /// Context/window compaction (ADR-002 + #965 amendment). Resolved into an
+    /// effective `Option<CompactionPolicy>` by [`Self::resolve_compaction`]
+    /// once the provider and effective model are known.
+    pub compaction: CompactionConfig,
 }
 
 impl AgentEnv {
@@ -146,6 +179,58 @@ impl AgentEnv {
         })
     }
 
+    /// Resolve the parsed [`CompactionConfig`] into an effective
+    /// `Option<CompactionPolicy>` for the frontends (ADR-002 amendment,
+    /// vikunja #965). Must be called from `main.rs` *after* the provider is
+    /// built and the effective (possibly `--model`-overridden) model is
+    /// known, so a `NeedsWindow` config queries the provider for the model
+    /// actually in use.
+    ///
+    /// - `Off` → `None` (compaction disabled).
+    /// - `Ready(policy)` → `Some(policy)`, unchanged.
+    /// - `NeedsWindow(spec)` → query `provider.context_window(effective_model)`
+    ///   and apply the deferred window checks. A lookup failure is a HARD
+    ///   ERROR (never a silent fallback to compaction-off) naming the model
+    ///   and directing the user to set `DAIMONOS_AGENT_CONTEXT_WINDOW`.
+    pub async fn resolve_compaction(
+        &self,
+        provider: &dyn LlmProvider,
+        effective_model: &str,
+    ) -> Result<Option<CompactionPolicy>, String> {
+        match &self.compaction {
+            CompactionConfig::Off => Ok(None),
+            CompactionConfig::Ready(policy) => Ok(Some(policy.clone())),
+            CompactionConfig::NeedsWindow(spec) => {
+                let context_window = provider
+                    .context_window(effective_model)
+                    .await
+                    .filter(|&w| w > 0)
+                    .ok_or_else(|| format!(
+                        "could not determine the context window for model '{effective_model}' \
+                         from the provider (network error, unknown model id, or the provider \
+                         does not report it). Set DAIMONOS_AGENT_CONTEXT_WINDOW explicitly in \
+                         the agent env file, or set DAIMONOS_AGENT_COMPACTION=off."
+                    ))?;
+                if spec.output_reservation >= context_window {
+                    return Err(format!(
+                        "DAIMONOS_AGENT_OUTPUT_RESERVATION ({}) must be smaller than the \
+                         provider-reported context window ({context_window}) for model \
+                         '{effective_model}'",
+                        spec.output_reservation
+                    ));
+                }
+                Ok(Some(CompactionPolicy {
+                    high_water: spec.high_water,
+                    low_water: spec.low_water,
+                    context_window,
+                    output_reservation: spec.output_reservation,
+                    summary_model: spec.summary_model.clone(),
+                    summary_prompt: spec.summary_prompt.clone(),
+                }))
+            }
+        }
+    }
+
     /// Global path for persisted "always" (Y) approvals, fixed at
     /// ~/.config/daimonos/agent-approvals (independent of the agent env file).
     pub fn approvals_path() -> Option<PathBuf> {
@@ -188,19 +273,22 @@ impl AgentEnv {
 /// Parse the ADR-002 compaction keys. `DAIMONOS_AGENT_COMPACTION` itself is
 /// in [`REQUIRED`] (checked by the caller); `on` additionally requires every
 /// [`COMPACTION_REQUIRED`] numeric key — there are deliberately no default
-/// values in code. Validation: `0 < low_water < high_water < 1`,
-/// `context_window > 0`, `output_reservation < context_window`.
+/// values in code. `DAIMONOS_AGENT_CONTEXT_WINDOW` is optional (vikunja
+/// #965): present → [`CompactionConfig::Ready`] (fully validated here);
+/// absent → [`CompactionConfig::NeedsWindow`] (window + its dependent checks
+/// deferred to [`AgentEnv::resolve_compaction`]). The window-independent
+/// watermark rule `0 < low_water < high_water < 1` is always enforced here.
 fn parse_compaction(
     vars: &HashMap<String, String>,
     path: &Path,
-) -> Result<Option<CompactionPolicy>, String> {
+) -> Result<CompactionConfig, String> {
     let present = |k: &str| {
         vars.get(k).map(|v| v.trim()).filter(|v| !v.is_empty()).map(|v| v.to_string())
     };
     // Caller has verified presence (REQUIRED).
     let switch = present("DAIMONOS_AGENT_COMPACTION").unwrap();
     match switch.as_str() {
-        "off" => Ok(None),
+        "off" => Ok(CompactionConfig::Off),
         "on" => {
             let missing: Vec<&str> = COMPACTION_REQUIRED
                 .iter()
@@ -228,7 +316,6 @@ fn parse_compaction(
             };
             let high_water = num("DAIMONOS_AGENT_COMPACTION_HIGH_WATER")?;
             let low_water = num("DAIMONOS_AGENT_COMPACTION_LOW_WATER")?;
-            let context_window = int("DAIMONOS_AGENT_CONTEXT_WINDOW")?;
             let output_reservation = int("DAIMONOS_AGENT_OUTPUT_RESERVATION")?;
 
             if !(low_water > 0.0 && low_water < high_water && high_water < 1.0) {
@@ -237,29 +324,44 @@ fn parse_compaction(
                     path.display()
                 ));
             }
-            if context_window == 0 {
-                return Err(format!(
-                    "agent env file {}: DAIMONOS_AGENT_CONTEXT_WINDOW must be > 0",
-                    path.display()
-                ));
-            }
-            if output_reservation >= context_window {
-                return Err(format!(
-                    "agent env file {}: DAIMONOS_AGENT_OUTPUT_RESERVATION ({output_reservation}) must be smaller than DAIMONOS_AGENT_CONTEXT_WINDOW ({context_window})",
-                    path.display()
-                ));
-            }
 
-            Ok(Some(CompactionPolicy {
-                high_water,
-                low_water,
-                context_window,
-                output_reservation,
-                // Optional: unset → the session's main model / built-in
-                // prompt template (referential fallbacks, not magic numbers).
-                summary_model: present("DAIMONOS_AGENT_SUMMARY_MODEL"),
-                summary_prompt: present("DAIMONOS_AGENT_SUMMARY_PROMPT"),
-            }))
+            // Optional: unset → the session's main model / built-in prompt
+            // template (referential fallbacks, not magic numbers).
+            let summary_model = present("DAIMONOS_AGENT_SUMMARY_MODEL");
+            let summary_prompt = present("DAIMONOS_AGENT_SUMMARY_PROMPT");
+
+            match present("DAIMONOS_AGENT_CONTEXT_WINDOW") {
+                Some(_) => {
+                    let context_window = int("DAIMONOS_AGENT_CONTEXT_WINDOW")?;
+                    if context_window == 0 {
+                        return Err(format!(
+                            "agent env file {}: DAIMONOS_AGENT_CONTEXT_WINDOW must be > 0",
+                            path.display()
+                        ));
+                    }
+                    if output_reservation >= context_window {
+                        return Err(format!(
+                            "agent env file {}: DAIMONOS_AGENT_OUTPUT_RESERVATION ({output_reservation}) must be smaller than DAIMONOS_AGENT_CONTEXT_WINDOW ({context_window})",
+                            path.display()
+                        ));
+                    }
+                    Ok(CompactionConfig::Ready(CompactionPolicy {
+                        high_water,
+                        low_water,
+                        context_window,
+                        output_reservation,
+                        summary_model,
+                        summary_prompt,
+                    }))
+                }
+                None => Ok(CompactionConfig::NeedsWindow(CompactionSpec {
+                    high_water,
+                    low_water,
+                    output_reservation,
+                    summary_model,
+                    summary_prompt,
+                })),
+            }
         }
         other => Err(format!(
             "agent env file {}: DAIMONOS_AGENT_COMPACTION '{other}' invalid (valid: on, off)",
@@ -458,7 +560,7 @@ mod tests {
 
     #[test]
     fn compaction_off_parses_to_none() {
-        assert_eq!(load_str(&base()).unwrap().compaction, None);
+        assert_eq!(load_str(&base()).unwrap().compaction, CompactionConfig::Off);
     }
 
     #[test]
@@ -475,9 +577,16 @@ mod tests {
         assert!(err.contains("invalid") && err.contains("maybe"), "{err}");
     }
 
+    fn ready_policy(env: &AgentEnv) -> CompactionPolicy {
+        match &env.compaction {
+            CompactionConfig::Ready(p) => p.clone(),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
     #[test]
     fn compaction_on_parses_full_policy() {
-        let p = load_str(&compaction_on()).unwrap().compaction.expect("policy");
+        let p = ready_policy(&load_str(&compaction_on()).unwrap());
         assert_eq!(p.high_water, 0.75);
         assert_eq!(p.low_water, 0.5);
         assert_eq!(p.context_window, 200_000);
@@ -488,21 +597,133 @@ mod tests {
     }
 
     #[test]
-    fn compaction_on_requires_all_numeric_keys_and_names_missing() {
+    fn compaction_on_requires_remaining_numeric_keys_and_names_missing() {
+        // CONTEXT_WINDOW is now optional (#965) — removing it alone must NOT
+        // error; the still-required numeric keys are reported when absent.
         let s = compaction_on()
             .replace("DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.5\n", "")
-            .replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+            .replace("DAIMONOS_AGENT_OUTPUT_RESERVATION=8192\n", "");
         let err = load_str(&s).unwrap_err();
         assert!(err.contains("DAIMONOS_AGENT_COMPACTION_LOW_WATER"), "{err}");
-        assert!(err.contains("DAIMONOS_AGENT_CONTEXT_WINDOW"), "{err}");
+        assert!(err.contains("DAIMONOS_AGENT_OUTPUT_RESERVATION"), "{err}");
         assert!(!err.contains("HIGH_WATER"), "present key must not be flagged: {err}");
+        assert!(!err.contains("CONTEXT_WINDOW"), "optional key must not be flagged: {err}");
         assert!(err.contains("<test>"), "error must name the file path: {err}");
     }
 
     #[test]
     fn compaction_off_ignores_missing_numeric_keys() {
         // off → the numeric knobs are not required.
-        assert!(load_str(&base()).unwrap().compaction.is_none());
+        assert_eq!(load_str(&base()).unwrap().compaction, CompactionConfig::Off);
+    }
+
+    // --- optional context window (#965) ---
+
+    #[test]
+    fn compaction_on_without_window_parses_to_needs_window() {
+        let s = compaction_on().replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+        let spec = match load_str(&s).unwrap().compaction {
+            CompactionConfig::NeedsWindow(spec) => spec,
+            other => panic!("expected NeedsWindow, got {other:?}"),
+        };
+        assert_eq!(spec.high_water, 0.75);
+        assert_eq!(spec.low_water, 0.5);
+        assert_eq!(spec.output_reservation, 8192);
+    }
+
+    #[test]
+    fn compaction_needs_window_still_enforces_watermarks_at_parse() {
+        // Window-independent validation must fire even when the window is
+        // deferred to the provider.
+        let s = compaction_on()
+            .replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "")
+            .replace("HIGH_WATER=0.75", "HIGH_WATER=0.4"); // low(0.5) > high(0.4)
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("0 < LOW_WATER < HIGH_WATER < 1"), "{err}");
+    }
+
+    #[test]
+    fn compaction_needs_window_captures_summary_keys() {
+        let s = compaction_on().replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "")
+            + "DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5\n";
+        match load_str(&s).unwrap().compaction {
+            CompactionConfig::NeedsWindow(spec) => {
+                assert_eq!(spec.summary_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+            }
+            other => panic!("expected NeedsWindow, got {other:?}"),
+        }
+    }
+
+    // A provider whose only interesting behavior is what context_window()
+    // reports, for resolve_compaction() tests.
+    struct FakeProvider(Option<u64>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            _opts: &crate::providers::CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            crate::providers::LlmResponse::error("unused")
+        }
+        async fn context_window(&self, _model: &str) -> Option<u64> {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_off_yields_none() {
+        let env = load_str(&base()).unwrap();
+        let out = env.resolve_compaction(&FakeProvider(Some(200_000)), "m").await.unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_ready_returns_policy_unchanged_without_querying() {
+        let env = load_str(&compaction_on()).unwrap();
+        // FakeProvider(None) would fail a lookup — proving Ready never queries.
+        let out = env.resolve_compaction(&FakeProvider(None), "m").await.unwrap();
+        assert_eq!(out.unwrap().context_window, 200_000);
+    }
+
+    #[tokio::test]
+    async fn resolve_needs_window_uses_provider_value() {
+        let s = compaction_on().replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+        let env = load_str(&s).unwrap();
+        let policy = env
+            .resolve_compaction(&FakeProvider(Some(128_000)), "some/model")
+            .await
+            .unwrap()
+            .expect("policy");
+        assert_eq!(policy.context_window, 128_000);
+        assert_eq!(policy.output_reservation, 8192);
+        assert_eq!(policy.high_water, 0.75);
+        assert_eq!(policy.budget(), 128_000 - 8192);
+    }
+
+    #[tokio::test]
+    async fn resolve_needs_window_hard_errors_on_lookup_failure() {
+        let s = compaction_on().replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+        let env = load_str(&s).unwrap();
+        let err = env
+            .resolve_compaction(&FakeProvider(None), "acme/model-x")
+            .await
+            .unwrap_err();
+        assert!(err.contains("acme/model-x"), "error names the model: {err}");
+        assert!(err.contains("DAIMONOS_AGENT_CONTEXT_WINDOW"), "error names the key: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_needs_window_rejects_reservation_at_or_above_window() {
+        let s = compaction_on().replace("DAIMONOS_AGENT_CONTEXT_WINDOW=200000\n", "");
+        let env = load_str(&s).unwrap();
+        // Provider reports a window smaller than the 8192 reservation.
+        let err = env
+            .resolve_compaction(&FakeProvider(Some(4096)), "tiny/model")
+            .await
+            .unwrap_err();
+        assert!(err.contains("must be smaller"), "{err}");
     }
 
     #[test]
@@ -538,7 +759,7 @@ mod tests {
         let s = compaction_on()
             + "DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5\n\
                DAIMONOS_AGENT_SUMMARY_PROMPT=Summarize tersely.\n";
-        let p = load_str(&s).unwrap().compaction.unwrap();
+        let p = ready_policy(&load_str(&s).unwrap());
         assert_eq!(p.summary_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
         assert_eq!(p.summary_prompt.as_deref(), Some("Summarize tersely."));
     }

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-12
 **Status:** Accepted
-**Tracks:** vikunja #962 (compaction), #964 (token-usage normalization precursor)
+**Tracks:** vikunja #962 (compaction), #964 (token-usage normalization precursor), #965 (provider-reported context window — see Amendment below)
 **Relates to:** ADR-001 (provider boundary — this ADR sharpens the neutral `Usage` semantics)
 
 ## Problem
@@ -81,15 +81,17 @@ TOML `Config` — matching the existing separation (`agent_env.rs`). Per user di
 | `DAIMONOS_AGENT_COMPACTION` | **always** (`on`/`off`) | master switch; forces an explicit choice |
 | `DAIMONOS_AGENT_COMPACTION_HIGH_WATER` | when `on` | trigger fraction (e.g. `0.75`) |
 | `DAIMONOS_AGENT_COMPACTION_LOW_WATER` | when `on` | target fraction (e.g. `0.50`) |
-| `DAIMONOS_AGENT_CONTEXT_WINDOW` | when `on` | model window in tokens (replaces the hard-coded heuristic for the budget) |
+| `DAIMONOS_AGENT_CONTEXT_WINDOW` | optional when `on` (see #965 amendment) | model window in tokens; when omitted, resolved live from the provider for the effective model |
 | `DAIMONOS_AGENT_OUTPUT_RESERVATION` | when `on` | tokens reserved for the reply (replaces the `max_tokens` code default for the budget) |
 | `DAIMONOS_AGENT_SUMMARY_MODEL` | optional | summarizer model; unset → `DAIMONOS_AGENT_MODEL` (a *reference* to an explicitly-set value, not a baked-in literal) |
 | `DAIMONOS_AGENT_SUMMARY_PROMPT` | optional | overrides the built-in summarization prompt template |
 
 Validation: `0 < low_water < high_water < 1`; `context_window > 0`;
-`output_reservation < context_window`. **Accepted breaking change:** every
-`agent`/`chat`/`acp` invocation (including Zed's) errors until its agent.env sets at least
-`DAIMONOS_AGENT_COMPACTION=off`.
+`output_reservation < context_window`. The watermark rule is checked at parse time always;
+the two window-dependent rules are checked at parse time when `CONTEXT_WINDOW` is present and
+deferred to resolution time when it is provider-resolved (#965 amendment). **Accepted breaking
+change:** every `agent`/`chat`/`acp` invocation (including Zed's) errors until its agent.env
+sets at least `DAIMONOS_AGENT_COMPACTION=off`.
 
 Config principle established: **require** values with no safe reference (numeric knobs); **allow
 omission** where the fallback is another explicitly-configured value (summary model → main model)
@@ -188,6 +190,52 @@ informational:
 2. **PR: compaction MVP (#962)** — policy + required-config parsing/validation/errors; strategy
    seam + SummarizeStrategy; boundary logic; `prompt()` proactive/reactive hook; frontend
    threading; surfacing; compaction event log.
+
+## Amendment (2026-07-12, #965): provider-reported context window
+
+The original design made `DAIMONOS_AGENT_CONTEXT_WINDOW` a **required** key when compaction is
+`on`, forcing the user to hand-configure the model's window. Both supported provider dialects
+expose the window programmatically, so it can be resolved live instead of hand-set:
+
+- **OpenAI-compatible** (`openrouter` provider, any `base_url`): `GET {base_url}/models` →
+  match the entry by `id` → `context_length`, falling back to `max_model_len` (self-hosted vLLM).
+- **Anthropic-native:** `GET {base_url}/v1/models/{id}` → `max_input_tokens`.
+
+**Precedence:** explicit env key > provider query > hard error. Fully backwards compatible — an
+env file that sets `CONTEXT_WINDOW` behaves exactly as before.
+
+**Design (chosen over two simpler alternatives):**
+
+- New trait method `LlmProvider::context_window(&self, model) -> Option<u64>`, default `None`;
+  per-provider impls return `None` on any failure (network, unknown id, missing/zero field). No
+  provider phrasing crosses into core (upholds ADR-001).
+- `CompactionPolicy`, `compaction.rs`, and `agent.rs` are **untouched**. The "window not yet
+  known" state is isolated at the config layer via a new `CompactionConfig`
+  enum (`Off` / `Ready(CompactionPolicy)` / `NeedsWindow(CompactionSpec)`) in `agent_env.rs`.
+  `parse_compaction` stays pure/synchronous: `CONTEXT_WINDOW` present → `Ready` (validated in
+  full, unchanged); absent → `NeedsWindow` (watermarks still validated; window + its dependent
+  checks deferred).
+- A new async `AgentEnv::resolve_compaction(provider, effective_model)` runs in `main.rs`
+  **after** the provider is built and the effective model is known (Chat + Acp arms only — the
+  one-shot `agent` command still has no compaction). It queries the provider for the effective
+  model, so a `--model` CLI override resolves the window for the model actually in use.
+  Downstream `run_chat`/`run_acp` signatures are unchanged (still `Option<CompactionPolicy>`).
+
+**Rejected alternatives:**
+
+- Making `CompactionPolicy.context_window` itself `Option<u64>` — ripples through `budget()`,
+  `should_compact()`, `target_tokens()`, and every call site in `agent.rs`; too invasive for a
+  config-layer concern.
+- Making `AgentEnv::load()` async and resolving the window there — `load()` runs before the
+  `--model` override is known (that's resolved in `main.rs`), so it would query the provider for
+  the wrong model whenever `--model` differs, silently producing wrong thresholds.
+
+**Failure handling:** a `NeedsWindow` lookup that fails is a **hard error** naming the model and
+telling the user to set `DAIMONOS_AGENT_CONTEXT_WINDOW` explicitly (or `COMPACTION=off`) — never
+a silent fallback to compaction-off.
+
+**Explicitly not in scope:** a static hardcoded model→window dataset. Live provider lookup is
+preferred; a maintained table is a last resort only if lookups prove unreliable in practice.
 
 ## Future work (explicitly out of scope)
 

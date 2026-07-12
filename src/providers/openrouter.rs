@@ -143,6 +143,16 @@ impl LlmProvider for OpenRouterProvider {
 
         state.finish()
     }
+
+    async fn context_window(&self, model: &str) -> Option<u64> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self.client.get(&url).bearer_auth(&self.api_key).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        context_length_from_models(&body, model)
+    }
 }
 
 // --- Streaming (vikunja #957) ---
@@ -411,6 +421,19 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
         || m.contains("prompt is too long")
         || m.contains("exceeds the available context")
         || m.contains("input is too long")
+}
+
+/// Find `model`'s context window in an OpenAI-dialect `GET /models` body
+/// (vikunja #965). OpenRouter reports it as `context_length`; self-hosted
+/// vLLM exposes `max_model_len` on the same list endpoint, so fall back to
+/// that. `None` when the model id isn't listed, both fields are absent, or
+/// the value is zero.
+pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u64> {
+    let entry = body["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?;
+    entry["context_length"]
+        .as_u64()
+        .or_else(|| entry["max_model_len"].as_u64())
+        .filter(|&n| n > 0)
 }
 
 #[cfg(test)]
@@ -702,6 +725,76 @@ mod tests {
         for msg in ["rate limit exceeded", "invalid api key", "model not found", "internal server error"] {
             assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
         }
+    }
+
+    // --- context window (vikunja #965) ---
+
+    #[test]
+    fn context_length_found_by_id() {
+        let body = json!({"data": [
+            {"id": "other/model", "context_length": 8192},
+            {"id": "anthropic/claude-sonnet-4.6", "context_length": 200000},
+        ]});
+        assert_eq!(
+            context_length_from_models(&body, "anthropic/claude-sonnet-4.6"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_length_falls_back_to_max_model_len() {
+        // Self-hosted vLLM: no context_length, exposes max_model_len instead.
+        let body = json!({"data": [{"id": "local/llama", "max_model_len": 32768}]});
+        assert_eq!(context_length_from_models(&body, "local/llama"), Some(32_768));
+    }
+
+    #[test]
+    fn context_length_prefers_context_length_over_max_model_len() {
+        let body = json!({"data": [
+            {"id": "m", "context_length": 128000, "max_model_len": 32768}
+        ]});
+        assert_eq!(context_length_from_models(&body, "m"), Some(128_000));
+    }
+
+    #[test]
+    fn context_length_unknown_model_is_none() {
+        let body = json!({"data": [{"id": "known", "context_length": 8192}]});
+        assert_eq!(context_length_from_models(&body, "missing"), None);
+    }
+
+    #[test]
+    fn context_length_missing_both_fields_is_none() {
+        let body = json!({"data": [{"id": "m"}]});
+        assert_eq!(context_length_from_models(&body, "m"), None);
+    }
+
+    #[test]
+    fn context_length_zero_is_none() {
+        let body = json!({"data": [{"id": "m", "context_length": 0}]});
+        assert_eq!(context_length_from_models(&body, "m"), None);
+    }
+
+    #[test]
+    fn context_length_no_data_array_is_none() {
+        assert_eq!(context_length_from_models(&json!({}), "m"), None);
+    }
+
+    #[tokio::test]
+    async fn context_window_returns_none_on_http_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let resp = b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+                stream.write_all(resp).await.ok();
+            }
+        });
+        let provider =
+            OpenRouterProvider::new("k".into(), format!("http://127.0.0.1:{port}")).unwrap();
+        assert_eq!(provider.context_window("some/model").await, None);
     }
 
     #[test]
