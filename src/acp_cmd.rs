@@ -17,15 +17,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock,
-    ContentChunk, Cost as AcpCost, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    StopReason as AcpStopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock, ContentChunk,
+    Cost as AcpCost, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
+    TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -129,7 +129,11 @@ fn tool_kind_for(name: &str) -> ToolKind {
 /// Best-effort — Zed only uses this to render a proportion, not an exact
 /// limit daimonos itself enforces.
 fn context_window_size_for(model: &str) -> u64 {
-    if model.contains("claude") || model.contains("opus") || model.contains("sonnet") || model.contains("haiku") {
+    if model.contains("claude")
+        || model.contains("opus")
+        || model.contains("sonnet")
+        || model.contains("haiku")
+    {
         200_000
     } else {
         128_000
@@ -140,7 +144,11 @@ fn current_cx(connection: &CurrentConnection) -> Option<ConnectionTo<AcpClientRo
     connection.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-fn send_notification(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, update: SessionUpdate) {
+fn send_notification(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    update: SessionUpdate,
+) {
     let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
 }
 
@@ -162,7 +170,11 @@ async fn request_permission(
     );
     let options = vec![
         PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
-        PermissionOption::new("allow_always", "Always Allow", PermissionOptionKind::AllowAlways),
+        PermissionOption::new(
+            "allow_always",
+            "Always Allow",
+            PermissionOptionKind::AllowAlways,
+        ),
         PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), update, options);
@@ -179,7 +191,10 @@ async fn request_permission(
             RequestPermissionOutcome::Cancelled => {
                 BeforeHookResult::Block(format!("permission request cancelled for '{}'", info.name))
             }
-            _ => BeforeHookResult::Block(format!("unrecognized permission outcome for '{}'", info.name)),
+            _ => BeforeHookResult::Block(format!(
+                "unrecognized permission outcome for '{}'",
+                info.name
+            )),
         },
         Err(_) => BeforeHookResult::Block(format!("permission request failed for '{}'", info.name)),
     }
@@ -220,7 +235,10 @@ fn build_before_tool_call_hook(
                 BeforeHookResult::Allow => ToolCallStatus::InProgress,
                 BeforeHookResult::Block(_) => ToolCallStatus::Failed,
             };
-            let update = ToolCallUpdate::new(info.id.clone(), ToolCallUpdateFields::new().status(Some(status)));
+            let update = ToolCallUpdate::new(
+                info.id.clone(),
+                ToolCallUpdateFields::new().status(Some(status)),
+            );
             send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
 
             decision
@@ -233,21 +251,33 @@ fn build_after_tool_call_hook(connection: CurrentConnection, session_id: Session
         let Some(cx) = current_cx(&connection) else {
             return AfterHookResult::Continue;
         };
-        let status = if is_error { ToolCallStatus::Failed } else { ToolCallStatus::Completed };
+        let status = if is_error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
         let update = ToolCallUpdate::new(
             info.id.clone(),
             ToolCallUpdateFields::new()
                 .status(Some(status))
-                .content(Some(vec![AcpContentBlock::Text(TextContent::new(content.to_string())).into()])),
+                .content(Some(vec![AcpContentBlock::Text(TextContent::new(
+                    content.to_string(),
+                ))
+                .into()])),
         );
         send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
         AfterHookResult::Continue
     })
 }
 
-fn build_stream_hook(connection: CurrentConnection, session_id: SessionId) -> crate::agent::StreamHook {
+fn build_stream_hook(
+    connection: CurrentConnection,
+    session_id: SessionId,
+) -> crate::agent::StreamHook {
     Box::new(move |ev: StreamEvent| {
-        let Some(cx) = current_cx(&connection) else { return };
+        let Some(cx) = current_cx(&connection) else {
+            return;
+        };
         if let StreamEvent::TextDelta(text) = ev {
             let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text)));
             send_notification(&cx, &session_id, SessionUpdate::AgentMessageChunk(chunk));
@@ -255,7 +285,12 @@ fn build_stream_hook(connection: CurrentConnection, session_id: SessionId) -> cr
     })
 }
 
-fn emit_usage_update(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, model: &str, usage: &Usage) {
+fn emit_usage_update(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    model: &str,
+    usage: &Usage,
+) {
     let update = UsageUpdate::new(usage.input + usage.output, context_window_size_for(model))
         .cost(AcpCost::new(usage.cost.total_usd, "USD"));
     send_notification(cx, session_id, SessionUpdate::UsageUpdate(update));
@@ -270,8 +305,9 @@ fn model_config_options(models: &[String], current: &str) -> Vec<SessionConfigOp
         .iter()
         .map(|m| SessionConfigSelectOption::new(m.clone(), m.clone()))
         .collect();
-    let option = SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
-        .category(Some(SessionConfigOptionCategory::Model));
+    let option =
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
+            .category(Some(SessionConfigOptionCategory::Model));
     vec![option]
 }
 
@@ -284,7 +320,9 @@ fn build_compaction_hook(
     session_id: SessionId,
 ) -> crate::agent::CompactionHook {
     Box::new(move |event: &crate::compaction::CompactionEvent| {
-        let Some(cx) = current_cx(&connection) else { return };
+        let Some(cx) = current_cx(&connection) else {
+            return;
+        };
         let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(format!(
             "[context compacted: {} older turn(s) summarized]",
             event.evicted_turns
@@ -307,17 +345,37 @@ fn build_agent_config(
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
-        .map(|s| ToolSchema { name: s.name, description: s.description, input_schema: s.input_schema })
+        .map(|s| ToolSchema {
+            name: s.name,
+            description: s.description,
+            input_schema: s.input_schema,
+        })
         .collect();
     AgentConfig {
         system: Some(default_system_prompt()),
         tools,
-        opts: CompleteOpts { model, ..CompleteOpts::default() },
-        before_tool_call: Some(build_before_tool_call_hook(Arc::clone(&connection), session_id.clone(), safety)),
-        after_tool_call: Some(build_after_tool_call_hook(Arc::clone(&connection), session_id.clone())),
-        on_compaction: Some(build_compaction_hook(Arc::clone(&connection), session_id.clone())),
+        opts: CompleteOpts {
+            model,
+            ..CompleteOpts::default()
+        },
+        before_tool_call: Some(build_before_tool_call_hook(
+            Arc::clone(&connection),
+            session_id.clone(),
+            safety,
+        )),
+        after_tool_call: Some(build_after_tool_call_hook(
+            Arc::clone(&connection),
+            session_id.clone(),
+        )),
+        on_compaction: Some(build_compaction_hook(
+            Arc::clone(&connection),
+            session_id.clone(),
+        )),
         on_stream_event: Some(build_stream_hook(connection, session_id)),
-        token_log: token_log.map(|path| TokenLogConfig { path, label: "acp".to_string() }),
+        token_log: token_log.map(|path| TokenLogConfig {
+            path,
+            label: "acp".to_string(),
+        }),
         compaction,
     }
 }
@@ -372,7 +430,11 @@ async fn run_prompt_turn(
 
     // Apply the picker's current model selection before the turn — a switch
     // made via session/set_config_option takes effect on the next prompt.
-    let model = handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let model = handle
+        .current_model
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
     agent_session.set_model(model.clone());
 
     let outcome = tokio::select! {
@@ -442,13 +504,18 @@ fn build_session_handle(
 /// view on `session/load`. User text → `UserMessageChunk`, assistant text →
 /// `AgentMessageChunk`, tool calls/results → the `ToolCall`/`ToolCallUpdate`
 /// lifecycle. `Thinking` blocks are dropped (not shown in the thread view).
-fn replay_history(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, history: &[crate::providers::Message]) {
+fn replay_history(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    history: &[crate::providers::Message],
+) {
     use crate::providers::{ContentBlock as CoreBlock, Role};
     for message in history {
         for block in &message.content {
             match block {
                 CoreBlock::Text(text) => {
-                    let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
+                    let chunk =
+                        ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
                     let update = match message.role {
                         Role::User => SessionUpdate::UserMessageChunk(chunk),
                         Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
@@ -462,13 +529,24 @@ fn replay_history(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId, hist
                         .raw_input(Some(input.clone()));
                     send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call));
                 }
-                CoreBlock::ToolResult { tool_use_id, content, is_error } => {
-                    let status = if *is_error { ToolCallStatus::Failed } else { ToolCallStatus::Completed };
+                CoreBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let status = if *is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    };
                     let update = ToolCallUpdate::new(
                         tool_use_id.clone(),
                         ToolCallUpdateFields::new()
                             .status(Some(status))
-                            .content(Some(vec![AcpContentBlock::Text(TextContent::new(content.clone())).into()])),
+                            .content(Some(vec![AcpContentBlock::Text(TextContent::new(
+                                content.clone(),
+                            ))
+                            .into()])),
                     );
                     send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
                 }
@@ -519,94 +597,31 @@ fn build_agent(
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .on_receive_request({
-            let state = Arc::clone(&state);
-            let workspace = workspace.clone();
-            let cfg = Arc::clone(&cfg);
-            let safety = Arc::clone(&safety);
-            let token_log = token_log.clone();
-            move |req: NewSessionRequest,
-                  responder: agent_client_protocol::Responder<NewSessionResponse>,
-                  cx: ConnectionTo<AcpClientRole>| {
+        .on_receive_request(
+            {
                 let state = Arc::clone(&state);
-                let workspace_fallback = workspace.clone();
+                let workspace = workspace.clone();
                 let cfg = Arc::clone(&cfg);
                 let safety = Arc::clone(&safety);
                 let token_log = token_log.clone();
-                async move {
-                    let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-                    // Use the client-provided project root, not the CLI's
-                    // own cwd — Zed passes the actual project it wants this
-                    // session to operate on.
-                    let session_workspace =
-                        if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
-                    let handle = match build_session_handle(
-                        &state,
-                        &cfg,
-                        safety,
-                        token_log,
-                        session_id.clone(),
-                        session_workspace,
-                        cx,
-                    ) {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            return responder.respond_with_error(
-                                agent_client_protocol::util::internal_error(format!("provider init: {e}")),
-                            );
-                        }
-                    };
-                    state.sessions.lock().await.insert(session_id.clone(), handle);
-
-                    // Advertise the model picker (vikunja #960); new sessions
-                    // start on the default model.
-                    let config_options = model_config_options(&state.models, &state.default_model);
-                    responder.respond(NewSessionResponse::new(session_id).config_options(Some(config_options)))
-                }
-            }
-        }, agent_client_protocol::on_receive_request!())
-        .on_receive_request({
-            // session/load (vikunja #961): Zed reopens a thread by calling
-            // this. We resolve the session in the same three states Zed's own
-            // native providers do (see agent/src/agent.rs open_thread):
-            //   1. still live in memory (window-switch)  → replay in-memory
-            //   2. not in memory but persisted on disk (process restarted) →
-            //      restore history from disk, then replay
-            //   3. neither  → error, exactly as native's load_thread does for
-            //      an id not in its store ("no thread found"). We do NOT
-            //      fabricate an empty "resumed" thread.
-            // Either way, replayed `session/update`s rebuild the thread; Zed
-            // registers it before this RPC returns so the notifications land.
-            let state = Arc::clone(&state);
-            let workspace = workspace.clone();
-            let cfg = Arc::clone(&cfg);
-            let safety = Arc::clone(&safety);
-            let token_log = token_log.clone();
-            move |req: LoadSessionRequest,
-                  responder: agent_client_protocol::Responder<LoadSessionResponse>,
-                  cx: ConnectionTo<AcpClientRole>| {
-                let state = Arc::clone(&state);
-                let workspace_fallback = workspace.clone();
-                let cfg = Arc::clone(&cfg);
-                let safety = Arc::clone(&safety);
-                let token_log = token_log.clone();
-                async move {
-                    let session_id = req.session_id.clone();
-                    let existing = state.sessions.lock().await.get(&session_id).cloned();
-                    let current_model = if let Some(handle) = existing {
-                        // 1. Live in memory: replay the in-memory history.
-                        let agent_session = handle.session.lock().await;
-                        replay_history(&cx, &session_id, agent_session.history());
-                        drop(agent_session);
-                        handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone()
-                    } else if let Some(record) =
-                        state.store.as_ref().and_then(|s| s.load(&session_id.to_string()))
-                    {
-                        // 2. Persisted on disk (process was restarted):
-                        // rebuild the session, seed its history + model, then
-                        // replay so Zed reconstructs the thread.
-                        let session_workspace =
-                            if req.cwd.as_os_str().is_empty() { workspace_fallback } else { req.cwd };
+                move |req: NewSessionRequest,
+                      responder: agent_client_protocol::Responder<NewSessionResponse>,
+                      cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    let workspace_fallback = workspace.clone();
+                    let cfg = Arc::clone(&cfg);
+                    let safety = Arc::clone(&safety);
+                    let token_log = token_log.clone();
+                    async move {
+                        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+                        // Use the client-provided project root, not the CLI's
+                        // own cwd — Zed passes the actual project it wants this
+                        // session to operate on.
+                        let session_workspace = if req.cwd.as_os_str().is_empty() {
+                            workspace_fallback
+                        } else {
+                            req.cwd
+                        };
                         let handle = match build_session_handle(
                             &state,
                             &cfg,
@@ -614,119 +629,253 @@ fn build_agent(
                             token_log,
                             session_id.clone(),
                             session_workspace,
-                            cx.clone(),
+                            cx,
                         ) {
                             Ok(handle) => handle,
                             Err(e) => {
                                 return responder.respond_with_error(
-                                    agent_client_protocol::util::internal_error(format!("provider init: {e}")),
+                                    agent_client_protocol::util::internal_error(format!(
+                                        "provider init: {e}"
+                                    )),
                                 );
                             }
                         };
-                        let model = record.model.clone();
-                        {
-                            let mut agent_session = handle.session.lock().await;
-                            agent_session.set_history(record.messages);
-                            agent_session.set_model(model.clone());
+                        state
+                            .sessions
+                            .lock()
+                            .await
+                            .insert(session_id.clone(), handle);
+
+                        // Advertise the model picker (vikunja #960); new sessions
+                        // start on the default model.
+                        let config_options =
+                            model_config_options(&state.models, &state.default_model);
+                        responder.respond(
+                            NewSessionResponse::new(session_id)
+                                .config_options(Some(config_options)),
+                        )
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                // session/load (vikunja #961): Zed reopens a thread by calling
+                // this. We resolve the session in the same three states Zed's own
+                // native providers do (see agent/src/agent.rs open_thread):
+                //   1. still live in memory (window-switch)  → replay in-memory
+                //   2. not in memory but persisted on disk (process restarted) →
+                //      restore history from disk, then replay
+                //   3. neither  → error, exactly as native's load_thread does for
+                //      an id not in its store ("no thread found"). We do NOT
+                //      fabricate an empty "resumed" thread.
+                // Either way, replayed `session/update`s rebuild the thread; Zed
+                // registers it before this RPC returns so the notifications land.
+                let state = Arc::clone(&state);
+                let workspace = workspace.clone();
+                let cfg = Arc::clone(&cfg);
+                let safety = Arc::clone(&safety);
+                let token_log = token_log.clone();
+                move |req: LoadSessionRequest,
+                      responder: agent_client_protocol::Responder<LoadSessionResponse>,
+                      cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    let workspace_fallback = workspace.clone();
+                    let cfg = Arc::clone(&cfg);
+                    let safety = Arc::clone(&safety);
+                    let token_log = token_log.clone();
+                    async move {
+                        let session_id = req.session_id.clone();
+                        let existing = state.sessions.lock().await.get(&session_id).cloned();
+                        let current_model = if let Some(handle) = existing {
+                            // 1. Live in memory: replay the in-memory history.
+                            let agent_session = handle.session.lock().await;
                             replay_history(&cx, &session_id, agent_session.history());
-                        }
-                        *handle.current_model.lock().unwrap_or_else(|p| p.into_inner()) = model.clone();
-                        state.sessions.lock().await.insert(session_id.clone(), handle);
-                        model
-                    } else {
-                        // 3. Unknown: not live, nothing persisted. Match
-                        // native providers — error rather than fake a resume.
-                        return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            format!("no session found with id '{session_id}'"),
-                        ));
-                    };
-                    // Echo the model picker (vikunja #960) with the session's
-                    // current model, as session/new does.
-                    let config_options = model_config_options(&state.models, &current_model);
-                    responder.respond(LoadSessionResponse::new().config_options(Some(config_options)))
-                }
-            }
-        }, agent_client_protocol::on_receive_request!())
-        .on_receive_request({
-            let state = Arc::clone(&state);
-            move |req: PromptRequest,
-                  responder: agent_client_protocol::Responder<PromptResponse>,
-                  cx: ConnectionTo<AcpClientRole>| {
-                let state = Arc::clone(&state);
-                async move {
-                    // Must use `cx.spawn`, not a bare `tokio::spawn`: requests
-                    // sent via `.block_task()` from within this task (e.g. the
-                    // permission request in `before_tool_call`) only get their
-                    // response routed correctly when the task is registered
-                    // with the connection this way (see `SentRequest::block_task`'s
-                    // docs — "use this when you're in a spawned task via
-                    // ConnectionTo::spawn").
-                    let spawn_cx = cx.clone();
-                    let _ = cx.spawn(async move {
-                        let session_id = req.session_id;
-                        let handle = state.sessions.lock().await.get(&session_id).cloned();
-                        let stop_reason = match handle {
-                            Some(handle) => {
-                                let text = prompt_text(req.prompt);
-                                run_prompt_turn(&handle, &spawn_cx, &session_id, text, state.store.as_ref()).await
+                            drop(agent_session);
+                            handle
+                                .current_model
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone()
+                        } else if let Some(record) = state
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.load(&session_id.to_string()))
+                        {
+                            // 2. Persisted on disk (process was restarted):
+                            // rebuild the session, seed its history + model, then
+                            // replay so Zed reconstructs the thread.
+                            let session_workspace = if req.cwd.as_os_str().is_empty() {
+                                workspace_fallback
+                            } else {
+                                req.cwd
+                            };
+                            let handle = match build_session_handle(
+                                &state,
+                                &cfg,
+                                safety,
+                                token_log,
+                                session_id.clone(),
+                                session_workspace,
+                                cx.clone(),
+                            ) {
+                                Ok(handle) => handle,
+                                Err(e) => {
+                                    return responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(format!(
+                                            "provider init: {e}"
+                                        )),
+                                    );
+                                }
+                            };
+                            let model = record.model.clone();
+                            {
+                                let mut agent_session = handle.session.lock().await;
+                                agent_session.set_history(record.messages);
+                                agent_session.set_model(model.clone());
+                                replay_history(&cx, &session_id, agent_session.history());
                             }
-                            None => AcpStopReason::Refusal,
+                            *handle
+                                .current_model
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) = model.clone();
+                            state
+                                .sessions
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), handle);
+                            model
+                        } else {
+                            // 3. Unknown: not live, nothing persisted. Match
+                            // native providers — error rather than fake a resume.
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(format!(
+                                    "no session found with id '{session_id}'"
+                                )),
+                            );
                         };
-                        let _ = responder.respond(PromptResponse::new(stop_reason));
-                        Ok(())
-                    });
-                    Ok(())
+                        // Echo the model picker (vikunja #960) with the session's
+                        // current model, as session/new does.
+                        let config_options = model_config_options(&state.models, &current_model);
+                        responder.respond(
+                            LoadSessionResponse::new().config_options(Some(config_options)),
+                        )
+                    }
                 }
-            }
-        }, agent_client_protocol::on_receive_request!())
-        .on_receive_request({
-            // Model picker (vikunja #960): the user picked a model in Zed's
-            // dropdown. Update this session's current-model cell (cheap, no
-            // dispatch-loop stall, no wait on an in-flight prompt's session
-            // lock); it's applied to the session on the next prompt turn.
-            let state = Arc::clone(&state);
-            move |req: SetSessionConfigOptionRequest,
-                  responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
-                  _cx: ConnectionTo<AcpClientRole>| {
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
                 let state = Arc::clone(&state);
-                async move {
-                    let handle = state.sessions.lock().await.get(&req.session_id).cloned();
-                    // Current value defaults to the session's start model if
-                    // the session is unknown (shouldn't happen from a real
-                    // client, but keep the echo sensible).
-                    let mut current = state.default_model.clone();
-                    if let Some(handle) = handle {
-                        if req.config_id.to_string() == MODEL_CONFIG_ID {
-                            if let Some(value) = req.value.as_value_id() {
-                                let picked = value.to_string();
-                                // Only honor a value we actually advertised.
-                                if state.models.iter().any(|m| m == &picked) {
-                                    *handle.current_model.lock().unwrap_or_else(|p| p.into_inner()) = picked;
+                move |req: PromptRequest,
+                      responder: agent_client_protocol::Responder<PromptResponse>,
+                      cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        // Must use `cx.spawn`, not a bare `tokio::spawn`: requests
+                        // sent via `.block_task()` from within this task (e.g. the
+                        // permission request in `before_tool_call`) only get their
+                        // response routed correctly when the task is registered
+                        // with the connection this way (see `SentRequest::block_task`'s
+                        // docs — "use this when you're in a spawned task via
+                        // ConnectionTo::spawn").
+                        let spawn_cx = cx.clone();
+                        let _ = cx.spawn(async move {
+                            let session_id = req.session_id;
+                            let handle = state.sessions.lock().await.get(&session_id).cloned();
+                            let stop_reason = match handle {
+                                Some(handle) => {
+                                    let text = prompt_text(req.prompt);
+                                    run_prompt_turn(
+                                        &handle,
+                                        &spawn_cx,
+                                        &session_id,
+                                        text,
+                                        state.store.as_ref(),
+                                    )
+                                    .await
+                                }
+                                None => AcpStopReason::Refusal,
+                            };
+                            let _ = responder.respond(PromptResponse::new(stop_reason));
+                            Ok(())
+                        });
+                        Ok(())
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                // Model picker (vikunja #960): the user picked a model in Zed's
+                // dropdown. Update this session's current-model cell (cheap, no
+                // dispatch-loop stall, no wait on an in-flight prompt's session
+                // lock); it's applied to the session on the next prompt turn.
+                let state = Arc::clone(&state);
+                move |req: SetSessionConfigOptionRequest,
+                      responder: agent_client_protocol::Responder<
+                    SetSessionConfigOptionResponse,
+                >,
+                      _cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let handle = state.sessions.lock().await.get(&req.session_id).cloned();
+                        // Current value defaults to the session's start model if
+                        // the session is unknown (shouldn't happen from a real
+                        // client, but keep the echo sensible).
+                        let mut current = state.default_model.clone();
+                        if let Some(handle) = handle {
+                            if req.config_id.to_string() == MODEL_CONFIG_ID {
+                                if let Some(value) = req.value.as_value_id() {
+                                    let picked = value.to_string();
+                                    // Only honor a value we actually advertised.
+                                    if state.models.iter().any(|m| m == &picked) {
+                                        *handle
+                                            .current_model
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner()) = picked;
+                                    }
                                 }
                             }
+                            current = handle
+                                .current_model
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
                         }
-                        current = handle.current_model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let options = model_config_options(&state.models, &current);
+                        responder.respond(SetSessionConfigOptionResponse::new(options))
                     }
-                    let options = model_config_options(&state.models, &current);
-                    responder.respond(SetSessionConfigOptionResponse::new(options))
                 }
-            }
-        }, agent_client_protocol::on_receive_request!())
-        .on_receive_notification({
-            let state = Arc::clone(&state);
-            move |notif: CancelNotification, _cx| {
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
                 let state = Arc::clone(&state);
-                async move {
-                    let handle = state.sessions.lock().await.get(&notif.session_id).cloned();
-                    if let Some(handle) = handle {
-                        if let Some(notify) = handle.cancel.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                            notify.notify_one();
+                move |notif: CancelNotification, _cx| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let handle = state.sessions.lock().await.get(&notif.session_id).cloned();
+                        if let Some(handle) = handle {
+                            if let Some(notify) = handle
+                                .cancel
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .as_ref()
+                            {
+                                notify.notify_one();
+                            }
                         }
+                        Ok(())
                     }
-                    Ok(())
                 }
-            }
-        }, agent_client_protocol::on_receive_notification!())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<AcpClientRole>| {
                 // `Dispatch::Response` here is a legitimate correlated
@@ -736,7 +885,10 @@ fn build_agent(
                 // waiting `SentRequest`. Only genuinely unhandled incoming
                 // requests/notifications should be rejected.
                 if matches!(message, Dispatch::Response(..)) {
-                    return Ok(agent_client_protocol::Handled::No { message, retry: false });
+                    return Ok(agent_client_protocol::Handled::No {
+                        message,
+                        retry: false,
+                    });
                 }
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled ACP method"),
@@ -798,7 +950,9 @@ mod tests {
 
     impl MockProvider {
         fn new(responses: Vec<crate::providers::LlmResponse>) -> Self {
-            MockProvider { responses: StdMutex::new(VecDeque::from(responses)) }
+            MockProvider {
+                responses: StdMutex::new(VecDeque::from(responses)),
+            }
         }
     }
 
@@ -848,11 +1002,19 @@ mod tests {
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
             context_overflow: false,
-            usage: Usage { input: 10, output: 5, ..Usage::default() },
+            usage: Usage {
+                input: 10,
+                output: 5,
+                ..Usage::default()
+            },
         }
     }
 
-    fn tool_call_resp(id: &str, name: &str, input: serde_json::Value) -> crate::providers::LlmResponse {
+    fn tool_call_resp(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> crate::providers::LlmResponse {
         crate::providers::LlmResponse {
             content: vec![crate::providers::ContentBlock::ToolCall {
                 id: id.to_string(),
@@ -944,11 +1106,15 @@ mod tests {
 
         let updates = updates.lock().unwrap();
         assert!(
-            updates.iter().any(|u| matches!(u, SessionUpdate::AgentMessageChunk(_))),
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::AgentMessageChunk(_))),
             "expected an AgentMessageChunk update, got: {updates:?}"
         );
         assert!(
-            updates.iter().any(|u| matches!(u, SessionUpdate::UsageUpdate(_))),
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::UsageUpdate(_))),
             "expected a UsageUpdate, got: {updates:?}"
         );
     }
@@ -990,7 +1156,10 @@ mod tests {
                     .send_request(NewSessionRequest::new(dir.path()))
                     .block_task()
                     .await?;
-                assert_ne!(s1.session_id, s2.session_id, "sessions must have distinct ids");
+                assert_ne!(
+                    s1.session_id, s2.session_id,
+                    "sessions must have distinct ids"
+                );
 
                 // Both sessions can prompt.
                 let a = connection
@@ -1057,9 +1226,14 @@ mod tests {
 
                 // SlowProvider sleeps 30s; if cancellation didn't actually
                 // short-circuit the in-flight prompt, this timeout fires.
-                let prompt_response = tokio::time::timeout(std::time::Duration::from_secs(5), prompt_fut)
-                    .await
-                    .expect("prompt should resolve quickly once cancelled, not wait for the slow provider")?;
+                let prompt_response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    prompt_fut,
+                )
+                .await
+                .expect(
+                    "prompt should resolve quickly once cancelled, not wait for the slow provider",
+                )?;
 
                 Ok(prompt_response.stop_reason)
             })
@@ -1324,7 +1498,10 @@ mod tests {
                 .is_some_and(|c| format!("{c:?}").contains("found me")),
             _ => false,
         });
-        assert!(completed_with_marker, "tool should have read marker.txt from the session's cwd: {updates:?}");
+        assert!(
+            completed_with_marker,
+            "tool should have read marker.txt from the session's cwd: {updates:?}"
+        );
     }
 
     // --- model picker (vikunja #960) ---
@@ -1347,16 +1524,16 @@ mod tests {
     }
 
     /// Pull the single model `SessionConfigOption` out of a config_options list.
-    fn model_option(
-        options: &[SessionConfigOption],
-    ) -> &SessionConfigOption {
+    fn model_option(options: &[SessionConfigOption]) -> &SessionConfigOption {
         options
             .iter()
             .find(|o| o.id.to_string() == MODEL_CONFIG_ID)
             .expect("a 'model' config option should be advertised")
     }
 
-    fn select_state(option: &SessionConfigOption) -> &agent_client_protocol::schema::v1::SessionConfigSelect {
+    fn select_state(
+        option: &SessionConfigOption,
+    ) -> &agent_client_protocol::schema::v1::SessionConfigSelect {
         match &option.kind {
             agent_client_protocol::schema::v1::SessionConfigKind::Select(s) => s,
             _ => panic!("model option should be a Select"),
@@ -1367,7 +1544,11 @@ mod tests {
     async fn acp_session_new_advertises_model_config_options() {
         let dir = tempfile::tempdir().unwrap();
         let make_provider = mock_factory(vec![]);
-        let models = vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()];
+        let models = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
         let agent = build_agent(
             make_provider,
             dir.path(),
@@ -1416,7 +1597,11 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let make_provider: ProviderFactory = {
             let seen = Arc::clone(&seen);
-            Arc::new(move || Ok(Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) })))
+            Arc::new(move || {
+                Ok(Box::new(ModelCaptureProvider {
+                    seen: Arc::clone(&seen),
+                }))
+            })
         };
         let models = vec!["model-a".to_string(), "model-b".to_string()];
         let agent = build_agent(
@@ -1449,7 +1634,9 @@ mod tests {
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
                         MODEL_CONFIG_ID,
-                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id("model-b"),
+                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id(
+                            "model-b",
+                        ),
                     ))
                     .block_task()
                     .await?;
@@ -1463,13 +1650,22 @@ mod tests {
                     .block_task()
                     .await?;
 
-                Ok(select_state(model_option(&set_resp.config_options)).current_value.to_string())
+                Ok(select_state(model_option(&set_resp.config_options))
+                    .current_value
+                    .to_string())
             })
             .await
             .unwrap();
 
-        assert_eq!(echoed_current, "model-b", "set_config_option response must echo the new selection");
-        assert_eq!(*seen.lock().unwrap(), vec!["model-b".to_string()], "the prompt turn must use the picked model");
+        assert_eq!(
+            echoed_current, "model-b",
+            "set_config_option response must echo the new selection"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["model-b".to_string()],
+            "the prompt turn must use the picked model"
+        );
     }
 
     #[tokio::test]
@@ -1478,7 +1674,11 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let make_provider: ProviderFactory = {
             let seen = Arc::clone(&seen);
-            Arc::new(move || Ok(Box::new(ModelCaptureProvider { seen: Arc::clone(&seen) })))
+            Arc::new(move || {
+                Ok(Box::new(ModelCaptureProvider {
+                    seen: Arc::clone(&seen),
+                }))
+            })
         };
         let models = vec!["model-a".to_string(), "model-b".to_string()];
         let agent = build_agent(
@@ -1496,23 +1696,35 @@ mod tests {
         let echoed_current = AcpClientRole
             .builder()
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-                let new_session =
-                    connection.send_request(NewSessionRequest::new(dir.path())).block_task().await?;
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
                 let set_resp = connection
                     .send_request(SetSessionConfigOptionRequest::new(
                         new_session.session_id,
                         MODEL_CONFIG_ID,
-                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id("model-evil"),
+                        agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id(
+                            "model-evil",
+                        ),
                     ))
                     .block_task()
                     .await?;
-                Ok(select_state(model_option(&set_resp.config_options)).current_value.to_string())
+                Ok(select_state(model_option(&set_resp.config_options))
+                    .current_value
+                    .to_string())
             })
             .await
             .unwrap();
 
-        assert_eq!(echoed_current, "model-a", "an unadvertised model must be ignored, current unchanged");
+        assert_eq!(
+            echoed_current, "model-a",
+            "an unadvertised model must be ignored, current unchanged"
+        );
     }
 
     // --- session/load (vikunja #961) ---
@@ -1546,7 +1758,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(load_session, "agent must advertise load_session so Zed reopens threads");
+        assert!(
+            load_session,
+            "agent must advertise load_session so Zed reopens threads"
+        );
     }
 
     #[tokio::test]
@@ -1584,9 +1799,14 @@ mod tests {
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-                let new_session =
-                    connection.send_request(NewSessionRequest::new(dir.path())).block_task().await?;
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
                 let session_id = new_session.session_id;
                 connection
                     .send_request(PromptRequest::new(
@@ -1606,7 +1826,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(config_options.is_some(), "session/load must echo the model-picker config_options");
+        assert!(
+            config_options.is_some(),
+            "session/load must echo the model-picker config_options"
+        );
 
         let updates = updates.lock().unwrap();
         let replayed = &updates[replay_start..];
@@ -1664,7 +1887,10 @@ mod tests {
         let load_errored = AcpClientRole
             .builder()
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
                 // An id that was never created via session/new. Return the raw
                 // result — we expect an error, so we must not `?` it away.
                 let made_up = SessionId::new("never-created-session-id");
@@ -1677,7 +1903,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(load_errored, "session/load of an unknown id with no persistence must error");
+        assert!(
+            load_errored,
+            "session/load of an unknown id with no persistence must error"
+        );
     }
 
     #[tokio::test]
@@ -1704,20 +1933,28 @@ mod tests {
         let ws1 = dir.path().to_path_buf();
         let session_id = AcpClientRole
             .builder()
-            .connect_with(agent1, |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-                let new_session =
-                    connection.send_request(NewSessionRequest::new(ws1)).block_task().await?;
-                let session_id = new_session.session_id;
-                connection
-                    .send_request(PromptRequest::new(
-                        session_id.clone(),
-                        vec![AcpContentBlock::Text(TextContent::new("persist-me"))],
-                    ))
-                    .block_task()
-                    .await?;
-                Ok(session_id)
-            })
+            .connect_with(
+                agent1,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(ws1))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+                    connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![AcpContentBlock::Text(TextContent::new("persist-me"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    Ok(session_id)
+                },
+            )
             .await
             .unwrap();
 
@@ -1749,14 +1986,20 @@ mod tests {
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
-            .connect_with(agent2, |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-                let result = connection
-                    .send_request(LoadSessionRequest::new(session_id, ws2))
-                    .block_task()
-                    .await;
-                Ok(result.is_ok())
-            })
+            .connect_with(
+                agent2,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let result = connection
+                        .send_request(LoadSessionRequest::new(session_id, ws2))
+                        .block_task()
+                        .await;
+                    Ok(result.is_ok())
+                },
+            )
             .await
             .unwrap();
 
@@ -1820,7 +2063,10 @@ mod tests {
     #[test]
     fn context_window_size_claude_models() {
         assert_eq!(context_window_size_for("claude-haiku-4-5"), 200_000);
-        assert_eq!(context_window_size_for("anthropic/claude-opus-4-8"), 200_000);
+        assert_eq!(
+            context_window_size_for("anthropic/claude-opus-4-8"),
+            200_000
+        );
     }
 
     #[test]
@@ -1838,7 +2084,10 @@ mod tests {
     #[test]
     fn map_stop_reason_aborted_is_cancelled() {
         use crate::providers::StopReason;
-        assert_eq!(map_stop_reason(StopReason::Aborted), AcpStopReason::Cancelled);
+        assert_eq!(
+            map_stop_reason(StopReason::Aborted),
+            AcpStopReason::Cancelled
+        );
     }
 
     #[test]
@@ -1850,7 +2099,10 @@ mod tests {
     #[test]
     fn map_stop_reason_max_tokens() {
         use crate::providers::StopReason;
-        assert_eq!(map_stop_reason(StopReason::MaxTokens), AcpStopReason::MaxTokens);
+        assert_eq!(
+            map_stop_reason(StopReason::MaxTokens),
+            AcpStopReason::MaxTokens
+        );
     }
 
     // --- prompt_text ---

@@ -253,19 +253,19 @@ fn normalize_string_literals(code: &str) -> String {
 
             // Triple-quoted string: copy verbatim until matching closing triple.
             if i + 2 < n && chars[i + 1] == q && chars[i + 2] == q {
-                out.push(q); out.push(q); out.push(q);
+                out.push(q);
+                out.push(q);
+                out.push(q);
                 i += 3;
                 while i < n {
                     if chars[i] == '\\' && i + 1 < n {
                         out.push(chars[i]);
                         out.push(chars[i + 1]);
                         i += 2;
-                    } else if chars[i] == q
-                        && i + 2 < n
-                        && chars[i + 1] == q
-                        && chars[i + 2] == q
-                    {
-                        out.push(q); out.push(q); out.push(q);
+                    } else if chars[i] == q && i + 2 < n && chars[i + 1] == q && chars[i + 2] == q {
+                        out.push(q);
+                        out.push(q);
+                        out.push(q);
                         i += 3;
                         break;
                     } else {
@@ -282,16 +282,23 @@ fn normalize_string_literals(code: &str) -> String {
             let mut has_newline = false;
 
             'outer: loop {
-                if i >= n { break; }
+                if i >= n {
+                    break;
+                }
                 match chars[i] {
-                    c if c == q => { i += 1; break; }
+                    c if c == q => {
+                        i += 1;
+                        break;
+                    }
                     '\n' => {
                         has_newline = true;
                         content.push('\n');
                         i += 1;
                         // Collect remaining content until closing quote.
                         loop {
-                            if i >= n { break 'outer; }
+                            if i >= n {
+                                break 'outer;
+                            }
                             if chars[i] == '\\' && i + 1 < n {
                                 content.push('\\');
                                 content.push(chars[i + 1]);
@@ -310,7 +317,10 @@ fn normalize_string_literals(code: &str) -> String {
                         content.push(chars[i + 1]);
                         i += 2;
                     }
-                    c => { content.push(c); i += 1; }
+                    c => {
+                        content.push(c);
+                        i += 1;
+                    }
                 }
             }
 
@@ -320,12 +330,18 @@ fn normalize_string_literals(code: &str) -> String {
                 // triple-quote delimiters is impossible for valid inputs:
                 // an unescaped `"` inside `"..."` always closes the string,
                 // so `"""` can never appear in the extracted content.
-                out.push(q); out.push(q); out.push(q);
+                out.push(q);
+                out.push(q);
+                out.push(q);
                 out.push_str(&content_str);
-                out.push(q); out.push(q); out.push(q);
+                out.push(q);
+                out.push(q);
+                out.push(q);
             } else {
                 out.push(q);
-                for c in &content { out.push(*c); }
+                for c in &content {
+                    out.push(*c);
+                }
                 out.push(q);
             }
             continue;
@@ -1578,21 +1594,31 @@ result = {"lines": lines, "status": "ok"}
         let input = "write_file(\"f.txt\", \"line1\nline2\")";
         let output = normalize_string_literals(input);
         // Should be parseable by Starlark now
-        assert!(output.contains("\"\"\""), "must use triple-quotes: {output}");
-        assert!(output.contains("line1\nline2"), "content preserved: {output}");
+        assert!(
+            output.contains("\"\"\""),
+            "must use triple-quotes: {output}"
+        );
+        assert!(
+            output.contains("line1\nline2"),
+            "content preserved: {output}"
+        );
         // Verify it actually parses
-        AstModule::parse("test", output, &Dialect::Standard)
-            .expect("normalized code must parse");
+        AstModule::parse("test", output, &Dialect::Standard).expect("normalized code must parse");
     }
 
     #[test]
     fn normalize_single_quoted_multiline_becomes_triple() {
         let input = "write_file('f.txt', 'line1\nline2')";
         let output = normalize_string_literals(input);
-        assert!(output.contains("'''"), "must use single triple-quotes: {output}");
-        assert!(output.contains("line1\nline2"), "content preserved: {output}");
-        AstModule::parse("test", output, &Dialect::Standard)
-            .expect("normalized code must parse");
+        assert!(
+            output.contains("'''"),
+            "must use single triple-quotes: {output}"
+        );
+        assert!(
+            output.contains("line1\nline2"),
+            "content preserved: {output}"
+        );
+        AstModule::parse("test", output, &Dialect::Standard).expect("normalized code must parse");
     }
 
     #[test]
@@ -1600,7 +1626,10 @@ result = {"lines": lines, "status": "ok"}
         let input = "x = 1\nwrite_file(\"a\", \"b\nc\")\nresult = x";
         let output = normalize_string_literals(input);
         assert!(output.starts_with("x = 1\n"), "prefix preserved: {output}");
-        assert!(output.ends_with("\nresult = x"), "suffix preserved: {output}");
+        assert!(
+            output.ends_with("\nresult = x"),
+            "suffix preserved: {output}"
+        );
     }
 
     #[test]
@@ -1631,8 +1660,14 @@ result = {"lines": lines, "status": "ok"}
 
         // Verify the file was actually written with newlines preserved.
         let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
-        assert!(content.contains("use serde::Serialize;\n"), "newline must be a real newline");
-        assert!(content.contains("use async_trait::async_trait;"), "second line preserved");
+        assert!(
+            content.contains("use serde::Serialize;\n"),
+            "newline must be a real newline"
+        );
+        assert!(
+            content.contains("use async_trait::async_trait;"),
+            "second line preserved"
+        );
     }
 
     #[tokio::test]

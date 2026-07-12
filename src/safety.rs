@@ -10,7 +10,13 @@ use crate::agent::{BeforeHook, BeforeHookResult, ToolCallInfo};
 /// Tools that mutate the filesystem, run processes, or talk to external services.
 /// In `Interactive` mode only these require approval; in `Paranoid` mode all tools do.
 const DESTRUCTIVE_TOOLS: &[&str] = &[
-    "exec", "write_file", "edit_file", "git", "docker", "cargo", "gh",
+    "exec",
+    "write_file",
+    "edit_file",
+    "git",
+    "docker",
+    "cargo",
+    "gh",
 ];
 
 /// Whether `name` is in the destructive-tools list (exec, write_file, etc.) —
@@ -100,10 +106,14 @@ impl SafetyPolicy {
     /// they ask) and applying the operator's decision themselves.
     pub fn gate(&self, name: &str) -> Gate {
         if self.denied_commands.iter().any(|d| d == name) {
-            return Gate::Block(format!("blocked by policy: '{name}' is in the denied-commands list"));
+            return Gate::Block(format!(
+                "blocked by policy: '{name}' is in the denied-commands list"
+            ));
         }
         if !self.allowed_commands.is_empty() && !self.allowed_commands.iter().any(|a| a == name) {
-            return Gate::Block(format!("blocked by policy: '{name}' is not in the allowed-commands list"));
+            return Gate::Block(format!(
+                "blocked by policy: '{name}' is not in the allowed-commands list"
+            ));
         }
         let needs_approval = match self.approval_mode {
             ApprovalMode::Auto => false,
@@ -113,7 +123,12 @@ impl SafetyPolicy {
         if !needs_approval {
             return Gate::Allow;
         }
-        if self.auto_approve.lock().unwrap_or_else(|p| p.into_inner()).contains(name) {
+        if self
+            .auto_approve
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(name)
+        {
             return Gate::Allow;
         }
         Gate::NeedsApproval
@@ -123,7 +138,10 @@ impl SafetyPolicy {
     /// in-session auto-approve set and persists it to `approvals_path` if
     /// configured. Shared by every approval surface.
     pub fn remember_always(&self, name: &str) {
-        self.auto_approve.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string());
+        self.auto_approve
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.to_string());
         if let Some(path) = &self.approvals_path {
             persist_approval(path, name);
         }
@@ -222,15 +240,26 @@ mod tests {
     use serde_json::json;
 
     fn info(name: &str) -> ToolCallInfo {
-        ToolCallInfo { id: "t1".into(), name: name.into(), input: json!({}) }
+        ToolCallInfo {
+            id: "t1".into(),
+            name: name.into(),
+            input: json!({}),
+        }
     }
 
     fn info_with(name: &str, input: Value) -> ToolCallInfo {
-        ToolCallInfo { id: "t1".into(), name: name.into(), input }
+        ToolCallInfo {
+            id: "t1".into(),
+            name: name.into(),
+            input,
+        }
     }
 
     async fn allow(policy: SafetyPolicy, name: &str) -> bool {
-        matches!(policy.into_before_hook()(&info(name)).await, BeforeHookResult::Allow)
+        matches!(
+            policy.into_before_hook()(&info(name)).await,
+            BeforeHookResult::Allow
+        )
     }
 
     async fn block_reason(policy: SafetyPolicy, name: &str) -> String {
@@ -244,7 +273,15 @@ mod tests {
 
     #[test]
     fn destructive_tools_are_flagged() {
-        for name in ["exec", "write_file", "edit_file", "git", "docker", "cargo", "gh"] {
+        for name in [
+            "exec",
+            "write_file",
+            "edit_file",
+            "git",
+            "docker",
+            "cargo",
+            "gh",
+        ] {
             assert!(is_destructive_tool(name), "{name} should be destructive");
         }
     }
@@ -252,7 +289,10 @@ mod tests {
     #[test]
     fn safe_tools_are_not_flagged() {
         for name in ["read_file", "search", "ls"] {
-            assert!(!is_destructive_tool(name), "{name} should not be destructive");
+            assert!(
+                !is_destructive_tool(name),
+                "{name} should not be destructive"
+            );
         }
     }
 
@@ -260,37 +300,55 @@ mod tests {
 
     #[test]
     fn gate_blocks_denied_tool_without_asking() {
-        let policy = SafetyPolicy { denied_commands: vec!["exec".into()], ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            denied_commands: vec!["exec".into()],
+            ..SafetyPolicy::default()
+        };
         assert!(matches!(policy.gate("exec"), Gate::Block(r) if r.contains("denied-commands")));
     }
 
     #[test]
     fn gate_blocks_tool_not_in_allowlist() {
-        let policy = SafetyPolicy { allowed_commands: vec!["read_file".into()], ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            allowed_commands: vec!["read_file".into()],
+            ..SafetyPolicy::default()
+        };
         assert!(matches!(policy.gate("exec"), Gate::Block(r) if r.contains("allowed-commands")));
     }
 
     #[test]
     fn gate_allows_non_destructive_tool_in_interactive_mode() {
-        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            ..SafetyPolicy::default()
+        };
         assert_eq!(policy.gate("read_file"), Gate::Allow);
     }
 
     #[test]
     fn gate_needs_approval_for_destructive_tool_in_interactive_mode() {
-        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            ..SafetyPolicy::default()
+        };
         assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
     }
 
     #[test]
     fn gate_auto_mode_never_needs_approval() {
-        let policy = SafetyPolicy { approval_mode: ApprovalMode::Auto, ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Auto,
+            ..SafetyPolicy::default()
+        };
         assert_eq!(policy.gate("exec"), Gate::Allow);
     }
 
     #[test]
     fn gate_respects_previously_remembered_always() {
-        let policy = SafetyPolicy { approval_mode: ApprovalMode::Interactive, ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            ..SafetyPolicy::default()
+        };
         assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
         policy.remember_always("exec");
         assert_eq!(policy.gate("exec"), Gate::Allow);
@@ -300,7 +358,10 @@ mod tests {
     fn remember_always_persists_to_approvals_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-approvals");
-        let policy = SafetyPolicy { approvals_path: Some(path.clone()), ..SafetyPolicy::default() };
+        let policy = SafetyPolicy {
+            approvals_path: Some(path.clone()),
+            ..SafetyPolicy::default()
+        };
         policy.remember_always("write_file");
         assert!(load_approvals(&path).contains("write_file"));
     }
@@ -501,12 +562,21 @@ mod tests {
             ..SafetyPolicy::default()
         };
         let hook = policy.into_before_hook();
-        assert!(matches!(hook(&info("write_file")).await, BeforeHookResult::Allow));
+        assert!(matches!(
+            hook(&info("write_file")).await,
+            BeforeHookResult::Allow
+        ));
         // Second call: auto-approved now, prompt must NOT fire again.
-        assert!(matches!(hook(&info("write_file")).await, BeforeHookResult::Allow));
+        assert!(matches!(
+            hook(&info("write_file")).await,
+            BeforeHookResult::Allow
+        ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(auto.lock().unwrap().contains("write_file"));
-        assert!(load_approvals(&path).contains("write_file"), "must persist to file");
+        assert!(
+            load_approvals(&path).contains("write_file"),
+            "must persist to file"
+        );
     }
 
     #[tokio::test]
@@ -523,7 +593,10 @@ mod tests {
             ..SafetyPolicy::default()
         };
         assert!(allow(policy, "exec").await);
-        assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "prompt must be skipped");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "prompt must be skipped"
+        );
     }
 
     #[tokio::test]

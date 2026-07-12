@@ -25,7 +25,10 @@ pub fn run(
             let hash = str_arg(args, "hash")?;
             let intent = Intent {
                 purpose: str_arg(args, "purpose")?.to_string(),
-                rationale: args.get("rationale").and_then(|v| v.as_str()).map(String::from),
+                rationale: args
+                    .get("rationale")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 open_questions: str_array(args, "open_questions"),
             };
             if !store.set_intent(hash, &intent)? {
@@ -54,8 +57,9 @@ pub fn run(
         "declare_edge" => {
             let from = str_arg(args, "from")?;
             let to = str_arg(args, "to")?;
-            let kind = EdgeKind::from_wire(str_arg(args, "kind")?)
-                .ok_or_else(|| anyhow!("kgl_assert: invalid edge kind (calls|depends_on|reads|mutates)"))?;
+            let kind = EdgeKind::from_wire(str_arg(args, "kind")?).ok_or_else(|| {
+                anyhow!("kgl_assert: invalid edge kind (calls|depends_on|reads|mutates)")
+            })?;
             // Verify the source node exists (mirrors intent/provenance), so a
             // typo'd `from` hash can't create an orphan edge that later reads as
             // a real relation. `to` is intentionally NOT checked: it may be a
@@ -79,7 +83,11 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 fn str_array(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -99,7 +107,9 @@ mod tests {
         )
         .unwrap();
         let mut store = KglStore::open(&tmp.path().join(".kgl").join("kgl.db")).unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r1")
+            .unwrap();
         tmp
     }
 
@@ -131,7 +141,10 @@ mod tests {
         assert_eq!(out["updated"], json!(true));
 
         let store = KglStore::open_workspace(ws).unwrap();
-        assert_eq!(store.node(&foo).unwrap().unwrap().intent.unwrap().purpose, "does foo");
+        assert_eq!(
+            store.node(&foo).unwrap().unwrap().intent.unwrap().purpose,
+            "does foo"
+        );
     }
 
     #[test]
@@ -148,7 +161,9 @@ mod tests {
         )
         .unwrap();
         let store = KglStore::open_workspace(ws).unwrap();
-        let edges = store.neighbors(&foo, Some(EdgeKind::Mutates), Direction::Out).unwrap();
+        let edges = store
+            .neighbors(&foo, Some(EdgeKind::Mutates), Direction::Out)
+            .unwrap();
         assert!(edges.iter().any(|e| e.to == "file:///x"));
     }
 

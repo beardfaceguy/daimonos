@@ -173,7 +173,10 @@ fn build_watcher(
             );
             break;
         }
-        if watcher.watch(entry.path(), RecursiveMode::NonRecursive).is_ok() {
+        if watcher
+            .watch(entry.path(), RecursiveMode::NonRecursive)
+            .is_ok()
+        {
             watched += 1;
         }
     }
@@ -285,7 +288,7 @@ mod tests {
         // our own .kgl/ writes must not count (else the rebuild self-triggers)
         assert!(!relevant_event(&[PathBuf::from("/ws/.kgl/kgl.db")]));
         assert!(!relevant_event(&[])); // pathless events ignored
-        // real source changes are relevant, even if mixed with a .kgl write
+                                       // real source changes are relevant, even if mixed with a .kgl write
         assert!(relevant_event(&[PathBuf::from("/ws/src/a.rs")]));
         assert!(relevant_event(&[
             PathBuf::from("/ws/.kgl/kgl.db"),
@@ -300,8 +303,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         let dirty = Arc::new(AtomicBool::new(false));
-        let _w = build_watcher(tmp.path(), dirty.clone(), &KglConfig::default())
-            .expect("watcher built");
+        let _w =
+            build_watcher(tmp.path(), dirty.clone(), &KglConfig::default()).expect("watcher built");
         std::thread::sleep(Duration::from_millis(300)); // let the watch arm
         std::fs::write(tmp.path().join("src").join("f.txt"), b"x").unwrap();
         let mut flipped = false;

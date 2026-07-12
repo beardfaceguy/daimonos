@@ -464,7 +464,9 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
             if !filtered.err.is_empty() {
                 resp["err"] = json!(cap_output(&filtered.err, max));
             }
-            return Response::ok(resp).filter_applied().with_unfiltered_chars(raw_chars);
+            return Response::ok(resp)
+                .filter_applied()
+                .with_unfiltered_chars(raw_chars);
         }
     }
 

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role,
-    StopReason, StreamEvent, ThinkingLevel, Usage,
+    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
+    StreamEvent, ThinkingLevel, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -57,7 +57,9 @@ struct CacheControl {
 
 impl CacheControl {
     fn ephemeral() -> Self {
-        CacheControl { kind: "ephemeral".to_string() }
+        CacheControl {
+            kind: "ephemeral".to_string(),
+        }
     }
 }
 
@@ -158,12 +160,27 @@ struct Pricing {
 
 fn pricing_for(model: &str) -> Pricing {
     if model.starts_with("claude-haiku-4") {
-        Pricing { input: 1.0, output: 5.0, cache_read: 0.1, cache_write: 1.25 }
+        Pricing {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.1,
+            cache_write: 1.25,
+        }
     } else if model.starts_with("claude-sonnet-4") {
-        Pricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }
+        Pricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        }
     } else {
         // Opus 4.x and Fable 5
-        Pricing { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 }
+        Pricing {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+        }
     }
 }
 
@@ -223,12 +240,25 @@ fn supports_adaptive_thinking(model: &str) -> bool {
 
 fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>) -> AnthropicBlock {
     match block {
-        ContentBlock::Text(t) => AnthropicBlock::Text { text: t.clone(), cache_control: cache },
-        ContentBlock::Thinking(t) => AnthropicBlock::Thinking { thinking: t.clone(), cache_control: cache },
-        ContentBlock::ToolCall { id, name, input } => AnthropicBlock::ToolUse {
-            id: id.clone(), name: name.clone(), input: input.clone(), cache_control: cache,
+        ContentBlock::Text(t) => AnthropicBlock::Text {
+            text: t.clone(),
+            cache_control: cache,
         },
-        ContentBlock::ToolResult { tool_use_id, content, is_error } => AnthropicBlock::ToolResult {
+        ContentBlock::Thinking(t) => AnthropicBlock::Thinking {
+            thinking: t.clone(),
+            cache_control: cache,
+        },
+        ContentBlock::ToolCall { id, name, input } => AnthropicBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+            cache_control: cache,
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => AnthropicBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: if *is_error { Some(true) } else { None },
@@ -239,35 +269,55 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
 
 fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMessage {
     let last = msg.content.len().saturating_sub(1);
-    let blocks = msg.content.iter().enumerate().map(|(i, block)| {
-        let cache = if is_prefix_boundary && i == last {
-            Some(CacheControl::ephemeral())
-        } else {
-            None
-        };
-        content_block_to_anthropic(block, cache)
-    }).collect();
+    let blocks = msg
+        .content
+        .iter()
+        .enumerate()
+        .map(|(i, block)| {
+            let cache = if is_prefix_boundary && i == last {
+                Some(CacheControl::ephemeral())
+            } else {
+                None
+            };
+            content_block_to_anthropic(block, cache)
+        })
+        .collect();
     AnthropicMessage {
-        role: match msg.role { Role::User => "user".to_string(), Role::Assistant => "assistant".to_string() },
+        role: match msg.role {
+            Role::User => "user".to_string(),
+            Role::Assistant => "assistant".to_string(),
+        },
         content: blocks,
     }
 }
 
 fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
-    let tools = ctx.tools.iter().map(|t| AnthropicTool {
-        name: t.name.clone(),
-        description: t.description.clone(),
-        input_schema: t.input_schema.clone(),
-    }).collect();
+    let tools = ctx
+        .tools
+        .iter()
+        .map(|t| AnthropicTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
 
-    let messages = ctx.messages.iter().enumerate().map(|(i, msg)| {
-        // Mark the last message of the stable prefix as the cache boundary
-        let is_boundary = ctx.stable_prefix_len > 0 && i + 1 == ctx.stable_prefix_len;
-        message_to_anthropic(msg, is_boundary)
-    }).collect();
+    let messages = ctx
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            // Mark the last message of the stable prefix as the cache boundary
+            let is_boundary = ctx.stable_prefix_len > 0 && i + 1 == ctx.stable_prefix_len;
+            message_to_anthropic(msg, is_boundary)
+        })
+        .collect();
 
-    let thinking = if opts.thinking != ThinkingLevel::Off && supports_adaptive_thinking(&opts.model) {
-        Some(AnthropicThinking { kind: "adaptive".to_string() })
+    let thinking = if opts.thinking != ThinkingLevel::Off && supports_adaptive_thinking(&opts.model)
+    {
+        Some(AnthropicThinking {
+            kind: "adaptive".to_string(),
+        })
     } else {
         None
     };
@@ -276,7 +326,11 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
     // drop it in that combination (core expresses intent, the provider
     // translates; ADR-001). The only setter today is the compaction
     // summarizer, which runs with thinking Off.
-    let temperature = if thinking.is_some() { None } else { opts.temperature };
+    let temperature = if thinking.is_some() {
+        None
+    } else {
+        opts.temperature
+    };
 
     AnthropicRequest {
         model: opts.model.clone(),
@@ -297,7 +351,11 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
 enum PartialBlock {
     Text(String),
     Thinking(String),
-    ToolUse { id: String, name: String, partial_json: String },
+    ToolUse {
+        id: String,
+        name: String,
+        partial_json: String,
+    },
 }
 
 /// Accumulates Anthropic's `message_start`/`content_block_*`/`message_delta`
@@ -361,7 +419,8 @@ impl StreamState {
                             events.push(StreamEvent::ThinkingDelta(piece.to_string()));
                         }
                         (PartialBlock::ToolUse { partial_json, .. }, Some("input_json_delta")) => {
-                            partial_json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                            partial_json
+                                .push_str(delta["partial_json"].as_str().unwrap_or_default());
                         }
                         _ => {}
                     }
@@ -388,7 +447,11 @@ impl StreamState {
                 PartialBlock::Text(t) if t.is_empty() => None,
                 PartialBlock::Text(t) => Some(ContentBlock::Text(t)),
                 PartialBlock::Thinking(t) => Some(ContentBlock::Thinking(t)),
-                PartialBlock::ToolUse { id, name, partial_json } => {
+                PartialBlock::ToolUse {
+                    id,
+                    name,
+                    partial_json,
+                } => {
                     let input: Value = serde_json::from_str(&partial_json)
                         .unwrap_or_else(|_| Value::Object(Default::default()));
                     Some(ContentBlock::ToolCall { id, name, input })
@@ -397,7 +460,13 @@ impl StreamState {
             .collect();
         let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         let usage = map_usage(self.usage, model);
-        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
+        LlmResponse {
+            content,
+            stop_reason,
+            error_message: None,
+            context_overflow: false,
+            usage,
+        }
     }
 }
 
@@ -444,7 +513,8 @@ impl LlmProvider for AnthropicProvider {
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
         let request = build_request(ctx, opts);
 
-        let result = self.client
+        let result = self
+            .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
@@ -473,11 +543,21 @@ impl LlmProvider for AnthropicProvider {
             Ok(r) => r,
         };
 
-        let content = raw.content.into_iter().filter_map(|b| b.into_content()).collect();
+        let content = raw
+            .content
+            .into_iter()
+            .filter_map(|b| b.into_content())
+            .collect();
         let stop_reason = map_stop_reason(raw.stop_reason.as_deref());
         let usage = map_usage(raw.usage, &opts.model);
 
-        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
+        LlmResponse {
+            content,
+            stop_reason,
+            error_message: None,
+            context_overflow: false,
+            usage,
+        }
     }
 
     async fn stream(
@@ -492,7 +572,8 @@ impl LlmProvider for AnthropicProvider {
         let mut request = build_request(ctx, opts);
         request.stream = true;
 
-        let result = self.client
+        let result = self
+            .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
@@ -532,7 +613,9 @@ impl LlmProvider for AnthropicProvider {
                 Err(_) => continue,
             };
             if data["type"] == "error" {
-                let msg = data["error"]["message"].as_str().unwrap_or("unknown stream error");
+                let msg = data["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown stream error");
                 let full = format!("API error: {msg}");
                 if is_context_overflow_error(msg) {
                     return LlmResponse::context_overflow_error(full);
@@ -640,7 +723,10 @@ mod tests {
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"Prompt is too long"}}"#,
             "input length and `max_tokens` exceed context limit: 199000 + 8192 > 200000",
         ] {
-            assert!(is_context_overflow_error(msg), "should classify as overflow: {msg}");
+            assert!(
+                is_context_overflow_error(msg),
+                "should classify as overflow: {msg}"
+            );
         }
     }
 
@@ -652,7 +738,10 @@ mod tests {
             "overloaded_error: Overloaded",
             "max_tokens: must be greater than 0",
         ] {
-            assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
+            assert!(
+                !is_context_overflow_error(msg),
+                "must not classify as overflow: {msg}"
+            );
         }
     }
 
@@ -685,7 +774,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let resp = b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+                let resp =
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
                 stream.write_all(resp).await.ok();
             }
         });
@@ -757,17 +847,25 @@ mod tests {
             stable_prefix_len: 0,
         };
         let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
-        assert!(json.get("temperature").is_none(), "temperature must not appear");
+        assert!(
+            json.get("temperature").is_none(),
+            "temperature must not appear"
+        );
         assert!(json.get("top_p").is_none(), "top_p must not appear");
         assert!(json.get("top_k").is_none(), "top_k must not appear");
-        assert!(json.get("budget_tokens").is_none(), "budget_tokens must not appear");
+        assert!(
+            json.get("budget_tokens").is_none(),
+            "budget_tokens must not appear"
+        );
     }
 
     #[test]
     fn build_request_explicit_temperature_is_sent_when_thinking_off() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
         let opts = CompleteOpts {
             thinking: ThinkingLevel::Off,
@@ -784,7 +882,9 @@ mod tests {
         // provider must drop it rather than send an invalid request.
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
         let opts = CompleteOpts {
             model: "claude-opus-4-8".to_string(), // supports adaptive thinking
@@ -793,16 +893,24 @@ mod tests {
         };
         let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
         assert_eq!(json["thinking"]["type"], "adaptive");
-        assert!(json.get("temperature").is_none(), "temperature must be dropped with thinking on");
+        assert!(
+            json.get("temperature").is_none(),
+            "temperature must be dropped with thinking on"
+        );
     }
 
     #[test]
     fn build_request_includes_adaptive_thinking_for_opus() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
-        let opts = CompleteOpts { model: "claude-opus-4-8".to_string(), ..CompleteOpts::default() };
+        let opts = CompleteOpts {
+            model: "claude-opus-4-8".to_string(),
+            ..CompleteOpts::default()
+        };
         let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
         assert_eq!(json["thinking"]["type"], "adaptive");
     }
@@ -811,9 +919,14 @@ mod tests {
     fn build_request_no_thinking_for_haiku() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
-        let opts = CompleteOpts { model: "claude-haiku-4-5".to_string(), ..CompleteOpts::default() };
+        let opts = CompleteOpts {
+            model: "claude-haiku-4-5".to_string(),
+            ..CompleteOpts::default()
+        };
         let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
         assert!(json.get("thinking").is_none() || json["thinking"].is_null());
     }
@@ -822,7 +935,9 @@ mod tests {
     fn build_request_thinking_off_suppresses_thinking() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
         let opts = CompleteOpts {
             model: "claude-opus-4-8".to_string(),
@@ -839,21 +954,25 @@ mod tests {
             messages: vec![Message::user("system context"), Message::user("user task")],
             system: None,
             tools: vec![],
-            stable_prefix_len: 1,  // first message is stable
+            stable_prefix_len: 1, // first message is stable
         };
         let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
         let first_block = &json["messages"][0]["content"][0];
         assert_eq!(first_block["cache_control"]["type"], "ephemeral");
         // Second message (volatile) must not have cache_control
         let second_block = &json["messages"][1]["content"][0];
-        assert!(second_block.get("cache_control").is_none() || second_block["cache_control"].is_null());
+        assert!(
+            second_block.get("cache_control").is_none() || second_block["cache_control"].is_null()
+        );
     }
 
     #[test]
     fn build_request_no_cache_control_when_stable_prefix_len_zero() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
         let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
         let block = &json["messages"][0]["content"][0];
@@ -908,11 +1027,13 @@ mod tests {
             }
         });
 
-        let provider = AnthropicProvider::new("bad-key")
-            .with_base_url(format!("http://127.0.0.1:{port}"));
+        let provider =
+            AnthropicProvider::new("bad-key").with_base_url(format!("http://127.0.0.1:{port}"));
         let ctx = Context {
             messages: vec![Message::user("hello")],
-            system: None, tools: vec![], stable_prefix_len: 0,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
         };
         let resp = provider.complete(&ctx, &CompleteOpts::default()).await;
         assert_eq!(resp.stop_reason, StopReason::Error);
@@ -927,7 +1048,8 @@ mod tests {
         let block: AnthropicResponseBlock = serde_json::from_value(json!({
             "type": "text",
             "text": "hello world"
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(matches!(block.into_content(), Some(ContentBlock::Text(t)) if t == "hello world"));
     }
 
@@ -938,8 +1060,11 @@ mod tests {
             "id": "toolu_01",
             "name": "read_file",
             "input": {"path": "foo.txt"}
-        })).unwrap();
-        assert!(matches!(block.into_content(), Some(ContentBlock::ToolCall { name, .. }) if name == "read_file"));
+        }))
+        .unwrap();
+        assert!(
+            matches!(block.into_content(), Some(ContentBlock::ToolCall { name, .. }) if name == "read_file")
+        );
     }
 
     #[test]
@@ -947,7 +1072,8 @@ mod tests {
         let block: AnthropicResponseBlock = serde_json::from_value(json!({
             "type": "redacted_thinking",
             "data": "opaque"
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(block.into_content().is_none());
     }
 
@@ -956,7 +1082,8 @@ mod tests {
     #[test]
     fn stream_text_deltas_accumulate_and_emit() {
         let mut state = StreamState::default();
-        state.on_data(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}));
+        state
+            .on_data(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}));
         state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
         let e1 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}}));
         let e2 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}}));
@@ -976,8 +1103,13 @@ mod tests {
         let mut state = StreamState::default();
         state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}));
         let ev = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "reasoning..."}}));
-        assert_eq!(ev, vec![StreamEvent::ThinkingDelta("reasoning...".to_string())]);
-        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}));
+        assert_eq!(
+            ev,
+            vec![StreamEvent::ThinkingDelta("reasoning...".to_string())]
+        );
+        state.on_data(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+        );
         let resp = state.finish("claude-haiku-4-5");
         assert!(matches!(&resp.content[0], ContentBlock::Thinking(t) if t == "reasoning..."));
     }
@@ -991,9 +1123,14 @@ mod tests {
         }));
         let ev1 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}));
         let ev2 = state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"a.txt\"}"}}));
-        assert!(ev1.is_empty(), "tool input deltas must not be emitted as stream events");
+        assert!(
+            ev1.is_empty(),
+            "tool input deltas must not be emitted as stream events"
+        );
         assert!(ev2.is_empty());
-        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}));
+        state.on_data(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}),
+        );
         let resp = state.finish("claude-haiku-4-5");
         assert!(matches!(
             &resp.content[0],
@@ -1013,7 +1150,9 @@ mod tests {
             "content_block": {"type": "tool_use", "id": "t1", "name": "exec", "input": {}}
         }));
         state.on_data(&json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}}));
-        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}));
+        state.on_data(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}),
+        );
         let resp = state.finish("claude-haiku-4-5");
         assert_eq!(resp.content.len(), 2);
         assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "checking"));
@@ -1024,8 +1163,13 @@ mod tests {
     fn stream_empty_text_block_omitted_from_content() {
         let mut state = StreamState::default();
         state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
-        state.on_data(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}));
+        state.on_data(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+        );
         let resp = state.finish("claude-haiku-4-5");
-        assert!(resp.content.is_empty(), "an empty text block should not appear in content");
+        assert!(
+            resp.content.is_empty(),
+            "an empty text block should not appear in content"
+        );
     }
 }

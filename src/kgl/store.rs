@@ -414,7 +414,11 @@ impl KglStore {
         }
         // Escape SQL LIKE metacharacters so user input doesn't silently change
         // match semantics (e.g. "get%" must match literally, not "get anything").
-        let escaped = q.to_lowercase().replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        let escaped = q
+            .to_lowercase()
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
         let needle = format!("%{escaped}%");
         let sql = format!(
             "{NODE_SELECT} WHERE lower(IFNULL(name,'')) LIKE ?1 ESCAPE '\\' \
@@ -490,7 +494,11 @@ impl KglStore {
         let recs = collect_records(rows)?;
         Ok(recs
             .into_iter()
-            .filter(|r| r.intent.as_ref().is_some_and(|i| !i.open_questions.is_empty()))
+            .filter(|r| {
+                r.intent
+                    .as_ref()
+                    .is_some_and(|i| !i.open_questions.is_empty())
+            })
             .collect())
     }
 
@@ -642,11 +650,7 @@ fn collect_records(
     Ok(out)
 }
 
-fn resolve_urn(
-    to: &str,
-    fns: &HashMap<String, String>,
-    mods: &HashMap<String, String>,
-) -> String {
+fn resolve_urn(to: &str, fns: &HashMap<String, String>, mods: &HashMap<String, String>) -> String {
     if let Some(n) = to.strip_prefix("x07fn:") {
         if let Some(h) = fns.get(n) {
             return h.clone();
@@ -705,7 +709,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        let (nodes, _edges) = store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
+        let (nodes, _edges) = store
+            .populate(&X07Substrate::default(), tmp.path(), "run1")
+            .unwrap();
         assert_eq!(nodes, 3); // module + 2 functions
 
         // the `calls` URN x07fn:checked_add resolved to checked_add's real hash
@@ -733,7 +739,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "run1")
+            .unwrap();
 
         let add = store.find("add", usize::MAX).unwrap();
         let add_hash = add
@@ -754,8 +762,12 @@ mod tests {
             )
             .unwrap();
 
-        let (n1, e1) = store.populate(&X07Substrate::default(), tmp.path(), "run2").unwrap();
-        let (n2, e2) = store.populate(&X07Substrate::default(), tmp.path(), "run3").unwrap();
+        let (n1, e1) = store
+            .populate(&X07Substrate::default(), tmp.path(), "run2")
+            .unwrap();
+        let (n2, e2) = store
+            .populate(&X07Substrate::default(), tmp.path(), "run3")
+            .unwrap();
         assert_eq!((n1, e1), (n2, e2)); // idempotent counts
 
         // metadata survived re-population (hash unchanged)
@@ -770,7 +782,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "run1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "run1")
+            .unwrap();
         // No intent set anywhere -> every node violates purpose.
         let v = store.check_completeness().unwrap();
         assert!(v.iter().any(|x| x.reason.contains("purpose")));
@@ -796,7 +810,9 @@ mod tests {
         )
         .unwrap();
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r1")
+            .unwrap();
         // Document every node so only effect-rule (b) violations could remain.
         // Use check_completeness() to enumerate all nodes rather than find(""),
         // since find("") is intentionally blocked (empty query matches nothing).
@@ -815,10 +831,16 @@ mod tests {
     #[test]
     fn observation_records_session_and_writers() {
         let store = KglStore::open_in_memory().unwrap();
-        store.record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t0").unwrap();
-        store.record_observation("sess-7", EdgeKind::Reads, "file:///ws/b.rs", "t0").unwrap();
+        store
+            .record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t0")
+            .unwrap();
+        store
+            .record_observation("sess-7", EdgeKind::Reads, "file:///ws/b.rs", "t0")
+            .unwrap();
         // dedupe: identical observation again -> still one edge
-        store.record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t1").unwrap();
+        store
+            .record_observation("sess-7", EdgeKind::Mutates, "file:///ws/a.rs", "t1")
+            .unwrap();
 
         let w = store.writers_of("file:///ws/a.rs").unwrap();
         assert!(w.iter().any(|r| r.node.name.as_deref() == Some("sess-7")));
@@ -834,9 +856,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path());
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
-        store.record_observation("sess-1", EdgeKind::Mutates, "file:///ws/x", "t0").unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r2").unwrap(); // re-index code
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r1")
+            .unwrap();
+        store
+            .record_observation("sess-1", EdgeKind::Mutates, "file:///ws/x", "t0")
+            .unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r2")
+            .unwrap(); // re-index code
         let w = store.writers_of("file:///ws/x").unwrap();
         assert!(
             w.iter().any(|r| r.node.name.as_deref() == Some("sess-1")),
@@ -882,7 +910,9 @@ mod tests {
         // Re-index with x07 (no *.x07.json present -> empty scan). The prune
         // must leave the graphify node, its intent, AND its structural edge
         // intact — re-indexing one substrate must not strip another's edges.
-        store.populate(&X07Substrate::default(), tmp.path(), "x1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "x1")
+            .unwrap();
 
         let rec = store.node("n_foo").unwrap();
         assert!(rec.is_some(), "graphify node wiped by an x07 re-index");
@@ -912,7 +942,9 @@ mod tests {
             )
             .unwrap();
         let mut store = KglStore::open_in_memory().unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r1").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r1")
+            .unwrap();
         let foo = store
             .find("foo", usize::MAX)
             .unwrap()
@@ -944,7 +976,9 @@ mod tests {
                "decls":[{"kind":"defn","name":"foo","params":[],"result":"Unit","body":[]}]}"#,
         )
         .unwrap();
-        store.populate(&X07Substrate::default(), tmp.path(), "r2").unwrap();
+        store
+            .populate(&X07Substrate::default(), tmp.path(), "r2")
+            .unwrap();
 
         assert!(store.node(&bar).unwrap().is_none(), "bar should be pruned");
         let out = store.neighbors(&foo, None, Direction::Out).unwrap();

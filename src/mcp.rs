@@ -25,8 +25,8 @@ use crate::protocol::Response;
 use crate::script;
 use crate::session::Session;
 use crate::snapshot::SnapshotStore;
-use crate::tool_runner::ToolRegistry;
 use crate::tool_facade;
+use crate::tool_runner::ToolRegistry;
 use crate::tools;
 
 pub struct DaimonosHandler {
@@ -273,10 +273,7 @@ async fn dispatch_tool_inner(
                                 None => Value::Null,
                             },
                         );
-                        obj.insert(
-                            "verbosity".to_string(),
-                            json!(session.verbosity.as_str()),
-                        );
+                        obj.insert("verbosity".to_string(), json!(session.verbosity.as_str()));
                     }
                     ok_text(serde_json::to_string(&value).unwrap_or_default())
                 }
@@ -1387,9 +1384,7 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
         .collect()
 }
 
-fn socket_call_tool_to_json(
-    result: std::result::Result<CallToolResult, CallToolError>,
-) -> Value {
+fn socket_call_tool_to_json(result: std::result::Result<CallToolResult, CallToolError>) -> Value {
     match result {
         Ok(r) => serde_json::to_value(&r).unwrap_or(json!({"content": [], "isError": false})),
         Err(e) => json!({
@@ -1455,7 +1450,11 @@ pub async fn serve_one_mcp(
                 Some(socket_jsonrpc_ok(id, socket_call_tool_to_json(result)))
             }
             "ping" => Some(socket_jsonrpc_ok(id, json!({}))),
-            _ => Some(socket_jsonrpc_error(id, -32601, &format!("method not found: {method}"))),
+            _ => Some(socket_jsonrpc_error(
+                id,
+                -32601,
+                &format!("method not found: {method}"),
+            )),
         };
 
         if let Some(resp) = response_opt {
@@ -1560,9 +1559,10 @@ mod tests {
 
         let mut session = Session::new(old.path().to_path_buf(), Arc::new(Config::default()));
         // Seed the read cache so we can assert it is cleared on re-root.
-        session
-            .read_cache
-            .insert(old.path().join("stale.txt"), crate::session::ReadCacheEntry { hash: 1, lines: 1 });
+        session.read_cache.insert(
+            old.path().join("stale.txt"),
+            crate::session::ReadCacheEntry { hash: 1, lines: 1 },
+        );
 
         apply_reroot(&mut session, new_canon.clone());
 
@@ -1984,8 +1984,9 @@ mod tests {
         let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
         session.verbosity = Verbosity::Compact;
         let analytics_dir = TempDir::new().unwrap();
-        session.analytics =
-            Some(Arc::new(AnalyticsStore::new(&analytics_dir.path().join("a.db"), 90).unwrap()));
+        session.analytics = Some(Arc::new(
+            AnalyticsStore::new(&analytics_dir.path().join("a.db"), 90).unwrap(),
+        ));
 
         let result =
             dispatch_tool_inner(&mut session, "session_stats", &json!({"scope": "session"}))
@@ -2077,7 +2078,9 @@ mod tests {
 
     // --- saved_tokens wiring ---
 
-    async fn session_with_analytics(dir: &std::path::Path) -> (Session, Arc<crate::analytics::AnalyticsStore>) {
+    async fn session_with_analytics(
+        dir: &std::path::Path,
+    ) -> (Session, Arc<crate::analytics::AnalyticsStore>) {
         let db = dir.join("analytics.db");
         let store = Arc::new(crate::analytics::AnalyticsStore::new(&db, 90).unwrap());
         let mut cfg = crate::config::Config::default();
@@ -2096,9 +2099,13 @@ mod tests {
 
         let args = json!({"path": "dup.txt"});
         // First read — cache miss, nothing saved
-        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        let _ = dispatch_tool(&mut session, "read_file", &args)
+            .await
+            .unwrap();
         // Second read — dedup hit; saved_tokens should reflect suppressed content
-        let _ = dispatch_tool(&mut session, "read_file", &args).await.unwrap();
+        let _ = dispatch_tool(&mut session, "read_file", &args)
+            .await
+            .unwrap();
 
         // Give the async record write a moment to land
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

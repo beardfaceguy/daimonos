@@ -180,7 +180,9 @@ mod tests {
     fn index_real_daimonos_graph() {
         use crate::kgl::store::KglStore;
         let mut store = KglStore::open_in_memory().unwrap();
-        let (nodes, edges) = store.populate(&GraphifySubstrate, Path::new("."), "real").unwrap();
+        let (nodes, edges) = store
+            .populate(&GraphifySubstrate, Path::new("."), "real")
+            .unwrap();
         println!("\n[graphify->kgl] daimonos Rust graph: {nodes} nodes, {edges} edges");
         let hits = store.find("config", usize::MAX).unwrap();
         println!(
@@ -195,7 +197,8 @@ mod tests {
             let blast = store.blast_radius(&first.node.hash, usize::MAX).unwrap();
             println!(
                 "blast_radius({:?}) -> {} dependents",
-                first.node.name, blast.len()
+                first.node.name,
+                blast.len()
             );
         }
         assert!(nodes > 100, "expected a substantial real graph");

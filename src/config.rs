@@ -236,10 +236,17 @@ impl Default for KglConfig {
 }
 
 fn default_kgl_skip_dirs() -> Vec<String> {
-    ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "target",
+        ".git",
+        ".jj",
+        "node_modules",
+        ".kgl",
+        "graphify-out",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.
@@ -636,7 +643,7 @@ mod tests {
     /// parallel test runner can't observe a half-applied env mutation.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-        #[test]
+    #[test]
     fn default_config_values() {
         let cfg = Config::default();
         assert_eq!(cfg.index.max_depth, 20);

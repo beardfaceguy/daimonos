@@ -76,7 +76,9 @@ impl ToolPlugin for ShellcheckPlugin {
 }
 
 async fn shellcheck_check(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
-    let args = args.and_then(|v| v.as_object()).ok_or("shellcheck: args must be a JSON object")?;
+    let args = args
+        .and_then(|v| v.as_object())
+        .ok_or("shellcheck: args must be a JSON object")?;
 
     // Accept either "file" (single path) or "files" (array)
     let files: Vec<String> = if let Some(f) = args.get("file").and_then(|v| v.as_str()) {
@@ -95,10 +97,7 @@ async fn shellcheck_check(cwd: &Path, args: Option<&Value>) -> Result<Value, Str
 
     let shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("bash");
 
-    let mut cmd_args: Vec<String> = vec![
-        "--format=json".into(),
-        format!("--shell={shell}"),
-    ];
+    let mut cmd_args: Vec<String> = vec!["--format=json".into(), format!("--shell={shell}")];
     cmd_args.extend(files.iter().cloned());
 
     let output = Command::new("shellcheck")
@@ -138,7 +137,10 @@ mod tests {
 
     #[test]
     fn shellcheck_is_available() {
-        assert!(is_available(), "shellcheck should be on PATH in this environment");
+        assert!(
+            is_available(),
+            "shellcheck should be on PATH in this environment"
+        );
     }
 
     #[tokio::test]
@@ -155,7 +157,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.output["clean"], true, "got: {}", result.output);
-        assert_eq!(result.output["diagnostics"], json!([]), "got: {}", result.output);
+        assert_eq!(
+            result.output["diagnostics"],
+            json!([]),
+            "got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

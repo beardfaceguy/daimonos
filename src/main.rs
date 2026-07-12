@@ -1,4 +1,10 @@
+mod acp_cmd;
+mod agent;
+mod agent_cmd;
+mod agent_env;
 mod analytics;
+mod chat_cmd;
+mod compaction;
 mod config;
 mod index;
 mod kgl;
@@ -7,20 +13,14 @@ mod ops;
 mod pipeline_cache;
 mod plugins;
 mod protocol;
+mod providers;
+mod safety;
 mod script;
 mod session;
 mod session_store;
 mod snapshot;
-mod acp_cmd;
-mod agent;
-mod agent_cmd;
-mod agent_env;
-mod chat_cmd;
-mod compaction;
-mod safety;
-mod providers;
-mod tool_runner;
 mod tool_facade;
+mod tool_runner;
 mod tools;
 mod verbosity;
 
@@ -96,7 +96,9 @@ fn try_build_llm_provider(
             providers::anthropic::AnthropicProvider::new(api_key.to_string())
                 .with_base_url(base_url.to_string()),
         )),
-        other => Err(format!("unsupported provider: {other} (valid: openrouter, anthropic)")),
+        other => Err(format!(
+            "unsupported provider: {other} (valid: openrouter, anthropic)"
+        )),
     }
 }
 
@@ -247,7 +249,11 @@ async fn main() -> anyhow::Result<()> {
 
     session::enhance_process_path();
 
-    let token_log = if cli.debug_tokens { debug_tokens_log_path() } else { None };
+    let token_log = if cli.debug_tokens {
+        debug_tokens_log_path()
+    } else {
+        None
+    };
 
     let workspace = std::fs::canonicalize(&cli.workspace)?;
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
@@ -267,7 +273,13 @@ async fn main() -> anyhow::Result<()> {
     // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
     // index/watcher/plugin setup needed.
     match cli.command {
-        Some(Commands::Agent { task, model, provider, dry_run, agent_env }) => {
+        Some(Commands::Agent {
+            task,
+            model,
+            provider,
+            dry_run,
+            agent_env,
+        }) => {
             // Dry-run prints tools + task without calling the API, so it needs
             // neither the agent env file nor a provider/key.
             struct DryRunProvider;
@@ -342,9 +354,14 @@ async fn main() -> anyhow::Result<()> {
                 analytics: analytics_store,
                 token_log: token_log.clone(),
             };
-            let result =
-                agent_cmd::run_agent(llm.as_ref(), &workspace, Arc::clone(&cfg), args, &mut std::io::stdout())
-                    .await?;
+            let result = agent_cmd::run_agent(
+                llm.as_ref(),
+                &workspace,
+                Arc::clone(&cfg),
+                args,
+                &mut std::io::stdout(),
+            )
+            .await?;
             if result.stop_reason == providers::StopReason::Error {
                 let msg = result.error_message.as_deref().unwrap_or("unknown error");
                 eprintln!("agent error: {msg}");
@@ -352,12 +369,21 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Commands::Chat { model, provider, agent_env, resume, list }) => {
+        Some(Commands::Chat {
+            model,
+            provider,
+            agent_env,
+            resume,
+            list,
+        }) => {
             // Chat sessions persist under ~/.daimonos so `--resume`/`--list`
             // can restore a prior conversation (vikunja #963). Separate dir
             // from acp-sessions to keep the two id namespaces from colliding.
-            let sessions_dir = std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".daimonos").join("chat-sessions"));
+            let sessions_dir = std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".daimonos")
+                    .join("chat-sessions")
+            });
             // --list is a pure query: enumerate saved sessions and exit
             // without loading the agent env / building a provider.
             if list {
@@ -415,7 +441,11 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             return Ok(());
         }
-        Some(Commands::Acp { model, provider, agent_env }) => {
+        Some(Commands::Acp {
+            model,
+            provider,
+            agent_env,
+        }) => {
             let agent = match agent_env::AgentEnv::load(agent_env) {
                 Ok(a) => a,
                 Err(e) => {
@@ -466,8 +496,11 @@ async fn main() -> anyhow::Result<()> {
             // Persist ACP sessions under ~/.daimonos so session/load can
             // resume a thread after this process exits and Zed re-requests a
             // session id from a previous run (see acp_cmd::SessionStore).
-            let sessions_dir = std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".daimonos").join("acp-sessions"));
+            let sessions_dir = std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".daimonos")
+                    .join("acp-sessions")
+            });
             acp_cmd::run_acp(
                 make_provider,
                 &workspace,

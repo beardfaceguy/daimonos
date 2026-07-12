@@ -8,7 +8,9 @@
 //! X07 parse is signature-level and the X07 files present may be sparse, so both
 //! degrade safely to empty when the body/effect shape is absent or unknown.
 
-use crate::kgl::model::{DefNode, Derivation, Edge, EdgeKind, EffectFacts, NodeKind, SubstrateKind};
+use crate::kgl::model::{
+    DefNode, Derivation, Edge, EdgeKind, EffectFacts, NodeKind, SubstrateKind,
+};
 use crate::kgl::substrate::{content_hash, filtered_walk_builder, IndexResult, Substrate};
 use crate::plugins::x07::parse_x07_module;
 use anyhow::{anyhow, Result};
@@ -139,7 +141,8 @@ fn index_module(ast: &Value, rel: &str, out: &mut IndexResult) {
             span: Some(format!("/decls/{idx}")),
         });
 
-        out.effects.insert(fn_hash.clone(), effect_facts(decl_value));
+        out.effects
+            .insert(fn_hash.clone(), effect_facts(decl_value));
 
         // calls edges (best-effort body scan) -> `x07fn:<name>` URNs; resolved
         // to concrete hashes at store load once all modules are indexed.
@@ -278,7 +281,9 @@ fn collect_io_ops(v: &Value, out: &mut Vec<(EdgeKind, String)>) {
 /// would come from a substrate that exposes a fine-grained effect set.
 fn classify_verb(name: &str) -> Option<EdgeKind> {
     let n = name.to_ascii_lowercase();
-    const WRITES: [&str; 8] = ["write", "save", "store", "put", "delete", "create", "send", "set"];
+    const WRITES: [&str; 8] = [
+        "write", "save", "store", "put", "delete", "create", "send", "set",
+    ];
     const READS: [&str; 6] = ["read", "open", "load", "get", "fetch", "recv"];
     if WRITES.iter().any(|w| n.contains(w)) {
         return Some(EdgeKind::Mutates);
@@ -363,16 +368,31 @@ mod tests {
 
         let idx = X07Substrate::default().index(tmp.path()).unwrap();
 
-        let modules: Vec<_> = idx.nodes.iter().filter(|n| n.kind == NodeKind::Module).collect();
-        let funcs: Vec<_> = idx.nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        let modules: Vec<_> = idx
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Module)
+            .collect();
+        let funcs: Vec<_> = idx
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .collect();
         assert_eq!(modules.len(), 1);
         assert_eq!(funcs.len(), 3);
 
         // reads/mutates with resource URNs (BUILD 3)
-        let load = funcs.iter().find(|n| n.name.as_deref() == Some("load_settings")).unwrap();
+        let load = funcs
+            .iter()
+            .find(|n| n.name.as_deref() == Some("load_settings"))
+            .unwrap();
         let io: Vec<_> = idx.edges.iter().filter(|e| e.from == load.hash).collect();
-        assert!(io.iter().any(|e| e.kind == EdgeKind::Reads && e.to == "file:///etc/app/conf.json"));
-        assert!(io.iter().any(|e| e.kind == EdgeKind::Mutates && e.to == "file://app.log"));
+        assert!(io
+            .iter()
+            .any(|e| e.kind == EdgeKind::Reads && e.to == "file:///etc/app/conf.json"));
+        assert!(io
+            .iter()
+            .any(|e| e.kind == EdgeKind::Mutates && e.to == "file://app.log"));
         assert_eq!(modules[0].name.as_deref(), Some("math.core"));
 
         // depends_on from import
@@ -388,8 +408,14 @@ mod tests {
             .any(|e| e.kind == EdgeKind::Calls && e.to == "x07fn:checked_add"));
 
         // effects: checked_add touches io, add does not
-        let checked = funcs.iter().find(|n| n.name.as_deref() == Some("checked_add")).unwrap();
-        let add = funcs.iter().find(|n| n.name.as_deref() == Some("add")).unwrap();
+        let checked = funcs
+            .iter()
+            .find(|n| n.name.as_deref() == Some("checked_add"))
+            .unwrap();
+        let add = funcs
+            .iter()
+            .find(|n| n.name.as_deref() == Some("add"))
+            .unwrap();
         assert!(idx.effects.get(&checked.hash).unwrap().touches_io);
         assert!(!idx.effects.get(&add.hash).unwrap().touches_io);
 

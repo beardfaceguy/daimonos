@@ -1303,11 +1303,9 @@ mod tests {
 
         let db = store.db_lock();
         let (cost, reason): (f64, String) = db
-            .query_row(
-                "SELECT cost_usd, stop_reason FROM agent_runs",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT cost_usd, stop_reason FROM agent_runs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert!((cost - 0.5678).abs() < 1e-9);
         assert_eq!(reason, "max_tokens");
@@ -1323,7 +1321,9 @@ mod tests {
 
         let db = store.db_lock();
         let ext: Option<String> = db
-            .query_row("SELECT external_session_id FROM agent_runs", [], |r| r.get(0))
+            .query_row("SELECT external_session_id FROM agent_runs", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(ext.as_deref(), Some("ext-session-xyz"));
     }
@@ -1371,7 +1371,10 @@ mod tests {
         store.record_agent_run(&sample_agent_run());
 
         let report = store.format_stats_report_filtered(30, None);
-        assert!(report.contains("Agent Runs"), "report must include Agent Runs section: {report}");
+        assert!(
+            report.contains("Agent Runs"),
+            "report must include Agent Runs section: {report}"
+        );
         assert!(report.contains("Runs: 1"));
     }
 
@@ -1386,7 +1389,10 @@ mod tests {
 
         let report = store.format_stats_report_filtered(30, None);
         // cache hit rate = 200 / (800 + 200) * 100 = 20.0%
-        assert!(report.contains("20.0%"), "cache hit rate must appear in report: {report}");
+        assert!(
+            report.contains("20.0%"),
+            "cache hit rate must appear in report: {report}"
+        );
     }
 
     #[test]
@@ -1395,7 +1401,10 @@ mod tests {
         store.record(&sample_record("read_file"));
 
         let report = store.format_stats_report_filtered(30, None);
-        assert!(!report.contains("Agent Runs"), "agent runs section must be hidden when no runs: {report}");
+        assert!(
+            !report.contains("Agent Runs"),
+            "agent runs section must be hidden when no runs: {report}"
+        );
     }
 
     #[test]

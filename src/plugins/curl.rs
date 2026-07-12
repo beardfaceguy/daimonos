@@ -79,7 +79,9 @@ const METRICS_SENTINEL: &str = "__CURL_METRICS__:";
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
 async fn curl_request(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
-    let args = args.and_then(|v| v.as_object()).ok_or("curl: args must be a JSON object")?;
+    let args = args
+        .and_then(|v| v.as_object())
+        .ok_or("curl: args must be a JSON object")?;
 
     let url = args
         .get("url")
@@ -180,8 +182,14 @@ async fn curl_request(cwd: &Path, args: Option<&Value>) -> Result<Value, String>
 fn parse_metrics(s: &str) -> (i64, f64) {
     // "200:0.123456"
     let mut parts = s.trim().splitn(2, ':');
-    let status = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-    let time_s = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let status = parts
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let time_s = parts
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
     (status, (time_s * 1000.0).round())
 }
 
@@ -221,7 +229,10 @@ mod tests {
     fn parse_metrics_extracts_status_and_time() {
         let (status, timing_ms) = parse_metrics("200:0.123456");
         assert_eq!(status, 200);
-        assert!((timing_ms - 123.0).abs() < 1.0, "expected ~123ms, got {timing_ms}");
+        assert!(
+            (timing_ms - 123.0).abs() < 1.0,
+            "expected ~123ms, got {timing_ms}"
+        );
     }
 
     #[test]
@@ -267,7 +278,10 @@ mod tests {
         let headers = parse_headers(raw);
         assert_eq!(headers["content-type"], "application/json");
         assert_eq!(headers["x-custom"], "value");
-        assert!(headers.get("HTTP/1.1 200 OK").is_none(), "status line should not appear as header");
+        assert!(
+            headers.get("HTTP/1.1 200 OK").is_none(),
+            "status line should not appear as header"
+        );
     }
 
     #[test]

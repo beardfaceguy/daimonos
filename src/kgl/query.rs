@@ -16,7 +16,13 @@ use std::path::Path;
 /// Dispatch one query action against the workspace's KGL store. `now` is an
 /// ISO-8601 timestamp supplied by the host (used as the index run stamp; KGL
 /// never invents time).
-pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglConfig) -> Result<Value> {
+pub fn run(
+    workspace: &Path,
+    action: &str,
+    args: &Value,
+    now: &str,
+    cfg: &KglConfig,
+) -> Result<Value> {
     let mut store = KglStore::open_workspace_with(workspace, cfg)?;
     match action {
         "index" => {
@@ -26,28 +32,30 @@ pub fn run(workspace: &Path, action: &str, args: &Value, now: &str, cfg: &KglCon
             // graph.json exists, else x07) — never blindly default to x07, which
             // on a graphify-only workspace would run an empty scan whose prune
             // wipes the existing graph and its agent metadata.
-            let (which, sub): (&str, Box<dyn Substrate>) =
-                match args.get("substrate").and_then(|v| v.as_str()) {
-                    Some("graphify") => ("graphify", Box::new(GraphifySubstrate)),
-                    Some("x07") => ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))),
-                    Some(other) => {
-                        return Err(anyhow!(
-                            "kgl_query: unknown substrate '{other}' (expected x07|graphify)"
-                        ))
+            let (which, sub): (&str, Box<dyn Substrate>) = match args
+                .get("substrate")
+                .and_then(|v| v.as_str())
+            {
+                Some("graphify") => ("graphify", Box::new(GraphifySubstrate)),
+                Some("x07") => ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "kgl_query: unknown substrate '{other}' (expected x07|graphify)"
+                    ))
+                }
+                None => match crate::kgl::autoindex::detect(workspace, cfg) {
+                    Some(pair) => pair,
+                    None => {
+                        return Ok(json!({
+                            "indexed": false,
+                            "substrate": Value::Null,
+                            "nodes": 0,
+                            "edges": 0,
+                            "reason": "no substrate detected (no graphify-out/graph.json or *.x07.json)",
+                        }))
                     }
-                    None => match crate::kgl::autoindex::detect(workspace, cfg) {
-                        Some(pair) => pair,
-                        None => {
-                            return Ok(json!({
-                                "indexed": false,
-                                "substrate": Value::Null,
-                                "nodes": 0,
-                                "edges": 0,
-                                "reason": "no substrate detected (no graphify-out/graph.json or *.x07.json)",
-                            }))
-                        }
-                    },
-                };
+                },
+            };
             let (nodes, edges) = store.populate(sub.as_ref(), workspace, now)?;
             Ok(json!({ "indexed": true, "substrate": which, "nodes": nodes, "edges": edges }))
         }
@@ -194,7 +202,14 @@ mod tests {
         assert!(idx["nodes"].as_u64().unwrap() >= 2);
 
         // find by name returns the authenticate node
-        let found = run(ws, "find", &json!({"q": "authenticate"}), "t0", &KglConfig::default()).unwrap();
+        let found = run(
+            ws,
+            "find",
+            &json!({"q": "authenticate"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         let arr = found.as_array().unwrap();
         assert!(arr.iter().any(|r| r["name"] == json!("authenticate")));
 
@@ -206,7 +221,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let nb = run(ws, "neighbors", &json!({"hash": hash, "kind": "reads"}), "t0", &KglConfig::default()).unwrap();
+        let nb = run(
+            ws,
+            "neighbors",
+            &json!({"hash": hash, "kind": "reads"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         assert!(nb
             .as_array()
             .unwrap()
@@ -214,7 +236,14 @@ mod tests {
             .any(|e| e["to"] == json!("file:///etc/users.db")));
 
         // check: authenticate has no purpose yet -> incomplete
-        let chk = run(ws, "check", &json!({"mode": "commit"}), "t0", &KglConfig::default()).unwrap();
+        let chk = run(
+            ws,
+            "check",
+            &json!({"mode": "commit"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         assert_eq!(chk["complete"], json!(false));
     }
 
@@ -223,7 +252,14 @@ mod tests {
         let tmp = workspace();
         let ws = tmp.path();
         run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
-        let o = run(ws, "orient", &json!({"task": "authenticate"}), "t0", &KglConfig::default()).unwrap();
+        let o = run(
+            ws,
+            "orient",
+            &json!({"task": "authenticate"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         assert!(o["matches"]
             .as_array()
             .unwrap()
@@ -249,7 +285,14 @@ mod tests {
         .unwrap();
         run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
 
-        let full = run(ws, "orient", &json!({"task": "auth"}), "t0", &KglConfig::default()).unwrap();
+        let full = run(
+            ws,
+            "orient",
+            &json!({"task": "auth"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
             full["matches"].as_array().unwrap().len(),
             2,

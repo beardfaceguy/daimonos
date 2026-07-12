@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::providers::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role,
-    StopReason, StreamEvent, ToolSchema, Usage,
+    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
+    StreamEvent, ToolSchema, Usage,
 };
 
 pub struct OpenRouterProvider {
@@ -17,7 +17,11 @@ impl OpenRouterProvider {
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
-        Ok(Self { api_key, base_url, client })
+        Ok(Self {
+            api_key,
+            base_url,
+            client,
+        })
     }
 }
 
@@ -106,7 +110,14 @@ impl LlmProvider for OpenRouterProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = match self.client.post(&url).bearer_auth(&self.api_key).json(&body).send().await {
+        let resp = match self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return LlmResponse::error(format!("openrouter request failed: {e}")),
         };
@@ -146,7 +157,13 @@ impl LlmProvider for OpenRouterProvider {
 
     async fn context_window(&self, model: &str) -> Option<u64> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let resp = self.client.get(&url).bearer_auth(&self.api_key).send().await.ok()?;
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -229,11 +246,21 @@ impl StreamState {
         for tc in self.tool_calls {
             let input: Value = serde_json::from_str(&tc.arguments)
                 .unwrap_or_else(|_| Value::Object(Default::default()));
-            content.push(ContentBlock::ToolCall { id: tc.id, name: tc.name, input });
+            content.push(ContentBlock::ToolCall {
+                id: tc.id,
+                name: tc.name,
+                input,
+            });
         }
         let stop_reason = map_finish_reason(self.finish_reason.as_deref());
         let usage = parse_usage(&self.usage);
-        LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
+        LlmResponse {
+            content,
+            stop_reason,
+            error_message: None,
+            context_overflow: false,
+            usage,
+        }
     }
 }
 
@@ -257,7 +284,12 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                     .content
                     .iter()
                     .filter_map(|b| {
-                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = b
+                        {
                             Some((tool_use_id.as_str(), content.as_str()))
                         } else {
                             None
@@ -278,7 +310,11 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                         .content
                         .iter()
                         .filter_map(|b| {
-                            if let ContentBlock::Text(t) = b { Some(t.as_str()) } else { None }
+                            if let ContentBlock::Text(t) = b {
+                                Some(t.as_str())
+                            } else {
+                                None
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -373,7 +409,13 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
         }
     }
 
-    LlmResponse { content, stop_reason, error_message: None, context_overflow: false, usage }
+    LlmResponse {
+        content,
+        stop_reason,
+        error_message: None,
+        context_overflow: false,
+        usage,
+    }
 }
 
 pub(crate) fn map_finish_reason(reason: Option<&str>) -> StopReason {
@@ -398,7 +440,9 @@ fn parse_usage(usage: &Value) -> Usage {
     let cache_read = details["cached_tokens"].as_u64().unwrap_or(0);
     let cache_write = details["cache_write_tokens"].as_u64().unwrap_or(0);
     Usage {
-        input: prompt.saturating_sub(cache_read).saturating_sub(cache_write),
+        input: prompt
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_write),
         output: usage["completion_tokens"].as_u64().unwrap_or(0),
         cache_read,
         cache_write,
@@ -429,7 +473,10 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
 /// that. `None` when the model id isn't listed, both fields are absent, or
 /// the value is zero.
 pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u64> {
-    let entry = body["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?;
+    let entry = body["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?;
     entry["context_length"]
         .as_u64()
         .or_else(|| entry["max_model_len"].as_u64())
@@ -663,11 +710,18 @@ mod tests {
             }
         });
         let resp = parse_response(&body);
-        assert_eq!(resp.usage.input, 144, "input must be the NON-cached prompt tokens");
+        assert_eq!(
+            resp.usage.input, 144,
+            "input must be the NON-cached prompt tokens"
+        );
         assert_eq!(resp.usage.output, 50);
         assert_eq!(resp.usage.cache_read, 30);
         assert_eq!(resp.usage.cache_write, 20);
-        assert_eq!(resp.usage.prompt_tokens(), 194, "invariant: prompt_tokens() == wire prompt_tokens");
+        assert_eq!(
+            resp.usage.prompt_tokens(),
+            194,
+            "invariant: prompt_tokens() == wire prompt_tokens"
+        );
     }
 
     #[test]
@@ -722,8 +776,16 @@ mod tests {
 
     #[test]
     fn overflow_classifier_rejects_other_errors() {
-        for msg in ["rate limit exceeded", "invalid api key", "model not found", "internal server error"] {
-            assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
+        for msg in [
+            "rate limit exceeded",
+            "invalid api key",
+            "model not found",
+            "internal server error",
+        ] {
+            assert!(
+                !is_context_overflow_error(msg),
+                "must not classify as overflow: {msg}"
+            );
         }
     }
 
@@ -745,7 +807,10 @@ mod tests {
     fn context_length_falls_back_to_max_model_len() {
         // Self-hosted vLLM: no context_length, exposes max_model_len instead.
         let body = json!({"data": [{"id": "local/llama", "max_model_len": 32768}]});
-        assert_eq!(context_length_from_models(&body, "local/llama"), Some(32_768));
+        assert_eq!(
+            context_length_from_models(&body, "local/llama"),
+            Some(32_768)
+        );
     }
 
     #[test]
@@ -828,8 +893,10 @@ mod tests {
     #[test]
     fn stream_text_deltas_accumulate_and_emit() {
         let mut state = StreamState::default();
-        let e1 = state.on_chunk(&json!({"choices": [{"delta": {"content": "hel"}, "finish_reason": null}]}));
-        let e2 = state.on_chunk(&json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": null}]}));
+        let e1 = state
+            .on_chunk(&json!({"choices": [{"delta": {"content": "hel"}, "finish_reason": null}]}));
+        let e2 = state
+            .on_chunk(&json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": null}]}));
         assert_eq!(e1, vec![StreamEvent::TextDelta("hel".to_string())]);
         assert_eq!(e2, vec![StreamEvent::TextDelta("lo".to_string())]);
         state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}}));
@@ -843,7 +910,8 @@ mod tests {
     #[test]
     fn stream_empty_content_delta_not_emitted() {
         let mut state = StreamState::default();
-        let ev = state.on_chunk(&json!({"choices": [{"delta": {"content": ""}, "finish_reason": null}]}));
+        let ev = state
+            .on_chunk(&json!({"choices": [{"delta": {"content": ""}, "finish_reason": null}]}));
         assert!(ev.is_empty());
     }
 
@@ -882,7 +950,9 @@ mod tests {
         state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}));
         let resp = state.finish();
         assert_eq!(resp.content.len(), 2);
-        assert!(matches!(&resp.content[0], ContentBlock::ToolCall { name, .. } if name == "read_file"));
+        assert!(
+            matches!(&resp.content[0], ContentBlock::ToolCall { name, .. } if name == "read_file")
+        );
         assert!(matches!(&resp.content[1], ContentBlock::ToolCall { name, .. } if name == "exec"));
     }
 
