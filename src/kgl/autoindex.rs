@@ -57,7 +57,9 @@ pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dy
 /// True if the graphify graph file parses and contains at least one `code`
 /// node. Missing/empty/stub graphs return false so `detect` falls through to
 /// x07 rather than picking an empty graphify index whose prune wipes the graph.
-fn graphify_has_code_nodes(path: &Path) -> bool {
+/// `pub(crate)` so the `kgl_query index` tool can apply the same guard to an
+/// explicit `substrate:"graphify"` request (not just the auto-detect path).
+pub(crate) fn graphify_has_code_nodes(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };

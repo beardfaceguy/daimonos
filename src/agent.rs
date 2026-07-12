@@ -125,7 +125,10 @@ fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
         "output": usage.output,
         "cache_read": usage.cache_read,
         "cache_write": usage.cache_write,
-        "cost_usd": usage.cost.total_usd,
+        // Fixed-decimal string, not a bare f64: serde_json renders small floats
+        // in scientific notation (e.g. 3e-6), which is diff-unfriendly and awkward
+        // to parse. Six decimals = microdollar precision, enough for per-call cost.
+        "cost_usd": format!("{:.6}", usage.cost.total_usd),
     })
     .to_string()
 }
@@ -794,7 +797,7 @@ mod tests {
         assert_eq!(parsed["output"], 45);
         assert_eq!(parsed["cache_read"], 3);
         assert_eq!(parsed["cache_write"], 7);
-        assert_eq!(parsed["cost_usd"], 0.0012);
+        assert_eq!(parsed["cost_usd"], "0.001200");
         assert!(parsed["ts"].is_string(), "must include a timestamp");
     }
 

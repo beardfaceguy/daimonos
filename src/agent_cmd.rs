@@ -574,6 +574,9 @@ mod tests {
 
     // --- cfg wiring (vikunja #958) ---
 
+    // Unix-only: relies on a shebang script + executable mode bit
+    // (`PermissionsExt`) to prove PATH resolution through `cfg.process.extra_path`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_uses_provided_cfg_for_tool_session() {
         // The tool `Session` must be built from the `cfg` passed into
