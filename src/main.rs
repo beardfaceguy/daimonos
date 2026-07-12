@@ -381,6 +381,19 @@ async fn main() -> anyhow::Result<()> {
             let model_explicit = model.is_some();
             let effective_model = model.unwrap_or_else(|| agent.model.clone());
             let llm = build_llm_provider(&effective_provider, &agent);
+            // Resolve compaction now that the provider + effective model are
+            // known: a provider-reported window (#965) is looked up for the
+            // model actually in use, honoring any --model override.
+            let compaction = match agent
+                .resolve_compaction(llm.as_ref(), &effective_model)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("agent config: {e}");
+                    std::process::exit(2);
+                }
+            };
             let approve_fn = if agent.approval_mode == "auto" {
                 None
             } else {
@@ -397,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
                 token_log,
                 sessions_dir,
                 resume,
-                agent.compaction.clone(),
+                compaction,
             )
             .await?;
             return Ok(());
@@ -427,6 +440,25 @@ async fn main() -> anyhow::Result<()> {
                 let base_url = agent.base_url.clone();
                 Arc::new(move || try_build_llm_provider(&provider, &api_key, &base_url))
             };
+            // Resolve compaction against a probe provider built from the same
+            // factory, querying the effective model's window when the env file
+            // omits DAIMONOS_AGENT_CONTEXT_WINDOW (#965).
+            let compaction = match make_provider() {
+                Ok(probe) => match agent
+                    .resolve_compaction(probe.as_ref(), &effective_model)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("agent config: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("agent config: {e}");
+                    std::process::exit(2);
+                }
+            };
             // No approve_fn: ACP asks the client via session/request_permission,
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.
@@ -445,7 +477,7 @@ async fn main() -> anyhow::Result<()> {
                 safety,
                 token_log,
                 sessions_dir,
-                agent.compaction.clone(),
+                compaction,
             )
             .await?;
             return Ok(());

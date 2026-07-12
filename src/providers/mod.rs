@@ -200,6 +200,18 @@ pub trait LlmProvider: Send + Sync {
     ) -> LlmResponse {
         self.complete(ctx, opts).await
     }
+
+    /// The maximum input/context window, in tokens, the provider reports for
+    /// `model` — used to resolve `DAIMONOS_AGENT_CONTEXT_WINDOW` when the
+    /// agent env file omits it (ADR-002 amendment, vikunja #965). Default
+    /// `None`, so test doubles and providers that can't answer are treated as
+    /// "no live value available". Implementations return `None` on any
+    /// failure (network error, unknown model id, missing/zero field) rather
+    /// than guessing — the caller then hard-errors telling the user to set
+    /// the key explicitly.
+    async fn context_window(&self, _model: &str) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +246,12 @@ mod tests {
             .await;
         assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hi"));
         assert!(events.is_empty(), "default stream() must not synthesize events");
+    }
+
+    #[tokio::test]
+    async fn default_context_window_is_none() {
+        let provider = StaticProvider(LlmResponse::error("unused"));
+        assert_eq!(provider.context_window("any-model").await, None);
     }
 
     #[test]

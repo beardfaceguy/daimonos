@@ -95,17 +95,22 @@ DAIMONOS_AGENT_COMPACTION=on
 # Required when on:
 DAIMONOS_AGENT_COMPACTION_HIGH_WATER=0.75   # compact when prompt ≥ 75% of budget
 DAIMONOS_AGENT_COMPACTION_LOW_WATER=0.50    # evict down to ~50% of budget
-DAIMONOS_AGENT_CONTEXT_WINDOW=200000        # your model's window, in tokens
 DAIMONOS_AGENT_OUTPUT_RESERVATION=8192      # tokens reserved for the reply
 
 # Optional:
+DAIMONOS_AGENT_CONTEXT_WINDOW=200000        # your model's window, in tokens;
+                                            # omit to resolve it live from the provider (#965)
 DAIMONOS_AGENT_SUMMARY_MODEL=anthropic/claude-haiku-4.5  # unset → the main model
 DAIMONOS_AGENT_SUMMARY_PROMPT=...                        # unset → built-in template
 ```
 
 The budget is `CONTEXT_WINDOW − OUTPUT_RESERVATION`; watermarks must satisfy
-`0 < LOW < HIGH < 1`. If you use the model picker across models with
-different windows, set `CONTEXT_WINDOW` for the smallest one. The simplest
+`0 < LOW < HIGH < 1`. `CONTEXT_WINDOW` is optional (#965): when omitted,
+daimonos queries the provider for the effective model's window (OpenRouter
+`context_length` / Anthropic `max_input_tokens`) and errors out if it can't be
+determined. If you use the model picker across models with different windows,
+either leave `CONTEXT_WINDOW` unset (each model resolves its own) or set it for
+the smallest one. The simplest
 valid setup is `DAIMONOS_AGENT_COMPACTION=off` (no other keys needed).
 When a compaction happens, Zed shows a collapsed thought line
 (`[context compacted: N older turn(s) summarized]`); the chat REPL prints

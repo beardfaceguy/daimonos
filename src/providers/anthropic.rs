@@ -208,6 +208,13 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
     m.contains("prompt is too long") || m.contains("exceed context limit")
 }
 
+/// Extract the context window from an Anthropic `GET /v1/models/{id}` body
+/// (vikunja #965). Anthropic's Models API exposes it as `max_input_tokens`.
+/// `None` when the field is absent or zero.
+pub(crate) fn max_input_tokens_from_model(body: &Value) -> Option<u64> {
+    body["max_input_tokens"].as_u64().filter(|&n| n > 0)
+}
+
 fn supports_adaptive_thinking(model: &str) -> bool {
     model.starts_with("claude-opus-4")
         || model.starts_with("claude-sonnet-4-6")
@@ -539,6 +546,22 @@ impl LlmProvider for AnthropicProvider {
 
         state.finish(&opts.model)
     }
+
+    async fn context_window(&self, model: &str) -> Option<u64> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/models/{model}", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        max_input_tokens_from_model(&body)
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +654,44 @@ mod tests {
         ] {
             assert!(!is_context_overflow_error(msg), "must not classify as overflow: {msg}");
         }
+    }
+
+    // --- context window (vikunja #965) ---
+
+    #[test]
+    fn max_input_tokens_parsed_from_model_body() {
+        let body = json!({"id": "claude-opus-4-8", "max_input_tokens": 200000});
+        assert_eq!(max_input_tokens_from_model(&body), Some(200_000));
+    }
+
+    #[test]
+    fn max_input_tokens_absent_is_none() {
+        let body = json!({"id": "claude-opus-4-8"});
+        assert_eq!(max_input_tokens_from_model(&body), None);
+    }
+
+    #[test]
+    fn max_input_tokens_zero_is_none() {
+        let body = json!({"id": "claude-opus-4-8", "max_input_tokens": 0});
+        assert_eq!(max_input_tokens_from_model(&body), None);
+    }
+
+    #[tokio::test]
+    async fn context_window_returns_none_on_http_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let resp = b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+                stream.write_all(resp).await.ok();
+            }
+        });
+        let provider =
+            AnthropicProvider::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        assert_eq!(provider.context_window("claude-opus-4-8").await, None);
     }
 
     #[test]
