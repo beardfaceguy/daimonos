@@ -34,6 +34,9 @@ impl LlmProvider for OpenRouterProvider {
             "stream": false,
         });
 
+        if let Some(t) = opts.temperature {
+            body["temperature"] = json!(t);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
@@ -94,6 +97,9 @@ impl LlmProvider for OpenRouterProvider {
             "stream": true,
         });
 
+        if let Some(t) = opts.temperature {
+            body["temperature"] = json!(t);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }

@@ -156,6 +156,10 @@ pub struct CompleteOpts {
     pub model: String,
     pub max_tokens: u32,
     pub thinking: ThinkingLevel,
+    /// Sampling temperature. `None` (default) sends no sampling params at
+    /// all — the provider/model default applies. Set (e.g. `Some(0.0)`) by
+    /// the compaction summarizer for deterministic summaries (ADR-002).
+    pub temperature: Option<f64>,
 }
 
 impl Default for CompleteOpts {
@@ -164,6 +168,7 @@ impl Default for CompleteOpts {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 8192,
             thinking: ThinkingLevel::default(),
+            temperature: None,
         }
     }
 }
