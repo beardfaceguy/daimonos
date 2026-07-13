@@ -55,7 +55,21 @@ pub fn run(
                     }
                     ("graphify", Box::new(GraphifySubstrate))
                 }
-                Some("x07") => ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))),
+                Some("x07") => {
+                    // Symmetric to the graphify guard: an explicit x07 request
+                    // with no *.x07.json sources indexes empty, and populate's
+                    // prune would wipe the existing graph. Refuse non-destructively.
+                    if !crate::kgl::autoindex::has_x07_sources(workspace, cfg) {
+                        return Ok(json!({
+                            "indexed": false,
+                            "substrate": "x07",
+                            "nodes": 0,
+                            "edges": 0,
+                            "reason": "x07 substrate requested but no *.x07.json sources found — refusing to index (would prune the existing graph)",
+                        }));
+                    }
+                    ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone())))
+                }
                 Some(other) => {
                     return Err(anyhow!(
                         "kgl_query: unknown substrate '{other}' (expected x07|graphify)"
@@ -414,6 +428,76 @@ mod tests {
             .iter()
             .any(|r| r["name"] == json!("authenticate")),
             "explicit graphify against a stub graph must not prune the existing graph"
+        );
+    }
+
+    #[test]
+    fn explicit_x07_with_no_sources_refuses_and_preserves_existing_graph() {
+        // Symmetric to the graphify guard: an explicit `substrate:"x07"` request
+        // with no *.x07.json sources must refuse non-destructively rather than
+        // populate empty and prune an existing (graphify-built) graph.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("graphify-out")).unwrap();
+        std::fs::write(
+            ws.join("graphify-out").join("graph.json"),
+            r#"{"nodes":[{"id":"n1","label":".foo()","file_type":"code","source_file":"src/a.rs"}],"links":[]}"#,
+        )
+        .unwrap();
+        // Build the graphify graph first.
+        let idx = run(
+            ws,
+            "index",
+            &json!({"substrate": "graphify"}),
+            "t0",
+            &KglConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(idx["indexed"], json!(true));
+        assert!(run(
+            ws,
+            "find",
+            &json!({"q": "foo"}),
+            "t0",
+            &KglConfig::default()
+        )
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == json!(".foo()")));
+
+        // Explicit x07 with no *.x07.json sources: must refuse, not prune.
+        let x = run(
+            ws,
+            "index",
+            &json!({"substrate": "x07"}),
+            "t1",
+            &KglConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            x["indexed"],
+            json!(false),
+            "must refuse when no x07 sources exist"
+        );
+        assert_eq!(x["substrate"], json!("x07"));
+
+        // The graphify graph must survive.
+        assert!(
+            run(
+                ws,
+                "find",
+                &json!({"q": "foo"}),
+                "t2",
+                &KglConfig::default()
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == json!(".foo()")),
+            "explicit x07 with no sources must not prune the existing graph"
         );
     }
 
