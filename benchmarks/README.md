@@ -119,6 +119,11 @@ OpenRouter often reports `0` — tokens are the honest cross-runtime metric.
   delta (only the new lines for that run).
 - **Cursor `tool_calls` is reported as 0** — cursor-agent's stream-json does not
   expose `tool_use` blocks the way Claude's does. Token counts are unaffected.
+- **daimonos reports `llm_calls` instead of `tool_calls`** — its token log
+  records LLM round-trips, not tool invocations, so `tool_calls` is `null`.
+- **The cursor arm moves `workspace/.cursor/mcp.json` aside** for the duration
+  (restored on exit) — it registers the daimonos MCP server for the tool-config
+  benchmark and would contaminate a native-tools-only arm.
 - Task 07 (snapshot) is daimonos-tool-specific and is skipped by all three arms.
 
 ## Structure

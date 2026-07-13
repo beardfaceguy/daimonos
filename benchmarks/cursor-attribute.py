@@ -37,11 +37,20 @@ def to_int(s):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # Single-pass arg parsing: --buffer consumes its value so a bare number
+    # is never mistaken for a positional argument.
+    args = []
     buffer_s = 5
-    for i, a in enumerate(sys.argv):
-        if a == "--buffer" and i + 1 < len(sys.argv):
-            buffer_s = int(sys.argv[i + 1])
+    it = iter(sys.argv[1:])
+    for a in it:
+        if a == "--buffer":
+            try:
+                buffer_s = int(next(it))
+            except (StopIteration, ValueError):
+                print("--buffer requires an integer argument")
+                sys.exit(1)
+        else:
+            args.append(a)
     if len(args) < 2:
         print(__doc__)
         sys.exit(1)
@@ -59,7 +68,10 @@ def main():
     rows.sort(key=lambda r: r["_dt"])
     used = set()
 
-    updated = 0
+    # Collect cursor task summaries with their raw windows first, sorted by
+    # start time, so buffered windows can be clamped against neighbors — the
+    # buffer must never extend into an adjacent task's actual run window.
+    tasks = []
     for fn in sorted(os.listdir(run_dir)):
         if not fn.endswith(".json"):
             continue
@@ -69,10 +81,28 @@ def main():
         if s.get("runtime") != "cursor" or "started_at" not in s:
             continue
         try:
-            start = parse_iso(s["started_at"]) - timedelta(seconds=buffer_s)
-            end = parse_iso(s["ended_at"]) + timedelta(seconds=buffer_s)
+            raw_start = parse_iso(s["started_at"])
+            raw_end = parse_iso(s["ended_at"])
         except (ValueError, KeyError):
             continue
+        tasks.append({"path": path, "summary": s, "raw_start": raw_start,
+                      "raw_end": raw_end})
+    tasks.sort(key=lambda t: t["raw_start"])
+
+    buf = timedelta(seconds=buffer_s)
+    for i, t in enumerate(tasks):
+        start = t["raw_start"] - buf
+        end = t["raw_end"] + buf
+        if i > 0:
+            start = max(start, tasks[i - 1]["raw_end"])
+        if i + 1 < len(tasks):
+            end = min(end, tasks[i + 1]["raw_start"])
+        t["start"], t["end"] = start, end
+
+    updated = 0
+    for t in tasks:
+        path, s = t["path"], t["summary"]
+        start, end = t["start"], t["end"]
 
         cost = 0.0
         csv_total = 0

@@ -7,17 +7,25 @@
 //
 // Usage:
 //   extract-tokens.js <runtime> <rawFile> <tokenlog|-> <taskId> <taskName> \
-//                     <modelSlug> <canon> <startedAt> <endedAt> <wallMs> <outFile>
+//                     <modelSlug> <canon> <startedAt> <endedAt> <wallMs> \
+//                     <exitCode> <outFile>
 //
 //   runtime  = daimonos | claude | cursor
 //   rawFile  = claude/cursor stream-json (.jsonl) or daimonos stdout (.txt)
 //   tokenlog = daimonos --debug-tokens delta (new lines only), or "-" otherwise
+//   exitCode = the CLI's exit code (feeds is_error)
 
 const fs = require('fs');
 
 const [runtime, rawFile, tokenlog, taskId, taskName, modelSlug, canon,
-  startedAt, endedAt, wallMsStr, outFile] = process.argv.slice(2);
+  startedAt, endedAt, wallMsStr, exitCodeStr, outFile] = process.argv.slice(2);
+if (!outFile) {
+  console.error('usage: extract-tokens.js <runtime> <rawFile> <tokenlog> <taskId> ' +
+    '<taskName> <modelSlug> <canon> <startedAt> <endedAt> <wallMs> <exitCode> <outFile>');
+  process.exit(2);
+}
 const wallMs = parseInt(wallMsStr, 10) || 0;
+const exitCode = parseInt(exitCodeStr, 10) || 0;
 
 function readLines(path) {
   try {
@@ -51,7 +59,11 @@ function countToolCalls(events) {
 }
 
 let m = { input: 0, cache_write: 0, cache_read: 0, output: 0, cost: 0 };
+// tool_calls: real count from tool_use blocks (claude; cursor's stream lacks
+// them and reports 0). For daimonos the token log has LLM calls, not tool
+// calls, so tool_calls is null and llm_calls carries the turn count instead.
 let toolCalls = 0;
+let llmCalls = null;
 let isError = true;
 let cost = null; // null = unknown (Cursor: comes from admin CSV later)
 
@@ -65,7 +77,8 @@ if (runtime === 'claude') {
   m.output = u.output_tokens || 0;
   cost = result ? (result.total_cost_usd || 0) : 0;
   toolCalls = countToolCalls(events);
-  isError = result ? (result.is_error !== undefined ? result.is_error : true) : true;
+  isError = exitCode !== 0 ||
+    (result ? (result.is_error !== undefined ? result.is_error : true) : true);
 } else if (runtime === 'cursor') {
   const events = jsonEvents(rawFile);
   const result = events.find((e) => e.type === 'result') || null;
@@ -76,15 +89,27 @@ if (runtime === 'claude') {
   m.output = u.outputTokens || 0;
   cost = null; // cursor-agent does not emit cost; joined from admin CSV
   toolCalls = countToolCalls(events);
-  isError = result ? (result.is_error !== undefined ? result.is_error : true) : true;
+  isError = exitCode !== 0 ||
+    (result ? (result.is_error !== undefined ? result.is_error : true) : true);
 } else if (runtime === 'daimonos') {
   // Sum per-LLM-call lines from the --debug-tokens delta; skip non-call
   // event lines (e.g. compaction) which carry no input/output token fields.
+  // The log is a global shared file, so additionally filter to this task's
+  // time window (with skew slack) — a concurrent daimonos process appending
+  // to the same log can't contaminate the sums.
+  const SKEW_MS = 2000;
+  const winStart = Date.parse(startedAt) - SKEW_MS;
+  const winEnd = Date.parse(endedAt) + SKEW_MS;
+  const hasWindow = !Number.isNaN(winStart) && !Number.isNaN(winEnd);
   let calls = 0;
   let sawLine = false;
   for (const ev of jsonEvents(tokenlog)) {
     if (ev.event) continue; // compaction / other structured events
     if (typeof ev.input !== 'number' && typeof ev.output !== 'number') continue;
+    if (hasWindow && ev.ts) {
+      const t = Date.parse(ev.ts);
+      if (!Number.isNaN(t) && (t < winStart || t > winEnd)) continue;
+    }
     m.input += ev.input || 0;
     m.cache_write += ev.cache_write || 0;
     m.cache_read += ev.cache_read || 0;
@@ -95,10 +120,9 @@ if (runtime === 'claude') {
     sawLine = true;
   }
   cost = m.cost; // OpenRouter path often reports 0; tokens are primary
-  toolCalls = calls > 0 ? calls - 1 : 0; // calls ~= turns; last is the answer turn
-  // daimonos exits 0 on success; the runner records is_error via exit code in
-  // meta, but if we got at least one token line the call reached the model.
-  isError = !sawLine;
+  toolCalls = null; // the token log records LLM calls, not tool invocations
+  llmCalls = calls;
+  isError = exitCode !== 0 || !sawLine;
 } else {
   console.error('unknown runtime: ' + runtime);
   process.exit(2);
@@ -122,6 +146,8 @@ const summary = {
   total_tokens: total,
   cost_usd: cost,
   tool_calls: toolCalls,
+  llm_calls: llmCalls,
+  exit_code: exitCode,
   is_error: isError,
   success: !isError, // upgraded to correctness-gated by check-task.js
 };
@@ -129,11 +155,12 @@ const summary = {
 fs.writeFileSync(outFile, JSON.stringify(summary, null, 2));
 
 const costStr = cost === null ? 'n/a (csv)' : ('$' + Number(cost).toFixed(4));
+const callsStr = toolCalls === null ? ('llm-calls:' + llmCalls) : ('tools:' + toolCalls);
 console.log('       tokens: ' + total.toLocaleString() +
   ' (in:' + m.input.toLocaleString() +
   ' cw:' + m.cache_write.toLocaleString() +
   ' cr:' + m.cache_read.toLocaleString() +
   ' out:' + m.output.toLocaleString() + ')' +
-  ' | tools:' + toolCalls +
+  ' | ' + callsStr +
   ' | cost:' + costStr +
   ' | wall:' + wallMs.toLocaleString() + 'ms');

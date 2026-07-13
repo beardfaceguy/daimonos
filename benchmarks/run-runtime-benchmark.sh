@@ -100,11 +100,30 @@ if [ "$RUNTIME" = "daimonos" ]; then
   # avoids needing a resolved context window. DAIMONOS_AGENT_COMPACTION is a
   # required key, so add it if the source env omits it.
   if grep -q '^DAIMONOS_AGENT_COMPACTION=' "$BENCH_AGENT_ENV"; then
-    sed -i 's/^DAIMONOS_AGENT_COMPACTION=.*/DAIMONOS_AGENT_COMPACTION=off/' "$BENCH_AGENT_ENV"
+    # Portable in-place edit (GNU/BSD sed -i flags differ): rewrite via temp file.
+    sed 's/^DAIMONOS_AGENT_COMPACTION=.*/DAIMONOS_AGENT_COMPACTION=off/' \
+      "$BENCH_AGENT_ENV" > "$BENCH_AGENT_ENV.tmp"
+    mv "$BENCH_AGENT_ENV.tmp" "$BENCH_AGENT_ENV"
   else
+    # Guard against a source env with no trailing newline before appending.
+    if [ -s "$BENCH_AGENT_ENV" ] && [ -n "$(tail -c 1 "$BENCH_AGENT_ENV")" ]; then
+      printf '\n' >> "$BENCH_AGENT_ENV"
+    fi
     printf 'DAIMONOS_AGENT_COMPACTION=off\n' >> "$BENCH_AGENT_ENV"
   fi
   chmod 600 "$BENCH_AGENT_ENV"
+fi
+
+# The bench workspace carries a .cursor/mcp.json that registers the daimonos
+# MCP server (for the tool-config benchmark). The cursor runtime arm must use
+# native tools ONLY, so move it aside for the duration and restore on exit.
+CURSOR_MCP="$WORKSPACE/.cursor/mcp.json"
+restore_cursor_mcp() {
+  [ -f "$CURSOR_MCP.bench-disabled" ] && mv "$CURSOR_MCP.bench-disabled" "$CURSOR_MCP"
+}
+if [ "$RUNTIME" = "cursor" ] && [ -f "$CURSOR_MCP" ]; then
+  mv "$CURSOR_MCP" "$CURSOR_MCP.bench-disabled"
+  trap restore_cursor_mcp EXIT INT TERM
 fi
 
 json_field() {
@@ -156,6 +175,11 @@ run_task() {
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   start_s="$(date +%s)"
 
+  # stderr goes to a per-task file (NOT /dev/null) so auth/runtime failures
+  # are inspectable; the CLI exit code is recorded and feeds is_error.
+  err_file="$RUN_DIR/${task_id}.stderr.log"
+  rc=0
+
   cd "$WORKSPACE"
   case "$RUNTIME" in
     claude)
@@ -165,23 +189,25 @@ run_task() {
       printf '%s' "$prompt" | "$CLAUDE" -p --output-format stream-json --verbose \
         --model "$MODEL_SLUG" --dangerously-skip-permissions \
         --no-session-persistence --strict-mcp-config \
-        > "$raw_file" 2>/dev/null || true
+        > "$raw_file" 2> "$err_file" || rc=$?
       ;;
     cursor)
       raw_file="$RUN_DIR/${task_id}.raw.jsonl"
       printf '%s' "$prompt" | "$CURSOR" -p --output-format stream-json \
         --model "$MODEL_SLUG" --force \
-        > "$raw_file" 2>/dev/null || true
+        > "$raw_file" 2> "$err_file" || rc=$?
       ;;
     daimonos)
       raw_file="$RUN_DIR/${task_id}.raw.txt"
       fmt="text"
       # Capture the token-log offset so we read only THIS run's call lines.
+      # (extract-tokens.js additionally filters the delta by this task's time
+      # window, so a concurrent daimonos process can't contaminate the sums.)
       pre_lines=0
       [ -f "$TOKEN_LOG" ] && pre_lines="$(wc -l < "$TOKEN_LOG" | tr -d ' ')"
       "$DAIMONOS_BIN" --debug-tokens -w "$WORKSPACE" agent "$prompt" \
         --model "$MODEL_SLUG" --agent-env "$BENCH_AGENT_ENV" \
-        > "$raw_file" 2>/dev/null || true
+        > "$raw_file" 2> "$err_file" || rc=$?
       if [ -f "$TOKEN_LOG" ]; then
         tail -n "+$((pre_lines + 1))" "$TOKEN_LOG" > "$tokenlog_file" || true
       else
@@ -194,9 +220,15 @@ run_task() {
   ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   wall_ms=$(( (end_s - start_s) * 1000 ))
 
+  if [ "$rc" -ne 0 ]; then
+    echo "       WARN: $RUNTIME exited $rc — see $err_file"
+  elif [ ! -s "$raw_file" ]; then
+    echo "       WARN: $RUNTIME produced no output — see $err_file"
+  fi
+
   node "$SCRIPT_DIR/extract-tokens.js" "$RUNTIME" "$raw_file" "$tokenlog_file" \
     "$task_id" "$task_name" "$MODEL_SLUG" "$CANON" \
-    "$started_at" "$ended_at" "$wall_ms" "$out_file"
+    "$started_at" "$ended_at" "$wall_ms" "$rc" "$out_file"
 
   # Correctness gate: response checks read the transcript in the runtime's
   # format; workspace checks (filesystem ground truth) are format-agnostic.
