@@ -159,15 +159,7 @@ async fn curl_request(cwd: &Path, args: Option<&Value>) -> Result<Value, String>
     let (headers_raw, body_raw) = split_headers_body(content);
     let headers = parse_headers(headers_raw);
 
-    let body = if body_raw.len() > MAX_BODY_BYTES {
-        format!(
-            "{}...[{} bytes truncated]",
-            &body_raw[..MAX_BODY_BYTES],
-            body_raw.len() - MAX_BODY_BYTES
-        )
-    } else {
-        body_raw.to_string()
-    };
+    let body = truncate_body(body_raw);
 
     Ok(json!({
         "status": status_code,
@@ -191,6 +183,16 @@ fn parse_metrics(s: &str) -> (i64, f64) {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
     (status, (time_s * 1000.0).round())
+}
+
+/// Cap a response body at `MAX_BODY_BYTES`, flooring the cut to a char boundary
+/// so a multi-byte UTF-8 char straddling the cap can't panic the slice.
+fn truncate_body(body: &str) -> String {
+    if body.len() <= MAX_BODY_BYTES {
+        return body.to_string();
+    }
+    let end = crate::plugins::floor_char_boundary(body, MAX_BODY_BYTES);
+    format!("{}...[{} bytes truncated]", &body[..end], body.len() - end)
 }
 
 fn split_headers_body(s: &str) -> (&str, &str) {
@@ -224,6 +226,25 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     // --- Pure parsing tests ---
+
+    #[test]
+    fn truncate_body_does_not_panic_on_multibyte_char_at_cap() {
+        // '€' (3 bytes) straddles MAX_BODY_BYTES; a raw byte slice would panic.
+        let mut body = "a".repeat(MAX_BODY_BYTES - 1);
+        body.push('€');
+        body.push_str("tail");
+        let out = truncate_body(&body);
+        assert!(out.contains("bytes truncated]"));
+        assert!(
+            !out.contains('€'),
+            "the straddling char must be dropped, not split"
+        );
+    }
+
+    #[test]
+    fn truncate_body_passes_through_short_bodies() {
+        assert_eq!(truncate_body("hello"), "hello");
+    }
 
     #[test]
     fn parse_metrics_extracts_status_and_time() {

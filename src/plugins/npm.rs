@@ -83,11 +83,9 @@ const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
 fn truncate(s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
-        format!(
-            "{}...[{} bytes truncated]",
-            &s[..MAX_OUTPUT_BYTES],
-            s.len() - MAX_OUTPUT_BYTES
-        )
+        // Floor to a char boundary: a raw byte cut mid-UTF-8 char panics.
+        let end = crate::plugins::floor_char_boundary(&s, MAX_OUTPUT_BYTES);
+        format!("{}...[{} bytes truncated]", &s[..end], s.len() - end)
     } else {
         s
     }
@@ -225,6 +223,20 @@ fn compact_audit(full: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_char_at_cap() {
+        // A 3-byte '€' straddles MAX_OUTPUT_BYTES; a raw byte slice would panic.
+        let mut s = "a".repeat(MAX_OUTPUT_BYTES - 1);
+        s.push('€');
+        s.push_str("tail");
+        let out = truncate(s);
+        assert!(out.contains("bytes truncated]"));
+        assert!(
+            !out.contains('€'),
+            "the straddling char must be dropped, not split"
+        );
+    }
 
     #[test]
     fn npm_is_available() {

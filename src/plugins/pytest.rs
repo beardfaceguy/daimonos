@@ -99,7 +99,9 @@ fn cap_output(s: String) -> String {
         return s;
     }
     let half = MAX_OUTPUT_CHARS / 2;
-    let head = &s[..half];
+    // Floor the head cut to a char boundary: `half` is a byte offset and a raw
+    // cut mid-UTF-8 char panics (the tail below is already boundary-aligned).
+    let head = &s[..crate::plugins::floor_char_boundary(&s, half)];
     // Find a char boundary going backwards from `half` into the tail.
     let tail_start = s.len() - half;
     let tail_start = s
@@ -340,6 +342,17 @@ mod tests {
     use super::*;
     use crate::tool_runner::ToolRegistry;
     use std::sync::Arc;
+
+    #[test]
+    fn cap_output_does_not_panic_on_multibyte_char_at_head_cut() {
+        // '€' (3 bytes) straddles the head cut at MAX_OUTPUT_CHARS/2.
+        let half = MAX_OUTPUT_CHARS / 2;
+        let mut s = "a".repeat(half - 1);
+        s.push('€');
+        s.push_str(&"b".repeat(MAX_OUTPUT_CHARS));
+        let out = cap_output(s);
+        assert!(out.contains("chars truncated"));
+    }
 
     const PASSING_TEST: &str = r#"def test_add():
     assert 1 + 1 == 2
