@@ -15,11 +15,14 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const [taskFile, rawFile, workspace, summaryFile] = process.argv.slice(2);
+const [taskFile, rawFile, workspace, summaryFile, format] = process.argv.slice(2);
 if (!summaryFile) {
-  console.error('usage: check-task.js <task.json> <raw.jsonl> <workspace> <summary.json>');
+  console.error('usage: check-task.js <task.json> <raw.jsonl> <workspace> <summary.json> [format]');
   process.exit(2);
 }
+// format: "stream-json" (default; claude/cursor emit a JSON event stream) or
+// "text" (daimonos agent writes plain assistant text to stdout, not events).
+const rawFormat = format || 'stream-json';
 
 const task = JSON.parse(fs.readFileSync(taskFile, 'utf8'));
 const checks = task.checks || [];
@@ -27,12 +30,15 @@ const checks = task.checks || [];
 // The final response text lives in the stream's `result` event; fall back to
 // concatenated assistant text blocks for streams that lack one.
 function finalText() {
-  let lines;
+  let raw;
   try {
-    lines = fs.readFileSync(rawFile, 'utf8').split('\n');
+    raw = fs.readFileSync(rawFile, 'utf8');
   } catch (e) {
     return '';
   }
+  // daimonos agent: the whole stdout IS the response text.
+  if (rawFormat === 'text') return raw;
+  const lines = raw.split('\n');
   let assistantText = '';
   for (const line of lines) {
     if (!line.trim()) continue;

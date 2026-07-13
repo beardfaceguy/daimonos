@@ -1,0 +1,21 @@
+{
+  "_comment": "Canonical model name -> per-runtime slug. Add Opus/fable etc. by editing here only. A null slug means that runtime cannot run that canonical model and is skipped for it (e.g. fable is not in daimonos's OpenRouter allowlist). Baseline is non-thinking; the *-high cursor slugs and the claude/daimonos defaults are non-thinking variants.",
+  "sonnet": {
+    "label": "Sonnet 5 (non-thinking)",
+    "daimonos": "anthropic/claude-sonnet-5",
+    "claude": "sonnet",
+    "cursor": "claude-sonnet-5-high"
+  },
+  "opus": {
+    "label": "Opus 4.8 (non-thinking)",
+    "daimonos": "anthropic/claude-opus-4.8",
+    "claude": "opus",
+    "cursor": "claude-opus-4-8-high"
+  },
+  "fable": {
+    "label": "Fable 5 (non-thinking)",
+    "daimonos": null,
+    "claude": "fable",
+    "cursor": "claude-fable-5-high"
+  }
+}

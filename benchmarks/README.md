@@ -60,12 +60,83 @@ early ad-hoc estimate of ~1.5h was ~2.7× too high because these tasks are short
 **Latest results and methodology: [results/2026-07-06-gated-three-arm.md](results/2026-07-06-gated-three-arm.md)**
 (the pre-2026-07 numbers below and any “~27% savings” figures are superseded).
 
+## Runtime comparison (daimonos-agent vs Claude CLI vs Cursor CLI)
+
+**Different axis from the benchmark above.** `run-benchmark.sh` runs the *same*
+Claude CLI for every arm and only toggles the daimonos MCP on/off — it isolates
+the *tools*. `run-runtime-benchmark.sh` instead compares three whole **agent
+runtimes**, each using its *own native tools*, on identical tasks:
+
+| Runtime | Command | Tools |
+|---|---|---|
+| `daimonos` | `daimonos agent … --agent-env <bench-env>` | native daimonos tools |
+| `claude` | `claude -p --output-format stream-json` | Claude Code built-in tools |
+| `cursor` | `cursor-agent -p --output-format stream-json --force` | cursor-agent built-in tools |
+
+### Quick start
+
+```bash
+# One runtime at a time (writes results/<ts>-<runtime>-<model>[-tag]/):
+BENCH_TAG=run1 ./run-runtime-benchmark.sh daimonos
+BENCH_TAG=run1 ./run-runtime-benchmark.sh claude
+BENCH_TAG=run1 ./run-runtime-benchmark.sh cursor
+
+# Normalized, correctness-gated token report across whatever runtimes are present:
+python3 analyze-runtimes.py results run1
+
+# Cursor emits tokens inline but NOT cost; after the Cursor admin usage report
+# populates, join dollar cost by time window (download the CSV from the admin page):
+python3 cursor-attribute.py results/<cursor-run-dir> ~/Downloads/team-usage-events-*.csv
+```
+
+### Models
+
+Slugs live in `models.json` as a canonical→per-runtime map, so adding Opus/fable
+is a one-line edit. Pick one with `BENCH_CANON_MODEL` (default `sonnet`, the
+non-thinking baseline). A `null` slug means that runtime skips that model (e.g.
+fable is not in daimonos's OpenRouter allowlist).
+
+```bash
+BENCH_CANON_MODEL=opus ./run-runtime-benchmark.sh claude
+```
+
+### Normalized metric schema
+
+Every runtime is collapsed to one schema (`extract-tokens.js`):
+`input` (fresh/non-cached) · `cache_write` · `cache_read` · `output` ·
+`total_tokens` (= sum of the four, matching Cursor's admin "Total Tokens") · `cost_usd`.
+
+Lead with **token counts** for efficiency. **Costs are not provider-neutral**
+(daimonos→OpenRouter, claude→Anthropic, cursor→Cursor) and daimonos via
+OpenRouter often reports `0` — tokens are the honest cross-runtime metric.
+
+### Runtime notes
+
+- **daimonos runs headless** via a generated bench env
+  (`~/.config/daimonos/agent.bench.env`, kept out of the repo — it has the API
+  key): a copy of your `agent.env` with `APPROVAL_MODE=auto` and
+  `COMPACTION=off`. Per-task token usage is read from the `--debug-tokens` log
+  delta (only the new lines for that run).
+- **Cursor `tool_calls` is reported as 0** — cursor-agent's stream-json does not
+  expose `tool_use` blocks the way Claude's does. Token counts are unaffected.
+- **daimonos reports `llm_calls` instead of `tool_calls`** — its token log
+  records LLM round-trips, not tool invocations, so `tool_calls` is `null`.
+- **The cursor arm moves `workspace/.cursor/mcp.json` aside** for the duration
+  (restored on exit) — it registers the daimonos MCP server for the tool-config
+  benchmark and would contaminate a native-tools-only arm.
+- Task 07 (snapshot) is daimonos-tool-specific and is skipped by all three arms.
+
 ## Structure
 
 ```
 benchmarks/
 ├── README.md                  # This file
-├── run-benchmark.sh           # Runner script — executes tasks via agent CLI
+├── run-benchmark.sh           # Tool-config benchmark (Claude CLI, MCP on/off)
+├── run-runtime-benchmark.sh   # Runtime benchmark (daimonos/claude/cursor, native tools)
+├── models.json                # Canonical→per-runtime model slug map
+├── extract-tokens.js          # Normalizes per-runtime usage into one schema
+├── analyze-runtimes.py        # 3-arm normalized, correctness-gated token report
+├── cursor-attribute.py        # Joins Cursor admin CSV cost by time window
 ├── setup-mcp.sh               # Configures .cursor/mcp.json for daimonos mode
 ├── analyze-results.py         # Compares results across runs
 ├── compare-models.py          # Cross-model comparison report
