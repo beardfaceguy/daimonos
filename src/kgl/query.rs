@@ -36,7 +36,25 @@ pub fn run(
                 .get("substrate")
                 .and_then(|v| v.as_str())
             {
-                Some("graphify") => ("graphify", Box::new(GraphifySubstrate)),
+                Some("graphify") => {
+                    // Explicit graphify still needs the code-node guard: a
+                    // missing/empty/stub graph.json indexes empty, and populate's
+                    // prune would then wipe the existing graph and its agent
+                    // metadata. Refuse non-destructively instead (mirrors the
+                    // auto-detect fall-through in autoindex::detect).
+                    if !crate::kgl::autoindex::graphify_has_code_nodes(
+                        &workspace.join("graphify-out").join("graph.json"),
+                    ) {
+                        return Ok(json!({
+                            "indexed": false,
+                            "substrate": "graphify",
+                            "nodes": 0,
+                            "edges": 0,
+                            "reason": "graphify substrate requested but graphify-out/graph.json is missing, empty, or has no code nodes — refusing to index (would prune the existing graph)",
+                        }));
+                    }
+                    ("graphify", Box::new(GraphifySubstrate))
+                }
                 Some("x07") => ("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))),
                 Some(other) => {
                     return Err(anyhow!(
@@ -334,6 +352,69 @@ mod tests {
         assert_eq!(idx["substrate"], json!("graphify"));
         assert_eq!(idx["indexed"], json!(true));
         assert!(idx["nodes"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn explicit_graphify_with_stub_graph_refuses_and_preserves_existing_graph() {
+        // Blocker regression: an explicit `substrate:"graphify"` request against
+        // a missing/empty/stub graph.json must NOT populate (its prune would wipe
+        // the graph) — it must refuse non-destructively and leave an existing
+        // x07-built graph intact.
+        let tmp = workspace(); // has svc.x07.json with `authenticate`
+        let ws = tmp.path();
+        run(ws, "index", &json!({}), "t0", &KglConfig::default()).unwrap();
+        assert!(run(
+            ws,
+            "find",
+            &json!({"q": "authenticate"}),
+            "t0",
+            &KglConfig::default()
+        )
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == json!("authenticate")));
+
+        // Stub graphify graph: valid JSON, zero code nodes.
+        std::fs::create_dir_all(ws.join("graphify-out")).unwrap();
+        std::fs::write(
+            ws.join("graphify-out").join("graph.json"),
+            br#"{"nodes":[],"links":[]}"#,
+        )
+        .unwrap();
+
+        let idx = run(
+            ws,
+            "index",
+            &json!({"substrate": "graphify"}),
+            "t1",
+            &KglConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            idx["indexed"],
+            json!(false),
+            "must refuse to index a stub graph"
+        );
+        assert_eq!(idx["substrate"], json!("graphify"));
+
+        // The pre-existing x07 graph must survive (not pruned).
+        assert!(
+            run(
+                ws,
+                "find",
+                &json!({"q": "authenticate"}),
+                "t2",
+                &KglConfig::default()
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == json!("authenticate")),
+            "explicit graphify against a stub graph must not prune the existing graph"
+        );
     }
 
     #[test]
