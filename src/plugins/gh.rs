@@ -325,10 +325,7 @@ fn cap_str(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = crate::plugins::floor_char_boundary(s, max);
     (
         format!("{}\n[truncated {} bytes]", &s[..end], s.len() - end),
         true,

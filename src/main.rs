@@ -228,12 +228,19 @@ struct Cli {
     command: Option<Commands>,
 }
 
+/// Resolve the user's home directory from `$HOME`. Single seam for every
+/// `~`-rooted daimonos path (debug log, chat/acp session stores) so the
+/// lookup lives in one place instead of being re-read inline at each site.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 /// Resolve the fixed `--debug-tokens` log path, creating its parent
 /// directory if missing. Returns `None` (silently) if `$HOME` can't be
 /// resolved or the directory can't be created — a debug log must not be
 /// able to block startup.
 fn debug_tokens_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = home_dir()?;
     let dir = home.join(".config/daimonos");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("token-debug.log"))
@@ -379,11 +386,7 @@ async fn main() -> anyhow::Result<()> {
             // Chat sessions persist under ~/.daimonos so `--resume`/`--list`
             // can restore a prior conversation (vikunja #963). Separate dir
             // from acp-sessions to keep the two id namespaces from colliding.
-            let sessions_dir = std::env::var_os("HOME").map(|h| {
-                std::path::PathBuf::from(h)
-                    .join(".daimonos")
-                    .join("chat-sessions")
-            });
+            let sessions_dir = home_dir().map(|h| h.join(".daimonos").join("chat-sessions"));
             // --list is a pure query: enumerate saved sessions and exit
             // without loading the agent env / building a provider.
             if list {
@@ -496,11 +499,7 @@ async fn main() -> anyhow::Result<()> {
             // Persist ACP sessions under ~/.daimonos so session/load can
             // resume a thread after this process exits and Zed re-requests a
             // session id from a previous run (see acp_cmd::SessionStore).
-            let sessions_dir = std::env::var_os("HOME").map(|h| {
-                std::path::PathBuf::from(h)
-                    .join(".daimonos")
-                    .join("acp-sessions")
-            });
+            let sessions_dir = home_dir().map(|h| h.join(".daimonos").join("acp-sessions"));
             acp_cmd::run_acp(
                 make_provider,
                 &workspace,
