@@ -39,7 +39,19 @@ pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dy
     if graphify_has_code_nodes(&workspace.join("graphify-out").join("graph.json")) {
         return Some(("graphify", Box::new(GraphifySubstrate)));
     }
-    let has_x07 = filtered_walk_builder(workspace, &cfg.skip_dirs)
+    if has_x07_sources(workspace, cfg) {
+        return Some(("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))));
+    }
+    None
+}
+
+/// True if the workspace contains at least one `*.x07.json` source file (honoring
+/// `cfg.skip_dirs` so `target/`, `node_modules/`, etc. are never crawled).
+/// `pub(crate)` so the `kgl_query index` tool can guard an explicit
+/// `substrate:"x07"` request the same way — an empty x07 scan would otherwise
+/// prune an existing graph (symmetric to the graphify guard).
+pub(crate) fn has_x07_sources(workspace: &Path, cfg: &KglConfig) -> bool {
+    filtered_walk_builder(workspace, &cfg.skip_dirs)
         .build()
         .filter_map(|e| e.ok())
         .any(|e| {
@@ -47,11 +59,7 @@ pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dy
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.ends_with(".x07.json"))
-        });
-    if has_x07 {
-        return Some(("x07", Box::new(X07Substrate::new(cfg.skip_dirs.clone()))));
-    }
-    None
+        })
 }
 
 /// True if the graphify graph file parses and contains at least one `code`
