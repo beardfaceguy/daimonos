@@ -16,6 +16,7 @@
 
 use crate::compaction::CompactionPolicy;
 use crate::config::Config;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Embedded default: core agent system prompt (`daimonos agent` / `chat` / ACP).
@@ -28,6 +29,143 @@ pub const MCP_INSTRUCTIONS_DEFAULT: &str = include_str!("../prompts/mcp_instruct
 pub const KGL_HINT_DEFAULT: &str = include_str!("../prompts/kgl_hint.md");
 /// Embedded default: compaction summarizer system prompt.
 pub const SUMMARY_DEFAULT: &str = include_str!("../prompts/summary.md");
+
+/// Canonical prompt keys, in a stable display order. This is the single list
+/// used by `default_by_name`, the `--print-prompt` flag, and the `--dump-prompts`
+/// scaffold, so adding a prompt means editing here and `default_by_name` only.
+pub const PROMPT_NAMES: [&str; 4] = ["agent_system", "mcp_instructions", "kgl_hint", "summary"];
+
+/// Embedded baseline default for a prompt key, or `None` for an unknown key.
+/// Backs `--print-prompt` and `--dump-prompts` so binary-only users can recover
+/// the baseline they are overriding against (vikunja #980).
+pub fn default_by_name(name: &str) -> Option<&'static str> {
+    match name {
+        "agent_system" => Some(AGENT_SYSTEM_DEFAULT),
+        "mcp_instructions" => Some(MCP_INSTRUCTIONS_DEFAULT),
+        "kgl_hint" => Some(KGL_HINT_DEFAULT),
+        "summary" => Some(SUMMARY_DEFAULT),
+        _ => None,
+    }
+}
+
+/// Default scaffold directory for `--dump-prompts`: `<config_home>/daimonos/prompts`,
+/// aligned with where `config.toml` is discovered.
+pub fn default_prompts_dir() -> Option<PathBuf> {
+    crate::config::dirs_next().map(|d| d.join("daimonos").join("prompts"))
+}
+
+/// Default optional user-instructions file for the agent runtimes. This follows
+/// the same config-home resolution as `config.toml`: `$XDG_CONFIG_HOME` when
+/// set, otherwise `~/.config`.
+pub fn default_agent_instructions_path() -> Option<PathBuf> {
+    crate::config::dirs_next().map(|d| d.join("daimonos").join("agent-instructions.md"))
+}
+
+/// Load additional instructions for `agent`, `chat`, and ACP. An explicit CLI
+/// path must be readable. With no CLI override, a missing default file is the
+/// normal "no extra rules" case; any other read error is surfaced so an
+/// existing rules file is never silently ignored.
+pub async fn load_agent_instructions(
+    cli_path: Option<&std::path::Path>,
+) -> std::io::Result<Option<String>> {
+    let (path, missing_is_ok) = match cli_path {
+        Some(path) => (path.to_path_buf(), false),
+        None => match default_agent_instructions_path() {
+            Some(path) => (path, true),
+            None => return Ok(None),
+        },
+    };
+    read_agent_instructions(&path, missing_is_ok).await
+}
+
+async fn read_agent_instructions(
+    path: &std::path::Path,
+    missing_is_ok: bool,
+) -> std::io::Result<Option<String>> {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if missing_is_ok && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("cannot read {}: {error}", path.display()),
+        )),
+    }
+}
+
+/// Outcome of scaffolding the baseline prompts to disk.
+pub struct DumpReport {
+    pub dir: PathBuf,
+    pub written: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+/// Write every baseline prompt to `<dir>/<name>.md`. An empty/`None` `dir`
+/// resolves to `default_prompts_dir()`. Existing files are left untouched unless
+/// `force` is set (reported in `skipped`), so a re-run never clobbers a user's
+/// edited copy by accident.
+pub fn dump_defaults(dir: Option<&str>, force: bool) -> std::io::Result<DumpReport> {
+    let dir = match dir {
+        Some(d) if !d.trim().is_empty() => expand_tilde(d),
+        _ => default_prompts_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot resolve default prompts dir ($HOME/$XDG_CONFIG_HOME unset); pass a directory",
+            )
+        })?,
+    };
+    std::fs::create_dir_all(&dir)?;
+    let mut written = Vec::new();
+    let mut skipped = Vec::new();
+    for name in PROMPT_NAMES {
+        let path = dir.join(format!("{name}.md"));
+        let content = default_by_name(name)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("no embedded default registered for prompt '{name}'"),
+                )
+            })?
+            .as_bytes();
+        if force {
+            std::fs::write(&path, content)?;
+        } else {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => file.write_all(content)?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    skipped.push(name.to_string());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        written.push(name.to_string());
+    }
+    Ok(DumpReport {
+        dir,
+        written,
+        skipped,
+    })
+}
+
+/// A ready-to-paste `[prompts]` TOML block pointing every key at `<dir>/<name>.md`,
+/// for `--dump-prompts` to print after scaffolding.
+pub fn prompts_toml_block(dir: &std::path::Path) -> String {
+    let width = PROMPT_NAMES.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut out = String::from("[prompts]\n");
+    for name in PROMPT_NAMES {
+        let path = dir.join(format!("{name}.md"));
+        out.push_str(&format!(
+            "{name:<width$} = {:?}\n",
+            path.to_string_lossy(),
+            width = width
+        ));
+    }
+    out
+}
 
 /// Expand a leading `~/` to `$HOME`. Mirrors the tilde handling in
 /// `AnalyticsConfig::resolved_db_path`; kept local so this module has no
@@ -59,13 +197,30 @@ fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> String {
     }
 }
 
-/// Core agent system prompt for the `agent`/`chat`/ACP runtimes.
+/// Core agent system prompt for the `agent`/`chat`/ACP runtimes, followed by
+/// optional user instructions loaded during startup. The additional file is
+/// appended verbatim with only a blank-line separator — no hidden instruction
+/// text is injected around it.
 pub fn agent_system(cfg: &Config) -> String {
-    resolve(
+    let mut prompt = resolve(
         "agent_system",
         cfg.prompts.agent_system.as_deref(),
         AGENT_SYSTEM_DEFAULT,
-    )
+    );
+    let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() else {
+        return prompt;
+    };
+    if additional.is_empty() {
+        return prompt;
+    }
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    if !prompt.ends_with("\n\n") {
+        prompt.push('\n');
+    }
+    prompt.push_str(additional);
+    prompt
 }
 
 /// Static MCP server instructions (before dynamic workspace context is appended).
@@ -200,6 +355,65 @@ mod tests {
     }
 
     #[test]
+    fn additional_agent_instructions_append_to_resolved_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.md");
+        std::fs::write(&path, "CUSTOM AGENT PROMPT").unwrap();
+        let mut cfg = Config::default();
+        cfg.prompts.agent_system = Some(path.to_string_lossy().to_string());
+        cfg.prompts.additional_agent_instructions = Some("USER RULES\nverbatim\n".to_string());
+
+        assert_eq!(
+            agent_system(&cfg),
+            "CUSTOM AGENT PROMPT\n\nUSER RULES\nverbatim\n"
+        );
+    }
+
+    #[test]
+    fn empty_additional_agent_instructions_do_not_change_prompt() {
+        let mut cfg = Config::default();
+        cfg.prompts.additional_agent_instructions = Some(String::new());
+        assert_eq!(agent_system(&cfg), AGENT_SYSTEM_DEFAULT);
+    }
+
+    #[tokio::test]
+    async fn explicit_agent_instructions_file_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.md");
+        std::fs::write(&path, "MY RULES").unwrap();
+
+        assert_eq!(
+            load_agent_instructions(Some(&path))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("MY RULES")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_explicit_agent_instructions_file_errors() {
+        let path = std::path::Path::new("/definitely/not/agent-instructions.md");
+        let err = load_agent_instructions(Some(path)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn missing_default_agent_instructions_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-default.md");
+        assert_eq!(read_agent_instructions(&path, true).await.unwrap(), None);
+    }
+
+    #[test]
+    fn default_agent_instructions_path_uses_daimonos_config_dir() {
+        if let Some(path) = default_agent_instructions_path() {
+            assert!(path.ends_with("daimonos/agent-instructions.md"));
+        }
+    }
+
+    #[test]
     fn unreadable_override_falls_back_to_default() {
         let mut cfg = Config::default();
         cfg.prompts.mcp_instructions = Some("/definitely/not/a/real/prompt.md".to_string());
@@ -246,5 +460,73 @@ mod tests {
         let mut cfg = Config::default();
         cfg.prompts.summary = Some("/whatever.md".to_string());
         assert!(apply_summary_override(None, &cfg).is_none());
+    }
+
+    // --- baseline dump / scaffold (vikunja #980) ---
+
+    #[test]
+    fn default_by_name_covers_every_prompt_name() {
+        for name in PROMPT_NAMES {
+            assert!(
+                default_by_name(name).is_some(),
+                "missing default for {name}"
+            );
+        }
+        assert!(default_by_name("nope").is_none());
+    }
+
+    #[test]
+    fn dump_defaults_writes_all_prompts_with_matching_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prompts");
+        let report = dump_defaults(Some(&target.to_string_lossy()), false).unwrap();
+        assert_eq!(report.written.len(), PROMPT_NAMES.len());
+        assert!(report.skipped.is_empty());
+        for name in PROMPT_NAMES {
+            let content = std::fs::read_to_string(target.join(format!("{name}.md"))).unwrap();
+            assert_eq!(content, default_by_name(name).unwrap());
+        }
+    }
+
+    #[test]
+    fn dump_defaults_skips_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prompts");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("summary.md"), "USER EDITED").unwrap();
+
+        let report = dump_defaults(Some(&target.to_string_lossy()), false).unwrap();
+        assert!(report.skipped.contains(&"summary".to_string()));
+        assert_eq!(report.written.len(), PROMPT_NAMES.len() - 1);
+        // The user's edited file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(target.join("summary.md")).unwrap(),
+            "USER EDITED"
+        );
+    }
+
+    #[test]
+    fn dump_defaults_force_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prompts");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("summary.md"), "USER EDITED").unwrap();
+
+        let report = dump_defaults(Some(&target.to_string_lossy()), true).unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target.join("summary.md")).unwrap(),
+            SUMMARY_DEFAULT
+        );
+    }
+
+    #[test]
+    fn prompts_toml_block_lists_all_keys_under_dir() {
+        let block = prompts_toml_block(std::path::Path::new("/tmp/p"));
+        assert!(block.starts_with("[prompts]\n"));
+        for name in PROMPT_NAMES {
+            assert!(block.contains(&format!("{name} =")) || block.contains(&format!("{name}  ")));
+            assert!(block.contains(&format!("/tmp/p/{name}.md")));
+        }
     }
 }

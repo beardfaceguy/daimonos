@@ -1,16 +1,16 @@
-# Graph Report - daimonos  (2026-07-14)
+# Graph Report - daimonos  (2026-07-15)
 
 ## Corpus Check
-- 5517 files · ~6,359,190 words
+- 5518 files · ~6,361,149 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 52978 nodes · 97016 edges · 4796 communities (4016 shown, 780 thin omitted)
+- 53011 nodes · 97084 edges · 4704 communities (4003 shown, 701 thin omitted)
 - Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 5704 edges (avg confidence: 0.69)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `bbeecddd`
+- Built from commit: `d9a7b775`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -369,7 +369,6 @@
 - [[_COMMUNITY_Community 352|Community 352]]
 - [[_COMMUNITY_Community 353|Community 353]]
 - [[_COMMUNITY_Community 354|Community 354]]
-- [[_COMMUNITY_Community 355|Community 355]]
 - [[_COMMUNITY_Community 356|Community 356]]
 - [[_COMMUNITY_Community 357|Community 357]]
 - [[_COMMUNITY_Community 358|Community 358]]
@@ -1147,6 +1146,7 @@
 - [[_COMMUNITY_Community 1137|Community 1137]]
 - [[_COMMUNITY_Community 1138|Community 1138]]
 - [[_COMMUNITY_Community 1139|Community 1139]]
+- [[_COMMUNITY_Community 1140|Community 1140]]
 - [[_COMMUNITY_Community 1141|Community 1141]]
 - [[_COMMUNITY_Community 1142|Community 1142]]
 - [[_COMMUNITY_Community 1143|Community 1143]]
@@ -1970,7 +1970,6 @@
 - [[_COMMUNITY_Community 2012|Community 2012]]
 - [[_COMMUNITY_Community 2013|Community 2013]]
 - [[_COMMUNITY_Community 2014|Community 2014]]
-- [[_COMMUNITY_Community 2015|Community 2015]]
 - [[_COMMUNITY_Community 2016|Community 2016]]
 - [[_COMMUNITY_Community 2017|Community 2017]]
 - [[_COMMUNITY_Community 2018|Community 2018]]
@@ -1984,7 +1983,6 @@
 - [[_COMMUNITY_Community 2026|Community 2026]]
 - [[_COMMUNITY_Community 2027|Community 2027]]
 - [[_COMMUNITY_Community 2028|Community 2028]]
-- [[_COMMUNITY_Community 2029|Community 2029]]
 - [[_COMMUNITY_Community 2030|Community 2030]]
 - [[_COMMUNITY_Community 2031|Community 2031]]
 - [[_COMMUNITY_Community 2032|Community 2032]]
@@ -2429,105 +2427,13 @@
 - [[_COMMUNITY_Community 4687|Community 4687]]
 - [[_COMMUNITY_Community 4688|Community 4688]]
 - [[_COMMUNITY_Community 4689|Community 4689]]
-- [[_COMMUNITY_Community 4690|Community 4690]]
-- [[_COMMUNITY_Community 4691|Community 4691]]
-- [[_COMMUNITY_Community 4692|Community 4692]]
 - [[_COMMUNITY_Community 4693|Community 4693]]
-- [[_COMMUNITY_Community 4694|Community 4694]]
-- [[_COMMUNITY_Community 4695|Community 4695]]
-- [[_COMMUNITY_Community 4696|Community 4696]]
-- [[_COMMUNITY_Community 4697|Community 4697]]
-- [[_COMMUNITY_Community 4698|Community 4698]]
-- [[_COMMUNITY_Community 4699|Community 4699]]
-- [[_COMMUNITY_Community 4700|Community 4700]]
-- [[_COMMUNITY_Community 4701|Community 4701]]
-- [[_COMMUNITY_Community 4702|Community 4702]]
-- [[_COMMUNITY_Community 4703|Community 4703]]
-- [[_COMMUNITY_Community 4704|Community 4704]]
-- [[_COMMUNITY_Community 4705|Community 4705]]
-- [[_COMMUNITY_Community 4706|Community 4706]]
-- [[_COMMUNITY_Community 4707|Community 4707]]
-- [[_COMMUNITY_Community 4708|Community 4708]]
-- [[_COMMUNITY_Community 4709|Community 4709]]
-- [[_COMMUNITY_Community 4710|Community 4710]]
 - [[_COMMUNITY_Community 4711|Community 4711]]
-- [[_COMMUNITY_Community 4712|Community 4712]]
-- [[_COMMUNITY_Community 4713|Community 4713]]
-- [[_COMMUNITY_Community 4714|Community 4714]]
-- [[_COMMUNITY_Community 4715|Community 4715]]
-- [[_COMMUNITY_Community 4716|Community 4716]]
-- [[_COMMUNITY_Community 4717|Community 4717]]
-- [[_COMMUNITY_Community 4718|Community 4718]]
-- [[_COMMUNITY_Community 4719|Community 4719]]
-- [[_COMMUNITY_Community 4720|Community 4720]]
-- [[_COMMUNITY_Community 4721|Community 4721]]
-- [[_COMMUNITY_Community 4722|Community 4722]]
-- [[_COMMUNITY_Community 4723|Community 4723]]
-- [[_COMMUNITY_Community 4724|Community 4724]]
-- [[_COMMUNITY_Community 4725|Community 4725]]
-- [[_COMMUNITY_Community 4726|Community 4726]]
-- [[_COMMUNITY_Community 4727|Community 4727]]
-- [[_COMMUNITY_Community 4728|Community 4728]]
-- [[_COMMUNITY_Community 4729|Community 4729]]
-- [[_COMMUNITY_Community 4730|Community 4730]]
-- [[_COMMUNITY_Community 4731|Community 4731]]
 - [[_COMMUNITY_Community 4732|Community 4732]]
 - [[_COMMUNITY_Community 4733|Community 4733]]
-- [[_COMMUNITY_Community 4734|Community 4734]]
-- [[_COMMUNITY_Community 4735|Community 4735]]
 - [[_COMMUNITY_Community 4736|Community 4736]]
-- [[_COMMUNITY_Community 4737|Community 4737]]
-- [[_COMMUNITY_Community 4738|Community 4738]]
-- [[_COMMUNITY_Community 4739|Community 4739]]
 - [[_COMMUNITY_Community 4740|Community 4740]]
-- [[_COMMUNITY_Community 4741|Community 4741]]
-- [[_COMMUNITY_Community 4742|Community 4742]]
-- [[_COMMUNITY_Community 4743|Community 4743]]
-- [[_COMMUNITY_Community 4744|Community 4744]]
-- [[_COMMUNITY_Community 4745|Community 4745]]
-- [[_COMMUNITY_Community 4746|Community 4746]]
-- [[_COMMUNITY_Community 4747|Community 4747]]
-- [[_COMMUNITY_Community 4748|Community 4748]]
-- [[_COMMUNITY_Community 4749|Community 4749]]
-- [[_COMMUNITY_Community 4750|Community 4750]]
-- [[_COMMUNITY_Community 4751|Community 4751]]
-- [[_COMMUNITY_Community 4752|Community 4752]]
-- [[_COMMUNITY_Community 4753|Community 4753]]
-- [[_COMMUNITY_Community 4754|Community 4754]]
-- [[_COMMUNITY_Community 4755|Community 4755]]
-- [[_COMMUNITY_Community 4756|Community 4756]]
-- [[_COMMUNITY_Community 4757|Community 4757]]
-- [[_COMMUNITY_Community 4758|Community 4758]]
-- [[_COMMUNITY_Community 4759|Community 4759]]
-- [[_COMMUNITY_Community 4760|Community 4760]]
-- [[_COMMUNITY_Community 4761|Community 4761]]
-- [[_COMMUNITY_Community 4762|Community 4762]]
-- [[_COMMUNITY_Community 4763|Community 4763]]
-- [[_COMMUNITY_Community 4764|Community 4764]]
-- [[_COMMUNITY_Community 4765|Community 4765]]
-- [[_COMMUNITY_Community 4766|Community 4766]]
-- [[_COMMUNITY_Community 4767|Community 4767]]
-- [[_COMMUNITY_Community 4768|Community 4768]]
-- [[_COMMUNITY_Community 4769|Community 4769]]
-- [[_COMMUNITY_Community 4770|Community 4770]]
-- [[_COMMUNITY_Community 4771|Community 4771]]
-- [[_COMMUNITY_Community 4772|Community 4772]]
-- [[_COMMUNITY_Community 4773|Community 4773]]
-- [[_COMMUNITY_Community 4774|Community 4774]]
-- [[_COMMUNITY_Community 4775|Community 4775]]
-- [[_COMMUNITY_Community 4776|Community 4776]]
-- [[_COMMUNITY_Community 4777|Community 4777]]
-- [[_COMMUNITY_Community 4778|Community 4778]]
-- [[_COMMUNITY_Community 4779|Community 4779]]
-- [[_COMMUNITY_Community 4780|Community 4780]]
 - [[_COMMUNITY_Community 4781|Community 4781]]
-- [[_COMMUNITY_Community 4782|Community 4782]]
-- [[_COMMUNITY_Community 4783|Community 4783]]
-- [[_COMMUNITY_Community 4784|Community 4784]]
-- [[_COMMUNITY_Community 4785|Community 4785]]
-- [[_COMMUNITY_Community 4786|Community 4786]]
-- [[_COMMUNITY_Community 4787|Community 4787]]
-- [[_COMMUNITY_Community 4788|Community 4788]]
 - [[_COMMUNITY_Community 4792|Community 4792]]
 - [[_COMMUNITY_Community 4793|Community 4793]]
 - [[_COMMUNITY_Community 4794|Community 4794]]
@@ -2554,8 +2460,8 @@
   benchmarks/analyze-results.py → distro/buildroot/output/host/lib/python3.12/pathlib.py
 - `Path` --uses--> `Path`  [INFERRED]
   benchmarks/compare-models.py → distro/buildroot/output/host/lib/python3.12/pathlib.py
-- `CallSample` --uses--> `Path`  [INFERRED]
-  benchmarks/server-bench/bench.py → distro/buildroot/output/host/lib/python3.12/pathlib.py
+- `main()` --calls--> `timedelta`  [INFERRED]
+  benchmarks/cursor-attribute.py → distro/buildroot/output/host/lib/python3.12/_pydatetime.py
 
 ## Import Cycles
 - 1-file cycle: `distro/buildroot/output/host/lib/python3.12/tomllib/_re.py -> distro/buildroot/output/host/lib/python3.12/tomllib/_re.py`
@@ -2579,7 +2485,7 @@
 - 1-file cycle: `src/kgl/demo.rs -> src/kgl/demo.rs`
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 
-## Communities (4796 total, 780 thin omitted)
+## Communities (4704 total, 701 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.01
@@ -2595,7 +2501,7 @@ Nodes (387): __m512, __mmask16, _cvtmask16_u32(), _cvtu32_mask16(), _kortest_mas
 
 ### Community 3 - "Community 3"
 Cohesion: 0.01
-Nodes (353): __m256, __m256d, __m512d, __mmask8, _mm512_add_pd(), _mm512_add_round_pd(), _mm512_broadcast_f64x4(), _mm512_broadcastsd_pd() (+345 more)
+Nodes (351): __m256, __m256d, __m512d, __mmask8, _mm512_add_pd(), _mm512_add_round_pd(), _mm512_broadcast_f64x4(), _mm512_broadcastsd_pd() (+343 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.01
@@ -2619,11 +2525,11 @@ Nodes (115): __mmask16, _mm256_cmp_epi16_mask(), _mm256_cmp_epu16_mask(), _mm256
 
 ### Community 9 - "Community 9"
 Cohesion: 0.02
-Nodes (125): Annotated, _AnnotatedAlias, assert_never(), assert_type(), _CallableGenericAlias, _CallableType, _caller(), cast() (+117 more)
+Nodes (124): _allow_reckless_class_checks(), Annotated, _AnnotatedAlias, assert_never(), assert_type(), _CallableGenericAlias, _CallableType, _caller() (+116 more)
 
 ### Community 10 - "Community 10"
 Cohesion: 0.01
-Nodes (74): TestATFAllwinner, TestPostScripts, TestBtrfs, TestErofs, Test4th, TestAcpica, TestApache, TestAtftp (+66 more)
+Nodes (93): TestATFAllwinner, TestOptee, DetectBadArchTest, TestFileCapabilities, TestBtrfs, TestErofs, TestSquashfs, TestSquashfsMaxBlocksize (+85 more)
 
 ### Community 11 - "Community 11"
 Cohesion: 0.02
@@ -2635,7 +2541,7 @@ Nodes (140): rtx, gen_addv16hf3_mask_round(), gen_addv16hf3_round(), gen_addv2df
 
 ### Community 13 - "Community 13"
 Cohesion: 0.01
-Nodes (264): __extract(), __m128i, __m512i, _MM_PERM_ENUM, _mm512_abs_epi32(), _mm512_abs_epi64(), _mm512_abs_pd(), _mm512_add_epi32() (+256 more)
+Nodes (253): __extract(), __m128i, __m512i, _MM_PERM_ENUM, _mm512_abs_epi32(), _mm512_abs_epi64(), _mm512_add_epi32(), _mm512_add_epi64() (+245 more)
 
 ### Community 14 - "Community 14"
 Cohesion: 0.01
@@ -2647,19 +2553,19 @@ Nodes (251): _Float16, __m128, __m128d, __m128h, __m128i, __m256, __m256d, __m25
 
 ### Community 16 - "Community 16"
 Cohesion: 0.02
-Nodes (228): _GLIBCXX_VISIBILITY(), _S_load(), __m128, __m128d, __m128i, __m128i_u, __m64, default (+220 more)
+Nodes (224): _GLIBCXX_VISIBILITY(), _S_load(), __m128, __m128d, __m128i, __m128i_u, __m64, default (+216 more)
 
 ### Community 17 - "Community 17"
 Cohesion: 0.03
 Nodes (233): __m128, __m128d, __m128i, __m256, __m256i, __m512, __m512d, __m512i (+225 more)
 
 ### Community 18 - "Community 18"
-Cohesion: 0.05
-Nodes (23): TestPythonPy3Automat, TestPythonPy3Colorzero, TestPythonPy3Constantly, TestPythonPy3Construct, TestPythonHwdata, TestPythonPy3Incremental, TestPythonPy3Iptables, TestPythonPy3Jmespath (+15 more)
+Cohesion: 0.01
+Nodes (97): TestCrudiniBase, TestCrudiniPy3, TestGst1Python, TestPythonPy3Libftdi1, TestPythonPy3Aexpect, TestPythonArgh, TestPythonPy3Argh, TestPythonPy3Asn1Crypto (+89 more)
 
 ### Community 19 - "Community 19"
 Cohesion: 0.02
-Nodes (199): __convert_x86(), __m128, __m128d, __m128i, __m256, __m256d, __m256i, _To (+191 more)
+Nodes (197): __m128, __m128d, __m128i, __m256, __m256d, __m256i, _mm256_abs_epi16(), _mm256_abs_epi32() (+189 more)
 
 ### Community 20 - "Community 20"
 Cohesion: 0.03
@@ -2667,11 +2573,11 @@ Nodes (197): constexpr(), __m128, __m128d, __m128i, __m256, __m256d, __m256i, __
 
 ### Community 21 - "Community 21"
 Cohesion: 0.06
-Nodes (21): Distribution, files(), A Python distribution package., Attempt to load metadata file given by the name.          :param filename: The n, Given a path to a file in this distribution, return a path         to it., Return a Distribution for the indicated metadata path          :param path: a st, Return the 'Name' metadata for the distribution package., Return a normalized version of the name. (+13 more)
+Nodes (24): Distribution, distributions(), files(), A Python distribution package., Attempt to load metadata file given by the name.          :param filename: The n, Given a path to a file in this distribution, return a path         to it., Return the Distribution for the given package name.          :param name: The na, Return an iterable of Distribution objects for all packages.          Pass a ``c (+16 more)
 
 ### Community 22 - "Community 22"
 Cohesion: 0.03
-Nodes (188): __m128, __m128d, __m128i, __m128i_u, __m256, __m256d, __m256i, _mm256_i32gather_pd() (+180 more)
+Nodes (186): __m128, __m128d, __m128i, __m128i_u, __m256, __m256d, __m256i, _mm256_add_pd() (+178 more)
 
 ### Community 23 - "Community 23"
 Cohesion: 0.02
@@ -2679,71 +2585,71 @@ Nodes (189): _MM_MANTISSA_NORM_ENUM, _MM_MANTISSA_SIGN_ENUM, __mmask32, _mm512_a
 
 ### Community 24 - "Community 24"
 Cohesion: 0.03
-Nodes (67): _GLIBCXX_BEGIN_NAMESPACE_VERSION, Exception, _Lock_policy(), AuthenticationError, BaseContext, BufferTooShort, DefaultContext, ForkContext (+59 more)
+Nodes (59): AuthenticationError, BaseContext, BufferTooShort, DefaultContext, ForkContext, ForkProcess, ForkServerContext, ForkServerProcess (+51 more)
 
 ### Community 25 - "Community 25"
 Cohesion: 0.01
 Nodes (161): __all_of_fn, __any_of_fn, __binary_search_fn, _GLIBCXX_VISIBILITY(), all_of(), any_of(), binary_search(), clamp() (+153 more)
 
 ### Community 26 - "Community 26"
-Cohesion: 0.02
-Nodes (140): gimple, T, tree, gimple_stmt_iterator, gomp_atomic_load, gomp_continue, gomp_critical, gomp_parallel (+132 more)
+Cohesion: 0.03
+Nodes (156): gimple, T, tree, gassign, gomp_critical, gomp_parallel, gimple_arg(), gimple_assign_lhs_ptr() (+148 more)
 
 ### Community 27 - "Community 27"
-Cohesion: 0.04
-Nodes (19): _cmperror(), date, Return ctime() style string., Return the date formatted according to ISO.          This is 'YYYY-MM-DD'., Return proleptic Gregorian ordinal for the year, month and day.          January, Return a new date with new values for the specified fields., Add a date to a timedelta., Subtract two dates, or a date and a timedelta. (+11 more)
+Cohesion: 0.03
+Nodes (134): internal_fn, gasm, gcall, gimple_stmt_iterator, gomp_atomic_load, gomp_continue, gomp_for, gomp_target (+126 more)
 
 ### Community 28 - "Community 28"
 Cohesion: 0.04
-Nodes (79): FixApply, Fixer that replaces deprecated unittest method names., FixBasestring, Fixer for basestring -> str., FixBuffer, find_excepts(), FixExcept, Fixer for except statements with named exceptions.  The following cases will be (+71 more)
+Nodes (75): FixApply, Fixer that replaces deprecated unittest method names., FixBasestring, Fixer for basestring -> str., FixBuffer, FixDict, find_excepts(), FixExcept (+67 more)
 
 ### Community 29 - "Community 29"
-Cohesion: 0.04
-Nodes (72): _convert_for_comparison(), _dec_from_triple(), Decimal, getcontext(), Returns a copy, unless it is a sNaN.          Rounds the number (if more than pr, Returns self + other.          -INF + INF (or the reverse) cause InvalidOperatio, Return self * other.          (+-) INF * 0 (or its reverse) raise InvalidOperati, Return (self // other, self % other), to context.prec precision.          Assume (+64 more)
+Cohesion: 0.03
+Nodes (79): _convert_for_comparison(), _dec_from_triple(), Decimal, getcontext(), Returns a copy with the sign switched.          Rounds, if it has reason., Returns a copy, unless it is a sNaN.          Rounds the number (if more than pr, Returns the absolute value of self.          If the keyword argument 'round' is, Returns self + other.          -INF + INF (or the reverse) cause InvalidOperatio (+71 more)
 
 ### Community 30 - "Community 30"
 Cohesion: 0.02
 Nodes (53): BaseEventLoop, _check_ssl_socket(), _format_handle(), _format_pipe(), _interleave_addrinfos(), _ipaddr_info(), Base implementation of event loop.  The event loop can be broken up into a multi, Connect to a TCP server.          Create a streaming transport connection to a g (+45 more)
 
 ### Community 31 - "Community 31"
-Cohesion: 0.02
-Nodes (55): BaseListProxy, BasePoolProxy, AcquirerProxy, all_methods(), AutoProxy(), BarrierProxy, BaseProxy, ConditionProxy (+47 more)
+Cohesion: 0.03
+Nodes (49): AutoProxy(), BaseManager, dispatch(), MakeProxyType(), Manages one or more shared memory segments., Adds the supplied shared memory block name to tracker., Calls unlink() on the shared memory block with the supplied name             and, Calls destroy_segment() on all tracked shared memory blocks. (+41 more)
 
 ### Community 32 - "Community 32"
-Cohesion: 0.11
-Nodes (14): DuplicateOptionError, DuplicateSectionError, Error, MissingSectionHeaderError, NoOptionError, ParsingError, Base class for ConfigParser exceptions., Raised when a section is repeated in an input source.      Possible repetitions (+6 more)
+Cohesion: 0.02
+Nodes (64): BasicInterpolation, ConfigParser, ConverterMapping, DuplicateOptionError, DuplicateSectionError, Error, ExtendedInterpolation, Interpolation (+56 more)
 
 ### Community 33 - "Community 33"
-Cohesion: 0.03
-Nodes (71): EmailMessage, BufferingHandler, DatagramHandler, HTTPHandler, MemoryHandler, QueueHandler, QueueListener, A handler class which sends an SMTP email for each logging event. (+63 more)
+Cohesion: 0.06
+Nodes (8): ChainMap, Initialize a ChainMap by setting *maps* to the given mappings.         If no map, Create a ChainMap with a single dict created from the iterable., New ChainMap with a new map followed by all previous maps.         If no map is, New ChainMap from maps[1:]., Remove and return an item pair from maps[0]. Raise KeyError is maps[0] is empty., A ChainMap groups multiple dicts (or other mappings) together     to create a si, UserDict
 
 ### Community 34 - "Community 34"
 Cohesion: 0.02
-Nodes (67): Context, _convert_other(), Compares self to the other operand numerically.          It's pretty much like c, Returns an indication of the class of self.          The class is one of the fol, Contains the context for a Decimal instance.      Contains:     prec - precision, Show the current context., Reset all traps to zero, Ignore all flags, if they are raised (+59 more)
+Nodes (70): Context, _convert_other(), Return True if self and other have the same exponent; otherwise         return F, Compares self to the other operand numerically.          It's pretty much like c, Returns an indication of the class of self.          The class is one of the fol, Contains the context for a Decimal instance.      Contains:     prec - precision, Show the current context., Reset all traps to zero (+62 more)
 
 ### Community 35 - "Community 35"
-Cohesion: 0.05
-Nodes (24): datetime, _format_offset(), _format_time(), Return formatted timezone offset (+xx:xx) or an empty string., Return the time formatted according to ISO.          The full format is 'HH:MM:S, datetime(year, month, day[, hour[, minute[, second[, microsecond[,tzinfo]]]]]), Construct a datetime from a POSIX timestamp (like time.time()).          A timez, Construct a datetime from a POSIX timestamp (like time.time()).          A timez (+16 more)
+Cohesion: 0.02
+Nodes (57): _check_utc_offset(), _cmperror(), date, datetime, _divide_and_round(), _format_offset(), _format_time(), Construct a date from the ISO year, week number and weekday.          This is th (+49 more)
 
 ### Community 36 - "Community 36"
-Cohesion: 0.07
-Nodes (33): encode_base64(), Encode the message's payload in Base64.      Also, add an appropriate Content-Tr, _fix_eols(), _quote_periods(), quoteaddr(), quotedata(), Sender address refused.      In addition to the attributes set by on all SMTPRes, All recipient addresses refused.      The errors for each recipient are accessib (+25 more)
+Cohesion: 0.10
+Nodes (24): Error, error_perm, error_proto, error_reply, error_temp, ftpcp(), parse150(), parse227() (+16 more)
 
 ### Community 37 - "Community 37"
-Cohesion: 0.03
-Nodes (120): internal_fn, gasm, gcall, gomp_for, gomp_target, gomp_teams, gtransaction, gtry (+112 more)
+Cohesion: 0.15
+Nodes (21): mcp_socket_server(), McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., Raw MCP JSON-RPC client over a Unix domain socket., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content. (+13 more)
 
 ### Community 38 - "Community 38"
-Cohesion: 0.02
-Nodes (82): AttributeError, __getattr__(), For backwards compatibility, continue to make names     from _resources_abc avai, __getattr__(), FrozenInstanceError, _auto_null, _dedent(), EnumCheck (+74 more)
+Cohesion: 0.04
+Nodes (50): _auto_null, _dedent(), EnumCheck, _EnumDict, global_enum(), global_enum_repr(), global_flag_repr(), global_str() (+42 more)
 
 ### Community 39 - "Community 39"
 Cohesion: 0.03
-Nodes (36): OSError, Implements BufferedIOBase.read1()          Reads up to a buffer's worth of data, _BufferedIOMixin, BufferedRandom, BufferedRWPair, BufferedWriter, IncrementalNewlineDecoder, open() (+28 more)
+Nodes (32): OSError, _BufferedIOMixin, BufferedRWPair, BufferedWriter, IncrementalNewlineDecoder, Create a new buffered reader using the given readable raw IO object., A buffer for a writeable sequential RawIO object.      The constructor creates a, A buffered reader and writer object together.      A buffered reader object and (+24 more)
 
 ### Community 40 - "Community 40"
 Cohesion: 0.02
-Nodes (39): Path, Path, Path, Path, __u64, v4l2_timeval_to_ns(), TestBcc, TestFping (+31 more)
+Nodes (44): Path, Path, Path, Path, __u64, v4l2_timeval_to_ns(), TestBcc, TestFping (+36 more)
 
 ### Community 41 - "Community 41"
 Cohesion: 0.04
@@ -2759,11 +2665,11 @@ Nodes (53): _decode_uu(), _formatparam(), Message, MIMEPart, _parseparam(), Retu
 
 ### Community 44 - "Community 44"
 Cohesion: 0.02
-Nodes (58): _count_elements(), Counter, _Link, OrderedDict, _OrderedDictItemsView, _OrderedDictKeysView, _OrderedDictValuesView, This module implements specialized container datatypes providing alternatives to (+50 more)
+Nodes (56): _count_elements(), Counter, _Link, OrderedDict, _OrderedDictItemsView, _OrderedDictKeysView, _OrderedDictValuesView, This module implements specialized container datatypes providing alternatives to (+48 more)
 
 ### Community 45 - "Community 45"
 Cohesion: 0.02
-Nodes (69): ABCMeta, F, ABCMeta, Register a virtual subclass of an ABC.              Returns the subclass, to all, Override for isinstance(instance, cls)., Override for issubclass(subclass, cls)., Clear the registry (for debugging or testing)., Clear the caches (for debugging or testing). (+61 more)
+Nodes (67): ABCMeta, F, ABCMeta, Register a virtual subclass of an ABC.              Returns the subclass, to all, Override for isinstance(instance, cls)., Override for issubclass(subclass, cls)., Clear the registry (for debugging or testing)., Clear the caches (for debugging or testing). (+59 more)
 
 ### Community 46 - "Community 46"
 Cohesion: 0.06
@@ -2771,35 +2677,35 @@ Nodes (12): Helper for writing string literals, minimizing escapes.         Retu
 
 ### Community 47 - "Community 47"
 Cohesion: 0.03
-Nodes (68): Calendar, Day, different_locale, format(), formatstring(), _get_default_locale(), __getattr__(), HTMLCalendar (+60 more)
+Nodes (65): Calendar, Day, different_locale, format(), formatstring(), _get_default_locale(), HTMLCalendar, IllegalMonthError (+57 more)
 
 ### Community 48 - "Community 48"
 Cohesion: 0.03
-Nodes (113): abi_type, _Ap, bit_and, bit_or, bit_xor, std(), all(), all_of() (+105 more)
+Nodes (115): abi_type, _Ap, bit_and, bit_or, bit_xor, std(), all(), all_of() (+107 more)
 
 ### Community 49 - "Community 49"
-Cohesion: 0.05
-Nodes (47): class, namespace, namespace, namespace, namespace, namespace, namespace, namespace (+39 more)
+Cohesion: 0.03
+Nodes (62): V8_INLINE, Value, class, namespace, namespace, namespace, namespace, V8_INLINE (+54 more)
 
 ### Community 50 - "Community 50"
-Cohesion: 0.03
-Nodes (63): MutableMapping, A MutableMapping is a generic container for associating     key/value pairs., D.pop(k[,d]) -> v, remove specified key and return the corresponding value., D.popitem() -> (k, v), remove and return some (key, value) pair            as a, D.clear() -> None.  Remove all items from D., D.setdefault(k[,d]) -> D.get(k,d), also set D[k]=d if k not in D, add_dll_directory(), _AddedDllDirectory (+55 more)
+Cohesion: 0.02
+Nodes (70): Mapping, MutableMapping, A Mapping is a generic container for associating key/value     pairs.      This, D.get(k[,d]) -> D[k] if k in D, else d.  d defaults to None., D.keys() -> a set-like object providing a view on D's keys, D.items() -> a set-like object providing a view on D's items, D.values() -> an object providing a view on D's values, A MutableMapping is a generic container for associating     key/value pairs. (+62 more)
 
 ### Community 51 - "Community 51"
 Cohesion: 0.03
-Nodes (71): BufferedReader, Any, Any, BinaryIO, Traversable, Any, BinaryIO, BinaryIO (+63 more)
+Nodes (76): Anchor, BufferedReader, Any, BinaryIO, Traversable, BinaryIO, Generic, Compatibility shim for .resources.simple as found on Python 3.10.  Consumers tha (+68 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.04
 Nodes (110): __m128i, _mm_cmov_si128(), _mm_comeq_epi16(), _mm_comeq_epi32(), _mm_comeq_epi64(), _mm_comeq_epi8(), _mm_comeq_epu16(), _mm_comeq_epu32() (+102 more)
 
 ### Community 53 - "Community 53"
-Cohesion: 0.02
-Nodes (106): DllCanUnloadNow(), DllGetClassObject(), open(), Open or create database at path given by *file*.      Optional argument *flag* c, ImportError, _builtin_from_name(), BuiltinImporter, _calc___package__() (+98 more)
+Cohesion: 0.04
+Nodes (70): _builtin_from_name(), BuiltinImporter, _calc___package__(), _call_with_frames_removed(), _exec(), _check_name(), Decorator to verify that the module being requested matches the one the     load, _find_and_load() (+62 more)
 
 ### Community 54 - "Community 54"
 Cohesion: 0.03
-Nodes (69): address_type(), answer_challenge(), arbitrary_address(), _check_timeout(), Client(), _close(), Connection, _ConnectionBase (+61 more)
+Nodes (60): address_type(), answer_challenge(), arbitrary_address(), _check_timeout(), Client(), _close(), Connection, _ConnectionBase (+52 more)
 
 ### Community 55 - "Community 55"
 Cohesion: 0.06
@@ -2807,7 +2713,7 @@ Nodes (30): BrokenProcessPool, _CallItem, _chain_from_iterable_of_lists(), _chec
 
 ### Community 56 - "Community 56"
 Cohesion: 0.04
-Nodes (103): _GLIBCXX_SIMD_MATH_FALLBACK(), __promote_preserving_unsigned(), _S_abs(), _S_acos(), _S_acosh(), _S_asin(), _S_asinh(), _S_atan() (+95 more)
+Nodes (101): __promote_preserving_unsigned(), _S_abs(), _S_acos(), _S_acosh(), _S_asin(), _S_asinh(), _S_atan(), _S_atan2() (+93 more)
 
 ### Community 57 - "Community 57"
 Cohesion: 0.02
@@ -2818,8 +2724,8 @@ Cohesion: 0.04
 Nodes (101): __m256h, _MM_MANTISSA_NORM_ENUM, _MM_MANTISSA_SIGN_ENUM, __mmask16, _mm256_setzero_ph(), _mm256_abs_ph(), _mm256_add_ph(), _mm256_cvtepi16_ph() (+93 more)
 
 ### Community 59 - "Community 59"
-Cohesion: 0.06
-Nodes (32): _addr_only(), LMTP, This is a subclass derived from SMTP that connects over an SSL         encrypted, LMTP - Local Mail Transfer Protocol      The LMTP protocol, which is very simila, Initialize a new instance., Connect to the LMTP daemon, on either a Unix or a TCP socket., This class manages a connection to an SMTP or ESMTP server.     SMTP Objects:, Initialize a new instance.          If specified, `host` is the name of the remo (+24 more)
+Cohesion: 0.05
+Nodes (37): _addr_only(), quoteaddr(), This is a subclass derived from SMTP that connects over an SSL         encrypted, Connect to the LMTP daemon, on either a Unix or a TCP socket., Quote a subset of the email addresses defined by RFC 821.      Should be able to, This class manages a connection to an SMTP or ESMTP server.     SMTP Objects:, Initialize a new instance.          If specified, `host` is the name of the remo, Set the debug output level.          A non-false value results in debug messages (+29 more)
 
 ### Community 60 - "Community 60"
 Cohesion: 0.02
@@ -2827,19 +2733,19 @@ Nodes (121): __m128d, _MM_MANTISSA_NORM_ENUM, _MM_MANTISSA_SIGN_ENUM, _mm256_get
 
 ### Community 61 - "Community 61"
 Cohesion: 0.05
-Nodes (81): basic_block, class, const_rtx, machine_mode, namespace, poly_int64, poly_uint64, rtx (+73 more)
+Nodes (85): basic_block, class, const_rtx, machine_mode, namespace, poly_int64, poly_uint64, rtx (+77 more)
 
 ### Community 62 - "Community 62"
-Cohesion: 0.03
-Nodes (33): ip_address(), ip_interface(), IPv4Address, IPv4Interface, IPv6Address, IPv6Interface, Test if the address is reserved for multicast use.          Returns:, Test if the address is reserved for link-local.          Returns:             A (+25 more)
+Cohesion: 0.06
+Nodes (15): BaseListProxy, AcquirerProxy, BarrierProxy, BaseProxy, ConditionProxy, EventProxy, IteratorProxy, ListProxy (+7 more)
 
 ### Community 63 - "Community 63"
 Cohesion: 0.03
-Nodes (79): _DefragResultBase, _ParseResultBase, _SplitResultBase, _byte_quoter_factory(), _check_bracketed_host(), _check_bracketed_netloc(), _checknetloc(), clear_cache() (+71 more)
+Nodes (75): _DefragResultBase, _ParseResultBase, _SplitResultBase, _byte_quoter_factory(), _check_bracketed_host(), _check_bracketed_netloc(), _checknetloc(), clear_cache() (+67 more)
 
 ### Community 64 - "Community 64"
 Cohesion: 0.04
-Nodes (114): Attribute, _check_for_early_dl_end(), DisplayName, DotAtomText, _find_mime_parameters(), get_addr_spec(), get_address(), get_address_list() (+106 more)
+Nodes (116): Attribute, _check_for_early_dl_end(), Domain, _find_mime_parameters(), get_addr_spec(), get_address(), get_address_list(), get_angle_addr() (+108 more)
 
 ### Community 65 - "Community 65"
 Cohesion: 0.03
@@ -2847,19 +2753,19 @@ Nodes (95): LookupError, _remove_temp_dir(), _access_check(), _basename(), _chec
 
 ### Community 66 - "Community 66"
 Cohesion: 0.04
-Nodes (92): __m128, _mm_add_ps(), _mm_add_ss(), _mm_and_ps(), _mm_andnot_ps(), _mm_cmpeq_ss(), _mm_cmpge_ps(), _mm_cmpge_ss() (+84 more)
+Nodes (106): __m128, _mm_add_ps(), _mm_add_ss(), _mm_and_ps(), _mm_andnot_ps(), _mm_cmpeq_ss(), _mm_cmpge_ps(), _mm_cmpge_ss() (+98 more)
 
 ### Community 67 - "Community 67"
 Cohesion: 0.03
-Nodes (64): BZ2File, True if this file is closed., Return the file descriptor for the underlying file., Return whether the file supports seeking., Return whether the file was opened for reading., Return whether the file was opened for writing., Return buffered data without advancing the file position.          Always return, Read up to size uncompressed bytes from the file.          If size is negative o (+56 more)
+Nodes (63): BZ2File, True if this file is closed., Return the file descriptor for the underlying file., Return whether the file supports seeking., Return whether the file was opened for reading., Return whether the file was opened for writing., Return buffered data without advancing the file position.          Always return, Read up to size uncompressed bytes from the file.          If size is negative o (+55 more)
 
 ### Community 68 - "Community 68"
 Cohesion: 0.07
 Nodes (74): agent_runs_summary_aggregates_correctly(), agent_runs_summary_empty_returns_zeros(), agent_runs_table_survives_reopen(), AgentRunRecord, AgentRunsSummary, AnalyticsStore, anonymize_command(), build_filtered_history_sql() (+66 more)
 
 ### Community 69 - "Community 69"
-Cohesion: 0.07
-Nodes (10): Complex, self / other: Should promote to float when necessary., self ** exponent; should promote to float or complex when necessary., Returns the Real distance from 0. Called for abs(self)., (x+y*i).conjugate() returns (x-y*i)., Complex defines the operations that work on the builtin complex type.      In sh, Return a builtin complex instance. Called for complex(self)., True if self != 0. Called for bool(self). (+2 more)
+Cohesion: 0.02
+Nodes (38): Complex, Integral, Number, Rational, self / other: Should promote to float when necessary., self ** exponent; should promote to float or complex when necessary., Returns the Real distance from 0. Called for abs(self)., (x+y*i).conjugate() returns (x-y*i). (+30 more)
 
 ### Community 70 - "Community 70"
 Cohesion: 0.02
@@ -2870,8 +2776,8 @@ Cohesion: 0.02
 Nodes (114): __m256d, _mm256_cmp_pd_mask(), _mm256_cvtepu32_pd(), _mm256_cvtpd_epu32(), _mm256_cvttpd_epu32(), _mm256_getexp_pd(), _mm256_i32scatter_pd(), _mm256_mask2_permutex2var_pd() (+106 more)
 
 ### Community 72 - "Community 72"
-Cohesion: 0.04
-Nodes (69): ArithmeticError, Clamped, ConversionSyntax, _decimal_lshift_exact(), DecimalException, _dexp(), _div_nearest(), DivisionByZero (+61 more)
+Cohesion: 0.03
+Nodes (76): ArithmeticError, Clamped, _ContextManager, ConversionSyntax, _decimal_lshift_exact(), DecimalException, _dexp(), _div_nearest() (+68 more)
 
 ### Community 73 - "Community 73"
 Cohesion: 0.04
@@ -2887,27 +2793,27 @@ Nodes (22): AbstractEventLoop, Handle, Object returned by timed callback registr
 
 ### Community 76 - "Community 76"
 Cohesion: 0.09
-Nodes (52): date, datetime, Any, Key, ParseFloat, Any, ParseFloat, Match (+44 more)
+Nodes (55): date, datetime, Any, BinaryIO, Key, ParseFloat, Any, ParseFloat (+47 more)
 
 ### Community 77 - "Community 77"
-Cohesion: 0.04
-Nodes (51): Error, error_perm, error_proto, error_reply, error_temp, FTP, ftpcp(), parse150() (+43 more)
+Cohesion: 0.08
+Nodes (19): FTP, Get the welcome message from the server.         (this is read and squirreled aw, Set the debugging level.         The required argument level means:         0: n, Use passive or active mode for data transfers.         With a false argument, us, Abort a file transfer.  Uses out-of-band data.         This does not follow the, Send a command and expect a response beginning with '2'., Send a PORT command with the current host and the given         port number., Send an EPRT command with the current host and the given port number. (+11 more)
 
 ### Community 78 - "Community 78"
 Cohesion: 0.04
-Nodes (73): AST, Constant, expr_context, mod, _ABC, AugLoad, AugStore, Bytes (+65 more)
+Nodes (74): AST, Constant, expr_context, mod, _ABC, AugLoad, AugStore, Bytes (+66 more)
 
 ### Community 79 - "Community 79"
-Cohesion: 0.04
-Nodes (31): HTTPMethod, HTTPStatus, HTTP methods and descriptions      Methods from the following RFCs are all obser, HTTP status codes and reason phrases      Status codes from the following RFCs a, Enum where members are also (and must be) ints, Enum where members are also (and must be) strings, Return the lower-cased version of the member name., StrEnum (+23 more)
+Cohesion: 0.08
+Nodes (21): add_callers(), add_func_stats(), count_calls(), f8(), func_get_function_name(), func_std_string(), func_strip_path(), FunctionProfile (+13 more)
 
 ### Community 80 - "Community 80"
-Cohesion: 0.04
-Nodes (50): set_spawning_popen(), main(), _serve_one(), write_signed(), _path_eq(), Provides shared memory for direct access across processes.  The API of this pack, _check_not_importing_main(), _fixup_main_from_name() (+42 more)
+Cohesion: 0.03
+Nodes (71): BasePoolProxy, active_children(), get_spawning_popen(), set_spawning_popen(), main(), _serve_one(), write_signed(), all_methods() (+63 more)
 
 ### Community 81 - "Community 81"
-Cohesion: 0.06
-Nodes (46): _byte_offset_to_character_offset(), clear_frames(), _compute_suggestion_error(), _display_width(), _extract_caret_anchors_from_line_segment(), extract_stack(), extract_tb(), format_list() (+38 more)
+Cohesion: 0.04
+Nodes (62): _byte_offset_to_character_offset(), clear_frames(), _compute_suggestion_error(), _display_width(), _ExceptionPrintContext, _extract_caret_anchors_from_line_segment(), extract_stack(), extract_tb() (+54 more)
 
 ### Community 82 - "Community 82"
 Cohesion: 0.05
@@ -2918,12 +2824,12 @@ Cohesion: 0.04
 Nodes (62): availability, cgraph_node, class, const_tree, hashval_t, HOST_WIDE_INT, ipa_ref, namespace (+54 more)
 
 ### Community 84 - "Community 84"
-Cohesion: 0.05
-Nodes (24): add_flowcontrol_defaults(), AppProtocolState, _create_transport_context(), Close the transport.          Buffered data will be flushed asynchronously.  No, Pause the receiving end.          No data will be passed to the protocol's data_, Resume the receiving end.          Data received will once again be passed to th, Set the high- and low-water limits for write flow control.          These two va, Return the current size of the write buffers. (+16 more)
+Cohesion: 0.09
+Nodes (6): Close the transport.          Buffered data will be flushed asynchronously.  No, Close the write end after flushing buffered data.          This raises :exc:`Not, Return True if this transport supports write_eof(), False if not., Close the transport immediately.          Buffered data will be lost.  No more d, Get optional transport information., _SSLProtocolTransport
 
 ### Community 85 - "Community 85"
-Cohesion: 0.12
-Nodes (63): machine_mode, poly_uint16, rtvec, rtx, RTX_CODE, gen_rtx_fmt_0_stat(), gen_rtx_fmt_e0_stat(), gen_rtx_fmt_E_stat() (+55 more)
+Cohesion: 0.09
+Nodes (86): basic_block, HOST_WIDE_INT, machine_mode, poly_uint16, rtvec, rtx, RTX_CODE, tree (+78 more)
 
 ### Community 86 - "Community 86"
 Cohesion: 0.03
@@ -2939,15 +2845,15 @@ Nodes (28): Read up to LEN bytes and return them.         Return zero-length str
 
 ### Community 89 - "Community 89"
 Cohesion: 0.04
-Nodes (56): aggr_init_expr_arg_iterator, build_trivial_dtor_call(), check_constraint_info(), check_nonnull(), class_of_this_parm(), cp_evaluated(), cp_expr(), cp_expr_loc_or_input_loc() (+48 more)
+Nodes (55): aggr_init_expr_arg_iterator, build_trivial_dtor_call(), check_constraint_info(), check_nonnull(), class_of_this_parm(), cp_evaluated(), cp_expr(), cp_expr_loc_or_input_loc() (+47 more)
 
 ### Community 90 - "Community 90"
-Cohesion: 0.05
-Nodes (89): built_in_class, const_cast, class, const_tree, explicit, hashval_t, HOST_WIDE_INT, location_t (+81 more)
+Cohesion: 0.06
+Nodes (73): const_cast, const_tree, HOST_WIDE_INT, location_t, poly_uint64, tree, wide_int, function_args_iterator (+65 more)
 
 ### Community 91 - "Community 91"
-Cohesion: 0.10
-Nodes (27): _build_struct_time(), _check_date_fields(), _days_before_month(), _days_before_year(), _days_in_month(), _find_isoformat_datetime_separator(), _is_ascii_digit(), _is_leap() (+19 more)
+Cohesion: 0.04
+Nodes (44): _build_struct_time(), _check_date_fields(), _check_time_fields(), _check_tzinfo_arg(), _check_tzname(), _days_before_month(), _days_before_year(), _days_in_month() (+36 more)
 
 ### Community 92 - "Community 92"
 Cohesion: 0.05
@@ -2979,11 +2885,11 @@ Nodes (81): __m256i, _mm512_castsi256_si512(), _mm512_cvt_roundpd_epi32(), _mm51
 
 ### Community 99 - "Community 99"
 Cohesion: 0.04
-Nodes (34): ContentManager, KeyError, BaseSelector, _BaseSelectorImpl, _can_use(), DevpollSelector, EpollSelector, _fileobj_to_fd() (+26 more)
+Nodes (33): KeyError, BaseSelector, _BaseSelectorImpl, _can_use(), DevpollSelector, EpollSelector, _fileobj_to_fd(), KqueueSelector (+25 more)
 
 ### Community 100 - "Community 100"
-Cohesion: 0.07
-Nodes (14): Helper class: Datatype to store Turtle attributes, Set or disable undobuffer.          Argument:         size -- an integer or None, Return count of entries in the undobuffer.          No argument.          Exampl, Delete all of pen's drawings, Delete the turtle's drawings from the screen. Do not move turtle.          No ar, Delete stamp with given stampid          Argument:         stampid - an integer,, Delete all or first/last n of turtle's stamps.          Optional argument:, undo (repeatedly) the last turtle action.          No argument.          undo (r (+6 more)
+Cohesion: 0.04
+Nodes (44): demo1(), Set turtle-mode ('standard', 'logo' or 'world') and perform reset.          Opti, Return the list of turtles on the screen.          Example (for a TurtleScreen i, Perform a TurtleScreen update., Helper class: Datatype to store Turtle attributes, Animation part of the RawTurtle.     Puts RawTurtle upon a TurtleScreen and prov, Delete the turtle's drawings and restore its default values.          No argumen, Set or disable undobuffer.          Argument:         size -- an integer or None (+36 more)
 
 ### Community 101 - "Community 101"
 Cohesion: 0.04
@@ -3002,44 +2908,44 @@ Cohesion: 0.05
 Nodes (38): binary_heap, begin, clear, empty, end, erase, erase_at, fix (+30 more)
 
 ### Community 105 - "Community 105"
-Cohesion: 0.07
-Nodes (57): BigEndianStructure, BigEndianUnion, LittleEndianStructure, LittleEndianUnion, _other_endian(), Structure with big endian byte order, Union with big endian byte order, Structure with little endian byte order (+49 more)
+Cohesion: 0.08
+Nodes (52): BigEndianStructure, BigEndianUnion, LittleEndianStructure, LittleEndianUnion, Structure with big endian byte order, Union with big endian byte order, Structure with little endian byte order, Union with little endian byte order (+44 more)
 
 ### Community 106 - "Community 106"
-Cohesion: 0.03
-Nodes (52): Unrelated but handy function to calculate Unix timestamp from GMT., timegm(), Enum, IntFlag, Create a collection of name/value pairs.      Example enumeration:      >>> clas, Returns public methods and other interesting attributes., The name of the Enum member., The value of the Enum member. (+44 more)
+Cohesion: 0.04
+Nodes (45): Unrelated but handy function to calculate Unix timestamp from GMT., timegm(), IntFlag, Support for integer-based Flags, string, format -> new datetime parsed from a string (like time.strptime())., _ASN1Object, cert_time_to_seconds(), create_default_context() (+37 more)
 
 ### Community 107 - "Community 107"
-Cohesion: 0.05
-Nodes (25): _BinaryPlistParser, _BinaryPlistWriter, _count_to_size(), _date_from_string(), _date_to_string(), _decode_base64(), _DumbXMLWriter, dump() (+17 more)
+Cohesion: 0.07
+Nodes (22): _BinaryPlistParser, _BinaryPlistWriter, _count_to_size(), _date_to_string(), _DumbXMLWriter, dump(), dumps(), _encode_base64() (+14 more)
 
 ### Community 108 - "Community 108"
-Cohesion: 0.03
-Nodes (38): FileIO, IOBase, Open a file.  The mode can be 'r' (default), 'w', 'x' or 'a' for reading,, Read at most size bytes, returned as bytes.          Only makes one system call,, Read all data from the file, returned as bytes.          In non-blocking mode, r, Write bytes b to file, return number written.          Only makes one system cal, Move to new file position.          Argument offset is a byte count.  Optional a, tell() -> int.  Current file position.          Can raise OSError for non seekab (+30 more)
+Cohesion: 0.05
+Nodes (30): BufferedRandom, BufferedReader, FileIO, open(), _open_code_with_warning(), Python implementation of the io module., BufferedReader(raw[, buffer_size])      A buffer for a readable, sequential Base, Read size bytes.          Returns exactly size bytes of data unless the underlyi (+22 more)
 
 ### Community 109 - "Community 109"
-Cohesion: 0.05
-Nodes (35): CompressionError, _FileInFile, is_tarfile(), main(), Return the next TarInfo object from TarFile object            tarfile., Process a GNU sparse header plus extra headers., Process a GNU tar extended sparse header, version 1.0., The TarFile Class provides an interface to tar archives. (+27 more)
+Cohesion: 0.11
+Nodes (6): _FileInFile, is_tarfile(), Open an (uncompressed) tar archive `name'. `mode' is either 'r' to            re, Return True if name points to a tar archive that we        are able to handle, e, A thin wrapper around an existing file object that        provides a part of its, Seek to a position in the file.
 
 ### Community 110 - "Community 110"
-Cohesion: 0.04
-Nodes (63): _bless_my_loader(), cache_from_source(), _calc_mode(), FileFinder, _fix_up_module(), _get_cached(), _get_sourcefile(), _get_supported_file_loaders() (+55 more)
+Cohesion: 0.03
+Nodes (87): _bless_my_loader(), cache_from_source(), _calc_mode(), _classify_pyc(), _code_to_hash_pyc(), _code_to_timestamp_pyc(), _compile_bytecode(), decode_source() (+79 more)
 
 ### Community 111 - "Community 111"
-Cohesion: 0.04
-Nodes (44): ContentTooShortError, HTTPError, Exception classes raised by urllib.  The base exception class is URLError, which, Raised when HTTP error occurs, but also acts like non-error return, Exception raised when downloaded size does not match content-length., URLError, Transform a string like '<URL:scheme://host/path>' into 'scheme://host/path'., unquote_to_bytes('abc%20def') -> b'abc def'. (+36 more)
+Cohesion: 0.05
+Nodes (40): ContentTooShortError, HTTPError, Exception classes raised by urllib.  The base exception class is URLError, which, Raised when HTTP error occurs, but also acts like non-error return, Exception raised when downloaded size does not match content-length., URLError, unquote_to_bytes('abc%20def') -> b'abc def'., unquote_to_bytes() (+32 more)
 
 ### Community 112 - "Community 112"
 Cohesion: 0.04
-Nodes (38): Barrier, _BarrierState, BoundedSemaphore, Condition, _ContextManagerMixin, Event, Lock, Synchronization primitives. (+30 more)
+Nodes (36): Barrier, BoundedSemaphore, Condition, _ContextManagerMixin, Event, Lock, Release a lock.          When the lock is locked, reset it to unlocked, and retu, Wake up the first waiter if it isn't done. (+28 more)
 
 ### Community 113 - "Community 113"
 Cohesion: 0.04
-Nodes (21): PurePath, Base class for manipulating paths without I/O.      PurePath represents a filesy, Return the string representation of the path, suitable for         passing to sy, Return the string representation of the path with forward (/)         slashes., Return the bytes representation of the path.  This is only         recommended t, Return the path as a 'file' URI., The drive prefix (letter or UNC path), if any., The root of the path, if any. (+13 more)
+Nodes (28): PurePath, Return a new path pointing to the current working directory., Return an absolute version of this path by prepending the current         workin, Return the path to which the symbolic link points., Rename this path to the target path.          The target path may be absolute or, Base class for manipulating paths without I/O.      PurePath represents a filesy, Construct a new path object from any number of path-like objects.         Subcla, Return the string representation of the path, suitable for         passing to sy (+20 more)
 
 ### Community 114 - "Community 114"
-Cohesion: 0.07
-Nodes (11): _BaseWaitHandleFuture, IocpProactor, _OverlappedFuture, Subclass of Future which represents a wait for the cancellation of a     _WaitHa, Proactor implementation using IOCP., Subclass of Future which represents an overlapped operation.      Cancelling it, Wait for a handle.          Return a Future object. The result of the future is, Unregister an overlapped object.          Call this method when its future has b (+3 more)
+Cohesion: 0.06
+Nodes (14): _BaseWaitHandleFuture, IocpProactor, _OverlappedFuture, ProactorEventLoop, Subclass of Future which represents a wait for the cancellation of a     _WaitHa, Windows version of proactor event loop using IOCP., Proactor implementation using IOCP., Subclass of Future which represents an overlapped operation.      Cancelling it (+6 more)
 
 ### Community 115 - "Community 115"
 Cohesion: 0.04
@@ -3047,19 +2953,19 @@ Nodes (25): Address, AddressHeader, BaseHeader, ContentDispositionHeader, Conten
 
 ### Community 116 - "Community 116"
 Cohesion: 0.04
-Nodes (35): demo1(), Navigation part of the RawTurtle.     Implements methods for turtle movement., reset turtle to its initial values          Will be overwritten by parent class, Set turtle-mode to 'standard', 'world' or 'logo'., Set angle measurement units to degrees.          Optional argument:         full, Set the angle measurement units to radians.          No arguments.          Exam, move turtle forward by specified distance, Turn turtle counterclockwise by specified angle if angle > 0. (+27 more)
+Nodes (27): Navigation part of the RawTurtle.     Implements methods for turtle movement., reset turtle to its initial values          Will be overwritten by parent class, Set turtle-mode to 'standard', 'world' or 'logo'., Set angle measurement units to degrees.          Optional argument:         full, Set the angle measurement units to radians.          No arguments.          Exam, move turtle forward by specified distance, Turn turtle counterclockwise by specified angle if angle > 0., move turtle to position end. (+19 more)
 
 ### Community 117 - "Community 117"
 Cohesion: 0.06
-Nodes (32): _AsyncIterator, AsyncMagicMixin, AsyncMock, Base, _check_signature(), _copy_func_details(), _get_method(), _get_signature_object() (+24 more)
+Nodes (41): _CallList, _check_and_set_parent(), _check_signature(), _check_spec_arg_typos(), _copy_func_details(), create_autospec(), _extract_mock(), _get_method() (+33 more)
 
 ### Community 118 - "Community 118"
 Cohesion: 0.05
 Nodes (64): __hash_code_base(), at(), __base_type(), __clp2(), __ebo_hash(), _GLIBCXX_VISIBILITY(), __h(), _M_bkt_for_elements() (+56 more)
 
 ### Community 119 - "Community 119"
-Cohesion: 0.04
-Nodes (42): end_element_handler(), ExpatBuilderNS, FilterCrutch, FragmentBuilder, FragmentBuilderNS, _intern(), InternalSubsetExtractor, makeBuilder() (+34 more)
+Cohesion: 0.03
+Nodes (50): end_element_handler(), ExpatBuilder, ExpatBuilderNS, FilterCrutch, FilterVisibilityController, FragmentBuilder, FragmentBuilderNS, _intern() (+42 more)
 
 ### Community 120 - "Community 120"
 Cohesion: 0.07
@@ -3074,8 +2980,8 @@ Cohesion: 0.07
 Nodes (71): gboolean, gchar, gint, gpointer, GdkDrawable, GdkEvent, GdkEventButton, GdkEventKey (+63 more)
 
 ### Community 123 - "Community 123"
-Cohesion: 0.04
-Nodes (39): _AcquireFutures, _AllCompletedWaiter, as_completed(), _AsCompletedWaiter, BrokenExecutor, CancelledError, _create_and_install_waiters(), Error (+31 more)
+Cohesion: 0.05
+Nodes (36): _AcquireFutures, _AllCompletedWaiter, as_completed(), _AsCompletedWaiter, CancelledError, _create_and_install_waiters(), Error, _FirstCompletedWaiter (+28 more)
 
 ### Community 124 - "Community 124"
 Cohesion: 0.10
@@ -3087,7 +2993,7 @@ Nodes (67): __arch_swab32(), __arch_swab64(), __be16_to_cpup(), __be32_to_cpup()
 
 ### Community 126 - "Community 126"
 Cohesion: 0.04
-Nodes (26): Logging configuration., FlowControlMixin, open_connection(), open_unix_connection(), Similar to `start_server` but works with UNIX Domain Sockets., Reusable flow control logic for StreamWriter.drain().      This implements the p, Helper class to adapt between Protocol and StreamReader.      (This is a helper, A wrapper for create_connection() returning a (reader, writer) pair.      The re (+18 more)
+Nodes (25): FlowControlMixin, open_connection(), open_unix_connection(), Similar to `start_server` but works with UNIX Domain Sockets., Reusable flow control logic for StreamWriter.drain().      This implements the p, Helper class to adapt between Protocol and StreamReader.      (This is a helper, A wrapper for create_connection() returning a (reader, writer) pair.      The re, Wraps a Transport.      This exposes write(), writelines(), [can_]write_eof(), (+17 more)
 
 ### Community 127 - "Community 127"
 Cohesion: 0.05
@@ -3110,60 +3016,64 @@ Cohesion: 0.08
 Nodes (69): _Bit_alloc_type, _Bit_type, __a(), assign(), at(), back(), begin(), _Bvector_base() (+61 more)
 
 ### Community 132 - "Community 132"
-Cohesion: 0.10
-Nodes (22): build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs(), effective_idle_timeout(), kgl_hint_is_gated_and_mentions_orient(), kgl_instructions_hint() (+14 more)
+Cohesion: 0.09
+Nodes (23): apply_reroot(), apply_reroot_repoints_workspace_cwd_and_index(), build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs(), effective_idle_timeout() (+15 more)
 
 ### Community 133 - "Community 133"
-Cohesion: 0.05
-Nodes (34): calc_chksums(), itn(), Return the object as a ustar header block., Return the object as a GNU header block sequence., Return the object as a ustar header block. If it cannot be            represente, Return the object as a pax global header block sequence., Split a name longer than 100 chars into a prefix            and a name part., Return a header block. info is a dictionary with file            information, fo (+26 more)
+Cohesion: 0.04
+Nodes (48): calc_chksums(), InvalidHeaderError, itn(), nti(), nts(), Return the object as a ustar header block., Return the object as a GNU header block sequence., Return the object as a ustar header block. If it cannot be            represente (+40 more)
 
 ### Community 134 - "Community 134"
 Cohesion: 0.06
 Nodes (50): context_length_from_models(), context_window_returns_none_on_http_error(), is_context_overflow_error(), map_finish_reason(), messages_to_wire(), OpenRouterProvider, parse_end_turn_response(), parse_missing_usage_fields_default_to_zero() (+42 more)
 
+### Community 135 - "Community 135"
+Cohesion: 0.04
+Nodes (44): _arp_getnode(), _find_mac_near_keyword(), _find_mac_under_heading(), _get_command_stdout(), _ifconfig_getnode(), _ip_getnode(), _ipconfig_getnode(), _is_universal() (+36 more)
+
 ### Community 136 - "Community 136"
 Cohesion: 0.04
-Nodes (49): all_tasks(), as_completed(), _cancel_and_wait(), create_eager_task_factory(), create_task(), current_task(), ensure_future(), _enter_task() (+41 more)
+Nodes (51): all_tasks(), as_completed(), _cancel_and_wait(), create_eager_task_factory(), create_task(), current_task(), ensure_future(), _enter_task() (+43 more)
 
 ### Community 137 - "Community 137"
 Cohesion: 0.04
 Nodes (24): PyInterpreterState, PyThreadState, PyThreadState, PyObject, PyTypeObject, _Py_ANNOTATE_MEMORY_ORDER(), _Py_atomic_signal_fence(), _Py_atomic_thread_fence() (+16 more)
 
 ### Community 138 - "Community 138"
-Cohesion: 0.05
-Nodes (62): basic_block, const_basic_block, gimple_seq, gbind, gcatch, geh_else, gimple_seq_node, bb_seq() (+54 more)
+Cohesion: 0.04
+Nodes (69): basic_block, const_basic_block, gimple_seq, gbind, gcatch, geh_else, gimple_seq_node, gtry (+61 more)
 
 ### Community 139 - "Community 139"
 Cohesion: 0.04
-Nodes (21): _compare_grouped_stats(), _format_size(), get_object_traceback(), Sequence of Frame instances sorted from the oldest frame     to the most recent, Get the traceback where the Python object *obj* was allocated.     Return a Trac, Trace of a memory block., Statistic difference on memory allocations between two Snapshot instance., Snapshot of traces of memory blocks allocated by Python. (+13 more)
+Nodes (19): BaseFilter, _compare_grouped_stats(), DomainFilter, Frame, get_object_traceback(), Frame of a traceback., Sequence of Frame instances sorted from the oldest frame     to the most recent, Get the traceback where the Python object *obj* was allocated.     Return a Trac (+11 more)
 
 ### Community 140 - "Community 140"
 Cohesion: 0.05
-Nodes (31): EOFError, read_signed(), TestPCIUtils, BadGzipFile, compress(), _create_simple_gzip_header(), decompress(), GzipFile (+23 more)
+Nodes (29): BadGzipFile, compress(), _create_simple_gzip_header(), decompress(), GzipFile, _GzipReader, main(), open() (+21 more)
 
 ### Community 141 - "Community 141"
-Cohesion: 0.03
-Nodes (35): ExtensionFileLoader, FileLoader, _LoaderBasics, NamespaceLoader, _NamespacePath, This method is deprecated., Base file loader class which implements the loader protocol methods that     req, Cache the module name and the path to the file found by the         finder. (+27 more)
+Cohesion: 0.04
+Nodes (22): FileLoader, NamespaceLoader, Base file loader class which implements the loader protocol methods that     req, Cache the module name and the path to the file found by the         finder., Load a module from a file.          This method is deprecated.  Use exec_module(, Return the path to the source file as found by the finder., Use default semantics for module creation., Use default semantics for module creation. (+14 more)
 
 ### Community 142 - "Community 142"
 Cohesion: 0.16
 Nodes (32): FILE, tristate, expr_alloc_and(), expr_alloc_comp(), expr_alloc_one(), expr_alloc_or(), expr_alloc_symbol(), expr_alloc_two() (+24 more)
 
 ### Community 143 - "Community 143"
-Cohesion: 0.04
-Nodes (38): _AnyComparer, _CallList, _check_and_set_parent(), _check_spec_arg_typos(), create_autospec(), _extract_mock(), _instance_callable(), InvalidSpecError (+30 more)
+Cohesion: 0.03
+Nodes (36): _AnyComparer, AsyncMockMixin, Base, _Call, _callable(), CallableMixin, _format_call_signature(), _is_exception() (+28 more)
 
 ### Community 144 - "Community 144"
 Cohesion: 0.03
 Nodes (3): namedtuple(), Returns a new subclass of tuple with named fields.      >>> Point = namedtuple(', UserString
 
 ### Community 145 - "Community 145"
-Cohesion: 0.04
-Nodes (41): Abstract base classes related to import., ExecutionLoader, FileLoader, InspectLoader, Loader, MetaPathFinder, PathEntryFinder, Optional method which when implemented should return whether the         module (+33 more)
+Cohesion: 0.05
+Nodes (34): Abstract base classes related to import., ExecutionLoader, FileLoader, InspectLoader, MetaPathFinder, PathEntryFinder, Optional method which when implemented should return whether the         module, Method which returns the code object for the module.          The fullname is a (+26 more)
 
 ### Community 146 - "Community 146"
 Cohesion: 0.04
-Nodes (31): Address, AddressList, Atom, ContentDisposition, ContentTransferEncoding, ContentType, Domain, DomainLiteral (+23 more)
+Nodes (35): Address, AddressList, Atom, ContentDisposition, ContentTransferEncoding, ContentType, DisplayName, DomainLiteral (+27 more)
 
 ### Community 147 - "Community 147"
 Cohesion: 0.03
@@ -3174,24 +3084,24 @@ Cohesion: 0.04
 Nodes (36): BaseTransport, DatagramTransport, _FlowControlMixin, Abstract Transport class., Base class for transports., Get the high and low watermarks for write flow control.         Return a tuple (, Write some data bytes to the transport.          This does not block; it buffers, Write a list (or any iterable) of data bytes to the transport.          The defa (+28 more)
 
 ### Community 149 - "Community 149"
-Cohesion: 0.12
-Nodes (36): begin(), clear(), erase(), extract(), _GLIBCXX_VISIBILITY(), lower_bound(), _M_begin(), _M_const_cast() (+28 more)
+Cohesion: 0.13
+Nodes (33): begin(), clear(), erase(), extract(), lower_bound(), _M_begin(), _M_const_cast(), _M_end() (+25 more)
 
 ### Community 150 - "Community 150"
-Cohesion: 0.04
-Nodes (64): Claude Code CLI, Claude Code Desktop App, Claude Code Setup Guide, Starlark Script Interpreter, Cline VS Code Extension Setup Guide, Daimonos MCP Server, execute_script Tool (Starlark), Index Settings [index] (+56 more)
+Cohesion: 0.05
+Nodes (52): Claude Code CLI, Claude Code Desktop App, Claude Code Setup Guide, Starlark Script Interpreter, Cline VS Code Extension Setup Guide, Daimonos MCP Server, execute_script Tool (Starlark), Index Settings [index] (+44 more)
 
 ### Community 151 - "Community 151"
-Cohesion: 0.04
-Nodes (29): Client(), Connection, Listener, Pipe(), Pool(), LifoQueue, _PySimpleQueue, Queue (+21 more)
+Cohesion: 0.06
+Nodes (24): Full, LifoQueue, _PySimpleQueue, Queue, A multi-producer, multi-consumer queue., Return True if the queue is full, False otherwise (not reliable!).          This, Put an item into the queue.          If optional args 'block' is true and 'timeo, Remove and return an item from the queue.          If optional args 'block' is t (+16 more)
 
 ### Community 152 - "Community 152"
 Cohesion: 0.03
-Nodes (45): AbstractAsyncContextManager, AbstractContextManager, aclosing, AsyncContextDecorator, asynccontextmanager(), _AsyncGeneratorContextManager, chdir, closing (+37 more)
+Nodes (50): AbstractAsyncContextManager, AbstractContextManager, aclosing, AsyncContextDecorator, asynccontextmanager(), AsyncExitStack, _AsyncGeneratorContextManager, _BaseExitStack (+42 more)
 
 ### Community 153 - "Community 153"
-Cohesion: 0.05
-Nodes (30): _ignore_error(), Path, Open the file pointed to by this path and return a file object, as         the b, Open the file in bytes mode, read it, and close the file., Open the file in text mode, read it, and close the file., Open the file in bytes mode, write to it, and close the file., Open the file in text mode, write to it, and close the file., Yield path objects of the directory contents.          The children are yielded (+22 more)
+Cohesion: 0.04
+Nodes (32): _ignore_error(), Path, Open the file pointed to by this path and return a file object, as         the b, Open the file in bytes mode, read it, and close the file., Open the file in text mode, read it, and close the file., Open the file in bytes mode, write to it, and close the file., Open the file in text mode, write to it, and close the file., Yield path objects of the directory contents.          The children are yielded (+24 more)
 
 ### Community 154 - "Community 154"
 Cohesion: 0.06
@@ -3210,12 +3120,12 @@ Cohesion: 0.08
 Nodes (53): active_model_prepended_when_absent_from_configured_list(), AgentEnv, base(), candidate_models(), compaction_invalid_switch_value_errors(), compaction_key_is_required(), compaction_needs_window_captures_summary_keys(), compaction_needs_window_still_enforces_watermarks_at_parse() (+45 more)
 
 ### Community 158 - "Community 158"
-Cohesion: 0.06
-Nodes (22): BufferedIOBase, Base class for text I/O.      This class provides a character and line based int, Read at most size characters from stream, where size is an int.          Read fr, Write string s to stream and returning an int., Truncate size to pos, where pos is an int., Read until newline or EOF.          Returns an empty string if EOF is hit immedi, Separate the underlying buffer from the TextIOBase and return it.          After, Subclasses should override. (+14 more)
+Cohesion: 0.03
+Nodes (40): BufferedIOBase, IOBase, Move to new file position.          Argument offset is a byte count.  Optional a, tell() -> int.  Current file position.          Can raise OSError for non seekab, True if file was opened in a read mode., True if file was opened in a write mode., Return the underlying file descriptor (an integer)., Base class for text I/O.      This class provides a character and line based int (+32 more)
 
 ### Community 159 - "Community 159"
 Cohesion: 0.06
-Nodes (74): _Abi0, __autocvt_to_simd(), constexpr(), __for_each(), _GLIBCXX_SIMD_APPLY_ON_TUPLE(), _GLIBCXX_SIMD_CMP_OPERATIONS(), _GLIBCXX_SIMD_TEST_ON_TUPLE_(), _M_apply_per_chunk() (+66 more)
+Nodes (62): _Abi0, __autocvt_to_simd(), constexpr(), __for_each(), _GLIBCXX_SIMD_APPLY_ON_TUPLE(), _GLIBCXX_SIMD_CMP_OPERATIONS(), _GLIBCXX_SIMD_TEST_ON_TUPLE_(), _M_apply_per_chunk() (+54 more)
 
 ### Community 160 - "Community 160"
 Cohesion: 0.05
@@ -3227,7 +3137,7 @@ Nodes (30): assert_substrate_isolation(), completeness_flags_missing_purpose_and
 
 ### Community 162 - "Community 162"
 Cohesion: 0.05
-Nodes (49): _add_slots(), asdict(), _asdict_inner(), astuple(), _astuple_inner(), _cmp_fn(), _create_fn(), dataclass() (+41 more)
+Nodes (50): _add_slots(), asdict(), _asdict_inner(), astuple(), _astuple_inner(), _cmp_fn(), _create_fn(), dataclass() (+42 more)
 
 ### Community 163 - "Community 163"
 Cohesion: 0.06
@@ -3235,15 +3145,15 @@ Nodes (56): Bytecode, code_info(), _deoptop(), dis(), disassemble(), _disassembl
 
 ### Community 164 - "Community 164"
 Cohesion: 0.04
-Nodes (54): _c3_merge(), _c3_mro(), cache(), cached_property, cmp_to_key(), _compose_mro(), _find_impl(), _ge_from_gt() (+46 more)
+Nodes (58): _c3_merge(), _c3_mro(), cache(), cached_property, cmp_to_key(), _compose_mro(), _find_impl(), _ge_from_gt() (+50 more)
 
 ### Community 165 - "Community 165"
 Cohesion: 0.05
 Nodes (38): A list-specific equality assertion.          Args:             list1: The first, A tuple-specific equality assertion.          Args:             tuple1: The firs, A set-specific equality assertion.          Args:             set1: The first se, Just like self.assertTrue(a in b), but with a nicer default message., Just like self.assertTrue(a not in b), but with a nicer default message., Just like self.assertTrue(a is b), but with a nicer default message., Just like self.assertTrue(a is not b), but with a nicer default message., Asserts that two iterables have the same elements, the same number of         ti (+30 more)
 
 ### Community 166 - "Community 166"
-Cohesion: 0.03
-Nodes (26): Binary, DateTime, _datetime_type(), dumps(), Error, escape(), ExpatParser, Fault (+18 more)
+Cohesion: 0.09
+Nodes (5): Binary, _datetime_type(), Wrapper for binary data., Unmarshal an XML-RPC response, based on incoming XML event     messages (start,, Unmarshaller
 
 ### Community 167 - "Community 167"
 Cohesion: 0.07
@@ -3258,44 +3168,44 @@ Cohesion: 0.05
 Nodes (56): inc_it_state(), PB_DS_CC_HASH_NAME, begin, clear, deallocate_all, deallocate_links_in_list, do_resize, do_resize_if_needed (+48 more)
 
 ### Community 170 - "Community 170"
-Cohesion: 0.13
-Nodes (26): class, COMBINE_LOCATION_DATA(), compare(), fixit_hint(), GTY(), label_text(), LINEMAP_FILE(), linemap_included_from() (+18 more)
+Cohesion: 0.07
+Nodes (67): cpp_hashnode, class, class, location_t, binary_op_rich_location(), gcc_rich_location(), maybe_range_label_for_tree_type_mismatch(), range_label_for_type_mismatch() (+59 more)
 
 ### Community 171 - "Community 171"
 Cohesion: 0.07
-Nodes (27): All the operations on a read-only sequence.      Concrete subclasses must overri, S.count(value) -> integer -- return number of occurrences of value, Sequence, _compile_pattern(), _compile_pattern_lines(), _DoubleRecursiveWildcardSelector, _is_case_sensitive(), _make_selector() (+19 more)
+Nodes (26): _compile_pattern(), _compile_pattern_lines(), _DoubleRecursiveWildcardSelector, _is_case_sensitive(), _make_selector(), __new__(), _ParentSelector, PosixPath (+18 more)
 
 ### Community 172 - "Community 172"
-Cohesion: 0.05
-Nodes (30): NNTP, NNTPReplyError, Unexpected [123]xx reply, Initialize an instance.  Arguments:         - host: hostname to connect to, Partial initialization for the NNTP protocol.         This instance method is ex, Get the welcome message from the server         (this is read and squirreled awa, Get the server capabilities, as read by __init__().         If the CAPABILITIES, Set the debugging level.  Argument 'level' means:         0: no debugging output (+22 more)
+Cohesion: 0.12
+Nodes (9): Internal: parse the response line of a STAT, NEXT, LAST,         ARTICLE, HEAD o, Internal: process a STAT, NEXT or LAST command., Process a STAT command.  Argument:         - message_spec: article number or mes, Process a NEXT command.  No arguments.  Return as for STAT., Process a LAST command.  No arguments.  Return as for STAT., Internal: process a HEAD, BODY or ARTICLE command., Process a HEAD command.  Argument:         - message_spec: article number or mes, Process a BODY command.  Argument:         - message_spec: article number or mes (+1 more)
 
 ### Community 173 - "Community 173"
-Cohesion: 0.09
-Nodes (45): class, loop_p, poly_uint64, tree, TYPE_VECTOR_SUBPARTS(), add_stmt_costs(), aligned_access_p(), auto_purge_vect_location() (+37 more)
+Cohesion: 0.07
+Nodes (60): HOST_WIDE_INT, poly_int64, class, loop_p, poly_uint64, tree, get_gimple_rhs_class(), gimple_assign_cast_p() (+52 more)
 
 ### Community 174 - "Community 174"
 Cohesion: 0.05
 Nodes (31): BufferedSubFile, BytesFeedParser, FeedParser, Push some new data into this object., A feed-style parser of email., _factory is called with no arguments to create a new message obj          The po, Push more data into the parser., Parse all remaining data and return the root message object. (+23 more)
 
 ### Community 175 - "Community 175"
-Cohesion: 0.15
-Nodes (8): BufferedReader, BufferedReader(raw[, buffer_size])      A buffer for a readable, sequential Base, Create a new buffered reader using the given readable raw IO object., Read size bytes.          Returns exactly size bytes of data unless the underlyi, Returns buffered bytes without advancing the position.          The argument ind, Reads up to size bytes, with at most one read() system call., Read data into *buf* with at most one system call., Constructor.          The arguments are two RawIO instances.
+Cohesion: 0.05
+Nodes (28): auto_ptr_ref(), get(), release(), binary_heap_const_iterator_, accumulate(), _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), noexcept() (+20 more)
 
 ### Community 176 - "Community 176"
-Cohesion: 0.07
-Nodes (19): BrokenBarrierError, CancelledError, IncompleteReadError, InvalidStateError, LimitOverrunError, The Future or Task was cancelled., The operation is not allowed in this state., Incomplete read error. Attributes:      - partial: read bytes string before the (+11 more)
+Cohesion: 0.05
+Nodes (31): Loader, Return a module to initialize and into which to load.          This method shoul, Return the loaded module.          The module must be added to sys.modules and h, Abstract base class for import loaders., _find_spec(), _ImportLockContext, Context manager for the import lock., Acquire the import lock. (+23 more)
 
 ### Community 177 - "Community 177"
 Cohesion: 0.05
 Nodes (40): cgraph_node, class, HOST_WIDE_INT, tree, va_gc, vec, GTY(), ipa_argagg_value_list() (+32 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.06
-Nodes (31): AbstractReducer, _C, dump(), DupFd(), DupHandle, duplicate(), ForkingPickler, Receive a handle over a local connection. (+23 more)
+Cohesion: 0.04
+Nodes (40): AbstractReducer, _C, dump(), DupFd(), DupHandle, duplicate(), ForkingPickler, Receive a handle over a local connection. (+32 more)
 
 ### Community 179 - "Community 179"
 Cohesion: 0.03
-Nodes (20): Obj, call(), concat(), contains(), countOf(), iconcat(), index(), indexOf() (+12 more)
+Nodes (22): Obj, call(), concat(), contains(), countOf(), iconcat(), index(), indexOf() (+14 more)
 
 ### Community 180 - "Community 180"
 Cohesion: 0.04
@@ -3306,8 +3216,8 @@ Cohesion: 0.04
 Nodes (62): _adjust_cli_sys_path(), browse(), cli(), describe(), Doc, ErrorDuringImport, _escape_stdout(), _findclass() (+54 more)
 
 ### Community 182 - "Community 182"
-Cohesion: 0.10
-Nodes (51): ALWAYS_INLINE, class, namespace, poly_uint64, T, U, from_int, as_a() (+43 more)
+Cohesion: 0.09
+Nodes (58): machine_mode, poly_uint16, ALWAYS_INLINE, class, namespace, poly_uint64, T, U (+50 more)
 
 ### Community 183 - "Community 183"
 Cohesion: 0.15
@@ -3318,12 +3228,12 @@ Cohesion: 0.05
 Nodes (31): r"""TELNET client class.  Based on RFC 854: TELNET Protocol Specification, by J., Telnet interface class.      An instance of this class represents a connection t, Constructor.          When called without arguments, create an unconnected insta, Connect to a host.          The optional second argument is the port number, whi, Destructor -- close the connection., Print a debug message, when the debug level is > 0.          If extra arguments, Set the debug level.          The higher it is, the more debug output you get (o, Close the connection. (+23 more)
 
 ### Community 185 - "Community 185"
-Cohesion: 0.04
-Nodes (52): demo2(), Set or return backgroundcolor of the TurtleScreen.          Arguments (if given), Drawing part of the RawTurtle.     Implements drawing properties., Set resizemode to one of the values: "auto", "user", "noresize".          (Optio, Set or return the line thickness.          Aliases:  pensize | width          Ar, Pull the pen up -- no drawing when moving.          Aliases: penup | pu | up, Pull the pen down -- drawing when moving.          Aliases: pendown | pd | down, Return True if pen is down, False if it's up.          No argument.          Exa (+44 more)
+Cohesion: 0.05
+Nodes (36): demo2(), Set or return backgroundcolor of the TurtleScreen.          Arguments (if given), Draw a circle with given radius.          Arguments:         radius -- a number, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, Drawing part of the RawTurtle.     Implements drawing properties., Set resizemode to one of the values: "auto", "user", "noresize".          (Optio (+28 more)
 
 ### Community 186 - "Community 186"
 Cohesion: 0.06
-Nodes (35): _format_callbacks(), _future_repr(), _future_repr_info(), isfuture(), Check for a Future.      This returns True when obj is a Future instance or is a, helper function for Future.__repr__, helper function for Future.__repr__, _chain_future() (+27 more)
+Nodes (32): isfuture(), Check for a Future.      This returns True when obj is a Future instance or is a, _chain_future(), _convert_future_exc(), _copy_future_state(), Future, _get_loop(), A Future class similar to the one in PEP 3148. (+24 more)
 
 ### Community 187 - "Community 187"
 Cohesion: 0.11
@@ -3331,7 +3241,7 @@ Nodes (58): blk64_t, blk_t, ext2_ino_t, ext2fs_fast_clear_bit(), ext2fs_fast_cle
 
 ### Community 188 - "Community 188"
 Cohesion: 0.08
-Nodes (53): FILE, lt_dladvise, lt_dlvtable, foreach_callback_func, lt__strdup(), argz_next(), argz_stringify(), argzize_path() (+45 more)
+Nodes (54): FILE, lt_dladvise, lt_dlvtable, foreach_callback_func, lt__strdup(), argz_stringify(), argzize_path(), file_not_found() (+46 more)
 
 ### Community 189 - "Community 189"
 Cohesion: 0.11
@@ -3342,8 +3252,8 @@ Cohesion: 0.18
 Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
 
 ### Community 191 - "Community 191"
-Cohesion: 0.06
-Nodes (33): _detect_future_features(), _EveryNode, FixerError, get_all_fix_names(), get_fixers_from_package(), _get_head_types(), _get_headnode_dict(), MultiprocessingUnsupported (+25 more)
+Cohesion: 0.05
+Nodes (35): find_root(), Find the top level namespace., _detect_future_features(), _EveryNode, FixerError, get_all_fix_names(), get_fixers_from_package(), _get_head_types() (+27 more)
 
 ### Community 192 - "Community 192"
 Cohesion: 0.06
@@ -3363,15 +3273,15 @@ Nodes (45): Drop, Globals, GlobalsBuilder, Handle, build_globals(), builtin_func
 
 ### Community 196 - "Community 196"
 Cohesion: 0.05
-Nodes (53): BoundaryError, CharsetError, CloseBoundaryNotFoundDefect, FirstHeaderLineIsContinuationDefect, HeaderDefect, HeaderMissingRequiredValue, HeaderParseError, InvalidBase64CharactersDefect (+45 more)
+Nodes (51): BoundaryError, CharsetError, CloseBoundaryNotFoundDefect, FirstHeaderLineIsContinuationDefect, HeaderDefect, HeaderMissingRequiredValue, InvalidBase64CharactersDefect, InvalidBase64LengthDefect (+43 more)
 
 ### Community 197 - "Community 197"
 Cohesion: 0.10
 Nodes (50): IndexState, concurrent_reindexes_serialize_correctly(), eager_index_small_root_regardless_of_marker(), extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), gate_allows_large_marked_root() (+42 more)
 
 ### Community 198 - "Community 198"
-Cohesion: 0.04
-Nodes (61): BufferFlags, _check_class(), _check_instance(), currentframe(), EndOfBlock, formatargvalues(), getargs(), getargvalues() (+53 more)
+Cohesion: 0.06
+Nodes (54): _findclass(), _finddoc(), findsource(), getabsfile(), getclosurevars(), getcomments(), getfile(), getframeinfo() (+46 more)
 
 ### Community 200 - "Community 200"
 Cohesion: 0.11
@@ -3391,7 +3301,7 @@ Nodes (55): __m512i, __mmask16, __mmask32, __mmask64, __mmask8, _mm512_mask_comp
 
 ### Community 204 - "Community 204"
 Cohesion: 0.10
-Nodes (54): Args, code_helper, combined_fn, gimple_seq, location_t, tree, basic_block, gimple (+46 more)
+Nodes (53): Args, code_helper, combined_fn, gimple_seq, location_t, tree, basic_block, gimple (+45 more)
 
 ### Community 205 - "Community 205"
 Cohesion: 0.11
@@ -3406,8 +3316,8 @@ Cohesion: 0.06
 Nodes (24): error_proto, POP3, POP3_SSL, A POP3 client class.  Based on the J. Myers POP3 draft, Jan. 96, Send user name, return response          (should indicate password required)., Send password, return response          (response includes message count, mailbo, Get mailbox status.          Result is tuple of 2 ints (message count, mailbox s, Request listing, return result.          Result without a message number argumen (+16 more)
 
 ### Community 208 - "Community 208"
-Cohesion: 0.05
-Nodes (31): Set turtle-mode ('standard', 'logo' or 'world') and perform reset.          Opti, Set up a user defined coordinate-system.          Arguments:         llx -- a nu, Resize the canvas the turtles are drawing on.          Optional arguments:, Modeled after the scrolled canvas class from Grayons's Tkinter book.      Used a, Adjust canvas and scrollbars according to given canvas size., Bind fun to mouse-click event on this turtle on canvas.          Arguments:, Bind fun to mouse-move event on this turtle on canvas.          Arguments:, Adjust scrollbars according to window- and canvas-size. (+23 more)
+Cohesion: 0.04
+Nodes (34): Set up a user defined coordinate-system.          Arguments:         llx -- a nu, Resize the canvas the turtles are drawing on.          Optional arguments:, Modeled after the scrolled canvas class from Grayons's Tkinter book.      Used a, Adjust canvas and scrollbars according to given canvas size., Bind fun to mouse-click event on this turtle on canvas.          Arguments:, Bind fun to mouse-move event on this turtle on canvas.          Arguments:, Adjust scrollbars according to window- and canvas-size., Go into mainloop until the mouse is clicked.          No arguments.          Bin (+26 more)
 
 ### Community 209 - "Community 209"
 Cohesion: 0.09
@@ -3418,8 +3328,8 @@ Cohesion: 0.04
 Nodes (12): Childless, DocumentFragment, Entity, Identified, Notation, ProcessingInstruction, Mix-in class that supports the publicId and systemId attributes., Mixin that makes childless-ness easy to implement and avoids     the complexity (+4 more)
 
 ### Community 211 - "Community 211"
-Cohesion: 0.06
-Nodes (50): __a(), __enable_shared_from_this_base(), __first(), get(), _GLIBCXX_VISIBILITY(), _M_add_ref_copy(), _M_alloc(), _M_alloc_array() (+42 more)
+Cohesion: 0.17
+Nodes (14): get(), _M_add_ref_copy(), _M_alloc_array(), _M_dealloc_array(), _M_destroy(), _M_release(), _M_weak_release(), new() (+6 more)
 
 ### Community 212 - "Community 212"
 Cohesion: 0.09
@@ -3431,15 +3341,15 @@ Nodes (51): blk_t, dgrp_t, ext2_filsys, ext2_ino_t, ext2_inode, __decode_extra_n
 
 ### Community 214 - "Community 214"
 Cohesion: 0.11
-Nodes (25): class, gt_pointer_operator, irange, tree, wide_int, clear_nan(), contains_zero_p(), frange() (+17 more)
+Nodes (36): class, const_tree, gt_pointer_operator, irange, REAL_VALUE_TYPE, tree, wide_int, clear_nan() (+28 more)
 
 ### Community 215 - "Community 215"
 Cohesion: 0.08
 Nodes (51): blk_t, dgrp_t, ext2_filsys, ext2_ino_t, ext2_inode, __decode_extra_nsec(), __decode_extra_sec(), __encode_extra_time() (+43 more)
 
 ### Community 216 - "Community 216"
-Cohesion: 0.05
-Nodes (27): active_children(), get_spawning_popen(), active_children(), AuthenticationString, BaseProcess, _cleanup(), current_process(), _MainProcess (+19 more)
+Cohesion: 0.06
+Nodes (17): AuthenticationString, BaseProcess, _MainProcess, _ParentProcess, Method to be run in sub-process; can be overridden in sub-class, Terminate process; sends SIGTERM signal or uses TerminateProcess(), Wait until child process terminates, Return whether process is alive (+9 more)
 
 ### Community 217 - "Community 217"
 Cohesion: 0.05
@@ -3450,8 +3360,8 @@ Cohesion: 0.06
 Nodes (38): PersistedSession, SessionSummary, build_agent_config(), build_tool_session(), ChatCommand, config_has_no_before_hook_without_safety_policy(), config_has_no_token_log_by_default(), config_has_system_prompt() (+30 more)
 
 ### Community 219 - "Community 219"
-Cohesion: 0.04
-Nodes (24): Fraction, _hash_algorithm(), Round a rational number to a given number of significant figures.      Rounds th, This class implements rational numbers.      In the two-argument form of the con, Constructs a Rational.          Takes a string like '3/2' or '1.5', another Rati, Converts a finite float to a rational number, exactly.          Beware that Frac, Converts a finite Decimal instance to a rational number, exactly., Convert a pair of ints to a rational number, for internal use.          The rati (+16 more)
+Cohesion: 0.05
+Nodes (15): Fraction, This class implements rational numbers.      In the two-argument form of the con, Constructs a Rational.          Takes a string like '3/2' or '1.5', another Rati, Converts a finite float to a rational number, exactly.          Beware that Frac, Converts a finite Decimal instance to a rational number, exactly., Convert a pair of ints to a rational number, for internal use.          The rati, Return True if the Fraction is an integer., Return a pair of integers, whose ratio is equal to the original Fraction. (+7 more)
 
 ### Community 220 - "Community 220"
 Cohesion: 0.08
@@ -3462,8 +3372,8 @@ Cohesion: 0.10
 Nodes (49): machine_mode, add_cost(), add_cost_ptr(), convert_cost(), convert_cost_ptr(), expmed_mode_index(), expmed_op_cheap_ptr(), expmed_op_cost_ptr() (+41 more)
 
 ### Community 222 - "Community 222"
-Cohesion: 0.24
-Nodes (26): signop, T1, T2, arshift(), cmp(), cmps(), cmpu(), eq_p() (+18 more)
+Cohesion: 0.19
+Nodes (35): HOST_WIDE_INT, namespace, signop, T1, T2, arshift(), cmp(), cmps() (+27 more)
 
 ### Community 223 - "Community 223"
 Cohesion: 0.07
@@ -3482,20 +3392,20 @@ Cohesion: 0.07
 Nodes (7): Au_read, Au_write, Error, open(), Stuff to parse Sun and NeXT audio files.  An audio file consists of a header fol, _read_u32(), _write_u32()
 
 ### Community 227 - "Community 227"
-Cohesion: 0.05
-Nodes (25): Reset all Turtles on the Screen to their initial state.          No argument., Return the list of turtles on the screen.          Example (for a TurtleScreen i, Return or set the drawing delay in milliseconds.          Optional argument:, Increment update counter., Perform a TurtleScreen update., Return the width of the turtle window.          Example (for a TurtleScreen inst, Return the height of the turtle window.          Example (for a TurtleScreen ins, Return the Canvas of this TurtleScreen.          No argument.          Example ( (+17 more)
+Cohesion: 0.04
+Nodes (31): Adds a turtle shape to TurtleScreen's shapelist.          Arguments:         (1), Return color string corresponding to args.          Argument may be a string or, Reset all Turtles on the Screen to their initial state.          No argument., Return or set the drawing delay in milliseconds.          Optional argument:, Increment update counter., Return the width of the turtle window.          Example (for a TurtleScreen inst, Return the height of the turtle window.          Example (for a TurtleScreen ins, Return the Canvas of this TurtleScreen.          No argument.          Example ( (+23 more)
 
 ### Community 228 - "Community 228"
 Cohesion: 0.09
 Nodes (42): CacheEntry, DeclCache, FunctionInfo, ModuleInfo, ParamInfo, CacheEntry, content_hash_deterministic(), decl_cache_bounded_after_many_entries() (+34 more)
 
 ### Community 229 - "Community 229"
-Cohesion: 0.04
-Nodes (13): ctf_dtdef_ref, ctf_dvdef_ref, class, hashval_t, class, ipa_ref, control_dependences(), ctfc_dtd_hasher() (+5 more)
+Cohesion: 0.05
+Nodes (11): ctf_dtdef_ref, ctf_dvdef_ref, class, hashval_t, ipa_ref, control_dependences(), ctfc_dtd_hasher(), ctfc_dvd_hasher() (+3 more)
 
 ### Community 230 - "Community 230"
-Cohesion: 0.07
-Nodes (42): const_iterator, const_reference, iterator, key_const_reference, mapped_reference, pair, point_const_iterator, point_iterator (+34 more)
+Cohesion: 0.06
+Nodes (44): const_iterator, const_reference, iterator, key_const_reference, mapped_reference, pair, point_const_iterator, point_iterator (+36 more)
 
 ### Community 231 - "Community 231"
 Cohesion: 0.06
@@ -3515,15 +3425,15 @@ Nodes (11): NodeFilter, This is the DOM2 NodeFilter interface. It contains only 
 
 ### Community 235 - "Community 235"
 Cohesion: 0.07
-Nodes (18): CycleError, _NodeInfo, Return a tuple of all the nodes that are ready.          Initially it returns al, Return ``True`` if more progress can be made and ``False`` otherwise.          P, Marks a set of nodes returned by "get_ready" as processed.          This method, Returns an iterable of nodes in a topological order.          The particular ord, Subclass of ValueError raised by TopologicalSorter.prepare if cycles     exist i, Provides functionality to topologically sort a graph of hashable nodes (+10 more)
+Nodes (19): CycleError, _NodeInfo, Return a tuple of all the nodes that are ready.          Initially it returns al, Return ``True`` if more progress can be made and ``False`` otherwise.          P, Marks a set of nodes returned by "get_ready" as processed.          This method, Returns an iterable of nodes in a topological order.          The particular ord, Subclass of ValueError raised by TopologicalSorter.prepare if cycles     exist i, Provides functionality to topologically sort a graph of hashable nodes (+11 more)
 
 ### Community 236 - "Community 236"
 Cohesion: 0.04
-Nodes (36): Random, Random variable generators.      bytes     -----            uniform bytes (value, Random number generator base class used by bound module functions.      Used to, Initialize an instance.          Optional argument x controls seeding, as for Ra, Initialize internal state from a seed.          The only supported seed types ar, Return internal state; can be passed to setstate() later., Restore internal state from object returned by getstate()., Control how subclasses generate random integers.          The algorithm a subcla (+28 more)
+Nodes (37): Random, Random variable generators.      bytes     -----            uniform bytes (value, Random number generator base class used by bound module functions.      Used to, Initialize an instance.          Optional argument x controls seeding, as for Ra, Initialize internal state from a seed.          The only supported seed types ar, Return internal state; can be passed to setstate() later., Restore internal state from object returned by getstate()., Control how subclasses generate random integers.          The algorithm a subcla (+29 more)
 
 ### Community 237 - "Community 237"
-Cohesion: 0.06
-Nodes (26): Return True if it is a directory., Return True if it is a symbolic link., Return True if it is a hard link., Return True if it is a character device., Return True if it is a block device., Print a table of contents to sys.stdout. If `verbose' is False, only, Extract all members from the archive to the current working            directory, Extract a member from the archive to the current working directory,            u (+18 more)
+Cohesion: 0.05
+Nodes (41): ExtractError, main(), Return True if it is a directory., Return True if it is a symbolic link., Return True if it is a hard link., Return True if it is a character device., Return True if it is a block device., The TarFile Class provides an interface to tar archives. (+33 more)
 
 ### Community 238 - "Community 238"
 Cohesion: 0.09
@@ -3534,8 +3444,8 @@ Cohesion: 0.06
 Nodes (50): analytics.rs, plugins/cargo.rs, config.rs, tests/conftest.py, Daimonos OS Layer, ops/diff_ops.rs, plugins/docker.rs, ops/exec_filter.rs (+42 more)
 
 ### Community 240 - "Community 240"
-Cohesion: 0.05
-Nodes (10): can_use_pidfd(), Threaded child watcher implementation.      The watcher uses a thread per proces, UNIX event loop policy with a watcher for child processes., Set the event loop.          As a side effect, if a child watcher was set before, Get the watcher for child processes.          If not yet set, a ThreadedChildWat, Set the watcher for child processes., ThreadedChildWatcher, _UnixDefaultEventLoopPolicy (+2 more)
+Cohesion: 0.06
+Nodes (11): can_use_pidfd(), PidfdChildWatcher, Threaded child watcher implementation.      The watcher uses a thread per proces, UNIX event loop policy with a watcher for child processes., Set the event loop.          As a side effect, if a child watcher was set before, Get the watcher for child processes.          If not yet set, a ThreadedChildWat, Set the watcher for child processes., Child watcher implementation using Linux's pid file descriptors.      This child (+3 more)
 
 ### Community 241 - "Community 241"
 Cohesion: 0.08
@@ -3547,19 +3457,19 @@ Nodes (47): base(), bernoulli_distribution(), cauchy_distribution(), default_see
 
 ### Community 243 - "Community 243"
 Cohesion: 0.06
-Nodes (41): class, HARD_REG_SET, rtx, allocno_emit_reg(), hard_reg_set_size(), ira_allocate_and_set_costs(), ira_allocno_iter_cond(), ira_allocno_iter_init() (+33 more)
+Nodes (44): class, HARD_REG_SET, machine_mode, rtx, allocno_emit_reg(), hard_reg_set_size(), ira_allocate_and_set_costs(), ira_allocno_iter_cond() (+36 more)
 
 ### Community 244 - "Community 244"
 Cohesion: 0.11
 Nodes (28): _append_modifier(), _build_localename(), getdefaultlocale(), getencoding(), getlocale(), getpreferredencoding(), normalize(), _parse_localename() (+20 more)
 
 ### Community 245 - "Community 245"
-Cohesion: 0.07
-Nodes (42): bidirectional_iterator, else(), __arrow_proxy(), base(), constexpr(), contiguous_iterator(), decltype(), __detail() (+34 more)
+Cohesion: 0.06
+Nodes (43): bidirectional_iterator, else(), __arrow_proxy(), base(), constexpr(), contiguous_iterator(), decltype(), __detail() (+35 more)
 
 ### Community 246 - "Community 246"
 Cohesion: 0.04
-Nodes (49): PB_DS_BIN_TREE_NAME, actual_erase_node, apply_update, begin, clear, clear_imp, empty, end (+41 more)
+Nodes (47): PB_DS_BIN_TREE_NAME, actual_erase_node, apply_update, begin, clear, clear_imp, empty, end (+39 more)
 
 ### Community 247 - "Community 247"
 Cohesion: 0.07
@@ -3574,8 +3484,8 @@ Cohesion: 0.04
 Nodes (49): __u8, cec_msg_cdc_hpd_report_state(), cec_msg_cdc_hpd_set_state(), cec_msg_cec_version(), cec_msg_deck_control(), cec_msg_deck_status(), cec_msg_feature_abort(), cec_msg_give_deck_status() (+41 more)
 
 ### Community 250 - "Community 250"
-Cohesion: 0.10
-Nodes (13): FixAsserts, BaseFix, Return a string suitable for use as an identifier          The new name is guara, Warn the user that a given chunk of code is not valid Python 3,         but that, Used for warning the user about possible uncertainty in the         translation., Some fixers need to maintain tree-wide state.         This method is called once, Optional base class for fixers.      The subclass name must be FixFooBar where F, Some fixers need to maintain tree-wide state.         This method is called once (+5 more)
+Cohesion: 0.06
+Nodes (24): FixAsserts, BaseFix, ConditionalFix, Return a string suitable for use as an identifier          The new name is guara, Warn the user that a given chunk of code is not valid Python 3,         but that, Used for warning the user about possible uncertainty in the         translation., Some fixers need to maintain tree-wide state.         This method is called once, Optional base class for fixers.      The subclass name must be FixFooBar where F (+16 more)
 
 ### Community 251 - "Community 251"
 Cohesion: 0.06
@@ -3598,8 +3508,8 @@ Cohesion: 0.05
 Nodes (37): __bin_op, is_heap_until(), sort_heap(), _GLIBCXX_VISIBILITY(), __is_heap(), __push_heap(), _M_key_compare(), _Combiner (+29 more)
 
 ### Community 257 - "Community 257"
-Cohesion: 0.08
-Nodes (45): begin(), bucket(), cbegin(), cend(), clear(), empty(), __enable_default_ctor(), end() (+37 more)
+Cohesion: 0.09
+Nodes (41): begin(), bucket(), cbegin(), cend(), clear(), empty(), __enable_default_ctor(), end() (+33 more)
 
 ### Community 258 - "Community 258"
 Cohesion: 0.10
@@ -3635,15 +3545,15 @@ Nodes (17): Hook method for setting up class fixture before running tests in the
 
 ### Community 266 - "Community 266"
 Cohesion: 0.13
-Nodes (46): append(), assign(), at(), back(), basic_string(), begin(), c_str(), cbegin() (+38 more)
+Nodes (45): append(), assign(), at(), back(), basic_string(), begin(), cbegin(), clear() (+37 more)
 
 ### Community 267 - "Community 267"
 Cohesion: 0.07
 Nodes (55): __and(), constexpr(), _GLIBCXX_SIMD_ALWAYS_INLINE_LAMBDA(), _S_any_of(), _S_broadcast(), _S_decrement(), _S_equal_to(), _S_find_first_set() (+47 more)
 
 ### Community 268 - "Community 268"
-Cohesion: 0.09
-Nodes (16): add_alias(), add_charset(), add_codec(), Charset, _encode(), Add character set properties to the global registry.      charset is the input c, Add a character set alias.      alias is the alias name, e.g. latin-1     canoni, Add a codec that map characters in the given charset to/from Unicode.      chars (+8 more)
+Cohesion: 0.10
+Nodes (19): body_encode(), decode(), header_encode(), header_length(), Return the length of s when it is encoded with base64., Encode a single header line with Base64 encoding in a given charset.      charse, r"""Encode a string with base64.      Each line will be wrapped at, at most, max, Decode a raw base64 string, returning a bytes object.      This function does no (+11 more)
 
 ### Community 269 - "Community 269"
 Cohesion: 0.12
@@ -3654,28 +3564,28 @@ Cohesion: 0.06
 Nodes (35): _decode_uXXXX(), JSONArray(), JSONDecodeError, JSONDecoder, JSONObject(), py_scanstring(), Implementation of JSONDecoder, Subclass of ValueError with the following additional properties:      msg: The u (+27 more)
 
 ### Community 271 - "Community 271"
-Cohesion: 0.35
-Nodes (11): diff(), diff_different_files(), diff_file_vs_content(), diff_identical_files(), diff_missing_args(), diff_missing_file(), session_in(), Op (+3 more)
+Cohesion: 0.08
+Nodes (15): EnumType, _make_class_unpicklable(), Make the given obj un-picklable.      obj should be either a dictionary, or an E, Returns the __new__ to be used for creating the enum members.          classdict, values must already be of type `str`, classes/types should always be True., Either returns an existing member, or creates a new enum class.          This me, Return True if `value` is in `cls`.          `value` is in `cls` if:         1) (+7 more)
 
 ### Community 272 - "Community 272"
-Cohesion: 0.08
-Nodes (47): _findclass(), _finddoc(), findsource(), _get_code_position(), _get_code_position_from_tb(), getabsfile(), getclosurevars(), getcomments() (+39 more)
+Cohesion: 0.03
+Nodes (68): BufferFlags, _check_class(), _check_instance(), currentframe(), EndOfBlock, formatargvalues(), _get_code_position(), _get_code_position_from_tb() (+60 more)
 
 ### Community 273 - "Community 273"
-Cohesion: 0.07
-Nodes (23): AddressValueError, _BaseV6, _IPAddressBase, NetmaskValueError, Make a (netmask, prefix_len) tuple from the given argument.          Argument ca, Args:             address: A string or integer representing the IP, Base IPv6 object.      The following methods are used by IPv6 objects in both si, Make a (netmask, prefix_len) tuple from the given argument.          Argument ca (+15 more)
+Cohesion: 0.03
+Nodes (56): AddressValueError, _BaseConstants, _BaseV4, _BaseV6, collapse_addresses(), _collapse_addresses_internal(), _count_righthand_zero_bits(), _find_address_range() (+48 more)
 
 ### Community 274 - "Community 274"
-Cohesion: 0.07
-Nodes (47): expand_makefile_vars(), _expand_vars(), _extend_dict(), _generate_posix_vars(), get_config_h_filename(), get_config_var(), get_config_vars(), get_default_scheme() (+39 more)
+Cohesion: 0.05
+Nodes (59): _aix_bgt(), _aix_bos_rte(), aix_buildtag(), aix_platform(), _aix_tag(), _aix_vrtl(), Shared AIX support functions., Return a Tuple[str, int] e.g., ['7.1.4.34', 1806]     The fileset bos.rte repres (+51 more)
 
 ### Community 275 - "Community 275"
-Cohesion: 0.18
-Nodes (30): AgentResult, AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider() (+22 more)
+Cohesion: 0.12
+Nodes (40): AgentResult, AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider() (+32 more)
 
 ### Community 276 - "Community 276"
-Cohesion: 0.05
-Nodes (14): BaseChildWatcher, FastChildWatcher, MultiLoopChildWatcher, PidfdChildWatcher, Selector event loop for Unix with signal handling., Safe' child watcher implementation.      This implementation avoids disrupting o, Fast' child watcher implementation.      This implementation reaps every termina, A watcher that doesn't require running loop in the main thread.      This implem (+6 more)
+Cohesion: 0.09
+Nodes (5): BaseChildWatcher, MultiLoopChildWatcher, Safe' child watcher implementation.      This implementation avoids disrupting o, A watcher that doesn't require running loop in the main thread.      This implem, SafeChildWatcher
 
 ### Community 277 - "Community 277"
 Cohesion: 0.09
@@ -3691,14 +3601,14 @@ Nodes (41): _add_filter(), catch_warnings, _deprecated(), _filters_mutated(), fi
 
 ### Community 280 - "Community 280"
 Cohesion: 0.05
-Nodes (26): _after_fork(), _DummyThread, _maintain_shutdown_locks(), _MainThread, Method representing the thread's activity.          You may override this method, Set a lock object which will be released by the interpreter when         the und, Remove current thread from the dict of currently running threads., Wait until the thread terminates.          This blocks the calling thread until (+18 more)
+Nodes (28): _after_fork(), _DummyThread, _enumerate(), _maintain_shutdown_locks(), _MainThread, _newname(), Method representing the thread's activity.          You may override this method, Set a lock object which will be released by the interpreter when         the und (+20 more)
 
 ### Community 281 - "Community 281"
 Cohesion: 0.09
 Nodes (8): AbstractHTTPHandler, HTTPHandler, HTTPPasswordMgrWithDefaultRealm, Return an HTTPResponse object for the request, using http_class.          http_c, Return request-host, as defined by RFC 2965.      Variation from RFC: returned v, Return a string indicating the HTTP request method., Request, request_host()
 
 ### Community 282 - "Community 282"
-Cohesion: 0.05
+Cohesion: 0.04
 Nodes (3): CARES_EXTERN, CARES_DEPRECATED_FOR(), socket
 
 ### Community 283 - "Community 283"
@@ -3718,8 +3628,8 @@ Cohesion: 0.06
 Nodes (10): DOMEventStream, ErrorHandler, parse(), parseString(), PullDOM, clear(): Explicitly release parsing structures, Fallback replacement for getEvent() using the             standard SAX2 interfac, Fallback replacement for getEvent() that emits             the events that _slur (+2 more)
 
 ### Community 287 - "Community 287"
-Cohesion: 0.05
-Nodes (25): addModuleCleanup(), _AssertRaisesBaseContext, _AssertRaisesContext, _AssertWarnsContext, _BaseTestCaseContext, _is_subtype(), Test case implementation, Same as addCleanup, except the cleanup items are called even if     setUpModule (+17 more)
+Cohesion: 0.06
+Nodes (17): _AssertRaisesBaseContext, _AssertRaisesContext, _AssertWarnsContext, _BaseTestCaseContext, _is_subtype(), Asserts that the message in a raised exception matches a regex.          Args:, Asserts that the message in a triggered warning matches a regexp.         Basic, If args is empty, assertRaises/Warns is being used as a         context manager, (+9 more)
 
 ### Community 288 - "Community 288"
 Cohesion: 0.09
@@ -3728,10 +3638,6 @@ Nodes (41): begin(), bucket(), bucket_size(), cbegin(), cend(), contains(), coun
 ### Community 289 - "Community 289"
 Cohesion: 0.12
 Nodes (42): yy_state_t, YYPTRDIFF_T, YYRESULTTAG, yysymbol_kind_t, yy_reduce_print(), yyaddDeferredAction(), yydefaultAction(), yydestroyGLRState() (+34 more)
-
-### Community 290 - "Community 290"
-Cohesion: 0.06
-Nodes (9): ElementInfo, ExpatBuilder, FilterVisibilityController, Document builder that uses Expat to build a ParsedXML.DOM document     instance., Create a new parser object., Free all data structures used during DOM construction., Install the callbacks needed to build the DOM into the parser., Wrapper around a DOMBuilderFilter which implements the checks     to make the wh (+1 more)
 
 ### Community 291 - "Community 291"
 Cohesion: 0.05
@@ -3747,31 +3653,31 @@ Nodes (27): interact(), InteractiveConsole, InteractiveInterpreter, Utilities ne
 
 ### Community 294 - "Community 294"
 Cohesion: 0.09
-Nodes (16): _clear_dict(), _get_target(), _patch, _patch_dict, _patch_multiple(), _patch_object(), _patch_stopall(), Activate a patch, returning any created mock. (+8 more)
+Nodes (14): contextmanager(), @contextmanager decorator.      Typical usage:          @contextmanager, Decorator factory to apply update_wrapper() to a wrapper function         Return, wraps(), _clear_dict(), _patch_dict, _patch_stopall(), Activate a patch, returning any created mock. (+6 more)
 
 ### Community 295 - "Community 295"
 Cohesion: 0.07
 Nodes (23): BabylMessage, Message, MHMessage, Return a Message representation or raise a KeyError., Message with mailbox-format-specific properties., Initialize a Message instance., Assume the non-format-specific state of message., Copy format-specific state to message insofar as possible. (+15 more)
 
 ### Community 296 - "Community 296"
-Cohesion: 0.07
-Nodes (8): ConversionError, Error, Packer, Implements (a subset of) Sun XDR -- eXternal Data Representation.  See: RFC 1014, Unpacks various data representations from the given buffer., Exception class for this module. Use:      except xdrlib.Error as var:         #, Pack various data representations into a buffer., Unpacker
+Cohesion: 0.06
+Nodes (10): ConversionError, Error, Packer, raise_conversion_error(), Implements (a subset of) Sun XDR -- eXternal Data Representation.  See: RFC 1014, Unpacks various data representations from the given buffer., Exception class for this module. Use:      except xdrlib.Error as var:         #, Wrap any raised struct.errors in a ConversionError. (+2 more)
 
 ### Community 297 - "Community 297"
-Cohesion: 0.06
-Nodes (21): binary_heap_const_iterator_, const_iterator_, entry_pointer, node_pointer, PB_DS_CLASS_C_DEC, const_pointer_, PB_DS_CLASS_C_DEC, PB_DS_GEN_POS (+13 more)
+Cohesion: 0.08
+Nodes (26): no_throw_copies_t, node_allocator, node_pointer, size_type, left_child_next_sibling_heap, actual_erase_node, begin, bubble_to_top (+18 more)
 
 ### Community 298 - "Community 298"
 Cohesion: 0.15
 Nodes (30): FILE, tristate, check_conf(), conf(), conf_askvalue(), conf_choice(), conf_string(), conf_sym() (+22 more)
 
 ### Community 299 - "Community 299"
-Cohesion: 0.07
-Nodes (13): ItemsView, Mapping, A set is a finite, iterable container.      This class provides concrete generic, Construct an instance of the class from any iterable input.          Must overri, Return True if two sets have a null intersection., Compute the hash value of a set.          Note that we don't define __hash__: no, A Mapping is a generic container for associating key/value     pairs.      This, D.get(k[,d]) -> D[k] if k in D, else d.  d defaults to None. (+5 more)
+Cohesion: 0.09
+Nodes (25): encode_base64(), Encode the message's payload in Base64.      Also, add an appropriate Content-Tr, _fix_eols(), _quote_periods(), quotedata(), Sender address refused.      In addition to the attributes set by on all SMTPRes, All recipient addresses refused.      The errors for each recipient are accessib, The SMTP server didn't accept the data. (+17 more)
 
 ### Community 300 - "Community 300"
 Cohesion: 0.06
-Nodes (19): copyfileobj(), _LowLevelFile, Add the TarInfo object `tarinfo' to the archive. If `fileobj' is            give, Copy length bytes from fileobj src to fileobj dst.        If length is None, cop, Low-level file object. Supports reading and writing.        It is used instead o, Class that serves as an adapter between TarFile and        a stream-like object., Construct a _Stream object., Initialize for writing with gzip compression. (+11 more)
+Nodes (20): copyfileobj(), _LowLevelFile, Close the TarFile. In write-mode, two finishing zero blocks are            appen, Copy length bytes from fileobj src to fileobj dst.        If length is None, cop, Low-level file object. Supports reading and writing.        It is used instead o, Class that serves as an adapter between TarFile and        a stream-like object., Construct a _Stream object., Initialize for writing with gzip compression. (+12 more)
 
 ### Community 301 - "Community 301"
 Cohesion: 0.09
@@ -3823,15 +3729,15 @@ Nodes (32): budget_saturates_when_reservation_exceeds_window(), choose_cut(), Co
 
 ### Community 313 - "Community 313"
 Cohesion: 0.09
-Nodes (43): av_set_t, def_list_t, def_t, basic_block, class, edge, rtx, vec (+35 more)
+Nodes (42): av_set_t, def_list_t, def_t, basic_block, class, edge, rtx, vec (+34 more)
 
 ### Community 314 - "Community 314"
-Cohesion: 0.07
-Nodes (37): _GLIBCXX_VISIBILITY(), __miter_base(), swap_ranges(), __check_partitioned_lower(), __check_partitioned_upper(), __check_sorted(), __check_sorted_aux(), __check_sorted_set() (+29 more)
+Cohesion: 0.06
+Nodes (43): _GLIBCXX_VISIBILITY(), __miter_base(), swap_ranges(), __check_partitioned_lower(), __check_partitioned_upper(), __check_sorted(), __check_sorted_aux(), __check_sorted_set() (+35 more)
 
 ### Community 315 - "Community 315"
-Cohesion: 0.40
-Nodes (4): error, Generic interface to all dbm clones.  Use          import dbm         d = dbm.op, Guess which db package to use to open a db file.      Return values:      - None, whichdb()
+Cohesion: 0.33
+Nodes (6): error, open(), Generic interface to all dbm clones.  Use          import dbm         d = dbm.op, Open or create database at path given by *file*.      Optional argument *flag* c, Guess which db package to use to open a db file.      Return values:      - None, whichdb()
 
 ### Community 316 - "Community 316"
 Cohesion: 0.07
@@ -3842,8 +3748,8 @@ Cohesion: 0.06
 Nodes (36): InitSystemBase, InitSystemBusyboxBase, TestInitSystemBusyboxRo, TestInitSystemBusyboxRoNet, TestInitSystemBusyboxRw, TestInitSystemBusyboxRwNet, InitSystemOpenrcBase, TestInitSystemOpenrcMergedUsrFull (+28 more)
 
 ### Community 318 - "Community 318"
-Cohesion: 0.15
-Nodes (5): DFAState, generate_grammar(), NFAState, ParserGenerator, PgenGrammar
+Cohesion: 0.10
+Nodes (14): _generate_pickle_name(), load_grammar(), load_packaged_grammar(), main(), _newer(), Load the grammar (maybe from a pickle)., Inquire whether file a was written since file b., Normally, loads a pickled grammar by doing         pkgutil.get_data(package, pic (+6 more)
 
 ### Community 319 - "Community 319"
 Cohesion: 0.12
@@ -3874,24 +3780,24 @@ Cohesion: 0.09
 Nodes (4): BaseSubprocessTransport, Wait until the process exit and return the process return code.          This me, ReadSubprocessPipeProto, WriteSubprocessPipeProto
 
 ### Community 326 - "Community 326"
-Cohesion: 0.08
-Nodes (32): Convert 4 bytes in little-endian to an integer., Convert 2 bytes in little-endian to an integer., _unpack_uint16(), _unpack_uint32(), _compile_source(), _eq_mtime(), _get_data(), _get_decompress_func() (+24 more)
+Cohesion: 0.09
+Nodes (30): EOFError, Convert 2 bytes in little-endian to an integer., _unpack_uint16(), read_signed(), _compile_source(), _eq_mtime(), _get_data(), _get_decompress_func() (+22 more)
 
 ### Community 327 - "Community 327"
 Cohesion: 0.15
 Nodes (32): ApiFetchResult, compact_message(), DiscordPlugin, list_channels(), list_guilds(), list_guilds_filters_to_allowlist(), mk_plugin(), parse_retry_after_secs() (+24 more)
 
 ### Community 328 - "Community 328"
-Cohesion: 0.08
-Nodes (13): CacheFTPHandler, ftperrors(), FTPHandler, ftpwrapper, Return the set of errors raised by the FTP class., Class used by open_ftp() for cache of open FTP connections., addbase, addclosehook (+5 more)
+Cohesion: 0.09
+Nodes (16): Transform a string like '<URL:scheme://host/path>' into 'scheme://host/path'., Replace %xx escapes by their single-character equivalent. The optional     encod, Like unquote(), but also replace plus signs by spaces, as required for     unquo, unquote(), unquote_plus(), unwrap(), open_https(), Class to open URLs.     This is a class rather than just a subroutine because we (+8 more)
 
 ### Community 329 - "Community 329"
-Cohesion: 0.06
-Nodes (26): BaseProtocol, BufferedProtocol, DatagramProtocol, _feed_data_to_buffered_proto(), Protocol, Abstract Protocol base classes., Common base class for protocol interfaces.      Usually user implements protocol, Called when the other end calls write_eof() or equivalent.          If this retu (+18 more)
+Cohesion: 0.04
+Nodes (32): BaseProtocol, BufferedProtocol, DatagramProtocol, _feed_data_to_buffered_proto(), Protocol, Abstract Protocol base classes., Common base class for protocol interfaces.      Usually user implements protocol, Called when the other end calls write_eof() or equivalent.          If this retu (+24 more)
 
 ### Community 330 - "Community 330"
-Cohesion: 0.06
-Nodes (43): Coroutine that completes after a given time (in seconds)., sleep(), Pen, lt(), Adds a turtle shape to TurtleScreen's shapelist.          Arguments:         (1), Turns turtle animation on/off and set delay for update drawings.          Option, Move turtle to the origin - coordinates (0,0).          No arguments.          M, Set the orientation of the turtle to to_angle.          Aliases:  setheading | s (+35 more)
+Cohesion: 0.07
+Nodes (35): lt(), Turns turtle animation on/off and set delay for update drawings.          Option, Turns turtle animation on/off and set delay for update drawings.          Option, Set/return turtle's stretchfactors/outline. Set resizemode to "user".          O, Rotate the turtleshape by angle.          Argument:         angle - a number, Return the current shape polygon as tuple of coordinate pairs.          No argum, Start recording the vertices of a polygon.          No argument.          Start, Stop recording the vertices of a polygon.          No argument.          Stop re (+27 more)
 
 ### Community 331 - "Community 331"
 Cohesion: 0.09
@@ -3907,7 +3813,7 @@ Nodes (35): basic_block, class, const_basic_block, edge, gcov_type, va_gc, vec, 
 
 ### Community 334 - "Community 334"
 Cohesion: 0.07
-Nodes (23): FixDict, FixExecfile, FixParen, Fixer that adds parentheses where they are required  This converts ``[x for x in, FixPrint, Comma(), Dot(), LParen() (+15 more)
+Nodes (27): FixSysExc, Fixer for sys.exc_{type, value, traceback}  sys.exc_type -> sys.exc_info()[0] sy, find_params(), FixTupleParams, is_docstring(), map_to_index(), Fixer for function definitions with tuple parameters.  def func(((a, b), c), d):, simplify_args() (+19 more)
 
 ### Community 335 - "Community 335"
 Cohesion: 0.09
@@ -3915,11 +3821,11 @@ Nodes (19): FrameDecorator, frame_name(), frame_var(), g_type_name_from_instance
 
 ### Community 336 - "Community 336"
 Cohesion: 0.12
-Nodes (9): _find_module(), Module, ModuleFinder, Find modules used by a script, using introspection., An importlib reimplementation of imp.find_module (for our purposes)., Print a report to stdout, listing the found modules with their         paths, as, Return a list of modules that appear to be missing. Use         any_missing_mayb, Return two lists, one with modules that are certainly missing         and one wi (+1 more)
+Nodes (10): ImportError, _find_module(), Module, ModuleFinder, Find modules used by a script, using introspection., An importlib reimplementation of imp.find_module (for our purposes)., Print a report to stdout, listing the found modules with their         paths, as, Return a list of modules that appear to be missing. Use         any_missing_mayb (+2 more)
 
 ### Community 337 - "Community 337"
-Cohesion: 0.06
-Nodes (28): _classify_pyc(), _code_to_hash_pyc(), _code_to_timestamp_pyc(), _compile_bytecode(), decode_source(), _pack_uint32(), Optional method that returns the modification time (an int) for the         spec, Optional method returning a metadata dict for the specified         path (a str) (+20 more)
+Cohesion: 0.08
+Nodes (13): AttributeError, __getattr__(), For backwards compatibility, continue to make names     from _resources_abc avai, __getattr__(), __getattr__(), property, This is a descriptor, used to define attributes that act differently     when ac, Block attempts to reassign Enum members.          A simple assignment to the cla (+5 more)
 
 ### Community 338 - "Community 338"
 Cohesion: 0.05
@@ -3966,40 +3872,36 @@ Cohesion: 0.06
 Nodes (22): T1, T2, class, class, namespace, node, node_type, root (+14 more)
 
 ### Community 350 - "Community 350"
-Cohesion: 0.10
-Nodes (14): HeaderWriteError, Error while writing headers., BytesGenerator, DecodedGenerator, Generator, Clone this generator with the exact same options., Generates output from a Message object tree.      This basic generator writes th, Create the generator for message flattening.          outfp is the output file-l (+6 more)
+Cohesion: 0.07
+Nodes (21): HeaderWriteError, Error while writing headers., BytesGenerator, DecodedGenerator, Generator, Clone this generator with the exact same options., Generates output from a Message object tree.      This basic generator writes th, Create the generator for message flattening.          outfp is the output file-l (+13 more)
 
 ### Community 351 - "Community 351"
 Cohesion: 0.08
 Nodes (21): close(), FileInput, filelineno(), filename(), fileno(), input(), isfirstline(), isstdin() (+13 more)
 
 ### Community 352 - "Community 352"
-Cohesion: 0.05
-Nodes (61): Decimal, Decimal fixed-point and floating-point arithmetic.  This is an implementation of, _coerce(), _convert(), correlation(), covariance(), _decimal_sqrt_of_frac(), _exact_ratio() (+53 more)
+Cohesion: 0.06
+Nodes (57): _coerce(), _convert(), covariance(), _decimal_sqrt_of_frac(), _exact_ratio(), _fail_neg(), _float_sqrt_of_frac(), fmean() (+49 more)
 
 ### Community 353 - "Community 353"
-Cohesion: 0.08
-Nodes (17): BadZipFile, _EndRecData(), _EndRecData64(), _get_decompressor(), LZMADecompressor, Read up to n bytes with at most one read() system call., Read in the table of contents for the ZIP file., Return file bytes for name. 'pwd' is the password to decrypt         encrypted f (+9 more)
+Cohesion: 0.14
+Nodes (7): Read up to n bytes with at most one read() system call., File-like object for reading an archive member.        Is returned by ZipFile.op, Read and return a line from the stream.          If limit is specified, at most, Returns buffered bytes without advancing the position., Read and return up to n bytes.         If the argument is omitted, None, or nega, _ZipDecrypter(), ZipExtFile
 
 ### Community 354 - "Community 354"
 Cohesion: 0.07
 Nodes (30): _Block_pair, _BPiter, __gnu_debug(), namespace, argument_type, class, const_pointer, const_reference (+22 more)
-
-### Community 355 - "Community 355"
-Cohesion: 0.06
-Nodes (7): cleanup_file_content(), populate_db_from_file(), read_file(), handle_definition(), handle_eval(), handle_usage(), populate_db()
 
 ### Community 356 - "Community 356"
 Cohesion: 0.06
 Nodes (91): CompactionEvent, RecordedCall, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), after_hook_terminate_exits_with_aborted(), AfterHookResult (+83 more)
 
 ### Community 357 - "Community 357"
-Cohesion: 0.09
-Nodes (35): find_library(), find_shared(), get_ld_header(), get_ld_header_info(), get_ld_headers(), get_legacy(), get_libpaths(), get_member() (+27 more)
+Cohesion: 0.14
+Nodes (22): find_library(), find_shared(), get_ld_header(), get_ld_header_info(), get_ld_headers(), get_legacy(), get_libpaths(), get_member() (+14 more)
 
 ### Community 358 - "Community 358"
-Cohesion: 0.09
-Nodes (28): gimple_code(), gimple_has_mem_ops(), gimple_has_substatements(), gimple_has_volatile_ops(), gimple_nop_p(), gimple_omp_atomic_memory_order(), gimple_omp_atomic_need_value_p(), gimple_omp_atomic_set_memory_order() (+20 more)
+Cohesion: 0.07
+Nodes (37): class, gimple, tree, gimple_code(), gimple_has_mem_ops(), gimple_has_substatements(), gimple_has_volatile_ops(), gimple_nop_p() (+29 more)
 
 ### Community 359 - "Community 359"
 Cohesion: 0.06
@@ -4014,20 +3916,20 @@ Cohesion: 0.09
 Nodes (15): Policy, _PolicyBase, r"""Controls for how messages are interpreted and formatted.      Most of the cl, Based on policy, either raise defect or call register_defect.              handl, Record 'defect' on 'obj'.          Called by handle_defect if raise_on_defect is, Policy Object basic framework.      This class is useless unless subclassed.  A, Return the maximum allowed number of headers named 'name'.          Called when, Given a list of linesep terminated strings constituting the lines of         a s (+7 more)
 
 ### Community 362 - "Community 362"
-Cohesion: 0.06
-Nodes (42): BaseConfigurator, _clearExistingHandlers(), _create_formatters(), dictConfig(), DictConfigurator, fileConfig(), _handle_existing_loggers(), _install_handlers() (+34 more)
+Cohesion: 0.10
+Nodes (19): BaseConfigurator, DictConfigurator, The configurator base class which defines some useful defaults., Resolve strings to objects using standard import and attribute         syntax., Default converter for the ext:// protocol., Default converter for the cfg:// protocol., Configure an object with a user-supplied factory., Utility function which converts lists to tuples. (+11 more)
 
 ### Community 363 - "Community 363"
 Cohesion: 0.07
 Nodes (29): MaildirMessage, mboxMessage, _mboxMMDFMessage, MMDFMessage, Message with Maildir-specific properties., Return 'new' or 'cur'., Set subdir to 'new' or 'cur'., Return as a string the flags that are set. (+21 more)
 
 ### Community 364 - "Community 364"
-Cohesion: 0.06
-Nodes (22): BaseServer, Base class for server classes.      Methods for the caller:      - __init__(serv, Called by constructor to activate the server.          May be overridden., Handle one request at a time until shutdown.          Polls for shutdown every p, Stops the serve_forever loop.          Blocks until the loop has finished. This, Called by the serve_forever() loop.          May be overridden by a subclass / M, Handle one request, possibly blocking.          Respects self.timeout., Handle one request, without blocking.          I assume that selector.select() h (+14 more)
+Cohesion: 0.08
+Nodes (16): BaseServer, Base class for server classes.      Methods for the caller:      - __init__(serv, Handle one request at a time until shutdown.          Polls for shutdown every p, Stops the serve_forever loop.          Blocks until the loop has finished. This, Called by the serve_forever() loop.          May be overridden by a subclass / M, Handle one request, possibly blocking.          Respects self.timeout., Handle one request, without blocking.          I assume that selector.select() h, Called if no new request arrives within self.timeout.          Overridden by For (+8 more)
 
 ### Community 365 - "Community 365"
 Cohesion: 0.07
-Nodes (35): _candidate_tempdir_list(), _dont_follow_symlinks(), _exists(), _get_candidate_names(), _get_default_tempdir(), _gettempdir(), gettempdirb(), gettempprefix() (+27 more)
+Nodes (37): _candidate_tempdir_list(), _dont_follow_symlinks(), _exists(), _get_candidate_names(), _get_default_tempdir(), _gettempdir(), gettempdirb(), gettempprefix() (+29 more)
 
 ### Community 366 - "Community 366"
 Cohesion: 0.06
@@ -4039,15 +3941,15 @@ Nodes (50): allow(), allowlist_blocks_unlisted_tool(), allowlist_permits_listed_
 
 ### Community 368 - "Community 368"
 Cohesion: 0.10
-Nodes (11): Mix-in class that dispatches XML-RPC requests.      This class is used to regist, Registers an instance to respond to XML-RPC requests.          Only one instance, Registers a function to respond to XML-RPC requests.          The optional name, Registers the XML-RPC introspection methods in the system         namespace., Registers the XML-RPC multicall method in the system         namespace., Dispatches an XML-RPC method from marshalled (XML) data.          XML-RPC method, system.methodSignature('add') => [double, int, int]          Returns a list desc, system.methodHelp('add') => "Adds two integers together"          Returns a stri (+3 more)
+Nodes (3): Queue, Private API hook called when feeding data in the background thread         raise, debug()
 
 ### Community 369 - "Community 369"
 Cohesion: 0.06
 Nodes (5): Clear maps[0], leaving maps[1:] intact., A more or less complete user-defined wrapper around list objects., od.clear() -> None.  Remove all items from od., Like dict.__delitem__() but does not raise KeyError for missing values., UserList
 
 ### Community 370 - "Community 370"
-Cohesion: 0.07
-Nodes (12): DeprecatedTuple, EntryPoint, EntryPoints, Provide subscript item access for backward compatibility.      >>> recwarn = get, An entry point as defined by Python packaging conventions.      See `the packagi, Load the entry point from its definition. If only a module         is indicated, EntryPoint matches the given parameters.          >>> ep = EntryPoint(group='foo, An immutable collection of selectable EntryPoint objects. (+4 more)
+Cohesion: 0.10
+Nodes (8): entry_points(), EntryPoint, An entry point as defined by Python packaging conventions.      See `the packagi, Load the entry point from its definition. If only a module         is indicated, EntryPoint matches the given parameters.          >>> ep = EntryPoint(group='foo, Get the EntryPoint in self matching name., Select entry points from self that match the         given parameters (typically, Return EntryPoint objects for all installed packages.      Pass selection parame
 
 ### Community 371 - "Community 371"
 Cohesion: 0.12
@@ -4071,7 +3973,7 @@ Nodes (3): NamedNodeMap, The attribute list is a transient interface to the unde
 
 ### Community 376 - "Community 376"
 Cohesion: 0.12
-Nodes (12): _Accumulator, decode_header(), Header, make_header(), Create a Header from a sequence of pairs as returned by decode_header()      dec, Create a MIME-compliant header that can contain many character sets.          Op, Return the string value of the header., Append a string to the MIME header.          Optional charset, if given, should (+4 more)
+Nodes (14): HeaderParseError, Error while parsing headers., _Accumulator, decode_header(), Header, make_header(), Create a Header from a sequence of pairs as returned by decode_header()      dec, Create a MIME-compliant header that can contain many character sets.          Op (+6 more)
 
 ### Community 377 - "Community 377"
 Cohesion: 0.07
@@ -4114,8 +4016,8 @@ Cohesion: 0.07
 Nodes (33): PriorityQueue, A subclass of Queue; retrieves entries in priority order (lowest first).      En, heapify(), _heapify_max(), heappop(), _heappop_max(), heappush(), heappushpop() (+25 more)
 
 ### Community 387 - "Community 387"
-Cohesion: 0.06
-Nodes (18): PipeServer, ProactorEventLoop, Selector and proactor event loops for Windows., Class representing a pipe server.      This is much like a bound, listening sock, Windows version of selector event loop., Windows version of proactor event loop using IOCP., WindowsProactorEventLoopPolicy, _WindowsSelectorEventLoop (+10 more)
+Cohesion: 0.05
+Nodes (27): PipeServer, Class representing a pipe server.      This is much like a bound, listening sock, partial, New function with partial application of the given arguments     and keywords., _ANY, _AsyncIterator, AsyncMagicMixin, AsyncMock (+19 more)
 
 ### Community 388 - "Community 388"
 Cohesion: 0.08
@@ -4130,20 +4032,20 @@ Cohesion: 0.09
 Nodes (25): _BlocksOutputBuffer, PyBytes_AS_STRING(), PyBytes_GET_SIZE(), Py_ssize_t, PyObject, Py_ssize_t, PyObject, PyObject (+17 more)
 
 ### Community 391 - "Community 391"
-Cohesion: 0.06
-Nodes (8): ChainMap, Initialize a ChainMap by setting *maps* to the given mappings.         If no map, Create a ChainMap with a single dict created from the iterable., New ChainMap with a new map followed by all previous maps.         If no map is, New ChainMap from maps[1:]., Remove and return an item pair from maps[0]. Raise KeyError is maps[0] is empty., A ChainMap groups multiple dicts (or other mappings) together     to create a si, UserDict
+Cohesion: 0.10
+Nodes (11): Mix-in class that dispatches XML-RPC requests.      This class is used to regist, Registers an instance to respond to XML-RPC requests.          Only one instance, Registers a function to respond to XML-RPC requests.          The optional name, Registers the XML-RPC introspection methods in the system         namespace., Registers the XML-RPC multicall method in the system         namespace., Dispatches an XML-RPC method from marshalled (XML) data.          XML-RPC method, system.methodSignature('add') => [double, int, int]          Returns a list desc, system.methodHelp('add') => "Adds two integers together"          Returns a stri (+3 more)
 
 ### Community 392 - "Community 392"
-Cohesion: 0.13
-Nodes (38): constexpr(), __bf16, __m128, __m128bh, __m256, __m256bh, __mmask16, __mmask8 (+30 more)
+Cohesion: 0.15
+Nodes (36): __bf16, __m128, __m128bh, __m256, __m256bh, __mmask16, __mmask8, _mm256_cvtepi16_epi32() (+28 more)
 
 ### Community 393 - "Community 393"
-Cohesion: 0.07
-Nodes (20): Text I/O implementation using an in-memory buffer.      The initial_value argume, StringIO, join(), _print_tokens(), quote(), A lexical analyzer class for simple shell-like syntaxes., Get a token from the input stream (or from stack if it's nonempty), A lexical analyzer class for simple shell-like syntaxes. (+12 more)
+Cohesion: 0.08
+Nodes (18): Text I/O implementation using an in-memory buffer.      The initial_value argume, StringIO, join(), _print_tokens(), quote(), A lexical analyzer class for simple shell-like syntaxes., Get a token from the input stream (or from stack if it's nonempty), A lexical analyzer class for simple shell-like syntaxes. (+10 more)
 
 ### Community 394 - "Community 394"
 Cohesion: 0.06
-Nodes (20): HeaderRegistry, A header_factory and header registry., Create a header_factory that works with the Policy API.          base_class is t, Register cls as the specialized class for handling "name" headers., Create a header instance for header 'name' from 'value'.          Creates a head, EmailPolicy, +         The implementation for this class returns the max_count attribute from, +         The name is parsed as everything up to the ':' and returned unmodified (+12 more)
+Nodes (20): HeaderRegistry, A header_factory and header registry., Create a header_factory that works with the Policy API.          base_class is t, Register cls as the specialized class for handling "name" headers., Create a header instance for header 'name' from 'value'.          Creates a head, EmailPolicy, This will be the home for the policy that hooks in the new code that adds all th, +         The implementation for this class returns the max_count attribute from (+12 more)
 
 ### Community 395 - "Community 395"
 Cohesion: 0.06
@@ -4162,8 +4064,8 @@ Cohesion: 0.07
 Nodes (13): Pdb, s(tep)          Execute the current line, stop at the first possible occasion, n(ext)          Continue execution until the next line in the current function, r(eturn)          Continue execution until the current function returns., c(ont(inue))          Continue execution, only stop when a breakpoint is encount, debug code          Enter a recursive debugger that steps through the code, q(uit) | exit          Quit from the debugger. The program being executed is abo, p expression          Print the value of the expression. (+5 more)
 
 ### Community 399 - "Community 399"
-Cohesion: 0.10
-Nodes (20): _FailedTest, findTestCases(), getTestCaseNames(), _make_failed_import_test(), _make_failed_load_tests(), _make_failed_test(), _make_skipped_test(), _makeLoader() (+12 more)
+Cohesion: 0.08
+Nodes (26): DllCanUnloadNow(), DllGetClassObject(), __import__(), Import a module.      The 'globals' argument is used to infer where the import i, Read in docstrings from lang-specific docstring dictionary.      Transfer docstr, read_docstrings(), _FailedTest, findTestCases() (+18 more)
 
 ### Community 400 - "Community 400"
 Cohesion: 0.06
@@ -4171,7 +4073,7 @@ Nodes (16): Print a std::chrono::duration., Print a std::chrono::time_point., Pr
 
 ### Community 401 - "Community 401"
 Cohesion: 0.08
-Nodes (34): bidirectional_iterator_tag, _BidirectionalIterator1, _BidirectionalIterator2, partition_point(), reverse_copy(), __d(), __find_end(), __find_if_not() (+26 more)
+Nodes (34): bidirectional_iterator_tag, _BidirectionalIterator1, _BidirectionalIterator2, is_partitioned(), partition_point(), __d(), __find_end(), __find_if_not() (+26 more)
 
 ### Community 402 - "Community 402"
 Cohesion: 0.12
@@ -4207,7 +4109,7 @@ Nodes (11): CookieJar, Collection of HTTP cookies.      You may not need to know
 
 ### Community 410 - "Community 410"
 Cohesion: 0.07
-Nodes (21): BMNode, BottomMatcher, A bottom-up tree matching algorithm implementation meant to speed up 2to3's matc, Prints a graphviz diagram of the BM automaton(for debugging), Class for a node of the Aho-Corasick automaton used in matching, The main matcher class. After instantiating the patterns should     be added usi, Reduces a fixer's pattern tree to a linear path and adds it         to the match, Recursively adds a linear pattern to the AC automaton (+13 more)
+Nodes (20): BMNode, BottomMatcher, A bottom-up tree matching algorithm implementation meant to speed up 2to3's matc, Prints a graphviz diagram of the BM automaton(for debugging), Class for a node of the Aho-Corasick automaton used in matching, The main matcher class. After instantiating the patterns should     be added usi, Reduces a fixer's pattern tree to a linear path and adds it         to the match, Recursively adds a linear pattern to the AC automaton (+12 more)
 
 ### Community 411 - "Community 411"
 Cohesion: 0.11
@@ -4218,8 +4120,8 @@ Cohesion: 0.10
 Nodes (8): ArgumentDefaultsHelpFormatter, HelpFormatter, MetavarTypeHelpFormatter, Formatter for generating usage messages and argument help strings.      Only the, Help message formatter which adds default values to argument help.      Only the, Add the default value to the option help message.          ArgumentDefaultsHelpF, Help message formatter which uses the argument 'type' as the default     metavar, _Section
 
 ### Community 413 - "Community 413"
-Cohesion: 0.08
-Nodes (16): MutableSequence, MutableSet, S.index(value, [start, [stop]]) -> integer -- return first index of value., All the operations on a read-write sequence.      Concrete subclasses must provi, S.insert(index, value) -- insert value before index, S.append(value) -- append value to the end of the sequence, S.clear() -> None -- remove all items from S, S.reverse() -- reverse *IN PLACE* (+8 more)
+Cohesion: 0.05
+Nodes (22): ItemsView, MutableSequence, MutableSet, S.index(value, [start, [stop]]) -> integer -- return first index of value., All the operations on a read-write sequence.      Concrete subclasses must provi, S.insert(index, value) -- insert value before index, S.append(value) -- append value to the end of the sequence, S.clear() -> None -- remove all items from S (+14 more)
 
 ### Community 414 - "Community 414"
 Cohesion: 0.13
@@ -4238,12 +4140,12 @@ Cohesion: 0.08
 Nodes (15): Entry, robotparser.py      Copyright (C) 2000  Bastian Kleineidam      You can choose b, using the parsed robots.txt decide if useragent can fetch url, A rule line is a single "Allow:" (allowance==True) or "Disallow:"        (allowa, An entry has one or more user-agents and zero or more rulelines, This class provides a set of methods to read, parse and answer     questions abo, check if this entry applies to the specified agent, Preconditions:         - our agent applies to this entry         - filename is U (+7 more)
 
 ### Community 418 - "Community 418"
-Cohesion: 0.21
-Nodes (12): acosh, constexpr(), decltype(), _GLIBCXX_SIMD_MATH_CALL_(), __math_double(), __math_float(), _S_data(), else (+4 more)
+Cohesion: 0.15
+Nodes (24): acosh, _S_all_of(), _S_any_of(), _S_convert(), _S_find_first_set(), _S_find_last_set(), _S_none_of(), _S_popcount() (+16 more)
 
 ### Community 419 - "Community 419"
-Cohesion: 0.11
-Nodes (33): _Alloc2, __alloc_on_copy(), allocate(), construct(), decltype(), destroy(), __do_alloc_on_copy(), _GLIBCXX_VISIBILITY() (+25 more)
+Cohesion: 0.09
+Nodes (36): _Alloc2, __alloc_on_copy(), allocate(), construct(), decltype(), destroy(), __do_alloc_on_copy(), _GLIBCXX_VISIBILITY() (+28 more)
 
 ### Community 420 - "Community 420"
 Cohesion: 0.10
@@ -4263,7 +4165,7 @@ Nodes (32): contains(), count(), decltype(), end(), erase(), extract(), find(), 
 
 ### Community 424 - "Community 424"
 Cohesion: 0.07
-Nodes (22): internal(), namespace, std, _T2, namespace, namespace, namespace, class (+14 more)
+Nodes (23): cppgc(), internal(), cppgc(), namespace, std, _T2, namespace, namespace (+15 more)
 
 ### Community 425 - "Community 425"
 Cohesion: 0.13
@@ -4271,7 +4173,7 @@ Nodes (33): __m128i, __m256i, __m512i, __mmask16, __mmask32, __mmask64, _mm256_g
 
 ### Community 426 - "Community 426"
 Cohesion: 0.07
-Nodes (24): namespace, HOST_WIDE_INT, rtx, machine_mode, poly_uint16, const_iterator, class, machine_mode (+16 more)
+Nodes (21): class, namespace, HOST_WIDE_INT, rtx, const_iterator, class, machine_mode, REAL_VALUE_TYPE (+13 more)
 
 ### Community 427 - "Community 427"
 Cohesion: 0.07
@@ -4294,8 +4196,8 @@ Cohesion: 0.08
 Nodes (14): IndexError, Pattern for a mutable list-like object shareable via a shared     memory block., Used in concert with _back_transforms_mapping to convert values         into the, Gets the packing format for a single value stored in the list., Gets the back transformation function for a single value., Sets the packing format and back transformation code for a         single value, The struct packing format used by all currently stored items., The struct packing format used for the items' storage offsets. (+6 more)
 
 ### Community 432 - "Community 432"
-Cohesion: 0.09
-Nodes (11): Class with methods to open, read, write, close, list zip files.      z = ZipFile, Open the ZIP file with mode read 'r', write 'w', exclusive create 'x',         o, Return a list of file names in the archive., Return a list of class ZipInfo instances for files in the         archive., Set default password for encrypted files., The comment text associated with the ZIP file., Extract all members from the archive to the current working            directory, Call the "close()" method in case the user forgot. (+3 more)
+Cohesion: 0.07
+Nodes (13): Class with methods to open, read, write, close, list zip files.      z = ZipFile, Open the ZIP file with mode read 'r', write 'w', exclusive create 'x',         o, Return a list of file names in the archive., Return a list of class ZipInfo instances for files in the         archive., Print a table of contents for the zip file., Set default password for encrypted files., The comment text associated with the ZIP file., Extract all members from the archive to the current working            directory (+5 more)
 
 ### Community 433 - "Community 433"
 Cohesion: 0.07
@@ -4314,16 +4216,16 @@ Cohesion: 0.10
 Nodes (19): _acquireLock(), _addHandlerRef(), addLevelName(), disable(), Tidy up any resources used by the handler.          This version removes the han, Add the specified logger as a child of this placeholder., Clear the cache for all loggers in loggerDict         Called when level changes, Associate 'levelName' with 'level'.      This is used when converting levels to (+11 more)
 
 ### Community 438 - "Community 438"
-Cohesion: 0.10
-Nodes (12): Manages one or more shared memory segments., Adds the supplied shared memory block name to tracker., Calls unlink() on the shared memory block with the supplied name             and, Calls destroy_segment() on all tracked shared memory blocks., Create a new distributed-shared object (not backed by a shared             memor, Call unlink() on all tracked shared memory, terminate the Server., Adds the supplied shared memory block name to Server's tracker., Calls unlink() on the shared memory block with the supplied name             and (+4 more)
+Cohesion: 0.08
+Nodes (7): _format_size(), Trace of a memory block., Statistic difference on memory allocations between two Snapshot instance., Statistic difference on memory allocations between an old and a new     Snapshot, Statistic, StatisticDiff, Trace
 
 ### Community 439 - "Community 439"
 Cohesion: 0.11
 Nodes (8): ArgumentError, ArgumentParser, _get_action_name(), Namespace, Simple object for storing attributes.      Implements equality by attribute name, Object for parsing command line strings into Python objects.      Keyword Argume, error(message: string)          Prints a usage message incorporating the message, An error from creating or using an argument (optional or positional).      The s
 
 ### Community 440 - "Community 440"
-Cohesion: 0.10
-Nodes (20): decode_header(), _encrypt_on(), NNTP_SSL, NNTPError, NNTPPermanentError, NNTPProtocolError, NNTPTemporaryError, _parse_datetime() (+12 more)
+Cohesion: 0.12
+Nodes (18): decode_header(), _encrypt_on(), NNTP_SSL, NNTPDataError, NNTPError, NNTPProtocolError, NNTPTemporaryError, _parse_overview_fmt() (+10 more)
 
 ### Community 441 - "Community 441"
 Cohesion: 0.06
@@ -4334,16 +4236,16 @@ Cohesion: 0.07
 Nodes (13): _iter, num_elements(), Print a std::pair object, with 'first' and 'second' as children., An iterator for std::pair types. Returns 'first' then 'second'., Turn an RB-tree-based container (std::map, std::set etc.) into     a Python iter, Return either "1 element" or "N elements" depending on the argument., Print a std::map or std::multimap., Print a std::set or std::multiset. (+5 more)
 
 ### Community 443 - "Community 443"
-Cohesion: 0.08
-Nodes (13): _T, DeprecatedNonAbstract, DistributionFinder, FileHash, MetadataPathFinder, A MetaPathFinder capable of discovering installed distributions., Find distributions.          Return an iterable of all Distribution instances ca, Find distributions.          Return an iterable of all Distribution instances ca (+5 more)
+Cohesion: 0.03
+Nodes (60): Any, _T, FreezableDefaultDict, Pair, Often it is desirable to prevent the mutation of     a default dict after its in, Context, DeprecatedNonAbstract, DeprecatedTuple (+52 more)
 
 ### Community 444 - "Community 444"
 Cohesion: 0.17
 Nodes (21): begin(), count(), elems_in_bucket(), end(), find(), insert_equal(), _M_bkt_num(), _M_bkt_num_key() (+13 more)
 
 ### Community 445 - "Community 445"
-Cohesion: 0.04
-Nodes (48): auto_ptr_ref(), get(), release(), binomial_heap_base, clear, erase, find_max, fix (+40 more)
+Cohesion: 0.06
+Nodes (30): binomial_heap_base, clear, erase, find_max, fix, insert_node, join, m_p_max (+22 more)
 
 ### Community 446 - "Community 446"
 Cohesion: 0.12
@@ -4354,8 +4256,8 @@ Cohesion: 0.13
 Nodes (31): __m128i, __m256i, __m512i, __mmask16, __mmask32, __mmask64, __mmask8, _mm256_bitshuffle_epi64_mask() (+23 more)
 
 ### Community 448 - "Community 448"
-Cohesion: 0.08
-Nodes (31): edge, gphi, location_t, gimple, use_operand_p, get_lineno(), gimple_arg_ptr(), gimple_block() (+23 more)
+Cohesion: 0.09
+Nodes (28): edge, gphi, location_t, gimple, use_operand_p, get_lineno(), gimple_block(), gimple_filename() (+20 more)
 
 ### Community 449 - "Community 449"
 Cohesion: 0.16
@@ -4370,24 +4272,24 @@ Cohesion: 0.08
 Nodes (16): Dialect, DictReader, DictWriter, excel, excel_tab, "Sniffs" the format of a CSV file (i.e. delimiter, quotechar)     Returns a Dial, Returns a dialect (or None) corresponding to the sample, csv.py - read/write/investigate CSV files (+8 more)
 
 ### Community 452 - "Community 452"
-Cohesion: 0.06
-Nodes (42): Sendfile syscall is not available.      Raised if OS does not support sendfile s, SendfileNotAvailableError, main(), Run resource tracker., active_count(), activeCount(), BrokenBarrierError, current_thread() (+34 more)
+Cohesion: 0.05
+Nodes (45): BrokenBarrierError, Sendfile syscall is not available.      Raised if OS does not support sendfile s, Barrier is broken by barrier.abort() call., SendfileNotAvailableError, BrokenExecutor, Mark the future as running or process any cancel notifications.          Should, Raised when a executor has become non-functional after a severe failure., main() (+37 more)
 
 ### Community 453 - "Community 453"
 Cohesion: 0.07
 Nodes (17): _c(), _calculate_meta(), coroutine(), _GeneratorWrapper, get_original_bases(), new_class(), prepare_class(), Define names for built-in types that aren't directly accessible as a builtin. (+9 more)
 
 ### Community 454 - "Community 454"
-Cohesion: 0.07
-Nodes (15): Called when an error has occurred. 'err' is a tuple of values as         returne, Called when an error has occurred. 'err' is a tuple of values as         returne, Called at the end of a subtest.         'err' is None if the subtest ended succe, Called when a test has completed successfully, Called when an expected failure/error occurred., Called when a test was expected to fail, but succeed., Tells whether or not this result was a success., Indicates that the tests should be aborted. (+7 more)
+Cohesion: 0.04
+Nodes (24): _addError(), _addSkip(), _Outcome, Execute all cleanup functions. Normally called for you after         tearDown., Run the test without collecting errors in a TestResult, Called once after all tests are executed.          See stopTest for a method cal, Called when an error has occurred. 'err' is a tuple of values as         returne, Called when an error has occurred. 'err' is a tuple of values as         returne (+16 more)
 
 ### Community 455 - "Community 455"
 Cohesion: 0.12
 Nodes (9): Used to decorate file-like objects with a handy 'writeln' method, A test runner class that displays results in textual form.      It prints out th, Construct a TextTestRunner.          Subclasses should accept **kwargs to ensure, Run the given test case or test suite., A test result class that can print formatted text results to a stream.      Used, Construct a TextTestResult. Subclasses should accept **kwargs         to ensure, TextTestResult, TextTestRunner (+1 more)
 
 ### Community 456 - "Community 456"
-Cohesion: 0.07
-Nodes (23): _BackInsertionSequence, __const_constraints(), __constraints(), _GLIBCXX_VISIBILITY(), __gnu_debug(), _DifferenceType, default, namespace (+15 more)
+Cohesion: 0.08
+Nodes (22): _BackInsertionSequence, __const_constraints(), __constraints(), _GLIBCXX_VISIBILITY(), __gnu_debug(), _DifferenceType, default, namespace (+14 more)
 
 ### Community 457 - "Community 457"
 Cohesion: 0.14
@@ -4402,20 +4304,20 @@ Cohesion: 0.12
 Nodes (23): PyCodeObject, PyObject, PyThreadState, _PyFrame_GetFirstComplete(), _PyFrame_GetFrameObject(), _PyFrame_GetGenerator(), _PyFrame_GetLocalsArray(), _PyFrame_GetStackPointer() (+15 more)
 
 ### Community 460 - "Community 460"
-Cohesion: 0.08
-Nodes (22): poly_uint64, T, const_rtx, machine_mode, rtx, const_tree, poly_uint64, tree (+14 more)
+Cohesion: 0.10
+Nodes (22): poly_uint64, T, class, machine_mode, rtx, const_rtx, machine_mode, rtx (+14 more)
 
 ### Community 461 - "Community 461"
 Cohesion: 0.14
 Nodes (27): A, class, iterator, s, T, vec, address(), allocated() (+19 more)
 
 ### Community 462 - "Community 462"
-Cohesion: 0.09
-Nodes (28): entry_pointer, key_const_reference, PB_DS_CLASS_T_DEC, entry_pointer, key_const_reference, Metadata, null_type, PB_DS_CLASS_T_DEC (+20 more)
+Cohesion: 0.16
+Nodes (17): entry_pointer, key_const_reference, PB_DS_CLASS_T_DEC, entry_pointer, key_const_reference, Metadata, null_type, PB_DS_CLASS_T_DEC (+9 more)
 
 ### Community 463 - "Community 463"
 Cohesion: 0.09
-Nodes (28): _check_parenthesis(), collapse_rfc2231_value(), decode_params(), decode_rfc2231(), encode_rfc2231(), format_datetime(), _format_timetuple_and_zone(), formatdate() (+20 more)
+Nodes (30): quote(), Prepare string to be used in a quoted string.      Turns backslash and double qu, _check_parenthesis(), collapse_rfc2231_value(), decode_params(), decode_rfc2231(), encode_rfc2231(), format_datetime() (+22 more)
 
 ### Community 464 - "Community 464"
 Cohesion: 0.10
@@ -4434,12 +4336,12 @@ Cohesion: 0.08
 Nodes (9): OptionConflictError, OptionContainer, OptionGroup, see OptionParser.destroy()., Declare that you are done with this OptionParser.  This cleans up         refere, Raised if conflicting options are added to an OptionParser., Abstract base class.      Class attributes:       standard_option_list : [Option, see OptionParser.destroy(). (+1 more)
 
 ### Community 469 - "Community 469"
-Cohesion: 0.16
-Nodes (17): Return the TurtleScreen object, the turtle is drawing  on.          No argument., Block, disable_keys(), enable_keys(), init_shelf(), isort(), main(), partition() (+9 more)
+Cohesion: 0.14
+Nodes (18): Bind fun to key-release event of key.          Arguments:         fun -- a funct, Return the TurtleScreen object, the turtle is drawing  on.          No argument., Block, disable_keys(), enable_keys(), init_shelf(), isort(), main() (+10 more)
 
 ### Community 470 - "Community 470"
-Cohesion: 0.12
-Nodes (9): Return the singleton screen object.     If none exists at the moment, create a n, Set the size and position of the main window.          Arguments:         width:, Set title of turtle-window          Argument:         titlestring -- a string, t, Shut the turtlegraphics window.          Example (for a TurtleScreen instance na, Go into mainloop until the mouse is clicked.          No arguments.          Bin, Root class for Screen based on Tkinter., Starts event loop - calling Tkinter's mainloop function.          No argument., _Root (+1 more)
+Cohesion: 0.16
+Nodes (7): Return the singleton screen object.     If none exists at the moment, create a n, Set the size and position of the main window.          Arguments:         width:, Set title of turtle-window          Argument:         titlestring -- a string, t, Shut the turtlegraphics window.          Example (for a TurtleScreen instance na, Root class for Screen based on Tkinter., _Root, Screen()
 
 ### Community 471 - "Community 471"
 Cohesion: 0.10
@@ -4450,27 +4352,24 @@ Cohesion: 0.07
 Nodes (26): add_one_template_type_printer(), add_one_type_printer(), FilteringTypePrinter, is_specialization_of(), # FIXME: this is unlikely in practice, but possible for, # TODO: add printer for basic_format_arg<Context> and print out children., # TODO: add printer for __format::_ArgStore<Context, Args...>., Test whether a type is a specialization of the named class template.     The typ (+18 more)
 
 ### Community 473 - "Community 473"
-Cohesion: 0.09
-Nodes (25): BaseCGIHandler, CGIHandler, format_date_time(), IISCGIHandler, _needs_transcode(), Base classes for server/gateway implementations, Return the URL scheme being used, Read environment, fixing HTTP variables (+17 more)
+Cohesion: 0.08
+Nodes (27): BaseCGIHandler, CGIHandler, format_date_time(), IISCGIHandler, _needs_transcode(), Base classes for server/gateway implementations, Return the URL scheme being used, Read environment, fixing HTTP variables (+19 more)
 
 ### Community 474 - "Community 474"
 Cohesion: 0.08
 Nodes (27): _Any_data, _ArgTypes, _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), _Function_base(), _GLIBCXX_VISIBILITY(), _M_functor(), _M_invoke() (+19 more)
 
 ### Community 475 - "Community 475"
-Cohesion: 0.04
-Nodes (33): _task_repr(), _task_repr_info(), _SendfileMode, _format_coroutine(), iscoroutine(), iscoroutinefunction(), Return True if func is a decorated coroutine function., Return True if obj is a coroutine object. (+25 more)
+Cohesion: 0.05
+Nodes (28): _SendfileMode, _cancel_all_tasks(), Execute the coroutine and return the result.      This function runs the passed, A context manager that controls event loop life cycle.      The context manager, Shutdown and close event loop., Return embedded event loop., Run a coroutine inside the embedded event loop., run() (+20 more)
 
 ### Community 476 - "Community 476"
 Cohesion: 0.08
 Nodes (22): get_new_size_for_arbitrary(), notify_arbitrary(), resize_needed_for_grow(), resize_needed_for_shrink(), resize_policy, get_new_size_for_arbitrary, get_new_size_for_grow, get_new_size_for_shrink (+14 more)
 
 ### Community 477 - "Community 477"
-Cohesion: 0.12
-Nodes (15): container_base_dispatch<Key, Mapped, _Alloc, cc_hash_tag, Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, gp_hash_tag, Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, list_update_tag,
-				   Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, ov_tree_tag, Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, pat_trie_tag, Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, rb_tree_tag, Policy_Tl>, container_base_dispatch<Key, Mapped, _Alloc, splay_tree_tag,
-				   Policy_Tl>, container_base_dispatch<Key, null_type, _Alloc, cc_hash_tag,
-				   Policy_Tl> (+7 more)
+Cohesion: 0.06
+Nodes (32): comp(), _GLIBCXX_VISIBILITY(), push(), swap(), __x(), _M_copy(), _M_impl(), _Rb_tree_header() (+24 more)
 
 ### Community 478 - "Community 478"
 Cohesion: 0.10
@@ -4501,8 +4400,8 @@ Cohesion: 0.10
 Nodes (28): const_pointer, const_reference, default, explicit, namespace, __other, pointer, reference (+20 more)
 
 ### Community 485 - "Community 485"
-Cohesion: 0.07
-Nodes (14): To Complex, Real adds the operations that work on real numbers.      In short, t, Any Real can be converted to a native float object.          Called for float(se, trunc(self): Truncates self to an Integral.          Returns an Integral i such, Finds the greatest Integral <= self., Finds the least Integral >= self., Rounds self to ndigits decimal places, defaulting to 0.          If ndigits is o, self // other: The floor() of self/other., other // self: The floor() of other/self. (+6 more)
+Cohesion: 0.09
+Nodes (13): HTTPMethod, HTTPStatus, HTTP methods and descriptions      Methods from the following RFCs are all obser, HTTP status codes and reason phrases      Status codes from the following RFCs a, FlagBoundary, Only changes the repr(), leaving str() and format() to the mixed-in type., Enum where members are also (and must be) ints, Enum where members are also (and must be) strings (+5 more)
 
 ### Community 486 - "Community 486"
 Cohesion: 0.17
@@ -4525,8 +4424,8 @@ Cohesion: 0.09
 Nodes (20): dedent(), fill(), indent(), Text wrapping and filling., _munge_whitespace(text : string) -> string          Munge whitespace in text: ex, _split(text : string) -> [string]          Split the text to wrap into indivisib, Object for wrapping/filling text.  The public interface consists of     the wrap, _fix_sentence_endings(chunks : [string])          Correct for sentence endings b (+12 more)
 
 ### Community 491 - "Community 491"
-Cohesion: 0.12
-Nodes (17): RawTurtle auto-creating (scrolled) canvas.      When a Turtle object is created, Data structure modeling shapes.      attribute _type is one of "polygon", "image, Shape, Turtle, ColorTurtle, main(), setbgcolor(), GravSys (+9 more)
+Cohesion: 0.14
+Nodes (15): RawTurtle auto-creating (scrolled) canvas.      When a Turtle object is created, Turtle, ColorTurtle, main(), setbgcolor(), GravSys, main(), Star (+7 more)
 
 ### Community 492 - "Community 492"
 Cohesion: 0.09
@@ -4565,8 +4464,8 @@ Cohesion: 0.11
 Nodes (26): HOST_WIDE_INT, class, s, abs_hwi(), absu_hwi(), add_hwi(), ceil_log2(), clz_hwi() (+18 more)
 
 ### Community 501 - "Community 501"
-Cohesion: 0.08
-Nodes (20): doModuleCleanups(), expectedFailure(), Execute all module cleanup functions. Normally called for you after     tearDown, Unconditionally skip a test., Skip a test if the condition is true., Skip a test unless the condition is true., skip(), skipIf() (+12 more)
+Cohesion: 0.07
+Nodes (30): addModuleCleanup(), doModuleCleanups(), enterModuleContext(), expectedFailure(), Test case implementation, Same as addCleanup, except the cleanup items are called even if     setUpModule, Same as enterContext, but module-wide., Execute all module cleanup functions. Normally called for you after     tearDown (+22 more)
 
 ### Community 503 - "Community 503"
 Cohesion: 0.11
@@ -4593,24 +4492,20 @@ Cohesion: 0.11
 Nodes (21): add_type(), guess_all_extensions(), guess_extension(), guess_type(), init(), _main(), MimeTypes, Guess the MIME type of a file.  This module defines two useful functions:  guess (+13 more)
 
 ### Community 509 - "Community 509"
-Cohesion: 0.07
-Nodes (9): _BaseGenericAlias, _Final, _is_dunder(), _LiteralSpecialForm, The central part of the internal API.      This represents a generic version of, Decorator to indicate final methods and final classes.      Use this decorator t, Mixin to prohibit subclassing., Special typing construct to indicate final names to type checkers.      A final (+1 more)
+Cohesion: 0.05
+Nodes (15): _BaseGenericAlias, _eval_type(), _Final, ForwardRef, get_type_hints(), _is_dunder(), _LiteralSpecialForm, The central part of the internal API.      This represents a generic version of (+7 more)
 
 ### Community 510 - "Community 510"
 Cohesion: 0.09
 Nodes (11): Return a name of a symbol., Return *True* if the symbol is used in         its block., Return *True* if the symbol is global., Return *True* if the symbol is declared global         with a global statement., Return *True* if a referenced symbol is         not assigned to., Return *True* if the symbol is created from         an import statement., Return *True* if a symbol is assigned to., Returns *True* if name binding introduces new namespace.          If the name is (+3 more)
 
 ### Community 512 - "Community 512"
-Cohesion: 0.15
-Nodes (21): mcp_socket_server(), McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., Raw MCP JSON-RPC client over a Unix domain socket., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content. (+13 more)
-
-### Community 513 - "Community 513"
-Cohesion: 0.08
-Nodes (11): _addError(), _addSkip(), _Outcome, Raise this exception in a test to skip it.      Usually you can use TestCase.ski, Execute all cleanup functions. Normally called for you after         tearDown., Run the test without collecting errors in a TestResult, SkipTest, Called once after all tests are executed.          See stopTest for a method cal (+3 more)
+Cohesion: 0.12
+Nodes (23): _clearExistingHandlers(), _create_formatters(), dictConfig(), fileConfig(), _handle_existing_loggers(), _install_handlers(), _install_loggers(), _is_queue_like_object() (+15 more)
 
 ### Community 514 - "Community 514"
-Cohesion: 0.06
-Nodes (16): gzip_encode(), GzipDecodedResponse, loads(), _Method, ProtocolError, data -> unmarshalled data, method name      Convert an XML-RPC packet to unmarsh, data -> gzip encoded data      Encode data using the gzip content encoding as de, a file-like object to decode a response encoded with the gzip     method, as des (+8 more)
+Cohesion: 0.04
+Nodes (33): dumps(), Error, ExpatParser, Fault, getparser(), GzipDecodedResponse, loads(), _Method (+25 more)
 
 ### Community 515 - "Community 515"
 Cohesion: 0.12
@@ -4621,8 +4516,8 @@ Cohesion: 0.10
 Nodes (24): G_GNUC_BEGIN_IGNORE_DEPRECATIONS, GError, GLIB_AVAILABLE_STATIC_INLINE_IN_2_76, gboolean, GError, g_unix_pipe_clear(), g_unix_pipe_close(), g_unix_pipe_get() (+16 more)
 
 ### Community 518 - "Community 518"
-Cohesion: 0.13
-Nodes (23): class, function, gcov_type, checking_verify_loop_structure(), fill_curr_loop(), gcov_type_to_wide_int(), get_loop(), GTY() (+15 more)
+Cohesion: 0.12
+Nodes (25): class, function, gcov_type, checking_verify_loop_structure(), fill_curr_loop(), gcov_type_to_wide_int(), get_loop(), GTY() (+17 more)
 
 ### Community 519 - "Community 519"
 Cohesion: 0.11
@@ -4640,10 +4535,6 @@ insert_leaf_imp(), PB_DS_S_TREE_NAME (+18 more)
 Cohesion: 0.11
 Nodes (40): jcharArray, jint, JNIEnv, jobject, jstring, jcharArray, jint, JNIEnv (+32 more)
 
-### Community 522 - "Community 522"
-Cohesion: 0.16
-Nodes (25): HOST_WIDE_INT, namespace, T, zext_hwi(), abs(), bit_not(), copy(), ext() (+17 more)
-
 ### Community 523 - "Community 523"
 Cohesion: 0.12
 Nodes (16): Handler, Do whatever it takes to actually log the specified logging record.          This, Conditionally emit the specified logging record.          Emission depends on fi, Ensure all logging output has been flushed.          This version does nothing a, Handle errors which occur during an emit() call.          This method should be, A handler class which writes logging records, appropriately formatted,     to a, Emit a record.          If a formatter is specified, it is used to format the re, Sets the StreamHandler's stream to the specified value,         if it is differe (+8 more)
@@ -4653,8 +4544,8 @@ Cohesion: 0.08
 Nodes (24): exists(), getatime(), getctime(), getmtime(), getsize(), isdir(), isfile(), Path operations common to more than one OS Do not use directly.  The OS specific (+16 more)
 
 ### Community 525 - "Community 525"
-Cohesion: 0.10
-Nodes (27): _descriptor_get(), get_annotations(), Compute the annotations dict for an object.      obj may be a callable, class, o, Private helper. Checks if ``cls`` has an attribute     named ``method_name`` and, Private helper to calculate how 'wrapped_sig' signature will     look like after, Private helper to transform signatures for unbound     functions to bound method, Private helper to test if `obj` is a callable that might     support Argument Cl, Private helper to test if `obj` is a duck type of FunctionType.     A good examp (+19 more)
+Cohesion: 0.11
+Nodes (23): _descriptor_get(), get_annotations(), Compute the annotations dict for an object.      obj may be a callable, class, o, Private helper. Checks if ``cls`` has an attribute     named ``method_name`` and, Private helper to calculate how 'wrapped_sig' signature will     look like after, Private helper to transform signatures for unbound     functions to bound method, Private helper function. Takes a signature in Argument Clinic's     extended sig, Private helper to parse content of '__text_signature__'     and return a Signatu (+15 more)
 
 ### Community 526 - "Community 526"
 Cohesion: 0.09
@@ -4665,11 +4556,11 @@ Cohesion: 0.14
 Nodes (26): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+18 more)
 
 ### Community 528 - "Community 528"
-Cohesion: 0.13
-Nodes (10): computerzug(), main(), Nim, NimController, NimModel, NimView, randommove(), randomrow() (+2 more)
+Cohesion: 0.04
+Nodes (23): Namespace, State, Value, _DupFd, _DupFd, object, Led, _Helper (+15 more)
 
 ### Community 529 - "Community 529"
-Cohesion: 0.14
+Cohesion: 0.18
 Nodes (5): _OrderedChainMap, Returns a one-line description of the subtest, or None if no         description, Returns a one-line description of the test, or None if no         description ha, Return a context manager that will return the enclosed block         of code in, _SubTest
 
 ### Community 530 - "Community 530"
@@ -4693,12 +4584,12 @@ Cohesion: 0.10
 Nodes (11): Indent, NotExecutable, Variables, check_file(), test_Flake8(), test_NotExecutable(), test_NotExecutable_hint(), test_Shellcheck() (+3 more)
 
 ### Community 535 - "Community 535"
-Cohesion: 0.06
-Nodes (33): diagnostic_context, diagnostic_info, class, namespace, class, virtual, class, class (+25 more)
+Cohesion: 0.09
+Nodes (21): diagnostic_context, diagnostic_info, class, namespace, class, virtual, class, expanded_location (+13 more)
 
 ### Community 536 - "Community 536"
-Cohesion: 0.09
-Nodes (11): class, T, namespace, class, allocate(), allocate_raw(), pool_usage(), remove() (+3 more)
+Cohesion: 0.08
+Nodes (14): class, mem_location, mem_usage, T, namespace, class, allocate(), allocate_raw() (+6 more)
 
 ### Community 537 - "Community 537"
 Cohesion: 0.18
@@ -4706,7 +4597,7 @@ Nodes (12): class, cgraph_node, class, predicate(), duplicate(), GTY(), ipa_cach
 
 ### Community 538 - "Community 538"
 Cohesion: 0.17
-Nodes (25): basic_block, class, const_basic_block, edge, gimple, gimple_poly_bb_p, loop_p, tree (+17 more)
+Nodes (24): basic_block, class, const_basic_block, edge, gimple, gimple_poly_bb_p, loop_p, tree (+16 more)
 
 ### Community 539 - "Community 539"
 Cohesion: 0.09
@@ -4721,16 +4612,16 @@ Cohesion: 0.08
 Nodes (30): Absent, deepvalues(), http2time(), is_HDN(), iso2time(), liberal_is_HDN(), offset_from_tz_string(), parse_ns_headers() (+22 more)
 
 ### Community 543 - "Community 543"
-Cohesion: 0.13
-Nodes (6): Message, Warn users that a ``KeyError`` can be expected when a         mising key is supp, Convert PackageMetadata to a JSON-compatible format         per PEP 0566., FoldedCase, A case insensitive string class; behaves just like str     except compares equal, Does self appear in other?
+Cohesion: 0.08
+Nodes (12): Message, Warn users that a ``KeyError`` can be expected when a         mising key is supp, Convert PackageMetadata to a JSON-compatible format         per PEP 0566., method_cache(), pass_none(), Wrap lru_cache to support storing the cache data in the object instances.      A, Wrap func so it's not called if its first param is None      >>> print_text = pa, Performance optimization: where possible, resolve the         normalized name fr (+4 more)
 
 ### Community 544 - "Community 544"
 Cohesion: 0.07
 Nodes (27): hash_load_check_resize_trigger, do_resize, get_loads, is_grow_needed, is_resize_needed, m_load_max, m_load_min, m_next_grow_size (+19 more)
 
 ### Community 545 - "Community 545"
-Cohesion: 0.10
-Nodes (12): AsyncExitStack, _BaseExitStack, A base class for ExitStack and AsyncExitStack., Preserve the context stack by transferring it to a new instance., Registers a callback with the standard __exit__ method signature.          Can s, Enters the supplied context manager.          If successful, also pushes its __e, Helper to correctly register callbacks to __exit__ methods., Async context manager for dynamic management of a stack of exit     callbacks. (+4 more)
+Cohesion: 0.23
+Nodes (4): Called when the low-level connection is made.          Start the SSL handshake., Called when the low-level connection is lost or closed.          The argument is, Called when the other end of the low-level stream         is half-closed., SSLProtocol
 
 ### Community 546 - "Community 546"
 Cohesion: 0.18
@@ -4753,12 +4644,12 @@ Cohesion: 0.09
 Nodes (9): _ClosedDict, DbfilenameShelf, open(), Manage shelves of pickled objects.  A "shelf" is a persistent, dictionary-like o, Shelf implementation using the "dbm" generic dbm interface.      This is initial, Open a persistent dictionary for reading and writing.      The filename paramete, Marker for a closed dict.  Access attempts raise a ValueError., Base class for shelf implementations.      This is initialized with a dictionary (+1 more)
 
 ### Community 551 - "Community 551"
-Cohesion: 0.10
-Nodes (9): NamedTemporaryFile(), A separate object allowing proper closing of a temporary file's     underlying f, Temporary file wrapper      This class provides a wrapper around files opened fo, Close the temporary file, possibly deleting it., Create and return a temporary file.     Arguments:     'prefix', 'suffix', 'dir', Create and return a temporary directory.  This has the same     behavior as mkdt, TemporaryDirectory, _TemporaryFileCloser (+1 more)
+Cohesion: 0.11
+Nodes (7): A separate object allowing proper closing of a temporary file's     underlying f, Temporary file wrapper      This class provides a wrapper around files opened fo, Close the temporary file, possibly deleting it., Create and return a temporary directory.  This has the same     behavior as mkdt, TemporaryDirectory, _TemporaryFileCloser, _TemporaryFileWrapper
 
 ### Community 552 - "Community 552"
-Cohesion: 0.10
-Nodes (12): Barrier, Wait until a condition evaluates to True.          predicate should be a callabl, Wake up all threads waiting on this condition.          If the calling thread ha, Wake up all threads waiting on this condition.          This method is deprecate, Implements a Barrier.      Useful for synchronizing a fixed number of threads at, Create a barrier, initialised to 'parties' threads.          'action' is a calla, Wait for the barrier.          When the specified number of threads have started, Reset the barrier to the initial state.          Any threads currently waiting w (+4 more)
+Cohesion: 0.07
+Nodes (17): Barrier, Event, Wait until a condition evaluates to True.          predicate should be a callabl, Wake up all threads waiting on this condition.          If the calling thread ha, Wake up all threads waiting on this condition.          This method is deprecate, Class implementing event objects.      Events manage a flag that can be set to t, Return true if and only if the internal flag is true.          This method is de, Set the internal flag to true.          All threads waiting for it to become tru (+9 more)
 
 ### Community 553 - "Community 553"
 Cohesion: 0.23
@@ -4777,12 +4668,12 @@ Cohesion: 0.07
 Nodes (21): Tests for read_file and write_file MCP tools., Paginated reads always return content, never 'unchanged'., Full read of a file ending in '\\n' must return content ending in '\\n'., Full read of a file WITHOUT trailing newline must not gain one., The canonical regression for vikunja #246: read then write must be     byte-iden, Offset read that reaches EOF must keep the file's trailing newline., Limited read that does NOT reach EOF must not append a newline., Limited read whose slice happens to end at EOF must keep the newline. (+13 more)
 
 ### Community 557 - "Community 557"
-Cohesion: 0.07
-Nodes (46): Anchor, ModuleType, Package, Resource, _(), as_file(), files(), from_package() (+38 more)
+Cohesion: 0.09
+Nodes (25): Any, BinaryIO, Package, Typed version of the return of open() in binary mode., Typed version of the return of open() in text mode., TextIO, Resource, Read resources contained within a package. (+17 more)
 
 ### Community 558 - "Community 558"
-Cohesion: 0.11
-Nodes (6): create_subprocess_exec(), create_subprocess_shell(), Process, Wait until the process exit and return the process return code., Like StreamReaderProtocol, but for a subprocess., SubprocessStreamProtocol
+Cohesion: 0.12
+Nodes (13): BaseRotatingHandler, Start the listener.          This starts up a background thread to monitor the q, Do a rollover, as described in __init__()., Handler for logging to a file, rotating the log file at certain timed     interv, Work out the rollover time based on the specified time., Determine if rollover should occur.          record is not used, as we are just, Determine the files to delete when rolling over.          More specific than the, do a rollover; in this case, a date/time stamp is appended to the filename (+5 more)
 
 ### Community 559 - "Community 559"
 Cohesion: 0.15
@@ -4801,8 +4692,8 @@ Cohesion: 0.15
 Nodes (26): _MM_MANTISSA_NORM_ENUM, _MM_MANTISSA_SIGN_ENUM, _mm512_getmant_pd(), _mm512_getmant_ps(), _mm512_getmant_round_pd(), _mm512_getmant_round_ps(), _mm512_mask_getmant_pd(), _mm512_mask_getmant_ps() (+18 more)
 
 ### Community 564 - "Community 564"
-Cohesion: 0.08
-Nodes (26): no_throw_copies_t, node_allocator, node_pointer, size_type, left_child_next_sibling_heap, actual_erase_node, begin, bubble_to_top (+18 more)
+Cohesion: 0.24
+Nodes (14): T, zext_hwi(), abs(), bit_not(), ext(), extract_uhwi(), fits_uhwi_p(), get_precision() (+6 more)
 
 ### Community 565 - "Community 565"
 Cohesion: 0.15
@@ -4825,8 +4716,8 @@ Cohesion: 0.08
 Nodes (26): _Inode, add_child, begin, end, get_begin_pos, get_child_it, get_child_node, get_join_child (+18 more)
 
 ### Community 570 - "Community 570"
-Cohesion: 0.08
-Nodes (15): A generally useful event scheduler class.  Each instance of this class manages i, Execute events until the queue is empty.         If blocking is False executes t, An ordered list of upcoming events.          Events are named tuples with fields, Initialize a new instance, passing the time and delay         functions, Enter a new event in the queue at an absolute time.          Returns an ID for t, A variant that specifies the time as a relative time.          This is actually, Remove an event from the queue.          This must be presented the ID as return, Check whether the queue is empty. (+7 more)
+Cohesion: 0.09
+Nodes (13): A generally useful event scheduler class.  Each instance of this class manages i, Execute events until the queue is empty.         If blocking is False executes t, An ordered list of upcoming events.          Events are named tuples with fields, Initialize a new instance, passing the time and delay         functions, Enter a new event in the queue at an absolute time.          Returns an ID for t, A variant that specifies the time as a relative time.          This is actually, Remove an event from the queue.          This must be presented the ID as return, Check whether the queue is empty. (+5 more)
 
 ### Community 571 - "Community 571"
 Cohesion: 0.10
@@ -4841,20 +4732,20 @@ Cohesion: 0.12
 Nodes (20): config_dict(), __forwardmethods(), getmethparlist(), _make_global_funcs(), __methodDict(), __methods(), Convert content of config-file into dictionary., Read config-files, change configuration-dict accordingly.      If there is a tur (+12 more)
 
 ### Community 574 - "Community 574"
-Cohesion: 0.06
-Nodes (19): DTDHandler, EntityResolver, ErrorHandler, LexicalHandler, This module contains the core classes of version 2.0 of SAX for Python. This fil, Handle DTD events.      This interface specifies only those DTD events required, Handle a notation declaration event., Handle an unparsed entity declaration event. (+11 more)
+Cohesion: 0.11
+Nodes (12): DTDHandler, EntityResolver, ErrorHandler, This module contains the core classes of version 2.0 of SAX for Python. This fil, Handle DTD events.      This interface specifies only those DTD events required, Handle a notation declaration event., Handle an unparsed entity declaration event., Basic interface for resolving entities. If you create an object     implementing (+4 more)
 
 ### Community 575 - "Community 575"
 Cohesion: 0.08
 Nodes (15): ContentHandler, End the scope of a prefix-URI mapping.          See startPrefixMapping for detai, Signals the start of an element in non-namespace mode.          The name paramet, Signals the end of an element in non-namespace mode.          The name parameter, Signals the start of an element in namespace mode.          The name parameter c, Signals the end of an element in namespace mode.          The name parameter con, Receive notification of character data.          The Parser will call this metho, Receive notification of ignorable whitespace in element content.          Valida (+7 more)
 
 ### Community 576 - "Community 576"
-Cohesion: 0.14
-Nodes (15): agent_system(), apply_summary_override(), expand_tilde(), kgl_hint(), mcp_instructions(), policy(), resolve(), CompactionPolicy (+7 more)
+Cohesion: 0.09
+Nodes (32): agent_system(), apply_summary_override(), default_agent_instructions_path(), default_agent_instructions_path_uses_daimonos_config_dir(), default_by_name(), default_prompts_dir(), dump_defaults(), dump_defaults_force_overwrites() (+24 more)
 
 ### Community 577 - "Community 577"
-Cohesion: 0.08
-Nodes (14): _check_utc_offset(), Format using strftime().          Example: "%d/%m/%Y, %H:%M:%S", Return local time tuple compatible with time.localtime()., Abstract base class for time zone info classes.      Subclasses must override th, datetime -> string name of time zone., datetime -> timedelta, positive for east of UTC, negative for west of UTC, datetime -> DST offset as timedelta, positive for east of UTC.          Return 0, datetime in UTC -> datetime in local time. (+6 more)
+Cohesion: 0.13
+Nodes (15): BadZipFile, _check_zipfile(), _EndRecData(), _EndRecData64(), is_zipfile(), main(), Read and write ZIP files.  XXX references to utf-8 need further investigation., Read in the table of contents for the ZIP file. (+7 more)
 
 ### Community 578 - "Community 578"
 Cohesion: 0.11
@@ -4865,12 +4756,12 @@ Cohesion: 0.08
 Nodes (8): Implement std::unique_ptr<T>::get() and std::unique_ptr<T>::operator->()., Implement std::unique_ptr<T>::operator*()., Implement std::unique_ptr<T>::operator[](size_t)., Implement std::shared_ptr<T>::operator*()., SharedPtrDerefWorker, UniquePtrDerefWorker, UniquePtrGetWorker, UniquePtrSubscriptWorker
 
 ### Community 580 - "Community 580"
-Cohesion: 0.10
-Nodes (15): _check_compression(), _check_zipfile(), is_zipfile(), LargeZipFile, main(), Read and write ZIP files.  XXX references to utf-8 need further investigation., Print a table of contents for the zip file., Read all the files and check the CRC.          Return None if all files could be (+7 more)
+Cohesion: 0.14
+Nodes (9): NNTPPermanentError, Initialize an instance.  Arguments:         - host: hostname to connect to, Partial initialization for the NNTP protocol.         This instance method is ex, Get the server capabilities, as read by __init__().         If the CAPABILITIES, Internal: get a response from the server.         Raise various errors if the re, Internal: send a command and get the response.         Same return value as _get, Process a SLAVE command.  Returns:         - resp: server response if successful, Process a POST command.  Arguments:         - data: bytes object, iterable or fi (+1 more)
 
 ### Community 581 - "Community 581"
-Cohesion: 0.27
-Nodes (24): a_const_pointer, a_const_iterator, node_const_pointer, PB_DS_CLASS_T_DEC, node_debug_info, add_child(), assert_valid(), assert_valid_imp() (+16 more)
+Cohesion: 0.25
+Nodes (26): a_const_pointer, a_const_iterator, iterator, node_const_pointer, PB_DS_CLASS_T_DEC, node_debug_info, add_child(), assert_valid() (+18 more)
 
 ### Community 582 - "Community 582"
 Cohesion: 0.11
@@ -4881,8 +4772,8 @@ Cohesion: 0.12
 Nodes (9): AbstractChildWatcher, Abstract base class for monitoring child processes.      Objects derived from th, Register a new child handler.          Arrange for callback(pid, returncode, *ar, Removes the handler for process 'pid'.          The function returns True if the, Attach the watcher to an event loop.          If the watcher was previously atta, Close the watcher.          This must be called to make sure that any underlying, Return ``True`` if the watcher is active and is used by the event loop., Enter the watcher's context and allow starting new processes          This funct (+1 more)
 
 ### Community 584 - "Community 584"
-Cohesion: 0.27
-Nodes (13): __atomic_ref(), __cmpexch_failure_order(), compare_exchange_strong(), compare_exchange_weak(), exchange(), kill_dependency(), load(), __pointer_type() (+5 more)
+Cohesion: 0.09
+Nodes (23): diff(), diff_different_files(), diff_file_vs_content(), diff_identical_files(), diff_missing_args(), diff_missing_file(), session_in(), _OptExcInfo (+15 more)
 
 ### Community 585 - "Community 585"
 Cohesion: 0.10
@@ -4909,8 +4800,8 @@ Cohesion: 0.18
 Nodes (24): __m128i, __m256i, __mmask16, __mmask32, _mm256_mask2_permutex2var_epi8(), _mm256_mask_multishift_epi64_epi8(), _mm256_mask_permutex2var_epi8(), _mm256_mask_permutexvar_epi8() (+16 more)
 
 ### Community 591 - "Community 591"
-Cohesion: 0.08
-Nodes (34): def_operand_p, gimple, tree, use_operand_p, gimple_debug_bind_get_value(), gimple_debug_bind_get_value_ptr(), gimple_debug_bind_get_var(), gimple_debug_bind_has_value_p() (+26 more)
+Cohesion: 0.11
+Nodes (18): def_operand_p, gimple, tree, use_operand_p, def_operand_p, tree, use_operand_p, gimple_has_ops() (+10 more)
 
 ### Community 592 - "Community 592"
 Cohesion: 0.14
@@ -4925,16 +4816,16 @@ Cohesion: 0.11
 Nodes (22): default, namespace, class, default, explicit, namespace, result_type, _Eng (+14 more)
 
 ### Community 595 - "Community 595"
-Cohesion: 0.09
-Nodes (20): class, namespace, namespace, explicit, namespace, std, T, V8_INLINE (+12 more)
+Cohesion: 0.08
+Nodes (24): class, namespace, explicit, namespace, std, T, V8_INLINE, class (+16 more)
 
 ### Community 596 - "Community 596"
 Cohesion: 0.11
 Nodes (6): EmptyNodeList, NodeList, Python version compatibility support for minidom.  This module contains internal, _get_elements_by_tagName_helper(), _get_elements_by_tagName_ns_helper(), Returns all descendant elements with the given tag name.          Returns the li
 
 ### Community 597 - "Community 597"
-Cohesion: 0.05
-Nodes (39): compile_pattern(), pattern_convert(), PatternCompiler, PatternSyntaxError, Converts raw node information to a Node or Leaf instance., Tokenizes a string suppressing significant whitespace., Initializer.          Takes an optional alternative filename for the pattern gra, Compiles a pattern string to a nested pytree.*Pattern object. (+31 more)
+Cohesion: 0.12
+Nodes (21): _GLIBCXX_BEGIN_NAMESPACE_VERSION, Exception, _Lock_policy(), _(), do_longs(), do_shorts(), getopt(), GetoptError (+13 more)
 
 ### Community 598 - "Community 598"
 Cohesion: 0.17
@@ -4966,7 +4857,7 @@ Nodes (18): atomic_write_leaves_no_tmp_file(), first_user_line(), list_returns_s
 
 ### Community 606 - "Community 606"
 Cohesion: 0.12
-Nodes (10): FastPath, Lookup, Prepared, Micro-optimized class for searching a path for     children.      >>> FastPath(', A prepared search for metadata on a possibly-named package., PEP 503 normalization plus dashes as underscores., Normalize the package name as found in the convention in         older packaging, Find metadata directories in paths heuristically. (+2 more)
+Nodes (5): Client(), Connection, Listener, Pipe(), Pool()
 
 ### Community 607 - "Community 607"
 Cohesion: 0.10
@@ -5009,8 +4900,8 @@ Cohesion: 0.10
 Nodes (23): maybe_null_type, maybe_null_type<Key, null_type, _Alloc, Store_Hash>, s_null_type, no_throw_copies, no_throw_copies<Key, null_type>, __simple, rebind_traits, select_value_type (+15 more)
 
 ### Community 618 - "Community 618"
-Cohesion: 0.21
-Nodes (19): SList, lt_dlloader_add(), lt_dlloader_dump(), slist_box(), slist_concat(), slist_cons(), slist_delete(), slist_find() (+11 more)
+Cohesion: 0.16
+Nodes (23): lt_user_data, SList, lt_dlloader_add(), lt_dlloader_dump(), loader_init(), lt_dlinit(), slist_box(), slist_concat() (+15 more)
 
 ### Community 619 - "Community 619"
 Cohesion: 0.11
@@ -5041,8 +4932,8 @@ Cohesion: 0.09
 Nodes (24): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, code:json ({), code:block2 (Use daimonos MCP tools for all file, search, exec, and git o), Custom Instructions (optional), Prerequisites (+16 more)
 
 ### Community 626 - "Community 626"
-Cohesion: 0.09
-Nodes (16): ModuleSpec, The specification for a module, used for loading.      A module's spec is the so, The name of the module's parent., all_suffixes(), The machinery of importlib: finders, loaders, hooks, etc., Returns a list of all recognized module suffixes for this process, compile(), _get_default_invalidation_mode() (+8 more)
+Cohesion: 0.13
+Nodes (16): help(), pm(), post_mortem(), Execute the *statement* (given as a string or a code object)     under debugger, Evaluate the *expression* (given as a string or a code object)     under debugge, Call the function (a function or method object, not a string)     with the given, Enter post-mortem debugging of the given *traceback* object.      If no tracebac, Enter post-mortem debugging of the traceback found in sys.last_traceback. (+8 more)
 
 ### Community 627 - "Community 627"
 Cohesion: 0.10
@@ -5077,8 +4968,8 @@ Cohesion: 0.11
 Nodes (15): AsyncCleanupHookHandle, namespace, class, namespace, AddEnvironmentCleanupHook(), node(), CallbackScope(), InitializationResult() (+7 more)
 
 ### Community 635 - "Community 635"
-Cohesion: 0.11
-Nodes (27): bitmap_iterator, bitmap_obstack, const_bitmap, T, bitmap, class, FILE, class (+19 more)
+Cohesion: 0.13
+Nodes (24): bitmap_iterator, bitmap_obstack, const_bitmap, bitmap, class, FILE, class, auto_bitmap() (+16 more)
 
 ### Community 636 - "Community 636"
 Cohesion: 0.13
@@ -5093,8 +4984,8 @@ Cohesion: 0.15
 Nodes (22): _S_all_of(), _S_any_of(), _S_ceil(), _S_find_first_set(), _S_find_last_set(), _S_floor(), _S_masked_store_nocvt(), _S_none_of() (+14 more)
 
 ### Community 639 - "Community 639"
-Cohesion: 0.15
-Nodes (19): test_handle_config_choice(), test_handle_config_helper(), test_handle_default(), test_handle_definition(), test_handle_line(), test_handle_note(), test_handle_select(), test_handle_usage() (+11 more)
+Cohesion: 0.19
+Nodes (17): test_handle_config_choice(), test_handle_config_helper(), test_handle_default(), test_handle_definition(), test_handle_line(), test_handle_note(), test_handle_select(), test_handle_usage() (+9 more)
 
 ### Community 640 - "Community 640"
 Cohesion: 0.13
@@ -5109,8 +5000,8 @@ Cohesion: 0.14
 Nodes (21): cppgc(), cppgc(), DeferTraceToMutatorThreadIfConcurrent(), HandleMovableReference(), HandleWeak(), internal(), RegisterWeakCallback(), VisitEphemeron() (+13 more)
 
 ### Community 643 - "Community 643"
-Cohesion: 0.13
-Nodes (21): cbegin(), crbegin(), __debug(), erase(), extract(), find(), insert(), lower_bound() (+13 more)
+Cohesion: 0.17
+Nodes (17): cbegin(), crbegin(), erase(), extract(), find(), insert(), lower_bound(), _Base_const_iterator (+9 more)
 
 ### Community 644 - "Community 644"
 Cohesion: 0.14
@@ -5121,8 +5012,8 @@ Cohesion: 0.10
 Nodes (16): namespace, rtx, rtx_insn, rtvec, get_insns(), get_last_insn(), replace_equiv_address(), rtl_ssa() (+8 more)
 
 ### Community 646 - "Community 646"
-Cohesion: 0.16
-Nodes (19): const_tree, tree, hashval_t, tree, extract_ops_from_tree(), gimple_call_addr_fndecl(), is_gimple_addressable(), is_gimple_constant() (+11 more)
+Cohesion: 0.15
+Nodes (20): const_tree, tree, hashval_t, tree, extract_ops_from_tree(), gimple_call_addr_fndecl(), is_gimple_addressable(), is_gimple_constant() (+12 more)
 
 ### Community 647 - "Community 647"
 Cohesion: 0.09
@@ -5176,10 +5067,6 @@ Nodes (13): digest(), HMAC, new(), HMAC (Keyed-Hashing for Message Authenticatio
 Cohesion: 0.15
 Nodes (8): ParserBase, Shared support for scanning document type declarations in HTML and XHTML.  This, Parser base class which provides some common support methods used     by the SGM, Return current line number and offset., _genops(), optimize(), Generate all the opcodes in a pickle.      'pickle' is a file-like object, or st, Optimize a pickle string by removing unused PUT opcodes
 
-### Community 660 - "Community 660"
-Cohesion: 0.11
-Nodes (5): BaseFilter, DomainFilter, Filter, _normalize_filename(), _Traces
-
 ### Community 661 - "Community 661"
 Cohesion: 0.12
 Nodes (12): cpe_matches(), cpe_product(), cpe_version(), CVE, Iterate over each product section of this cve, Parse the node inside the configurations section to extract the         cpe info, The CVE unique identifier, The set of CPE products referred by this CVE definition (+4 more)
@@ -5201,12 +5088,12 @@ Cohesion: 0.11
 Nodes (3): A socket-like wrapper for exposing real transport sockets.      These objects ca, TransportSocket, socket
 
 ### Community 666 - "Community 666"
-Cohesion: 0.14
-Nodes (18): _GLIBCXX_VISIBILITY(), literals(), __variant(), default, namespace, _CharT, default, namespace (+10 more)
+Cohesion: 0.13
+Nodes (19): c_str(), _GLIBCXX_VISIBILITY(), literals(), __variant(), default, namespace, _CharT, default (+11 more)
 
 ### Community 667 - "Community 667"
-Cohesion: 0.13
-Nodes (27): _GLIBCXX_VISIBILITY(), __uninit_copy(), __uninit_default(), __uninit_default_n(), __uninit_default_novalue(), __uninit_default_novalue_n(), __uninit_fill(), __uninit_fill_n() (+19 more)
+Cohesion: 0.11
+Nodes (31): _GLIBCXX_VISIBILITY(), __uninit_copy(), __uninit_default(), __uninit_default_n(), __uninit_default_novalue(), __uninit_default_novalue_n(), __uninit_fill(), __uninit_fill_n() (+23 more)
 
 ### Community 668 - "Community 668"
 Cohesion: 0.18
@@ -5221,8 +5108,8 @@ Cohesion: 0.10
 Nodes (21): Model Context Protocol (MCP), Batch Operations, code:block1 ([op: u8, ...args]), code:block2 ([0, "src/main.rs", 10, 50]), code:json ({"ok": true, "d": <result data>}), code:json ({"ok": false, "e": <error code>, "m": <message>}), code:json ({"batch": [), Compact Mode (optional, non-MCP clients) (+13 more)
 
 ### Community 672 - "Community 672"
-Cohesion: 0.10
-Nodes (9): Return a boolean value translating from other types if necessary., ConfigParser that does not do interpolation., Return a list of section names, excluding [DEFAULT], Indicate whether the named section is present in the configuration.          The, Like read() but the argument must be a file-like object.          The `f` argume, Read configuration from a given string., Remove a section from the parser and return it as         a (section_name, secti, Remove a file section. (+1 more)
+Cohesion: 0.14
+Nodes (10): const_pointer, const_reference, pointer, reference, value_type, _Iter, _Leaf, m_value (+2 more)
 
 ### Community 673 - "Community 673"
 Cohesion: 0.15
@@ -5233,12 +5120,12 @@ Cohesion: 0.11
 Nodes (21): body_check(), body_encode(), body_length(), decode(), header_check(), header_decode(), header_encode(), header_length() (+13 more)
 
 ### Community 675 - "Community 675"
-Cohesion: 0.10
-Nodes (21): CannotSendRequest, HTTPException, HTTPMessage, ImproperConnectionState, _parse_header_lines(), parse_headers(), r"""HTTP/1.1 client library  <intro stuff goes here> <other stuff, too>  HTTPCon, # NOTE: no TE header implies *only* "chunked" (+13 more)
+Cohesion: 0.12
+Nodes (17): CannotSendRequest, HTTPException, HTTPMessage, ImproperConnectionState, r"""HTTP/1.1 client library  <intro stuff goes here> <other stuff, too>  HTTPCon, # NOTE: no TE header implies *only* "chunked", Remove interface scope from IPv6 address., Find all header lines matching a given header name.          Look through the li (+9 more)
 
 ### Community 676 - "Community 676"
 Cohesion: 0.12
-Nodes (13): FreezableDefaultDict, Pair, Often it is desirable to prevent the mutation of     a default dict after its in, PackagePath, PathDistribution, A reference to a path in a package, Return a path-like object for this path, A simple entry point config parser for performance      >>> for item in Sectione (+5 more)
+Nodes (13): FixImport, Walks over all the names imported in a dotted_as_names node., traverse_imports(), FixIntern, FixReduce, FixReload, Fixer for reload().  reload(s) -> importlib.reload(s), FromImport() (+5 more)
 
 ### Community 677 - "Community 677"
 Cohesion: 0.13
@@ -5253,16 +5140,16 @@ Cohesion: 0.17
 Nodes (16): debug(), DocFileSuite(), DocFileTest(), _DocTestSuite, _load_testfile(), _module_relative_path(), _newline_convert(), _normalize_module() (+8 more)
 
 ### Community 680 - "Community 680"
-Cohesion: 0.07
-Nodes (34): BufferedIOBase, BufferedIOBase, IOBase, The io module provides the Python interfaces to stream handling. The builtin ope, RawIOBase, TextIOBase, ForkingMixIn, ForkingTCPServer (+26 more)
+Cohesion: 0.13
+Nodes (25): BufferedIOBase, ForkingMixIn, ForkingTCPServer, ForkingUDPServer, ForkingUnixDatagramServer, ForkingUnixStreamServer, _NoThreads, Generic socket server classes.  This module tries to capture the various aspects (+17 more)
 
 ### Community 681 - "Community 681"
-Cohesion: 0.08
-Nodes (13): unt(il) [lineno]          Without argument, continue execution until the line wi, run [args...]          Restart the debugged python program. If a string is suppl, retval          Print the return value for the last return of a function., l(ist) [first[, last] | .]          List source code for the current file.  With, ll | longlist          List the whole source code for the current function or fr, source expression          Try to get source code for the given object and displ, Print a range of lines., undisplay [expression]          Do not display the expression any more in the cu (+5 more)
+Cohesion: 0.10
+Nodes (10): u(p) [count]          Move the current frame count (default one) levels up in th, d(own) [count]          Move the current frame count (default one) levels down i, unt(il) [lineno]          Without argument, continue execution until the line wi, run [args...]          Restart the debugged python program. If a string is suppl, undisplay [expression]          Do not display the expression any more in the cu, alias [name [command]]          Create an alias called 'name' that executes 'com, (Pdb) commands [bpnumber]         (com) ...         (com) end         (Pdb), enable bpnumber [bpnumber ...]          Enables the breakpoints given as a space (+2 more)
 
 ### Community 682 - "Community 682"
-Cohesion: 0.12
-Nodes (13): _ExceptionPrintContext, format_exception_only(), _format_final_exc_line(), Print the result of self.format(chain=chain) to 'file'., Format the exception part of a traceback.      The return value is a list of str, An exception ready for rendering.      The traceback module captures enough attr, Create a TracebackException from an exception., Private API. force all lines in the stack to be loaded. (+5 more)
+Cohesion: 0.15
+Nodes (3): _date_from_string(), _decode_base64(), _PlistParser
 
 ### Community 683 - "Community 683"
 Cohesion: 0.09
@@ -5277,24 +5164,24 @@ Cohesion: 0.19
 Nodes (3): DemoWindow, getExampleEntries(), main()
 
 ### Community 686 - "Community 686"
-Cohesion: 0.06
-Nodes (15): AsyncMockMixin, _Call, _callable(), CallableMixin, _format_call_signature(), _is_exception(), _MockIter, Assert that the mock was awaited at least once. (+7 more)
+Cohesion: 0.13
+Nodes (15): class, class, class, dump_location_t, auto_diagnostic_group(), failure_at(), get_problem(), opt_problem() (+7 more)
 
 ### Community 687 - "Community 687"
 Cohesion: 0.08
 Nodes (13): is_member_of_namespace(), lookup_node_type(), lookup_templ_spec(), Print a std::forward_list., Lookup template specialization templ<args...>., Lookup specialization of template nodename corresponding to containertype., Test whether a type is a member of one of the specified namespaces.     The type, Print a __gnu_cxx::slist. (+5 more)
 
 ### Community 688 - "Community 688"
-Cohesion: 0.11
-Nodes (12): Return the instance of ZipInfo given 'name'., Extract a member from the archive to the current working directory,            u, Replace bad characters and remove trailing dots from parts., Extract the ZipInfo object 'member' to a physical            file on the path ta, Put the bytes from filename into the archive under the name         arcname., Write a file into the archive.  The contents is 'data', which         may be eit, Creates a directory inside the zip archive., Class with attributes describing each file in the ZIP archive. (+4 more)
+Cohesion: 0.12
+Nodes (12): Return the instance of ZipInfo given 'name'., Extract a member from the archive to the current working directory,            u, Extract the ZipInfo object 'member' to a physical            file on the path ta, Put the bytes from filename into the archive under the name         arcname., Write a file into the archive.  The contents is 'data', which         may be eit, Creates a directory inside the zip archive., Class with attributes describing each file in the ZIP archive., Return the per-file header as a bytes object.          When the optional zip64 a (+4 more)
 
 ### Community 689 - "Community 689"
 Cohesion: 0.10
 Nodes (12): Timeout async context manager.      Useful in cases when you want to apply timeo, Schedule the timeout at absolute time.      Like timeout() but argument gives ab, Asynchronous context manager for cancelling overdue coroutines.      Use `timeou, Schedule a timeout that will trigger at a given loop time.          - If `when`, Return the current deadline., Reschedule the timeout., Is timeout expired during execution?, _State (+4 more)
 
 ### Community 690 - "Community 690"
-Cohesion: 0.09
-Nodes (19): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), experimental(), _GLIBCXX_VISIBILITY(), _M_try_acquire_for(), _M_try_acquire_until(), _GLIBCXX_VISIBILITY(), chrono (+11 more)
+Cohesion: 0.10
+Nodes (15): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), experimental(), _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), chrono, default, namespace (+7 more)
 
 ### Community 691 - "Community 691"
 Cohesion: 0.10
@@ -5321,8 +5208,8 @@ Cohesion: 0.18
 Nodes (20): __m128, __m128bh, __m128h, __m256, __m256bh, __m256h, _mm256_bcstnebf16_ps(), _mm256_bcstnesh_ps() (+12 more)
 
 ### Community 697 - "Community 697"
-Cohesion: 0.12
-Nodes (20): mem_location, mem_usage, mem_location, mem_usage, class, hashval_t, value_type, dump() (+12 more)
+Cohesion: 0.14
+Nodes (17): mem_location, mem_usage, class, hashval_t, value_type, dump(), dump(), equal() (+9 more)
 
 ### Community 698 - "Community 698"
 Cohesion: 0.11
@@ -5330,7 +5217,7 @@ Nodes (14): rtx_insn, class, poly_int64, rtx_insn, insn_addresses_new(), lra_get
 
 ### Community 699 - "Community 699"
 Cohesion: 0.10
-Nodes (32): const_hard_reg_set, HARD_REG_SET, machine_mode, const_hard_reg_set, HARD_REG_SET, machine_mode, hard_reg_set_iterator, CLEAR_HARD_REG_BIT() (+24 more)
+Nodes (32): T, const_hard_reg_set, HARD_REG_SET, const_hard_reg_set, HARD_REG_SET, machine_mode, hard_reg_set_iterator, base() (+24 more)
 
 ### Community 700 - "Community 700"
 Cohesion: 0.14
@@ -5341,8 +5228,8 @@ Cohesion: 0.19
 Nodes (17): comb_probe_fn, key_const_reference, null_type, PB_DS_CLASS_C_DEC, PB_DS_CLASS_T_DEC, r_hash_fn, size_type, _GLIBCXX_DEBUG() (+9 more)
 
 ### Community 702 - "Community 702"
-Cohesion: 0.13
-Nodes (9): iterator, metadata_const_reference, pair, size_type, _Node_citer, m_p_nd, m_p_traits, _Node_iter (+1 more)
+Cohesion: 0.16
+Nodes (7): metadata_const_reference, pair, size_type, _Node_citer, m_p_nd, m_p_traits, _Node_iter
 
 ### Community 703 - "Community 703"
 Cohesion: 0.19
@@ -5373,8 +5260,8 @@ Cohesion: 0.13
 Nodes (4): Option, OptionError, Raised if an Option instance is created with invalid or     inconsistent argumen, Instance attributes:       _short_opts : [string]       _long_opts : [string]
 
 ### Community 711 - "Community 711"
-Cohesion: 0.14
-Nodes (7): lasti2lineno(), This function is called when we stop or break at this line., Call every command that was set for the current active breakpoint         (if th, This function is called when a return trap is set here., This function is called if an exception occurs,         but only if we are to st, Interpret the argument as though it had been typed in response         to the pr, Handles one command line during command list definition.
+Cohesion: 0.12
+Nodes (8): lasti2lineno(), This method is called when there is the remote possibility         that we ever, This function is called when we stop or break at this line., Call every command that was set for the current active breakpoint         (if th, This function is called when a return trap is set here., This function is called if an exception occurs,         but only if we are to st, Interpret the argument as though it had been typed in response         to the pr, Handles one command line during command list definition.
 
 ### Community 712 - "Community 712"
 Cohesion: 0.17
@@ -5401,16 +5288,16 @@ Cohesion: 0.10
 Nodes (14): get_template_arg_list(), Print a std::basic_format_args., Remove known inline namespaces from the canonical name of a type., Return a type's template arguments as a list., The recognizer class for TemplateTypePrinter., If type_obj is a specialization of self.name that uses all the             defau, Convert a gdb.Type to a string by applying recognizers,             or if that f, Return a recognizer object for this type printer. (+6 more)
 
 ### Community 718 - "Community 718"
-Cohesion: 0.18
-Nodes (15): ALONE_CXX_MEM_STAT_INFO, gimple, T, ggc_alloc(), ggc_alloc_atomic(), ggc_alloc_cleared_gimple_statement_stat(), ggc_alloc_cleared_tree_node_stat(), ggc_alloc_no_dtor() (+7 more)
+Cohesion: 0.11
+Nodes (21): ALONE_CXX_MEM_STAT_INFO, gimple, T, cgraph_node, cgraph_node, ggc_alloc(), ggc_alloc_atomic(), ggc_alloc_cleared_gimple_statement_stat() (+13 more)
 
 ### Community 719 - "Community 719"
-Cohesion: 0.10
-Nodes (11): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), default, namespace, default, namespace, default (+3 more)
+Cohesion: 0.12
+Nodes (8): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), default, namespace, default, namespace, __attribute__(), _mm_move_ss()
 
 ### Community 720 - "Community 720"
-Cohesion: 0.18
-Nodes (10): __atomic_notify_address_bare(), _GLIBCXX_VISIBILITY(), _M_acquire(), _M_release(), _S_do_try_acquire(), default, __detail, namespace (+2 more)
+Cohesion: 0.12
+Nodes (17): __atomic_notify_address_bare(), _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), _M_acquire(), _M_release(), _M_try_acquire_for(), _M_try_acquire_until(), _S_do_try_acquire() (+9 more)
 
 ### Community 721 - "Community 721"
 Cohesion: 0.12
@@ -5441,8 +5328,8 @@ Cohesion: 0.25
 Nodes (19): __m128i, __m256i, __mmask8, _mm256_mask_dpbusd_epi32(), _mm256_mask_dpbusds_epi32(), _mm256_mask_dpwssd_epi32(), _mm256_mask_dpwssds_epi32(), _mm256_maskz_dpbusd_epi32() (+11 more)
 
 ### Community 728 - "Community 728"
-Cohesion: 0.06
-Nodes (34): class, class, namespace, class, dump_flags_t, namespace, class, class (+26 more)
+Cohesion: 0.11
+Nodes (19): class, namespace, class, dump_flags_t, namespace, namespace, debug_dump_context(), dump_context() (+11 more)
 
 ### Community 729 - "Community 729"
 Cohesion: 0.16
@@ -5465,7 +5352,7 @@ Cohesion: 0.15
 Nodes (13): find(), findall(), findtext(), _is_wildcard_tag(), iterfind(), prepare_child(), prepare_descendant(), _prepare_tag() (+5 more)
 
 ### Community 734 - "Community 734"
-Cohesion: 0.16
+Cohesion: 0.17
 Nodes (11): ConvertingDict, ConvertingList, ConvertingMixin, ConvertingTuple, For ConvertingXXX's, this mixin class provides common functions, A converting dictionary wrapper., A converting list wrapper., A converting tuple wrapper. (+3 more)
 
 ### Community 735 - "Community 735"
@@ -5477,8 +5364,8 @@ Cohesion: 0.09
 Nodes (5): DocFileCase, DocTestCase, r"""Run the test case without results and without catching exceptions, val -> _TestClass object with associated value val.          >>> t = _TestClass(, SkipDocTestCase
 
 ### Community 737 - "Community 737"
-Cohesion: 0.11
-Nodes (8): bin(), Flag, Like built-in bin(), except negative values are represented in     twos-complime, Extract all members from the value in definition (i.e. increasing value) order., Extract all members from the value in definition order., Create a composite member containing all canonical members present in `value`., Returns True if self has at least the same flags set as other., Returns flags in definition order.
+Cohesion: 0.09
+Nodes (10): bin(), Flag, Generate the next value when not given.          name: the name of the member, Like built-in bin(), except negative values are represented in     twos-complime, Generate the next value when not given.          name: the name of the member, Extract all members from the value in definition (i.e. increasing value) order., Extract all members from the value in definition order., Create a composite member containing all canonical members present in `value`. (+2 more)
 
 ### Community 738 - "Community 738"
 Cohesion: 0.21
@@ -5489,8 +5376,8 @@ Cohesion: 0.14
 Nodes (14): get_long_be(), get_long_le(), get_short_le(), Routines to help recognizing sound files.  Function whathdr() recognizes various, Guess the type of a sound file., Recognize sound headers., test(), test_hcom() (+6 more)
 
 ### Community 741 - "Community 741"
-Cohesion: 0.09
-Nodes (12): Event, local, _localimpl, _patch(), Thread-local objects.  (Note that this module provides a Python version of the t, A class managing thread-local dicts, Return the dict for the current thread. Raises KeyError if none         defined., Create a new dict for the current thread, and return it. (+4 more)
+Cohesion: 0.22
+Nodes (7): local, _localimpl, _patch(), Thread-local objects.  (Note that this module provides a Python version of the t, A class managing thread-local dicts, Return the dict for the current thread. Raises KeyError if none         defined., Create a new dict for the current thread, and return it.
 
 ### Community 742 - "Community 742"
 Cohesion: 0.15
@@ -5529,8 +5416,8 @@ Cohesion: 0.11
 Nodes (6): namespace, rtx, gcc(), constraint_satisfied_p(), insn_extra_register_constraint(), reg_class_for_constraint()
 
 ### Community 752 - "Community 752"
-Cohesion: 0.39
-Nodes (7): DIR, closedir(), opendir(), readdir(), lt_strlcat(), lt_strlcpy(), list_files_by_dir()
+Cohesion: 0.18
+Nodes (16): DIR, error_t, argz_append(), argz_create_sep(), argz_insert(), argz_next(), closedir(), opendir() (+8 more)
 
 ### Community 753 - "Community 753"
 Cohesion: 0.14
@@ -5541,8 +5428,8 @@ Cohesion: 0.13
 Nodes (7): class, arg_direct_p(), arg_eaf_flags(), arg_noescape_p(), arg_readonly_p(), arg_used_p(), attr_fnspec()
 
 ### Community 755 - "Community 755"
-Cohesion: 0.09
-Nodes (38): const_sbitmap, class, gimple, rtx, tree, basic_block, bitmap, tree (+30 more)
+Cohesion: 0.12
+Nodes (21): const_sbitmap, class, gimple, rtx, tree, auto_sbitmap(), bitmap_bit_p(), bitmap_check_index() (+13 more)
 
 ### Community 756 - "Community 756"
 Cohesion: 0.16
@@ -5597,8 +5484,8 @@ Cohesion: 0.16
 Nodes (7): netrc, _netrclex, NetrcParseError, An object-oriented interface to .netrc files., Exception raised on syntax errors in the .netrc file., Return a (user, account, password) tuple for given host., Dump the class data in the format of a .netrc file.
 
 ### Community 770 - "Community 770"
-Cohesion: 0.12
-Nodes (8): Round self to the nearest integer, or to a given precision.          If only one, Return the floor of self, as an integer.          For a finite Decimal instance, Return the ceiling of self, as an integer.          For a finite Decimal instanc, Return True if self and other have the same exponent; otherwise         return F, Round a nonzero, nonspecial Decimal to a fixed number of         significant fig, Creates a new Decimal instance from a float but rounding using self         as t, Converts a float to a decimal number, exactly.          Note that Decimal.from_f, Express a finite Decimal instance in the form n / d.          Returns a pair (n,
+Cohesion: 0.15
+Nodes (7): pow(), Round self to the nearest integer, or to a given precision.          If only one, Return the floor of self, as an integer.          For a finite Decimal instance, Return the ceiling of self, as an integer.          For a finite Decimal instanc, Round a nonzero, nonspecial Decimal to a fixed number of         significant fig, x.__hash__() <==> hash(x), Express a finite Decimal instance in the form n / d.          Returns a pair (n,
 
 ### Community 771 - "Community 771"
 Cohesion: 0.11
@@ -5621,8 +5508,8 @@ Cohesion: 0.12
 Nodes (9): AbstractServer, Abstract server returned by create_server()., Stop serving.  This leaves existing connections open., Get the event loop the Server object is attached to., Return True if the server is accepting connections., Start accepting connections.          This method is idempotent, so it can be ca, Start accepting connections until the coroutine is cancelled.          The serve, Coroutine to wait until service is closed. (+1 more)
 
 ### Community 777 - "Community 777"
-Cohesion: 0.16
-Nodes (10): int, Path, str, float, compare_task(), fmt_ns(), fmt_pct(), load_results() (+2 more)
+Cohesion: 0.12
+Nodes (6): add_flowcontrol_defaults(), _create_transport_context(), Pause the receiving end.          No data will be passed to the protocol's data_, Set the high- and low-water limits for write flow control.          These two va, Set the high- and low-water limits for read flow control.          These two val, Return the current size of the read buffer.
 
 ### Community 778 - "Community 778"
 Cohesion: 0.17
@@ -5645,8 +5532,8 @@ Cohesion: 0.12
 Nodes (6): Annotation, Arg, Interface, Method, Property, Signal
 
 ### Community 783 - "Community 783"
-Cohesion: 0.12
-Nodes (14): _encode_base64(), _encode_text(), _finalize_set(), _prepare_set(), set_bytes_content(), set_message_content(), set_text_content(), This will be the home for the policy that hooks in the new code that adds all th (+6 more)
+Cohesion: 0.16
+Nodes (8): ContentManager, _encode_base64(), _encode_text(), _finalize_set(), _prepare_set(), set_bytes_content(), set_message_content(), set_text_content()
 
 ### Community 784 - "Community 784"
 Cohesion: 0.25
@@ -5661,8 +5548,8 @@ Cohesion: 0.22
 Nodes (17): class, relation_kind, tree, bits_to_pe(), equiv_chain(), equiv_oracle(), equiv_relation_iterator(), pe_min() (+9 more)
 
 ### Community 787 - "Community 787"
-Cohesion: 0.16
-Nodes (15): YYRESULTTAG, glr_stack, rule_num, semantic_option, yy_default_action(), yy_is_defaulted_state(), yygetLRActions(), yyLRgotoState() (+7 more)
+Cohesion: 0.17
+Nodes (6): NNTP, Get the welcome message from the server         (this is read and squirreled awa, Set the debugging level.  Argument 'level' means:         0: no debugging output, Get a description for a single group.  If more than one         group matches (', Get descriptions for a range of groups., Process a QUIT command and close the socket.  Returns:         - resp: server re
 
 ### Community 788 - "Community 788"
 Cohesion: 0.15
@@ -5685,8 +5572,8 @@ Cohesion: 0.11
 Nodes (18): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Agent still uses built-in tools, code:json ({), code:block4 (---), code:bash (echo '{}' | /path/to/daimonos --mcp -w /path/to/workspace), Cursor IDE Setup (+10 more)
 
 ### Community 793 - "Community 793"
-Cohesion: 0.08
-Nodes (7): Integral, Integral adds methods that work on integral numbers.      In short, these are co, Called whenever an index is needed, such as in slicing, self ** exponent % modulus, but maybe faster.          Accept the modulus argume, float(self) == float(int(self)), Integers are their own numerators., Integers have a denominator of 1.
+Cohesion: 0.13
+Nodes (10): Charset, _encode(), Map character sets to their email properties.      This class provides informati, Return the content-transfer-encoding used for body encoding.          This is ei, Return the output character set.          This is self.output_charset if that is, Header-encode a string by converting it first to bytes.          The type of enc, Header-encode a string by converting it first to bytes.          This is similar, Body-encode a string by converting it first to bytes.          The type of encod (+2 more)
 
 ### Community 794 - "Community 794"
 Cohesion: 0.14
@@ -5713,8 +5600,8 @@ Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
 
 ### Community 800 - "Community 800"
-Cohesion: 0.11
-Nodes (12): Formatter, LogRecord, A LogRecord instance represents an event being logged.      LogRecord instances, Initialize a logging record with interesting information., Return the message for this LogRecord.          Return the message for this LogR, Formatter instances are used to convert a LogRecord to text.      Formatters nee, Return the creation time of the specified LogRecord as formatted text., Format and return the specified exception information as a string.          This (+4 more)
+Cohesion: 0.18
+Nodes (8): Formatter, Formatter instances are used to convert a LogRecord to text.      Formatters nee, Return the creation time of the specified LogRecord as formatted text., Format and return the specified exception information as a string.          This, Check if the format uses the creation time of the record., This method is provided as an extension point for specialized         formatting, Format the specified record as text.          The record's attribute dictionary, Format the specified record.          If a formatter is set, use it. Otherwise,
 
 ### Community 801 - "Community 801"
 Cohesion: 0.12
@@ -5727,10 +5614,6 @@ Nodes (10): Differ, ndiff(), r"""         Format "?" output and deal with tabs. 
 ### Community 803 - "Community 803"
 Cohesion: 0.14
 Nodes (12): DocTestFinder, Return a DocTest for the given object, if it defines a docstring;         otherw, Return a line number of the given object's docstring.          Returns `None` if, Test examples in the given object's docstring (`f`), using `globs`     as global, A class used to extract the DocTests that are relevant to a given     object, fr, Create a new doctest finder.          The optional argument `parser` specifies a, Return a list of the DocTests that are defined by the given         object's doc, Return true if the given object is defined in the given         module. (+4 more)
-
-### Community 804 - "Community 804"
-Cohesion: 0.13
-Nodes (16): help(), pm(), post_mortem(), Execute the *statement* (given as a string or a code object)     under debugger, Evaluate the *expression* (given as a string or a code object)     under debugge, Call the function (a function or method object, not a string)     with the given, Enter post-mortem debugging of the given *traceback* object.      If no tracebac, Enter post-mortem debugging of the traceback found in sys.last_traceback. (+8 more)
 
 ### Community 805 - "Community 805"
 Cohesion: 0.12
@@ -5761,8 +5644,8 @@ Cohesion: 0.13
 Nodes (16): constexpr(), copy(), copy_backward(), equal(), __first(), move(), __copy_backward_fn, __copy_fn (+8 more)
 
 ### Community 813 - "Community 813"
-Cohesion: 0.12
-Nodes (8): _check_time_fields(), _check_tzinfo_arg(), _check_tzname(), Constructor.          Arguments:          hour, minute (required)         second, Return the timezone name.          Note that the name is 100% informational -- t, Return the timezone name.          Note that the name is 100% informational -- t, Constructor.          Arguments:          year, month, day (required, base 1), timezone
+Cohesion: 0.16
+Nodes (10): int, Path, str, float, compare_task(), fmt_ns(), fmt_pct(), load_results() (+2 more)
 
 ### Community 814 - "Community 814"
 Cohesion: 0.12
@@ -5781,8 +5664,8 @@ Cohesion: 0.24
 Nodes (16): __ctype_inline, isspace(), isalnum(), isalpha(), isascii(), isblank(), iscntrl(), isdigit() (+8 more)
 
 ### Community 818 - "Community 818"
-Cohesion: 0.24
-Nodes (9): class, rtx_insn, alternative_class(), insn_change_watermark(), insn_propagation(), recog_memoized(), temporary_volatile_ok(), which_op_alt() (+1 more)
+Cohesion: 0.15
+Nodes (13): CUMULATIVE_ARGS, cumulative_args_t, class, rtx_insn, alternative_class(), insn_change_watermark(), insn_propagation(), recog_memoized() (+5 more)
 
 ### Community 819 - "Community 819"
 Cohesion: 0.15
@@ -5805,8 +5688,8 @@ Cohesion: 0.24
 Nodes (16): __m128i, __m256i, __mmask16, __mmask8, _mm256_mask_popcnt_epi32(), _mm256_mask_popcnt_epi64(), _mm256_maskz_popcnt_epi32(), _mm256_maskz_popcnt_epi64() (+8 more)
 
 ### Community 824 - "Community 824"
-Cohesion: 0.12
-Nodes (13): BaseRotatingHandler, Start the listener.          This starts up a background thread to monitor the q, Do a rollover, as described in __init__()., Handler for logging to a file, rotating the log file at certain timed     interv, Work out the rollover time based on the specified time., Determine if rollover should occur.          record is not used, as we are just, Determine the files to delete when rolling over.          More specific than the, do a rollover; in this case, a date/time stamp is appended to the filename (+5 more)
+Cohesion: 0.03
+Nodes (71): EmailMessage, BufferingHandler, DatagramHandler, HTTPHandler, MemoryHandler, QueueHandler, QueueListener, A handler class which sends an SMTP email for each logging event. (+63 more)
 
 ### Community 825 - "Community 825"
 Cohesion: 0.15
@@ -5825,8 +5708,8 @@ Cohesion: 0.18
 Nodes (15): comb_hash_fn, eq_fn, hash_fn, probe_fn, resize_policy, ranged_hash_fn< Key, Hash_Fn, _Alloc, Comb_Hash_Fn, false>, notify_resized, swap (+7 more)
 
 ### Community 829 - "Community 829"
-Cohesion: 0.14
-Nodes (10): const_pointer, const_reference, pointer, reference, value_type, _Iter, _Leaf, m_value (+2 more)
+Cohesion: 0.17
+Nodes (10): metadata_type, node_type, _Head, m_p_max, m_p_min, _Metadata, m_metadata, _Node_base (+2 more)
 
 ### Community 830 - "Community 830"
 Cohesion: 0.38
@@ -5840,25 +5723,21 @@ Nodes (23): hash_standard_resize_policy, do_resize, get_actual_size, get_new_siz
 Cohesion: 0.15
 Nodes (15): basepath(), get_elf_arch_tag(), get_elf_prog_interpreter(), get_file_arch(), img_round_power2(), log_file_path(), open_log_file(), Rounds up the size of an image file to the next power of 2 (+7 more)
 
-### Community 833 - "Community 833"
-Cohesion: 0.13
-Nodes (13): BasicInterpolation, ExtendedInterpolation, InterpolationDepthError, InterpolationError, InterpolationMissingOptionError, InterpolationSyntaxError, Configuration file parser.  A configuration file consists of sections, lead by a, Base class for interpolation-related exceptions. (+5 more)
-
 ### Community 834 - "Community 834"
 Cohesion: 0.13
 Nodes (8): _make_filename(), A memoryview of contents of the shared memory block., Unique name that identifies the shared memory block., Closes access to the shared memory from this instance but does         not destr, Requests that the underlying shared memory block be destroyed.          In order, Create a random filename for the shared memory object., Creates a new shared memory block or attaches to an existing     shared memory b, SharedMemory
 
 ### Community 835 - "Community 835"
-Cohesion: 0.32
-Nodes (16): restore(), restore_missing_id(), restore_nonexistent(), session_in(), snap(), snap_and_restore_roundtrip(), snap_delete(), snap_delete_existing() (+8 more)
+Cohesion: 0.20
+Nodes (24): __atomic_impl(), __atomic_ref(), atomic_signal_fence(), atomic_thread_fence(), __cmpexch_failure_order(), __cmpexch_failure_order2(), compare_exchange_strong(), compare_exchange_weak() (+16 more)
 
 ### Community 836 - "Community 836"
 Cohesion: 0.15
 Nodes (7): Chunk, Simple class to read IFF chunks.  An IFF chunk (used in formats such as AIFF, TI, Seek to specified position into the chunk.         Default position is 0 (start, Read at most size bytes from the chunk.         If size is omitted or negative,, Skip the rest of the chunk.         If you are not interested in the contents of, Return the name (ID) of the current chunk., Return the size of the current chunk.
 
 ### Community 837 - "Community 837"
-Cohesion: 0.13
-Nodes (7): FTP_TLS, Initialization method (called by class instantiation).         Initialize host t, A FTP subclass which adds TLS support to FTP as described         in RFC-4217., Set up secure control connection by using TLS/SSL., Switch back to a clear-text control connection., Set up secure data connection., Set up clear text data connection.
+Cohesion: 0.12
+Nodes (8): FTP_TLS, Initialization method (called by class instantiation).         Initialize host t, Connect to host.  Arguments are:          - host: hostname to connect to (string, A FTP subclass which adds TLS support to FTP as described         in RFC-4217., Set up secure control connection by using TLS/SSL., Switch back to a clear-text control connection., Set up secure data connection., Set up clear text data connection.
 
 ### Community 838 - "Community 838"
 Cohesion: 0.13
@@ -5869,24 +5748,24 @@ Cohesion: 0.15
 Nodes (10): Creates an exception. The message is required, but the exception         is opti, Create a string representation of the exception., Encapsulate an XML parse error or warning.      This exception will include info, Creates the exception. The exception parameter is allowed to be None., The column number of the end of the text where the exception         occurred., The line number of the end of the text where the exception occurred., Get the public identifier of the entity where the exception occurred., Get the system identifier of the entity where the exception occurred. (+2 more)
 
 ### Community 840 - "Community 840"
-Cohesion: 0.11
-Nodes (7): A proxy for a single section from a parser., Creates a view on a section of the specified `name` in `parser`., Get an option value.          Unless `fallback` is provided, `None` will be retu, Create a new section in the configuration.          Raise DuplicateSectionError, Return a list of option names for the given section name., Check for the existence of a given option in a given section.         If the spe, SectionProxy
+Cohesion: 0.25
+Nodes (17): basic_block, bitmap, tree, basevar_index(), live_on_entry(), live_on_exit(), live_var_map(), make_live_on_entry() (+9 more)
 
 ### Community 841 - "Community 841"
 Cohesion: 0.21
 Nodes (15): Unit tests for benchmarks/analyze-results.py aggregation (#928).  Pure-python: s, Create a fake run dir with one summary json per task., test_aggregate_all_incorrect_falls_back_to_all_rows(), test_aggregate_backcompat_runs_without_correct_field(), test_aggregate_correct_rate(), test_aggregate_excludes_incorrect_runs_from_metrics(), test_aggregate_handles_task_missing_from_some_runs(), test_aggregate_means_across_runs() (+7 more)
 
 ### Community 842 - "Community 842"
-Cohesion: 0.12
-Nodes (14): _CalendarOffset, _DayOffset, _load_timedelta(), _parse_dst_start_end(), _parse_transition_time(), _parse_tz_delta(), _parse_tz_str(), _post_epoch_days_before_year() (+6 more)
+Cohesion: 0.18
+Nodes (10): _DayOffset, _load_timedelta(), _parse_dst_start_end(), _parse_transition_time(), _parse_tz_delta(), _parse_tz_str(), _post_epoch_days_before_year(), Get the number of days between 1970-01-01 and YEAR-01-01 (+2 more)
 
 ### Community 843 - "Community 843"
 Cohesion: 0.12
 Nodes (17): _GLIBCXX_VISIBILITY(), __invoke(), else(), return(), _GLIBCXX_VISIBILITY(), prev(), _Callable, _Args (+9 more)
 
 ### Community 844 - "Community 844"
-Cohesion: 0.39
-Nodes (9): built_in_function, combined_fn, internal_fn, as_builtin_fn(), as_combined_fn(), as_internal_fn(), builtin_fn_p(), internal_fn() (+1 more)
+Cohesion: 0.13
+Nodes (21): built_in_class, built_in_function, class, combined_fn, explicit, internal_fn, tree_code, as_builtin_fn() (+13 more)
 
 ### Community 845 - "Community 845"
 Cohesion: 0.18
@@ -5901,8 +5780,8 @@ Cohesion: 0.14
 Nodes (12): class, class, gimple, tree, class, assume_query(), gimple_outgoing_range(), gimple_ranger() (+4 more)
 
 ### Community 848 - "Community 848"
-Cohesion: 0.15
-Nodes (16): method_cache(), pass_none(), Wrap lru_cache to support storing the cache data in the object instances.      A, Wrap func so it's not called if its first param is None      >>> print_text = pa, distributions(), entry_points(), packages_distributions(), Get all ``Distribution`` instances in the current environment.      :return: An (+8 more)
+Cohesion: 0.16
+Nodes (15): YYRESULTTAG, glr_stack, rule_num, semantic_option, yy_default_action(), yy_is_defaulted_state(), yygetLRActions(), yyLRgotoState() (+7 more)
 
 ### Community 849 - "Community 849"
 Cohesion: 0.21
@@ -5917,8 +5796,8 @@ Cohesion: 0.19
 Nodes (12): class, location_t, char_span(), file_cache(), from_macro_definition_at(), from_macro_expansion_at(), get_finish(), get_pure_location() (+4 more)
 
 ### Community 852 - "Community 852"
-Cohesion: 0.11
-Nodes (13): cppgc(), cppgc(), namespace, namespace, namespace, namespace, namespace, namespace (+5 more)
+Cohesion: 0.25
+Nodes (10): _compile_pattern(), filter(), fnmatch(), fnmatchcase(), Filename matching with shell patterns.  fnmatch(FILENAME, PATTERN) matches accor, Test whether FILENAME matches PATTERN.      Patterns are Unix shell style:, Construct a list from those elements of the iterable NAMES that match PAT., Test whether FILENAME matches PATTERN, including case.      This is a version of (+2 more)
 
 ### Community 853 - "Community 853"
 Cohesion: 0.17
@@ -5929,12 +5808,12 @@ Cohesion: 0.13
 Nodes (19): getdecoder(), getencoder(), getincrementaldecoder(), getincrementalencoder(), getreader(), getwriter(), iterencode(), make_encoding_map() (+11 more)
 
 ### Community 855 - "Community 855"
-Cohesion: 0.11
-Nodes (23): lt_dladvise, lt_dlvtable, lt_module, lt_user_data, lt_dladvise, lt_dlvtable, lt_module, lt_user_data (+15 more)
+Cohesion: 0.19
+Nodes (12): lt_dladvise, lt_dlvtable, lt_module, lt_user_data, lt__malloc(), lt__memdup(), lt__zalloc(), get_vtable() (+4 more)
 
 ### Community 856 - "Community 856"
-Cohesion: 0.14
-Nodes (22): lt_dladvise, lt_dlvtable, lt_module, lt_user_data, lt_user_data, loader_init(), lt_dlinit(), lt_dlopen() (+14 more)
+Cohesion: 0.23
+Nodes (15): lt_dladvise, lt_dlvtable, lt_module, lt_user_data, add_symlist(), free_symlists(), get_vtable(), lt_dlpreload() (+7 more)
 
 ### Community 857 - "Community 857"
 Cohesion: 0.16
@@ -5969,20 +5848,16 @@ Cohesion: 0.14
 Nodes (7): Generic element structure builder.      This builder converts a sequence of star, Flush builder buffers and return toplevel document Element., Add text to current element., Close and return current Element.          *tag* is the element name., Create a comment using the comment_factory.          *text* is the text of the c, Create a processing instruction using the pi_factory.          *target* is the t, TreeBuilder
 
 ### Community 866 - "Community 866"
-Cohesion: 0.09
-Nodes (18): FixIntern, FixReduce, FixReload, ConditionalFix, Base class for fixers which not execute if an import is found., does_tree_import(), _find(), find_binding() (+10 more)
-
-### Community 867 - "Community 867"
-Cohesion: 0.18
-Nodes (3): FixOperator, Fixer for operator functions.  operator.isCallable(obj)       -> callable(obj) o, Return a k sized list of population elements chosen with replacement.          I
+Cohesion: 0.14
+Nodes (15): find_assign(), FixNext, is_assign_target(), is_subtree(), Fixer for it.next() -> next(it), per PEP 3114., does_tree_import(), _find(), find_binding() (+7 more)
 
 ### Community 869 - "Community 869"
 Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 870 - "Community 870"
-Cohesion: 0.10
-Nodes (12): Context, metadata(), PackageNotFoundError, Return the Distribution for the given package name.          :param name: The na, Return an iterable of Distribution objects for all packages.          Pass a ``c, Search the meta_path for resolvers., Return the parsed metadata for this Distribution.          The returned object w, The package was not found. (+4 more)
+Cohesion: 0.26
+Nodes (12): _Base_ptr, _Rb_tree_const_iterator(), _Rb_tree_iterator(), _S_key(), _S_left(), _S_maximum(), _S_minimum(), _S_right() (+4 more)
 
 ### Community 871 - "Community 871"
 Cohesion: 0.42
@@ -6017,16 +5892,16 @@ Cohesion: 0.15
 Nodes (6): A Signature object represents the overall signature of a function.     It stores, Private method. Don't use directly., Get a BoundArguments object, that maps the passed `args`         and `kwargs` to, Get a BoundArguments object, that partially maps the         passed `args` and `, Get a signature object for the passed callable., Signature
 
 ### Community 879 - "Community 879"
-Cohesion: 0.11
-Nodes (7): ConverterMapping, Interpolation, Reads the defaults passed in the initializer, implicitly converting         valu, Enables reuse of get*() methods between the parser and section proxies.      If, Dummy interpolation that passes the value through with no changes., Write an .ini-format representation of the configuration state.          If `spa, Write a single section to the specified `fp`.
+Cohesion: 0.20
+Nodes (8): Decimal, Decimal fixed-point and floating-point arithmetic.  This is an implementation of, _hash_algorithm(), Round a rational number to a given number of significant figures.      Rounds th, Format this fraction according to the given format specification., Round a rational number to the nearest multiple of a given power of 10.      Rou, _round_to_exponent(), _round_to_figures()
 
 ### Community 880 - "Community 880"
-Cohesion: 0.04
-Nodes (20): BaseManager, Namespace, Return some info --- useful to spot problems with refcounting, Base class for managers, Connect manager object to the server process, Spawn a server process for this manager object, Join the manager process (if it has been spawned), Register a typeid with the manager type (+12 more)
+Cohesion: 0.17
+Nodes (4): DateTime, _iso8601_format(), DateTime wrapper for an ISO 8601 string or time tuple or     localtime integer v, _strftime()
 
 ### Community 881 - "Community 881"
-Cohesion: 0.25
-Nodes (18): CallToolError, CallToolRequestParams, CallToolResult, dispatch_tool(), err_text(), ok_text(), response_to_result(), Result (+10 more)
+Cohesion: 0.33
+Nodes (9): Option, Session, UnixStream, Value, Vec, serve_one_mcp(), socket_jsonrpc_error(), socket_jsonrpc_ok() (+1 more)
 
 ### Community 882 - "Community 882"
 Cohesion: 0.23
@@ -6049,8 +5924,8 @@ Cohesion: 0.14
 Nodes (10): access_ref, class, class, tree, array_bounds_checker(), add_max_offset(), add_offset(), compute_objsize() (+2 more)
 
 ### Community 887 - "Community 887"
-Cohesion: 0.16
-Nodes (8): LegacyInterpolation, NoSectionError, Read the defaults passed in the initializer.         Note: values can be non-str, Create a sequence of lookups with 'vars' taking priority over         the 'secti, Raised when no section matches a requested option., Deprecated interpolation used in old versions of ConfigParser.     Use BasicInte, Get an option value for a given section.          If `vars` is provided, it must, Return a list of (name, value) tuples for each option in a section.          All
+Cohesion: 0.18
+Nodes (7): _check_compression(), _get_decompressor(), LargeZipFile, Return file-like object for 'name'.          name is a string for the file name, Check for errors before writing a file to the archive., Raised when writing a zipfile, the zipfile requires ZIP64 extensions     and tho, _SharedFile
 
 ### Community 888 - "Community 888"
 Cohesion: 0.15
@@ -6065,8 +5940,8 @@ Cohesion: 0.39
 Nodes (14): assert_consistent_with_debug_base(), assert_iterators(), assert_max(), assert_max_imp(), assert_min(), assert_min_imp(), assert_node_consistent(), assert_node_consistent_with_left() (+6 more)
 
 ### Community 891 - "Community 891"
-Cohesion: 0.13
-Nodes (13): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), messages(), __refs(), _GLIBCXX_VISIBILITY(), default, namespace, default (+5 more)
+Cohesion: 0.32
+Nodes (16): restore(), restore_missing_id(), restore_nonexistent(), session_in(), snap(), snap_and_restore_roundtrip(), snap_delete(), snap_delete_existing() (+8 more)
 
 ### Community 892 - "Community 892"
 Cohesion: 0.22
@@ -6101,12 +5976,12 @@ Cohesion: 0.23
 Nodes (14): __m128i, __m256i, _mm256_dpbssd_epi32(), _mm256_dpbssds_epi32(), _mm256_dpbsud_epi32(), _mm256_dpbsuds_epi32(), _mm256_dpbuud_epi32(), _mm256_dpbuuds_epi32() (+6 more)
 
 ### Community 901 - "Community 901"
-Cohesion: 0.16
-Nodes (17): __m128, __m128d, __m128i, _mm_load1_pd(), _mm_load_pd1(), _mm_shuffle_pd(), _mm_addsub_pd(), _mm_addsub_ps() (+9 more)
+Cohesion: 0.21
+Nodes (14): __m128, __m128d, __m128i, _mm_addsub_pd(), _mm_addsub_ps(), _mm_hadd_pd(), _mm_hadd_ps(), _mm_hsub_pd() (+6 more)
 
 ### Community 902 - "Community 902"
-Cohesion: 0.11
-Nodes (9): Return a new path pointing to the current working directory., Return an absolute version of this path by prepending the current         workin, Make the path absolute, resolving all symlinks on the way and also         norma, Return the path to which the symbolic link points., Rename this path to the target path.          The target path may be absolute or, Construct a new path object from any number of path-like objects.         Subcla, Return the relative path to another path identified by the passed         argume, Return True if the path is relative to another path or False. (+1 more)
+Cohesion: 0.12
+Nodes (7): BufferedIOBase, Constructor.  May be extended, do not override., Constructor.  May be extended, do not override., Called by constructor to bind the socket.          May be overridden., Return socket file number.          Interface required by selector., Simple writable BufferedIOBase implementation for a socket      Does not hold da, _SocketWriter
 
 ### Community 903 - "Community 903"
 Cohesion: 0.16
@@ -6121,12 +5996,12 @@ Cohesion: 0.15
 Nodes (14): metadata_type, node_pointer, value_type, left_child_next_sibling_heap_node_, m_metadata, m_p_l_child, m_p_next_sibling, m_p_prev_or_parent (+6 more)
 
 ### Community 906 - "Community 906"
-Cohesion: 0.10
-Nodes (27): _ATraits, const_iterator, const_reference, false_type, integral_constant, key_const_reference, Set, true_type (+19 more)
+Cohesion: 0.14
+Nodes (13): _ATraits, integral_constant, Set, pat_trie_base, synth_access_traits, cmp_keys, cmp_prefixes, equal_keys (+5 more)
 
 ### Community 907 - "Community 907"
-Cohesion: 0.19
-Nodes (18): _arp_getnode(), _find_mac_near_keyword(), _find_mac_under_heading(), _get_command_stdout(), _ifconfig_getnode(), _ip_getnode(), _is_universal(), _lanscan_getnode() (+10 more)
+Cohesion: 0.12
+Nodes (6): _BaseAddress, get_mixed_type_key(), Return a key suitable for sorting between networks and addresses.      Address a, A generic IP object.      This IP class contains the version independent methods, Returns an IP address as a formatted string.          Supported presentation typ, Network-only key function.          Returns an object that identifies this addre
 
 ### Community 908 - "Community 908"
 Cohesion: 0.12
@@ -6137,28 +6012,28 @@ Cohesion: 0.20
 Nodes (5): GitRemote, Start a local git server.          In order to support test cases in parallel, s, GitTestBase, TestGitHash, TestGitRefs
 
 ### Community 910 - "Community 910"
-Cohesion: 0.19
-Nodes (5): FixFuture, FixIdioms, FixItertoolsImports, Fixer for imports of itertools.(imap|ifilter|izip|ifilterfalse), BlankLine()
+Cohesion: 0.07
+Nodes (17): FixExitfunc, Convert use of sys.exitfunc to use the atexit module., FixFuture, FixIdioms, Adjust some old Python 2 idioms to their modern counterparts.  * Change some typ, FixItertoolsImports, Fixer for imports of itertools.(imap|ifilter|izip|ifilterfalse), FixPrint (+9 more)
 
 ### Community 911 - "Community 911"
-Cohesion: 0.12
-Nodes (11): AddressList, mktime_tz(), parsedate(), parsedate_tz(), quote(), Convert a time string to a time tuple., Turn a 10-tuple as returned by parsedate_tz() into a POSIX timestamp., Prepare string to be used in a quoted string.      Turns backslash and double qu (+3 more)
+Cohesion: 0.19
+Nodes (12): class, HOST_WIDE_INT, format_postprocessor(), output_buffer(), output_buffer_append_r(), output_buffer_formatted_text(), output_buffer_last_position_in_text(), pp_get_prefix() (+4 more)
 
 ### Community 913 - "Community 913"
 Cohesion: 0.25
 Nodes (12): INIT_LIST_HEAD(), __list_add(), list_add_tail(), __list_del(), list_del_init(), list_empty(), list_move(), list_move_tail() (+4 more)
 
 ### Community 914 - "Community 914"
-Cohesion: 0.13
-Nodes (8): FileHandler, getLevelName(), A handler class which writes formatted logging records to disk files., Open the specified file and use it as the stream for logging., Open the current base file with the (original) mode and encoding.         Return, Emit a record.          If the stream was not opened because 'delay' was specifi, Return the textual or numeric representation of logging level 'level'.      If t, Get the effective level for the underlying logger.
+Cohesion: 0.24
+Nodes (5): FileHandler, A handler class which writes formatted logging records to disk files., Open the specified file and use it as the stream for logging., Open the current base file with the (original) mode and encoding.         Return, Emit a record.          If the stream was not opened because 'delay' was specifi
 
 ### Community 915 - "Community 915"
 Cohesion: 0.28
 Nodes (13): brlicense(), brname(), buildroot.command(), generate_config(), generate_hash(), generate_mk(), generate_test(), get_dependencies() (+5 more)
 
 ### Community 916 - "Community 916"
-Cohesion: 0.13
-Nodes (14): pairing_heap, back_join, erase, forward_join, join, join_node_children, modify, pop (+6 more)
+Cohesion: 0.22
+Nodes (11): gswitch, gimple_set_num_ops(), gimple_switch_default_label(), gimple_switch_index(), gimple_switch_index_ptr(), gimple_switch_label(), gimple_switch_num_labels(), gimple_switch_set_default_label() (+3 more)
 
 ### Community 917 - "Community 917"
 Cohesion: 0.13
@@ -6169,8 +6044,8 @@ Cohesion: 0.20
 Nodes (15): decode(), decodestring(), encode(), encodestring(), ishex(), main(), needsquoting(), quote() (+7 more)
 
 ### Community 919 - "Community 919"
-Cohesion: 0.50
-Nodes (4): call(), check_call(), Run command with arguments.  Wait for command to complete or     for timeout sec, Run command with arguments.  Wait for command to complete.  If     the exit code
+Cohesion: 0.13
+Nodes (9): AddressList, mktime_tz(), parsedate(), parsedate_tz(), Convert a time string to a time tuple., Turn a 10-tuple as returned by parsedate_tz() into a POSIX timestamp., Convert a date string to a time tuple.      Accounts for military timezones., An AddressList encapsulates a list of parsed RFC 2822 addresses. (+1 more)
 
 ### Community 920 - "Community 920"
 Cohesion: 0.23
@@ -6213,8 +6088,8 @@ Cohesion: 0.33
 Nodes (13): fix(), insert_value(), modify(), push(), resize_for_insert_if_needed(), swap_value_imp(), const_reference, entry_pointer (+5 more)
 
 ### Community 931 - "Community 931"
-Cohesion: 0.23
-Nodes (21): __atomic_impl(), atomic_signal_fence(), atomic_thread_fence(), __cmpexch_failure_order2(), fetch_add(), fetch_and(), fetch_or(), fetch_sub() (+13 more)
+Cohesion: 0.27
+Nodes (14): fetch_add(), fetch_and(), fetch_or(), fetch_sub(), fetch_xor(), __int_type(), _M_type_size(), noexcept() (+6 more)
 
 ### Community 932 - "Community 932"
 Cohesion: 0.19
@@ -6237,8 +6112,8 @@ Cohesion: 0.22
 Nodes (13): class, irange, relation_kind, tree, vrange, empty_range_varying(), floating_op_table(), range_op_handler() (+5 more)
 
 ### Community 937 - "Community 937"
-Cohesion: 0.26
-Nodes (14): const_tree, tree, automatically_generated_chrec_p(), build_polynomial_chrec(), chrec_apply_map(), chrec_fold_op(), chrec_type(), evolution_function_is_affine_in_loop() (+6 more)
+Cohesion: 0.29
+Nodes (13): const_tree, tree, automatically_generated_chrec_p(), build_polynomial_chrec(), chrec_apply_map(), chrec_fold_op(), chrec_type(), evolution_function_is_affine_in_loop() (+5 more)
 
 ### Community 938 - "Community 938"
 Cohesion: 0.20
@@ -6257,8 +6132,8 @@ Cohesion: 0.35
 Nodes (13): key_const_reference, node_const_pointer, node_pointer, PB_DS_CLASS_T_DEC, find(), find_imp(), leftmost_descendant(), lower_bound() (+5 more)
 
 ### Community 942 - "Community 942"
-Cohesion: 0.37
-Nodes (13): key_const_reference, node_pointer, PB_DS_CLASS_C_DEC, PB_DS_CLASS_T_DEC, size_type, black_height(), join(), join_imp() (+5 more)
+Cohesion: 0.25
+Nodes (6): load_data(), load_tzdata(), Exception raised when a ZoneInfo key is not found., _TZifHeader, ZoneInfoNotFoundError, __getattr__()
 
 ### Community 943 - "Community 943"
 Cohesion: 0.36
@@ -6293,8 +6168,8 @@ Cohesion: 0.21
 Nodes (12): find_metas(), FixMetaclass, fixup_indent(), fixup_parse_tree(), fixup_simple_stmt(), has_metaclass(), Fixer for __metaclass__ = X -> (metaclass=X) methods.     The various forms of c, If an INDENT is followed by a thing with a prefix then nuke the prefix         O (+4 more)
 
 ### Community 951 - "Community 951"
-Cohesion: 0.11
-Nodes (12): FixImport, Walks over all the names imported in a dotted_as_names node., traverse_imports(), FixUrllib, Fix changes imports of urllib which are now incompatible.    This is rather simi, Transform for calls to module members in code., Transform for the basic import case. Replaces the old            import name wit, Transform for imports of specific module elements. Replaces            the modul (+4 more)
+Cohesion: 0.16
+Nodes (5): Return the current size of the write buffers., Write some data bytes to the transport.          This does not block; it buffers, Write a list (or any iterable) of data bytes to the transport.          The defa, Called when the low-level transport's buffer goes over         the high-water ma, Called when the low-level transport's buffer drains below         the low-water
 
 ### Community 952 - "Community 952"
 Cohesion: 0.22
@@ -6305,8 +6180,8 @@ Cohesion: 0.15
 Nodes (8): _create_https_context(), HTTPSConnection, NotConnected, Send `data' to the server.         ``data`` can be a string object, a bytes obje, Send the currently buffered request and clear the buffer.          Appends an ex, This class allows communication via SSL., Connect to a host on a given (SSL) port., Test whether a file-like object is a text or a binary stream.
 
 ### Community 954 - "Community 954"
-Cohesion: 0.22
-Nodes (5): Get the response from the server.          If the HTTPConnection is in the corre, True if the connection is closed., Returns the value of the header matching *name*.          If there are multiple, Return list of (header, value) tuples., ResponseNotReady
+Cohesion: 0.15
+Nodes (9): _parse_header_lines(), parse_headers(), Get the response from the server.          If the HTTPConnection is in the corre, Reads potential header lines into a list from a file pointer.      Length of lin, Parses only RFC2822 headers from header lines.      email Parser wants to see st, Parses only RFC2822 headers from a file pointer., True if the connection is closed., Returns a dictionary with the headers of the response         received from the (+1 more)
 
 ### Community 956 - "Community 956"
 Cohesion: 0.34
@@ -6333,8 +6208,8 @@ Cohesion: 0.15
 Nodes (7): Breakpoint, Breakpoint class.      Implements temporary breakpoints, ignore counts, disablin, Mark the breakpoint as enabled., Mark the breakpoint as disabled., Print the output of bpformat().          The optional out argument directs where, Return a string with information about the breakpoint.          The information, Return a condensed description of the breakpoint.
 
 ### Community 962 - "Community 962"
-Cohesion: 0.15
-Nodes (6): EncodedFile(), iterdecode(), Decoding iterator.      Decodes the input strings from the iterator using an Inc, StreamRecoder instances translate data from one encoding to another.          Th, Return a wrapped version of file which provides transparent         encoding tra, StreamRecoder
+Cohesion: 0.16
+Nodes (4): BufferedIncrementalEncoder, Return the next decoded line from the input stream., Return the next decoded line from the input stream., Return the next decoded line from the input stream.
 
 ### Community 963 - "Community 963"
 Cohesion: 0.10
@@ -6350,7 +6225,7 @@ Nodes (12): findmatch(), findparam(), getcaps(), listmailcapfiles(), lookup(), M
 
 ### Community 966 - "Community 966"
 Cohesion: 0.15
-Nodes (7): cl(ear) [filename:lineno | bpnumber ...]          With a space separated list of, EOF          Handles the receipt of EOF as a command., (!) statement          Execute the (one-line) statement in the context of the cu, Enter the debugger at the calling stack frame.      This is useful to hard-code, This method is called when there is the remote possibility         that we ever, Custom displayhook for the exec in default(), which prevents         assignment, set_trace()
+Nodes (7): cl(ear) [filename:lineno | bpnumber ...]          With a space separated list of, EOF          Handles the receipt of EOF as a command., retval          Print the return value for the last return of a function., (!) statement          Execute the (one-line) statement in the context of the cu, Enter the debugger at the calling stack frame.      This is useful to hard-code, Custom displayhook for the exec in default(), which prevents         assignment, set_trace()
 
 ### Community 967 - "Community 967"
 Cohesion: 0.20
@@ -6361,8 +6236,8 @@ Cohesion: 0.14
 Nodes (16): python_branch(), python_build(), python_compiler(), python_implementation(), python_revision(), python_version(), python_version_tuple(), Returns a parsed version of Python's sys.version as tuple         (name, version (+8 more)
 
 ### Community 969 - "Community 969"
-Cohesion: 0.10
-Nodes (11): Return color string corresponding to args.          Argument may be a string or, Set background image or return name of current backgroundimage.          Optiona, Set/return turtle's stretchfactors/outline. Set resizemode to "user".          O, return an image object containing the         imagedata from a gif-file named fi, Check if the string color is a legal Tkinter color string., Configure image item as to draw image object         at center of canvas. Set it, Some TurtleGraphics Error, Add component to a shape of type compound.          Arguments: poly is a polygon (+3 more)
+Cohesion: 0.13
+Nodes (7): getLevelName(), LogRecord, Return the textual or numeric representation of logging level 'level'.      If t, Get the effective level for the underlying logger., A LogRecord instance represents an event being logged.      LogRecord instances, Initialize a logging record with interesting information., Return the message for this LogRecord.          Return the message for this LogR
 
 ### Community 970 - "Community 970"
 Cohesion: 0.08
@@ -6373,11 +6248,11 @@ Cohesion: 0.30
 Nodes (11): assert_(), check_content_type(), check_environ(), check_errors(), check_exc_info(), check_headers(), check_input(), check_iterator() (+3 more)
 
 ### Community 972 - "Community 972"
-Cohesion: 0.14
-Nodes (5): MultiCall, MultiCallIterator, _MultiCallMethod, Iterates over the results of a multicall. Exceptions are     raised in response, server -> an object used to boxcar method calls      server should be a ServerPr
+Cohesion: 0.13
+Nodes (13): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), messages(), __refs(), _GLIBCXX_VISIBILITY(), default, namespace, default (+5 more)
 
 ### Community 973 - "Community 973"
-Cohesion: 0.15
+Cohesion: 0.16
 Nodes (6): Internal helper that is the actual signal handler., Remove a handler for a signal.  UNIX only.          Return True if a signal hand, Internal helper to validate a signal.          Raise ValueError if the signal nu, Unix event loop.      Adds signal handling and UNIX Domain Socket support to Sel, Add a handler for a signal.  UNIX only.          Raise ValueError if the signal, _UnixSelectorEventLoop
 
 ### Community 974 - "Community 974"
@@ -6397,8 +6272,8 @@ Cohesion: 0.21
 Nodes (10): __cust(), __cust_access(), default_sentinel(), default_sentinel_t(), __detail(), ranges(), unreachable_sentinel(), _GLIBCXX_BEGIN_NAMESPACE_VERSION (+2 more)
 
 ### Community 979 - "Community 979"
-Cohesion: 0.11
-Nodes (10): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), default, namespace, default, namespace, CodecInfo, Codec details when looking up the codec registry (+2 more)
+Cohesion: 0.15
+Nodes (9): _GLIBCXX_VISIBILITY(), _GLIBCXX_VISIBILITY(), default, namespace, default, namespace, CodecInfo, Codec details when looking up the codec registry (+1 more)
 
 ### Community 980 - "Community 980"
 Cohesion: 0.27
@@ -6425,8 +6300,8 @@ Cohesion: 0.16
 Nodes (12): class, gimple, class, copy_bb_data(), gimple_build_predict(), gimple_predict_outcome(), gimple_predict_predictor(), gimple_predict_set_outcome() (+4 more)
 
 ### Community 986 - "Community 986"
-Cohesion: 0.20
-Nodes (14): class, const_hard_reg_set, HARD_REG_SET, machine_mode, call_clobbered_in_region_p(), clobbers_at_least_part_of_reg_p(), clobbers_full_reg_p(), clobbers_reg_p() (+6 more)
+Cohesion: 0.23
+Nodes (13): find_library(), find_msvcrt(), _findLib_crle(), _findLib_gcc(), _findLib_ld(), _findSoname_ldconfig(), _get_build_version(), _get_soname() (+5 more)
 
 ### Community 987 - "Community 987"
 Cohesion: 0.24
@@ -6477,24 +6352,24 @@ Cohesion: 0.24
 Nodes (4): TestFlutter, TestWeston, GraphicsBase, Return count DRM CRC from the framebuffer. If uniq is True,         only unique
 
 ### Community 999 - "Community 999"
-Cohesion: 0.24
-Nodes (12): _aix_bgt(), _aix_bos_rte(), aix_buildtag(), aix_platform(), _aix_tag(), _aix_vrtl(), Shared AIX support functions., Return a Tuple[str, int] e.g., ['7.1.4.34', 1806]     The fileset bos.rte repres (+4 more)
+Cohesion: 0.20
+Nodes (14): class, const_hard_reg_set, HARD_REG_SET, machine_mode, call_clobbered_in_region_p(), clobbers_at_least_part_of_reg_p(), clobbers_full_reg_p(), clobbers_reg_p() (+6 more)
 
 ### Community 1000 - "Community 1000"
 Cohesion: 0.18
 Nodes (8): _ellipsis_match(), OutputChecker, Create a new test runner.          Optional keyword arg `checker` is the `Output, A class used to check the whether the actual output from a doctest     example m, Convert string to hex-escaped ASCII string., Return True iff the actual output from an example (`got`)         matches the ex, Return a string describing the differences between the         expected output f, Essentially the only subtle case:     >>> _ellipsis_match('aa...aa', 'aaa')
 
 ### Community 1001 - "Community 1001"
-Cohesion: 0.29
-Nodes (11): _(), do_longs(), do_shorts(), getopt(), GetoptError, gnu_getopt(), long_has_args(), Parser for command line options.  This module helps scripts to parse the command (+3 more)
+Cohesion: 0.20
+Nodes (5): Internal: send one line to the server, appending CRLF.         The `line` must b, Internal: send one command to the server (through _putline()).         The `line, Internal: return one line from the server, stripping _CRLF.         Raise EOFErr, Internal: get a response plus following text from the server.         Raise vari, Internal: send a command and get the response plus following text.         Same
 
 ### Community 1002 - "Community 1002"
 Cohesion: 0.21
 Nodes (12): fallback_getpass(), GetPassWarning, getuser(), Utilities to get a password and/or the current user name.  getpass(prompt[, stre, # NOTE: The Python C API calls flockfile() (and unlock) during readline., Get the username from the environment or password database.      First try vario, Prompt for a password, with echo turned off.      Args:       prompt: Written on, Prompt for password with echo off, using Windows getwch(). (+4 more)
 
 ### Community 1003 - "Community 1003"
-Cohesion: 0.04
-Nodes (39): _BaseConstants, _BaseV4, collapse_addresses(), _collapse_addresses_internal(), _count_righthand_zero_bits(), _find_address_range(), ip_network(), _IPv4Constants (+31 more)
+Cohesion: 0.03
+Nodes (39): ip_address(), ip_interface(), IPv4Address, IPv4Interface, IPv6Address, IPv6Interface, Test if the address is reserved for multicast use.          Returns:, Test if the address is reserved for link-local.          Returns:             A (+31 more)
 
 ### Community 1004 - "Community 1004"
 Cohesion: 0.15
@@ -6513,8 +6388,8 @@ Cohesion: 0.12
 Nodes (11): mbox, NoSuchMailboxError, Initialize a MaildirMessage instance., Initialize a _PartialFile., The specified mailbox does not exist and won't be created., Initialize a Maildir instance., Initialize a single-file mailbox., A classic mbox mailbox. (+3 more)
 
 ### Community 1008 - "Community 1008"
-Cohesion: 0.15
-Nodes (17): _GLIBCXX_NOEXCEPT(), _M_construct_node(), _M_copy(), _M_create_node(), _M_destroy_node(), _M_drop_node(), _M_impl(), _M_put_node() (+9 more)
+Cohesion: 0.27
+Nodes (4): _CalendarOffset, Get the information about the current transition - tti, Calculates the datetime of the occurrence from the year, _TZStr
 
 ### Community 1009 - "Community 1009"
 Cohesion: 0.24
@@ -6549,8 +6424,8 @@ Cohesion: 0.18
 Nodes (11): _GLIBCXX_VISIBILITY(), _M_msb(), __max_diff_type(), __max_size_type(), noexcept(), class, default, explicit (+3 more)
 
 ### Community 1017 - "Community 1017"
-Cohesion: 0.12
-Nodes (6): _BaseAddress, get_mixed_type_key(), Return a key suitable for sorting between networks and addresses.      Address a, A generic IP object.      This IP class contains the version independent methods, Returns an IP address as a formatted string.          Supported presentation typ, Network-only key function.          Returns an object that identifies this addre
+Cohesion: 0.13
+Nodes (7): ExtensionFileLoader, Loader for extension modules.      The constructor is designed to work with File, Create an uninitialized extension module, Initialize an extension module, Return True if the extension module is a package., Return None as an extension module cannot create a code object., Return None as extension modules have no source code.
 
 ### Community 1018 - "Community 1018"
 Cohesion: 0.26
@@ -6561,12 +6436,12 @@ Cohesion: 0.20
 Nodes (6): assoc_laguerre(), assoc_laguerref(), assoc_legendre(), _GLIBCXX_BEGIN_NAMESPACE_VERSION, _Tp, typename
 
 ### Community 1020 - "Community 1020"
-Cohesion: 0.21
+Cohesion: 0.14
 Nodes (4): _empty_line_or_comment(), HashNumberOfFields, HashSpaces, HashType
 
 ### Community 1021 - "Community 1021"
-Cohesion: 0.32
-Nodes (10): all_symbols_from(), handle_config_choice(), handle_config_helper(), handle_default(), handle_definition(), handle_line(), handle_note(), handle_select() (+2 more)
+Cohesion: 0.25
+Nodes (4): l(ist) [first[, last] | .]          List source code for the current file.  With, ll | longlist          List the whole source code for the current function or fr, source expression          Try to get source code for the given object and displ, Print a range of lines.
 
 ### Community 1022 - "Community 1022"
 Cohesion: 0.29
@@ -6585,8 +6460,8 @@ Cohesion: 0.36
 Nodes (11): __m128i, __m256i, __mmask8, _mm256_mask_madd52hi_epu64(), _mm256_mask_madd52lo_epu64(), _mm256_maskz_madd52hi_epu64(), _mm256_maskz_madd52lo_epu64(), _mm_mask_madd52hi_epu64() (+3 more)
 
 ### Community 1026 - "Community 1026"
-Cohesion: 0.18
-Nodes (8): gzip_decode(), gzip encoded data -> unencoded data      Decode data using the gzip content enco, DocXMLRPCRequestHandler, Simple XML-RPC request handler class.      Handles all HTTP POST requests and at, Handles the HTTP POST request.          Attempts to interpret all HTTP POST requ, Selectively log an accepted request., XML-RPC and documentation request handler class.      Handles all HTTP POST requ, SimpleXMLRPCRequestHandler
+Cohesion: 0.16
+Nodes (10): gzip_decode(), gzip_encode(), data -> gzip encoded data      Encode data using the gzip content encoding as de, gzip encoded data -> unencoded data      Decode data using the gzip content enco, DocXMLRPCRequestHandler, Simple XML-RPC request handler class.      Handles all HTTP POST requests and at, Handles the HTTP POST request.          Attempts to interpret all HTTP POST requ, Selectively log an accepted request. (+2 more)
 
 ### Community 1027 - "Community 1027"
 Cohesion: 0.27
@@ -6597,8 +6472,8 @@ Cohesion: 0.32
 Nodes (6): false_type, leaf_pointer, node_pointer, true_type, _CIter, m_p_nd
 
 ### Community 1029 - "Community 1029"
-Cohesion: 0.18
-Nodes (10): metadata_type, node_type, _Head, m_p_max, m_p_min, _Metadata, m_metadata, _Node_base (+2 more)
+Cohesion: 0.25
+Nodes (14): const_iterator, const_reference, false_type, key_const_reference, true_type, _ATraits(), cmp_keys(), cmp_prefixes() (+6 more)
 
 ### Community 1030 - "Community 1030"
 Cohesion: 0.26
@@ -6613,8 +6488,8 @@ Cohesion: 0.26
 Nodes (11): It, other, PB_DS_CLASS_C_DEC, PB_DS_CLASS_T_DEC, r_cmp_fn, r_node_update, base_type(), copy_from_range() (+3 more)
 
 ### Community 1033 - "Community 1033"
-Cohesion: 0.08
-Nodes (16): class, namespace, class, namespace, namespace, class, namespace, StackFrame() (+8 more)
+Cohesion: 0.13
+Nodes (14): pairing_heap, back_join, erase, forward_join, join, join_node_children, modify, pop (+6 more)
 
 ### Community 1034 - "Community 1034"
 Cohesion: 0.26
@@ -6961,12 +6836,12 @@ Cohesion: 0.20
 Nodes (6): find_function(), Helper function for break/clear parsing -- may be overridden.          lookupmod, b(reak) [ ([filename:]lineno | function) [, condition] ]          Without argume, Produce a reasonable default., tbreak [ ([filename:]lineno | function) [, condition] ]          Same arguments, Check whether specified line seems to be executable.          Return `lineno` if
 
 ### Community 1120 - "Community 1120"
-Cohesion: 0.27
-Nodes (10): _enum_to_int(), getsignal(), _int_to_enum(), pthread_sigmask(), Convert a possible numeric value to an IntEnum member.     If it's not a known m, Convert an IntEnum member to a numeric value.     If it's not an IntEnum member, signal(), sigpending() (+2 more)
+Cohesion: 0.15
+Nodes (6): EncodedFile(), iterdecode(), Decoding iterator.      Decodes the input strings from the iterator using an Inc, StreamRecoder instances translate data from one encoding to another.          Th, Return a wrapped version of file which provides transparent         encoding tra, StreamRecoder
 
 ### Community 1121 - "Community 1121"
-Cohesion: 0.23
-Nodes (5): _NoThreads, Joinable list of all non-daemon threads., Degenerate version of _Threads., Start a new thread to process the request., _Threads
+Cohesion: 0.27
+Nodes (3): Joinable list of all non-daemon threads., Start a new thread to process the request., _Threads
 
 ### Community 1122 - "Community 1122"
 Cohesion: 0.17
@@ -6985,8 +6860,8 @@ Cohesion: 0.30
 Nodes (11): _copy_archive(), create_archive(), get_interpreter(), main(), _maybe_open(), Run the zipapp command line interface.      The ARGS parameter lets you specify, Write a shebang line., Copy an application archive, modifying the shebang line. (+3 more)
 
 ### Community 1126 - "Community 1126"
-Cohesion: 0.12
-Nodes (17): RuntimeWarning, load_data(), load_tzdata(), Exception raised when a ZoneInfo key is not found., _TZifHeader, ZoneInfoNotFoundError, __getattr__(), available_timezones() (+9 more)
+Cohesion: 0.23
+Nodes (11): RuntimeWarning, available_timezones(), find_tzfile(), _get_invalid_paths_message(), InvalidTZPathWarning, _parse_python_tzpath(), Returns a set containing all available time zones.      .. caution::          Th, Warning raised if an invalid path is specified in PYTHONTZPATH. (+3 more)
 
 ### Community 1127 - "Community 1127"
 Cohesion: 0.13
@@ -6997,16 +6872,16 @@ Cohesion: 0.21
 Nodes (11): _err_text(), str, Regression tests for set_cwd (vikunja #249, fix #7).  The bug: `set_cwd` checked, Non-existent path must produce a canonicalize/resolve error,     not a 'not a di, When set_cwd is given a path to a regular file, the error must     reference the, When set_cwd is given a symlink pointing at a file, the error must     reference, Sanity check: setting cwd to a real subdirectory should succeed     and report t, test_set_cwd_missing_path_returns_canonicalize_error() (+3 more)
 
 ### Community 1130 - "Community 1130"
-Cohesion: 0.23
-Nodes (8): Bind fun to key-release event of key.          Arguments:         fun -- a funct, Disc, hanoi(), main(), play(), Hanoi tower, a subclass of built-in type list, create an empty tower. x is x-position of peg, Tower
+Cohesion: 0.27
+Nodes (7): Disc, hanoi(), main(), play(), Hanoi tower, a subclass of built-in type list, create an empty tower. x is x-position of peg, Tower
 
 ### Community 1131 - "Community 1131"
 Cohesion: 0.24
 Nodes (9): ATTRIBUTE_RETURNS_NONNULL, class, class, get_global_range_query(), get_range_query(), global_range_query(), range_query(), value_query() (+1 more)
 
 ### Community 1132 - "Community 1132"
-Cohesion: 0.29
-Nodes (10): BasicCrossThreadPersistent, Clear(), cppgc(), Get(), GetFromGC(), loc(), Release(), subtle() (+2 more)
+Cohesion: 0.08
+Nodes (11): FastChildWatcher, Fast' child watcher implementation.      This implementation reaps every termina, waitstatus_to_exitcode(), Registers an arbitrary callback and arguments.          Cannot suppress exceptio, Like ntransfercmd() but returns only the socket., Retrieve data in line mode.  A new port is created for you.          Args:, Store a file in binary mode.  A new port is created for you.          Args:, Store a file in line mode.  A new port is created for you.          Args: (+3 more)
 
 ### Community 1133 - "Community 1133"
 Cohesion: 0.31
@@ -7017,8 +6892,8 @@ Cohesion: 0.24
 Nodes (7): binary_heap_point_const_iterator_, m_p_e, const_pointer, const_reference, entry_pointer, false_type, true_type
 
 ### Community 1135 - "Community 1135"
-Cohesion: 0.27
-Nodes (10): BlockingType, namespace, virtual, CreateBlockingScope(), CurrentClockTimeMilliseconds(), CurrentClockTimeMillisecondsHighResolution(), DumpWithoutCrashing(), GetHighAllocationThroughputObserver() (+2 more)
+Cohesion: 0.25
+Nodes (6): NNTPReplyError, _parse_datetime(), Unexpected [123]xx reply, Parse a pair of (date, time) strings, and return a datetime object.     If only, Process a GROUP command.  Argument:         - group: the group name         Retu, Process the DATE command.         Returns:         - resp: server response if su
 
 ### Community 1136 - "Community 1136"
 Cohesion: 0.18
@@ -7036,9 +6911,13 @@ Nodes (5): TestSELinuxCustomGit, TestSELinuxExtraModules, TestSELinuxExtraModule
 Cohesion: 0.33
 Nodes (9): _PyObject_CallMethodIdNoArgs(), _PyObject_CallMethodIdOneArg(), PyObject_CallMethodNoArgs(), PyObject_CallMethodOneArg(), _PyObject_VectorcallMethodId(), _PyVectorcall_NARGS(), Py_ssize_t, PyObject (+1 more)
 
+### Community 1140 - "Community 1140"
+Cohesion: 0.19
+Nodes (10): class, namespace, AllocationProfile(), CpuProfiler(), CpuProfilingOptions(), EmbedderGraph(), HeapGraphEdge(), ObjectNameResolver() (+2 more)
+
 ### Community 1141 - "Community 1141"
-Cohesion: 0.27
-Nodes (15): LINEMAPS_ALLOCATED(), LINEMAPS_CACHE(), LINEMAPS_LAST_ALLOCATED_MACRO_MAP(), LINEMAPS_LAST_ALLOCATED_MAP(), LINEMAPS_LAST_MAP(), LINEMAPS_MACRO_ALLOCATED(), LINEMAPS_MACRO_CACHE(), LINEMAPS_MACRO_MAP_AT() (+7 more)
+Cohesion: 0.29
+Nodes (5): _parse_overview(), Parse the response to an OVER or XOVER command according to the     overview for, Internal: get the overview format. Queries the server if not         already don, Process an XOVER command (optional server extension) Arguments:         - start:, Process an OVER command.  If the command isn't supported, fall         back to X
 
 ### Community 1142 - "Community 1142"
 Cohesion: 0.22
@@ -7069,8 +6948,8 @@ Cohesion: 0.33
 Nodes (10): V, fibonacci_node_t, decrease_key(), get_data(), get_key(), insert_before(), min(), replace_data() (+2 more)
 
 ### Community 1149 - "Community 1149"
-Cohesion: 0.08
-Nodes (36): gswitch, gassign, get_gimple_rhs_class(), gimple_assign_cast_p(), gimple_assign_lhs(), gimple_assign_lhs_ptr(), gimple_assign_load_p(), gimple_assign_nontemporal_move_p() (+28 more)
+Cohesion: 0.18
+Nodes (9): Move the turtle forward by the specified distance.          Aliases: forward | f, Turn turtle right by angle units.          Aliases: right | rt          Argument, Turn turtle left by angle units.          Aliases: left | lt          Argument:, draw(), main(), replace(), main(), main() (+1 more)
 
 ### Community 1150 - "Community 1150"
 Cohesion: 0.38
@@ -7081,12 +6960,12 @@ Cohesion: 0.25
 Nodes (10): class, explicit, namespace, cppgc(), DisabledCheckingPolicy(), IgnoreLocationPolicy(), KeepLocationPolicy(), SameThreadEnabledCheckingPolicy() (+2 more)
 
 ### Community 1152 - "Community 1152"
-Cohesion: 0.25
-Nodes (9): namespace, V8_INLINE, v8(), IsNull(), QuickIsFalse(), QuickIsNull(), QuickIsString(), QuickIsTrue() (+1 more)
+Cohesion: 0.19
+Nodes (4): HTTPPasswordMgr, HTTPPasswordMgrWithPriorAuth, Accept authority or URI and extract only the authority and path., Check if test is below base in a URI tree          Both args must be URIs in red
 
 ### Community 1153 - "Community 1153"
-Cohesion: 0.06
-Nodes (18): EWWhiteSpaceTerminal, _fold_as_ew(), get_unstructured(), InvalidMessageID, make_quoted_pairs(), MessageID, MsgID, parse_message_id() (+10 more)
+Cohesion: 0.12
+Nodes (3): EWWhiteSpaceTerminal, Terminal, WhiteSpaceTerminal
 
 ### Community 1154 - "Community 1154"
 Cohesion: 0.25
@@ -7105,8 +6984,8 @@ Cohesion: 0.22
 Nodes (6): Codec, IncrementalDecoder, IncrementalEncoder, Python 'unicode-escape' Codec   Written by Marc-Andre Lemburg (mal@lemburg.com)., StreamReader, StreamWriter
 
 ### Community 1160 - "Community 1160"
-Cohesion: 0.27
-Nodes (14): apply_reroot(), apply_reroot_repoints_workspace_cwd_and_index(), dispatch_tool_inner(), dispatch_tool_inner_stashes_meta_on_session(), dispatch_tool_threads_meta_through_session_and_resets_after(), extract_result_text(), Self, session_stats_history_scope_filters_by_external_session_id() (+6 more)
+Cohesion: 0.23
+Nodes (22): CallToolError, CallToolRequestParams, CallToolResult, dispatch_tool(), dispatch_tool_inner(), dispatch_tool_inner_stashes_meta_on_session(), dispatch_tool_threads_meta_through_session_and_resets_after(), err_text() (+14 more)
 
 ### Community 1161 - "Community 1161"
 Cohesion: 0.31
@@ -7117,8 +6996,8 @@ Cohesion: 0.31
 Nodes (9): logic_error, container_error, insert_error, join_error, resize_error, __throw_container_error(), __throw_insert_error(), __throw_join_error() (+1 more)
 
 ### Community 1163 - "Community 1163"
-Cohesion: 0.19
-Nodes (4): HTTPPasswordMgr, HTTPPasswordMgrWithPriorAuth, Accept authority or URI and extract only the authority and path., Check if test is below base in a URI tree          Both args must be URIs in red
+Cohesion: 0.29
+Nodes (4): access_streambuf_ptrs(), Access the streambuf put area pointers., Print a std::basic_stringbuf., StdStringBufPrinter
 
 ### Community 1167 - "Community 1167"
 Cohesion: 0.24
@@ -7132,21 +7011,13 @@ Nodes (6): Driver, Parse a string and return the syntax tree., Parse a series of
 Cohesion: 0.38
 Nodes (8): descriptor_round_trip(), GenericCliPlugin, make_descriptor(), new_stores_descriptor(), no_quickfixes_by_default(), Self, ToolDescriptor, ToolPlugin
 
-### Community 1170 - "Community 1170"
-Cohesion: 0.18
-Nodes (14): cpp_hashnode, location_t, IS_ADHOC_LOC(), IS_ORDINARY_LOC(), LINEMAPS_LAST_MACRO_MAP(), LINEMAPS_MACRO_LOWEST_LOCATION(), LINEMAPS_MACRO_MAPS(), LINEMAPS_MACRO_USED() (+6 more)
-
 ### Community 1172 - "Community 1172"
 Cohesion: 0.22
 Nodes (10): bar(), BdbQuit, checkfuncname(), effective(), foo(), Exception to give up completely., Start debugging with a Bdb instance from the caller's frame., Return True if break should happen here.      Whether a break should happen depe (+2 more)
 
 ### Community 1173 - "Community 1173"
-Cohesion: 0.25
-Nodes (10): _compile_pattern(), filter(), fnmatch(), fnmatchcase(), Filename matching with shell patterns.  fnmatch(FILENAME, PATTERN) matches accor, Test whether FILENAME matches PATTERN.      Patterns are Unix shell style:, Construct a list from those elements of the iterable NAMES that match PAT., Test whether FILENAME matches PATTERN, including case.      This is a version of (+2 more)
-
-### Community 1174 - "Community 1174"
-Cohesion: 0.14
-Nodes (10): compress(), decompress(), open(), Interface to the liblzma compression library.  This module provides a class for, Flush and close the file.          May be called more than once without error. O, Write a bytes object to the file.          Returns the number of uncompressed by, Open an LZMA-compressed file in binary or text mode.      filename can be either, Compress a block of data.      Refer to LZMACompressor's docstring for a descrip (+2 more)
+Cohesion: 0.15
+Nodes (3): escape(), Marshaller, Generate an XML-RPC params chunk from a Python data structure.      Create a Mar
 
 ### Community 1175 - "Community 1175"
 Cohesion: 0.21
@@ -7251,8 +7122,8 @@ Cohesion: 0.51
 Nodes (9): T, U, as_a(), cast(), dyn_cast(), is_a(), safe_as_a(), safe_dyn_cast() (+1 more)
 
 ### Community 1201 - "Community 1201"
-Cohesion: 0.16
-Nodes (8): _ContextManager, localcontext(), Set this thread's context to context., Return a context manager for a copy of the supplied context      Uses a copy of, Context manager class to support localcontext().        Sets a copy of the suppl, Reset all flags to zero, Returns a deep copy from self., setcontext()
+Cohesion: 0.18
+Nodes (13): constexpr(), __convert_x86(), else, _To, _V, __i16_to_i32, _mm256_set1_epi32(), _mm_slli_si128() (+5 more)
 
 ### Community 1202 - "Community 1202"
 Cohesion: 0.33
@@ -7347,8 +7218,8 @@ Cohesion: 0.22
 Nodes (6): FileCookieJar, CookieJar that can be loaded from and saved to a file., Cookies are NOT loaded from the named file until either the .load() or         ., Save cookies to a file., Load cookies from a file., Clear all cookies and reload cookies from a saved file.          Raises LoadErro
 
 ### Community 1226 - "Community 1226"
-Cohesion: 0.27
-Nodes (10): _MM_GET_EXCEPTION_MASK(), _MM_GET_EXCEPTION_STATE(), _MM_GET_FLUSH_ZERO_MODE(), _MM_GET_ROUNDING_MODE(), _mm_getcsr(), _MM_SET_EXCEPTION_MASK(), _MM_SET_EXCEPTION_STATE(), _MM_SET_FLUSH_ZERO_MODE() (+2 more)
+Cohesion: 0.37
+Nodes (13): key_const_reference, node_pointer, PB_DS_CLASS_C_DEC, PB_DS_CLASS_T_DEC, size_type, black_height(), join(), join_imp() (+5 more)
 
 ### Community 1227 - "Community 1227"
 Cohesion: 0.33
@@ -7399,8 +7270,8 @@ Cohesion: 0.22
 Nodes (3): Close I/O established in "open"., Close I/O established in "open"., Close currently selected mailbox.          Deleted messages are removed from wri
 
 ### Community 1241 - "Community 1241"
-Cohesion: 0.22
-Nodes (9): FrameInfo, getinnerframes(), getouterframes(), Get a list of records for a frame and all higher (calling) frames.      Each rec, Get a list of records for a traceback's frame and all lower frames.      Each re, Return a list of records for the stack above the caller's frame., Return a list of records for the stack below the current exception., stack() (+1 more)
+Cohesion: 0.17
+Nodes (10): T, dataclass_transform(), _IdentityCallable, An ABC with one abstract method __abs__ that is covariant in its return type., An ABC with one abstract method __round__ that is covariant in its return type., Ask a static type checker to reveal the inferred type of an expression.      Whe, Decorator to mark an object as providing dataclass-like behaviour.      The deco, reveal_type() (+2 more)
 
 ### Community 1242 - "Community 1242"
 Cohesion: 0.27
@@ -7423,12 +7294,12 @@ Cohesion: 0.20
 Nodes (9): description, name, packages, repository, source, url, $schema, title (+1 more)
 
 ### Community 1247 - "Community 1247"
-Cohesion: 0.18
-Nodes (11): comp(), _GLIBCXX_VISIBILITY(), push(), swap(), __x(), default, explicit, namespace (+3 more)
+Cohesion: 0.21
+Nodes (13): _mm512_abs_pd(), _mm512_and_epi64(), _mm512_mask_abs_pd(), _mm512_mask_and_epi64(), _mm512_mask_mov_epi64(), _mm512_mask_mullox_epi64(), _mm512_mask_reduce_and_epi64(), _mm512_mask_reduce_max_epi64() (+5 more)
 
 ### Community 1248 - "Community 1248"
-Cohesion: 0.17
-Nodes (10): T, dataclass_transform(), _IdentityCallable, An ABC with one abstract method __abs__ that is covariant in its return type., An ABC with one abstract method __round__ that is covariant in its return type., Ask a static type checker to reveal the inferred type of an expression.      Whe, Decorator to mark an object as providing dataclass-like behaviour.      The deco, reveal_type() (+2 more)
+Cohesion: 0.40
+Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
 
 ### Community 1249 - "Community 1249"
 Cohesion: 0.20
@@ -7474,10 +7345,6 @@ Nodes (8): fix(), insert_node(), modify(), push(), const_reference, node_pointer
 ### Community 1259 - "Community 1259"
 Cohesion: 0.25
 Nodes (6): _GLIBCXX_VISIBILITY(), hash(), __hash_combine(), default, namespace, _Tp
-
-### Community 1260 - "Community 1260"
-Cohesion: 0.24
-Nodes (10): end_turn_with_text(), MockProvider, PanicProvider, CompleteOpts, Context, LlmProvider, LlmResponse, Mutex (+2 more)
 
 ### Community 1261 - "Community 1261"
 Cohesion: 0.25
@@ -7556,8 +7423,8 @@ Cohesion: 0.39
 Nodes (8): __m128i, _mm_aesdec_si128(), _mm_aesdeclast_si128(), _mm_aesenc_si128(), _mm_aesenclast_si128(), _mm_aesimc_si128(), _mm_aeskeygenassist_si128(), _mm_clmulepi64_si128()
 
 ### Community 1281 - "Community 1281"
-Cohesion: 0.31
-Nodes (7): class, class, block_range_cache(), ranger_cache(), ssa_global_cache(), gimple_infer_range(), infer_range_manager()
+Cohesion: 0.32
+Nodes (10): all_symbols_from(), handle_config_choice(), handle_config_helper(), handle_default(), handle_definition(), handle_line(), handle_note(), handle_select() (+2 more)
 
 ### Community 1282 - "Community 1282"
 Cohesion: 0.36
@@ -7568,8 +7435,8 @@ Cohesion: 0.36
 Nodes (8): class, tree, aff_comb_elt(), aff_combination_const_p(), aff_combination_singleton_var_p(), aff_combination_type(), aff_combination_zero_p(), aff_tree()
 
 ### Community 1284 - "Community 1284"
-Cohesion: 0.33
-Nodes (4): compare_type, hashval_t, value_type, tree_operand_hash()
+Cohesion: 0.22
+Nodes (7): hashval_t, compare_type, hashval_t, value_type, tree_operand_hash(), iterative_hash_expr(), struct_ptr_hash()
 
 ### Community 1285 - "Community 1285"
 Cohesion: 0.25
@@ -7628,12 +7495,8 @@ Cohesion: 0.33
 Nodes (3): SSHTestBase, TestSCP, TestSFTP
 
 ### Community 1298 - "Community 1298"
-Cohesion: 0.28
-Nodes (8): body_encode(), decode(), header_encode(), header_length(), Return the length of s when it is encoded with base64., Encode a single header line with Base64 encoding in a given charset.      charse, r"""Encode a string with base64.      Each line will be wrapped at, at most, max, Decode a raw base64 string, returning a bytes object.      This function does no
-
-### Community 1299 - "Community 1299"
-Cohesion: 0.20
-Nodes (5): CFWSList, Comment, _fold_mime_parameters(), Fold TokenList 'part' into the 'lines' list as mime parameters.      Using the d, WhiteSpaceTokenList
+Cohesion: 0.24
+Nodes (11): const_tree, poly_uint64, tree, wide_int, TYPE_VECTOR_SUBPARTS(), allow_steps_p(), nelts_of(), nelts_per_pattern_of() (+3 more)
 
 ### Community 1300 - "Community 1300"
 Cohesion: 0.28
@@ -7716,16 +7579,16 @@ Cohesion: 0.20
 Nodes (11): ContentBlock, AnthropicBlock, AnthropicResponseBlock, AnthropicTool, CacheControl, content_block_to_anthropic(), max_input_tokens_from_model(), message_to_anthropic() (+3 more)
 
 ### Community 1322 - "Community 1322"
-Cohesion: 0.26
-Nodes (12): _Base_ptr, _Rb_tree_const_iterator(), _Rb_tree_iterator(), _S_key(), _S_left(), _S_maximum(), _S_minimum(), _S_right() (+4 more)
+Cohesion: 0.24
+Nodes (11): const_reference, entry_pointer, false_type, Metadata, null_type, PB_DS_CLASS_T_DEC, true_type, type_to_type (+3 more)
 
 ### Community 1323 - "Community 1323"
-Cohesion: 0.16
-Nodes (4): BufferedIncrementalEncoder, Return the next decoded line from the input stream., Return the next decoded line from the input stream., Return the next decoded line from the input stream.
+Cohesion: 0.17
+Nodes (8): class, namespace, namespace, BackupIncumbentScope(), DeepFreezeDelegate(), v8(), v8(), V8_NODISCARD
 
 ### Community 1324 - "Community 1324"
-Cohesion: 0.38
-Nodes (10): class, machine_mode, rtx, create_address_operand(), create_convert_operand_from(), create_convert_operand_to(), create_fixed_operand(), create_input_operand() (+2 more)
+Cohesion: 0.07
+Nodes (18): Meta path finder for modules declared in the Windows registry., WindowsRegistryFinder, ModuleSpec, The specification for a module, used for loading.      A module's spec is the so, The name of the module's parent., all_suffixes(), The machinery of importlib: finders, loaders, hooks, etc., Returns a list of all recognized module suffixes for this process (+10 more)
 
 ### Community 1325 - "Community 1325"
 Cohesion: 0.25
@@ -7740,16 +7603,16 @@ Cohesion: 0.31
 Nodes (8): file_digest(), __get_builtin_constructor(), __get_openssl_constructor(), __hash_new(), __py_new(), new(name, data=b'', **kwargs) - Return a new hashing object using the     named, new(name, data=b'') - Return a new hashing object using the named algorithm;, Hash the contents of a file-like object. Returns a digest object.      *fileobj*
 
 ### Community 1328 - "Community 1328"
-Cohesion: 0.20
-Nodes (10): _has_code_flag(), _has_coroutine_mark(), isasyncgenfunction(), iscoroutinefunction(), isgeneratorfunction(), Return true if the object is a user-defined function.      Function objects prov, Return true if ``f`` is a function (or a method or functools.partial     wrapper, Return true if the object is a user-defined generator function.      Generator f (+2 more)
+Cohesion: 0.09
+Nodes (12): _NamespacePath, PathFinder, Represents a namespace package's path.  It uses the module name     to find its, Returns a tuple of (parent-module-name, parent-path-attr-name), Meta path finder for sys.path and package __path__ attributes., Call the invalidate_caches() method on all path entry finders         stored in, Search sys.path_hooks for a finder for 'path'., Get the finder for the path entry from sys.path_importer_cache.          If the (+4 more)
 
 ### Community 1329 - "Community 1329"
 Cohesion: 0.17
 Nodes (12): size_type, hash_exponential_size_policy, get_nearest_larger_size, get_nearest_smaller_size, m_grow_factor, m_start_size, swap, hash_prime_size_policy (+4 more)
 
 ### Community 1330 - "Community 1330"
-Cohesion: 0.20
-Nodes (5): _BlockingOnManager, A context manager responsible to updating ``_blocking_on``., Mark the running thread as waiting for self.lock. via _blocking_on., Remove self.lock from this thread's _blocking_on list., _WeakValueDictionary
+Cohesion: 0.17
+Nodes (12): Biasing the model toward daimonos in the Desktop app, code:bash (xattr -dr com.apple.quarantine /usr/local/bin/daimonos), code:bash (claude mcp add-from-claude-desktop), code:bash (claude mcp add daimonos -s user -- /usr/local/bin/daimonos -), code:bash (cd /path/to/project), code:markdown (# Tool preferences), Desktop workflow, Importing from the old Claude Desktop chat app (+4 more)
 
 ### Community 1331 - "Community 1331"
 Cohesion: 0.22
@@ -7844,8 +7707,8 @@ Cohesion: 0.43
 Nodes (7): clear(), erase(), pop(), remove_parentless_node(), node_pointer, PB_DS_CLASS_T_DEC, point_iterator
 
 ### Community 1356 - "Community 1356"
-Cohesion: 0.18
-Nodes (6): ConfigParser, Raises a TypeError for non-string values.          The only legal non-string val, ConfigParser implementing interpolation., Set an option.  Extends RawConfigParser.set by validating type and         inter, Create a new section in the configuration.  Extends         RawConfigParser.add_, Read configuration from a dictionary.          Keys are section names, values ar
+Cohesion: 0.15
+Nodes (5): addbase, addinfo, Response classes used by urllib.  The base class, addbase, defines a minimal fil, Base class for addinfo and addclosehook. Is a good idea for garbage collection., class to add an info() method to an open file.
 
 ### Community 1357 - "Community 1357"
 Cohesion: 0.36
@@ -7888,16 +7751,16 @@ Cohesion: 0.25
 Nodes (8): __m256, __m256d, __m256i, _mm256_cmov_si256(), _mm256_frcz_pd(), _mm256_frcz_ps(), _mm256_permute2_pd(), _mm256_permute2_ps()
 
 ### Community 1367 - "Community 1367"
-Cohesion: 0.39
-Nodes (7): class, binary_op_rich_location(), gcc_rich_location(), maybe_range_label_for_tree_type_mismatch(), range_label_for_type_mismatch(), text_range_label(), rich_location()
+Cohesion: 0.18
+Nodes (12): atof(), atoi(), delocalize(), _format(), format_string(), Formats a string in the same way that the % formatting would use,     but takes, Convert float to string, taking the locale into account., Parses a string as a normalized number according to the locale settings. (+4 more)
 
 ### Community 1368 - "Community 1368"
 Cohesion: 0.29
 Nodes (7): class, code_helper, tree, gimple_match_cond, any_else(), gimple_match_op(), gimple_simplified_result_is_gimple_val()
 
 ### Community 1369 - "Community 1369"
-Cohesion: 0.18
-Nodes (12): atof(), atoi(), delocalize(), _format(), format_string(), Formats a string in the same way that the % formatting would use,     but takes, Convert float to string, taking the locale into account., Parses a string as a normalized number according to the locale settings. (+4 more)
+Cohesion: 0.17
+Nodes (8): An ABC with one abstract method __int__., An ABC with one abstract method __float__., An ABC with one abstract method __bytes__., An ABC with one abstract method __index__., SupportsBytes, SupportsFloat, SupportsIndex, SupportsInt
 
 ### Community 1370 - "Community 1370"
 Cohesion: 0.36
@@ -8016,8 +7879,8 @@ Cohesion: 0.33
 Nodes (4): container_base_dispatch<_Tv, Cmp_Fn, _Alloc, Tag>::type, cmp_fn, It, priority_queue
 
 ### Community 1406 - "Community 1406"
-Cohesion: 0.17
-Nodes (6): dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class, dummy method - to be overwritten by child class
+Cohesion: 0.50
+Nodes (4): _Hashtable(), noexcept, std, true_type
 
 ### Community 1407 - "Community 1407"
 Cohesion: 0.29
@@ -8125,7 +7988,7 @@ Nodes (6): default, namespace, std, _GLIBCXX_VISIBILITY(), _S_chk(), _TRet
 
 ### Community 1433 - "Community 1433"
 Cohesion: 0.29
-Nodes (6): explicit, namespace, __end, __generic_find_selector(), __gnu_parallel(), _M_end()
+Nodes (10): BasicCrossThreadPersistent, Clear(), cppgc(), Get(), GetFromGC(), loc(), Release(), subtle() (+2 more)
 
 ### Community 1434 - "Community 1434"
 Cohesion: 0.29
@@ -8136,8 +7999,8 @@ Cohesion: 0.43
 Nodes (5): __u32, tipc_addr(), tipc_cluster(), tipc_node(), tipc_zone()
 
 ### Community 1436 - "Community 1436"
-Cohesion: 0.11
-Nodes (5): AddrSpec, AngleAddr, BareQuotedString, quote_string(), QuotedString
+Cohesion: 0.06
+Nodes (15): AddrSpec, AngleAddr, CFWSList, Comment, _fold_as_ew(), _fold_mime_parameters(), make_quoted_pairs(), quote_string() (+7 more)
 
 ### Community 1437 - "Community 1437"
 Cohesion: 0.43
@@ -8236,8 +8099,8 @@ Cohesion: 0.43
 Nodes (6): Codec, getregentry(), IncrementalDecoder, IncrementalEncoder, StreamReader, StreamWriter
 
 ### Community 1461 - "Community 1461"
-Cohesion: 0.17
-Nodes (8): An ABC with one abstract method __int__., An ABC with one abstract method __float__., An ABC with one abstract method __bytes__., An ABC with one abstract method __index__., SupportsBytes, SupportsFloat, SupportsIndex, SupportsInt
+Cohesion: 0.67
+Nodes (4): shift_left(), shift_right(), _ForwardIterator, typename
 
 ### Community 1466 - "Community 1466"
 Cohesion: 0.52
@@ -8276,8 +8139,8 @@ Cohesion: 0.29
 Nodes (6): PB_DS_BRANCH_POLICY_BASE, tree_order_statistics_node_update, find_by_order, node_begin, node_end, order_of_key
 
 ### Community 1478 - "Community 1478"
-Cohesion: 0.20
-Nodes (3): _get_compressor(), LZMACompressor, _ZipWriteFile
+Cohesion: 0.09
+Nodes (12): compress(), decompress(), open(), Interface to the liblzma compression library.  This module provides a class for, Open an LZMA-compressed file in binary or text mode.      filename can be either, Compress a block of data.      Refer to LZMACompressor's docstring for a descrip, Decompress a block of data.      Refer to LZMADecompressor's docstring for a des, Open an LZMA-compressed file in binary mode.          filename can be either an (+4 more)
 
 ### Community 1479 - "Community 1479"
 Cohesion: 0.29
@@ -8288,8 +8151,8 @@ Cohesion: 0.29
 Nodes (4): Help message formatter which retains any formatting in descriptions.      Only t, Help message formatter which retains formatting of all help text.      Only the, RawDescriptionHelpFormatter, RawTextHelpFormatter
 
 ### Community 1481 - "Community 1481"
-Cohesion: 0.29
-Nodes (8): classify_class_attrs(), _getmembers(), getmembers_static(), getmro(), Return all members of an object as (name, value) pairs sorted by name.     Optio, Return all members of an object as (name, value) pairs sorted by name     withou, Return list of attribute-descriptor tuples.      For each name in dir(cls), the, Return tuple of base classes (including cls) in method resolution order.
+Cohesion: 0.20
+Nodes (10): classify_class_attrs(), _getmembers(), getmembers_static(), getmro(), Return all members of an object as (name, value) pairs sorted by name.     Optio, Return all members of an object as (name, value) pairs sorted by name     withou, Return list of attribute-descriptor tuples.      For each name in dir(cls), the, Return tuple of base classes (including cls) in method resolution order. (+2 more)
 
 ### Community 1482 - "Community 1482"
 Cohesion: 0.29
@@ -8304,8 +8167,8 @@ Cohesion: 0.29
 Nodes (3): TestExternalToolchainArmAarch64, TestExternalToolchainArmAarch64Be, TestExternalToolchainArmArm
 
 ### Community 1486 - "Community 1486"
-Cohesion: 0.29
-Nodes (4): access_streambuf_ptrs(), Access the streambuf put area pointers., Print a std::basic_stringbuf., StdStringBufPrinter
+Cohesion: 0.18
+Nodes (11): __first(), operator(), _S_first_elem(), _Sp_ebo_helper(), __tp(), explicit, _Iter, pointer (+3 more)
 
 ### Community 1488 - "Community 1488"
 Cohesion: 0.33
@@ -8349,7 +8212,7 @@ Nodes (5): __wl(), _GLIBCXX_VISIBILITY(), default, namespace, _M_param
 
 ### Community 1498 - "Community 1498"
 Cohesion: 0.27
-Nodes (11): basic_block, gen_rtx_fmt_uuB00is_stat(), gen_rtx_fmt_uuBe0000_stat(), gen_rtx_fmt_uuBeiie0_stat(), gen_rtx_fmt_uuBeiie_stat(), gen_rtx_fmt_uuBeiiee_stat(), init_rtx_fmt_uuB00is(), init_rtx_fmt_uuBe0000() (+3 more)
+Nodes (11): _GLIBCXX_NOEXCEPT(), _M_construct_node(), _M_create_node(), _M_destroy_node(), _M_drop_node(), _M_put_node(), _M_valptr(), pointer (+3 more)
 
 ### Community 1499 - "Community 1499"
 Cohesion: 0.33
@@ -8429,8 +8292,8 @@ Cohesion: 0.53
 Nodes (5): tree, convert_to_complex_nofold(), convert_to_integer_nofold(), convert_to_pointer_nofold(), convert_to_real_nofold()
 
 ### Community 1519 - "Community 1519"
-Cohesion: 0.47
-Nodes (5): class, tree, gori_compute(), gori_export_iterator(), range_def_chain()
+Cohesion: 0.27
+Nodes (10): BlockingType, namespace, virtual, CreateBlockingScope(), CurrentClockTimeMilliseconds(), CurrentClockTimeMillisecondsHighResolution(), DumpWithoutCrashing(), GetHighAllocationThroughputObserver() (+2 more)
 
 ### Community 1520 - "Community 1520"
 Cohesion: 0.33
@@ -8440,17 +8303,9 @@ Nodes (4): namespace, class, json(), optrecord_json_writer()
 Cohesion: 0.40
 Nodes (5): basic_block, edge, gcov_type, bb_gcov_count(), edge_gcov_count()
 
-### Community 1522 - "Community 1522"
-Cohesion: 0.60
-Nodes (5): tree, range_false(), range_true(), range_true_and_false(), int_range
-
 ### Community 1523 - "Community 1523"
 Cohesion: 0.33
 Nodes (4): value_type, operator(), value_type(), rtx_type
-
-### Community 1524 - "Community 1524"
-Cohesion: 0.44
-Nodes (11): const_tree, REAL_VALUE_TYPE, frange_val_is_max(), frange_val_is_min(), frange_val_max(), frange_val_min(), real_max_representable(), real_min_representable() (+3 more)
 
 ### Community 1525 - "Community 1525"
 Cohesion: 0.33
@@ -8547,12 +8402,12 @@ Cohesion: 0.25
 Nodes (10): 1. Open MCP configuration, 2. Add daimonos as an MCP server, 3. Verify, Adding a Rules Directive (optional), code:json ({), code:block2 (Use daimonos MCP tools for all file, search, exec, and git o), Prerequisites, Setup (+2 more)
 
 ### Community 1548 - "Community 1548"
-Cohesion: 0.15
-Nodes (8): FixExitfunc, Convert use of sys.exitfunc to use the atexit module., find_params(), FixTupleParams, is_docstring(), simplify_args(), tuple_name(), Newline()
+Cohesion: 0.25
+Nodes (9): namespace, V8_INLINE, v8(), IsNull(), QuickIsFalse(), QuickIsNull(), QuickIsString(), QuickIsTrue() (+1 more)
 
 ### Community 1549 - "Community 1549"
-Cohesion: 0.18
-Nodes (3): FrameSummary, Information about a single frame from a traceback.      - :attr:`filename` The f, Construct a FrameSummary.          :param lookup_line: If True, `linecache` is c
+Cohesion: 0.20
+Nodes (6): namespace, namespace, namespace, v8(), v8(), v8()
 
 ### Community 1550 - "Community 1550"
 Cohesion: 0.60
@@ -8578,9 +8433,13 @@ Nodes (3): clipboard, display_activity(), load_activity()
 Cohesion: 0.33
 Nodes (5): MIMEImage, Class for generating image/* type MIME documents., Create an image/* type MIME document.          _imagedata contains the bytes for, rule(), _what()
 
+### Community 1557 - "Community 1557"
+Cohesion: 0.17
+Nodes (7): LexicalHandler, Optional SAX2 handler for lexical events.      This handler is used to obtain le, Reports a comment anywhere in the document (including the         DTD and outsid, Report the start of the DTD declarations, if the document         has an associa, Signals the end of DTD declarations., Reports the beginning of a CDATA marked section.          The contents of the CD, Reports the end of a CDATA marked section.
+
 ### Community 1561 - "Community 1561"
-Cohesion: 0.24
-Nodes (8): CUMULATIVE_ARGS, cumulative_args_t, HOST_WIDE_INT, poly_int64, estimated_poly_value(), get_cumulative_args(), pack_cumulative_args(), poly_value_estimate_kind
+Cohesion: 0.33
+Nodes (9): compile_dir(), compile_file(), compile_path(), main(), Module/script to byte-compile all .py files to .pyc files.  When called as a scr, Byte-compile one file.      Arguments (only fullname is required):      fullname, Byte-compile all module on sys.path.      Arguments (all optional):      skip_cu, Byte-compile all modules in the given directory tree.      Arguments (only dir i (+1 more)
 
 ### Community 1563 - "Community 1563"
 Cohesion: 0.53
@@ -8589,10 +8448,6 @@ Nodes (5): pciaddr_t, pci_bus(), pci_dev(), pci_func(), pci_mkaddr()
 ### Community 1565 - "Community 1565"
 Cohesion: 0.42
 Nodes (9): Py_ssize_t, PyObject, PyThreadState, _PyObject_CallNoArgs(), _PyObject_CallNoArgsTstate(), _PyObject_FastCallTstate(), _PyObject_VectorcallTstate(), _PyVectorcall_FunctionInline() (+1 more)
-
-### Community 1567 - "Community 1567"
-Cohesion: 0.18
-Nodes (4): w(here)          Print a stack trace, with the most recent frame at the bottom., u(p) [count]          Move the current frame count (default one) levels up in th, d(own) [count]          Move the current frame count (default one) levels down i, j(ump) lineno          Set the next line that will be executed.  Only available
 
 ### Community 1568 - "Community 1568"
 Cohesion: 0.33
@@ -8621,10 +8476,6 @@ Nodes (4): empty(), max_size(), size(), PB_DS_CLASS_T_DEC
 ### Community 1576 - "Community 1576"
 Cohesion: 0.60
 Nodes (4): empty(), max_size(), size(), PB_DS_CLASS_T_DEC
-
-### Community 1577 - "Community 1577"
-Cohesion: 0.40
-Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
 
 ### Community 1578 - "Community 1578"
 Cohesion: 0.50
@@ -8831,12 +8682,8 @@ Cohesion: 0.40
 Nodes (4): class, namespace, v8(), V8_EXPORT()
 
 ### Community 1634 - "Community 1634"
-Cohesion: 0.17
-Nodes (7): Elf_Addr, _List, _HashedSeq, _make_key(), This class guarantees that hash() will be called no more than once         per e, Make a cache key from optionally typed positional and keyword arguments      The, module_get_absolute()
-
-### Community 1635 - "Community 1635"
-Cohesion: 0.29
-Nodes (9): class, gimple, tree, fold_using_range(), fur_depend(), fur_source(), gimple_range_ssa_p(), gimple_range_type() (+1 more)
+Cohesion: 0.08
+Nodes (16): _BlockingOnManager, _DeadlockError, _DummyModuleLock, _get_module_lock(), _has_deadlocked(), _lock_unlock_module(), _ModuleLock, A context manager responsible to updating ``_blocking_on``. (+8 more)
 
 ### Community 1636 - "Community 1636"
 Cohesion: 0.22
@@ -8847,8 +8694,8 @@ Cohesion: 0.40
 Nodes (3): FixLong, is_probably_builtin(), Check that something isn't an attribute or function name etc.
 
 ### Community 1638 - "Community 1638"
-Cohesion: 0.60
-Nodes (3): TestSquashfs, TestSquashfsMaxBlocksize, TestSquashfsMinBlocksize
+Cohesion: 0.22
+Nodes (9): FrameInfo, getinnerframes(), getouterframes(), Get a list of records for a frame and all higher (calling) frames.      Each rec, Get a list of records for a traceback's frame and all lower frames.      Each re, Return a list of records for the stack above the caller's frame., Return a list of records for the stack below the current exception., stack() (+1 more)
 
 ### Community 1639 - "Community 1639"
 Cohesion: 0.40
@@ -8894,25 +8741,13 @@ Nodes (4): Author, Compiling and Testing, License, Release History
 Cohesion: 0.18
 Nodes (6): Set values of attributes as ready to start debugging., Debug a statement executed via the exec() function.          globals defaults to, Debug an expression executed via the eval() function.          globals defaults, For backwards-compatibility.  Defers to run()., Debug a single function call.          Return the result of the function call., test()
 
-### Community 1687 - "Community 1687"
-Cohesion: 0.33
-Nodes (9): compile_dir(), compile_file(), compile_path(), main(), Module/script to byte-compile all .py files to .pyc files.  When called as a scr, Byte-compile one file.      Arguments (only fullname is required):      fullname, Byte-compile all module on sys.path.      Arguments (all optional):      skip_cu, Byte-compile all modules in the given directory tree.      Arguments (only dir i (+1 more)
-
 ### Community 1689 - "Community 1689"
 Cohesion: 0.40
 Nodes (3): TestFrozenUtf8_1, TestFrozenUtf8_2, TestFrozenUtf8_4
 
 ### Community 1690 - "Community 1690"
-Cohesion: 0.40
-Nodes (4): BlockFinder, getblock(), Provide a tokeneater() method to detect the end of a code block., Extract the block of code at the top of the given list of lines.
-
-### Community 1691 - "Community 1691"
-Cohesion: 0.24
-Nodes (10): _default_sysroot(), _find_appropriate_compiler(), _find_build_tool(), _find_executable(), Returns the root of the default SDK for this system, or '/', Find appropriate C compiler for extension module builds, Tries to find 'executable' in the directories listed in 'path'.      A string li, Output from successful command execution or None (+2 more)
-
-### Community 1692 - "Community 1692"
-Cohesion: 0.20
-Nodes (6): getnode(), r"""Create a UUID from either a string of 32 hexadecimal digits,         a strin, Get the hardware address as a 48-bit positive integer.      The first time this, Generate a UUID from a host ID, sequence number, and the current time.     If 'n, SafeUUID, uuid1()
+Cohesion: 0.12
+Nodes (14): any(), detect_encoding(), generate_tokens(), _get_normal_name(), group(), maybe(), Imitates get_normal_name in tokenizer.c., The detect_encoding() function is used to detect the encoding that should     be (+6 more)
 
 ### Community 1693 - "Community 1693"
 Cohesion: 0.40
@@ -8950,21 +8785,9 @@ Nodes (4): trie_metadata_helper, trie_metadata_helper<Node_Update, false>, trie_
 Cohesion: 0.40
 Nodes (4): sample_trie_access_traits, begin, e_pos, end
 
-### Community 1704 - "Community 1704"
-Cohesion: 0.22
-Nodes (6): cgraph_node, cgraph_node, ggc_delete(), cleanup(), clone_info(), thunk_info()
-
 ### Community 1706 - "Community 1706"
 Cohesion: 0.33
 Nodes (9): _mm512_abs_ps(), _mm512_and_epi32(), _mm512_mask_mov_epi32(), _mm512_mask_reduce_and_epi32(), _mm512_mask_reduce_max_epi32(), _mm512_mask_reduce_min_epi32(), _mm512_mask_reduce_min_epu32(), _mm512_mask_reduce_mul_epi32() (+1 more)
-
-### Community 1707 - "Community 1707"
-Cohesion: 0.28
-Nodes (9): currency(), _group(), _grouping_intervals(), localeconv(), _localize(), Formats val according to the currency settings     in the current locale., Parses a string as locale number according to the locale settings., localeconv() -> dict.             Returns numeric and monetary locale-specific p (+1 more)
-
-### Community 1708 - "Community 1708"
-Cohesion: 0.22
-Nodes (5): Number, Rational, .numerator and .denominator should be in lowest terms., float(self) = self.numerator / self.denominator          It's important that thi, All numbers inherit from this class.      If you just want to check if an argume
 
 ### Community 1709 - "Community 1709"
 Cohesion: 0.67
@@ -8977,10 +8800,6 @@ Nodes (3): O, usage(), flasher.sh script
 ### Community 1711 - "Community 1711"
 Cohesion: 0.50
 Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
-
-### Community 1712 - "Community 1712"
-Cohesion: 0.07
-Nodes (8): main(), parse_iso(), to_int(), _divide_and_round(), divide a by b and round result to the nearest integer      When the ratio is exa, Represent the difference between two datetime objects.      Supported operators:, Total seconds in the duration., timedelta
 
 ### Community 1713 - "Community 1713"
 Cohesion: 0.50
@@ -9103,8 +8922,8 @@ Cohesion: 0.50
 Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
 
 ### Community 1743 - "Community 1743"
-Cohesion: 0.67
-Nodes (4): shift_left(), shift_right(), _ForwardIterator, typename
+Cohesion: 0.33
+Nodes (9): lt_dladvise, lt_dlvtable, lt_module, lt_user_data, get_vtable(), vl_exit(), vm_close(), vm_open() (+1 more)
 
 ### Community 1744 - "Community 1744"
 Cohesion: 0.50
@@ -9207,8 +9026,8 @@ Cohesion: 0.50
 Nodes (4): __m128d, _mm_frcz_pd(), _mm_frcz_sd(), _mm_permute2_pd()
 
 ### Community 1773 - "Community 1773"
-Cohesion: 0.25
-Nodes (8): Context compaction (required config), Model picker, Prerequisites, Scope, Setup, Troubleshooting, Verify, Zed Editor Setup (native ACP agent)
+Cohesion: 0.24
+Nodes (10): _default_sysroot(), _find_appropriate_compiler(), _find_build_tool(), _find_executable(), Returns the root of the default SDK for this system, or '/', Find appropriate C compiler for extension module builds, Tries to find 'executable' in the directories listed in 'path'.      A string li, Output from successful command execution or None (+2 more)
 
 ### Community 1774 - "Community 1774"
 Cohesion: 0.67
@@ -9334,10 +9153,6 @@ Nodes (3): __u64, mdp_super_t, md_event()
 Cohesion: 0.67
 Nodes (3): __u16, usb_raw_io_flags_valid(), usb_raw_io_flags_zero()
 
-### Community 1810 - "Community 1810"
-Cohesion: 0.33
-Nodes (6): namespace, V8_INLINE, value_, Holder(), slot(), v8()
-
 ### Community 1811 - "Community 1811"
 Cohesion: 0.50
 Nodes (3): ASIdOrRange, DECLARE_ASN1_FUNCTIONS(), PROXY_CERT_INFO_EXTENSION
@@ -9347,8 +9162,8 @@ Cohesion: 0.83
 Nodes (3): die(), run(), sign.sh script
 
 ### Community 1816 - "Community 1816"
-Cohesion: 0.29
-Nodes (4): Set a cookie if policy says it's OK to do so., Set a cookie, without checking whether or not it should be set., Extract cookies from response, where allowable given the request., If you override .set_ok(), be sure to call this method.  If it returns         f
+Cohesion: 0.28
+Nodes (9): __a(), _M_alloc(), _M_dispose(), _M_get_deleter(), _M_ptr(), _Alloc, _M_impl, std (+1 more)
 
 ### Community 1818 - "Community 1818"
 Cohesion: 0.83
@@ -9371,8 +9186,8 @@ Cohesion: 0.67
 Nodes (3): _Unwind_GetDataRelBase(), _Unwind_GetTextRelBase(), _Unwind_Ptr
 
 ### Community 1831 - "Community 1831"
-Cohesion: 0.50
-Nodes (4): _mm_load1_ps(), _mm_load_ps1(), _mm_set1_ps(), _mm_set_ps1()
+Cohesion: 0.31
+Nodes (7): class, class, block_range_cache(), ranger_cache(), ssa_global_cache(), gimple_infer_range(), infer_range_manager()
 
 ### Community 1832 - "Community 1832"
 Cohesion: 0.50
@@ -9383,8 +9198,12 @@ Cohesion: 0.50
 Nodes (3): dylib_info(), Generic dylib path manipulation, A dylib name can take one of the following four forms:         Location/Name.Som
 
 ### Community 1836 - "Community 1836"
-Cohesion: 0.29
-Nodes (8): _check_name(), Decorator to verify that the module being requested matches the one the     load, Simple substitute for functools.update_wrapper., Decorator to verify the named module is built-in., Decorator to verify the named module is frozen., _requires_builtin(), _requires_frozen(), _wrap()
+Cohesion: 0.28
+Nodes (6): const_pointer_, PB_DS_CLASS_C_DEC, PB_DS_GEN_POS, const_iterator_, m_p_tbl, m_pos
+
+### Community 1837 - "Community 1837"
+Cohesion: 0.50
+Nodes (4): correlation(), _rank(), Pearson's correlation coefficient      Return the Pearson's correlation coeffici, Rank order a dataset. The lowest value has rank 1.      Ties are averaged so tha
 
 ### Community 1838 - "Community 1838"
 Cohesion: 0.25
@@ -9394,6 +9213,10 @@ Nodes (5): Filterer, A base class for loggers and handlers which allows them to 
 Cohesion: 0.25
 Nodes (4): Inherit all other methods from the underlying stream., Inherit all other methods from the underlying stream., Inherit all other methods from the underlying stream., Inherit all other methods from the underlying stream.
 
+### Community 1841 - "Community 1841"
+Cohesion: 0.25
+Nodes (7): The tokenize() function accepts two parameters: one representing the     input s, tokenize(), tokenize_loop(), BlockFinder, getblock(), Provide a tokeneater() method to detect the end of a code block., Extract the block of code at the top of the given list of lines.
+
 ### Community 1842 - "Community 1842"
 Cohesion: 0.83
 Nodes (4): Daimonos Filesystem Permissions, Agent User, Benchmark User, Daimonos Users Config
@@ -9402,37 +9225,33 @@ Nodes (4): Daimonos Filesystem Permissions, Agent User, Benchmark User, Daimonos
 Cohesion: 0.50
 Nodes (4): islink(), Test whether a path is a symbolic link, Directory tree generator.      For each directory in the directory tree rooted a, walk()
 
-### Community 1845 - "Community 1845"
-Cohesion: 0.29
-Nodes (4): Returns a copy with the sign switched.          Rounds, if it has reason., Returns the absolute value of self.          If the keyword argument 'round' is, Compares self to other using abstract repr., ignoring sign.          Like compar, Returns a copy of the operand with the sign set to 0.          >>> ExtendedConte
-
 ### Community 1846 - "Community 1846"
-Cohesion: 0.09
-Nodes (17): NNTPDataError, _parse_overview(), _parse_overview_fmt(), Error in response data, Parse a list of string representing the response to LIST OVERVIEW.FMT     and re, Parse the response to an OVER or XOVER command according to the     overview for, Format a date or datetime object as a pair of (date, time) strings     in the fo, Internal: send a command and get the response plus following text.         Same (+9 more)
+Cohesion: 0.13
+Nodes (9): Format a date or datetime object as a pair of (date, time) strings     in the fo, Internal: send a command and get the response plus following text.         Same, Process a CAPABILITIES command.  Not supported by all servers.         Return:, Process a NEWGROUPS command.  Arguments:         - date: a date or datetime obje, Process a NEWNEWS command.  Arguments:         - group: group name or '*', Process a LIST or LIST ACTIVE command. Arguments:         - group_pattern: a pat, Process a HELP command. Argument:         - file: Filename string or file object, Process an XHDR command (optional server extension).  Arguments:         - hdr: (+1 more)
+
+### Community 1847 - "Community 1847"
+Cohesion: 0.28
+Nodes (9): currency(), _group(), _grouping_intervals(), localeconv(), _localize(), Formats val according to the currency settings     in the current locale., Parses a string as locale number according to the locale settings., localeconv() -> dict.             Returns numeric and monetary locale-specific p (+1 more)
 
 ### Community 1848 - "Community 1848"
 Cohesion: 0.25
-Nodes (4): Swaps self/other and returns __truediv__., Swaps self/other and returns __divmod__., Swaps self/other and returns __mod__., Swaps self/other and returns __pow__.
+Nodes (8): __enable_shared_from_this_base(), _M_less(), _M_swap(), __p(), __enable_shared_from_this, friend, __shared_count, __weak_count
 
 ### Community 1849 - "Community 1849"
 Cohesion: 0.50
 Nodes (4): classify_class_attrs(), _is_bound_method(), Returns True if fn is a bound method, regardless of whether     fn was implement, Wrap inspect.classify_class_attrs, with fixup for data descriptors and bound met
 
 ### Community 1850 - "Community 1850"
-Cohesion: 0.43
-Nodes (7): HOST_WIDE_INT, gen_rtx_fmt_w_stat(), gen_rtx_fmt_ww_stat(), gen_rtx_fmt_www_stat(), init_rtx_fmt_w(), init_rtx_fmt_ww(), init_rtx_fmt_www()
+Cohesion: 0.29
+Nodes (5): PB_DS_CLASS_C_DEC, PB_DS_GEN_POS, pointer, reference, iterator_
 
 ### Community 1851 - "Community 1851"
-Cohesion: 0.33
-Nodes (5): def_operand_p, tree, use_operand_p, get_def_from_ptr(), get_use_from_ptr()
-
-### Community 1852 - "Community 1852"
-Cohesion: 0.33
-Nodes (5): encode_7or8bit(), encode_quopri(), _qencode(), Encode the message's payload in quoted-printable.      Also, add an appropriate, Set the Content-Transfer-Encoding header to 7bit or 8bit.
+Cohesion: 0.25
+Nodes (8): Context compaction (required config), Model picker, Prerequisites, Scope, Setup, Troubleshooting, Verify, Zed Editor Setup (native ACP agent)
 
 ### Community 1853 - "Community 1853"
-Cohesion: 0.38
-Nodes (4): escape_path(), Path component of request-URI, as defined by RFC 2965., Escape any invalid characters in HTTP URL, and uppercase all escapes., request_path()
+Cohesion: 0.29
+Nodes (4): Set a cookie if policy says it's OK to do so., Set a cookie, without checking whether or not it should be set., Extract cookies from response, where allowable given the request., If you override .set_ok(), be sure to call this method.  If it returns         f
 
 ### Community 1854 - "Community 1854"
 Cohesion: 0.50
@@ -9446,113 +9265,137 @@ Nodes (29): Changes, Changes, Changes, Changes, Changes, Changes, Changes, Chang
 Cohesion: 0.67
 Nodes (3): __m128i, _mm_cvtsi128_si16(), _mm_cvtsi16_si128()
 
-### Community 1957 - "Community 1957"
-Cohesion: 0.67
-Nodes (3): V8_INLINE, Value, Cast()
-
 ### Community 1958 - "Community 1958"
-Cohesion: 0.67
-Nodes (3): V8_INLINE, Value, Cast()
+Cohesion: 0.25
+Nodes (4): Swaps self/other and returns __truediv__., Swaps self/other and returns __divmod__., Swaps self/other and returns __mod__., Swaps self/other and returns __pow__.
 
 ### Community 1964 - "Community 1964"
 Cohesion: 0.38
-Nodes (6): decode(), encode(), Error, Decode uuencoded file, uuencode/uudecode main program, test()
+Nodes (3): cleanup_file_content(), populate_db_from_file(), read_file()
 
 ### Community 1966 - "Community 1966"
 Cohesion: 0.33
 Nodes (6): insert(), const_iterator, initializer_list, iterator, value_type, __ireturn_type
 
-### Community 2008 - "Community 2008"
-Cohesion: 0.47
-Nodes (4): class, align_flags(), max(), normalize()
+### Community 1967 - "Community 1967"
+Cohesion: 0.03
+Nodes (53): _format_callbacks(), _future_repr(), _future_repr_info(), helper function for Future.__repr__, helper function for Future.__repr__, _task_repr(), _task_repr_info(), _format_coroutine() (+45 more)
 
-### Community 2009 - "Community 2009"
+### Community 2008 - "Community 2008"
+Cohesion: 0.43
+Nodes (5): _other_endian(), Return the type with the 'other' byte order.  Simple types like     c_int and so, _swapped_meta, _swapped_struct_meta, _swapped_union_meta
+
+### Community 2010 - "Community 2010"
 Cohesion: 0.33
-Nodes (6): After deploying, Before building, code:bash (cd distro/br2-external/board/daimonos), code:bash (# Check NVMe), Debugging a non-booting instance, Verifying the Config
+Nodes (3): Elf_Addr, _List, module_get_absolute()
 
 ### Community 2011 - "Community 2011"
-Cohesion: 0.33
-Nodes (6): AWS Import Considerations, Boot Mode, code:block14 (ClientError: Unsupported kernel version 6.12.27), code:bash (# Import as snapshot (no kernel check)), `import-image` vs `import-snapshot`, Root Device Naming
-
-### Community 2012 - "Community 2012"
-Cohesion: 0.60
-Nodes (5): error_t, argz_append(), argz_create_sep(), argz_insert(), lt_argz_insert()
+Cohesion: 0.38
+Nodes (4): escape_path(), Path component of request-URI, as defined by RFC 2965., Escape any invalid characters in HTTP URL, and uppercase all escapes., request_path()
 
 ### Community 2013 - "Community 2013"
-Cohesion: 0.33
-Nodes (5): Daimonos prompts, How they are used, `summary` override precedence, The prompts, WARNING
+Cohesion: 0.25
+Nodes (7): Additional user instructions for agent runtimes, Daimonos prompts, Getting the baseline defaults (no source needed), How they are used, `summary` override precedence, The prompts, WARNING
 
-### Community 2015 - "Community 2015"
-Cohesion: 0.40
-Nodes (6): _ipconfig_getnode(), _netbios_getnode(), [DEPRECATED] Get the hardware address on Windows., [DEPRECATED] Get the hardware address on Windows., Get the hardware address on Windows using the _uuid extension module., _windll_getnode()
+### Community 2014 - "Community 2014"
+Cohesion: 0.53
+Nodes (4): handle_definition(), handle_eval(), handle_usage(), populate_db()
 
 ### Community 2016 - "Community 2016"
-Cohesion: 0.40
-Nodes (5): Daimonos Buildroot Distro, Alpine Linux, Buildroot Build System, Alpine Legacy Build README, CLA-208 Alpine to Buildroot Migration
+Cohesion: 0.47
+Nodes (5): class, tree, gori_compute(), gori_export_iterator(), range_def_chain()
 
 ### Community 2017 - "Community 2017"
 Cohesion: 0.40
 Nodes (3): PyDict_GET_SIZE(), Py_ssize_t, PyObject
 
+### Community 2018 - "Community 2018"
+Cohesion: 0.60
+Nodes (5): tree, range_false(), range_true(), range_true_and_false(), int_range
+
 ### Community 2019 - "Community 2019"
 Cohesion: 0.40
 Nodes (3): PySet_GET_SIZE(), Py_ssize_t, PyObject
 
-### Community 2021 - "Community 2021"
-Cohesion: 0.60
-Nodes (5): tree, gen_rtx_fmt_t_stat(), gen_rtx_fmt_te_stat(), init_rtx_fmt_t(), init_rtx_fmt_te()
+### Community 2020 - "Community 2020"
+Cohesion: 0.33
+Nodes (6): After deploying, Before building, code:bash (cd distro/br2-external/board/daimonos), code:bash (# Check NVMe), Debugging a non-booting instance, Verifying the Config
 
-### Community 2032 - "Community 2032"
+### Community 2021 - "Community 2021"
+Cohesion: 0.33
+Nodes (6): AWS Import Considerations, Boot Mode, code:block14 (ClientError: Unsupported kernel version 6.12.27), code:bash (# Import as snapshot (no kernel check)), `import-image` vs `import-snapshot`, Root Device Naming
+
+### Community 2022 - "Community 2022"
+Cohesion: 0.40
+Nodes (5): Daimonos Buildroot Distro, Alpine Linux, Buildroot Build System, Alpine Legacy Build README, CLA-208 Alpine to Buildroot Migration
+
+### Community 2024 - "Community 2024"
 Cohesion: 0.60
-Nodes (4): namespace, base(), perfetto(), platform()
+Nodes (5): reset(), __shared_ptr(), swap(), _Lp, __weak_ptr
 
 ### Community 2033 - "Community 2033"
 Cohesion: 0.50
 Nodes (3): jffs2dump_find_file(), # TODO: there are some scary JFFS2 messages when one starts to, TestJffs2
 
-### Community 2039 - "Community 2039"
-Cohesion: 0.80
-Nodes (5): linemap_check_macro(), linemap_check_ordinary(), MAP_MODULE_P(), MAP_ORDINARY_P(), line_map
+### Community 2036 - "Community 2036"
+Cohesion: 0.40
+Nodes (3): LMTP, LMTP - Local Mail Transfer Protocol      The LMTP protocol, which is very simila, Initialize a new instance.
+
+### Community 2038 - "Community 2038"
+Cohesion: 0.83
+Nodes (3): main(), parse_iso(), to_int()
 
 ### Community 2041 - "Community 2041"
 Cohesion: 0.40
 Nodes (4): mask_based_range_hashing<Size_Type>, direct_mask_range_hashing, notify_resized, swap
 
-### Community 2100 - "Community 2100"
-Cohesion: 0.50
-Nodes (4): noexcept(), __i, operator, __p
-
-### Community 2215 - "Community 2215"
-Cohesion: 0.50
-Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
-
-### Community 2249 - "Community 2249"
+### Community 2045 - "Community 2045"
 Cohesion: 0.67
 Nodes (3): PyCell_GET(), PyCell_SET(), PyObject
 
-### Community 2250 - "Community 2250"
-Cohesion: 0.67
-Nodes (4): signop, wide_int, max_value(), min_value()
+### Community 2046 - "Community 2046"
+Cohesion: 0.50
+Nodes (4): namespace, value_, slot(), v8()
+
+### Community 2088 - "Community 2088"
+Cohesion: 0.39
+Nodes (8): CLI smoke tests for the baseline-prompt commands (vikunja #980): `--print-prompt, _run(), test_agent_instructions_flag_reports_unreadable_explicit_file(), test_dump_prompts_scaffolds_all_files(), test_dump_prompts_skips_existing_without_force(), test_force_requires_dump_prompts(), test_print_prompt_emits_default(), test_print_prompt_unknown_name_errors()
+
+### Community 2249 - "Community 2249"
+Cohesion: 0.50
+Nodes (4): call(), check_call(), Run command with arguments.  Wait for command to complete or     for timeout sec, Run command with arguments.  Wait for command to complete.  If     the exit code
 
 ### Community 2251 - "Community 2251"
 Cohesion: 0.50
 Nodes (4): closeEvent(), saveConfig(), saveConfigAs(), QCloseEvent
 
+### Community 2253 - "Community 2253"
+Cohesion: 0.67
+Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
+
+### Community 2266 - "Community 2266"
+Cohesion: 0.67
+Nodes (3): namespace, inchash(), wi()
+
 ### Community 2298 - "Community 2298"
 Cohesion: 0.67
 Nodes (3): isjunction(), Test whether a path is a junction, Test whether a path is a junction
+
+### Community 2301 - "Community 2301"
+Cohesion: 0.67
+Nodes (3): _mm_set1_pi8(), _mm_set_pi8(), _mm_setr_pi8()
+
+### Community 4600 - "Community 4600"
+Cohesion: 0.60
+Nodes (4): IOBase, The io module provides the Python interfaces to stream handling. The builtin ope, RawIOBase, TextIOBase
 
 ### Community 4672 - "Community 4672"
 Cohesion: 0.67
 Nodes (4): _args_from_interpreter_flags(), _optim_args_from_interpreter_flags(), Return a list of command-line arguments reproducing the current     optimization, Return a list of command-line arguments reproducing the current     settings in
 
-### Community 4679 - "Community 4679"
+### Community 4677 - "Community 4677"
 Cohesion: 0.67
-Nodes (3): V8_INLINE, Value, Cast()
-
-### Community 4681 - "Community 4681"
-Cohesion: 0.67
-Nodes (3): _mm_set1_pi16(), _mm_set_pi16(), _mm_setr_pi16()
+Nodes (3): _GLIBCXX_VISIBILITY(), default, namespace
 
 ### Community 4733 - "Community 4733"
 Cohesion: 0.67
@@ -9563,23 +9406,23 @@ Nodes (3): isdevdrive(), Determines whether the specified path is on a Windows D
   distro/alpine-legacy/README.md · relation: semantically_similar_to
 
 ## Knowledge Gaps
-- **3875 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+3870 more)
+- **3878 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+3873 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **780 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **701 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **What is the exact relationship between `CLA-208 Migration Issue` and `CLA-208 Alpine to Buildroot Migration`?**
   _Edge tagged AMBIGUOUS (relation: semantically_similar_to) - confidence is low._
-- **Why does `time` connect `Community 40` to `Community 512`, `Community 521`, `Community 528`, `Community 24`, `Community 541`, `Community 30`, `Community 31`, `Community 33`, `Community 51`, `Community 54`, `Community 567`, `Community 4662`, `Community 57`, `Community 570`, `Community 573`, `Community 67`, `Community 68`, `Community 580`, `Community 76`, `Community 79`, `Community 86`, `Community 1113`, `Community 91`, `Community 1124`, `Community 1129`, `Community 620`, `Community 1140`, `Community 1653`, `Community 632`, `Community 120`, `Community 122`, `Community 1145`, `Community 123`, `Community 132`, `Community 140`, `Community 151`, `Community 1182`, `Community 677`, `Community 166`, `Community 2215`, `Community 680`, `Community 690`, `Community 181`, `Community 184`, `Community 213`, `Community 215`, `Community 224`, `Community 229`, `Community 742`, `Community 287`, `Community 808`, `Community 298`, `Community 1335`, `Community 319`, `Community 322`, `Community 326`, `Community 330`, `Community 338`, `Community 345`, `Community 348`, `Community 350`, `Community 378`, `Community 387`, `Community 911`, `Community 404`, `Community 415`, `Community 1469`, `Community 958`, `Community 452`, `Community 463`, `Community 465`, `Community 473`, `Community 998`, `Community 491`, `Community 1010`, `Community 501`, `Community 2044`?**
+- **Why does `time` connect `Community 40` to `Community 514`, `Community 132`, `Community 521`, `Community 140`, `Community 528`, `Community 18`, `Community 404`, `Community 919`, `Community 24`, `Community 151`, `Community 282`, `Community 541`, `Community 30`, `Community 415`, `Community 1182`, `Community 677`, `Community 37`, `Community 680`, `Community 808`, `Community 298`, `Community 557`, `Community 1967`, `Community 690`, `Community 181`, `Community 54`, `Community 567`, `Community 824`, `Community 57`, `Community 570`, `Community 1335`, `Community 184`, `Community 1469`, `Community 958`, `Community 319`, `Community 573`, `Community 577`, `Community 322`, `Community 67`, `Community 452`, `Community 68`, `Community 326`, `Community 330`, `Community 76`, `Community 463`, `Community 80`, `Community 465`, `Community 338`, `Community 79`, `Community 213`, `Community 86`, `Community 215`, `Community 345`, `Community 1113`, `Community 91`, `Community 348`, `Community 473`, `Community 350`, `Community 224`, `Community 1124`, `Community 229`, `Community 998`, `Community 742`, `Community 1129`, `Community 491`, `Community 620`, `Community 632`, `Community 378`, `Community 1010`, `Community 1653`, `Community 501`, `Community 120`, `Community 1145`, `Community 122`, `Community 123`?**
   _High betweenness centrality (0.177) - this node is a cross-community bridge._
-- **Why does `bitset` connect `Community 48` to `Community 151`?**
+- **Why does `bitset` connect `Community 48` to `Community 597`?**
   _High betweenness centrality (0.173) - this node is a cross-community bridge._
-- **Why does `constexpr()` connect `Community 20` to `Community 2`, `Community 3`, `Community 66`, `Community 1831`, `Community 267`, `Community 1261`, `Community 16`, `Community 17`, `Community 19`, `Community 22`, `Community 56`, `Community 474`, `Community 284`, `Community 127`?**
+- **Why does `constexpr()` connect `Community 20` to `Community 2`, `Community 3`, `Community 66`, `Community 267`, `Community 1261`, `Community 16`, `Community 17`, `Community 19`, `Community 22`, `Community 56`, `Community 474`, `Community 284`, `Community 127`?**
   _High betweenness centrality (0.091) - this node is a cross-community bridge._
 - **What connects `Load all task summaries from one run directory.`, `All run dirs belonging to (arm, tag), including -rN repetitions.`, `Per-task cross-run statistics: mean/min/max per metric, success rate,     contam` to the rest of the system?**
-  _10432 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _10436 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Community 0` be split into smaller, more focused modules?**
   _Cohesion score 0.01107219257622417 - nodes in this community are weakly interconnected._
 - **Should `Community 1` be split into smaller, more focused modules?**

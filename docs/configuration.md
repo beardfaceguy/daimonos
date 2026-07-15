@@ -293,6 +293,37 @@ file. See `prompts/README.md` for the committed defaults and full guidance.
 | `kgl_hint` | `daimonos --mcp` (KGL auto-index only) | Nudge to orient via the knowledge graph before reading source. |
 | `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
 
+**Getting the baseline defaults**: the defaults are embedded in the binary, so
+you don't need the source to see or copy them:
+
+```bash
+daimonos --print-prompt mcp_instructions      # print one default to stdout
+daimonos --dump-prompts                        # scaffold all four into
+                                               #   ~/.config/daimonos/prompts/
+daimonos --dump-prompts /path/to/dir           # ...into a custom directory
+daimonos --dump-prompts --force                # overwrite existing files
+```
+
+`--dump-prompts` writes `<name>.md` for each key (skipping existing files unless
+`--force`) and prints a ready-to-paste `[prompts]` block pointing at them. Start
+from these so an override begins at — and can be diffed against — the baseline.
+
+**Additional agent instructions**: `daimonos agent`, `daimonos chat`, and ACP
+append `~/.config/daimonos/agent-instructions.md` to the resolved
+`agent_system` prompt when that file exists. If `$XDG_CONFIG_HOME` is set, it
+replaces `~/.config`. Override the file for a run with the global flag:
+
+```bash
+daimonos agent "task" --agent-instructions /path/to/rules.md
+daimonos chat --agent-instructions /path/to/rules.md
+daimonos acp --agent-instructions /path/to/rules.md
+```
+
+The additional file is appended verbatim with a blank-line separator. A missing
+default file is silently ignored. An explicit unreadable override — or a default
+file that exists but cannot be read — is an error, preventing configured rules
+from being silently omitted. This does not apply to `daimonos --mcp`.
+
 **Warning**: these change how the agent behaves. Removing the `execute_script`
 guidance or the terse directive typically **increases** token usage. Override
 deliberately and prefer editing copies over the committed defaults so you can

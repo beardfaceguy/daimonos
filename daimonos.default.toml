@@ -193,6 +193,11 @@ skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 # summary          = "~/.config/daimonos/prompts/summary.md"
 # Note: `summary` is also overridable via the agent-env DAIMONOS_AGENT_SUMMARY_PROMPT,
 # which takes precedence over the path above.
+#
+# Agent/chat/ACP append optional user rules from
+# ~/.config/daimonos/agent-instructions.md (or $XDG_CONFIG_HOME/daimonos/...)
+# after the resolved agent_system prompt. Override that location per run with
+# `--agent-instructions /path/to/rules.md`. This does not apply to --mcp mode.
 
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.

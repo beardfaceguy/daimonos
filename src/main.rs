@@ -217,6 +217,30 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     print_config_path: bool,
 
+    /// Print one embedded baseline prompt to stdout and exit. Value is one of:
+    /// agent_system, mcp_instructions, kgl_hint, summary. Use this to see or
+    /// save the default you are overriding via [prompts].
+    #[arg(long, value_name = "NAME")]
+    print_prompt: Option<String>,
+
+    /// Write all embedded baseline prompts to a directory (default
+    /// ~/.config/daimonos/prompts), print a ready-to-enable [prompts] block,
+    /// and exit. Existing files are left untouched unless --force. Pass a
+    /// directory to override the target: --dump-prompts /path/to/dir.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "")]
+    dump_prompts: Option<String>,
+
+    /// With --dump-prompts, overwrite existing prompt files instead of skipping
+    /// them.
+    #[arg(long, default_value_t = false, requires = "dump_prompts")]
+    force: bool,
+
+    /// Additional user instructions appended to the agent system prompt for
+    /// `agent`, `chat`, and ACP. Defaults to
+    /// ~/.config/daimonos/agent-instructions.md when that file exists.
+    #[arg(long, global = true, value_name = "PATH")]
+    agent_instructions: Option<PathBuf>,
+
     /// With --stats, restrict the report to a single agent-runtime
     /// session id (matches whatever `set_external_session_id` /
     /// `DAIMONOS_AGENT_SESSION_ID` set on the recording side).
@@ -292,13 +316,54 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // --print-prompt <name>: dump one embedded baseline prompt to stdout, exit.
+    if let Some(name) = cli.print_prompt.as_deref() {
+        match prompts::default_by_name(name) {
+            Some(text) => {
+                print!("{text}");
+                return Ok(());
+            }
+            None => {
+                eprintln!(
+                    "unknown prompt '{name}'. valid names: {}",
+                    prompts::PROMPT_NAMES.join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // --dump-prompts [DIR]: scaffold all baseline prompts + a [prompts] block,
+    // exit. `Some("")` means the flag was given with no value → default dir.
+    if let Some(dir) = cli.dump_prompts.as_deref() {
+        let dir_arg = if dir.is_empty() { None } else { Some(dir) };
+        match prompts::dump_defaults(dir_arg, cli.force) {
+            Ok(report) => {
+                for name in &report.written {
+                    println!("wrote {}/{name}.md", report.dir.display());
+                }
+                for name in &report.skipped {
+                    println!(
+                        "skipped {}/{name}.md (exists; use --force to overwrite)",
+                        report.dir.display()
+                    );
+                }
+                println!(
+                    "\nAdd this to your daimonos config to use these files (edit as needed):\n\n{}",
+                    prompts::prompts_toml_block(&report.dir)
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("daimonos: --dump-prompts failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = cli.mcp && !startup_logs_early;
-    let cfg = Arc::new(config::load(
-        cli.config.as_deref(),
-        &workspace,
-        quiet_cfg_stderr,
-    ));
+    let mut cfg = config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr);
     if let Err(e) = cfg.validate() {
         eprintln!(
             "config: validation error: {}",
@@ -306,6 +371,26 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // Load optional extra user rules once, before any agent runtime starts.
+    // Pure inspection modes (`agent --dry-run`, `chat --list`) do not create an
+    // agent and therefore do not need the file.
+    let uses_agent_prompt = match &cli.command {
+        Some(Commands::Agent { dry_run, .. }) => !dry_run,
+        Some(Commands::Chat { list, .. }) => !list,
+        Some(Commands::Acp { .. }) => true,
+        None => false,
+    };
+    if uses_agent_prompt {
+        cfg.prompts.additional_agent_instructions =
+            match prompts::load_agent_instructions(cli.agent_instructions.as_deref()).await {
+                Ok(instructions) => instructions,
+                Err(e) => {
+                    eprintln!("agent instructions: {e}");
+                    std::process::exit(2);
+                }
+            };
+    }
+    let cfg = Arc::new(cfg);
     // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
     // index/watcher/plugin setup needed.
     match cli.command {
