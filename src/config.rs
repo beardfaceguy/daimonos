@@ -578,13 +578,8 @@ fn default_project_markers() -> Vec<String> {
 /// successful config discovery (`loaded from …`, `using built-in defaults`).
 /// Parse/read failures are always printed — those are real errors.
 pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: bool) -> Config {
-    let candidates = [
-        explicit.map(|p| p.to_path_buf()),
-        Some(workspace.join("daimonos.toml")),
-        dirs_next().map(|d| d.join("daimonos").join("config.toml")),
-    ];
-
-    for candidate in candidates.iter().flatten() {
+    for candidate in search_candidates(explicit, workspace) {
+        let candidate = &candidate;
         if candidate.is_file() {
             match std::fs::read_to_string(candidate) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
@@ -609,6 +604,22 @@ pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: 
         eprintln!("config: using built-in defaults");
     }
     Config::default()
+}
+
+/// Ordered config-file search candidates, matching `load`'s discovery order:
+/// explicit `--config` path (if any), then `<workspace>/daimonos.toml`, then
+/// `$XDG_CONFIG_HOME`/`~/.config` `daimonos/config.toml`. Candidates that can't
+/// be formed (no `$HOME`/`$XDG_CONFIG_HOME`) are omitted. This is the single
+/// source of truth shared by `load` and the `--print-config-path` CLI flag.
+pub fn search_candidates(explicit: Option<&Path>, workspace: &Path) -> Vec<std::path::PathBuf> {
+    [
+        explicit.map(|p| p.to_path_buf()),
+        Some(workspace.join("daimonos.toml")),
+        dirs_next().map(|d| d.join("daimonos").join("config.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn dirs_next() -> Option<std::path::PathBuf> {
@@ -802,6 +813,22 @@ poll_tail_lines = 50
         let dir = tempfile::tempdir().unwrap();
         let cfg = load(None, dir.path(), false);
         assert_eq!(cfg.index.max_depth, 20);
+    }
+
+    #[test]
+    fn search_candidates_order_and_explicit() {
+        let ws = std::path::Path::new("/tmp/ws");
+        // Without --config: workspace file comes first, home config after.
+        let without = search_candidates(None, ws);
+        assert_eq!(without.first().unwrap(), &ws.join("daimonos.toml"));
+        assert!(without
+            .iter()
+            .all(|c| c != std::path::Path::new("/explicit/cfg.toml")));
+        // With --config: the explicit path is first in the search order.
+        let explicit = std::path::Path::new("/explicit/cfg.toml");
+        let with = search_candidates(Some(explicit), ws);
+        assert_eq!(with.first().unwrap(), explicit);
+        assert_eq!(with[1], ws.join("daimonos.toml"));
     }
 
     #[test]

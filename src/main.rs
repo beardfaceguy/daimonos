@@ -211,6 +211,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     stats: bool,
 
+    /// Print the config file search order (marking which file is used) and
+    /// exit. Honors --config and --workspace. Useful for discovering where to
+    /// put a config file / [prompts] overrides.
+    #[arg(long, default_value_t = false)]
+    print_config_path: bool,
+
     /// With --stats, restrict the report to a single agent-runtime
     /// session id (matches whatever `set_external_session_id` /
     /// `DAIMONOS_AGENT_SESSION_ID` set on the recording side).
@@ -264,6 +270,28 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let workspace = std::fs::canonicalize(&cli.workspace)?;
+
+    // --print-config-path: report discovery order and which file wins, then
+    // exit — before any config load / index / plugin setup.
+    if cli.print_config_path {
+        let candidates = config::search_candidates(cli.config.as_deref(), &workspace);
+        println!("config: search order (first existing file wins):");
+        let mut used: Option<&std::path::Path> = None;
+        for (i, c) in candidates.iter().enumerate() {
+            let found = c.is_file();
+            if found && used.is_none() {
+                used = Some(c);
+            }
+            let mark = if found { "found" } else { "not found" };
+            println!("  {}. {} [{mark}]", i + 1, c.display());
+        }
+        match used {
+            Some(p) => println!("=> using: {}", p.display()),
+            None => println!("=> using: built-in defaults (no config file found)"),
+        }
+        return Ok(());
+    }
+
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = cli.mcp && !startup_logs_early;
     let cfg = Arc::new(config::load(
