@@ -26830,8 +26830,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784093161.3500726,
-    "ast_hash": "92a89067c7a497024c3bc3fc07051592",
+    "mtime": 1784142428.075531,
+    "ast_hash": "19462b826db192e2cb0a9b3d57639c62",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -26895,8 +26895,8 @@
     "semantic_hash": ""
   },
   "src/main.rs": {
-    "mtime": 1784093149.768156,
-    "ast_hash": "4a0b8654ac0eb11c63c2a43ad1f313ca",
+    "mtime": 1784146727.1082463,
+    "ast_hash": "6d6dc7b227188b1a32f5a3f0c7a7f0f5",
     "semantic_hash": ""
   },
   "src/mcp.rs": {
@@ -29485,8 +29485,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784093224.1576202,
-    "ast_hash": "575360f4b12440546b2211c7bb300f96",
+    "mtime": 1784142520.374912,
+    "ast_hash": "21b2bd78d1725a14520283a0c599284e",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -29860,8 +29860,8 @@
     "semantic_hash": ""
   },
   "src/prompts.rs": {
-    "mtime": 1784092846.165342,
-    "ast_hash": "1cdec4a213f983b2ee5c91a5bce04708",
+    "mtime": 1784146742.624116,
+    "ast_hash": "5395b732177928e846f7a115e3facb70",
     "semantic_hash": ""
   },
   "src/session_store.rs": {
@@ -29910,8 +29910,8 @@
     "semantic_hash": ""
   },
   "prompts/README.md": {
-    "mtime": 1784092846.1633422,
-    "ast_hash": "2c24838ca476a96a6eb92ed718464d01",
+    "mtime": 1784142512.7239635,
+    "ast_hash": "13c4ebc45de12d6604e862456c5b2ee6",
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
@@ -29932,6 +29932,11 @@
   "prompts/summary.md": {
     "mtime": 1784092846.1650639,
     "ast_hash": "b39234fd3026ca1c3db7a171cb88909b",
+    "semantic_hash": ""
+  },
+  "tests/test_cli_prompts.py": {
+    "mtime": 1784146721.706292,
+    "ast_hash": "512bb8e6246a88297645162878ccefda",
     "semantic_hash": ""
   }
 }

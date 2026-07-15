@@ -25,6 +25,49 @@ stderr (it does not crash).
 the prompt, so do **not** put comments inside a prompt file (they would be sent
 to the model). Keep guidance in this README or in `daimonos.toml` comments.
 
+## Getting the baseline defaults (no source needed)
+
+Because the defaults are embedded in the binary, you can recover them at runtime
+— you don't need this repo:
+
+```bash
+daimonos --print-prompt <name>       # print one default to stdout (name is one
+                                     #   of: agent_system, mcp_instructions,
+                                     #   kgl_hint, summary)
+daimonos --dump-prompts              # scaffold all four into
+                                     #   ~/.config/daimonos/prompts/
+daimonos --dump-prompts /path/dir    # ...into a custom directory
+daimonos --dump-prompts --force      # overwrite existing files
+```
+
+`--dump-prompts` skips files that already exist (unless `--force`) and prints a
+ready-to-paste `[prompts]` block pointing at the scaffolded files, so you start
+from the baseline and can diff your edits against it.
+
+## Additional user instructions for agent runtimes
+
+`daimonos agent`, `daimonos chat`, and ACP optionally append user-specific
+instructions to the resolved `agent_system` prompt. Put them at:
+
+```text
+~/.config/daimonos/agent-instructions.md
+```
+
+`$XDG_CONFIG_HOME` replaces `~/.config` when set. A missing default file means
+"no additional instructions" and is silently ignored. To use another file:
+
+```bash
+daimonos agent "task" --agent-instructions /path/to/rules.md
+daimonos chat --agent-instructions /path/to/rules.md
+daimonos acp --agent-instructions /path/to/rules.md
+```
+
+The file is appended verbatim with only a blank-line separator. An explicitly
+selected unreadable file is an error; an existing but unreadable default file is
+also an error so configured rules are never silently omitted. This mechanism
+does not affect `daimonos --mcp`, whose host-facing prompt is
+`mcp_instructions`.
+
 ## The prompts
 
 | File | Used by | Purpose |

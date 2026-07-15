@@ -41,6 +41,11 @@ pub struct PromptsConfig {
     pub kgl_hint: Option<String>,
     /// Compaction summarizer system prompt.
     pub summary: Option<String>,
+    /// Additional user instructions loaded at startup for agent/chat/ACP and
+    /// appended to the resolved `agent_system`. Runtime-only: populated from
+    /// the default file or `--agent-instructions`, never deserialized from TOML.
+    #[serde(skip)]
+    pub additional_agent_instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -622,7 +627,11 @@ pub fn search_candidates(explicit: Option<&Path>, workspace: &Path) -> Vec<std::
     .collect()
 }
 
-fn dirs_next() -> Option<std::path::PathBuf> {
+/// Base config directory (`$XDG_CONFIG_HOME`, else `~/.config`). `daimonos`'s
+/// own files live under `<this>/daimonos/`. Shared by config discovery and the
+/// prompt-scaffold default directory so both agree on where daimonos config
+/// lives.
+pub(crate) fn dirs_next() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
