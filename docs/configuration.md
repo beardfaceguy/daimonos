@@ -24,6 +24,21 @@ Or place it in your project:
 cp daimonos.default.toml /path/to/project/daimonos.toml
 ```
 
+### Which config file is in use?
+
+To see the discovery order and which file (if any) daimonos will load:
+
+```bash
+daimonos --print-config-path            # uses default workspace (.)
+daimonos --print-config-path -w /path   # for a specific workspace
+daimonos --print-config-path --config /path/to/file.toml
+```
+
+It prints each candidate in search order with a `[found]` / `[not found]`
+marker and the file that wins (or `built-in defaults` if none exist), then
+exits without starting the server. In non-MCP modes daimonos also logs
+`config: loaded from …` to stderr at startup (add `--verbose` in `--mcp` mode).
+
 ## Settings
 
 ### `[index]` — Workspace Indexing
