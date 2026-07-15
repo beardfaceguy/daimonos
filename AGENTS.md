@@ -175,6 +175,11 @@ daimonos/
 - **No hardcoded values**: all tunables go in `daimonos.default.toml` and
   `config.rs`. Never hardcode file extensions, limits, or defaults in
   operational code.
+- **No hardcoded prompts**: model-facing prompts live in `prompts/*.md`,
+  embedded via `include_str!` in `src/prompts.rs` and overridable at runtime
+  through the `[prompts]` config table (see `prompts/README.md`). Never inline a
+  new model-facing prompt as a string literal — add a `prompts/*.md` file and an
+  override key instead.
 - **Compact field names**: protocol fields use single-letter keys (`c`, `p`,
   `s`, `n`, `a`, `g`, `kv`) to minimize token cost. Response fields are
   similarly terse (`d` for data, `e` for error code, `m` for message).

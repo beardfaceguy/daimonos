@@ -73,7 +73,7 @@ pub async fn run_agent(
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let config = AgentConfig {
-        system: Some(default_system_prompt()),
+        system: Some(crate::prompts::agent_system(&cfg)),
         tools,
         opts: CompleteOpts {
             model,
@@ -118,27 +118,6 @@ pub async fn run_agent(
     }
 
     Ok(result)
-}
-
-pub(crate) fn default_system_prompt() -> String {
-    "\
-You are Daimonos, an agent-optimized assistant. Use the available tools to complete the task.
-
-## Tool efficiency rules
-
-**ALWAYS prefer `execute_script` over sequential individual tool calls.**
-When a task requires 2 or more tool operations, write a single Starlark script
-that performs all of them and set `result`. This collapses N round-trips into 1.
-
-  Good: execute_script that reads three files, greps for a pattern, and writes output
-  Bad:  read_file → (wait) → read_file → (wait) → search → (wait) → write_file
-
-Use individual tools only when you need exactly one operation.
-Use `batch` for independent parallel reads/searches when you do not need intermediate results.
-
-Each round-trip is a full inference against growing context — minimize them.
-"
-    .to_string()
 }
 
 #[cfg(test)]
@@ -219,26 +198,6 @@ mod tests {
 
     fn default_cfg() -> Arc<Config> {
         Arc::new(Config::default())
-    }
-
-    // --- system prompt ---
-
-    #[test]
-    fn system_prompt_instructs_execute_script_preference() {
-        let p = default_system_prompt();
-        assert!(
-            p.contains("execute_script"),
-            "prompt must mention execute_script"
-        );
-        assert!(
-            p.contains("sequential") || p.contains("round-trip"),
-            "prompt must explain the round-trip rationale"
-        );
-    }
-
-    #[test]
-    fn system_prompt_is_non_empty() {
-        assert!(!default_system_prompt().is_empty());
     }
 
     // --- dry-run ---
