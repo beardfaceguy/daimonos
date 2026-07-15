@@ -1100,25 +1100,18 @@ impl ServerHandler for DaimonosHandler {
 /// Orientation hint nudging agents to query the KGL graph first (and to record
 /// intent as they work). Only emitted when KGL auto-indexing is on, so the
 /// graph actually exists. Pure (takes the gate) so it's testable without env.
-fn kgl_instructions_hint(kgl_enabled: bool) -> Option<&'static str> {
+fn kgl_instructions_hint(kgl_enabled: bool, cfg: &crate::config::Config) -> Option<String> {
     if !kgl_enabled {
         return None;
     }
-    Some(
-        "KGL graph: this workspace has a queryable code+intent knowledge graph. To orient before \
-         reading source, call kgl_query {query:'orient', args:{task:'<topic>'}} — one call returns \
-         matching defs + their intent/open-questions + edges + dependents. Record intent / \
-         provenance / contracts as you work with kgl_assert. Reading source still finds latent \
-         issues the graph hasn't been told about.",
-    )
+    Some(crate::prompts::kgl_hint(cfg))
 }
 
-async fn build_instructions(workspace: &std::path::Path) -> String {
+async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Config) -> String {
+    // The static instruction sentences are an externalized prompt (vikunja
+    // #974); the dynamic workspace context below is appended in code.
     let mut parts = vec![
-        "Use daimonos tools, not built-in equivalents.".to_string(),
-        "If your plan requires 2+ tool calls, use execute_script instead — write a Starlark script that calls the tool functions and sets `result`. This is faster and cheaper than sequential calls. Only call individual tools when you need exactly one operation.".to_string(),
-        "Terse output. Drop filler, articles, pleasantries, hedging. Fragments OK. Technical substance exact. Code unchanged. Pattern: [thing] [action] [reason].".to_string(),
-        "File discovery: use ls(glob=\"*.ext\", type=\"f\", depth=N) instead of exec find — ls auto-excludes .git/node_modules/target/__pycache__ and returns structured JSON.".to_string(),
+        crate::prompts::mcp_instructions(cfg).trim_end().to_string(),
         format!("Workspace: {}", workspace.display()),
     ];
 
@@ -1127,8 +1120,8 @@ async fn build_instructions(workspace: &std::path::Path) -> String {
         script::tool_signatures()
     ));
 
-    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled()) {
-        parts.push(hint.to_string());
+    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg) {
+        parts.push(hint.trim_end().to_string());
     }
 
     // Detect primary language / project type from manifest files
@@ -1304,7 +1297,7 @@ pub async fn run_mcp_server(
     // process-global env reads (vikunja #181).
     session.verbosity = config::effective_verbosity(&session.cfg);
 
-    let instructions = build_instructions(&workspace).await;
+    let instructions = build_instructions(&workspace, &session.cfg).await;
     let handler = DaimonosHandler::new(session, last_activity, startup_logs);
 
     let server_details = InitializeResult {
@@ -1405,7 +1398,7 @@ pub async fn serve_one_mcp(
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
-    let instructions = build_instructions(&session.workspace).await;
+    let instructions = build_instructions(&session.workspace, &session.cfg).await;
 
     while let Ok(Some(line)) = lines.next_line().await {
         let req: Value = match serde_json::from_str(&line) {
@@ -1814,8 +1807,9 @@ mod tests {
 
     #[test]
     fn kgl_hint_is_gated_and_mentions_orient() {
-        assert!(kgl_instructions_hint(false).is_none());
-        let hint = kgl_instructions_hint(true).expect("hint when enabled");
+        assert!(kgl_instructions_hint(false, &crate::config::Config::default()).is_none());
+        let hint = kgl_instructions_hint(true, &crate::config::Config::default())
+            .expect("hint when enabled");
         assert!(hint.contains("orient"));
         assert!(hint.contains("kgl_assert"));
     }
@@ -1823,7 +1817,7 @@ mod tests {
     #[tokio::test]
     async fn build_instructions_includes_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions = build_instructions(dir.path()).await;
+        let instructions = build_instructions(dir.path(), &crate::config::Config::default()).await;
         let workspace_str = dir.path().to_string_lossy();
         assert!(
             instructions.contains(&*workspace_str),
@@ -1837,7 +1831,7 @@ mod tests {
         tokio::fs::write(dir.path().join("Cargo.toml"), "[package]")
             .await
             .unwrap();
-        let instructions = build_instructions(dir.path()).await;
+        let instructions = build_instructions(dir.path(), &crate::config::Config::default()).await;
         assert!(instructions.contains("Rust (Cargo)"));
     }
 
@@ -1847,7 +1841,7 @@ mod tests {
         tokio::fs::create_dir(dir.path().join(".git"))
             .await
             .unwrap();
-        let instructions = build_instructions(dir.path()).await;
+        let instructions = build_instructions(dir.path(), &crate::config::Config::default()).await;
         assert!(instructions.contains("VCS: git"));
     }
 
@@ -1858,7 +1852,7 @@ mod tests {
         tokio::fs::create_dir(dir.path().join("tests"))
             .await
             .unwrap();
-        let instructions = build_instructions(dir.path()).await;
+        let instructions = build_instructions(dir.path(), &crate::config::Config::default()).await;
         assert!(instructions.contains("Top-level dirs:"));
         assert!(instructions.contains("src"));
     }

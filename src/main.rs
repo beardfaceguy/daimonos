@@ -12,6 +12,7 @@ mod mcp;
 mod ops;
 mod pipeline_cache;
 mod plugins;
+mod prompts;
 mod protocol;
 mod providers;
 mod safety;
@@ -423,6 +424,9 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             };
+            // Apply the [prompts].summary override (vikunja #974) unless the
+            // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
+            let compaction = prompts::apply_summary_override(compaction, &cfg);
             let approve_fn = if agent.approval_mode == "auto" {
                 None
             } else {
@@ -492,6 +496,9 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             };
+            // Apply the [prompts].summary override (vikunja #974) unless the
+            // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
+            let compaction = prompts::apply_summary_override(compaction, &cfg);
             // No approve_fn: ACP asks the client via session/request_permission,
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.

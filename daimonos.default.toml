@@ -174,6 +174,26 @@ blast_radius_max = 500
 # registering watches (build/vcs churn + our own store).
 skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 
+[prompts]
+# Runtime overrides for the model-facing prompts (vikunja #974). Each key is a
+# path to a file whose contents REPLACE the built-in default embedded in the
+# binary. Leave a key unset (or empty) to use the embedded default. A path that
+# points at an unreadable file falls back to the embedded default and warns on
+# stderr. `~` expands to $HOME. The whole file is sent to the model verbatim, so
+# do NOT put comments inside a prompt file. See prompts/README.md for details.
+#
+# WARNING: these steer agent behavior, tool-use strategy, and output token cost.
+# Removing the execute_script guidance or the terse directive typically INCREASES
+# token usage. Override deliberately; prefer editing copies over the committed
+# defaults in prompts/ so you can compare against the baseline.
+#
+# agent_system     = "~/.config/daimonos/prompts/agent_system.md"
+# mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
+# kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
+# summary          = "~/.config/daimonos/prompts/summary.md"
+# Note: `summary` is also overridable via the agent-env DAIMONOS_AGENT_SUMMARY_PROMPT,
+# which takes precedence over the path above.
+
 # Registered tools for the tool runner.
 # Each tool gets a [tools.<id>] section.
 # Tools with id "x07" use the built-in X07 plugin; all others use the generic CLI plugin.

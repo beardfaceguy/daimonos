@@ -86,17 +86,12 @@ pub struct CompactionEvent {
     pub fallback_drop: bool,
 }
 
-/// Default summarization system prompt (a template, not a tunable number —
-/// env-overridable via `DAIMONOS_AGENT_SUMMARY_PROMPT`).
+/// Default summarization system prompt. Externalized to `prompts/summary.md`
+/// and embedded at compile time (vikunja #974); overridable at runtime via the
+/// agent-env `DAIMONOS_AGENT_SUMMARY_PROMPT` or the `[prompts].summary` config
+/// key (see `prompts::apply_summary_override`).
 pub fn default_summary_prompt() -> String {
-    "You are summarizing the earlier part of a conversation between a user and a \
-     coding agent so the conversation can continue with the summary in place of \
-     the original messages. Preserve: the user's overall goal; key decisions and \
-     their rationale; files, commands, and resources touched and their current \
-     state; important facts learned from tool results; and open threads or next \
-     steps. Drop verbatim file contents, command output, and pleasantries. Be \
-     dense and factual. Reply with the summary only."
-        .to_string()
+    crate::prompts::SUMMARY_DEFAULT.to_string()
 }
 
 // --- Token estimation (chars/4) ---

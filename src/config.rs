@@ -18,8 +18,29 @@ pub struct Config {
     pub mcp: McpConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
+    pub prompts: PromptsConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
+}
+
+/// Runtime overrides for the model-facing prompts (vikunja #974). Each field is
+/// an optional path to a file whose contents replace the embedded default in
+/// `src/prompts.rs`. `None`/empty → the embedded default. See `prompts/README.md`.
+///
+/// WARNING: these steer agent behavior and token cost. `summary` also honors the
+/// agent-env `DAIMONOS_AGENT_SUMMARY_PROMPT`, which takes precedence over the
+/// path here (see `prompts::apply_summary_override`).
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct PromptsConfig {
+    /// Core agent system prompt (`daimonos agent` / `chat` / ACP).
+    pub agent_system: Option<String>,
+    /// Static MCP server instructions (`daimonos --mcp`).
+    pub mcp_instructions: Option<String>,
+    /// KGL orientation hint (only emitted when KGL auto-index is on).
+    pub kgl_hint: Option<String>,
+    /// Compaction summarizer system prompt.
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

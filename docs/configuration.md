@@ -253,6 +253,40 @@ blast_radius_max = 500
 skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 ```
 
+### `[prompts]` — Model-Facing Prompt Overrides
+
+The prompts that steer daimonos's behavior are embedded in the binary as
+defaults but can be overridden at runtime without recompiling. Each key points
+at a file whose contents **replace** the built-in default. Leave a key unset (or
+empty) to use the embedded default; a key pointing at an unreadable file falls
+back to the embedded default and warns on stderr. `~` expands to `$HOME`. The
+file is sent to the model verbatim, so do **not** put comments inside a prompt
+file. See `prompts/README.md` for the committed defaults and full guidance.
+
+```toml
+[prompts]
+# agent_system     = "~/.config/daimonos/prompts/agent_system.md"
+# mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
+# kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
+# summary          = "~/.config/daimonos/prompts/summary.md"
+```
+
+| Key | Used by | Purpose |
+|-----|---------|---------|
+| `agent_system` | `daimonos agent` / `chat` / ACP | Core agent system prompt (tool-use strategy, `execute_script` preference). |
+| `mcp_instructions` | `daimonos --mcp` | Server instructions sent to the MCP host, including the terse-output directive that affects output token cost. |
+| `kgl_hint` | `daimonos --mcp` (KGL auto-index only) | Nudge to orient via the knowledge graph before reading source. |
+| `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
+
+**Warning**: these change how the agent behaves. Removing the `execute_script`
+guidance or the terse directive typically **increases** token usage. Override
+deliberately and prefer editing copies over the committed defaults so you can
+compare against the baseline.
+
+`summary` is also overridable via the `DAIMONOS_AGENT_SUMMARY_PROMPT` agent-env
+variable, which takes precedence over `[prompts].summary`. Precedence:
+`DAIMONOS_AGENT_SUMMARY_PROMPT` > `[prompts].summary` > embedded `summary.md`.
+
 ### `[tools.<id>]` — Tool Plugins (Advanced)
 
 Register external tools for the tool runner system. Most users don't need
@@ -275,6 +309,7 @@ These are not part of the config file but affect daimonos behavior:
 | `DAIMONOS_IDLE_TIMEOUT_SECS` | Overrides `[mcp] idle_timeout_secs` when set to a parseable integer. `0` disables the idle watchdog. Used by tests. |
 | `DAIMONOS_LOG_STARTUP` | When non-empty and not `0` / `false` / `no`, enables MCP stderr startup diagnostics before config load (same family as `--verbose` / `[mcp] startup_logs`). |
 | `DAIMONOS_AGENT_SESSION_ID` | Optional agent-runtime session id (e.g. a UUID matching `claude --session-id`). When set, every analytics row recorded by this daimonos process is tagged with this id, and `daimonos --stats --session-id <id>` / `session_stats {external_session_id: <id>}` will filter to it. The `set_external_session_id` MCP tool can override this at runtime. |
+| `DAIMONOS_AGENT_SUMMARY_PROMPT` | Overrides the context-compaction summarizer prompt. Takes precedence over `[prompts].summary` and the embedded default. |
 | `DISCORD_BOT_TOKEN` | Default Discord bot token variable when `[discord].bot_token_env_var` is unchanged. |
 | `PATH` | Daimonos inherits the launching process's `PATH` for exec/bg commands |
 

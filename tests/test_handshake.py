@@ -86,6 +86,60 @@ def test_initialize_instructions_contain_workspace_context(daimonos_binary, tmp_
         proc.wait(timeout=5)
 
 
+def _instructions(daimonos_binary, workspace) -> str:
+    """Spawn the MCP server and return the handshake `instructions` string."""
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp", "-w", str(workspace)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        from conftest import DaimonosClient
+
+        client = DaimonosClient(proc, str(workspace))
+        resp = client.send_raw({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1.0.0"},
+            },
+        })
+        return resp["result"].get("instructions", "")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_initialize_instructions_contain_terse_directive(daimonos_binary, tmp_path):
+    """The externalized default MCP instructions (prompts/mcp_instructions.md)
+    are still served over the handshake — regression for vikunja #974."""
+    instructions = _instructions(daimonos_binary, tmp_path)
+    assert "Terse output" in instructions
+    assert "Use daimonos tools" in instructions
+
+
+def test_prompts_override_replaces_mcp_instructions(daimonos_binary, tmp_path):
+    """A `[prompts].mcp_instructions` override in daimonos.toml replaces the
+    embedded default at runtime (vikunja #974, Option A) — proves prompts are
+    editable without recompiling."""
+    custom = tmp_path / "custom_mcp.md"
+    custom.write_text("SENTINEL custom mcp instructions line.\n", encoding="utf-8")
+    (tmp_path / "daimonos.toml").write_text(
+        "[prompts]\nmcp_instructions = " + repr(str(custom)) + "\n",
+        encoding="utf-8",
+    )
+    instructions = _instructions(daimonos_binary, tmp_path)
+    assert "SENTINEL custom mcp instructions line." in instructions
+    # The embedded default's terse directive must be gone (fully replaced).
+    assert "Terse output" not in instructions
+    # Dynamic context is still appended after the override.
+    assert str(tmp_path) in instructions
+
+
 def test_list_tools_returns_core_tools(daimonos):
     """Core tools + git + snapshots are exposed by default."""
     tools = daimonos.list_tools()

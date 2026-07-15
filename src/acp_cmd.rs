@@ -35,7 +35,6 @@ use crate::agent::{
     AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook, BeforeHookResult,
     TokenLogConfig, ToolCallInfo,
 };
-use crate::agent_cmd::default_system_prompt;
 use crate::config::Config;
 use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema, Usage};
 use crate::session::Session;
@@ -334,6 +333,7 @@ fn build_compaction_hook(
 /// Build the [`AgentConfig`] for one ACP session — mirrors
 /// `chat_cmd::build_agent_config`, but every hook reports through
 /// `session/update`/`session/request_permission` instead of the terminal.
+#[allow(clippy::too_many_arguments)]
 fn build_agent_config(
     workspace: &Path,
     model: String,
@@ -342,6 +342,7 @@ fn build_agent_config(
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
+    system_prompt: String,
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
@@ -352,7 +353,7 @@ fn build_agent_config(
         })
         .collect();
     AgentConfig {
-        system: Some(default_system_prompt()),
+        system: Some(system_prompt),
         tools,
         opts: CompleteOpts {
             model,
@@ -489,6 +490,7 @@ fn build_session_handle(
         safety,
         token_log,
         state.compaction.clone(),
+        crate::prompts::agent_system(cfg),
     );
     let tool_session = Session::new(session_workspace, Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
