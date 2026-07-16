@@ -151,16 +151,17 @@ fn tool_call_locations(
     let Some(path) = tool_target_path(workspace, input) else {
         return Vec::new();
     };
-    let mut location = ToolCallLocation::new(path);
     // read_file's `offset` is a 0-based start line — the same base Zed
     // uses for `line` (it builds `Point::new(line, ...)` directly).
-    if name == "read_file" {
-        location.line = input
+    let line = if name == "read_file" {
+        input
             .get("offset")
             .and_then(|v| v.as_u64())
-            .and_then(|line| u32::try_from(line).ok());
-    }
-    vec![location]
+            .and_then(|line| u32::try_from(line).ok())
+    } else {
+        None
+    };
+    vec![ToolCallLocation::new(path).line(line)]
 }
 
 /// Reconstruct the full post-edit file text by replaying `edit_file`'s
