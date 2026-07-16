@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
-    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -121,19 +121,46 @@ fn is_file_edit_tool(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
 }
 
-/// Resolve a file-edit tool call's `path` argument the way
-/// `Session::resolve_path` does for a session whose cwd is the workspace.
-/// Best-effort: if the agent moved its cwd with `set_cwd`, a relative path
-/// may resolve differently than the tool saw it — the after hook then
-/// falls back to plain-text rendering (edit_file) or shows the diff as a
-/// file creation (write_file).
-fn edit_target_path(workspace: &Path, input: &serde_json::Value) -> Option<PathBuf> {
+/// Resolve a tool call's `path` argument the way `Session::resolve_path`
+/// does for a session whose cwd is the workspace. Best-effort: if the
+/// agent moved its cwd with `set_cwd`, a relative path may resolve
+/// differently than the tool saw it — consumers degrade gracefully (diff
+/// rendering falls back to plain text, follow-the-agent locations just
+/// don't resolve to a buffer).
+fn tool_target_path(workspace: &Path, input: &serde_json::Value) -> Option<PathBuf> {
     let path = PathBuf::from(input.get("path")?.as_str()?);
     Some(if path.is_absolute() {
         path
     } else {
         workspace.join(path)
     })
+}
+
+/// Locations for the client's "follow the agent" mode (vikunja #986):
+/// file-oriented tool calls advertise the file (and line, when known) they
+/// touch, so Zed can move its agent-location indicator there. Non-file
+/// tools (and calls without a usable `path`) advertise none.
+fn tool_call_locations(
+    workspace: &Path,
+    name: &str,
+    input: &serde_json::Value,
+) -> Vec<ToolCallLocation> {
+    if !matches!(name, "read_file" | "write_file" | "edit_file" | "search") {
+        return Vec::new();
+    }
+    let Some(path) = tool_target_path(workspace, input) else {
+        return Vec::new();
+    };
+    let mut location = ToolCallLocation::new(path);
+    // read_file's `offset` is a 0-based start line — the same base Zed
+    // uses for `line` (it builds `Point::new(line, ...)` directly).
+    if name == "read_file" {
+        location.line = input
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .and_then(|line| u32::try_from(line).ok());
+    }
+    vec![location]
 }
 
 /// Reconstruct the full post-edit file text by replaying `edit_file`'s
@@ -164,7 +191,7 @@ fn diff_for_completed_edit(
     workspace: &Path,
     old_text: Option<String>,
 ) -> Option<AcpDiff> {
-    let path = edit_target_path(workspace, &info.input)?;
+    let path = tool_target_path(workspace, &info.input)?;
     let new_text = match info.name.as_str() {
         "write_file" => info.input.get("content")?.as_str()?.to_string(),
         "edit_file" => {
@@ -289,6 +316,7 @@ fn build_before_tool_call_hook(
             let tool_call = ToolCall::new(info.id.clone(), info.name.clone())
                 .kind(tool_kind_for(&info.name))
                 .status(ToolCallStatus::Pending)
+                .locations(tool_call_locations(&workspace, &info.name, &info.input))
                 .raw_input(Some(info.input.clone()));
             send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
 
@@ -306,7 +334,7 @@ fn build_before_tool_call_hook(
             // Capture the pre-edit file text so the after hook can render
             // the completion as a Diff (vikunja #983).
             if matches!(decision, BeforeHookResult::Allow) && is_file_edit_tool(&info.name) {
-                if let Some(path) = edit_target_path(&workspace, &info.input) {
+                if let Some(path) = tool_target_path(&workspace, &info.input) {
                     let old_text = tokio::fs::read_to_string(&path).await.ok();
                     diff_stash
                         .lock()
@@ -2232,17 +2260,17 @@ mod tests {
     // --- Diff content for write_file/edit_file (vikunja #983) ---
 
     #[test]
-    fn edit_target_path_joins_relative_to_workspace() {
+    fn tool_target_path_joins_relative_to_workspace() {
         let ws = Path::new("/workspace");
         assert_eq!(
-            edit_target_path(ws, &serde_json::json!({"path": "src/f.rs"})),
+            tool_target_path(ws, &serde_json::json!({"path": "src/f.rs"})),
             Some(PathBuf::from("/workspace/src/f.rs"))
         );
         assert_eq!(
-            edit_target_path(ws, &serde_json::json!({"path": "/abs/f.rs"})),
+            tool_target_path(ws, &serde_json::json!({"path": "/abs/f.rs"})),
             Some(PathBuf::from("/abs/f.rs"))
         );
-        assert_eq!(edit_target_path(ws, &serde_json::json!({})), None);
+        assert_eq!(tool_target_path(ws, &serde_json::json!({})), None);
     }
 
     #[test]
@@ -2353,6 +2381,86 @@ mod tests {
             input: serde_json::json!({"path": "f.txt", "content": "x"}),
         };
         assert!(diff_for_completed_edit(&info, "{}", Path::new("/ws"), None).is_none());
+    }
+
+    // --- tool-call locations for follow-the-agent (vikunja #986) ---
+
+    #[test]
+    fn locations_for_read_file_include_offset_as_line() {
+        let locs = tool_call_locations(
+            Path::new("/ws"),
+            "read_file",
+            &serde_json::json!({"path": "src/f.rs", "offset": 42}),
+        );
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, PathBuf::from("/ws/src/f.rs"));
+        assert_eq!(locs[0].line, Some(42));
+    }
+
+    #[test]
+    fn locations_for_read_file_without_offset_have_no_line() {
+        let locs = tool_call_locations(
+            Path::new("/ws"),
+            "read_file",
+            &serde_json::json!({"path": "f.rs"}),
+        );
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].line, None);
+    }
+
+    #[test]
+    fn locations_for_write_and_edit_carry_path_only() {
+        for tool in ["write_file", "edit_file"] {
+            let locs = tool_call_locations(
+                Path::new("/ws"),
+                tool,
+                &serde_json::json!({"path": "f.rs", "offset": 3}),
+            );
+            assert_eq!(locs.len(), 1, "{tool}");
+            assert_eq!(locs[0].path, PathBuf::from("/ws/f.rs"), "{tool}");
+            assert_eq!(locs[0].line, None, "{tool}");
+        }
+    }
+
+    #[test]
+    fn locations_empty_for_non_file_tools_and_missing_path() {
+        assert!(tool_call_locations(
+            Path::new("/ws"),
+            "exec",
+            &serde_json::json!({"path": "f.rs"})
+        )
+        .is_empty());
+        assert!(tool_call_locations(
+            Path::new("/ws"),
+            "search",
+            &serde_json::json!({"pattern": "x"})
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn acp_tool_call_advertises_location() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp("t1", "read_file", serde_json::json!({"path": "f.txt"})),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let locations: Vec<&ToolCallLocation> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCall(tc) => Some(&tc.locations),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(locations.len(), 1, "got: {updates:?}");
+        assert_eq!(locations[0].path, dir.path().join("f.txt"));
     }
 
     /// Run one scripted tool call through the full ACP flow and return the
