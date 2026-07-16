@@ -18,14 +18,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock, ContentChunk,
-    Cost as AcpCost, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    Cost as AcpCost, Diff as AcpDiff, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
     RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
-    TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UsageUpdate,
+    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -108,6 +108,75 @@ struct AcpState {
 
 /// The `SessionConfigId` for the model picker option.
 const MODEL_CONFIG_ID: &str = "model";
+
+/// Pre-edit file text captured by the before hook (keyed by tool-call id)
+/// and consumed by the after hook to render write_file/edit_file
+/// completions as ACP `Diff` content (vikunja #983). A `None` value means
+/// the file did not exist (or could not be read) before the call.
+type DiffStash = Arc<StdMutex<HashMap<String, Option<String>>>>;
+
+/// Tools whose successful completion is rendered as an ACP `Diff` instead
+/// of the raw JSON tool output (vikunja #983).
+fn is_file_edit_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
+}
+
+/// Resolve a file-edit tool call's `path` argument the way
+/// `Session::resolve_path` does for a session whose cwd is the workspace.
+/// Best-effort: if the agent moved its cwd with `set_cwd`, a relative path
+/// may resolve differently than the tool saw it — the after hook then
+/// falls back to plain-text rendering (edit_file) or shows the diff as a
+/// file creation (write_file).
+fn edit_target_path(workspace: &Path, input: &serde_json::Value) -> Option<PathBuf> {
+    let path = PathBuf::from(input.get("path")?.as_str()?);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    })
+}
+
+/// Reconstruct the full post-edit file text by replaying `edit_file`'s
+/// applied `[old, new]` pairs on the pre-edit text — the same sequential
+/// `replacen(old, new, 1)` the patch op performs. Returns `None` when a
+/// pair doesn't match (the pre-edit capture raced another write or
+/// resolved a different path than the tool did), signalling the caller to
+/// fall back to plain-text rendering rather than show a wrong diff.
+fn replay_edit_pairs(old_text: &str, pairs: &[serde_json::Value]) -> Option<String> {
+    let mut text = old_text.to_string();
+    for pair in pairs {
+        let old = pair.get(0)?.as_str()?;
+        let new = pair.get(1)?.as_str()?;
+        if !text.contains(old) {
+            return None;
+        }
+        text = text.replacen(old, new, 1);
+    }
+    Some(text)
+}
+
+/// Build the ACP `Diff` for a successfully completed write_file/edit_file
+/// call, or `None` to keep the plain-text rendering. `old_text` is the
+/// pre-call file content captured by the before hook.
+fn diff_for_completed_edit(
+    info: &ToolCallInfo,
+    output: &str,
+    workspace: &Path,
+    old_text: Option<String>,
+) -> Option<AcpDiff> {
+    let path = edit_target_path(workspace, &info.input)?;
+    let new_text = match info.name.as_str() {
+        "write_file" => info.input.get("content")?.as_str()?.to_string(),
+        "edit_file" => {
+            let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
+            // No `diffs` key means nothing was applied — no diff to show.
+            let pairs = parsed.get("diffs")?.as_array()?;
+            replay_edit_pairs(old_text.as_deref()?, pairs)?
+        }
+        _ => return None,
+    };
+    Some(AcpDiff::new(path, new_text).old_text(old_text))
+}
 
 /// Map a daimonos tool name to the closest ACP [`ToolKind`] for client UI
 /// (icon/treatment) purposes. Best-effort — unmapped tools fall back to
@@ -203,11 +272,15 @@ fn build_before_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     safety: Arc<crate::safety::SafetyPolicy>,
+    diff_stash: DiffStash,
+    workspace: PathBuf,
 ) -> BeforeHook {
     Box::new(move |info: &ToolCallInfo| {
         let connection = Arc::clone(&connection);
         let session_id = session_id.clone();
         let safety = Arc::clone(&safety);
+        let diff_stash = Arc::clone(&diff_stash);
+        let workspace = workspace.clone();
         Box::pin(async move {
             let Some(cx) = current_cx(&connection) else {
                 return BeforeHookResult::Block("no active ACP connection".to_string());
@@ -230,6 +303,18 @@ fn build_before_tool_call_hook(
                 }
             };
 
+            // Capture the pre-edit file text so the after hook can render
+            // the completion as a Diff (vikunja #983).
+            if matches!(decision, BeforeHookResult::Allow) && is_file_edit_tool(&info.name) {
+                if let Some(path) = edit_target_path(&workspace, &info.input) {
+                    let old_text = tokio::fs::read_to_string(&path).await.ok();
+                    diff_stash
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(info.id.clone(), old_text);
+                }
+            }
+
             let status = match &decision {
                 BeforeHookResult::Allow => ToolCallStatus::InProgress,
                 BeforeHookResult::Block(_) => ToolCallStatus::Failed,
@@ -245,8 +330,20 @@ fn build_before_tool_call_hook(
     })
 }
 
-fn build_after_tool_call_hook(connection: CurrentConnection, session_id: SessionId) -> AfterHook {
+fn build_after_tool_call_hook(
+    connection: CurrentConnection,
+    session_id: SessionId,
+    diff_stash: DiffStash,
+    workspace: PathBuf,
+) -> AfterHook {
     Box::new(move |info: &ToolCallInfo, content: &str, is_error: bool| {
+        // Always drain this call's stash entry (even on failure) so blocked
+        // or failed edits don't leak entries.
+        let old_text = diff_stash
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&info.id)
+            .flatten();
         let Some(cx) = current_cx(&connection) else {
             return AfterHookResult::Continue;
         };
@@ -255,14 +352,18 @@ fn build_after_tool_call_hook(connection: CurrentConnection, session_id: Session
         } else {
             ToolCallStatus::Completed
         };
+        let block: AcpToolCallContent = match (!is_error)
+            .then(|| diff_for_completed_edit(info, content, &workspace, old_text))
+            .flatten()
+        {
+            Some(diff) => diff.into(),
+            None => AcpContentBlock::Text(TextContent::new(content.to_string())).into(),
+        };
         let update = ToolCallUpdate::new(
             info.id.clone(),
             ToolCallUpdateFields::new()
                 .status(Some(status))
-                .content(Some(vec![AcpContentBlock::Text(TextContent::new(
-                    content.to_string(),
-                ))
-                .into()])),
+                .content(Some(vec![block])),
         );
         send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
         AfterHookResult::Continue
@@ -352,6 +453,7 @@ fn build_agent_config(
             input_schema: s.input_schema,
         })
         .collect();
+    let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
     AgentConfig {
         system: Some(system_prompt),
         tools,
@@ -363,10 +465,14 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             safety,
+            Arc::clone(&diff_stash),
+            workspace.to_path_buf(),
         )),
         after_tool_call: Some(build_after_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
+            diff_stash,
+            workspace.to_path_buf(),
         )),
         on_compaction: Some(build_compaction_hook(
             Arc::clone(&connection),
@@ -2121,5 +2227,276 @@ mod tests {
     #[test]
     fn prompt_text_empty_for_no_blocks() {
         assert_eq!(prompt_text(vec![]), "");
+    }
+
+    // --- Diff content for write_file/edit_file (vikunja #983) ---
+
+    #[test]
+    fn edit_target_path_joins_relative_to_workspace() {
+        let ws = Path::new("/workspace");
+        assert_eq!(
+            edit_target_path(ws, &serde_json::json!({"path": "src/f.rs"})),
+            Some(PathBuf::from("/workspace/src/f.rs"))
+        );
+        assert_eq!(
+            edit_target_path(ws, &serde_json::json!({"path": "/abs/f.rs"})),
+            Some(PathBuf::from("/abs/f.rs"))
+        );
+        assert_eq!(edit_target_path(ws, &serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn replay_edit_pairs_applies_sequentially() {
+        let pairs = vec![
+            serde_json::json!(["hello", "goodbye"]),
+            serde_json::json!(["foo", "baz"]),
+        ];
+        assert_eq!(
+            replay_edit_pairs("hello foo hello", &pairs),
+            Some("goodbye baz hello".to_string())
+        );
+    }
+
+    #[test]
+    fn replay_edit_pairs_bails_on_unmatched_pair() {
+        let pairs = vec![serde_json::json!(["not-present", "x"])];
+        assert_eq!(replay_edit_pairs("hello", &pairs), None);
+    }
+
+    #[test]
+    fn diff_for_write_file_uses_input_content() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "f.txt", "content": "new text\n"}),
+        };
+        let diff = diff_for_completed_edit(
+            &info,
+            r#"{"path":"f.txt"}"#,
+            Path::new("/ws"),
+            Some("old text\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(diff.path, PathBuf::from("/ws/f.txt"));
+        assert_eq!(diff.old_text.as_deref(), Some("old text\n"));
+        assert_eq!(diff.new_text, "new text\n");
+    }
+
+    #[test]
+    fn diff_for_write_file_new_file_has_no_old_text() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "f.txt", "content": "created\n"}),
+        };
+        let diff = diff_for_completed_edit(&info, "{}", Path::new("/ws"), None).unwrap();
+        assert_eq!(diff.old_text, None);
+        assert_eq!(diff.new_text, "created\n");
+    }
+
+    #[test]
+    fn diff_for_edit_file_replays_applied_pairs() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "edit_file".to_string(),
+            input: serde_json::json!({"path": "f.txt", "edits": ["hello", "goodbye"]}),
+        };
+        let diff = diff_for_completed_edit(
+            &info,
+            r#"{"applied":1,"diffs":[["hello","goodbye"]]}"#,
+            Path::new("/ws"),
+            Some("hello world\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(diff.old_text.as_deref(), Some("hello world\n"));
+        assert_eq!(diff.new_text, "goodbye world\n");
+    }
+
+    #[test]
+    fn diff_for_edit_file_falls_back_without_applied_diffs() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "edit_file".to_string(),
+            input: serde_json::json!({"path": "f.txt", "edits": ["missing", "x"]}),
+        };
+        // applied == 0: no `diffs` key in the tool output.
+        let result = diff_for_completed_edit(
+            &info,
+            r#"{"applied":0}"#,
+            Path::new("/ws"),
+            Some("hello\n".to_string()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn diff_for_edit_file_falls_back_without_pre_edit_capture() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "edit_file".to_string(),
+            input: serde_json::json!({"path": "f.txt", "edits": ["a", "b"]}),
+        };
+        let result = diff_for_completed_edit(
+            &info,
+            r#"{"applied":1,"diffs":[["a","b"]]}"#,
+            Path::new("/ws"),
+            None,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn diff_not_built_for_non_edit_tools() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({"path": "f.txt", "content": "x"}),
+        };
+        assert!(diff_for_completed_edit(&info, "{}", Path::new("/ws"), None).is_none());
+    }
+
+    /// Run one scripted tool call through the full ACP flow and return the
+    /// collected session updates.
+    async fn run_tool_call_flow(
+        workspace: &Path,
+        responses: Vec<crate::providers::LlmResponse>,
+    ) -> Vec<SessionUpdate> {
+        let agent = build_agent(
+            mock_factory(responses),
+            workspace,
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let ws = workspace.to_path_buf();
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(ws))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        new_session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        Arc::try_unwrap(updates).unwrap().into_inner().unwrap()
+    }
+
+    fn diff_contents(updates: &[SessionUpdate]) -> Vec<AcpDiff> {
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.content.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|c| match c {
+                AcpToolCallContent::Diff(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn acp_write_file_completion_carries_diff_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "before\n").unwrap();
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp(
+                    "t1",
+                    "write_file",
+                    serde_json::json!({"path": "f.txt", "content": "after\n"}),
+                ),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let diffs = diff_contents(&updates);
+        assert_eq!(diffs.len(), 1, "expected one Diff content: {updates:?}");
+        assert_eq!(diffs[0].path, dir.path().join("f.txt"));
+        assert_eq!(diffs[0].old_text.as_deref(), Some("before\n"));
+        assert_eq!(diffs[0].new_text, "after\n");
+    }
+
+    #[tokio::test]
+    async fn acp_edit_file_completion_carries_full_file_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world\n").unwrap();
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp(
+                    "t1",
+                    "edit_file",
+                    serde_json::json!({"path": "f.txt", "edits": ["hello", "goodbye"]}),
+                ),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let diffs = diff_contents(&updates);
+        assert_eq!(diffs.len(), 1, "expected one Diff content: {updates:?}");
+        assert_eq!(diffs[0].old_text.as_deref(), Some("hello world\n"));
+        assert_eq!(diffs[0].new_text, "goodbye world\n");
+    }
+
+    #[tokio::test]
+    async fn acp_failed_edit_keeps_text_content() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file and edits that can't apply -> edit_file errors (path missing).
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp(
+                    "t1",
+                    "edit_file",
+                    serde_json::json!({"path": "missing.txt", "edits": ["a", "b"]}),
+                ),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        assert!(
+            diff_contents(&updates).is_empty(),
+            "failed edit must not render a diff: {updates:?}"
+        );
+        let failed = updates.iter().any(|u| {
+            matches!(u, SessionUpdate::ToolCallUpdate(tcu)
+                if tcu.fields.status == Some(ToolCallStatus::Failed))
+        });
+        assert!(failed, "expected a Failed tool-call update: {updates:?}");
     }
 }
