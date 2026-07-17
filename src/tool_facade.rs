@@ -38,9 +38,18 @@ pub fn active_schemas(workspace: &Path) -> Vec<NeutralToolSchema> {
 /// (`to_request` is set). Returns `None` for plugin/special tools — the
 /// caller (MCP adapter or agent loop) must handle those itself.
 pub async fn invoke(session: &mut Session, name: &str, args: &Value) -> Option<Response> {
+    invoke_with_progress(session, name, args, None).await
+}
+
+pub async fn invoke_with_progress(
+    session: &mut Session,
+    name: &str,
+    args: &Value,
+    on_exec_progress: Option<&crate::ops::ExecProgressCallback<'_>>,
+) -> Option<Response> {
     let req = tools::build_request(name, args)?;
     let response = match req {
-        Ok(r) => ops::dispatch(session, r).await,
+        Ok(r) => ops::dispatch_with_progress(session, r, on_exec_progress).await,
         Err(e) => Response::err(3, &e),
     };
     Some(response)

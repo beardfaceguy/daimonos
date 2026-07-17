@@ -9,20 +9,43 @@ mod tool_ops;
 use crate::protocol::{self, Op, Request, Response};
 use crate::session::Session;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecProgress {
+    Output(String),
+    Exit {
+        code: Option<i32>,
+        signal: Option<String>,
+    },
+}
+
+pub type ExecProgressCallback<'a> = dyn Fn(ExecProgress) + Send + Sync + 'a;
+
 pub async fn dispatch(session: &mut Session, req: Request) -> Response {
+    dispatch_with_progress(session, req, None).await
+}
+
+pub async fn dispatch_with_progress(
+    session: &mut Session,
+    req: Request,
+    on_exec_progress: Option<&ExecProgressCallback<'_>>,
+) -> Response {
     match req {
-        Request::Single(op) => dispatch_op(session, op).await,
+        Request::Single(op) => dispatch_op(session, op, on_exec_progress).await,
         Request::Batch { batch } => {
             let mut results = Vec::with_capacity(batch.len());
             for op in batch {
-                results.push(dispatch_op(session, op).await);
+                results.push(dispatch_op(session, op, on_exec_progress).await);
             }
             Response::ok(serde_json::to_value(results).unwrap())
         }
     }
 }
 
-async fn dispatch_op(session: &mut Session, op: Op) -> Response {
+async fn dispatch_op(
+    session: &mut Session,
+    op: Op,
+    on_exec_progress: Option<&ExecProgressCallback<'_>>,
+) -> Response {
     match op.c {
         protocol::op::READ => file_ops::read(session, &op).await,
         protocol::op::WRITE => file_ops::write(session, &op).await,
@@ -35,7 +58,7 @@ async fn dispatch_op(session: &mut Session, op: Op) -> Response {
             if let Some(cmd) = &op.s {
                 session.record_exec_usage(cmd.clone());
             }
-            exec_ops::exec(session, &op).await
+            exec_ops::exec_with_progress(session, &op, on_exec_progress).await
         }
         protocol::op::BG => {
             if let Some(cmd) = &op.s {

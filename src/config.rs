@@ -103,6 +103,8 @@ pub struct ProcessConfig {
     /// Max characters for exec stdout/stderr before truncation.
     /// When exceeded, keeps first + last lines with a truncation notice.
     pub exec_output_max_chars: usize,
+    /// Read size for each live foreground-exec progress update.
+    pub exec_stream_chunk_bytes: usize,
     /// Additional directories to prepend to PATH for exec/bg commands.
     /// Common tool dirs (~/.cargo/bin, ~/.local/bin) are auto-detected;
     /// use this for non-standard locations.
@@ -156,6 +158,15 @@ impl AcpConfig {
     fn validate(&self) -> Result<(), String> {
         if self.session_list_page_size == 0 {
             return Err("acp.session_list_page_size must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl ProcessConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.exec_stream_chunk_bytes == 0 {
+            return Err("process.exec_stream_chunk_bytes must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -425,6 +436,7 @@ impl Default for ProcessConfig {
         Self {
             poll_tail_lines: 20,
             exec_output_max_chars: 100_000,
+            exec_stream_chunk_bytes: 8_192,
             extra_path: Vec::new(),
             max_cache_entries: 1024,
             exec_output_filters: true,
@@ -453,6 +465,7 @@ impl IndexConfig {
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.acp.validate()?;
+        self.process.validate()?;
         self.discord.validate()
     }
 }
@@ -720,6 +733,7 @@ mod tests {
         assert_eq!(cfg.acp.session_list_page_size, 50);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
+        assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
@@ -743,6 +757,7 @@ mod tests {
         let cfg: Config =
             toml::from_str(toml_str).expect("daimonos.default.toml must parse as valid Config");
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
+        assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.index.max_depth, 20);
         assert!(!cfg.mcp.startup_logs);
@@ -810,6 +825,19 @@ mod tests {
             .validate()
             .expect_err("zero page size must be rejected")
             .contains("acp.session_list_page_size"));
+    }
+
+    #[test]
+    fn exec_stream_chunk_bytes_parses_and_must_be_positive() {
+        let cfg: Config = toml::from_str("[process]\nexec_stream_chunk_bytes = 1024\n").unwrap();
+        assert_eq!(cfg.process.exec_stream_chunk_bytes, 1024);
+        assert!(cfg.validate().is_ok());
+
+        let invalid: Config = toml::from_str("[process]\nexec_stream_chunk_bytes = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero chunk size must be rejected")
+            .contains("process.exec_stream_chunk_bytes"));
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
@@ -21,7 +22,7 @@ use agent_client_protocol::schema::v1::{
     ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, DeleteSessionRequest,
     DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource, ImageContent,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
@@ -36,7 +37,7 @@ use agent_client_protocol::{
 
 use crate::agent::{
     AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook, BeforeHookResult,
-    TokenLogConfig, ToolCallInfo,
+    TokenLogConfig, ToolCallInfo, ToolProgressHook,
 };
 use crate::config::Config;
 use crate::providers::{
@@ -110,6 +111,8 @@ struct AcpState {
     store: Option<SessionStore>,
     /// Whether the configured provider adapter can serialize image prompts.
     supports_images: bool,
+    /// Zed's `_meta.terminal_output` extension, negotiated at initialize.
+    supports_terminal_output: AtomicBool,
     /// Maximum sessions returned by one session/list response.
     session_list_page_size: usize,
     /// Context/window compaction policy (ADR-002), engine-wide from the
@@ -406,6 +409,103 @@ fn send_notification(
     let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
 }
 
+fn client_supports_terminal_output(req: &InitializeRequest) -> bool {
+    req.client_capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("terminal_output"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn terminal_cwd(workspace: &Path, input: &serde_json::Value) -> PathBuf {
+    input
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .map(|cwd| {
+            if cwd.is_absolute() {
+                cwd
+            } else {
+                workspace.join(cwd)
+            }
+        })
+        .unwrap_or_else(|| workspace.to_path_buf())
+}
+
+fn terminal_info_meta(workspace: &Path, info: &ToolCallInfo) -> Option<Meta> {
+    (info.name == "exec").then(|| {
+        Meta::from_iter([(
+            "terminal_info".to_string(),
+            serde_json::json!({
+                "terminal_id": info.id,
+                "cwd": terminal_cwd(workspace, &info.input),
+            }),
+        )])
+    })
+}
+
+fn tool_call_title(info: &ToolCallInfo) -> String {
+    if info.name == "exec" {
+        info.input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| info.name.clone())
+    } else {
+        info.name.clone()
+    }
+}
+
+fn terminal_exit_meta(info: &ToolCallInfo, code: Option<i32>, signal: Option<String>) -> Meta {
+    Meta::from_iter([(
+        "terminal_exit".to_string(),
+        serde_json::json!({
+            "terminal_id": info.id,
+            "exit_code": code.and_then(|code| u32::try_from(code).ok()),
+            "signal": signal,
+        }),
+    )])
+}
+
+fn build_tool_progress_hook(
+    connection: CurrentConnection,
+    session_id: SessionId,
+    enabled: bool,
+) -> Option<ToolProgressHook> {
+    enabled.then(|| {
+        Box::new(
+            move |info: &ToolCallInfo, event: crate::ops::ExecProgress| {
+                if info.name != "exec" {
+                    return;
+                }
+                let Some(cx) = current_cx(&connection) else {
+                    return;
+                };
+                let (key, value) = match event {
+                    crate::ops::ExecProgress::Output(data) => (
+                        "terminal_output",
+                        serde_json::json!({
+                            "terminal_id": info.id,
+                            "data": data,
+                        }),
+                    ),
+                    crate::ops::ExecProgress::Exit { code, signal } => {
+                        let update =
+                            ToolCallUpdate::new(info.id.clone(), ToolCallUpdateFields::new())
+                                .meta(terminal_exit_meta(info, code, signal));
+                        send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+                        return;
+                    }
+                };
+                let update = ToolCallUpdate::new(info.id.clone(), ToolCallUpdateFields::new())
+                    .meta(Meta::from_iter([(key.to_string(), value)]));
+                send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+            },
+        ) as ToolProgressHook
+    })
+}
+
 /// Send `session/request_permission` and await the client's answer,
 /// applying the operator's decision to `safety` (persisting an "always
 /// allow" choice the same way the stdin prompt does). Must be sent via the
@@ -460,6 +560,7 @@ fn build_before_tool_call_hook(
     safety: Arc<crate::safety::SafetyPolicy>,
     diff_stash: DiffStash,
     workspace: PathBuf,
+    terminal_output: bool,
 ) -> BeforeHook {
     Box::new(move |info: &ToolCallInfo| {
         let connection = Arc::clone(&connection);
@@ -472,11 +573,19 @@ fn build_before_tool_call_hook(
                 return BeforeHookResult::Block("no active ACP connection".to_string());
             };
 
-            let tool_call = ToolCall::new(info.id.clone(), info.name.clone())
+            let title = if terminal_output {
+                tool_call_title(info)
+            } else {
+                info.name.clone()
+            };
+            let mut tool_call = ToolCall::new(info.id.clone(), title)
                 .kind(tool_kind_for(&info.name))
                 .status(ToolCallStatus::Pending)
                 .locations(tool_call_locations(&workspace, &info.name, &info.input))
                 .raw_input(Some(info.input.clone()));
+            if terminal_output {
+                tool_call = tool_call.meta(terminal_info_meta(&workspace, info));
+            }
             send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
 
             // Denylist/allowlist/approval-mode gating first (same policy
@@ -519,7 +628,13 @@ fn build_before_tool_call_hook(
                         })))
                 }
             };
-            let update = ToolCallUpdate::new(info.id.clone(), fields);
+            let mut update = ToolCallUpdate::new(info.id.clone(), fields);
+            if terminal_output
+                && info.name == "exec"
+                && matches!(decision, BeforeHookResult::Block(_))
+            {
+                update = update.meta(terminal_exit_meta(info, None, Some("blocked".to_string())));
+            }
             send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
 
             decision
@@ -647,6 +762,7 @@ fn build_agent_config(
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
     system_prompt: String,
+    terminal_output: bool,
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
         .into_iter()
@@ -670,6 +786,7 @@ fn build_agent_config(
             safety,
             Arc::clone(&diff_stash),
             workspace.to_path_buf(),
+            terminal_output,
         )),
         after_tool_call: Some(build_after_tool_call_hook(
             Arc::clone(&connection),
@@ -681,7 +798,15 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
         )),
-        on_stream_event: Some(build_stream_hook(connection, session_id)),
+        on_stream_event: Some(build_stream_hook(
+            Arc::clone(&connection),
+            session_id.clone(),
+        )),
+        on_tool_progress: build_tool_progress_hook(
+            Arc::clone(&connection),
+            session_id.clone(),
+            terminal_output,
+        ),
         token_log: token_log.map(|path| TokenLogConfig {
             path,
             label: "acp".to_string(),
@@ -884,6 +1009,7 @@ fn build_session_handle(
         token_log,
         state.compaction.clone(),
         crate::prompts::agent_system(cfg),
+        state.supports_terminal_output.load(Ordering::Acquire),
     );
     let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
@@ -993,6 +1119,7 @@ fn build_agent(
         default_model: model,
         store: sessions_dir.map(SessionStore::new),
         supports_images,
+        supports_terminal_output: AtomicBool::new(false),
         session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
     });
@@ -1008,7 +1135,11 @@ fn build_agent(
                       _cx: ConnectionTo<AcpClientRole>| {
                     let persistence_enabled = state.store.is_some();
                     let supports_images = state.supports_images;
+                    let state = Arc::clone(&state);
                     async move {
+                        state
+                            .supports_terminal_output
+                            .store(client_supports_terminal_output(&req), Ordering::Release);
                         // load_session(true): Zed calls session/load to reopen
                         // a thread on window refocus.
                         let mut capabilities = AgentCapabilities::new()
@@ -2334,7 +2465,16 @@ mod tests {
             )
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
                 connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            agent_client_protocol::schema::v1::ClientCapabilities::new().meta(
+                                Meta::from_iter([(
+                                    "terminal_output".to_string(),
+                                    serde_json::json!(true),
+                                )]),
+                            ),
+                        ),
+                    )
                     .block_task()
                     .await?;
                 let new_session = connection
@@ -2393,6 +2533,14 @@ mod tests {
         assert_eq!(
             message,
             Some("blocked: blocked by policy: 'exec' is in the denied-commands list")
+        );
+        assert_eq!(
+            failed_updates[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_exit"))
+                .and_then(|exit| exit.get("signal")),
+            Some(&serde_json::json!("blocked"))
         );
     }
 
@@ -3760,6 +3908,149 @@ mod tests {
             .await
             .unwrap();
         Arc::try_unwrap(updates).unwrap().into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn acp_streams_exec_terminal_metadata_when_client_advertises_support() {
+        use agent_client_protocol::schema::v1::ClientCapabilities;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![
+                tool_call_resp(
+                    "t1",
+                    "exec",
+                    serde_json::json!({"command": "printf streamed-terminal"}),
+                ),
+                end_turn_resp("done"),
+            ]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let cwd = workspace.path().to_path_buf();
+
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                let capabilities = ClientCapabilities::new().meta(
+                    agent_client_protocol::schema::v1::Meta::from_iter([(
+                        "terminal_output".to_string(),
+                        serde_json::json!(true),
+                    )]),
+                );
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(capabilities),
+                    )
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("run it"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let updates = updates.lock().unwrap();
+        let terminal_info = updates.iter().find_map(|update| match update {
+            SessionUpdate::ToolCall(call) => call
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_info")),
+            _ => None,
+        });
+        assert_eq!(terminal_info.unwrap()["terminal_id"], "t1");
+        assert_eq!(
+            terminal_info.unwrap()["cwd"],
+            workspace.path().to_string_lossy().as_ref()
+        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCall(call) if call.title == "printf streamed-terminal"
+        )));
+
+        let terminal_output = updates.iter().find_map(|update| match update {
+            SessionUpdate::ToolCallUpdate(call) => call
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_output")),
+            _ => None,
+        });
+        assert_eq!(terminal_output.unwrap()["terminal_id"], "t1");
+        assert!(terminal_output.unwrap()["data"]
+            .as_str()
+            .unwrap()
+            .contains("streamed-terminal"));
+
+        let terminal_exit = updates.iter().find_map(|update| match update {
+            SessionUpdate::ToolCallUpdate(call) => call
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_exit")),
+            _ => None,
+        });
+        assert_eq!(terminal_exit.unwrap()["terminal_id"], "t1");
+        assert_eq!(terminal_exit.unwrap()["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn acp_omits_terminal_metadata_without_client_capability() {
+        let workspace = tempfile::tempdir().unwrap();
+        let updates = run_tool_call_flow(
+            workspace.path(),
+            vec![
+                tool_call_resp(
+                    "t1",
+                    "exec",
+                    serde_json::json!({"command": "printf no-terminal"}),
+                ),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        assert!(updates.iter().all(|update| match update {
+            SessionUpdate::ToolCall(call) => call
+                .meta
+                .as_ref()
+                .is_none_or(|meta| !meta.contains_key("terminal_info")),
+            SessionUpdate::ToolCallUpdate(call) => call.meta.as_ref().is_none_or(|meta| {
+                !meta.contains_key("terminal_output") && !meta.contains_key("terminal_exit")
+            }),
+            _ => true,
+        }));
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCall(call) if call.title == "exec"
+        )));
     }
 
     fn diff_contents(updates: &[SessionUpdate]) -> Vec<AcpDiff> {
