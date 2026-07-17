@@ -110,6 +110,11 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .iter()
         .map(|b| match b {
             ContentBlock::Text(t) | ContentBlock::Thinking(t) => t.len(),
+            ContentBlock::Image {
+                data,
+                media_type,
+                uri,
+            } => data.len() + media_type.len() + uri.as_ref().map_or(0, String::len),
             ContentBlock::ToolCall { id, name, input } => {
                 id.len() + name.len() + input.to_string().len()
             }
@@ -143,7 +148,11 @@ pub fn estimate_prompt_tokens(system: Option<&str>, messages: &[Message]) -> u64
 /// User-role messages but start with a `ToolResult` block, so checking the
 /// first block distinguishes them.
 fn is_turn_start(message: &Message) -> bool {
-    message.role == Role::User && matches!(message.content.first(), Some(ContentBlock::Text(_)))
+    message.role == Role::User
+        && matches!(
+            message.content.first(),
+            Some(ContentBlock::Text(_) | ContentBlock::Image { .. })
+        )
 }
 
 /// Indices of every turn start in `messages`.
@@ -210,6 +219,15 @@ pub fn transcript_for_summary(messages: &[Message]) -> String {
                         Role::Assistant => "Assistant",
                     };
                     out.push_str(&format!("{label}: {text}\n"));
+                }
+                ContentBlock::Image {
+                    media_type, uri, ..
+                } => {
+                    let location = uri
+                        .as_deref()
+                        .map(|uri| format!(" {uri}"))
+                        .unwrap_or_default();
+                    out.push_str(&format!("[user image: {media_type}{location}]\n"));
                 }
                 ContentBlock::ToolCall { name, input, .. } => {
                     out.push_str(&format!("[tool call: {name} {input}]\n"));
@@ -338,6 +356,24 @@ mod tests {
             },
         ];
         assert_eq!(estimate_tokens(&msgs), 150);
+    }
+
+    #[test]
+    fn image_prompt_starts_turn_and_summary_omits_base64_payload() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                data: "sensitive-base64-payload".into(),
+                media_type: "image/png".into(),
+                uri: Some("file:///workspace/screenshot.png".into()),
+            }],
+        };
+
+        assert_eq!(turn_starts(std::slice::from_ref(&message)), vec![0]);
+        let transcript = transcript_for_summary(&[message]);
+        assert!(transcript.contains("image/png"));
+        assert!(transcript.contains("file:///workspace/screenshot.png"));
+        assert!(!transcript.contains("sensitive-base64-payload"));
     }
 
     #[test]

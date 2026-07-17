@@ -157,6 +157,14 @@ fn render_transcript(messages: &[Message]) -> String {
                         out.push('\n');
                     }
                 },
+                ContentBlock::Image {
+                    media_type, uri, ..
+                } => out.push_str(&format!(
+                    "[image: {media_type}{}]\n",
+                    uri.as_deref()
+                        .map(|uri| format!(" {uri}"))
+                        .unwrap_or_default()
+                )),
                 ContentBlock::ToolCall { name, .. } => out.push_str(&format!("[tool: {name}]\n")),
                 ContentBlock::Thinking(_) | ContentBlock::ToolResult { .. } => {}
             }

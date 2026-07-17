@@ -376,7 +376,14 @@ impl AgentSession {
     /// so dropping this future mid-await (e.g. a REPL Ctrl-C abort) leaves the
     /// session's history untouched instead of losing it to a half-finished turn.
     pub async fn prompt(&mut self, user_text: impl Into<String>) -> TurnResult {
-        let user_text: String = user_text.into();
+        self.prompt_message(Message::user(user_text)).await
+    }
+
+    /// Multimodal form of [`Self::prompt`]. The caller supplies a complete
+    /// user-role message so ACP images and embedded context survive provider
+    /// serialization, history persistence, and retries.
+    pub async fn prompt_message(&mut self, user_message: Message) -> TurnResult {
+        debug_assert_eq!(user_message.role, Role::User);
 
         // Proactive compaction (ADR-002): compact BEFORE the turn when the
         // last measured occupancy (or, if never measured, an estimate)
@@ -392,7 +399,7 @@ impl AgentSession {
             }
         }
 
-        let result = self.attempt(&user_text).await;
+        let result = self.attempt(&user_message).await;
 
         // Reactive safety net (ADR-002): a classified context overflow means
         // our between-turns measurement missed — compact and retry ONCE.
@@ -402,7 +409,7 @@ impl AgentSession {
             && self.config.compaction.is_some()
             && self.compact().await.is_some()
         {
-            self.attempt(&user_text).await
+            self.attempt(&user_message).await
         } else {
             result
         };
@@ -413,9 +420,9 @@ impl AgentSession {
     /// Run one turn attempt against the current history without committing
     /// its messages. Usage and the measured occupancy are recorded either
     /// way (a failed attempt still spent/observed them).
-    async fn attempt(&mut self, user_text: &str) -> AgentResult {
+    async fn attempt(&mut self, user_message: &Message) -> AgentResult {
         let mut history = self.messages.clone();
-        history.push(Message::user(user_text));
+        history.push(user_message.clone());
         let result = run(
             self.provider.as_ref(),
             &mut self.tool_session,
@@ -631,6 +638,18 @@ mod tests {
         }
     }
 
+    struct CaptureProvider {
+        seen: Arc<Mutex<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CaptureProvider {
+        async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            *self.seen.lock().unwrap() = ctx.messages.clone();
+            end_turn_resp()
+        }
+    }
+
     fn mock_usage(input: u64, output: u64) -> Usage {
         Usage {
             input,
@@ -678,6 +697,42 @@ mod tests {
         assert_eq!(turn.text, "done");
         assert_eq!(turn.stop_reason, StopReason::EndTurn);
         assert_eq!(sess.history().len(), 2); // user + assistant
+    }
+
+    #[tokio::test]
+    async fn session_prompt_message_preserves_multimodal_user_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            seen: Arc::clone(&seen),
+        });
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text("describe".into()),
+                ContentBlock::Image {
+                    data: "aW1hZ2U=".into(),
+                    media_type: "image/png".into(),
+                    uri: None,
+                },
+            ],
+        };
+
+        sess.prompt_message(message).await;
+
+        assert!(matches!(
+            &seen.lock().unwrap()[0].content[1],
+            ContentBlock::Image {
+                data,
+                media_type,
+                ..
+            } if data == "aW1hZ2U=" && media_type == "image/png"
+        ));
+        assert!(matches!(
+            &sess.history()[0].content[1],
+            ContentBlock::Image { .. }
+        ));
     }
 
     #[tokio::test]

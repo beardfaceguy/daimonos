@@ -125,6 +125,8 @@ the equivalent notice.
 4. Token/cost usage for the session is shown via Zed's usage indicator.
 5. If you set `DAIMONOS_AGENT_MODELS`, the model dropdown at the bottom of
    the chat lists your models; picking one applies to the next message.
+6. File `@mentions` include their contents, and pasted images are sent to
+   image-capable providers.
 
 ## Scope
 
@@ -132,7 +134,10 @@ the equivalent notice.
   process across chat threads), with `session/load` resume — reopening a
   thread after a window switch or a full Zed restart restores its history
   (persisted under `~/.daimonos/acp-sessions`).
-- Text-only prompts (image/audio/resource content blocks are ignored).
+- Embedded file context and pasted images are preserved in the model prompt.
+  Image capability is advertised only when the configured provider adapter
+  supports multimodal requests (the Anthropic and OpenRouter adapters do).
+  Audio prompts are not advertised.
 - Tool execution and file access are handled entirely by daimonos's own
   tools — the `fs/*`/`terminal/*` client-proxy methods aren't used.
 

@@ -27,6 +27,10 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl LlmProvider for OpenRouterProvider {
+    fn supports_images(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
         let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
         let tools = tools_to_wire(&ctx.tools);
@@ -305,6 +309,28 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                             "content": content,
                         }));
                     }
+                } else if msg
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image { .. }))
+                {
+                    let content: Vec<Value> = msg
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(json!({"type": "text", "text": text})),
+                            ContentBlock::Image {
+                                data, media_type, ..
+                            } => Some(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{media_type};base64,{data}")
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    wire.push(json!({"role": "user", "content": content}));
                 } else {
                     let text: String = msg
                         .content
@@ -341,6 +367,8 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                         }
                         // Thinking blocks are Anthropic-specific; skip for OpenRouter
                         ContentBlock::Thinking(_) => {}
+                        // Images are only valid in user prompts.
+                        ContentBlock::Image { .. } => {}
                         // Tool results belong on user messages, not assistant
                         ContentBlock::ToolResult { .. } => {}
                     }
@@ -497,6 +525,39 @@ mod tests {
         assert_eq!(wire.len(), 1);
         assert_eq!(wire[0]["role"], "user");
         assert_eq!(wire[0]["content"], "hello");
+    }
+
+    #[test]
+    fn wire_user_image_message_uses_openai_multimodal_format() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text("describe this".into()),
+                ContentBlock::Image {
+                    data: "aW1hZ2U=".into(),
+                    media_type: "image/png".into(),
+                    uri: Some("file:///tmp/image.png".into()),
+                },
+            ],
+        }];
+        let wire = messages_to_wire(None, &msgs);
+        assert_eq!(
+            wire[0]["content"][0],
+            json!({"type": "text", "text": "describe this"})
+        );
+        assert_eq!(
+            wire[0]["content"][1],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aW1hZ2U="}
+            })
+        );
+    }
+
+    #[test]
+    fn provider_advertises_image_support() {
+        let provider = OpenRouterProvider::new("key".into(), "https://example.com".into()).unwrap();
+        assert!(provider.supports_images());
     }
 
     #[test]
