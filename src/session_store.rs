@@ -161,7 +161,11 @@ impl SessionStore {
                 },
             ));
         }
-        rows.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
+            b_time
+                .cmp(a_time)
+                .then_with(|| a_summary.id.cmp(&b_summary.id))
+        });
         rows.into_iter().map(|(_, s)| s).collect()
     }
 }
@@ -299,6 +303,31 @@ mod tests {
         assert_eq!(s1.message_count, 2);
         // Label is the FIRST LINE of the first user message, trimmed.
         assert_eq!(s1.first_user_line.as_deref(), Some("first question"));
+    }
+
+    #[test]
+    fn list_breaks_equal_mtime_ties_by_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let same_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        for id in ["session-b", "session-a"] {
+            store.save(id, "model", &[]);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(format!("{id}.json")))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(same_time))
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>(),
+            vec!["session-a", "session-b"]
+        );
     }
 
     #[test]
