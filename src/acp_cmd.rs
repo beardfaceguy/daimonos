@@ -388,11 +388,17 @@ fn build_after_tool_call_hook(
             Some(diff) => diff.into(),
             None => AcpContentBlock::Text(TextContent::new(content.to_string())).into(),
         };
+        // Machine-readable result for the client's tool-call inspector
+        // (vikunja #991). Tool output is normally compact JSON; plain-text
+        // messages (e.g. "tool not available") become a JSON string.
+        let raw_output: serde_json::Value = serde_json::from_str(content)
+            .unwrap_or_else(|_| serde_json::Value::String(content.to_string()));
         let update = ToolCallUpdate::new(
             info.id.clone(),
             ToolCallUpdateFields::new()
                 .status(Some(status))
-                .content(Some(vec![block])),
+                .content(Some(vec![block]))
+                .raw_output(Some(raw_output)),
         );
         send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
         AfterHookResult::Continue
@@ -2462,6 +2468,64 @@ mod tests {
             .collect();
         assert_eq!(locations.len(), 1, "got: {updates:?}");
         assert_eq!(locations[0].path, dir.path().join("f.txt"));
+    }
+
+    // --- raw_output on completion (vikunja #991) ---
+
+    fn raw_outputs(updates: &[SessionUpdate]) -> Vec<serde_json::Value> {
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.raw_output.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn acp_completed_tool_call_carries_structured_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp("t1", "read_file", serde_json::json!({"path": "f.txt"})),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let outputs = raw_outputs(&updates);
+        assert_eq!(outputs.len(), 1, "got: {updates:?}");
+        assert!(
+            outputs[0].is_object(),
+            "read_file output should parse as a JSON object: {:?}",
+            outputs[0]
+        );
+        assert_eq!(outputs[0]["content"], "hi\n");
+    }
+
+    #[tokio::test]
+    async fn acp_plain_text_tool_result_becomes_json_string_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tool that doesn't exist in agent mode produces a plain-text
+        // error message, not JSON — raw_output must wrap it as a string.
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp("t1", "nonexistent_tool", serde_json::json!({})),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let outputs = raw_outputs(&updates);
+        assert_eq!(outputs.len(), 1, "got: {updates:?}");
+        assert!(
+            outputs[0].as_str().unwrap_or("").contains("not available"),
+            "got: {:?}",
+            outputs[0]
+        );
     }
 
     /// Run one scripted tool call through the full ACP flow and return the
