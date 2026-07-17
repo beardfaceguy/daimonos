@@ -144,6 +144,19 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `[acp]` — Native agent protocol (`acp`)
+
+These settings apply to native ACP integrations such as Zed.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `session_list_page_size` | `50` | Maximum saved sessions returned by one `session/list` response. When more remain, the response includes an opaque continuation cursor. Must be greater than zero. |
+
+```toml
+[acp]
+session_list_page_size = 50
+```
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,

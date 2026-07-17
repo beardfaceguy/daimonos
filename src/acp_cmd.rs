@@ -105,6 +105,8 @@ struct AcpState {
     /// On-disk session persistence for cross-process `session/load` resume.
     /// `None` disables persistence (used by tests that don't exercise it).
     store: Option<SessionStore>,
+    /// Maximum sessions returned by one session/list response.
+    session_list_page_size: usize,
     /// Context/window compaction policy (ADR-002), engine-wide from the
     /// agent env; cloned into each session's config. `None` = off.
     compaction: Option<crate::compaction::CompactionPolicy>,
@@ -184,6 +186,80 @@ fn session_info(summary: SessionSummary, fallback_cwd: &Path) -> SessionInfo {
     SessionInfo::new(summary.id, cwd)
         .title(title)
         .updated_at(updated_at)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SessionListCursor {
+    updated_nanos: u128,
+    id: String,
+}
+
+fn session_updated_nanos(summary: &SessionSummary) -> u128 {
+    summary
+        .updated_at
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+fn encode_session_list_cursor(summary: &SessionSummary) -> String {
+    format!("v1:{}:{}", session_updated_nanos(summary), summary.id)
+}
+
+fn decode_session_list_cursor(cursor: &str) -> Result<SessionListCursor, String> {
+    let mut parts = cursor.splitn(3, ':');
+    let version = parts.next();
+    let updated_nanos = parts.next();
+    let id = parts.next();
+    if version != Some("v1") || id.is_none_or(str::is_empty) {
+        return Err("invalid session list cursor".to_string());
+    }
+    let updated_nanos = updated_nanos
+        .and_then(|value| value.parse::<u128>().ok())
+        .ok_or_else(|| "invalid session list cursor".to_string())?;
+    Ok(SessionListCursor {
+        updated_nanos,
+        id: id.unwrap_or_default().to_string(),
+    })
+}
+
+fn paginate_session_summaries(
+    summaries: Vec<SessionSummary>,
+    requested_cwd: Option<&Path>,
+    cursor: Option<&str>,
+    page_size: usize,
+    fallback_cwd: &Path,
+) -> Result<(Vec<SessionInfo>, Option<String>), String> {
+    if page_size == 0 {
+        return Err("ACP session list page size must be greater than zero".to_string());
+    }
+    let summaries: Vec<_> = summaries
+        .into_iter()
+        .filter(|summary| {
+            requested_cwd
+                .is_none_or(|requested| summary.cwd.as_deref().unwrap_or(fallback_cwd) == requested)
+        })
+        .collect();
+    let start = if let Some(cursor) = cursor {
+        let cursor = decode_session_list_cursor(cursor)?;
+        summaries
+            .iter()
+            .position(|summary| {
+                summary.id == cursor.id && session_updated_nanos(summary) == cursor.updated_nanos
+            })
+            .map(|index| index + 1)
+            .ok_or_else(|| "session list cursor is stale".to_string())?
+    } else {
+        0
+    };
+    let end = start.saturating_add(page_size).min(summaries.len());
+    let next_cursor =
+        (end < summaries.len()).then(|| encode_session_list_cursor(&summaries[end - 1]));
+    let sessions = summaries[start..end]
+        .iter()
+        .cloned()
+        .map(|summary| session_info(summary, fallback_cwd))
+        .collect();
+    Ok((sessions, next_cursor))
 }
 
 /// Pre-edit file text captured by the before hook (keyed by tool-call id)
@@ -823,6 +899,7 @@ fn build_agent(
         models,
         default_model: model,
         store: sessions_dir.map(SessionStore::new),
+        session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
     });
 
@@ -864,6 +941,7 @@ fn build_agent(
                       responder: agent_client_protocol::Responder<ListSessionsResponse>,
                       _cx: ConnectionTo<AcpClientRole>| {
                     let store = state.store.clone();
+                    let page_size = state.session_list_page_size;
                     let fallback_cwd = workspace.clone();
                     async move {
                         let Some(store) = store else {
@@ -873,17 +951,20 @@ fn build_agent(
                                 ),
                             );
                         };
-                        let sessions = store
-                            .list()
-                            .into_iter()
-                            .map(|summary| session_info(summary, &fallback_cwd))
-                            .filter(|info| {
-                                req.cwd
-                                    .as_ref()
-                                    .is_none_or(|requested| requested == &info.cwd)
-                            })
-                            .collect();
-                        responder.respond(ListSessionsResponse::new(sessions))
+                        match paginate_session_summaries(
+                            store.list(),
+                            req.cwd.as_deref(),
+                            req.cursor.as_deref(),
+                            page_size,
+                            &fallback_cwd,
+                        ) {
+                            Ok((sessions, next_cursor)) => responder.respond(
+                                ListSessionsResponse::new(sessions).next_cursor(next_cursor),
+                            ),
+                            Err(error) => responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(error),
+                            ),
+                        }
                     }
                 }
             },
@@ -1618,6 +1699,110 @@ mod tests {
             .updated_at
             .as_deref()
             .is_some_and(|date| date.contains("1970")));
+    }
+
+    fn pagination_summary(id: &str, updated_secs: u64, cwd: &Path) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            model: "model".to_string(),
+            message_count: 1,
+            cwd: Some(cwd.to_path_buf()),
+            updated_at: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated_secs)),
+            first_user_line: Some(format!("Session {id}")),
+        }
+    }
+
+    #[test]
+    fn session_list_pagination_uses_stable_keyset_cursor() {
+        let workspace = tempfile::tempdir().unwrap();
+        let summaries = vec![
+            pagination_summary("s3", 3, workspace.path()),
+            pagination_summary("s2", 2, workspace.path()),
+            pagination_summary("s1", 1, workspace.path()),
+        ];
+
+        let (first, cursor) =
+            paginate_session_summaries(summaries.clone(), None, None, 2, workspace.path()).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|info| info.session_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["s3", "s2"]
+        );
+        let cursor = cursor.expect("first page must have a continuation cursor");
+
+        // A new session before the anchor must not shift or duplicate page 2.
+        let mut with_newer = vec![pagination_summary("s4", 4, workspace.path())];
+        with_newer.extend(summaries);
+        let (second, next) =
+            paginate_session_summaries(with_newer, None, Some(&cursor), 2, workspace.path())
+                .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|info| info.session_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["s1"]
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn session_list_pagination_filters_before_slicing() {
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let summaries = vec![
+            pagination_summary("a2", 3, workspace_a.path()),
+            pagination_summary("b1", 2, workspace_b.path()),
+            pagination_summary("a1", 1, workspace_a.path()),
+        ];
+
+        let (first, cursor) = paginate_session_summaries(
+            summaries.clone(),
+            Some(workspace_a.path()),
+            None,
+            1,
+            workspace_a.path(),
+        )
+        .unwrap();
+        assert_eq!(first[0].session_id.to_string(), "a2");
+        let (second, next) = paginate_session_summaries(
+            summaries,
+            Some(workspace_a.path()),
+            cursor.as_deref(),
+            1,
+            workspace_a.path(),
+        )
+        .unwrap();
+        assert_eq!(second[0].session_id.to_string(), "a1");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn session_list_pagination_rejects_invalid_and_stale_cursors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let summaries = vec![
+            pagination_summary("s2", 2, workspace.path()),
+            pagination_summary("s1", 1, workspace.path()),
+        ];
+        assert!(paginate_session_summaries(
+            summaries.clone(),
+            None,
+            Some("not-a-cursor"),
+            1,
+            workspace.path(),
+        )
+        .is_err());
+
+        let (_, cursor) =
+            paginate_session_summaries(summaries, None, None, 1, workspace.path()).unwrap();
+        let changed = vec![pagination_summary("s1", 1, workspace.path())];
+        assert!(
+            paginate_session_summaries(changed, None, cursor.as_deref(), 1, workspace.path(),)
+                .expect_err("missing anchor must make the cursor stale")
+                .contains("stale")
+        );
     }
 
     #[tokio::test]
@@ -2499,6 +2684,89 @@ mod tests {
                 .is_empty(),
             "deleted session must be removed from disk"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_session_list_returns_cursor_pages_and_rejects_bad_anchors() {
+        use agent_client_protocol::schema::v1::ListSessionsRequest;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf());
+        store.save_with_cwd("session-a", "test-model", &[], workspace.path());
+        store.save_with_cwd("session-b", "test-model", &[], workspace.path());
+
+        let mut cfg = Config::default();
+        cfg.acp.session_list_page_size = 1;
+        let agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(cfg),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+        let store_for_client = store.clone();
+
+        let (first_id, second_id, final_cursor, invalid_failed, stale_failed) = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+
+                let first = connection
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                let first_id = first.sessions[0].session_id.to_string();
+                let cursor = first
+                    .next_cursor
+                    .expect("one-item page must provide a cursor");
+                let second = connection
+                    .send_request(ListSessionsRequest::new().cursor(cursor))
+                    .block_task()
+                    .await?;
+                let second_id = second.sessions[0].session_id.to_string();
+
+                let invalid_failed = connection
+                    .send_request(ListSessionsRequest::new().cursor("invalid"))
+                    .block_task()
+                    .await
+                    .is_err();
+
+                let first_again = connection
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                let stale_anchor = first_again.sessions[0].session_id.to_string();
+                let stale_cursor = first_again.next_cursor.expect("cursor");
+                store_for_client.delete(&stale_anchor).unwrap();
+                let stale_failed = connection
+                    .send_request(ListSessionsRequest::new().cursor(stale_cursor))
+                    .block_task()
+                    .await
+                    .is_err();
+
+                Ok((
+                    first_id,
+                    second_id,
+                    second.next_cursor,
+                    invalid_failed,
+                    stale_failed,
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(first_id, second_id);
+        assert_eq!(final_cursor, None);
+        assert!(invalid_failed);
+        assert!(stale_failed);
     }
 
     #[tokio::test]

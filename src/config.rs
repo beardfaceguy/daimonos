@@ -16,6 +16,7 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
+    pub acp: AcpConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
     pub prompts: PromptsConfig,
@@ -132,9 +133,33 @@ pub struct ProcessConfig {
 /// in `daimonos.default.toml`.
 pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
 
-// Agent connection config lives in the agent env file, loaded by the
-// `agent_env` module (vikunja #949) — it is intentionally NOT part of the TOML
-// Config (which governs the MCP server, indexer, kgl, ...). See src/agent_env.rs.
+// LLM/provider connection config lives in the agent env file, loaded by the
+// `agent_env` module (vikunja #949). This TOML section contains only ACP
+// protocol-server operational limits.
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AcpConfig {
+    /// Maximum saved sessions returned by one ACP session/list response.
+    pub session_list_page_size: usize,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            session_list_page_size: 50,
+        }
+    }
+}
+
+impl AcpConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.session_list_page_size == 0 {
+            return Err("acp.session_list_page_size must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -427,6 +452,7 @@ impl IndexConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        self.acp.validate()?;
         self.discord.validate()
     }
 }
@@ -691,6 +717,7 @@ mod tests {
         assert_eq!(cfg.index.max_file_size, 1_000_000);
         assert_eq!(cfg.search.default_grep_max, 100);
         assert_eq!(cfg.search.default_find_max, 20);
+        assert_eq!(cfg.acp.session_list_page_size, 50);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert!(!cfg.discord.enabled);
@@ -698,6 +725,7 @@ mod tests {
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
         assert!(!cfg.mcp.startup_logs);
         assert!(!cfg.mcp.full_tool_schemas);
+        assert_eq!(cfg.acp.session_list_page_size, 50);
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
         assert_eq!(cfg.kgl.max_watches, 4_096);
         assert_eq!(cfg.kgl.debounce_secs, 2);
@@ -769,6 +797,19 @@ mod tests {
         let toml = "[mcp]\ndefault_verbosity = \"terse\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.mcp.default_verbosity, Verbosity::Terse);
+    }
+
+    #[test]
+    fn acp_session_list_page_size_parses_and_must_be_positive() {
+        let cfg: Config = toml::from_str("[acp]\nsession_list_page_size = 25\n").unwrap();
+        assert_eq!(cfg.acp.session_list_page_size, 25);
+        assert!(cfg.validate().is_ok());
+
+        let invalid: Config = toml::from_str("[acp]\nsession_list_page_size = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero page size must be rejected")
+            .contains("acp.session_list_page_size"));
     }
 
     #[test]

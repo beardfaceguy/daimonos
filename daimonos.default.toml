@@ -102,6 +102,11 @@ startup_logs = false
 # in the Glama Dockerfile build (recommended for release scoring only).
 full_tool_schemas = false
 
+[acp]
+# Maximum saved sessions returned by one session/list response. Clients receive
+# an opaque continuation cursor when more sessions remain.
+session_list_page_size = 50
+
 [discord]
 # Enable Discord integration tools. Defaults to false (off).
 enabled = false
