@@ -17,15 +17,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock as AcpContentBlock, ContentChunk,
-    Cost as AcpCost, Diff as AcpDiff, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
-    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+    ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, Diff as AcpDiff,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    StopReason as AcpStopReason, TextContent, ToolCall, ToolCallContent as AcpToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -108,6 +108,68 @@ struct AcpState {
 
 /// The `SessionConfigId` for the model picker option.
 const MODEL_CONFIG_ID: &str = "model";
+
+const ACP_HELP_TEXT: &str = "\
+Commands:
+  /clear   reset conversation history (cumulative usage is kept)
+  /usage   show cumulative token usage for this session
+  /help    show this message";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpCommand {
+    Clear,
+    Usage,
+    Help,
+}
+
+fn parse_acp_command(text: &str) -> Option<AcpCommand> {
+    match text.trim() {
+        "/clear" => Some(AcpCommand::Clear),
+        "/usage" => Some(AcpCommand::Usage),
+        "/help" => Some(AcpCommand::Help),
+        _ => None,
+    }
+}
+
+fn available_commands() -> Vec<AvailableCommand> {
+    vec![
+        AvailableCommand::new(
+            "clear",
+            "Reset conversation history; cumulative usage is kept",
+        ),
+        AvailableCommand::new("usage", "Show cumulative token usage and cost"),
+        AvailableCommand::new("help", "Show available Daimonos commands"),
+    ]
+}
+
+fn send_available_commands(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
+    );
+}
+
+fn run_acp_command(command: AcpCommand, session: &mut AgentSession) -> String {
+    match command {
+        AcpCommand::Clear => {
+            session.clear();
+            "[history cleared]".to_string()
+        }
+        AcpCommand::Usage => {
+            let usage = session.total_usage();
+            format!(
+                "input={} output={} cache_read={} cache_write={} cost=${:.4}",
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.cost.total_usd
+            )
+        }
+        AcpCommand::Help => ACP_HELP_TEXT.to_string(),
+    }
+}
 
 /// Pre-edit file text captured by the before hook (keyed by tool-call id)
 /// and consumed by the after hook to render write_file/edit_file
@@ -577,9 +639,6 @@ async fn run_prompt_turn(
     // dispatch's cx — see `CurrentConnection`'s doc comment for why.
     *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
 
-    let notify = Arc::new(tokio::sync::Notify::new());
-    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
-
     // Apply the picker's current model selection before the turn — a switch
     // made via session/set_config_option takes effect on the next prompt.
     let model = handle
@@ -588,6 +647,23 @@ async fn run_prompt_turn(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     agent_session.set_model(model.clone());
+
+    if let Some(command) = parse_acp_command(&text) {
+        let response = run_acp_command(command, &mut agent_session);
+        let cleared_history =
+            (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
+        drop(agent_session);
+
+        if let (Some(store), Some(messages)) = (store, cleared_history) {
+            store.save(&session_id.to_string(), &model, &messages);
+        }
+        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
+        send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
+        return AcpStopReason::EndTurn;
+    }
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
     let outcome = tokio::select! {
         turn = agent_session.prompt(text) => Some(turn),
@@ -782,7 +858,7 @@ fn build_agent(
                             token_log,
                             session_id.clone(),
                             session_workspace,
-                            cx,
+                            cx.clone(),
                         ) {
                             Ok(handle) => handle,
                             Err(e) => {
@@ -804,9 +880,11 @@ fn build_agent(
                         let config_options =
                             model_config_options(&state.models, &state.default_model);
                         responder.respond(
-                            NewSessionResponse::new(session_id)
+                            NewSessionResponse::new(session_id.clone())
                                 .config_options(Some(config_options)),
-                        )
+                        )?;
+                        send_available_commands(&cx, &session_id);
+                        Ok(())
                     }
                 }
             },
@@ -913,7 +991,9 @@ fn build_agent(
                         let config_options = model_config_options(&state.models, &current_model);
                         responder.respond(
                             LoadSessionResponse::new().config_options(Some(config_options)),
-                        )
+                        )?;
+                        send_available_commands(&cx, &session_id);
+                        Ok(())
                     }
                 }
             },
@@ -1270,6 +1350,137 @@ mod tests {
                 .any(|u| matches!(u, SessionUpdate::UsageUpdate(_))),
             "expected a UsageUpdate, got: {updates:?}"
         );
+        let commands = updates.iter().find_map(|update| match update {
+            SessionUpdate::AvailableCommandsUpdate(commands) => Some(&commands.available_commands),
+            _ => None,
+        });
+        let command_names: Vec<&str> = commands
+            .expect("session/new must advertise slash commands")
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(command_names, vec!["clear", "usage", "help"]);
+    }
+
+    #[tokio::test]
+    async fn acp_commands_execute_without_llm_and_clear_persisted_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        // Only the ordinary prompt has a scripted response. If any command
+        // reaches the provider, MockProvider exhaustion makes it a refusal.
+        let agent = build_agent(
+            mock_factory(vec![end_turn_resp("remembered")]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let (session_id, command_stops) = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notif: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notif.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(workspace.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("remember this"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let mut command_stops = Vec::new();
+                for command in ["/usage", "/help", "/clear"] {
+                    let response = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![AcpContentBlock::Text(TextContent::new(command))],
+                        ))
+                        .block_task()
+                        .await?;
+                    command_stops.push(response.stop_reason);
+                }
+                Ok((session_id, command_stops))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            command_stops,
+            vec![
+                AcpStopReason::EndTurn,
+                AcpStopReason::EndTurn,
+                AcpStopReason::EndTurn
+            ],
+            "commands must not consume another provider response"
+        );
+
+        let agent_texts: Vec<String> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    AcpContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            agent_texts
+                .iter()
+                .any(|text| text.contains("input=10 output=5")),
+            "/usage must report cumulative usage: {agent_texts:?}"
+        );
+        assert!(
+            agent_texts.iter().any(|text| text.contains("/clear")),
+            "/help must list ACP commands: {agent_texts:?}"
+        );
+        assert!(
+            agent_texts.iter().any(|text| text == "[history cleared]"),
+            "/clear must confirm the reset: {agent_texts:?}"
+        );
+
+        let persisted = SessionStore::new(sessions.path().to_path_buf())
+            .load(&session_id.to_string())
+            .expect("/clear must persist the session");
+        assert!(
+            persisted.messages.is_empty(),
+            "/clear must persist empty history"
+        );
+    }
+
+    #[test]
+    fn acp_command_parser_only_accepts_advertised_exact_commands() {
+        assert_eq!(parse_acp_command(" /usage "), Some(AcpCommand::Usage));
+        assert_eq!(parse_acp_command("/compact"), None);
+        assert_eq!(parse_acp_command("/help extra"), None);
     }
 
     #[tokio::test]
@@ -2042,6 +2253,14 @@ mod tests {
         assert!(
             agent_texts.iter().any(|t| t == "recalled-text"),
             "replay must include the historical assistant message: {replayed:?}"
+        );
+        assert!(
+            replayed.iter().any(|update| matches!(
+                update,
+                SessionUpdate::AvailableCommandsUpdate(commands)
+                    if commands.available_commands.len() == 3
+            )),
+            "session/load must re-advertise slash commands: {replayed:?}"
         );
     }
 
