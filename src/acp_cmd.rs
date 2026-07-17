@@ -344,14 +344,24 @@ fn build_before_tool_call_hook(
                 }
             }
 
-            let status = match &decision {
-                BeforeHookResult::Allow => ToolCallStatus::InProgress,
-                BeforeHookResult::Block(_) => ToolCallStatus::Failed,
+            let fields = match &decision {
+                BeforeHookResult::Allow => {
+                    ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress))
+                }
+                BeforeHookResult::Block(reason) => {
+                    let message = format!("blocked: {reason}");
+                    ToolCallUpdateFields::new()
+                        .status(Some(ToolCallStatus::Failed))
+                        .content(Some(vec![
+                            AcpContentBlock::Text(TextContent::new(message)).into()
+                        ]))
+                        .raw_output(Some(serde_json::json!({
+                            "blocked": true,
+                            "reason": reason,
+                        })))
+                }
             };
-            let update = ToolCallUpdate::new(
-                info.id.clone(),
-                ToolCallUpdateFields::new().status(Some(status)),
-            );
+            let update = ToolCallUpdate::new(info.id.clone(), fields);
             send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
 
             decision
@@ -1558,14 +1568,41 @@ mod tests {
             "a denylisted tool must not even ask for permission"
         );
         let updates = updates.lock().unwrap();
-        let statuses: Vec<ToolCallStatus> = updates
+        let failed_updates: Vec<&ToolCallUpdate> = updates
             .iter()
-            .filter_map(|u| match u {
-                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.status,
+            .filter_map(|update| match update {
+                SessionUpdate::ToolCallUpdate(tool_call)
+                    if tool_call.fields.status == Some(ToolCallStatus::Failed) =>
+                {
+                    Some(tool_call)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(statuses, vec![ToolCallStatus::Failed], "got: {updates:?}");
+        assert_eq!(failed_updates.len(), 1, "got: {updates:?}");
+        let fields = &failed_updates[0].fields;
+        assert_eq!(
+            fields.raw_output,
+            Some(serde_json::json!({
+                "blocked": true,
+                "reason": "blocked by policy: 'exec' is in the denied-commands list",
+            }))
+        );
+        let message = fields
+            .content
+            .as_ref()
+            .and_then(|content| content.first())
+            .and_then(|content| match content {
+                AcpToolCallContent::Content(content) => match &content.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        assert_eq!(
+            message,
+            Some("blocked: blocked by policy: 'exec' is in the denied-commands list")
+        );
     }
 
     #[tokio::test]
