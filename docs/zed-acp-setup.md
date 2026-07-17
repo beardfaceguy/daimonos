@@ -127,6 +127,8 @@ the equivalent notice.
    the chat lists your models; picking one applies to the next message.
 6. File `@mentions` include their contents, and pasted images are sent to
    image-capable providers.
+7. Foreground `exec` calls show stdout/stderr live in a terminal card, followed
+   by the command's exit status.
 
 ## Scope
 
@@ -140,6 +142,11 @@ the equivalent notice.
   Audio prompts are not advertised.
 - Tool execution and file access are handled entirely by daimonos's own
   tools — the `fs/*`/`terminal/*` client-proxy methods aren't used.
+- When Zed advertises its terminal-output metadata extension, foreground
+  `exec` runs directly so daimonos can mirror subprocess output live. The
+  completed tool result remains structured and still uses semantic output
+  filtering and output caps. Other clients retain plugin redirects and the
+  existing completion-only behavior.
 
 ## Troubleshooting
 

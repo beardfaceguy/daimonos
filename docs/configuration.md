@@ -111,6 +111,7 @@ default_find_max = 20
 |---------|---------|-------------|
 | `poll_tail_lines` | `20` | Number of trailing output lines returned by `poll` for background processes |
 | `exec_output_max_chars` | `100000` (100 KB) | Max characters of exec stdout/stderr before auto-truncation |
+| `exec_stream_chunk_bytes` | `8192` (8 KB) | Read size for live foreground-exec updates sent to ACP clients |
 | `extra_path` | *(none)* | Additional directories to prepend to `PATH` for exec/bg commands |
 
 Auto-truncation keeps the first and last lines of output with a
@@ -125,6 +126,7 @@ locations:
 [process]
 poll_tail_lines = 20
 exec_output_max_chars = 100_000
+exec_stream_chunk_bytes = 8_192
 extra_path = ["/opt/custom/bin", "/usr/local/go/bin"]
 ```
 

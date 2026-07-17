@@ -44,6 +44,7 @@ pub type BeforeHook = Box<
         + Sync,
 >;
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
+pub type ToolProgressHook = Box<dyn Fn(&ToolCallInfo, crate::ops::ExecProgress) + Send + Sync>;
 /// Invoked with each `StreamEvent` as a turn streams in (vikunja #957).
 pub type StreamHook = Box<dyn Fn(StreamEvent) + Send + Sync>;
 /// Invoked after each compaction (ADR-002) so frontends can surface an
@@ -66,6 +67,7 @@ pub struct AgentConfig {
     pub opts: CompleteOpts,
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
+    pub on_tool_progress: Option<ToolProgressHook>,
     pub on_stream_event: Option<StreamHook>,
     pub token_log: Option<TokenLogConfig>,
     /// Context/window compaction (ADR-002). `None` = off.
@@ -248,15 +250,14 @@ pub async fn run(
                 let mut terminate = false;
 
                 for (id, name, input) in calls {
+                    let info = ToolCallInfo {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    };
                     // before_tool_call hook
                     if let Some(hook) = &config.before_tool_call {
-                        match hook(&ToolCallInfo {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        })
-                        .await
-                        {
+                        match hook(&info).await {
                             BeforeHookResult::Allow => {}
                             BeforeHookResult::Block(reason) => {
                                 tool_results.push(ContentBlock::ToolResult {
@@ -270,29 +271,33 @@ pub async fn run(
                     }
 
                     // invoke via facade
-                    let (content, is_error) =
-                        match tool_facade::invoke(session, &name, &input).await {
-                            Some(r) => {
-                                let ok = r.ok;
-                                (response_to_content(r), !ok)
-                            }
-                            None => (format!("tool '{name}' not available in agent mode"), true),
-                        };
+                    let on_progress = |event| {
+                        if let Some(hook) = &config.on_tool_progress {
+                            hook(&info, event);
+                        }
+                    };
+                    let progress_callback = config
+                        .on_tool_progress
+                        .as_ref()
+                        .map(|_| &on_progress as &crate::ops::ExecProgressCallback<'_>);
+                    let (content, is_error) = match tool_facade::invoke_with_progress(
+                        session,
+                        &name,
+                        &input,
+                        progress_callback,
+                    )
+                    .await
+                    {
+                        Some(r) => {
+                            let ok = r.ok;
+                            (response_to_content(r), !ok)
+                        }
+                        None => (format!("tool '{name}' not available in agent mode"), true),
+                    };
 
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
-                        if matches!(
-                            hook(
-                                &ToolCallInfo {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone()
-                                },
-                                &content,
-                                is_error
-                            ),
-                            AfterHookResult::Terminate
-                        ) {
+                        if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
                             terminate = true;
                         }
                     }
@@ -1231,6 +1236,51 @@ mod tests {
         assert!(matches!(
             &result.messages[2].content[0],
             ContentBlock::ToolResult { is_error: true, content, .. } if content.contains("blocked")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_progress_hook_receives_exec_output_and_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session_in(dir.path());
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "exec", json!({"command": "printf streamed-output"})),
+            end_turn_resp(),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_hook = Arc::clone(&events);
+        let config = AgentConfig {
+            on_tool_progress: Some(Box::new(move |info, event| {
+                events_for_hook
+                    .lock()
+                    .unwrap()
+                    .push((info.id.clone(), event));
+            })),
+            ..AgentConfig::default()
+        };
+
+        run(
+            &provider,
+            &mut session,
+            vec![Message::user("run command")],
+            &config,
+        )
+        .await;
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(
+            |(id, event)| id == "t1"
+                && matches!(event, crate::ops::ExecProgress::Output(data) if data.contains("streamed-output"))
+        ));
+        assert!(matches!(
+            events.last(),
+            Some((
+                id,
+                crate::ops::ExecProgress::Exit {
+                    code: Some(0),
+                    ..
+                }
+            )) if id == "t1"
         ));
     }
 

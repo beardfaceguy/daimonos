@@ -48,6 +48,8 @@ default_find_max = 20
 poll_tail_lines = 20
 # Max characters of exec stdout/stderr before truncation (keeps first+last lines)
 exec_output_max_chars = 100_000
+# Bytes read per live foreground-exec progress update (ACP terminal streaming)
+exec_stream_chunk_bytes = 8_192
 # Additional directories to prepend to PATH for exec/bg commands.
 # Common tool dirs (~/.cargo/bin, ~/.local/bin, etc.) are auto-detected;
 # use this for non-standard locations.

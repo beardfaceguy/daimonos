@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784328279.6547942,
-    "ast_hash": "599959d53db02cbbf6edc1b0c433f625",
+    "mtime": 1784331517.6637468,
+    "ast_hash": "930e838d60e5e368c83f5a0e29babdee",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784327849.813033,
-    "ast_hash": "d872c823879fe6b107a27146ac711c45",
+    "mtime": 1784331172.3481688,
+    "ast_hash": "e2444b72c30158e00917ba28329ae5fd",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -280,18 +280,18 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1784327989.3959813,
+    "mtime": 1784329420.6912117,
     "ast_hash": "94e6e63a124d8bf5229c8ba3fe8e0004",
     "semantic_hash": ""
   },
   "src/compaction.rs": {
-    "mtime": 1784328062.4134312,
+    "mtime": 1784329420.6912117,
     "ast_hash": "8e46ea7810509592c944437ff8f7873f",
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784327063.7599804,
-    "ast_hash": "e7fdc3dbb351827fb9585543591a425b",
+    "mtime": 1784331493.543916,
+    "ast_hash": "f65b6c300a530a594cc438ce06a98cdf",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -375,9 +375,9 @@
     "semantic_hash": "87419cbcf60a37e69e4ba01b8a642fde"
   },
   "src/ops/exec_ops.rs": {
-    "mtime": 1783897689.4900227,
-    "ast_hash": "136ea8fa4c0c00ad82ae98565fe67f2f",
-    "semantic_hash": "136ea8fa4c0c00ad82ae98565fe67f2f"
+    "mtime": 1784331387.9446568,
+    "ast_hash": "774f15a9afcd17003e03b9de52eb11ce",
+    "semantic_hash": ""
   },
   "src/ops/file_ops.rs": {
     "mtime": 1783897689.4900227,
@@ -385,9 +385,9 @@
     "semantic_hash": "01a0e0db2555807ba5beeaffc6266e8d"
   },
   "src/ops/mod.rs": {
-    "mtime": 1783889642.914951,
-    "ast_hash": "eeb8cd5b451d4acbc863f860acfcf527",
-    "semantic_hash": "eeb8cd5b451d4acbc863f860acfcf527"
+    "mtime": 1784331157.4082737,
+    "ast_hash": "5c242a4a14b9bafdde988b3270d38e2a",
+    "semantic_hash": ""
   },
   "src/ops/schema.rs": {
     "mtime": 1783889642.914951,
@@ -480,17 +480,17 @@
     "semantic_hash": "ae8b2eb11a1219fe71e48dc25bdd9df4"
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1784327857.506975,
+    "mtime": 1784329420.6912117,
     "ast_hash": "ac166bfd7f00875db2cdf6f55e67d586",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1784327839.356112,
+    "mtime": 1784329420.6912117,
     "ast_hash": "3f740c1912f8defbfe77fb13bbef8e36",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1784328124.9939597,
+    "mtime": 1784329420.6922119,
     "ast_hash": "626afc98132e7b87f271fc86bd2caf61",
     "semantic_hash": ""
   },
@@ -520,9 +520,9 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1783897689.4920225,
-    "ast_hash": "483cc5a43e8739d441215485eef16da7",
-    "semantic_hash": "483cc5a43e8739d441215485eef16da7"
+    "mtime": 1784331168.1871982,
+    "ast_hash": "fa70ceeb9bf2a3244f587125389a08ad",
+    "semantic_hash": ""
   },
   "src/tool_runner.rs": {
     "mtime": 1783889642.916951,
@@ -830,8 +830,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784327063.7519805,
-    "ast_hash": "cb42bcb62ad06621a517d94c0806f6cc",
+    "mtime": 1784331216.7798574,
+    "ast_hash": "a4220b4b298451267e2a98a47421b4f5",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -875,8 +875,8 @@
     "semantic_hash": ""
   },
   "docs/zed-acp-setup.md": {
-    "mtime": 1784328114.9860349,
-    "ast_hash": "25b8837b09123861c6679eef790b7373",
+    "mtime": 1784331226.6526423,
+    "ast_hash": "74e536d8da2dbe85a509a680304f238f",
     "semantic_hash": ""
   },
   "docs/zed-setup.md": {

@@ -1,4 +1,4 @@
-use crate::ops::exec_filter;
+use crate::ops::{exec_filter, ExecProgress, ExecProgressCallback};
 use crate::protocol::{Op, Response};
 use crate::session::{BgProcess, Session};
 use crate::tool_runner::ToolRegistry;
@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 /// Merge per-call env vars (`op.kv`) on top of the session env, so callers
@@ -409,7 +410,16 @@ async fn parse_docker_redirect(
     }
 }
 
+#[cfg(test)]
 pub async fn exec(session: &Session, op: &Op) -> Response {
+    exec_with_progress(session, op, None).await
+}
+
+pub async fn exec_with_progress(
+    session: &Session,
+    op: &Op,
+    on_progress: Option<&ExecProgressCallback<'_>>,
+) -> Response {
     let cmd = match &op.s {
         Some(c) => c.clone(),
         None => return Response::err(3, "exec requires command in 's'"),
@@ -426,7 +436,9 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
 
     // Layer 1: try redirecting through a native plugin for structured output.
     // Pass the merged env so per-call kv reaches the plugin too.
-    if session.cfg.process.exec_plugin_redirect && args.is_empty() {
+    // Native plugins return only their completed structured result. ACP terminal
+    // streaming needs subprocess pipes, so observed foreground calls stay raw.
+    if on_progress.is_none() && session.cfg.process.exec_plugin_redirect && args.is_empty() {
         if let Some(registry) = &session.tool_registry {
             if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
                 return resp;
@@ -444,14 +456,28 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         command.env(k, v);
     }
 
-    let output = match command.output().await {
-        Ok(o) => o,
-        Err(e) => return Response::err(5, &format!("exec: {e}")),
+    let (stdout_bytes, stderr_bytes, status) = if let Some(on_progress) = on_progress {
+        match run_streaming_command(
+            &mut command,
+            session.cfg.process.exec_stream_chunk_bytes,
+            on_progress,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(e) => return Response::err(5, &format!("exec: {e}")),
+        }
+    } else {
+        let output = match command.output().await {
+            Ok(output) => output,
+            Err(e) => return Response::err(5, &format!("exec: {e}")),
+        };
+        (output.stdout, output.stderr, output.status)
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let exit = status.code().unwrap_or(-1);
     let max = session.cfg.process.exec_output_max_chars;
 
     if session.cfg.process.exec_output_filters {
@@ -479,6 +505,125 @@ pub async fn exec(session: &Session, op: &Op) -> Response {
         resp["err"] = json!(cap_output(err_trimmed, max));
     }
     Response::ok(resp)
+}
+
+async fn run_streaming_command(
+    command: &mut Command,
+    chunk_bytes: usize,
+    on_progress: &ExecProgressCallback<'_>,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            on_progress(ExecProgress::Exit {
+                code: None,
+                signal: Some("spawn_error".to_string()),
+            });
+            return Err(error);
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("spawned exec has no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("spawned exec has no stderr pipe"))?;
+
+    let (stdout, stderr, status) = tokio::join!(
+        read_stream(stdout, chunk_bytes, on_progress),
+        read_stream(stderr, chunk_bytes, on_progress),
+        child.wait()
+    );
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            on_progress(ExecProgress::Exit {
+                code: None,
+                signal: Some("wait_error".to_string()),
+            });
+            return Err(error);
+        }
+    };
+    on_progress(ExecProgress::Exit {
+        code: status.code(),
+        signal: exit_signal(&status),
+    });
+    Ok((stdout?, stderr?, status))
+}
+
+async fn read_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    chunk_bytes: usize,
+    on_progress: &ExecProgressCallback<'_>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pending_utf8 = Vec::new();
+    let mut chunk = vec![0; chunk_bytes];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            let text = decode_stream_utf8(&mut pending_utf8, true);
+            if !text.is_empty() {
+                on_progress(ExecProgress::Output(text));
+            }
+            return Ok(output);
+        }
+        output.extend_from_slice(&chunk[..read]);
+        pending_utf8.extend_from_slice(&chunk[..read]);
+        let text = decode_stream_utf8(&mut pending_utf8, false);
+        if !text.is_empty() {
+            on_progress(ExecProgress::Output(text));
+        }
+    }
+}
+
+fn decode_stream_utf8(pending: &mut Vec<u8>, eof: bool) -> String {
+    let mut rendered = String::new();
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                rendered.push_str(text);
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                rendered.push_str(
+                    std::str::from_utf8(&pending[consumed..consumed + valid])
+                        .expect("valid_up_to always identifies valid UTF-8"),
+                );
+                consumed += valid;
+                match error.error_len() {
+                    Some(invalid_bytes) => {
+                        rendered.push('\u{FFFD}');
+                        consumed += invalid_bytes;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+    if eof && !pending.is_empty() {
+        rendered.push_str(&String::from_utf8_lossy(pending));
+        pending.clear();
+    }
+    rendered
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| signal.to_string())
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
+    None
 }
 
 pub async fn bg(session: &mut Session, op: &Op) -> Response {
@@ -654,6 +799,57 @@ mod tests {
         let d = r.d.unwrap();
         assert_eq!(d["exit"], 42);
         assert_eq!(d["err"], "err");
+    }
+
+    #[tokio::test]
+    async fn exec_streams_output_chunks_and_exit_before_returning_final_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let events = std::sync::Mutex::new(Vec::new());
+        let on_progress = |event| events.lock().unwrap().push(event);
+
+        let r = exec_with_progress(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("sh".into()),
+                a: Some(vec![
+                    "-c".into(),
+                    "printf first; sleep 0.05; printf second; printf err >&2; exit 7".into(),
+                ]),
+                ..Op::default()
+            },
+            Some(&on_progress),
+        )
+        .await;
+
+        assert!(r.ok);
+        assert_eq!(r.d.as_ref().unwrap()["exit"], 7);
+        let events = events.into_inner().unwrap();
+        let streamed = events
+            .iter()
+            .filter_map(|event| match event {
+                ExecProgress::Output(data) => Some(data.as_str()),
+                ExecProgress::Exit { .. } => None,
+            })
+            .collect::<String>();
+        assert!(streamed.contains("first"));
+        assert!(streamed.contains("second"));
+        assert!(streamed.contains("err"));
+        assert!(matches!(
+            events.last(),
+            Some(ExecProgress::Exit { code: Some(7), .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_utf8_decoder_preserves_codepoints_split_across_reads() {
+        let euro = "€".as_bytes();
+        let mut pending = euro[..1].to_vec();
+        assert_eq!(decode_stream_utf8(&mut pending, false), "");
+        pending.extend_from_slice(&euro[1..]);
+        assert_eq!(decode_stream_utf8(&mut pending, false), "€");
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
