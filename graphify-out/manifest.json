@@ -255,9 +255,9 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784307253.1830742,
-    "ast_hash": "3b6ba702f1720fdcd3a81f384660c619",
-    "semantic_hash": "3b6ba702f1720fdcd3a81f384660c619"
+    "mtime": 1784316467.5675724,
+    "ast_hash": "7cece34d7037955efdf258cfdcac8f84",
+    "semantic_hash": ""
   },
   "src/agent.rs": {
     "mtime": 1783902345.1162875,
