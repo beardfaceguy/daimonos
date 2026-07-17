@@ -18,14 +18,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, Diff as AcpDiff,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, DeleteSessionRequest,
+    DeleteSessionResponse, Diff as AcpDiff, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    StopReason as AcpStopReason, TextContent, ToolCall, ToolCallContent as AcpToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason as AcpStopReason, TextContent, ToolCall,
+    ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -38,7 +41,7 @@ use crate::agent::{
 use crate::config::Config;
 use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema, Usage};
 use crate::session::Session;
-use crate::session_store::SessionStore;
+use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
 
 /// One in-flight prompt's cancellation switch. Stored outside the
@@ -84,6 +87,7 @@ struct SessionHandle {
     cancel: CancelSlot,
     connection: CurrentConnection,
     current_model: CurrentModel,
+    cwd: PathBuf,
 }
 
 /// Shared engine state across all sessions on one process.
@@ -169,6 +173,17 @@ fn run_acp_command(command: AcpCommand, session: &mut AgentSession) -> String {
         }
         AcpCommand::Help => ACP_HELP_TEXT.to_string(),
     }
+}
+
+fn session_info(summary: SessionSummary, fallback_cwd: &Path) -> SessionInfo {
+    let cwd = summary.cwd.unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let title = summary.first_user_line.filter(|line| !line.is_empty());
+    let updated_at = summary
+        .updated_at
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    SessionInfo::new(summary.id, cwd)
+        .title(title)
+        .updated_at(updated_at)
 }
 
 /// Pre-edit file text captured by the before hook (keyed by tool-call id)
@@ -655,7 +670,7 @@ async fn run_prompt_turn(
         drop(agent_session);
 
         if let (Some(store), Some(messages)) = (store, cleared_history) {
-            store.save(&session_id.to_string(), &model, &messages);
+            store.save_with_cwd(&session_id.to_string(), &model, &messages, &handle.cwd);
         }
         let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
         send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
@@ -679,7 +694,7 @@ async fn run_prompt_turn(
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     if let (Some(store), Some(messages)) = (store, history_snapshot) {
-        store.save(&session_id.to_string(), &model, &messages);
+        store.save_with_cwd(&session_id.to_string(), &model, &messages, &handle.cwd);
     }
 
     match outcome {
@@ -719,12 +734,13 @@ fn build_session_handle(
         state.compaction.clone(),
         crate::prompts::agent_system(cfg),
     );
-    let tool_session = Session::new(session_workspace, Arc::clone(cfg));
+    let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
         connection,
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
+        cwd: session_workspace,
     }))
 }
 
@@ -814,15 +830,113 @@ fn build_agent(
         .builder()
         .name("daimonos")
         .on_receive_request(
-            async move |req: InitializeRequest, responder, _cx| {
-                responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        // load_session(true): Zed calls session/load to
-                        // reopen a thread on window refocus; without this
-                        // capability it refuses with "Loading or resuming
-                        // sessions is not supported by this agent."
-                        .agent_capabilities(AgentCapabilities::new().load_session(true)),
-                )
+            {
+                let state = Arc::clone(&state);
+                move |req: InitializeRequest,
+                      responder: agent_client_protocol::Responder<InitializeResponse>,
+                      _cx: ConnectionTo<AcpClientRole>| {
+                    let persistence_enabled = state.store.is_some();
+                    async move {
+                        // load_session(true): Zed calls session/load to reopen
+                        // a thread on window refocus.
+                        let mut capabilities = AgentCapabilities::new().load_session(true);
+                        if persistence_enabled {
+                            capabilities = capabilities.session_capabilities(
+                                SessionCapabilities::new()
+                                    .list(SessionListCapabilities::new())
+                                    .delete(SessionDeleteCapabilities::new()),
+                            );
+                        }
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(capabilities),
+                        )
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                let workspace = workspace.clone();
+                move |req: ListSessionsRequest,
+                      responder: agent_client_protocol::Responder<ListSessionsResponse>,
+                      _cx: ConnectionTo<AcpClientRole>| {
+                    let store = state.store.clone();
+                    let fallback_cwd = workspace.clone();
+                    async move {
+                        let Some(store) = store else {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "session persistence is disabled",
+                                ),
+                            );
+                        };
+                        let sessions = store
+                            .list()
+                            .into_iter()
+                            .map(|summary| session_info(summary, &fallback_cwd))
+                            .filter(|info| {
+                                req.cwd
+                                    .as_ref()
+                                    .is_none_or(|requested| requested == &info.cwd)
+                            })
+                            .collect();
+                        responder.respond(ListSessionsResponse::new(sessions))
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                move |req: DeleteSessionRequest,
+                      responder: agent_client_protocol::Responder<DeleteSessionResponse>,
+                      _cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let Some(store) = state.store.clone() else {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "session persistence is disabled",
+                                ),
+                            );
+                        };
+                        let removed_handle = state.sessions.lock().await.remove(&req.session_id);
+                        if let Some(handle) = &removed_handle {
+                            let notify = handle
+                                .cancel
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            if let Some(notify) = notify {
+                                notify.notify_one();
+                            }
+                            // Wait for a cancelled turn (or short direct command)
+                            // to release the session before removing its file, so
+                            // it cannot save itself again after deletion.
+                            let session = handle.session.lock().await;
+                            drop(session);
+                        }
+                        if let Err(error) = store.delete(&req.session_id.to_string()) {
+                            if let Some(handle) = removed_handle {
+                                state
+                                    .sessions
+                                    .lock()
+                                    .await
+                                    .insert(req.session_id.clone(), handle);
+                            }
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(format!(
+                                    "failed to delete session: {error}"
+                                )),
+                            );
+                        }
+                        responder.respond(DeleteSessionResponse::new())
+                    }
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1483,6 +1597,29 @@ mod tests {
         assert_eq!(parse_acp_command("/help extra"), None);
     }
 
+    #[test]
+    fn legacy_session_info_uses_process_workspace_fallback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let info = session_info(
+            SessionSummary {
+                id: "legacy".to_string(),
+                model: "model".to_string(),
+                message_count: 1,
+                cwd: None,
+                updated_at: Some(std::time::UNIX_EPOCH),
+                first_user_line: Some("Legacy thread".to_string()),
+            },
+            workspace.path(),
+        );
+
+        assert_eq!(info.cwd, workspace.path());
+        assert_eq!(info.title.as_deref(), Some("Legacy thread"));
+        assert!(info
+            .updated_at
+            .as_deref()
+            .is_some_and(|date| date.contains("1970")));
+    }
+
     #[tokio::test]
     async fn acp_supports_multiple_sessions_per_process() {
         // Zed keeps one `daimonos acp` process across chat threads and sends
@@ -1600,6 +1737,58 @@ mod tests {
                 )?;
 
                 Ok(prompt_response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn acp_session_delete_cancels_inflight_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let make_provider: ProviderFactory = Arc::new(|| Ok(Box::new(SlowProvider)));
+        let agent = build_agent(
+            make_provider,
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(workspace.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task();
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                connection
+                    .send_request(DeleteSessionRequest::new(session_id))
+                    .block_task()
+                    .await?;
+                let response = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+                    .await
+                    .expect("delete should cancel the prompt promptly")?;
+                Ok(response.stop_reason)
             })
             .await
             .unwrap();
@@ -2152,6 +2341,163 @@ mod tests {
         assert!(
             load_session,
             "agent must advertise load_session so Zed reopens threads"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_advertises_list_delete_only_when_persistence_enabled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let persistent_agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+        let persistent_capabilities = AcpClientRole
+            .builder()
+            .connect_with(
+                persistent_agent,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    let init = connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    Ok(init.agent_capabilities.session_capabilities)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(persistent_capabilities.list.is_some());
+        assert!(persistent_capabilities.delete.is_some());
+
+        let transient_agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let transient_capabilities = AcpClientRole
+            .builder()
+            .connect_with(
+                transient_agent,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    let init = connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    Ok(init.agent_capabilities.session_capabilities)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(transient_capabilities.list.is_none());
+        assert!(transient_capabilities.delete.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_session_list_filters_and_delete_removes_disk_and_live_state() {
+        use agent_client_protocol::schema::v1::{DeleteSessionRequest, ListSessionsRequest};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let other_workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let expected_workspace = workspace.path().to_path_buf();
+        let request_workspace = expected_workspace.clone();
+        let request_other_workspace = other_workspace.path().to_path_buf();
+        let agent = build_agent(
+            mock_factory(vec![end_turn_resp("remembered")]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+
+        let (listed, filtered_count, remaining_count, load_failed) = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(request_workspace.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("remember this"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(request_workspace.clone()))
+                    .block_task()
+                    .await?;
+                let filtered_count = connection
+                    .send_request(ListSessionsRequest::new().cwd(request_other_workspace))
+                    .block_task()
+                    .await?
+                    .sessions
+                    .len();
+
+                connection
+                    .send_request(DeleteSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                // Deletion is idempotent.
+                connection
+                    .send_request(DeleteSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                let remaining_count = connection
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?
+                    .sessions
+                    .len();
+                let load_failed = connection
+                    .send_request(LoadSessionRequest::new(session_id, request_workspace))
+                    .block_task()
+                    .await
+                    .is_err();
+                Ok((listed, filtered_count, remaining_count, load_failed))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(listed.sessions.len(), 1);
+        let info = &listed.sessions[0];
+        assert_eq!(info.cwd, expected_workspace);
+        assert_eq!(info.title.as_deref(), Some("remember this"));
+        assert!(info.updated_at.is_some());
+        assert_eq!(listed.next_cursor, None);
+        assert_eq!(filtered_count, 0);
+        assert_eq!(remaining_count, 0);
+        assert!(load_failed, "deleted live session must no longer load");
+        assert!(
+            SessionStore::new(sessions.path().to_path_buf())
+                .list()
+                .is_empty(),
+            "deleted session must be removed from disk"
         );
     }
 
