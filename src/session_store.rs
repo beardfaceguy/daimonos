@@ -5,7 +5,7 @@
 //! leave a truncated file. Mirrors how Zed's native providers restore full
 //! history from a local store.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,8 @@ pub struct PersistedSession {
     pub version: u32,
     pub session_id: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub messages: Vec<Message>,
 }
 
@@ -33,6 +35,8 @@ pub struct SessionSummary {
     pub id: String,
     pub model: String,
     pub message_count: usize,
+    pub cwd: Option<PathBuf>,
+    pub updated_at: Option<std::time::SystemTime>,
     /// First line of the first user message, for a human-recognizable label.
     pub first_user_line: Option<String>,
 }
@@ -62,6 +66,17 @@ impl SessionStore {
     /// Persist a session's history. Best-effort: a write failure is logged to
     /// stderr and never fails the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
+        self.save_record(id, model, messages, None);
+    }
+
+    /// Persist a session and the working directory needed by ACP session/list.
+    /// The cwd is optional in the on-disk format so pre-existing records remain
+    /// readable and the chat store can continue using [`Self::save`].
+    pub fn save_with_cwd(&self, id: &str, model: &str, messages: &[Message], cwd: &Path) {
+        self.save_record(id, model, messages, Some(cwd.to_path_buf()));
+    }
+
+    fn save_record(&self, id: &str, model: &str, messages: &[Message], cwd: Option<PathBuf>) {
         let Some(name) = Self::file_name(id) else {
             return;
         };
@@ -69,6 +84,7 @@ impl SessionStore {
             version: SESSION_PERSIST_VERSION,
             session_id: id.to_string(),
             model: model.to_string(),
+            cwd,
             messages: messages.to_vec(),
         };
         if let Err(e) = self.write_atomic(&name, &record) {
@@ -93,6 +109,19 @@ impl SessionStore {
         let bytes = std::fs::read(self.dir.join(name)).ok()?;
         let record: PersistedSession = serde_json::from_slice(&bytes).ok()?;
         (record.version == SESSION_PERSIST_VERSION).then_some(record)
+    }
+
+    /// Delete a persisted session. Missing and unsafe ids are treated as
+    /// already deleted so ACP session/delete remains idempotent.
+    pub fn delete(&self, id: &str) -> std::io::Result<bool> {
+        let Some(name) = Self::file_name(id) else {
+            return Ok(false);
+        };
+        match std::fs::remove_file(self.dir.join(name)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Summaries of all saved sessions, most-recently-modified first. Files
@@ -126,6 +155,8 @@ impl SessionStore {
                     id: record.session_id,
                     model: record.model,
                     message_count: record.messages.len(),
+                    cwd: record.cwd,
+                    updated_at: Some(mtime),
                     first_user_line: first_user_line(&record.messages),
                 },
             ));
@@ -173,6 +204,46 @@ mod tests {
         assert!(
             matches!(&loaded.messages[0].content[0], ContentBlock::Text(t) if t == "first question\nsecond line")
         );
+    }
+
+    #[test]
+    fn save_with_cwd_round_trips_and_lists_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save_with_cwd("acp-1", "test-model", &msgs(), workspace.path());
+
+        let loaded = store.load("acp-1").expect("saved session should load");
+        assert_eq!(loaded.cwd.as_deref(), Some(workspace.path()));
+
+        let summary = store
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == "acp-1")
+            .expect("saved session should be listed");
+        assert_eq!(summary.cwd.as_deref(), Some(workspace.path()));
+        assert!(summary.updated_at.is_some());
+    }
+
+    #[test]
+    fn legacy_record_without_cwd_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let json = serde_json::json!({
+            "version": SESSION_PERSIST_VERSION,
+            "session_id": "legacy",
+            "model": "m",
+            "messages": [],
+        });
+        std::fs::write(
+            dir.path().join("legacy.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load("legacy").expect("legacy record should load");
+        assert_eq!(loaded.cwd, None);
+        assert_eq!(store.list()[0].cwd, None);
     }
 
     #[test]
@@ -228,6 +299,18 @@ mod tests {
         assert_eq!(s1.message_count, 2);
         // Label is the FIRST LINE of the first user message, trimmed.
         assert_eq!(s1.first_user_line.as_deref(), Some("first question"));
+    }
+
+    #[test]
+    fn delete_is_idempotent_and_rejects_unsafe_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("s1", "m", &msgs());
+
+        assert!(store.delete("s1").unwrap());
+        assert!(store.load("s1").is_none());
+        assert!(!store.delete("s1").unwrap());
+        assert!(!store.delete("../../etc/passwd").unwrap());
     }
 
     #[test]

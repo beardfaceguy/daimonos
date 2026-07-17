@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784316467.5675724,
-    "ast_hash": "7cece34d7037955efdf258cfdcac8f84",
+    "mtime": 1784317994.5080056,
+    "ast_hash": "dd76cea2c852078edb28a08a1d3e9df7",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -510,9 +510,9 @@
     "semantic_hash": "fb421295ade6e74a1e59ee73594373e9"
   },
   "src/session_store.rs": {
-    "mtime": 1783897689.4920225,
-    "ast_hash": "73b3e1689c32c9e8c4ae6b3d285cb368",
-    "semantic_hash": "73b3e1689c32c9e8c4ae6b3d285cb368"
+    "mtime": 1784318014.7098644,
+    "ast_hash": "2c949851149bca0f5eb0de95080f0d1a",
+    "semantic_hash": ""
   },
   "src/snapshot.rs": {
     "mtime": 1783889642.916951,
