@@ -19,16 +19,16 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, DeleteSessionRequest,
-    DeleteSessionResponse, Diff as AcpDiff, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason as AcpStopReason, TextContent, ToolCall,
-    ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource, ImageContent,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
+    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -39,7 +39,10 @@ use crate::agent::{
     TokenLogConfig, ToolCallInfo,
 };
 use crate::config::Config;
-use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ToolSchema, Usage};
+use crate::providers::{
+    CompleteOpts, ContentBlock as CoreBlock, LlmProvider, Message as CoreMessage, Role as CoreRole,
+    StreamEvent, ToolSchema, Usage,
+};
 use crate::session::Session;
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
@@ -105,6 +108,8 @@ struct AcpState {
     /// On-disk session persistence for cross-process `session/load` resume.
     /// `None` disables persistence (used by tests that don't exercise it).
     store: Option<SessionStore>,
+    /// Whether the configured provider adapter can serialize image prompts.
+    supports_images: bool,
     /// Maximum sessions returned by one session/list response.
     session_list_page_size: usize,
     /// Context/window compaction policy (ADR-002), engine-wide from the
@@ -695,19 +700,89 @@ fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
     }
 }
 
-/// Extract the plain text from a prompt's content blocks. Non-text blocks
-/// (images, resources, ...) are dropped — daimonos's tool loop is
-/// text-in/text-out; multimodal prompt support is a fast-follow, not a v1
-/// requirement.
-fn prompt_text(blocks: Vec<AcpContentBlock>) -> String {
-    blocks
-        .into_iter()
-        .filter_map(|b| match b {
-            AcpContentBlock::Text(t) => Some(t.text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Convert ACP prompt content into the provider-neutral message shape without
+/// silently dropping blocks. Embedded text is bounded by visible URI markers;
+/// image payloads stay structured for provider-specific serialization.
+fn prompt_message(blocks: Vec<AcpContentBlock>) -> CoreMessage {
+    let mut content = Vec::new();
+    for block in blocks {
+        match block {
+            AcpContentBlock::Text(text) => content.push(CoreBlock::Text(text.text)),
+            AcpContentBlock::Image(image) => content.push(CoreBlock::Image {
+                data: image.data,
+                media_type: image.mime_type,
+                uri: image.uri,
+            }),
+            AcpContentBlock::Resource(resource) => match resource.resource {
+                EmbeddedResourceResource::TextResourceContents(resource) => {
+                    content.push(CoreBlock::Text(format!(
+                        "[Embedded resource: {}]\n{}\n[End embedded resource]",
+                        resource.uri, resource.text
+                    )));
+                }
+                EmbeddedResourceResource::BlobResourceContents(resource) => {
+                    let media_type = resource
+                        .mime_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    if media_type.starts_with("image/") {
+                        content.push(CoreBlock::Image {
+                            data: resource.blob,
+                            media_type,
+                            uri: Some(resource.uri),
+                        });
+                    } else {
+                        content.push(CoreBlock::Text(format!(
+                            "[Unsupported embedded binary resource: {} ({media_type})]",
+                            resource.uri
+                        )));
+                    }
+                }
+                _ => content.push(CoreBlock::Text(
+                    "[Unsupported ACP embedded resource]".to_string(),
+                )),
+            },
+            AcpContentBlock::ResourceLink(link) => {
+                let description = link
+                    .description
+                    .map(|description| format!(" — {description}"))
+                    .unwrap_or_default();
+                content.push(CoreBlock::Text(format!(
+                    "[Resource link: {} ({}){description}]",
+                    link.name, link.uri
+                )));
+            }
+            AcpContentBlock::Audio(audio) => {
+                content.push(CoreBlock::Text(format!(
+                    "[Unsupported ACP audio block ({})]",
+                    audio.mime_type
+                )));
+            }
+            _ => content.push(CoreBlock::Text(
+                "[Unsupported ACP prompt content block]".to_string(),
+            )),
+        }
+    }
+    if content.is_empty() {
+        content.push(CoreBlock::Text(String::new()));
+    }
+    CoreMessage {
+        role: CoreRole::User,
+        content,
+    }
+}
+
+fn direct_command_text(message: &CoreMessage) -> Option<&str> {
+    match message.content.as_slice() {
+        [CoreBlock::Text(text)] => Some(text),
+        _ => None,
+    }
+}
+
+fn message_has_images(message: &CoreMessage) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, CoreBlock::Image { .. }))
 }
 
 /// Run one prompt turn against `handle`, racing it against `session/cancel`.
@@ -717,7 +792,7 @@ async fn run_prompt_turn(
     handle: &Arc<SessionHandle>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    text: String,
+    user_message: CoreMessage,
     store: Option<&SessionStore>,
 ) -> AcpStopReason {
     // Acquire exclusive access to this session *before* publishing the
@@ -739,7 +814,7 @@ async fn run_prompt_turn(
         .clone();
     agent_session.set_model(model.clone());
 
-    if let Some(command) = parse_acp_command(&text) {
+    if let Some(command) = direct_command_text(&user_message).and_then(parse_acp_command) {
         let response = run_acp_command(command, &mut agent_session);
         let cleared_history =
             (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
@@ -757,7 +832,7 @@ async fn run_prompt_turn(
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
     let outcome = tokio::select! {
-        turn = agent_session.prompt(text) => Some(turn),
+        turn = agent_session.prompt_message(user_message) => Some(turn),
         _ = notify.notified() => None,
     };
 
@@ -822,9 +897,10 @@ fn build_session_handle(
 
 /// Replay a loaded session's in-memory history back to the client as
 /// `session/update` notifications, so Zed rebuilds the reopened thread's
-/// view on `session/load`. User text → `UserMessageChunk`, assistant text →
-/// `AgentMessageChunk`, tool calls/results → the `ToolCall`/`ToolCallUpdate`
-/// lifecycle. `Thinking` blocks are dropped (not shown in the thread view).
+/// view on `session/load`. User text/images → `UserMessageChunk`, assistant
+/// text/images → `AgentMessageChunk`, tool calls/results →
+/// the `ToolCall`/`ToolCallUpdate` lifecycle. `Thinking` blocks are dropped
+/// (not shown in the thread view).
 fn replay_history(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
@@ -837,6 +913,20 @@ fn replay_history(
                 CoreBlock::Text(text) => {
                     let chunk =
                         ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
+                    let update = match message.role {
+                        Role::User => SessionUpdate::UserMessageChunk(chunk),
+                        Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+                    };
+                    send_notification(cx, session_id, update);
+                }
+                CoreBlock::Image {
+                    data,
+                    media_type,
+                    uri,
+                } => {
+                    let chunk = ContentChunk::new(AcpContentBlock::Image(
+                        ImageContent::new(data.clone(), media_type.clone()).uri(uri.clone()),
+                    ));
                     let update = match message.role {
                         Role::User => SessionUpdate::UserMessageChunk(chunk),
                         Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
@@ -893,12 +983,16 @@ fn build_agent(
     compaction: Option<crate::compaction::CompactionPolicy>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
+    let supports_images = make_provider()
+        .map(|provider| provider.supports_images())
+        .unwrap_or(false);
     let state = Arc::new(AcpState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
         models,
         default_model: model,
         store: sessions_dir.map(SessionStore::new),
+        supports_images,
         session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
     });
@@ -913,10 +1007,17 @@ fn build_agent(
                       responder: agent_client_protocol::Responder<InitializeResponse>,
                       _cx: ConnectionTo<AcpClientRole>| {
                     let persistence_enabled = state.store.is_some();
+                    let supports_images = state.supports_images;
                     async move {
                         // load_session(true): Zed calls session/load to reopen
                         // a thread on window refocus.
-                        let mut capabilities = AgentCapabilities::new().load_session(true);
+                        let mut capabilities = AgentCapabilities::new()
+                            .load_session(true)
+                            .prompt_capabilities(
+                                PromptCapabilities::new()
+                                    .embedded_context(true)
+                                    .image(supports_images),
+                            );
                         if persistence_enabled {
                             capabilities = capabilities.session_capabilities(
                                 SessionCapabilities::new()
@@ -1215,15 +1316,28 @@ fn build_agent(
                             let handle = state.sessions.lock().await.get(&session_id).cloned();
                             let stop_reason = match handle {
                                 Some(handle) => {
-                                    let text = prompt_text(req.prompt);
-                                    run_prompt_turn(
-                                        &handle,
-                                        &spawn_cx,
-                                        &session_id,
-                                        text,
-                                        state.store.as_ref(),
-                                    )
-                                    .await
+                                    let user_message = prompt_message(req.prompt);
+                                    if message_has_images(&user_message) && !state.supports_images {
+                                        send_notification(
+                                            &spawn_cx,
+                                            &session_id,
+                                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                                AcpContentBlock::Text(TextContent::new(
+                                                    "The configured provider does not support image prompts.",
+                                                )),
+                                            )),
+                                        );
+                                        AcpStopReason::Refusal
+                                    } else {
+                                        run_prompt_turn(
+                                            &handle,
+                                            &spawn_cx,
+                                            &session_id,
+                                            user_message,
+                                            state.store.as_ref(),
+                                        )
+                                        .await
+                                    }
                                 }
                                 None => AcpStopReason::Refusal,
                             };
@@ -1424,6 +1538,27 @@ mod tests {
         }
     }
 
+    struct ImageCapableProvider;
+
+    #[async_trait]
+    impl LlmProvider for ImageCapableProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            _opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            end_turn_resp("done")
+        }
+
+        fn supports_images(&self) -> bool {
+            true
+        }
+    }
+
+    fn image_capable_factory() -> ProviderFactory {
+        Arc::new(|| Ok(Box::new(ImageCapableProvider)))
+    }
+
     fn end_turn_resp(text: &str) -> crate::providers::LlmResponse {
         crate::providers::LlmResponse {
             content: vec![crate::providers::ContentBlock::Text(text.to_string())],
@@ -1555,6 +1690,77 @@ mod tests {
             .map(|command| command.name.as_str())
             .collect();
         assert_eq!(command_names, vec!["clear", "usage", "help"]);
+    }
+
+    #[tokio::test]
+    async fn acp_refuses_images_when_provider_is_text_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![end_turn_resp("must not run")]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let response = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Image(ImageContent::new(
+                            "aW1hZ2U=",
+                            "image/png",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::Refusal);
+        let texts: Vec<String> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    AcpContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(texts
+            .iter()
+            .any(|text| text.contains("does not support image prompts")));
     }
 
     #[tokio::test]
@@ -2530,6 +2736,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_advertises_embedded_context_and_provider_gated_images() {
+        let workspace = tempfile::tempdir().unwrap();
+        let image_agent = build_agent(
+            image_capable_factory(),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let image_capabilities = AcpClientRole
+            .builder()
+            .connect_with(
+                image_agent,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    let init = connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    Ok(init.agent_capabilities.prompt_capabilities)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(image_capabilities.embedded_context);
+        assert!(image_capabilities.image);
+        assert!(!image_capabilities.audio);
+
+        let text_only_agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+        );
+        let text_only_capabilities = AcpClientRole
+            .builder()
+            .connect_with(
+                text_only_agent,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    let init = connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    Ok(init.agent_capabilities.prompt_capabilities)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(text_only_capabilities.embedded_context);
+        assert!(!text_only_capabilities.image);
+    }
+
+    #[tokio::test]
     async fn acp_advertises_list_delete_only_when_persistence_enabled() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
@@ -3118,20 +3385,62 @@ mod tests {
         );
     }
 
-    // --- prompt_text ---
+    // --- prompt_message ---
 
     #[test]
-    fn prompt_text_joins_text_blocks() {
+    fn prompt_message_preserves_text_resources_links_and_images() {
+        use agent_client_protocol::schema::v1::{
+            EmbeddedResource, EmbeddedResourceResource, ImageContent, ResourceLink,
+            TextResourceContents,
+        };
+
         let blocks = vec![
             AcpContentBlock::Text(TextContent::new("hello")),
-            AcpContentBlock::Text(TextContent::new("world")),
+            AcpContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    "fn main() {}",
+                    "file:///workspace/src/main.rs",
+                )),
+            )),
+            AcpContentBlock::ResourceLink(ResourceLink::new(
+                "README",
+                "file:///workspace/README.md",
+            )),
+            AcpContentBlock::Image(
+                ImageContent::new("aW1hZ2U=", "image/png").uri("file:///workspace/image.png"),
+            ),
         ];
-        assert_eq!(prompt_text(blocks), "hello\nworld");
+        let message = prompt_message(blocks);
+        assert_eq!(message.role, CoreRole::User);
+        assert!(matches!(&message.content[0], CoreBlock::Text(text) if text == "hello"));
+        assert!(matches!(&message.content[1], CoreBlock::Text(text)
+                if text.contains("file:///workspace/src/main.rs")
+                    && text.contains("fn main() {}")));
+        assert!(matches!(&message.content[2], CoreBlock::Text(text)
+                if text.contains("README") && text.contains("file:///workspace/README.md")));
+        assert!(matches!(
+            &message.content[3],
+            CoreBlock::Image {
+                data,
+                media_type,
+                uri: Some(uri),
+            } if data == "aW1hZ2U="
+                && media_type == "image/png"
+                && uri == "file:///workspace/image.png"
+        ));
     }
 
     #[test]
-    fn prompt_text_empty_for_no_blocks() {
-        assert_eq!(prompt_text(vec![]), "");
+    fn prompt_message_does_not_silently_drop_unsupported_audio() {
+        use agent_client_protocol::schema::v1::AudioContent;
+
+        let message = prompt_message(vec![AcpContentBlock::Audio(AudioContent::new(
+            "YXVkaW8=",
+            "audio/wav",
+        ))]);
+        assert!(matches!(&message.content[0], CoreBlock::Text(text)
+                if text.contains("Unsupported ACP audio block")
+                    && text.contains("audio/wav")));
     }
 
     // --- Diff content for write_file/edit_file (vikunja #983) ---

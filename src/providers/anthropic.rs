@@ -50,6 +50,14 @@ struct AnthropicMessage {
 }
 
 #[derive(Serialize)]
+struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    kind: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
     kind: String,
@@ -68,6 +76,11 @@ impl CacheControl {
 enum AnthropicBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Image {
+        source: AnthropicImageSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -242,6 +255,16 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
     match block {
         ContentBlock::Text(t) => AnthropicBlock::Text {
             text: t.clone(),
+            cache_control: cache,
+        },
+        ContentBlock::Image {
+            data, media_type, ..
+        } => AnthropicBlock::Image {
+            source: AnthropicImageSource {
+                kind: "base64".to_string(),
+                media_type: media_type.clone(),
+                data: data.clone(),
+            },
             cache_control: cache,
         },
         ContentBlock::Thinking(t) => AnthropicBlock::Thinking {
@@ -510,6 +533,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn supports_images(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
         let request = build_request(ctx, opts);
 
@@ -857,6 +884,43 @@ mod tests {
             json.get("budget_tokens").is_none(),
             "budget_tokens must not appear"
         );
+    }
+
+    #[test]
+    fn build_request_serializes_base64_image_block() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text("describe this".into()),
+                    ContentBlock::Image {
+                        data: "aW1hZ2U=".into(),
+                        media_type: "image/png".into(),
+                        uri: Some("file:///tmp/image.png".into()),
+                    },
+                ],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        assert_eq!(
+            json["messages"][0]["content"][1],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aW1hZ2U="
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn provider_advertises_image_support() {
+        assert!(AnthropicProvider::new("key").supports_images());
     }
 
     #[test]

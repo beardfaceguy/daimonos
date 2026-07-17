@@ -16,6 +16,11 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
+    Image {
+        data: String,
+        media_type: String,
+        uri: Option<String>,
+    },
     Thinking(String),
     ToolCall {
         id: String,
@@ -204,6 +209,13 @@ pub enum StreamEvent {
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse;
 
+    /// Whether this provider adapter can serialize image prompt blocks.
+    /// Defaults false so test doubles and text-only providers never cause ACP
+    /// clients to send content that would be discarded.
+    fn supports_images(&self) -> bool {
+        false
+    }
+
     /// Like `complete`, but invokes `on_event` with each `StreamEvent` as it
     /// arrives, before returning the same final `LlmResponse` `complete`
     /// would produce. Default: no incremental events, just delegates to
@@ -279,6 +291,12 @@ mod tests {
     async fn default_context_window_is_none() {
         let provider = StaticProvider(LlmResponse::error("unused"));
         assert_eq!(provider.context_window("any-model").await, None);
+    }
+
+    #[test]
+    fn default_provider_does_not_advertise_image_support() {
+        let provider = StaticProvider(LlmResponse::error("unused"));
+        assert!(!provider.supports_images());
     }
 
     #[test]

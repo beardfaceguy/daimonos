@@ -15,7 +15,7 @@
     "semantic_hash": "675fe1c500a971841ba2e5abc1aeb579"
   },
   ".git-hooks/pre-commit": {
-    "mtime": 1784319537.9922683,
+    "mtime": 1784326749.48839,
     "ast_hash": "b900729699a37a34da887821b42c296e",
     "semantic_hash": ""
   },
@@ -255,14 +255,14 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784320159.2249851,
-    "ast_hash": "800d6823c545ac38ea0cb26e2e21475e",
+    "mtime": 1784328279.6547942,
+    "ast_hash": "599959d53db02cbbf6edc1b0c433f625",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1783902345.1162875,
-    "ast_hash": "645f5f43e5c330147f2fb9ef1a7c2cf7",
-    "semantic_hash": "645f5f43e5c330147f2fb9ef1a7c2cf7"
+    "mtime": 1784327849.813033,
+    "ast_hash": "d872c823879fe6b107a27146ac711c45",
+    "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
     "mtime": 1784092846.1650639,
@@ -280,17 +280,17 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1784092846.1650639,
-    "ast_hash": "5312586ee50cd4bc89ced16f806d6b10",
-    "semantic_hash": "5312586ee50cd4bc89ced16f806d6b10"
+    "mtime": 1784327989.3959813,
+    "ast_hash": "94e6e63a124d8bf5229c8ba3fe8e0004",
+    "semantic_hash": ""
   },
   "src/compaction.rs": {
-    "mtime": 1784092846.1650639,
-    "ast_hash": "efb137c13fe5c054bf77325760a093ea",
-    "semantic_hash": "efb137c13fe5c054bf77325760a093ea"
+    "mtime": 1784328062.4134312,
+    "ast_hash": "8e46ea7810509592c944437ff8f7873f",
+    "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784320159.247985,
+    "mtime": 1784327063.7599804,
     "ast_hash": "e7fdc3dbb351827fb9585543591a425b",
     "semantic_hash": ""
   },
@@ -480,19 +480,19 @@
     "semantic_hash": "ae8b2eb11a1219fe71e48dc25bdd9df4"
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1783897689.4910226,
-    "ast_hash": "4102af6dbcc9a202caead62840090ce8",
-    "semantic_hash": "4102af6dbcc9a202caead62840090ce8"
+    "mtime": 1784327857.506975,
+    "ast_hash": "ac166bfd7f00875db2cdf6f55e67d586",
+    "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1783897689.4910226,
-    "ast_hash": "42aeddba9cbd400b2666c0becdc4f4d5",
-    "semantic_hash": "42aeddba9cbd400b2666c0becdc4f4d5"
+    "mtime": 1784327839.356112,
+    "ast_hash": "3f740c1912f8defbfe77fb13bbef8e36",
+    "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1783897689.4920225,
-    "ast_hash": "03ccc6294031b2ae5b591c69b5886093",
-    "semantic_hash": "03ccc6294031b2ae5b591c69b5886093"
+    "mtime": 1784328124.9939597,
+    "ast_hash": "626afc98132e7b87f271fc86bd2caf61",
+    "semantic_hash": ""
   },
   "src/safety.rs": {
     "mtime": 1783897689.4920225,
@@ -510,7 +510,7 @@
     "semantic_hash": "fb421295ade6e74a1e59ee73594373e9"
   },
   "src/session_store.rs": {
-    "mtime": 1784320309.5669487,
+    "mtime": 1784327063.7599804,
     "ast_hash": "362ac5adf01886302123f7846c7e8b8e",
     "semantic_hash": ""
   },
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784319985.6471815,
+    "mtime": 1784327063.7519805,
     "ast_hash": "cb42bcb62ad06621a517d94c0806f6cc",
     "semantic_hash": ""
   },
@@ -875,8 +875,8 @@
     "semantic_hash": ""
   },
   "docs/zed-acp-setup.md": {
-    "mtime": 1783889626.2460585,
-    "ast_hash": "5ed2dbb2ce8779f8f8d875d1a863dc8e",
+    "mtime": 1784328114.9860349,
+    "ast_hash": "25b8837b09123861c6679eef790b7373",
     "semantic_hash": ""
   },
   "docs/zed-setup.md": {
