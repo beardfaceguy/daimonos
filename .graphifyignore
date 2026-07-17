@@ -1,0 +1,4 @@
+# Graphify only loads ignore rules from the scan root and its ancestors, so it
+# does not see distro/.gitignore. This directory is a local, entirely untracked
+# Buildroot checkout containing generated toolchains, sysroots, and build output.
+distro/buildroot/

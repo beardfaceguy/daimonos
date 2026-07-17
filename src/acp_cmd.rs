@@ -344,14 +344,24 @@ fn build_before_tool_call_hook(
                 }
             }
 
-            let status = match &decision {
-                BeforeHookResult::Allow => ToolCallStatus::InProgress,
-                BeforeHookResult::Block(_) => ToolCallStatus::Failed,
+            let fields = match &decision {
+                BeforeHookResult::Allow => {
+                    ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress))
+                }
+                BeforeHookResult::Block(reason) => {
+                    let message = format!("blocked: {reason}");
+                    ToolCallUpdateFields::new()
+                        .status(Some(ToolCallStatus::Failed))
+                        .content(Some(vec![
+                            AcpContentBlock::Text(TextContent::new(message)).into()
+                        ]))
+                        .raw_output(Some(serde_json::json!({
+                            "blocked": true,
+                            "reason": reason,
+                        })))
+                }
             };
-            let update = ToolCallUpdate::new(
-                info.id.clone(),
-                ToolCallUpdateFields::new().status(Some(status)),
-            );
+            let update = ToolCallUpdate::new(info.id.clone(), fields);
             send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
 
             decision
@@ -388,11 +398,17 @@ fn build_after_tool_call_hook(
             Some(diff) => diff.into(),
             None => AcpContentBlock::Text(TextContent::new(content.to_string())).into(),
         };
+        // Machine-readable result for the client's tool-call inspector
+        // (vikunja #991). Tool output is normally compact JSON; plain-text
+        // messages (e.g. "tool not available") become a JSON string.
+        let raw_output: serde_json::Value = serde_json::from_str(content)
+            .unwrap_or_else(|_| serde_json::Value::String(content.to_string()));
         let update = ToolCallUpdate::new(
             info.id.clone(),
             ToolCallUpdateFields::new()
                 .status(Some(status))
-                .content(Some(vec![block])),
+                .content(Some(vec![block]))
+                .raw_output(Some(raw_output)),
         );
         send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
         AfterHookResult::Continue
@@ -1552,14 +1568,41 @@ mod tests {
             "a denylisted tool must not even ask for permission"
         );
         let updates = updates.lock().unwrap();
-        let statuses: Vec<ToolCallStatus> = updates
+        let failed_updates: Vec<&ToolCallUpdate> = updates
             .iter()
-            .filter_map(|u| match u {
-                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.status,
+            .filter_map(|update| match update {
+                SessionUpdate::ToolCallUpdate(tool_call)
+                    if tool_call.fields.status == Some(ToolCallStatus::Failed) =>
+                {
+                    Some(tool_call)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(statuses, vec![ToolCallStatus::Failed], "got: {updates:?}");
+        assert_eq!(failed_updates.len(), 1, "got: {updates:?}");
+        let fields = &failed_updates[0].fields;
+        assert_eq!(
+            fields.raw_output,
+            Some(serde_json::json!({
+                "blocked": true,
+                "reason": "blocked by policy: 'exec' is in the denied-commands list",
+            }))
+        );
+        let message = fields
+            .content
+            .as_ref()
+            .and_then(|content| content.first())
+            .and_then(|content| match content {
+                AcpToolCallContent::Content(content) => match &content.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        assert_eq!(
+            message,
+            Some("blocked: blocked by policy: 'exec' is in the denied-commands list")
+        );
     }
 
     #[tokio::test]
@@ -2462,6 +2505,64 @@ mod tests {
             .collect();
         assert_eq!(locations.len(), 1, "got: {updates:?}");
         assert_eq!(locations[0].path, dir.path().join("f.txt"));
+    }
+
+    // --- raw_output on completion (vikunja #991) ---
+
+    fn raw_outputs(updates: &[SessionUpdate]) -> Vec<serde_json::Value> {
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCallUpdate(tcu) => tcu.fields.raw_output.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn acp_completed_tool_call_carries_structured_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp("t1", "read_file", serde_json::json!({"path": "f.txt"})),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let outputs = raw_outputs(&updates);
+        assert_eq!(outputs.len(), 1, "got: {updates:?}");
+        assert!(
+            outputs[0].is_object(),
+            "read_file output should parse as a JSON object: {:?}",
+            outputs[0]
+        );
+        assert_eq!(outputs[0]["content"], "hi\n");
+    }
+
+    #[tokio::test]
+    async fn acp_plain_text_tool_result_becomes_json_string_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tool that doesn't exist in agent mode produces a plain-text
+        // error message, not JSON — raw_output must wrap it as a string.
+        let updates = run_tool_call_flow(
+            dir.path(),
+            vec![
+                tool_call_resp("t1", "nonexistent_tool", serde_json::json!({})),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        let outputs = raw_outputs(&updates);
+        assert_eq!(outputs.len(), 1, "got: {updates:?}");
+        assert!(
+            outputs[0].as_str().unwrap_or("").contains("not available"),
+            "got: {:?}",
+            outputs[0]
+        );
     }
 
     /// Run one scripted tool call through the full ACP flow and return the
