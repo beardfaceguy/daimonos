@@ -148,6 +148,16 @@ impl SafetyPolicy {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(name.to_string());
+        // Remote MCP tools (mcp__*) get a *session-scoped* approval only. Their
+        // exposed name is not a stable cross-session identity — it is sanitized,
+        // truncated to 64 chars, and de-duped with ordering-dependent numeric
+        // suffixes — so persisting it could silently authorize a *different*
+        // remote server in a later session (#990 review). Within one process
+        // the bridge's name→route map is fixed, so the in-memory entry above is
+        // safe; we just never write it to disk.
+        if name.starts_with(REMOTE_TOOL_PREFIX) {
+            return;
+        }
         if let Some(path) = &self.approvals_path {
             persist_approval(path, name);
         }
@@ -399,6 +409,25 @@ mod tests {
         };
         policy.remember_always("write_file");
         assert!(load_approvals(&path).contains("write_file"));
+    }
+
+    #[test]
+    fn remember_always_does_not_persist_remote_tools() {
+        // #990 review: mcp__ names are not stable cross-session identities, so
+        // an "always" approval must stay in-memory (session-scoped) and never
+        // hit disk where it could authorize a different server later.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-approvals");
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            approvals_path: Some(path.clone()),
+            ..SafetyPolicy::default()
+        };
+        policy.remember_always("mcp__github__create_pr");
+        // In-session: the approval is honored (no re-prompt this session)...
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::Allow);
+        // ...but nothing was written to the persistent approvals file.
+        assert!(!path.exists() || !load_approvals(&path).contains("mcp__github__create_pr"));
     }
 
     // --- denylist ---

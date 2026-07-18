@@ -261,29 +261,44 @@ impl McpBridge {
     }
 }
 
-/// Connect to one server and list its tools, bounded by `init_timeout`.
+/// Connect to one server and list its tools. `init_timeout` is a single
+/// handshake deadline covering `start()` (initialize) *and* `tools/list`, so N
+/// slow/non-responsive servers cannot add up to `N * 2 * init_timeout` and
+/// wedge `session/new` (ADR-003 D3 fail-open). On any failure *after* the
+/// client is created, the client is shut down before returning so a spawned
+/// stdio child and its runtime tasks cannot leak.
 async fn connect(
     spec: &ServerSpec,
     cfg: &AcpMcpConfig,
     init_timeout: Duration,
 ) -> Result<(Arc<ClientRuntime>, Vec<rust_mcp_sdk::schema::Tool>), String> {
     let client = create_client(spec, cfg)?;
-    tokio::time::timeout(init_timeout, client.clone().start())
+    let deadline = tokio::time::Instant::now() + init_timeout;
+    match handshake(&client, deadline).await {
+        Ok(tools) => Ok((client, tools)),
+        Err(e) => {
+            // Fail-open must not leak: tear down whatever start() spawned.
+            let _ = client.shut_down().await;
+            Err(e)
+        }
+    }
+}
+
+/// Initialize then list tools against an already-created client, both bounded
+/// by a single shared `deadline`.
+async fn handshake(
+    client: &Arc<ClientRuntime>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<rust_mcp_sdk::schema::Tool>, String> {
+    tokio::time::timeout_at(deadline, client.clone().start())
         .await
         .map_err(|_| "initialize timed out".to_string())?
         .map_err(|e| format!("initialize failed: {e}"))?;
-    let listed = tokio::time::timeout(init_timeout, client.request_tool_list(None)).await;
-    match listed {
-        Ok(Ok(result)) => Ok((client, result.tools)),
-        Ok(Err(e)) => {
-            let _ = client.shut_down().await;
-            Err(format!("tools/list failed: {e}"))
-        }
-        Err(_) => {
-            let _ = client.shut_down().await;
-            Err("tools/list timed out".to_string())
-        }
-    }
+    let result = tokio::time::timeout_at(deadline, client.request_tool_list(None))
+        .await
+        .map_err(|_| "tools/list timed out".to_string())?
+        .map_err(|e| format!("tools/list failed: {e}"))?;
+    Ok(result.tools)
 }
 
 fn client_details() -> InitializeRequestParams {
@@ -572,6 +587,49 @@ mod tests {
         let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
         assert!(bridge.tools().is_empty());
         assert_eq!(bridge.server_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn build_times_out_on_unresponsive_server_within_single_deadline() {
+        // A process that launches but never speaks MCP (sleep) must time out on
+        // the initialize handshake, be cleaned up, and be skipped — without the
+        // whole build taking multiple init_timeouts (#990 review: single
+        // handshake deadline covering initialize + tools/list).
+        if which_sleep().is_none() {
+            eprintln!("skipping: no `sleep` binary");
+            return;
+        }
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 1,
+            ..AcpMcpConfig::default()
+        };
+        let spec = ServerSpec::Stdio {
+            name: "asleep".to_string(),
+            command: "sleep".to_string(),
+            args: vec!["30".to_string()],
+            env: HashMap::new(),
+        };
+        let start = std::time::Instant::now();
+        let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
+        let elapsed = start.elapsed();
+        assert!(bridge.tools().is_empty());
+        assert_eq!(bridge.server_count(), 0);
+        // One server, single ~1s deadline: comfortably under 5s. A regression
+        // to per-call timeouts (initialize + list) would still pass here, but a
+        // regression that hangs on the child (no cleanup) would blow this.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "build should be bounded by the handshake deadline, took {elapsed:?}"
+        );
+    }
+
+    fn which_sleep() -> Option<()> {
+        std::process::Command::new("sleep")
+            .arg("0")
+            .status()
+            .ok()
+            .filter(|s| s.success())
+            .map(|_| ())
     }
 
     #[tokio::test]

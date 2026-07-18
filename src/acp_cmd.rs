@@ -1187,7 +1187,9 @@ fn replay_history(
 
 /// Build the fully-configured ACP agent, ready to `.connect_to(transport)`.
 /// Split out from [`run_acp`] so tests can connect it to an in-process
-/// [`AcpClientRole`] builder instead of real stdio.
+/// [`AcpClientRole`] builder instead of real stdio. Production goes through
+/// [`build_agent_with_state`] so it can drain MCP bridges on exit.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_agent(
     make_provider: ProviderFactory,
@@ -1200,6 +1202,42 @@ fn build_agent(
     sessions_dir: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
     analytics: Option<Arc<AnalyticsStore>>,
+) -> impl ConnectTo<AcpClientRole> {
+    // Tests don't need the state handle; production ([`run_acp`]) uses
+    // [`build_agent_with_state`] so it can drain MCP bridges on exit.
+    build_agent_with_state(
+        make_provider,
+        workspace,
+        cfg,
+        model,
+        models,
+        safety,
+        token_log,
+        sessions_dir,
+        compaction,
+        analytics,
+        &mut None,
+    )
+}
+
+/// Like [`build_agent`], but also hands the caller an `Arc<AcpState>` via
+/// `state_out`. [`run_acp`] needs it to tear down every session's MCP bridge
+/// when ACP stdin closes (ADR-003 D7/D8): `SessionHandle`s are otherwise just
+/// dropped, and a dropped bridge does not `await` `shut_down()`, so stdio
+/// grandchildren that don't exit on their own stdin EOF could outlive daimonos.
+#[allow(clippy::too_many_arguments)]
+fn build_agent_with_state(
+    make_provider: ProviderFactory,
+    workspace: &Path,
+    cfg: Arc<Config>,
+    model: String,
+    models: Vec<String>,
+    safety: Arc<crate::safety::SafetyPolicy>,
+    token_log: Option<PathBuf>,
+    sessions_dir: Option<PathBuf>,
+    compaction: Option<crate::compaction::CompactionPolicy>,
+    analytics: Option<Arc<AnalyticsStore>>,
+    state_out: &mut Option<Arc<AcpState>>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
     let supports_images = make_provider()
@@ -1221,6 +1259,7 @@ fn build_agent(
         compaction,
         analytics,
     });
+    *state_out = Some(Arc::clone(&state));
 
     AcpAgentRole
         .builder()
@@ -1715,7 +1754,8 @@ pub async fn run_acp(
     if let Err(e) = (make_provider)() {
         anyhow::bail!("provider init: {e}");
     }
-    build_agent(
+    let mut state_out: Option<Arc<AcpState>> = None;
+    let agent = build_agent_with_state(
         make_provider,
         workspace,
         cfg,
@@ -1726,10 +1766,29 @@ pub async fn run_acp(
         sessions_dir,
         compaction,
         analytics,
-    )
-    .connect_to(Stdio::new())
-    .await?;
+        &mut state_out,
+    );
+    let result = agent.connect_to(Stdio::new()).await;
+    // stdin closed (or the connection errored): drain every live session's MCP
+    // bridge so Zed-spawned stdio servers are reaped instead of leaking (D7/D8).
+    if let Some(state) = state_out {
+        shutdown_all_bridges(&state).await;
+    }
+    result?;
     Ok(())
+}
+
+/// Shut down the MCP bridge of every live session. Called on ACP engine
+/// teardown; `session/delete` already tears down a single session's bridge, so
+/// this handles the process-exit path where handles are otherwise just dropped.
+async fn shutdown_all_bridges(state: &AcpState) {
+    let handles: Vec<Arc<SessionHandle>> = {
+        let mut map = state.sessions.lock().await;
+        map.drain().map(|(_, handle)| handle).collect()
+    };
+    for handle in handles {
+        handle.bridge.shutdown().await;
+    }
 }
 
 #[cfg(test)]
