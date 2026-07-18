@@ -9,6 +9,7 @@ mod config;
 mod index;
 mod kgl;
 mod mcp;
+mod mcp_bridge;
 mod ops;
 mod paths;
 mod pipeline_cache;
@@ -622,6 +623,22 @@ async fn main() -> anyhow::Result<()> {
             // resume a thread after this process exits and Zed re-requests a
             // session id from a previous run (see acp_cmd::SessionStore).
             let sessions_dir = paths::home_dir().map(|h| h.join(".daimonos").join("acp-sessions"));
+            // Analytics for the ACP arm: attributes remote (Zed-provided) MCP
+            // tool calls the same way socket/MCP sessions attribute native ones
+            // (ADR-003, D9). The global store below is built after this arm's
+            // early return, so build one here.
+            let analytics_store = if cfg.analytics.enabled {
+                let db_path = cfg.analytics.resolved_db_path();
+                match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+                    Ok(store) => Some(Arc::new(store)),
+                    Err(e) => {
+                        eprintln!("analytics: disabled (init failed: {e})");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             acp_cmd::run_acp(
                 make_provider,
                 &workspace,
@@ -632,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
                 token_log,
                 sessions_dir,
                 compaction,
+                analytics_store,
             )
             .await?;
             return Ok(());

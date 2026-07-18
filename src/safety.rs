@@ -19,11 +19,17 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "gh",
 ];
 
-/// Whether `name` is in the destructive-tools list (exec, write_file, etc.) —
-/// shared with other approval surfaces (e.g. the ACP engine's permission
-/// requests) so "which tools need approval" stays defined in one place.
+/// Namespace prefix for remote (Zed-provided) MCP tools bridged into the tool
+/// list (ADR-003). Their behaviour is opaque to daimonos, so they are treated
+/// as destructive by default and gated like `exec`/`write_file`.
+pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
+
+/// Whether `name` is in the destructive-tools list (exec, write_file, etc.) or
+/// is a remote MCP tool (`mcp__*`) — shared with other approval surfaces (e.g.
+/// the ACP engine's permission requests) so "which tools need approval" stays
+/// defined in one place.
 pub fn is_destructive_tool(name: &str) -> bool {
-    DESTRUCTIVE_TOOLS.contains(&name)
+    DESTRUCTIVE_TOOLS.contains(&name) || name.starts_with(REMOTE_TOOL_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -117,7 +123,7 @@ impl SafetyPolicy {
         }
         let needs_approval = match self.approval_mode {
             ApprovalMode::Auto => false,
-            ApprovalMode::Interactive => DESTRUCTIVE_TOOLS.contains(&name),
+            ApprovalMode::Interactive => is_destructive_tool(name),
             ApprovalMode::Paranoid => true,
         };
         if !needs_approval {
@@ -142,6 +148,16 @@ impl SafetyPolicy {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(name.to_string());
+        // Remote MCP tools (mcp__*) get a *session-scoped* approval only. Their
+        // exposed name is not a stable cross-session identity — it is sanitized,
+        // truncated to 64 chars, and de-duped with ordering-dependent numeric
+        // suffixes — so persisting it could silently authorize a *different*
+        // remote server in a later session (#990 review). Within one process
+        // the bridge's name→route map is fixed, so the in-memory entry above is
+        // safe; we just never write it to disk.
+        if name.starts_with(REMOTE_TOOL_PREFIX) {
+            return;
+        }
         if let Some(path) = &self.approvals_path {
             persist_approval(path, name);
         }
@@ -296,6 +312,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_mcp_tools_are_flagged_destructive() {
+        // ADR-003 D6: Zed-provided MCP tools are opaque, so they default to
+        // permission-required (gated like exec in Interactive mode).
+        for name in ["mcp__github__create_pr", "mcp__self__read_file"] {
+            assert!(is_destructive_tool(name), "{name} should be destructive");
+        }
+    }
+
+    #[test]
+    fn gate_needs_approval_for_remote_tool_in_interactive_mode() {
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            ..SafetyPolicy::default()
+        };
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn gate_auto_mode_allows_remote_tool() {
+        // Auto mode is fully unattended; remote tools follow the same policy as
+        // native ones (no prompt), consistent with the rest of the gate.
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Auto,
+            ..SafetyPolicy::default()
+        };
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::Allow);
+    }
+
     // --- gate / remember_always (vikunja #954: shared with ACP) ---
 
     #[test]
@@ -364,6 +409,25 @@ mod tests {
         };
         policy.remember_always("write_file");
         assert!(load_approvals(&path).contains("write_file"));
+    }
+
+    #[test]
+    fn remember_always_does_not_persist_remote_tools() {
+        // #990 review: mcp__ names are not stable cross-session identities, so
+        // an "always" approval must stay in-memory (session-scoped) and never
+        // hit disk where it could authorize a different server later.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-approvals");
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            approvals_path: Some(path.clone()),
+            ..SafetyPolicy::default()
+        };
+        policy.remember_always("mcp__github__create_pr");
+        // In-session: the approval is honored (no re-prompt this session)...
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::Allow);
+        // ...but nothing was written to the persistent approvals file.
+        assert!(!path.exists() || !load_approvals(&path).contains("mcp__github__create_pr"));
     }
 
     // --- denylist ---

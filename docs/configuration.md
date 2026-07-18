@@ -159,6 +159,39 @@ These settings apply to native ACP integrations such as Zed.
 session_list_page_size = 50
 ```
 
+#### `[acp.mcp]` — MCP-server bridge
+
+Zed forwards every configured context server to the ACP agent on `session/new`
+and `session/load`. When the bridge is enabled, daimonos connects to each as an
+MCP client, discovers its tools, and exposes them to the model as
+`mcp__{server}__{tool}` alongside the native daimonos tools (ADR-003, #990).
+Native tools always win a name collision. A server that fails to start,
+connect, or list tools is skipped (fail-open) — the session still gets the
+remaining servers and all native tools. Remote tool calls flow through the same
+permission hooks as native destructive tools and are attributed in analytics
+under their `mcp__…` name.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Master switch. When `false`, forwarded `mcp_servers` are ignored and the `mcp` agent capability is not advertised. |
+| `allow_stdio` | `true` | Accept + advertise stdio-transport servers (`command`/`args`/`env`). |
+| `allow_http` | `true` | Accept + advertise HTTP-transport servers (`url`/`headers`). |
+| `init_timeout_secs` | `10` | Per-server budget for the `initialize` + `tools/list` handshake. Exceeding it skips that server. Must be > 0 when enabled. |
+| `call_timeout_secs` | `60` | Per remote `tools/call` budget. On timeout the model gets an error tool result and the turn continues. Must be > 0 when enabled. |
+| `max_servers` | `32` | Upper bound on forwarded servers connected per session. Must be > 0 when enabled. |
+| `max_tools_per_server` | `128` | Upper bound on tools registered from any single server. Must be > 0 when enabled. |
+
+```toml
+[acp.mcp]
+enabled = true
+allow_stdio = true
+allow_http = true
+init_timeout_secs = 10
+call_timeout_secs = 60
+max_servers = 32
+max_tools_per_server = 128
+```
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,
