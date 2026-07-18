@@ -44,6 +44,10 @@ pub struct Session {
     /// Tools currently exposed in list_tools. Core tools are always present;
     /// extended tools are added on first use or via `list_all_tools`.
     pub exposed_tools: HashSet<String>,
+    /// Set when `exposed_tools` actually grows during a request, so the MCP
+    /// layer can emit a `notifications/tools/list_changed` after the call.
+    /// Consumed (cleared) via `take_tools_changed` (vikunja #993).
+    pub tools_changed: bool,
     /// Tools the model has already called this session. Used to strip schemas
     /// from list_tools responses — the model already has them in context.
     pub used_tools: HashSet<String>,
@@ -94,6 +98,7 @@ impl Session {
             exec_usage: HashMap::new(),
             read_cache: HashMap::new(),
             exposed_tools: tools::initial_exposed_tools(),
+            tools_changed: false,
             used_tools: HashSet::new(),
             analytics: None,
             external_session_id: None,
@@ -212,16 +217,29 @@ impl Session {
         }
     }
 
-    /// Expose a tool so it appears in future list_tools responses.
+    /// Expose a tool so it appears in future list_tools responses. Marks the
+    /// tool set dirty only when the name was not already exposed.
     pub fn activate_tool(&mut self, name: &str) {
-        self.exposed_tools.insert(name.to_string());
+        if self.exposed_tools.insert(name.to_string()) {
+            self.tools_changed = true;
+        }
     }
 
     /// Expose all known tools at once (including on-demand tier 2 tools).
+    /// Marks the tool set dirty if any name was newly added.
     pub fn activate_all_tools(&mut self) {
         for name in tools::on_demand_names() {
-            self.exposed_tools.insert(name.to_string());
+            if self.exposed_tools.insert(name.to_string()) {
+                self.tools_changed = true;
+            }
         }
+    }
+
+    /// Return and clear the "tool set changed" flag. The MCP layer calls this
+    /// after each tools/call and emits `notifications/tools/list_changed` when
+    /// it returns true (vikunja #993).
+    pub fn take_tools_changed(&mut self) -> bool {
+        std::mem::take(&mut self.tools_changed)
     }
 }
 
@@ -442,6 +460,36 @@ mod tests {
         assert!(!s.exposed_tools.contains("custom_tool"));
         s.activate_tool("custom_tool");
         assert!(s.exposed_tools.contains("custom_tool"));
+    }
+
+    #[test]
+    fn activate_tool_sets_and_takes_changed_flag() {
+        let mut s = test_session("/workspace");
+        assert!(!s.tools_changed, "fresh session is not dirty");
+
+        // Re-activating an already-exposed tool must not mark dirty.
+        let existing = tools::initial_exposed_tools().into_iter().next().unwrap();
+        s.activate_tool(&existing);
+        assert!(!s.tools_changed, "re-exposing existing tool is a no-op");
+
+        // A genuinely new tool marks dirty.
+        s.activate_tool("custom_tool");
+        assert!(s.tools_changed, "new tool marks the set dirty");
+
+        // take_tools_changed returns then clears.
+        assert!(s.take_tools_changed());
+        assert!(!s.tools_changed, "flag cleared after take");
+        assert!(!s.take_tools_changed(), "second take returns false");
+    }
+
+    #[test]
+    fn activate_all_tools_sets_changed_flag_once() {
+        let mut s = test_session("/workspace");
+        s.activate_all_tools();
+        assert!(s.take_tools_changed(), "adding on-demand tools marks dirty");
+        // Second call adds nothing new, so no change.
+        s.activate_all_tools();
+        assert!(!s.tools_changed, "re-activating all is a no-op");
     }
 
     #[test]
