@@ -3,7 +3,13 @@
 
 import subprocess
 
-PROMPT_NAMES = ["agent_system", "mcp_instructions", "kgl_hint", "summary"]
+PROMPT_FILES = {
+    "agent_system": "agent_system.md",
+    "mcp_instructions": "mcp_instructions.md",
+    "kgl_hint": "kgl_hint.md",
+    "summary": "summary.md",
+    "tool_descriptions": "tool_descriptions.toml",
+}
 
 
 def _run(binary, args, cwd=None):
@@ -24,7 +30,7 @@ def test_print_prompt_unknown_name_errors(daimonos_binary):
     assert r.returncode == 2
     assert "unknown prompt" in r.stderr
     # Lists the valid names so the user can recover.
-    for name in PROMPT_NAMES:
+    for name in PROMPT_FILES:
         assert name in r.stderr
 
 
@@ -32,12 +38,20 @@ def test_dump_prompts_scaffolds_all_files(daimonos_binary, tmp_path):
     target = tmp_path / "prompts"
     r = _run(daimonos_binary, ["--dump-prompts", str(target)])
     assert r.returncode == 0
-    for name in PROMPT_NAMES:
-        f = target / f"{name}.md"
-        assert f.is_file(), f"missing {name}.md"
+    for name, filename in PROMPT_FILES.items():
+        f = target / filename
+        assert f.is_file(), f"missing {filename}"
         assert f.read_text(encoding="utf-8").strip()
     # Prints a ready-to-paste config block.
     assert "[prompts]" in r.stdout
+    assert "tool_descriptions.toml" in r.stdout
+
+
+def test_print_prompt_emits_tool_description_catalog(daimonos_binary):
+    r = _run(daimonos_binary, ["--print-prompt", "tool_descriptions"])
+    assert r.returncode == 0
+    assert "[read_file]" in r.stdout
+    assert "full =" in r.stdout
 
 
 def test_dump_prompts_skips_existing_without_force(daimonos_binary, tmp_path):

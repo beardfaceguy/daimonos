@@ -46,7 +46,7 @@ pub async fn run_agent(
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
-    let schemas = tool_facade::active_schemas(workspace);
+    let schemas = tool_facade::active_schemas(workspace, &cfg.prompts.resolved_tool_descriptions);
 
     if args.dry_run {
         writeln!(out, "[dry-run] task: {}", args.task)?;
@@ -73,7 +73,7 @@ pub async fn run_agent(
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let config = AgentConfig {
-        system: Some(crate::prompts::agent_system(&cfg)),
+        system: Some(crate::prompts::agent_system(&cfg).await),
         tools,
         opts: CompleteOpts {
             model,

@@ -206,7 +206,7 @@ async fn dispatch_tool_inner(
                 },
             };
 
-            let all = tools::tool_definitions();
+            let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let results: Vec<Value> = all
                 .into_iter()
                 .filter(|t| names.contains(&t.name))
@@ -237,7 +237,7 @@ async fn dispatch_tool_inner(
 
         "list_all_tools" => {
             session.activate_all_tools();
-            let all = tools::tool_definitions();
+            let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let summary: Vec<Value> = all
                 .iter()
                 .map(|t| json!({"name": t.name, "description": t.description}))
@@ -924,7 +924,8 @@ impl ServerHandler for DaimonosHandler {
     ) -> std::result::Result<ListToolsResult, RpcError> {
         self.poke_activity();
         let session = self.session.lock().await;
-        let all = tools::tool_definitions();
+        let descriptions = &session.cfg.prompts.resolved_tool_descriptions;
+        let all = tools::tool_definitions(descriptions);
         let workspace = &session.workspace;
 
         let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
@@ -935,7 +936,7 @@ impl ServerHandler for DaimonosHandler {
             .filter(|t| tools::passes_context_check(&t.name, workspace))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
-                tools::render_list_tool(t, verbosity, full_tool_schemas, already_used)
+                tools::render_list_tool(t, descriptions, verbosity, full_tool_schemas, already_used)
             })
             .collect();
         Ok(ListToolsResult {
@@ -1100,18 +1101,21 @@ impl ServerHandler for DaimonosHandler {
 /// Orientation hint nudging agents to query the KGL graph first (and to record
 /// intent as they work). Only emitted when KGL auto-indexing is on, so the
 /// graph actually exists. Pure (takes the gate) so it's testable without env.
-fn kgl_instructions_hint(kgl_enabled: bool, cfg: &crate::config::Config) -> Option<String> {
+async fn kgl_instructions_hint(kgl_enabled: bool, cfg: &crate::config::Config) -> Option<String> {
     if !kgl_enabled {
         return None;
     }
-    Some(crate::prompts::kgl_hint(cfg))
+    Some(crate::prompts::kgl_hint(cfg).await)
 }
 
 async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Config) -> String {
     // The static instruction sentences are an externalized prompt (vikunja
     // #974); the dynamic workspace context below is appended in code.
     let mut parts = vec![
-        crate::prompts::mcp_instructions(cfg).trim_end().to_string(),
+        crate::prompts::mcp_instructions(cfg)
+            .await
+            .trim_end()
+            .to_string(),
         format!("Workspace: {}", workspace.display()),
     ];
 
@@ -1120,7 +1124,7 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
         script::tool_signatures()
     ));
 
-    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg) {
+    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg).await {
         parts.push(hint.trim_end().to_string());
     }
 
@@ -1362,7 +1366,8 @@ fn socket_jsonrpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
 }
 
 fn socket_list_tools_json(session: &Session) -> Vec<Value> {
-    let all = tools::tool_definitions();
+    let descriptions = &session.cfg.prompts.resolved_tool_descriptions;
+    let all = tools::tool_definitions(descriptions);
     let workspace = &session.workspace;
     let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
     let verbosity = session.verbosity;
@@ -1371,7 +1376,13 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
         .filter(|t| tools::passes_context_check(&t.name, workspace))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
-            let t = tools::render_list_tool(t, verbosity, full_tool_schemas, already_used);
+            let t = tools::render_list_tool(
+                t,
+                descriptions,
+                verbosity,
+                full_tool_schemas,
+                already_used,
+            );
             serde_json::to_value(&t).unwrap_or(Value::Null)
         })
         .collect()
@@ -1673,7 +1684,8 @@ mod tests {
 
     #[test]
     fn tool_definitions_has_entries() {
-        let defs = tools::tool_definitions();
+        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
+        let defs = tools::tool_definitions(&descriptions);
         assert!(!defs.is_empty());
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
@@ -1692,7 +1704,8 @@ mod tests {
 
     #[test]
     fn tool_definitions_all_have_descriptions() {
-        for tool in tools::tool_definitions() {
+        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
+        for tool in tools::tool_definitions(&descriptions) {
             assert!(!tool.name.is_empty(), "tool has empty name");
             assert!(
                 tool.description.is_some() && !tool.description.as_ref().unwrap().is_empty(),
@@ -1704,7 +1717,8 @@ mod tests {
 
     #[test]
     fn tool_definitions_no_duplicates() {
-        let defs = tools::tool_definitions();
+        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
+        let defs = tools::tool_definitions(&descriptions);
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
         let unique: std::collections::HashSet<&&str> = names.iter().collect();
         assert_eq!(names.len(), unique.len(), "duplicate tool names found");
@@ -1712,7 +1726,8 @@ mod tests {
 
     #[test]
     fn schema_token_savings_benchmark() {
-        let all = tools::tool_definitions();
+        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
+        let all = tools::tool_definitions(&descriptions);
 
         let full_json: Vec<Value> = all
             .iter()
@@ -1805,10 +1820,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kgl_hint_is_gated_and_mentions_orient() {
-        assert!(kgl_instructions_hint(false, &crate::config::Config::default()).is_none());
+    #[tokio::test]
+    async fn kgl_hint_is_gated_and_mentions_orient() {
+        assert!(
+            kgl_instructions_hint(false, &crate::config::Config::default())
+                .await
+                .is_none()
+        );
         let hint = kgl_instructions_hint(true, &crate::config::Config::default())
+            .await
             .expect("hint when enabled");
         assert!(hint.contains("orient"));
         assert!(hint.contains("kgl_assert"));

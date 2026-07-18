@@ -42,11 +42,16 @@ pub struct PromptsConfig {
     pub kgl_hint: Option<String>,
     /// Compaction summarizer system prompt.
     pub summary: Option<String>,
+    /// Top-level full/terse tool-description catalog.
+    pub tool_descriptions: Option<String>,
     /// Additional user instructions loaded at startup for agent/chat/ACP and
     /// appended to the resolved `agent_system`. Runtime-only: populated from
     /// the default file or `--agent-instructions`, never deserialized from TOML.
     #[serde(skip)]
     pub additional_agent_instructions: Option<String>,
+    /// Resolved embedded defaults plus any runtime override.
+    #[serde(skip)]
+    pub resolved_tool_descriptions: crate::tool_descriptions::ToolDescriptions,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -387,21 +392,10 @@ impl Default for AnalyticsConfig {
 impl AnalyticsConfig {
     pub fn resolved_db_path(&self) -> std::path::PathBuf {
         if let Some(p) = &self.db_path {
-            let expanded = if let Some(rest) = p.strip_prefix("~/") {
-                if let Some(home) = std::env::var_os("HOME") {
-                    std::path::PathBuf::from(home).join(rest)
-                } else {
-                    std::path::PathBuf::from(p)
-                }
-            } else {
-                std::path::PathBuf::from(p)
-            };
-            return expanded;
+            return crate::paths::expand_tilde(p);
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            std::path::PathBuf::from(home)
-                .join(".daimonos")
-                .join("analytics.db")
+        if let Some(home) = crate::paths::home_dir() {
+            home.join(".daimonos").join("analytics.db")
         } else {
             std::path::PathBuf::from("/tmp/daimonos-analytics.db")
         }
@@ -671,9 +665,7 @@ pub fn search_candidates(explicit: Option<&Path>, workspace: &Path) -> Vec<std::
 /// prompt-scaffold default directory so both agree on where daimonos config
 /// lives.
 pub(crate) fn dirs_next() -> Option<std::path::PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    crate::paths::config_dir()
 }
 
 /// Register tools from config into the tool registry.

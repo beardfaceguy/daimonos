@@ -285,13 +285,13 @@ skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 
 ### `[prompts]` — Model-Facing Prompt Overrides
 
-The prompts that steer daimonos's behavior are embedded in the binary as
-defaults but can be overridden at runtime without recompiling. Each key points
-at a file whose contents **replace** the built-in default. Leave a key unset (or
-empty) to use the embedded default; a key pointing at an unreadable file falls
-back to the embedded default and warns on stderr. `~` expands to `$HOME`. The
-file is sent to the model verbatim, so do **not** put comments inside a prompt
-file. See `prompts/README.md` for the committed defaults and full guidance.
+The text that steers daimonos's behavior is embedded in the binary as defaults
+but can be overridden at runtime without recompiling. Prompt-file contents
+**replace** their built-in defaults. The tool-description catalog is a partial
+overlay: omitted tools and variants keep their embedded values. Unset/empty keys
+use the embedded default; unreadable files warn and fall back. `~` expands to
+`$HOME`. Prompt files are sent to the model verbatim, so do **not** put comments
+inside them. See `prompts/README.md` for the committed defaults and guidance.
 
 ```toml
 [prompts]
@@ -299,6 +299,7 @@ file. See `prompts/README.md` for the committed defaults and full guidance.
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
 | Key | Used by | Purpose |
@@ -307,21 +308,23 @@ file. See `prompts/README.md` for the committed defaults and full guidance.
 | `mcp_instructions` | `daimonos --mcp` | Server instructions sent to the MCP host, including the terse-output directive that affects output token cost. |
 | `kgl_hint` | `daimonos --mcp` (KGL auto-index only) | Nudge to orient via the knowledge graph before reading source. |
 | `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
+| `tool_descriptions` | MCP / `agent` / `chat` / ACP | Partial TOML overlay for top-level full and terse tool descriptions. |
 
 **Getting the baseline defaults**: the defaults are embedded in the binary, so
 you don't need the source to see or copy them:
 
 ```bash
 daimonos --print-prompt mcp_instructions      # print one default to stdout
-daimonos --dump-prompts                        # scaffold all four into
+daimonos --dump-prompts                        # scaffold all five resources into
                                                #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/to/dir           # ...into a custom directory
 daimonos --dump-prompts --force                # overwrite existing files
 ```
 
-`--dump-prompts` writes `<name>.md` for each key (skipping existing files unless
-`--force`) and prints a ready-to-paste `[prompts]` block pointing at them. Start
-from these so an override begins at — and can be diffed against — the baseline.
+`--dump-prompts` writes the four `<name>.md` prompts and
+`tool_descriptions.toml` (skipping existing files unless `--force`), then prints
+a ready-to-paste `[prompts]` block. Start from these so an override begins at —
+and can be diffed against — the baseline.
 
 **Additional agent instructions**: `daimonos agent`, `daimonos chat`, and ACP
 append `~/.config/daimonos/agent-instructions.md` to the resolved

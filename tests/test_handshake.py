@@ -140,6 +140,48 @@ def test_prompts_override_replaces_mcp_instructions(daimonos_binary, tmp_path):
     assert str(tmp_path) in instructions
 
 
+def test_tool_description_override_reaches_list_tools(daimonos_binary, tmp_path):
+    """A partial top-level description catalog overrides one tool while
+    preserving embedded defaults for all others (vikunja #975)."""
+    custom = tmp_path / "tool_descriptions.toml"
+    custom.write_text(
+        '[read_file]\nfull = "SENTINEL custom read description."\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "daimonos.toml").write_text(
+        "[prompts]\ntool_descriptions = " + repr(str(custom)) + "\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp", "-w", str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        from conftest import DaimonosClient
+
+        client = DaimonosClient(proc, str(tmp_path))
+        init = client.send_raw({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1.0.0"},
+            },
+        })
+        assert "result" in init
+        client.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        tools = {tool["name"]: tool for tool in client.list_tools()}
+        assert tools["read_file"]["description"] == "SENTINEL custom read description."
+        assert tools["write_file"]["description"] == "Write file, creating parent dirs."
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def test_list_tools_returns_core_tools(daimonos):
     """Core tools + git + snapshots are exposed by default."""
     tools = daimonos.list_tools()

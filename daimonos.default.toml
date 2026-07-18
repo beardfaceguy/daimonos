@@ -198,8 +198,11 @@ skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 # Note: `summary` is also overridable via the agent-env DAIMONOS_AGENT_SUMMARY_PROMPT,
 # which takes precedence over the path above.
+# `tool_descriptions` is a partial TOML overlay: omitted tools/variants keep
+# their embedded defaults; unknown tools and empty values are ignored.
 #
 # Agent/chat/ACP append optional user rules from
 # ~/.config/daimonos/agent-instructions.md (or $XDG_CONFIG_HOME/daimonos/...)

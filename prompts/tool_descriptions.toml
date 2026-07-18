@@ -1,0 +1,119 @@
+# Top-level tool descriptions shown to models. `full` is used by agent
+# runtimes and full-verbosity MCP schemas. Optional `terse` text replaces it
+# in compact/terse MCP list_tools responses.
+
+[read_file]
+full = """Read file. Returns {content, lines} or {unchanged:true, lines} if already read and unmodified."""
+terse = """Read file → {content, lines}."""
+
+[write_file]
+full = """Write file, creating parent dirs."""
+
+[edit_file]
+full = """String-replace edits. Returns {applied, diffs} confirming each change."""
+
+[search]
+full = """Regex content search or trigram file-name search."""
+
+[workspace_info]
+full = """Detailed workspace info (session state, root listing, index stats). Basic info is already in server instructions — only call if you need index stats or full detail."""
+terse = """Workspace info: session, root listing, index stats."""
+
+[exec]
+full = """Run command. Returns {exit, out, err?}. Output auto-truncated if very large."""
+terse = """Run command → {exit, out, err?}."""
+
+[batch]
+full = """Multiple tools in one call. Always batch when you need 2+ independent reads/searches. E.g. [{tool:"read_file",arguments:{path:"a.rs"}},{tool:"search",arguments:{pattern:"TODO"}}]."""
+terse = """Run 2+ independent tools in one call; get_tool_schema for shape."""
+
+[get_tool_schema]
+full = """Get full inputSchema for tool(s). Call before using a tool whose schema was not in list_tools."""
+terse = """Get full inputSchema for tool(s) before use."""
+
+[execute_script]
+full = """Run a Starlark (Python-subset) script with all tools as built-in functions. Intermediate results stay in the sandbox; only `result` variable is returned. Much cheaper than sequential tool calls."""
+terse = """Run a Starlark script; all tools as functions; returns `result`. Cheaper than sequential calls."""
+
+[kgl_query]
+full = """Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness."""
+terse = """Query KGL graph: find defs, deps, calls, state, open questions, blast radius; index/check."""
+
+[kgl_assert]
+full = """Declare the non-derivable KGL layer for a def: its intent/purpose (+ rationale, open questions), authoring provenance, or a typed edge (reads/mutates/calls/depends_on). This is how an authoring agent records WHY code exists and what it touches — the part no derived graph provides. Get the target def 'hash' from kgl_query find/node."""
+terse = """Declare KGL layer for a def: intent, provenance, or typed edge."""
+
+[list_tool_signatures]
+full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
+
+[git]
+full = """Git operations. Commands: status, log, diff, branch, add, commit, push, pull, checkout. All args besides 'command' are passed through."""
+terse = """Git: status, log, diff, branch, add, commit, push, pull, checkout."""
+
+[cargo]
+full = """Cargo operations. Commands: test, build, check, clippy, fmt, add."""
+terse = """Cargo: test, build, check, clippy, fmt, add."""
+
+[pytest]
+full = """Python test runner. Commands: run (passed/failed/skipped + failure ids), collect (--collect-only test ids)."""
+terse = """Python tests: run, collect."""
+
+[gh]
+full = """GitHub CLI (structured). Commands: pr_view, pr_list, pr_create, pr_diff, pr_checks, pr_merge, pr_checkout, run_list, run_view, issue_list, issue_view, issue_create, issue_comment, api, raw (arbitrary gh args)."""
+terse = """GitHub: pr_view/list/create/diff/checks/merge/checkout, run_list/view, issue_list/view/create/comment, api, raw."""
+
+[docker]
+full = """Docker operations. Commands: ps, logs, exec, images, inspect, stop, compose_up, compose_down, compose_ps."""
+terse = """Docker: ps, logs, exec, images, inspect, stop, compose_up/down/ps."""
+
+[curl]
+full = """HTTP request. Returns {status, headers, body (capped 16KB), timing_ms, url, method}. Auto-registered when curl is on PATH."""
+terse = """HTTP request → {status, headers, body, timing_ms}."""
+
+[shellcheck]
+full = """Lint shell scripts via shellcheck. Returns {clean, diagnostics:[{file,line,col,level,code,message}]}. Auto-registered when shellcheck is on PATH."""
+terse = """Lint shell scripts → {clean, diagnostics}."""
+
+[npm]
+full = """npm package manager. Commands: install, run, test, build, audit. Returns {exit, ok, stdout, stderr} or {clean, vulnerabilities, findings} for audit. Auto-registered when npm is on PATH."""
+terse = """npm: install, run, test, build, audit."""
+
+[discord]
+full = """Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages."""
+terse = """Discord read-only: list_guilds, list_channels, read_messages, search_messages."""
+
+[snapshot]
+full = """Workspace snapshots. Actions: create (returns id), restore (rolls back), list, delete."""
+terse = """Workspace snapshots: create, restore, list, delete."""
+
+[set_cwd]
+full = """Change working directory for all subsequent operations. Returns {cwd, previous}."""
+
+[ls]
+full = """List directory. Returns [{n,d,s}]. Skips .git/node_modules/target/__pycache__. Use glob to filter by filename pattern (e.g. *.rs), type to restrict to files (f) or dirs (d)."""
+terse = """List dir → [{n,d,s}]; skips vcs/build dirs; glob/type filters."""
+
+[session_stats]
+full = """Token analytics. Scopes: session (current totals), history (cross-session), daily (trend). Optional external_session_id filters history/daily to a single agent-runtime session id."""
+terse = """Token analytics: session, history, daily."""
+
+[set_external_session_id]
+full = """Attach an agent-runtime session id (e.g. claude `--session-id` UUID) to every subsequent analytics row from this connection. Use to correlate daimonos analytics with the agent's own usage logs. Pass an empty string to clear."""
+terse = """Attach agent-runtime session id to analytics rows."""
+
+[set_verbosity]
+full = """Set this session's output verbosity: full (default, most detail), compact (tighter caps), terse (minimum viable — counts, exit codes, first error). Trades tool-output tokens for detail. Returns {verbosity, previous}."""
+terse = """Set output verbosity: full|compact|terse."""
+
+[list_all_tools]
+full = """Show all available tools including extended ones (diff, pipelines, repair). Call once to unlock them."""
+terse = """Unlock extended tools (diff, pipelines, repair)."""
+
+[diff_files]
+full = """Structured diff: hunks with =, +, - tagged lines."""
+
+[tool_pipeline]
+full = """Run tool stages sequentially, abort on failure."""
+
+[tool_repair]
+full = """Auto lint-fix loop until clean."""

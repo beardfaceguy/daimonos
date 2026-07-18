@@ -226,12 +226,9 @@ impl Session {
 }
 
 fn shellexpand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest).to_string_lossy().to_string();
-        }
-    }
-    path.to_string()
+    crate::paths::expand_tilde(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Collect common tool directories that should be on PATH.
@@ -249,8 +246,7 @@ fn collect_tool_dirs(existing: &std::collections::HashSet<&str>, extra: &mut Vec
     }
 
     // User-specific tool directories
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = crate::paths::home_dir() {
         let candidates = [
             home.join(".cargo/bin"),
             home.join(".local/bin"),
@@ -339,8 +335,8 @@ mod tests {
     #[test]
     fn path_includes_cargo_bin_if_exists() {
         let s = test_session("/workspace");
-        if let Some(home) = std::env::var_os("HOME") {
-            let cargo_bin = PathBuf::from(&home).join(".cargo/bin");
+        if let Some(home) = crate::paths::home_dir() {
+            let cargo_bin = home.join(".cargo/bin");
             if cargo_bin.is_dir() {
                 let path = s.env.get("PATH").expect("PATH should be set");
                 assert!(
