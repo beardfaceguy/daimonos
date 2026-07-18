@@ -949,7 +949,7 @@ impl ServerHandler for DaimonosHandler {
     async fn handle_call_tool_request(
         &self,
         params: CallToolRequestParams,
-        _runtime: Arc<dyn McpServer>,
+        runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
         self.poke_activity();
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
@@ -968,7 +968,16 @@ impl ServerHandler for DaimonosHandler {
             let timeout_secs = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(60) as u64;
             let timeout = std::time::Duration::from_secs(timeout_secs);
 
-            return match script::execute(&code, self.session.clone(), timeout).await {
+            // Keep the (Send) script result across the lock/notify awaits and
+            // build the non-Send CallToolResult only afterwards, so the handler
+            // future stays Send.
+            let script_res = script::execute(&code, self.session.clone(), timeout).await;
+            // A script may activate on-demand tools via nested dispatch.
+            let changed = self.session.lock().await.take_tools_changed();
+            if changed {
+                spawn_notify_tools_changed(&runtime);
+            }
+            return match script_res {
                 Ok(result) => {
                     let mut resp = json!({
                         "result": result.value,
@@ -1038,6 +1047,8 @@ impl ServerHandler for DaimonosHandler {
             }
 
             let payload = serde_json::to_string(&results).unwrap_or_default();
+            // Read the dirty flag before the observe path may drop the lock.
+            let tools_changed = session.take_tools_changed();
             if observe_on && !observed_ops.is_empty() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let sid = session
@@ -1056,10 +1067,15 @@ impl ServerHandler for DaimonosHandler {
                     }
                 }
             }
+            if tools_changed {
+                spawn_notify_tools_changed(&runtime);
+            }
             return ok_text(payload);
         }
 
         let result = dispatch_tool(&mut session, &params.name, &args).await;
+        // Read the dirty flag before the observe path may drop the lock.
+        let tools_changed = session.take_tools_changed();
         // Observed-provenance capture (KGL), gated off by default. Records direct
         // file ops as observed reads/mutates edges from the session. Best-effort:
         // never affects the tool result. The session lock is released before the
@@ -1090,8 +1106,26 @@ impl ServerHandler for DaimonosHandler {
                 }
             }
         }
+        if tools_changed {
+            spawn_notify_tools_changed(&runtime);
+        }
         result
     }
+}
+
+/// Emit `notifications/tools/list_changed` to the connected client without
+/// awaiting in the caller. Spawned rather than awaited so the non-`Send`
+/// `CallToolResult` a handler is about to return need not be held across an
+/// await, and so a slow/failed notification never blocks or fails the tool
+/// call that triggered it. The server advertises `tools.list_changed: true`,
+/// so supporting clients re-fetch `tools/list` on receipt (vikunja #993).
+fn spawn_notify_tools_changed(runtime: &Arc<dyn McpServer>) {
+    let runtime = Arc::clone(runtime);
+    tokio::spawn(async move {
+        if let Err(e) = runtime.notify_tool_list_changed(None).await {
+            eprintln!("daimonos: tools/list_changed notification failed: {e}");
+        }
+    });
 }
 
 // --- Proactive workspace context ---
@@ -1424,6 +1458,10 @@ pub async fn serve_one_mcp(
             .unwrap_or("")
             .to_string();
 
+        // Set when a tools/call grows the exposed set, so we can emit a
+        // tools/list_changed notification after the response (vikunja #993).
+        let mut tools_changed = false;
+
         let response_opt: Option<Value> = match method.as_str() {
             "initialize" => Some(socket_jsonrpc_ok(
                 id,
@@ -1451,6 +1489,7 @@ pub async fn serve_one_mcp(
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 let result = dispatch_tool(&mut session, &name, &args).await;
+                tools_changed = session.take_tools_changed();
                 Some(socket_jsonrpc_ok(id, socket_call_tool_to_json(result)))
             }
             "ping" => Some(socket_jsonrpc_ok(id, json!({}))),
@@ -1463,6 +1502,16 @@ pub async fn serve_one_mcp(
 
         if let Some(resp) = response_opt {
             let mut out = serde_json::to_string(&resp)?;
+            out.push('\n');
+            writer.write_all(out.as_bytes()).await?;
+            writer.flush().await?;
+        }
+
+        // Emit the tool-list-changed notification after the triggering
+        // response so clients that support it re-fetch tools/list.
+        if tools_changed {
+            let note = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+            let mut out = serde_json::to_string(&note)?;
             out.push('\n');
             writer.write_all(out.as_bytes()).await?;
             writer.flush().await?;

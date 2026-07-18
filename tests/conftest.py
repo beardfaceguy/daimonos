@@ -15,22 +15,42 @@ class DaimonosClient:
         self.process = process
         self.workspace = workspace
         self._id = 0
+        # Server-initiated notifications (no "id") seen while reading responses.
+        self.notifications: List[dict] = []
 
     def _next_id(self):
         self._id += 1
         return self._id
 
     def send_raw(self, msg: dict) -> Optional[dict]:
-        """Send a JSON-RPC message. Returns the response, or None for notifications."""
+        """Send a JSON-RPC message. Returns the response, or None for notifications.
+
+        Server-initiated notifications (messages without an ``id``) may be
+        interleaved with responses — e.g. ``notifications/tools/list_changed``.
+        They are stashed in ``self.notifications`` and skipped so the returned
+        value always matches the request ``id`` we sent.
+        """
         line = json.dumps(msg) + "\n"
         self.process.stdin.write(line.encode())
         self.process.stdin.flush()
         if "id" not in msg:
             return None
-        resp_line = self.process.stdout.readline()
-        if not resp_line:
-            raise RuntimeError("daimonos process closed stdout unexpectedly")
-        return json.loads(resp_line)
+        want_id = msg["id"]
+        while True:
+            resp_line = self.process.stdout.readline()
+            if not resp_line:
+                raise RuntimeError("daimonos process closed stdout unexpectedly")
+            parsed = json.loads(resp_line)
+            if parsed.get("id") == want_id:
+                return parsed
+            # Anything else (notification or unrelated id) is not our response.
+            self.notifications.append(parsed)
+
+    def drain_notifications(self, method: Optional[str] = None) -> List[dict]:
+        """Return collected notifications, optionally filtered by method."""
+        if method is None:
+            return list(self.notifications)
+        return [n for n in self.notifications if n.get("method") == method]
 
     def call_tool(self, name: str, arguments: Optional[dict] = None) -> dict:
         req = {

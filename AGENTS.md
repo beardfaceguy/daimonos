@@ -230,7 +230,12 @@ daimonos/
   `Cargo.toml`). Extended tools (`diff_files`, `tool_pipeline`,
   `tool_repair`) are exposed after the model calls `list_all_tools` or
   uses one directly. The set of exposed tools is tracked in
-  `session.exposed_tools`.
+  `session.exposed_tools`. When a `tools/call` grows that set, the server
+  emits a `notifications/tools/list_changed` (both stdio and socket
+  transports advertise `tools.list_changed: true`), so clients re-fetch
+  `tools/list`. A `Session::tools_changed` dirty flag drives this and is
+  set only on a real membership addition — not on the description re-render
+  that happens on a tool's first use.
 - **Proactive workspace context**: the MCP `instructions` field is built
   dynamically at startup with workspace path, detected project type
   (Cargo.toml → Rust, package.json → Node.js, etc.), VCS info, and
