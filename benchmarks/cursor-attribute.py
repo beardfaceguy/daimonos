@@ -107,10 +107,15 @@ def main():
         cost = 0.0
         csv_total = 0
         matched = 0
+        ignored_model_rows = 0
+        expected_model = s.get("model_slug")
         for i, r in enumerate(rows):
             if i in used:
                 continue
             if start <= r["_dt"] <= end:
+                if not expected_model or r.get("Model") != expected_model:
+                    ignored_model_rows += 1
+                    continue
                 used.add(i)
                 matched += 1
                 try:
@@ -120,10 +125,25 @@ def main():
                 csv_total += to_int(r.get("Total Tokens"))
 
         s["cursor_csv_rows"] = matched
+        s["cursor_csv_ignored_model_rows"] = ignored_model_rows
         if matched == 0:
+            # A rerun may be correcting an earlier contaminated attribution.
+            # Fail closed by clearing every value derived from a CSV match.
+            s["cost_usd"] = None
+            s.pop("cursor_csv_total_tokens", None)
+            s.pop("cursor_csv_drift", None)
             # Report almost certainly hasn't populated this window yet; leave
             # cost_usd null (analyzer shows n/a) rather than a misleading $0.
-            print(f"  {s['task_id']:22s} rows=0 (no CSV match yet; cost left null)")
+            reason = (
+                "missing model_slug; "
+                if not expected_model
+                else ""
+            )
+            print(
+                f"  {s['task_id']:22s} rows=0 "
+                f"ignored_model_rows={ignored_model_rows} "
+                f"({reason}no CSV match yet; cost left null)"
+            )
             with open(path, "w") as f:
                 json.dump(s, f, indent=2)
             updated += 1
@@ -139,7 +159,8 @@ def main():
             json.dump(s, f, indent=2)
         updated += 1
         print(f"  {s['task_id']:22s} rows={matched} cost=${cost:.4f} "
-              f"csv_tokens={csv_total:,} inline={inline_total:,}")
+              f"csv_tokens={csv_total:,} inline={inline_total:,} "
+              f"ignored_model_rows={ignored_model_rows}")
 
     if updated == 0:
         print("No cursor task summaries with timestamps found in " + run_dir)

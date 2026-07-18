@@ -89,6 +89,11 @@ python3 analyze-runtimes.py results run1
 python3 cursor-attribute.py results/<cursor-run-dir> ~/Downloads/team-usage-events-*.csv
 ```
 
+CSV attribution requires each row's `Model` to exactly match the task
+summary's `model_slug`; in-window events for other models are counted in
+`cursor_csv_ignored_model_rows` and excluded. A summary without `model_slug`
+fails closed and leaves cost unset.
+
 ### Models
 
 Slugs live in `models.json` as a canonical→per-runtime map, so adding Opus/fable

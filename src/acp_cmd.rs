@@ -770,8 +770,9 @@ fn build_agent_config(
     compaction: Option<crate::compaction::CompactionPolicy>,
     system_prompt: String,
     terminal_output: bool,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
 ) -> AgentConfig {
-    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
+    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
         .into_iter()
         .map(|s| ToolSchema {
             name: s.name,
@@ -994,7 +995,7 @@ async fn run_prompt_turn(
 /// unknown-id branch of `session/load` (a respawned process has no in-memory
 /// state for the requested id).
 #[allow(clippy::too_many_arguments)]
-fn build_session_handle(
+async fn build_session_handle(
     state: &AcpState,
     cfg: &Arc<Config>,
     safety: Arc<crate::safety::SafetyPolicy>,
@@ -1015,8 +1016,9 @@ fn build_session_handle(
         safety,
         token_log,
         state.compaction.clone(),
-        crate::prompts::agent_system(cfg),
+        crate::prompts::agent_system(cfg).await,
         state.supports_terminal_output.load(Ordering::Acquire),
+        &cfg.prompts.resolved_tool_descriptions,
     );
     let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
@@ -1298,7 +1300,9 @@ fn build_agent(
                             session_id.clone(),
                             session_workspace,
                             cx.clone(),
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(handle) => handle,
                             Err(e) => {
                                 return responder.respond_with_error(
@@ -1389,7 +1393,9 @@ fn build_agent(
                                 session_id.clone(),
                                 session_workspace,
                                 cx.clone(),
-                            ) {
+                            )
+                            .await
+                            {
                                 Ok(handle) => handle,
                                 Err(e) => {
                                     return responder.respond_with_error(

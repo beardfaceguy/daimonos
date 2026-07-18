@@ -33,7 +33,13 @@ pub const SUMMARY_DEFAULT: &str = include_str!("../prompts/summary.md");
 /// Canonical prompt keys, in a stable display order. This is the single list
 /// used by `default_by_name`, the `--print-prompt` flag, and the `--dump-prompts`
 /// scaffold, so adding a prompt means editing here and `default_by_name` only.
-pub const PROMPT_NAMES: [&str; 4] = ["agent_system", "mcp_instructions", "kgl_hint", "summary"];
+pub const PROMPT_NAMES: [&str; 5] = [
+    "agent_system",
+    "mcp_instructions",
+    "kgl_hint",
+    "summary",
+    "tool_descriptions",
+];
 
 /// Embedded baseline default for a prompt key, or `None` for an unknown key.
 /// Backs `--print-prompt` and `--dump-prompts` so binary-only users can recover
@@ -44,8 +50,18 @@ pub fn default_by_name(name: &str) -> Option<&'static str> {
         "mcp_instructions" => Some(MCP_INSTRUCTIONS_DEFAULT),
         "kgl_hint" => Some(KGL_HINT_DEFAULT),
         "summary" => Some(SUMMARY_DEFAULT),
+        "tool_descriptions" => Some(crate::tool_descriptions::DEFAULT_TEXT),
         _ => None,
     }
+}
+
+pub fn prompt_filename(name: &str) -> String {
+    let extension = if name == "tool_descriptions" {
+        "toml"
+    } else {
+        "md"
+    };
+    format!("{name}.{extension}")
 }
 
 /// Default scaffold directory for `--dump-prompts`: `<config_home>/daimonos/prompts`,
@@ -105,7 +121,7 @@ pub struct DumpReport {
 /// edited copy by accident.
 pub fn dump_defaults(dir: Option<&str>, force: bool) -> std::io::Result<DumpReport> {
     let dir = match dir {
-        Some(d) if !d.trim().is_empty() => expand_tilde(d),
+        Some(d) if !d.trim().is_empty() => crate::paths::expand_tilde(d),
         _ => default_prompts_dir().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -117,7 +133,7 @@ pub fn dump_defaults(dir: Option<&str>, force: bool) -> std::io::Result<DumpRepo
     let mut written = Vec::new();
     let mut skipped = Vec::new();
     for name in PROMPT_NAMES {
-        let path = dir.join(format!("{name}.md"));
+        let path = dir.join(prompt_filename(name));
         let content = default_by_name(name)
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -157,7 +173,7 @@ pub fn prompts_toml_block(dir: &std::path::Path) -> String {
     let width = PROMPT_NAMES.iter().map(|n| n.len()).max().unwrap_or(0);
     let mut out = String::from("[prompts]\n");
     for name in PROMPT_NAMES {
-        let path = dir.join(format!("{name}.md"));
+        let path = dir.join(prompt_filename(name));
         out.push_str(&format!(
             "{name:<width$} = {:?}\n",
             path.to_string_lossy(),
@@ -170,29 +186,22 @@ pub fn prompts_toml_block(dir: &std::path::Path) -> String {
 /// Expand a leading `~/` to `$HOME`. Mirrors the tilde handling in
 /// `AnalyticsConfig::resolved_db_path`; kept local so this module has no
 /// dependency beyond `std`.
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
-}
-
 /// Resolve one prompt: read the override file when the key is set and non-empty,
 /// otherwise use the embedded default. A set-but-unreadable path warns and falls
 /// back so a typo never silently swaps in the wrong prompt without a trace.
-fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> String {
+async fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> String {
     match override_path {
-        Some(p) if !p.trim().is_empty() => match std::fs::read_to_string(expand_tilde(p)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
+        Some(p) if !p.trim().is_empty() => {
+            match tokio::fs::read_to_string(crate::paths::expand_tilde(p)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
                     "daimonos: prompt override '{name}' ({p}) unreadable: {e}; using embedded default"
                 );
-                embedded.to_string()
+                    embedded.to_string()
+                }
             }
-        },
+        }
         _ => embedded.to_string(),
     }
 }
@@ -201,12 +210,13 @@ fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> String {
 /// optional user instructions loaded during startup. The additional file is
 /// appended verbatim with only a blank-line separator — no hidden instruction
 /// text is injected around it.
-pub fn agent_system(cfg: &Config) -> String {
+pub async fn agent_system(cfg: &Config) -> String {
     let mut prompt = resolve(
         "agent_system",
         cfg.prompts.agent_system.as_deref(),
         AGENT_SYSTEM_DEFAULT,
-    );
+    )
+    .await;
     let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() else {
         return prompt;
     };
@@ -224,21 +234,23 @@ pub fn agent_system(cfg: &Config) -> String {
 }
 
 /// Static MCP server instructions (before dynamic workspace context is appended).
-pub fn mcp_instructions(cfg: &Config) -> String {
+pub async fn mcp_instructions(cfg: &Config) -> String {
     resolve(
         "mcp_instructions",
         cfg.prompts.mcp_instructions.as_deref(),
         MCP_INSTRUCTIONS_DEFAULT,
     )
+    .await
 }
 
 /// KGL orientation hint text.
-pub fn kgl_hint(cfg: &Config) -> String {
+pub async fn kgl_hint(cfg: &Config) -> String {
     resolve(
         "kgl_hint",
         cfg.prompts.kgl_hint.as_deref(),
         KGL_HINT_DEFAULT,
     )
+    .await
 }
 
 /// Apply the `[prompts].summary` override to an already-resolved compaction
@@ -250,7 +262,7 @@ pub fn kgl_hint(cfg: &Config) -> String {
 /// (already parsed into `policy.summary_prompt`) > `[prompts].summary` >
 /// embedded `summary.md` (the fallback in `compaction::default_summary_prompt`).
 /// So this only fills in a policy that did not already get an env override.
-pub fn apply_summary_override(
+pub async fn apply_summary_override(
     compaction: Option<CompactionPolicy>,
     cfg: &Config,
 ) -> Option<CompactionPolicy> {
@@ -258,17 +270,16 @@ pub fn apply_summary_override(
         Some(p) if !p.trim().is_empty() => p,
         _ => return compaction,
     };
-    compaction.map(|mut policy| {
-        if policy.summary_prompt.is_none() {
-            match std::fs::read_to_string(expand_tilde(path)) {
-                Ok(s) => policy.summary_prompt = Some(s),
-                Err(e) => eprintln!(
-                    "daimonos: prompt override 'summary' ({path}) unreadable: {e}; using default"
-                ),
-            }
+    let mut policy = compaction?;
+    if policy.summary_prompt.is_none() {
+        match tokio::fs::read_to_string(crate::paths::expand_tilde(path)).await {
+            Ok(s) => policy.summary_prompt = Some(s),
+            Err(e) => eprintln!(
+                "daimonos: prompt override 'summary' ({path}) unreadable: {e}; using default"
+            ),
         }
-        policy
-    })
+    }
+    Some(policy)
 }
 
 #[cfg(test)]
@@ -329,33 +340,33 @@ mod tests {
 
     // --- override resolution ---
 
-    #[test]
-    fn unset_key_uses_embedded_default() {
+    #[tokio::test]
+    async fn unset_key_uses_embedded_default() {
         let cfg = Config::default();
-        assert_eq!(agent_system(&cfg), AGENT_SYSTEM_DEFAULT);
-        assert_eq!(mcp_instructions(&cfg), MCP_INSTRUCTIONS_DEFAULT);
-        assert_eq!(kgl_hint(&cfg), KGL_HINT_DEFAULT);
+        assert_eq!(agent_system(&cfg).await, AGENT_SYSTEM_DEFAULT);
+        assert_eq!(mcp_instructions(&cfg).await, MCP_INSTRUCTIONS_DEFAULT);
+        assert_eq!(kgl_hint(&cfg).await, KGL_HINT_DEFAULT);
     }
 
-    #[test]
-    fn empty_override_path_uses_default() {
+    #[tokio::test]
+    async fn empty_override_path_uses_default() {
         let mut cfg = Config::default();
         cfg.prompts.agent_system = Some("   ".to_string());
-        assert_eq!(agent_system(&cfg), AGENT_SYSTEM_DEFAULT);
+        assert_eq!(agent_system(&cfg).await, AGENT_SYSTEM_DEFAULT);
     }
 
-    #[test]
-    fn override_file_wins() {
+    #[tokio::test]
+    async fn override_file_wins() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom.md");
         std::fs::write(&path, "CUSTOM AGENT PROMPT").unwrap();
         let mut cfg = Config::default();
         cfg.prompts.agent_system = Some(path.to_string_lossy().to_string());
-        assert_eq!(agent_system(&cfg), "CUSTOM AGENT PROMPT");
+        assert_eq!(agent_system(&cfg).await, "CUSTOM AGENT PROMPT");
     }
 
-    #[test]
-    fn additional_agent_instructions_append_to_resolved_system_prompt() {
+    #[tokio::test]
+    async fn additional_agent_instructions_append_to_resolved_system_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom.md");
         std::fs::write(&path, "CUSTOM AGENT PROMPT").unwrap();
@@ -364,16 +375,16 @@ mod tests {
         cfg.prompts.additional_agent_instructions = Some("USER RULES\nverbatim\n".to_string());
 
         assert_eq!(
-            agent_system(&cfg),
+            agent_system(&cfg).await,
             "CUSTOM AGENT PROMPT\n\nUSER RULES\nverbatim\n"
         );
     }
 
-    #[test]
-    fn empty_additional_agent_instructions_do_not_change_prompt() {
+    #[tokio::test]
+    async fn empty_additional_agent_instructions_do_not_change_prompt() {
         let mut cfg = Config::default();
         cfg.prompts.additional_agent_instructions = Some(String::new());
-        assert_eq!(agent_system(&cfg), AGENT_SYSTEM_DEFAULT);
+        assert_eq!(agent_system(&cfg).await, AGENT_SYSTEM_DEFAULT);
     }
 
     #[tokio::test]
@@ -413,35 +424,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unreadable_override_falls_back_to_default() {
+    #[tokio::test]
+    async fn unreadable_override_falls_back_to_default() {
         let mut cfg = Config::default();
         cfg.prompts.mcp_instructions = Some("/definitely/not/a/real/prompt.md".to_string());
-        assert_eq!(mcp_instructions(&cfg), MCP_INSTRUCTIONS_DEFAULT);
+        assert_eq!(mcp_instructions(&cfg).await, MCP_INSTRUCTIONS_DEFAULT);
     }
 
     // --- summary override injection ---
 
-    #[test]
-    fn summary_override_unset_leaves_policy_untouched() {
+    #[tokio::test]
+    async fn summary_override_unset_leaves_policy_untouched() {
         let cfg = Config::default();
-        let out = apply_summary_override(Some(policy()), &cfg).unwrap();
+        let out = apply_summary_override(Some(policy()), &cfg).await.unwrap();
         assert_eq!(out.summary_prompt, None);
     }
 
-    #[test]
-    fn summary_override_fills_empty_policy_prompt() {
+    #[tokio::test]
+    async fn summary_override_fills_empty_policy_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sum.md");
         std::fs::write(&path, "CUSTOM SUMMARY").unwrap();
         let mut cfg = Config::default();
         cfg.prompts.summary = Some(path.to_string_lossy().to_string());
-        let out = apply_summary_override(Some(policy()), &cfg).unwrap();
+        let out = apply_summary_override(Some(policy()), &cfg).await.unwrap();
         assert_eq!(out.summary_prompt.as_deref(), Some("CUSTOM SUMMARY"));
     }
 
-    #[test]
-    fn summary_override_does_not_clobber_env_value() {
+    #[tokio::test]
+    async fn summary_override_does_not_clobber_env_value() {
         // An agent-env DAIMONOS_AGENT_SUMMARY_PROMPT has already populated
         // policy.summary_prompt; the config path must not override it.
         let dir = tempfile::tempdir().unwrap();
@@ -451,15 +462,15 @@ mod tests {
         cfg.prompts.summary = Some(path.to_string_lossy().to_string());
         let mut p = policy();
         p.summary_prompt = Some("ENV SUMMARY".to_string());
-        let out = apply_summary_override(Some(p), &cfg).unwrap();
+        let out = apply_summary_override(Some(p), &cfg).await.unwrap();
         assert_eq!(out.summary_prompt.as_deref(), Some("ENV SUMMARY"));
     }
 
-    #[test]
-    fn summary_override_on_disabled_compaction_is_none() {
+    #[tokio::test]
+    async fn summary_override_on_disabled_compaction_is_none() {
         let mut cfg = Config::default();
         cfg.prompts.summary = Some("/whatever.md".to_string());
-        assert!(apply_summary_override(None, &cfg).is_none());
+        assert!(apply_summary_override(None, &cfg).await.is_none());
     }
 
     // --- baseline dump / scaffold (vikunja #980) ---
@@ -483,7 +494,7 @@ mod tests {
         assert_eq!(report.written.len(), PROMPT_NAMES.len());
         assert!(report.skipped.is_empty());
         for name in PROMPT_NAMES {
-            let content = std::fs::read_to_string(target.join(format!("{name}.md"))).unwrap();
+            let content = std::fs::read_to_string(target.join(prompt_filename(name))).unwrap();
             assert_eq!(content, default_by_name(name).unwrap());
         }
     }
@@ -526,7 +537,7 @@ mod tests {
         assert!(block.starts_with("[prompts]\n"));
         for name in PROMPT_NAMES {
             assert!(block.contains(&format!("{name} =")) || block.contains(&format!("{name}  ")));
-            assert!(block.contains(&format!("/tmp/p/{name}.md")));
+            assert!(block.contains(&format!("/tmp/p/{}", prompt_filename(name))));
         }
     }
 }

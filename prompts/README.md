@@ -1,7 +1,8 @@
 # Daimonos prompts
 
-These files are the **model-facing prompts** that steer daimonos's behavior.
-They are not documentation — their exact text is sent to the LLM.
+These files are the **model-facing text** that steers daimonos's behavior.
+The Markdown prompts are sent verbatim; `tool_descriptions.toml` supplies the
+top-level tool metadata shown to models.
 
 ## How they are used
 
@@ -15,15 +16,17 @@ recompiling** by pointing the matching key in your `daimonos.toml` at a file:
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
 An unset (or empty) key uses the embedded default. A key that points at an
 **unreadable** file falls back to the embedded default and logs a warning on
 stderr (it does not crash).
 
-`~` is expanded to `$HOME`. Paths are read verbatim — the entire file becomes
-the prompt, so do **not** put comments inside a prompt file (they would be sent
-to the model). Keep guidance in this README or in `daimonos.toml` comments.
+`~` is expanded to `$HOME`. Prompt paths are read verbatim — the entire file
+becomes the prompt, so do **not** put comments inside a Markdown prompt file
+(they would be sent to the model). The tool catalog may contain TOML comments
+and may override only selected tools/variants; omitted values retain defaults.
 
 ## Getting the baseline defaults (no source needed)
 
@@ -33,8 +36,8 @@ Because the defaults are embedded in the binary, you can recover them at runtime
 ```bash
 daimonos --print-prompt <name>       # print one default to stdout (name is one
                                      #   of: agent_system, mcp_instructions,
-                                     #   kgl_hint, summary)
-daimonos --dump-prompts              # scaffold all four into
+                                     #   kgl_hint, summary, tool_descriptions)
+daimonos --dump-prompts              # scaffold all five resources into
                                      #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/dir    # ...into a custom directory
 daimonos --dump-prompts --force      # overwrite existing files
@@ -76,6 +79,7 @@ does not affect `daimonos --mcp`, whose host-facing prompt is
 | `mcp_instructions.md` | `daimonos --mcp` | Server `instructions` sent to the MCP host. Includes the **terse-output** directive that materially affects output token cost. |
 | `kgl_hint.md` | `daimonos --mcp` (only when KGL auto-index is on) | Nudge to orient via the knowledge graph before reading source. |
 | `summary.md` | context compaction (all interactive runtimes) | System prompt for the one-shot summarizer that replaces evicted turns. |
+| `tool_descriptions.toml` | MCP, agent, chat, ACP | Full descriptions for all top-level tools plus curated terse variants used by compact MCP listings. |
 
 ## WARNING
 

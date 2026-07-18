@@ -59,6 +59,7 @@ pub fn parse_line(line: &str) -> ChatCommand {
 /// deltas live as they arrive (vikunja #957) — thinking/tool-call deltas are
 /// captured by the provider but not rendered, matching prior non-streaming
 /// behavior where thinking was never shown in the REPL.
+#[cfg(test)]
 pub fn build_agent_config(
     workspace: &Path,
     model: String,
@@ -67,7 +68,28 @@ pub fn build_agent_config(
     compaction: Option<CompactionPolicy>,
     system_prompt: String,
 ) -> AgentConfig {
-    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace)
+    build_agent_config_with_descriptions(
+        workspace,
+        model,
+        safety,
+        token_log,
+        compaction,
+        system_prompt,
+        &crate::tool_descriptions::ToolDescriptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_agent_config_with_descriptions(
+    workspace: &Path,
+    model: String,
+    safety: Option<SafetyPolicy>,
+    token_log: Option<std::path::PathBuf>,
+    compaction: Option<CompactionPolicy>,
+    system_prompt: String,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
+) -> AgentConfig {
+    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
         .into_iter()
         .map(|s| ToolSchema {
             name: s.name,
@@ -206,14 +228,15 @@ pub async fn run_chat(
     resume: Option<String>,
     compaction: Option<CompactionPolicy>,
 ) -> anyhow::Result<()> {
-    let system_prompt = crate::prompts::agent_system(&cfg);
-    let config = build_agent_config(
+    let system_prompt = crate::prompts::agent_system(&cfg).await;
+    let config = build_agent_config_with_descriptions(
         workspace,
         model.clone(),
         safety,
         token_log,
         compaction,
         system_prompt,
+        &cfg.prompts.resolved_tool_descriptions,
     );
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);

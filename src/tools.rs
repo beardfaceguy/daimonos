@@ -54,7 +54,6 @@ pub enum ToolTier {
 pub struct ToolDef {
     pub name: &'static str,
     pub tier: ToolTier,
-    pub description: &'static str,
     pub schema: Value,
     /// Maps MCP args JSON to a protocol Request. None for special tools
     /// that need session access or custom handling (git, set_cwd, etc.).
@@ -68,11 +67,9 @@ pub struct ToolDef {
 pub fn all_tools() -> Vec<ToolDef> {
     vec![
         // ===================== Tier 0: Full schema =====================
-
         ToolDef {
             name: "read_file",
             tier: ToolTier::Full,
-            description: "Read file. Returns {content, lines} or {unchanged:true, lines} if already read and unmodified.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -82,20 +79,20 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["path"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::READ,
-                p: get_str(args, "path"),
-                n: get_i64(args, "offset"),
-                n2: get_i64(args, "limit"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::READ,
+                    p: get_str(args, "path"),
+                    n: get_i64(args, "offset"),
+                    n2: get_i64(args, "limit"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "write_file",
             tier: ToolTier::Full,
-            description: "Write file, creating parent dirs.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -104,19 +101,19 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["path", "content"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::WRITE,
-                p: get_str(args, "path"),
-                s: get_str(args, "content"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::WRITE,
+                    p: get_str(args, "path"),
+                    s: get_str(args, "content"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "edit_file",
             tier: ToolTier::Full,
-            description: "String-replace edits. Returns {applied, diffs} confirming each change.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -129,19 +126,19 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["path", "edits"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::PATCH,
-                p: get_str(args, "path"),
-                a: get_str_array(args, "edits"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::PATCH,
+                    p: get_str(args, "path"),
+                    a: get_str_array(args, "edits"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "search",
             tier: ToolTier::Full,
-            description: "Regex content search or trigram file-name search.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -175,20 +172,16 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             context_check: None,
         },
-
         ToolDef {
             name: "workspace_info",
             tier: ToolTier::Terse,
-            description: "Detailed workspace info (session state, root listing, index stats). Basic info is already in server instructions — only call if you need index stats or full detail.",
             schema: json!({"type": "object", "properties": {}}),
             to_request: None, // needs session.index access
             context_check: None,
         },
-
         ToolDef {
             name: "exec",
             tier: ToolTier::Full,
-            description: "Run command. Returns {exit, out, err?}. Output auto-truncated if very large.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -199,21 +192,21 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["command"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::EXEC,
-                s: get_str(args, "command"),
-                a: get_str_array(args, "args"),
-                q: get_str(args, "cwd"),
-                kv: get_str_map(args, "env"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::EXEC,
+                    s: get_str(args, "command"),
+                    a: get_str_array(args, "args"),
+                    q: get_str(args, "cwd"),
+                    kv: get_str_map(args, "env"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "batch",
             tier: ToolTier::Terse,
-            description: "Multiple tools in one call. Always batch when you need 2+ independent reads/searches. E.g. [{tool:\"read_file\",arguments:{path:\"a.rs\"}},{tool:\"search\",arguments:{pattern:\"TODO\"}}].",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -234,11 +227,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // meta-tool handled in mcp.rs
             context_check: None,
         },
-
         ToolDef {
             name: "get_tool_schema",
             tier: ToolTier::Full,
-            description: "Get full inputSchema for tool(s). Call before using a tool whose schema was not in list_tools.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -253,11 +244,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // schema lookup handled in mcp.rs
             context_check: None,
         },
-
         ToolDef {
             name: "execute_script",
             tier: ToolTier::Full,
-            description: "Run a Starlark (Python-subset) script with all tools as built-in functions. Intermediate results stay in the sandbox; only `result` variable is returned. Much cheaper than sequential tool calls.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -269,11 +258,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // Starlark runtime handled in mcp.rs
             context_check: None,
         },
-
         ToolDef {
             name: "kgl_query",
             tier: ToolTier::Full,
-            description: "Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -294,11 +281,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             // (dispatch auto-activates), so `kgl_query index` bootstraps fine.
             context_check: Some(|ws| ws.join(".kgl").exists()),
         },
-
         ToolDef {
             name: "kgl_assert",
             tier: ToolTier::Full,
-            description: "Declare the non-derivable KGL layer for a def: its intent/purpose (+ rationale, open questions), authoring provenance, or a typed edge (reads/mutates/calls/depends_on). This is how an authoring agent records WHY code exists and what it touches — the part no derived graph provides. Get the target def 'hash' from kgl_query find/node.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -313,22 +298,17 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // KGL store access handled in mcp.rs
             context_check: Some(|ws| ws.join(".kgl").exists()),
         },
-
         ToolDef {
             name: "list_tool_signatures",
             tier: ToolTier::OnDemand,
-            description: "Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions.",
             schema: json!({"type": "object", "properties": {}}),
             to_request: None, // returns static string
             context_check: None,
         },
-
         // ===================== Tier 1: Terse schema =====================
-
         ToolDef {
             name: "git",
             tier: ToolTier::Terse,
-            description: "Git operations. Commands: status, log, diff, branch, add, commit, push, pull, checkout. All args besides 'command' are passed through.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -352,11 +332,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // uses ToolRegistry plugin
             context_check: Some(|ws| ws.join(".git").exists()),
         },
-
         ToolDef {
             name: "cargo",
             tier: ToolTier::Terse,
-            description: "Cargo operations. Commands: test, build, check, clippy, fmt, add.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -372,11 +350,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // uses ToolRegistry plugin
             context_check: Some(|ws| ws.join("Cargo.toml").exists()),
         },
-
         ToolDef {
             name: "pytest",
             tier: ToolTier::Terse,
-            description: "Python test runner. Commands: run (passed/failed/skipped + failure ids), collect (--collect-only test ids).",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -400,11 +376,9 @@ pub fn all_tools() -> Vec<ToolDef> {
                     || ws.join("tests").is_dir()
             }),
         },
-
         ToolDef {
             name: "gh",
             tier: ToolTier::Terse,
-            description: "GitHub CLI (structured). Commands: pr_view, pr_list, pr_create, pr_diff, pr_checks, pr_merge, pr_checkout, run_list, run_view, issue_list, issue_view, issue_create, issue_comment, api, raw (arbitrary gh args).",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -434,11 +408,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None,
             context_check: Some(|ws| ws.join(".git").exists()),
         },
-
         ToolDef {
             name: "docker",
             tier: ToolTier::Terse,
-            description: "Docker operations. Commands: ps, logs, exec, images, inspect, stop, compose_up, compose_down, compose_ps.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -457,11 +429,9 @@ pub fn all_tools() -> Vec<ToolDef> {
                     || ws.join("docker-compose.yaml").exists()
             }),
         },
-
         ToolDef {
             name: "curl",
             tier: ToolTier::Terse,
-            description: "HTTP request. Returns {status, headers, body (capped 16KB), timing_ms, url, method}. Auto-registered when curl is on PATH.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -476,11 +446,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // uses CurlPlugin via ToolRegistry
             context_check: None,
         },
-
         ToolDef {
             name: "shellcheck",
             tier: ToolTier::Terse,
-            description: "Lint shell scripts via shellcheck. Returns {clean, diagnostics:[{file,line,col,level,code,message}]}. Auto-registered when shellcheck is on PATH.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -492,11 +460,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // uses ShellcheckPlugin via ToolRegistry
             context_check: None,
         },
-
         ToolDef {
             name: "npm",
             tier: ToolTier::Terse,
-            description: "npm package manager. Commands: install, run, test, build, audit. Returns {exit, ok, stdout, stderr} or {clean, vulnerabilities, findings} for audit. Auto-registered when npm is on PATH.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -508,11 +474,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // uses NpmPlugin via ToolRegistry
             context_check: None,
         },
-
         ToolDef {
             name: "discord",
             tier: ToolTier::Terse,
-            description: "Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -528,11 +492,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None,
             context_check: None,
         },
-
         ToolDef {
             name: "snapshot",
             tier: ToolTier::Terse,
-            description: "Workspace snapshots. Actions: create (returns id), restore (rolls back), list, delete.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -557,15 +519,17 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "restore" | "delete" => get_str(args, "id"),
                     _ => None,
                 };
-                Ok(Request::Single(Op { c: opcode, p, ..Default::default() }))
+                Ok(Request::Single(Op {
+                    c: opcode,
+                    p,
+                    ..Default::default()
+                }))
             }),
             context_check: None,
         },
-
         ToolDef {
             name: "set_cwd",
             tier: ToolTier::Terse,
-            description: "Change working directory for all subsequent operations. Returns {cwd, previous}.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -576,11 +540,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // mutates session directly
             context_check: None,
         },
-
         ToolDef {
             name: "ls",
             tier: ToolTier::Terse,
-            description: "List directory. Returns [{n,d,s}]. Skips .git/node_modules/target/__pycache__. Use glob to filter by filename pattern (e.g. *.rs), type to restrict to files (f) or dirs (d).",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -617,11 +579,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             context_check: None,
         },
-
         ToolDef {
             name: "session_stats",
             tier: ToolTier::Terse,
-            description: "Token analytics. Scopes: session (current totals), history (cross-session), daily (trend). Optional external_session_id filters history/daily to a single agent-runtime session id.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -633,11 +593,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // needs session.analytics access
             context_check: None,
         },
-
         ToolDef {
             name: "set_external_session_id",
             tier: ToolTier::Terse,
-            description: "Attach an agent-runtime session id (e.g. claude `--session-id` UUID) to every subsequent analytics row from this connection. Use to correlate daimonos analytics with the agent's own usage logs. Pass an empty string to clear.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -648,11 +606,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // mutates session directly
             context_check: None,
         },
-
         ToolDef {
             name: "set_verbosity",
             tier: ToolTier::Terse,
-            description: "Set this session's output verbosity: full (default, most detail), compact (tighter caps), terse (minimum viable — counts, exit codes, first error). Trades tool-output tokens for detail. Returns {verbosity, previous}.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -663,22 +619,17 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: None, // mutates session directly
             context_check: None,
         },
-
         ToolDef {
             name: "list_all_tools",
             tier: ToolTier::Terse,
-            description: "Show all available tools including extended ones (diff, pipelines, repair). Call once to unlock them.",
             schema: json!({"type": "object", "properties": {}}),
             to_request: None, // activates on-demand tools in session
             context_check: None,
         },
-
         // ===================== Tier 2: On-demand =====================
-
         ToolDef {
             name: "diff_files",
             tier: ToolTier::OnDemand,
-            description: "Structured diff: hunks with =, +, - tagged lines.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -688,20 +639,20 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["path_a"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::DIFF,
-                p: get_str(args, "path_a"),
-                q: get_str(args, "path_b"),
-                s: get_str(args, "content_b"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::DIFF,
+                    p: get_str(args, "path_a"),
+                    q: get_str(args, "path_b"),
+                    s: get_str(args, "content_b"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "tool_pipeline",
             tier: ToolTier::OnDemand,
-            description: "Run tool stages sequentially, abort on failure.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -711,20 +662,20 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["tool_id", "stages"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::TOOL_PIPELINE,
-                p: get_str(args, "tool_id"),
-                a: get_str_array(args, "stages"),
-                q: get_str(args, "cwd"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::TOOL_PIPELINE,
+                    p: get_str(args, "tool_id"),
+                    a: get_str_array(args, "stages"),
+                    q: get_str(args, "cwd"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
-
         ToolDef {
             name: "tool_repair",
             tier: ToolTier::OnDemand,
-            description: "Auto lint-fix loop until clean.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -734,13 +685,15 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["tool_id"]
             }),
-            to_request: Some(|args| Ok(Request::Single(Op {
-                c: protocol::op::TOOL_REPAIR,
-                p: get_str(args, "tool_id"),
-                n: get_i64(args, "max_iterations"),
-                q: get_str(args, "cwd"),
-                ..Default::default()
-            }))),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::TOOL_REPAIR,
+                    p: get_str(args, "tool_id"),
+                    n: get_i64(args, "max_iterations"),
+                    q: get_str(args, "cwd"),
+                    ..Default::default()
+                }))
+            }),
             context_check: None,
         },
     ]
@@ -783,60 +736,18 @@ pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_u
     has_full_schema(name) && !already_used
 }
 
-/// A shorter description for `name`, used at verbosity levels below `Full` to
-/// shrink the list_tools prefix (vikunja #936 lever 3). Returns `None` for tools
-/// whose full description is already terse — callers fall back to the full one.
-///
-/// Terse variants deliberately KEEP the subcommand list for multiplexer tools
-/// (git/cargo/gh/docker/...): at low verbosity the inputSchema is stripped from
-/// list_tools, so dropping the command names would just push the agent to call
-/// `get_tool_schema` more (extra activation round-trips), defeating the saving.
-pub fn terse_description(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "read_file" => "Read file → {content, lines}.",
-        "workspace_info" => "Workspace info: session, root listing, index stats.",
-        "exec" => "Run command → {exit, out, err?}.",
-        "batch" => "Run 2+ independent tools in one call; get_tool_schema for shape.",
-        "execute_script" => {
-            "Run a Starlark script; all tools as functions; returns `result`. Cheaper than sequential calls."
-        }
-        "get_tool_schema" => "Get full inputSchema for tool(s) before use.",
-        "git" => "Git: status, log, diff, branch, add, commit, push, pull, checkout.",
-        "cargo" => "Cargo: test, build, check, clippy, fmt, add.",
-        "pytest" => "Python tests: run, collect.",
-        "gh" => {
-            "GitHub: pr_view/list/create/diff/checks/merge/checkout, run_list/view, issue_list/view/create/comment, api, raw."
-        }
-        "docker" => "Docker: ps, logs, exec, images, inspect, stop, compose_up/down/ps.",
-        "npm" => "npm: install, run, test, build, audit.",
-        "curl" => "HTTP request → {status, headers, body, timing_ms}.",
-        "shellcheck" => "Lint shell scripts → {clean, diagnostics}.",
-        "discord" => "Discord read-only: list_guilds, list_channels, read_messages, search_messages.",
-        "snapshot" => "Workspace snapshots: create, restore, list, delete.",
-        "ls" => "List dir → [{n,d,s}]; skips vcs/build dirs; glob/type filters.",
-        "session_stats" => "Token analytics: session, history, daily.",
-        "set_external_session_id" => "Attach agent-runtime session id to analytics rows.",
-        "set_verbosity" => "Set output verbosity: full|compact|terse.",
-        "list_all_tools" => "Unlock extended tools (diff, pipelines, repair).",
-        "kgl_query" => {
-            "Query KGL graph: find defs, deps, calls, state, open questions, blast radius; index/check."
-        }
-        "kgl_assert" => "Declare KGL layer for a def: intent, provenance, or typed edge.",
-        _ => return None,
-    })
-}
-
 /// Render one tool definition for a list_tools response under the session's
 /// verbosity + schema policy: swap in a terse description below `Full`, then
 /// strip the inputSchema unless this tool should advertise it.
 pub fn render_list_tool(
     mut t: rust_mcp_sdk::schema::Tool,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
     verbosity: crate::verbosity::Verbosity,
     full_tool_schemas: bool,
     already_used: bool,
 ) -> rust_mcp_sdk::schema::Tool {
     if verbosity != crate::verbosity::Verbosity::Full {
-        if let Some(d) = terse_description(&t.name) {
+        if let Some(d) = descriptions.terse(&t.name) {
             t.description = Some(d.to_string());
         }
     }
@@ -871,13 +782,15 @@ pub fn build_request(name: &str, args: &Value) -> Option<Result<Request, String>
 }
 
 /// Build MCP Tool objects from the registry for list_tools responses.
-pub fn tool_definitions() -> Vec<rust_mcp_sdk::schema::Tool> {
+pub fn tool_definitions(
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
+) -> Vec<rust_mcp_sdk::schema::Tool> {
     all_tools()
         .into_iter()
         .map(|td| {
             serde_json::from_value(json!({
                 "name": td.name,
-                "description": td.description,
+                "description": descriptions.full_or_name(td.name),
                 "inputSchema": td.schema,
             }))
             .expect("valid tool definition")
@@ -893,6 +806,10 @@ pub fn all_tool_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn descriptions() -> crate::tool_descriptions::ToolDescriptions {
+        crate::tool_descriptions::ToolDescriptions::default()
+    }
 
     #[test]
     fn all_tools_has_entries() {
@@ -922,9 +839,12 @@ mod tests {
 
     #[test]
     fn all_tools_have_descriptions() {
+        let descriptions = descriptions();
         for tool in all_tools() {
             assert!(
-                !tool.description.is_empty(),
+                descriptions
+                    .full(tool.name)
+                    .is_some_and(|description| !description.is_empty()),
                 "tool '{}' has no description",
                 tool.name
             );
@@ -1051,7 +971,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_roundtrip() {
-        let defs = tool_definitions();
+        let defs = tool_definitions(&descriptions());
         assert!(!defs.is_empty());
         for tool in &defs {
             assert!(!tool.name.is_empty());
@@ -1063,77 +983,83 @@ mod tests {
 
     #[test]
     fn terse_descriptions_are_shorter_and_curated_only() {
+        let descriptions = descriptions();
         for t in all_tools() {
-            if let Some(terse) = terse_description(t.name) {
+            if let Some(terse) = descriptions.terse(t.name) {
+                let full = descriptions.full(t.name).unwrap();
                 assert!(
-                    terse.len() < t.description.len(),
+                    terse.len() < full.len(),
                     "terse desc for {} not shorter ({} >= {})",
                     t.name,
                     terse.len(),
-                    t.description.len()
+                    full.len()
                 );
             }
         }
-        assert!(terse_description("does_not_exist").is_none());
+        assert!(descriptions.terse("does_not_exist").is_none());
         // Already-short descriptions need no terse variant.
-        assert!(terse_description("write_file").is_none());
+        assert!(descriptions.terse("write_file").is_none());
     }
 
     #[test]
     fn terse_multiplexer_descriptions_keep_subcommands() {
+        let descriptions = descriptions();
         // Dropping command names at low verbosity would force extra
         // get_tool_schema round-trips; guard against over-trimming.
-        assert!(terse_description("git").unwrap().contains("commit"));
-        assert!(terse_description("git").unwrap().contains("push"));
-        assert!(terse_description("cargo").unwrap().contains("clippy"));
-        assert!(terse_description("docker").unwrap().contains("compose"));
-        let gh = terse_description("gh").unwrap();
+        assert!(descriptions.terse("git").unwrap().contains("commit"));
+        assert!(descriptions.terse("git").unwrap().contains("push"));
+        assert!(descriptions.terse("cargo").unwrap().contains("clippy"));
+        assert!(descriptions.terse("docker").unwrap().contains("compose"));
+        let gh = descriptions.terse("gh").unwrap();
         assert!(gh.contains("merge") && gh.contains("raw"));
     }
 
     #[test]
     fn render_list_tool_swaps_description_below_full() {
         use crate::verbosity::Verbosity;
+        let descriptions = descriptions();
         let git = || {
-            tool_definitions()
+            tool_definitions(&descriptions)
                 .into_iter()
                 .find(|t| t.name == "git")
                 .unwrap()
         };
 
         let orig = git().description.clone();
-        let full = render_list_tool(git(), Verbosity::Full, false, false);
+        let full = render_list_tool(git(), &descriptions, Verbosity::Full, false, false);
         assert_eq!(
             full.description, orig,
             "Full verbosity must keep the full description"
         );
 
-        let terse = render_list_tool(git(), Verbosity::Terse, false, false);
-        assert_eq!(terse.description.as_deref(), terse_description("git"));
+        let terse = render_list_tool(git(), &descriptions, Verbosity::Terse, false, false);
+        assert_eq!(terse.description.as_deref(), descriptions.terse("git"));
         assert!(terse.description.unwrap().len() < full.description.unwrap().len());
 
         // A tool without a terse variant is unchanged even below Full.
         let wf = || {
-            tool_definitions()
+            tool_definitions(&descriptions)
                 .into_iter()
                 .find(|t| t.name == "write_file")
                 .unwrap()
         };
-        let wf_full = render_list_tool(wf(), Verbosity::Full, false, false);
-        let wf_terse = render_list_tool(wf(), Verbosity::Terse, false, false);
+        let wf_full = render_list_tool(wf(), &descriptions, Verbosity::Full, false, false);
+        let wf_terse = render_list_tool(wf(), &descriptions, Verbosity::Terse, false, false);
         assert_eq!(wf_full.description, wf_terse.description);
     }
 
     #[test]
     fn description_block_shrinks_meaningfully_at_terse() {
-        let full_bytes: usize = tool_definitions()
+        let descriptions = descriptions();
+        let full_bytes: usize = tool_definitions(&descriptions)
             .iter()
             .map(|t| t.description.as_deref().unwrap_or("").len())
             .sum();
-        let terse_bytes: usize = tool_definitions()
+        let terse_bytes: usize = tool_definitions(&descriptions)
             .iter()
             .map(|t| {
-                terse_description(&t.name)
+                descriptions
+                    .terse(&t.name)
                     .map(|s| s.len())
                     .unwrap_or_else(|| t.description.as_deref().unwrap_or("").len())
             })

@@ -95,12 +95,7 @@ impl AgentEnv {
         if let Some(p) = std::env::var_os("DAIMONOS_AGENT_ENV") {
             return Some(PathBuf::from(p));
         }
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("daimonos")
-                .join("agent.env")
-        })
+        crate::paths::home_dir().map(|home| home.join(".config").join("daimonos").join("agent.env"))
     }
 
     /// Load + validate the agent env file. Returns a clear error (naming the
@@ -236,9 +231,8 @@ impl AgentEnv {
     /// Global path for persisted "always" (Y) approvals, fixed at
     /// ~/.config/daimonos/agent-approvals (independent of the agent env file).
     pub fn approvals_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h)
-                .join(".config")
+        crate::paths::home_dir().map(|home| {
+            home.join(".config")
                 .join("daimonos")
                 .join("agent-approvals")
         })

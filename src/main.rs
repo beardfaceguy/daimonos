@@ -10,6 +10,7 @@ mod index;
 mod kgl;
 mod mcp;
 mod ops;
+mod paths;
 mod pipeline_cache;
 mod plugins;
 mod prompts;
@@ -20,6 +21,7 @@ mod script;
 mod session;
 mod session_store;
 mod snapshot;
+mod tool_descriptions;
 mod tool_facade;
 mod tool_runner;
 mod tools;
@@ -218,8 +220,8 @@ struct Cli {
     print_config_path: bool,
 
     /// Print one embedded baseline prompt to stdout and exit. Value is one of:
-    /// agent_system, mcp_instructions, kgl_hint, summary. Use this to see or
-    /// save the default you are overriding via [prompts].
+    /// agent_system, mcp_instructions, kgl_hint, summary, tool_descriptions.
+    /// Use this to see or save the default you are overriding via [prompts].
     #[arg(long, value_name = "NAME")]
     print_prompt: Option<String>,
 
@@ -259,19 +261,12 @@ struct Cli {
     command: Option<Commands>,
 }
 
-/// Resolve the user's home directory from `$HOME`. Single seam for every
-/// `~`-rooted daimonos path (debug log, chat/acp session stores) so the
-/// lookup lives in one place instead of being re-read inline at each site.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 /// Resolve the fixed `--debug-tokens` log path, creating its parent
 /// directory if missing. Returns `None` (silently) if `$HOME` can't be
 /// resolved or the directory can't be created — a debug log must not be
 /// able to block startup.
 fn debug_tokens_log_path() -> Option<PathBuf> {
-    let home = home_dir()?;
+    let home = paths::home_dir()?;
     let dir = home.join(".config/daimonos");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("token-debug.log"))
@@ -340,12 +335,17 @@ async fn main() -> anyhow::Result<()> {
         match prompts::dump_defaults(dir_arg, cli.force) {
             Ok(report) => {
                 for name in &report.written {
-                    println!("wrote {}/{name}.md", report.dir.display());
+                    println!(
+                        "wrote {}/{}",
+                        report.dir.display(),
+                        prompts::prompt_filename(name)
+                    );
                 }
                 for name in &report.skipped {
                     println!(
-                        "skipped {}/{name}.md (exists; use --force to overwrite)",
-                        report.dir.display()
+                        "skipped {}/{} (exists; use --force to overwrite)",
+                        report.dir.display(),
+                        prompts::prompt_filename(name)
                     );
                 }
                 println!(
@@ -371,6 +371,8 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    cfg.prompts.resolved_tool_descriptions =
+        tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
     // Load optional extra user rules once, before any agent runtime starts.
     // Pure inspection modes (`agent --dry-run`, `chat --list`) do not create an
     // agent and therefore do not need the file.
@@ -500,7 +502,7 @@ async fn main() -> anyhow::Result<()> {
             // Chat sessions persist under ~/.daimonos so `--resume`/`--list`
             // can restore a prior conversation (vikunja #963). Separate dir
             // from acp-sessions to keep the two id namespaces from colliding.
-            let sessions_dir = home_dir().map(|h| h.join(".daimonos").join("chat-sessions"));
+            let sessions_dir = paths::home_dir().map(|h| h.join(".daimonos").join("chat-sessions"));
             // --list is a pure query: enumerate saved sessions and exit
             // without loading the agent env / building a provider.
             if list {
@@ -539,7 +541,7 @@ async fn main() -> anyhow::Result<()> {
             };
             // Apply the [prompts].summary override (vikunja #974) unless the
             // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
-            let compaction = prompts::apply_summary_override(compaction, &cfg);
+            let compaction = prompts::apply_summary_override(compaction, &cfg).await;
             let approve_fn = if agent.approval_mode == "auto" {
                 None
             } else {
@@ -611,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
             };
             // Apply the [prompts].summary override (vikunja #974) unless the
             // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
-            let compaction = prompts::apply_summary_override(compaction, &cfg);
+            let compaction = prompts::apply_summary_override(compaction, &cfg).await;
             // No approve_fn: ACP asks the client via session/request_permission,
             // not a stdin prompt — the denylist/allowlist/approval-mode gating
             // (SafetyPolicy::gate) still applies the same as agent/chat.
@@ -619,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
             // Persist ACP sessions under ~/.daimonos so session/load can
             // resume a thread after this process exits and Zed re-requests a
             // session id from a previous run (see acp_cmd::SessionStore).
-            let sessions_dir = home_dir().map(|h| h.join(".daimonos").join("acp-sessions"));
+            let sessions_dir = paths::home_dir().map(|h| h.join(".daimonos").join("acp-sessions"));
             acp_cmd::run_acp(
                 make_provider,
                 &workspace,

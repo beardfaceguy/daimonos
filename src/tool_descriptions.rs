@@ -1,0 +1,176 @@
+//! Runtime-configurable top-level tool descriptions.
+
+use serde::Deserialize;
+use std::collections::HashMap;
+
+pub const DEFAULT_TEXT: &str = include_str!("../prompts/tool_descriptions.toml");
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct DescriptionEntry {
+    full: Option<String>,
+    terse: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolDescriptions {
+    entries: HashMap<String, DescriptionEntry>,
+}
+
+impl Default for ToolDescriptions {
+    fn default() -> Self {
+        Self {
+            entries: parse(DEFAULT_TEXT)
+                .expect("embedded prompts/tool_descriptions.toml must be valid TOML"),
+        }
+    }
+}
+
+impl ToolDescriptions {
+    pub fn full(&self, name: &str) -> Option<&str> {
+        self.entries.get(name)?.full.as_deref()
+    }
+
+    pub fn terse(&self, name: &str) -> Option<&str> {
+        self.entries.get(name)?.terse.as_deref()
+    }
+
+    /// Full description with a visible, nonempty fallback if code/catalog
+    /// parity ever drifts despite the invariant tests.
+    pub fn full_or_name<'a>(&'a self, name: &'a str) -> &'a str {
+        match self.full(name) {
+            Some(description) => description,
+            None => {
+                eprintln!(
+                    "daimonos: no full description registered for tool '{name}'; using tool name"
+                );
+                name
+            }
+        }
+    }
+
+    /// Load and overlay a user catalog. Missing entries keep embedded defaults;
+    /// unknown tools and empty values are ignored with a warning.
+    pub async fn load(override_path: Option<&str>) -> Self {
+        let mut descriptions = Self::default();
+        let Some(path) = override_path.filter(|path| !path.trim().is_empty()) else {
+            return descriptions;
+        };
+        let text = match tokio::fs::read_to_string(crate::paths::expand_tilde(path)).await {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!(
+                    "daimonos: tool description override ({path}) unreadable: {error}; using embedded defaults"
+                );
+                return descriptions;
+            }
+        };
+        let overrides = match parse(&text) {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                eprintln!(
+                    "daimonos: tool description override ({path}) invalid: {error}; using embedded defaults"
+                );
+                return descriptions;
+            }
+        };
+
+        for (name, entry) in overrides {
+            let Some(default) = descriptions.entries.get_mut(&name) else {
+                eprintln!(
+                    "daimonos: tool description override contains unknown tool '{name}'; ignoring"
+                );
+                continue;
+            };
+            for variant in entry.extra.keys() {
+                eprintln!(
+                    "daimonos: unknown description variant '{variant}' for tool '{name}'; ignoring"
+                );
+            }
+            merge_value(&name, "full", &mut default.full, entry.full);
+            merge_value(&name, "terse", &mut default.terse, entry.terse);
+        }
+        descriptions
+    }
+}
+
+fn parse(text: &str) -> Result<HashMap<String, DescriptionEntry>, toml::de::Error> {
+    toml::from_str(text)
+}
+
+fn merge_value(name: &str, variant: &str, target: &mut Option<String>, value: Option<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.trim().is_empty() {
+        eprintln!("daimonos: empty {variant} description for tool '{name}'; ignoring");
+        return;
+    }
+    *target = Some(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_catalog_covers_all_tools_and_terse_variants() {
+        let catalog = ToolDescriptions::default();
+        let names = crate::tools::all_tool_names();
+        assert_eq!(catalog.entries.len(), names.len());
+        for name in &names {
+            assert!(
+                catalog.full(name).is_some_and(|text| !text.is_empty()),
+                "missing full description for {name}"
+            );
+        }
+        assert!(catalog
+            .entries
+            .keys()
+            .all(|name| names.contains(&name.as_str())));
+    }
+
+    #[tokio::test]
+    async fn partial_override_merges_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        tokio::fs::write(
+            &path,
+            "[read_file]\nfull = \"Custom read\"\nterse = \"Read custom\"\n\n[unknown]\nfull = \"ignored\"\nfuture_variant = \"also ignored\"\n",
+        )
+        .await
+        .unwrap();
+
+        let catalog = ToolDescriptions::load(Some(path.to_string_lossy().as_ref())).await;
+        assert_eq!(catalog.full("read_file"), Some("Custom read"));
+        assert_eq!(catalog.terse("read_file"), Some("Read custom"));
+        assert_eq!(
+            catalog.full("write_file"),
+            ToolDescriptions::default().full("write_file")
+        );
+        assert!(catalog.full("unknown").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_override_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        tokio::fs::write(&path, "[read_file\n").await.unwrap();
+
+        let catalog = ToolDescriptions::load(Some(path.to_string_lossy().as_ref())).await;
+        assert_eq!(
+            catalog.full("read_file"),
+            ToolDescriptions::default().full("read_file")
+        );
+    }
+
+    #[test]
+    fn missing_description_falls_back_to_tool_name() {
+        let catalog = ToolDescriptions {
+            entries: HashMap::new(),
+        };
+        assert_eq!(catalog.full_or_name("future_tool"), "future_tool");
+    }
+}

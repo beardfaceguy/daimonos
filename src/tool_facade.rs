@@ -19,14 +19,17 @@ pub struct NeutralToolSchema {
 /// Returns Full + Terse tools whose context_check passes. OnDemand tools are
 /// excluded (they must be activated explicitly, same as in the MCP path).
 #[allow(dead_code)]
-pub fn active_schemas(workspace: &Path) -> Vec<NeutralToolSchema> {
+pub fn active_schemas(
+    workspace: &Path,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
+) -> Vec<NeutralToolSchema> {
     tools::all_tools()
         .into_iter()
         .filter(|t| t.tier != ToolTier::OnDemand)
         .filter(|t| tools::passes_context_check(t.name, workspace))
         .map(|t| NeutralToolSchema {
             name: t.name.to_string(),
-            description: t.description.to_string(),
+            description: descriptions.full_or_name(t.name).to_string(),
             input_schema: t.schema.clone(),
         })
         .collect()
@@ -66,12 +69,16 @@ mod tests {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
     }
 
+    fn default_schemas(dir: &std::path::Path) -> Vec<NeutralToolSchema> {
+        active_schemas(dir, &crate::tool_descriptions::ToolDescriptions::default())
+    }
+
     // --- active_schemas ---
 
     #[test]
     fn active_schemas_is_non_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!active_schemas(dir.path()).is_empty());
+        assert!(!default_schemas(dir.path()).is_empty());
     }
 
     #[test]
@@ -82,7 +89,7 @@ mod tests {
             .filter(|t| t.tier == ToolTier::OnDemand)
             .map(|t| t.name)
             .collect();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -97,7 +104,7 @@ mod tests {
     #[test]
     fn active_schemas_fields_populated() {
         let dir = tempfile::tempdir().unwrap();
-        for schema in active_schemas(dir.path()) {
+        for schema in default_schemas(dir.path()) {
             assert!(!schema.name.is_empty(), "empty name");
             assert!(
                 !schema.description.is_empty(),
@@ -112,10 +119,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn active_schemas_use_runtime_description_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_path = dir.path().join("tools.toml");
+        tokio::fs::write(&catalog_path, "[read_file]\nfull = \"CUSTOM AGENT READ\"\n")
+            .await
+            .unwrap();
+        let descriptions = crate::tool_descriptions::ToolDescriptions::load(Some(
+            catalog_path.to_string_lossy().as_ref(),
+        ))
+        .await;
+        let read = active_schemas(dir.path(), &descriptions)
+            .into_iter()
+            .find(|schema| schema.name == "read_file")
+            .unwrap();
+        assert_eq!(read.description, "CUSTOM AGENT READ");
+    }
+
     #[test]
     fn active_schemas_no_duplicate_names() {
         let dir = tempfile::tempdir().unwrap();
-        let schemas = active_schemas(dir.path());
+        let schemas = default_schemas(dir.path());
         let mut seen = std::collections::HashSet::new();
         for s in &schemas {
             assert!(
@@ -130,7 +155,7 @@ mod tests {
     fn active_schemas_excludes_context_filtered_tools_without_git() {
         let dir = tempfile::tempdir().unwrap();
         // No .git dir — git tool should not appear
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -141,7 +166,7 @@ mod tests {
     fn active_schemas_includes_git_when_git_dir_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -151,7 +176,7 @@ mod tests {
     #[test]
     fn active_schemas_excludes_cargo_without_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -162,7 +187,7 @@ mod tests {
     fn active_schemas_includes_cargo_when_cargo_toml_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -172,7 +197,7 @@ mod tests {
     #[test]
     fn active_schemas_excludes_docker_without_dockerfile() {
         let dir = tempfile::tempdir().unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -183,7 +208,7 @@ mod tests {
     fn active_schemas_includes_docker_when_dockerfile_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM ubuntu").unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -194,7 +219,7 @@ mod tests {
     fn active_schemas_includes_docker_when_compose_yml_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("docker-compose.yml"), "version: '3'").unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
@@ -205,7 +230,7 @@ mod tests {
     fn active_schemas_includes_docker_when_compose_yaml_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("docker-compose.yaml"), "version: '3'").unwrap();
-        let names: Vec<_> = active_schemas(dir.path())
+        let names: Vec<_> = default_schemas(dir.path())
             .iter()
             .map(|s| s.name.clone())
             .collect();
