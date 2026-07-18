@@ -270,7 +270,7 @@
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
-    "mtime": 1784405885.659216,
+    "mtime": 1784406467.3100789,
     "ast_hash": "810bafe06bbe0a8ad0b028b92bad6dd5",
     "semantic_hash": ""
   },
@@ -520,8 +520,8 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784352158.971194,
-    "ast_hash": "cb64857c90790d13d7c18aac99fe8036",
+    "mtime": 1784406848.4413636,
+    "ast_hash": "8f8d671d87de57ad2fbc6587374e26d3",
     "semantic_hash": ""
   },
   "src/tool_runner.rs": {
@@ -530,8 +530,8 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784352158.971194,
-    "ast_hash": "51577551893f189807aacdbb79cb6321",
+    "mtime": 1784424181.2699635,
+    "ast_hash": "8567b9aea8d6a07850fb28b6a9836ff1",
     "semantic_hash": ""
   },
   "src/verbosity.rs": {
@@ -605,8 +605,8 @@
     "semantic_hash": "acbca61bef7706f641f343b03274c30d"
   },
   "tests/test_handshake.py": {
-    "mtime": 1784352158.972194,
-    "ast_hash": "a884bc5fd0d37885c5f1b101bceacc41",
+    "mtime": 1784406907.054946,
+    "ast_hash": "df0b1d180d0d5e254b55cfdad19dd13c",
     "semantic_hash": ""
   },
   "tests/test_index_guard.py": {
@@ -830,8 +830,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784405416.7555397,
-    "ast_hash": "a90309084b7da8426ae7d87e86993434",
+    "mtime": 1784406926.6118066,
+    "ast_hash": "d812ab0f2408443f193b87d466f42164",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -885,8 +885,8 @@
     "semantic_hash": ""
   },
   "prompts/README.md": {
-    "mtime": 1784352158.969194,
-    "ast_hash": "439152e4a817852926cad2284ab24e69",
+    "mtime": 1784406921.4028437,
+    "ast_hash": "b018b1ad6309fea23cafa1541b13e35d",
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
@@ -920,8 +920,8 @@
     "semantic_hash": ""
   },
   "src/tool_descriptions.rs": {
-    "mtime": 1784352158.971194,
-    "ast_hash": "5a1302a0e30ef2c70221cef832a1ff13",
+    "mtime": 1784424176.850996,
+    "ast_hash": "622c90619210a506be4db65239f3fc07",
     "semantic_hash": ""
   },
   "tests/test_benchmark_scripts.py": {

@@ -141,11 +141,12 @@ def test_prompts_override_replaces_mcp_instructions(daimonos_binary, tmp_path):
 
 
 def test_tool_description_override_reaches_list_tools(daimonos_binary, tmp_path):
-    """A partial top-level description catalog overrides one tool while
-    preserving embedded defaults for all others (vikunja #975)."""
+    """A partial catalog overrides tool + parameter text while preserving
+    embedded defaults for all other values (vikunja #975, #1007)."""
     custom = tmp_path / "tool_descriptions.toml"
     custom.write_text(
-        '[read_file]\nfull = "SENTINEL custom read description."\n',
+        '[read_file]\nfull = "SENTINEL custom read description."\n'
+        '\n[read_file.parameters]\npath = "SENTINEL custom path description."\n',
         encoding="utf-8",
     )
     (tmp_path / "daimonos.toml").write_text(
@@ -176,6 +177,14 @@ def test_tool_description_override_reaches_list_tools(daimonos_binary, tmp_path)
         client.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
         tools = {tool["name"]: tool for tool in client.list_tools()}
         assert tools["read_file"]["description"] == "SENTINEL custom read description."
+        assert (
+            tools["read_file"]["inputSchema"]["properties"]["path"]["description"]
+            == "SENTINEL custom path description."
+        )
+        assert (
+            tools["read_file"]["inputSchema"]["properties"]["offset"]["description"]
+            == "Start line (0-based)"
+        )
         assert tools["write_file"]["description"] == "Write file, creating parent dirs."
     finally:
         proc.terminate()

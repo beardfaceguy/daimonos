@@ -2,7 +2,7 @@
 
 These files are the **model-facing text** that steers daimonos's behavior.
 The Markdown prompts are sent verbatim; `tool_descriptions.toml` supplies the
-top-level tool metadata shown to models.
+tool and parameter metadata shown to models.
 
 ## How they are used
 
@@ -26,7 +26,17 @@ stderr (it does not crash).
 `~` is expanded to `$HOME`. Prompt paths are read verbatim — the entire file
 becomes the prompt, so do **not** put comments inside a Markdown prompt file
 (they would be sent to the model). The tool catalog may contain TOML comments
-and may override only selected tools/variants; omitted values retain defaults.
+and may override only selected tools, variants, or parameters; omitted values
+retain defaults. Parameter text uses nested tables:
+
+```toml
+[read_file]
+full = "Read a file."
+
+[read_file.parameters]
+path = "Relative path"
+offset = "Start line (0-based)"
+```
 
 ## Getting the baseline defaults (no source needed)
 
@@ -79,7 +89,7 @@ does not affect `daimonos --mcp`, whose host-facing prompt is
 | `mcp_instructions.md` | `daimonos --mcp` | Server `instructions` sent to the MCP host. Includes the **terse-output** directive that materially affects output token cost. |
 | `kgl_hint.md` | `daimonos --mcp` (only when KGL auto-index is on) | Nudge to orient via the knowledge graph before reading source. |
 | `summary.md` | context compaction (all interactive runtimes) | System prompt for the one-shot summarizer that replaces evicted turns. |
-| `tool_descriptions.toml` | MCP, agent, chat, ACP | Full descriptions for all top-level tools plus curated terse variants used by compact MCP listings. |
+| `tool_descriptions.toml` | MCP, agent, chat, ACP | Full descriptions for all tools, curated terse variants, and top-level parameter descriptions injected into JSON Schemas. |
 
 ## WARNING
 

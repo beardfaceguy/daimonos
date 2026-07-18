@@ -379,7 +379,7 @@ inside them. See `prompts/README.md` for the committed defaults and guidance.
 | `mcp_instructions` | `daimonos --mcp` | Server instructions sent to the MCP host, including the terse-output directive that affects output token cost. |
 | `kgl_hint` | `daimonos --mcp` (KGL auto-index only) | Nudge to orient via the knowledge graph before reading source. |
 | `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
-| `tool_descriptions` | MCP / `agent` / `chat` / ACP | Partial TOML overlay for top-level full and terse tool descriptions. |
+| `tool_descriptions` | MCP / `agent` / `chat` / ACP | Partial TOML overlay for full/terse tool descriptions and nested `[tool.parameters]` JSON Schema property descriptions. |
 
 **Getting the baseline defaults**: the defaults are embedded in the binary, so
 you don't need the source to see or copy them:
