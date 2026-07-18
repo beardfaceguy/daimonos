@@ -129,6 +129,10 @@ call_timeout_secs = 60
 # Upper bound on forwarded servers connected per session (bounds spawned
 # processes / connections). Extra servers are ignored.
 max_servers = 32
+# Maximum initialize + tools/list handshakes in flight at once. Completed
+# servers are still registered in forwarded order so collision suffixes remain
+# deterministic.
+max_concurrent_connects = 8
 # Upper bound on tools registered from any single server (bounds the exposed
 # tool set). Extra tools are ignored.
 max_tools_per_server = 128

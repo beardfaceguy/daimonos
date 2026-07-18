@@ -290,8 +290,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784398910.153402,
-    "ast_hash": "a1e662b7bf7d0eed3bf97dedfce73ba3",
+    "mtime": 1784404129.6027071,
+    "ast_hash": "d5cd077f7676c43b7a8fe21dd7d123ad",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -360,7 +360,7 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1784402978.8500926,
+    "mtime": 1784404010.8885543,
     "ast_hash": "5fc268927fc3fa2f5bc1001a6042bc4b",
     "semantic_hash": ""
   },
@@ -635,7 +635,7 @@
     "semantic_hash": "f6847dbcf090cb82dbcc5f6140ad5500"
   },
   "tests/test_mcp_socket.py": {
-    "mtime": 1784402876.178832,
+    "mtime": 1784404010.8885543,
     "ast_hash": "27a58b1df0a25497540bbc8dce3248fe",
     "semantic_hash": ""
   },
@@ -830,8 +830,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784398910.1454022,
-    "ast_hash": "a431a296f407254c4207a977ffeb3438",
+    "mtime": 1784404159.9194908,
+    "ast_hash": "a2af056b58611b2a04519af25cf914f7",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -930,13 +930,13 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784398910.153402,
-    "ast_hash": "5a4eb3fc77eafc1007232bd40a525e75",
+    "mtime": 1784404578.2435052,
+    "ast_hash": "1b31c5fd30501fe78521e869db8e65ad",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
-    "mtime": 1784398910.1454022,
-    "ast_hash": "3483e51c5e23e2824aa2c1424f4d7da0",
+    "mtime": 1784404169.9124196,
+    "ast_hash": "6f5c208c2233fc82fbffdf07eb98a4a7",
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {
