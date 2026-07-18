@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{stream, StreamExt};
 use serde_json::Value;
 
 use rust_mcp_sdk::mcp_client::ClientRuntime;
@@ -99,9 +100,11 @@ impl McpBridge {
         }
     }
 
-    /// Connect to every forwarded server (fail-open: a server that can't be
-    /// started, initialized, or listed is logged and skipped). `native_tool_names`
-    /// are the daimonos tool names that must always win a name collision.
+    /// Connect to forwarded servers with bounded concurrency (fail-open: a
+    /// server that can't be started, initialized, or listed is logged and
+    /// skipped). Results are registered in forwarded order so network timing
+    /// cannot change collision suffixes. `native_tool_names` are the daimonos
+    /// tool names that must always win a name collision.
     pub async fn build(
         specs: Vec<ServerSpec>,
         cfg: &AcpMcpConfig,
@@ -124,10 +127,25 @@ impl McpBridge {
         // Names already taken: native tools win, then earlier remote tools.
         let mut used: HashSet<String> = native_tool_names.clone();
         let init_timeout = Duration::from_secs(cfg.init_timeout_secs);
+        let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
+        let connect_futures =
+            specs
+                .into_iter()
+                .take(cfg.max_servers)
+                .enumerate()
+                .map(|(index, spec)| async move {
+                    let server_name = spec.name().to_string();
+                    let outcome = connect(&spec, cfg, init_timeout).await;
+                    (index, server_name, outcome)
+                });
+        let mut outcomes = stream::iter(connect_futures)
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        outcomes.sort_unstable_by_key(|(index, _, _)| *index);
 
-        for spec in specs.into_iter().take(cfg.max_servers) {
-            let server_name = spec.name().to_string();
-            match connect(&spec, cfg, init_timeout).await {
+        for (_, server_name, outcome) in outcomes {
+            match outcome {
                 Ok((client, tools)) => {
                     let client_idx = bridge.clients.len();
                     let mut registered_any = false;
@@ -623,6 +641,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn build_connects_unresponsive_servers_with_bounded_concurrency() {
+        if which_sleep().is_none() {
+            eprintln!("skipping: no `sleep` binary");
+            return;
+        }
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 2,
+            max_concurrent_connects: 3,
+            ..AcpMcpConfig::default()
+        };
+        let specs = (0..3)
+            .map(|index| ServerSpec::Stdio {
+                name: format!("asleep-{index}"),
+                command: "sleep".to_string(),
+                args: vec!["30".to_string()],
+                env: HashMap::new(),
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let bridge = McpBridge::build(specs, &cfg, &native_set(&[]), None, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(bridge.tools().is_empty());
+        assert_eq!(bridge.server_count(), 0);
+        // Three sequential two-second handshakes take at least six seconds.
+        // With fan-out three they share one timeout window. A five-second bound
+        // leaves roughly three seconds of CI scheduling headroom over the
+        // expected concurrent runtime while still rejecting the old behavior.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "three handshakes should run concurrently, took {elapsed:?}"
+        );
+    }
+
     fn which_sleep() -> Option<()> {
         std::process::Command::new("sleep")
             .arg("0")
@@ -740,6 +794,88 @@ mod tests {
             outcome.content.contains("hello.txt"),
             "ls output should list the workspace file, got: {}",
             outcome.content
+        );
+
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_build_registers_tools_in_forwarded_order() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            eprintln!("skipping: no `sh` binary");
+            return;
+        }
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        std::fs::write(first_workspace.path().join("marker.txt"), "first").unwrap();
+        std::fs::write(second_workspace.path().join("marker.txt"), "second").unwrap();
+
+        // Delay the first forwarded server so the second finishes connecting
+        // first. Registration must still follow vector order.
+        let first = ServerSpec::Stdio {
+            name: "duplicate".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 1; exec \"$1\" --mcp -w \"$2\"".to_string(),
+                "sh".to_string(),
+                bin.to_string_lossy().into_owned(),
+                first_workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+        let second = ServerSpec::Stdio {
+            name: "duplicate".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                second_workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 30,
+            call_timeout_secs: 30,
+            max_concurrent_connects: 2,
+            ..AcpMcpConfig::default()
+        };
+        let bridge =
+            McpBridge::build(vec![first, second], &cfg, &native_set(&[]), None, None).await;
+
+        assert_eq!(bridge.server_count(), 2);
+        let first_outcome = bridge
+            .call(
+                "mcp__duplicate__read_file",
+                &serde_json::json!({"path": "marker.txt"}),
+            )
+            .await
+            .expect("base route should exist");
+        let second_outcome = bridge
+            .call(
+                "mcp__duplicate__read_file__2",
+                &serde_json::json!({"path": "marker.txt"}),
+            )
+            .await
+            .expect("suffixed route should exist");
+        assert!(
+            first_outcome.content.contains("first"),
+            "base route must remain assigned to first forwarded server: {}",
+            first_outcome.content
+        );
+        assert!(
+            second_outcome.content.contains("second"),
+            "suffix route must remain assigned to second forwarded server: {}",
+            second_outcome.content
         );
 
         bridge.shutdown().await;

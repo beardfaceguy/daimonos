@@ -66,6 +66,10 @@ tools. One misconfigured server can never wedge a session. A remote `tools/call`
 times out returns an error *tool result* to the model (so it can recover) — it does not abort the
 turn.
 
+Server handshakes run concurrently with bounded fan-out (`max_concurrent_connects`). Completed
+connections are collected and then registered in their original forwarded-server order, so network
+timing cannot change collision suffixes or route names (#1013).
+
 ### D4 — Collision-safe tool names: `mcp__{server}__{tool}`
 
 Remote tools are exposed to the model as `mcp__{server}__{tool}` (the widely-used Zed/Claude
@@ -164,6 +168,8 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
 - `call_timeout_secs` (u64, default e.g. `60`) — per remote `tools/call` budget.
 - `max_servers` (usize) and `max_tools_per_server` (usize) — bounds to keep the exposed tool set
   and spawned processes bounded (bounded-collections rule).
+- `max_concurrent_connects` (usize, default `8`) — bounds simultaneous initialize/list handshakes;
+  registration remains deterministic in forwarded order.
 - (transport enables) `allow_stdio` / `allow_http` (bool, default `true`) — advertise + accept
   each transport.
 
