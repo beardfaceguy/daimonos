@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1784399884.0822914,
-    "ast_hash": "6e5b2ad46eb1f655d9233c99f06e69c5",
+    "mtime": 1784402978.8500926,
+    "ast_hash": "5fc268927fc3fa2f5bc1001a6042bc4b",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -505,7 +505,7 @@
     "semantic_hash": "2961487e925a6228dac02d70ccc3c621"
   },
   "src/session.rs": {
-    "mtime": 1784399665.006889,
+    "mtime": 1784402264.433214,
     "ast_hash": "752147af4b80c2f926cfd55db2ba2b33",
     "semantic_hash": ""
   },
@@ -540,7 +540,7 @@
     "semantic_hash": "438d6e45db829aed66343076deb0ff1e"
   },
   "tests/conftest.py": {
-    "mtime": 1784399757.8202114,
+    "mtime": 1784402264.433214,
     "ast_hash": "1a30984f97e2f2fb6d6f4abffd215676",
     "semantic_hash": ""
   },
@@ -635,9 +635,9 @@
     "semantic_hash": "f6847dbcf090cb82dbcc5f6140ad5500"
   },
   "tests/test_mcp_socket.py": {
-    "mtime": 1782106263.2443678,
-    "ast_hash": "1357e8280fb305e529f2542be7780090",
-    "semantic_hash": "1357e8280fb305e529f2542be7780090"
+    "mtime": 1784402876.178832,
+    "ast_hash": "27a58b1df0a25497540bbc8dce3248fe",
+    "semantic_hash": ""
   },
   "tests/test_memory.py": {
     "mtime": 1781856597.283386,
@@ -745,7 +745,7 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1784400034.2292216,
+    "mtime": 1784402264.421214,
     "ast_hash": "ac4c780d40d58c060ee0bda1dc14c310",
     "semantic_hash": ""
   },
@@ -940,7 +940,7 @@
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {
-    "mtime": 1784399780.885043,
+    "mtime": 1784402264.433214,
     "ast_hash": "88bd454696894c426b994e3ef3bfe861",
     "semantic_hash": ""
   }
