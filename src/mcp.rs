@@ -956,39 +956,16 @@ impl ServerHandler for DaimonosHandler {
 
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
         if params.name == "execute_script" {
-            self.session
-                .lock()
-                .await
-                .used_tools
-                .insert("execute_script".into());
-            let code = match args.get("code").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => return err_text("execute_script requires 'code' argument".into()),
-            };
-            let timeout_secs = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(60) as u64;
-            let timeout = std::time::Duration::from_secs(timeout_secs);
-
             // Keep the (Send) script result across the lock/notify awaits and
             // build the non-Send CallToolResult only afterwards, so the handler
             // future stays Send.
-            let script_res = script::execute(&code, self.session.clone(), timeout).await;
+            let script_res = run_execute_script(self.session.clone(), &args).await;
             // A script may activate on-demand tools via nested dispatch.
             let changed = self.session.lock().await.take_tools_changed();
             if changed {
                 spawn_notify_tools_changed(&runtime);
             }
-            return match script_res {
-                Ok(result) => {
-                    let mut resp = json!({
-                        "result": result.value,
-                    });
-                    if !result.logs.is_empty() {
-                        resp["logs"] = json!(result.logs);
-                    }
-                    ok_text(serde_json::to_string(&resp).unwrap_or_default())
-                }
-                Err(e) => err_text(e.to_string()),
-            };
+            return script_result_to_tool_result(script_res);
         }
 
         let mut session = self.session.lock().await;
@@ -1126,6 +1103,44 @@ fn spawn_notify_tools_changed(runtime: &Arc<dyn McpServer>) {
             eprintln!("daimonos: tools/list_changed notification failed: {e}");
         }
     });
+}
+
+/// Execute a Starlark tool script against shared session state. Both MCP
+/// transports use this path so `execute_script` has identical argument,
+/// timeout, and used-tool behavior (vikunja #998).
+async fn run_execute_script(
+    session: Arc<Mutex<Session>>,
+    args: &Value,
+) -> Result<script::ScriptResult, String> {
+    session
+        .lock()
+        .await
+        .used_tools
+        .insert("execute_script".into());
+    let code = args
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "execute_script requires 'code' argument".to_string())?
+        .to_string();
+    let timeout_secs = args.get("timeout").and_then(Value::as_i64).unwrap_or(60) as u64;
+    script::execute(&code, session, std::time::Duration::from_secs(timeout_secs)).await
+}
+
+/// Convert the Send-safe script outcome only after all handler awaits finish;
+/// `CallToolError` itself is not Send.
+fn script_result_to_tool_result(
+    script_result: Result<script::ScriptResult, String>,
+) -> std::result::Result<CallToolResult, CallToolError> {
+    match script_result {
+        Ok(result) => {
+            let mut response = json!({"result": result.value});
+            if !result.logs.is_empty() {
+                response["logs"] = json!(result.logs);
+            }
+            ok_text(serde_json::to_string(&response).unwrap_or_default())
+        }
+        Err(error) => err_text(error),
+    }
 }
 
 // --- Proactive workspace context ---
@@ -1432,18 +1447,50 @@ fn socket_call_tool_to_json(result: std::result::Result<CallToolResult, CallTool
     }
 }
 
+fn socket_client_supports_roots(initialize_request: &Value) -> bool {
+    initialize_request
+        .pointer("/params/capabilities/roots")
+        .is_some()
+}
+
+/// Apply a successful socket `roots/list` response to the live session.
+/// Invalid/missing/non-directory roots preserve the launch workspace.
+fn apply_socket_roots_response(session: &mut Session, response: &Value) -> bool {
+    let roots = match response
+        .pointer("/result/roots")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<Root>>(value).ok())
+    {
+        Some(roots) => roots,
+        None => return false,
+    };
+    let new_root = match pick_workspace_root(&roots) {
+        Some(root) => root,
+        None => return false,
+    };
+    let current = session
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| session.workspace.clone());
+    if new_root == current {
+        return false;
+    }
+    apply_reroot(session, new_root);
+    true
+}
+
 /// Serve one MCP session over an already-connected `UnixStream`.
 ///
 /// Each connection owns a freshly-constructed `Session` so sessions are
 /// fully isolated: cwd, read-cache, used-tools, and analytics are not
 /// shared across concurrent connections.
-pub async fn serve_one_mcp(
-    stream: tokio::net::UnixStream,
-    mut session: Session,
-) -> anyhow::Result<()> {
+pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     let instructions = build_instructions(&session.workspace, &session.cfg).await;
+    let session = Arc::new(Mutex::new(session));
+    let mut client_supports_roots = false;
+    let mut pending_roots_request: Option<Value> = None;
 
     while let Ok(Some(line)) = lines.next_line().await {
         let req: Value = match serde_json::from_str(&line) {
@@ -1452,31 +1499,59 @@ pub async fn serve_one_mcp(
         };
 
         let id = req.get("id").cloned();
-        let method = req
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let method = req.get("method").and_then(Value::as_str);
+
+        // Response to the server-initiated roots/list request.
+        if method.is_none()
+            && pending_roots_request.is_some()
+            && id.as_ref() == pending_roots_request.as_ref()
+        {
+            let mut session = session.lock().await;
+            apply_socket_roots_response(&mut session, &req);
+            pending_roots_request = None;
+            continue;
+        }
+        // Ignore other response-shaped messages rather than replying with a
+        // method-not-found error to a JSON-RPC response.
+        let Some(method) = method else {
+            continue;
+        };
 
         // Set when a tools/call grows the exposed set, so we can emit a
         // tools/list_changed notification after the response (vikunja #993).
         let mut tools_changed = false;
+        let mut server_request: Option<Value> = None;
 
-        let response_opt: Option<Value> = match method.as_str() {
-            "initialize" => Some(socket_jsonrpc_ok(
-                id,
-                json!({
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {"tools": {"listChanged": true}},
-                    "serverInfo": {
-                        "name": "daimonos",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "instructions": instructions,
-                }),
-            )),
-            "notifications/initialized" => None,
+        let response_opt: Option<Value> = match method {
+            "initialize" => {
+                client_supports_roots = socket_client_supports_roots(&req);
+                Some(socket_jsonrpc_ok(
+                    id,
+                    json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {"listChanged": true}},
+                        "serverInfo": {
+                            "name": "daimonos",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                        "instructions": instructions,
+                    }),
+                ))
+            }
+            "notifications/initialized" => {
+                if client_supports_roots && pending_roots_request.is_none() {
+                    let request_id = json!("daimonos-roots-1");
+                    pending_roots_request = Some(request_id.clone());
+                    server_request = Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "roots/list",
+                    }));
+                }
+                None
+            }
             "tools/list" => {
+                let session = session.lock().await;
                 let tools_json = socket_list_tools_json(&session);
                 Some(socket_jsonrpc_ok(id, json!({"tools": tools_json})))
             }
@@ -1488,8 +1563,18 @@ pub async fn serve_one_mcp(
                     .unwrap_or("")
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let result = dispatch_tool(&mut session, &name, &args).await;
-                tools_changed = session.take_tools_changed();
+                let result = if name == "execute_script" {
+                    // Keep the Send-safe script outcome across the lock await;
+                    // construct CallToolResult only afterwards.
+                    let script_result = run_execute_script(Arc::clone(&session), &args).await;
+                    tools_changed = session.lock().await.take_tools_changed();
+                    script_result_to_tool_result(script_result)
+                } else {
+                    let mut session = session.lock().await;
+                    let result = dispatch_tool(&mut session, &name, &args).await;
+                    tools_changed = session.take_tools_changed();
+                    result
+                };
                 Some(socket_jsonrpc_ok(id, socket_call_tool_to_json(result)))
             }
             "ping" => Some(socket_jsonrpc_ok(id, json!({}))),
@@ -1502,6 +1587,13 @@ pub async fn serve_one_mcp(
 
         if let Some(resp) = response_opt {
             let mut out = serde_json::to_string(&resp)?;
+            out.push('\n');
+            writer.write_all(out.as_bytes()).await?;
+            writer.flush().await?;
+        }
+
+        if let Some(request) = server_request {
+            let mut out = serde_json::to_string(&request)?;
             out.push('\n');
             writer.write_all(out.as_bytes()).await?;
             writer.flush().await?;
@@ -1636,6 +1728,73 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
         assert!(found, "re-rooted index did not pick up new-root file");
+    }
+
+    #[test]
+    fn socket_roots_capability_detection_requires_roots_key() {
+        assert!(socket_client_supports_roots(&json!({
+            "params": {"capabilities": {"roots": {"listChanged": true}}}
+        })));
+        assert!(!socket_client_supports_roots(&json!({
+            "params": {"capabilities": {}}
+        })));
+        assert!(!socket_client_supports_roots(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn socket_roots_response_reroots_only_for_valid_result() {
+        use crate::config::Config;
+
+        let launch = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_canon = project.path().canonicalize().unwrap();
+        let mut session = Session::new(launch.path().to_path_buf(), Arc::new(Config::default()));
+
+        assert!(!apply_socket_roots_response(
+            &mut session,
+            &json!({"error": {"code": -1, "message": "no roots"}}),
+        ));
+        assert_eq!(session.workspace, launch.path());
+
+        assert!(apply_socket_roots_response(
+            &mut session,
+            &json!({
+                "result": {
+                    "roots": [{
+                        "uri": format!("file://{}", project_canon.display()),
+                        "name": "project"
+                    }]
+                }
+            }),
+        ));
+        assert_eq!(session.workspace, project_canon);
+        assert_eq!(session.cwd, project_canon);
+    }
+
+    #[tokio::test]
+    async fn shared_execute_script_runner_writes_through_session() {
+        use crate::config::Config;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            workspace.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+        let outcome = run_execute_script(
+            Arc::clone(&session),
+            &json!({
+                "code": "write_file('socket-script.txt', 'ok')\nresult = 'done'"
+            }),
+        )
+        .await
+        .expect("script should execute");
+
+        assert_eq!(outcome.value, json!("done"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("socket-script.txt")).unwrap(),
+            "ok"
+        );
+        assert!(session.lock().await.used_tools.contains("execute_script"));
     }
 
     // --- ResponseMeta plumbing (vikunja #247): structured analytics signals ---

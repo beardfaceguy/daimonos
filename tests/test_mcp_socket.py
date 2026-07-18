@@ -18,6 +18,7 @@ class McpSocketClient:
         self._sock.connect(sock_path)
         self._rfile = self._sock.makefile("rb")
         self._id = 0
+        self.notifications = []
 
     def close(self):
         self._sock.close()
@@ -31,24 +32,58 @@ class McpSocketClient:
         self._sock.sendall(line.encode())
         if "id" not in msg:
             return None
-        resp_line = self._rfile.readline()
-        if not resp_line:
-            raise RuntimeError("server closed connection")
-        return json.loads(resp_line)
+        request_id = msg["id"]
+        while True:
+            resp_line = self._rfile.readline()
+            if not resp_line:
+                raise RuntimeError("server closed connection")
+            response = json.loads(resp_line)
+            if response.get("id") == request_id:
+                return response
+            self.notifications.append(response)
 
-    def handshake(self):
+    def handshake(self, roots=None):
+        capabilities = {}
+        if roots is not None:
+            capabilities["roots"] = {"listChanged": True}
         resp = self.send_raw({
             "jsonrpc": "2.0",
             "id": self._next_id(),
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": {"name": "pytest-socket", "version": "0.1"},
             },
         })
         assert "result" in resp, f"initialize failed: {resp}"
         self.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        if roots is not None:
+            # The server must ask for roots after initialized. Reply before
+            # sending a ping barrier so the server applies the re-root before
+            # handshake() returns.
+            raw = self._rfile.readline()
+            if not raw:
+                raise RuntimeError("server closed before roots/list")
+            request = json.loads(raw)
+            assert request.get("method") == "roots/list", request
+            self._sock.sendall(
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"roots": roots},
+                    })
+                    + "\n"
+                ).encode()
+            )
+            ping = self.send_raw({
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": "ping",
+                "params": {},
+            })
+            assert "result" in ping
 
     def list_tools(self):
         resp = self.send_raw({
@@ -184,6 +219,49 @@ def test_mcp_socket_call_write_file(mcp_socket_server, tmp_path):
         assert os.path.exists(target), "write_file did not create the file"
         with open(target) as f:
             assert "written via socket" in f.read()
+    finally:
+        client.close()
+
+
+def test_mcp_socket_roots_reroot_workspace(mcp_socket_server, tmp_path):
+    """A roots-capable socket client can replace the launch workspace."""
+    sock_path, launch_workspace, _ = mcp_socket_server
+    project = tmp_path / "real_project"
+    project.mkdir()
+    root_uri = f"file://{os.path.realpath(project)}"
+
+    client = McpSocketClient(sock_path)
+    try:
+        client.handshake(roots=[{"uri": root_uri, "name": "project"}])
+        result = client.call_tool("workspace_info")
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["session"]["workspace"] == os.path.realpath(project)
+        assert payload["session"]["workspace"] != os.path.realpath(launch_workspace)
+    finally:
+        client.close()
+
+
+def test_mcp_socket_execute_script(mcp_socket_server):
+    """execute_script is callable over socket, matching stdio MCP."""
+    sock_path, workspace, _ = mcp_socket_server
+    target = os.path.join(workspace, "from_script.txt")
+
+    client = McpSocketClient(sock_path)
+    try:
+        client.handshake()
+        result = client.call_tool(
+            "execute_script",
+            {
+                "code": (
+                    "write_file('from_script.txt', 'written by socket script')\n"
+                    "result = 'ok'"
+                )
+            },
+        )
+        assert result.get("isError") is not True, result
+        assert os.path.exists(target)
+        with open(target) as file:
+            assert file.read() == "written by socket script"
     finally:
         client.close()
 
