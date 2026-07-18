@@ -696,10 +696,17 @@ fn build_stream_hook(
         let Some(cx) = current_cx(&connection) else {
             return;
         };
-        if let StreamEvent::TextDelta(text) = ev {
-            let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text)));
-            send_notification(&cx, &session_id, SessionUpdate::AgentMessageChunk(chunk));
-        }
+        let (text, thought) = match ev {
+            StreamEvent::TextDelta(text) => (text, false),
+            StreamEvent::ThinkingDelta(text) => (text, true),
+        };
+        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text)));
+        let update = if thought {
+            SessionUpdate::AgentThoughtChunk(chunk)
+        } else {
+            SessionUpdate::AgentMessageChunk(chunk)
+        };
+        send_notification(&cx, &session_id, update);
     })
 }
 
@@ -1024,9 +1031,9 @@ fn build_session_handle(
 /// Replay a loaded session's in-memory history back to the client as
 /// `session/update` notifications, so Zed rebuilds the reopened thread's
 /// view on `session/load`. User text/images → `UserMessageChunk`, assistant
-/// text/images → `AgentMessageChunk`, tool calls/results →
-/// the `ToolCall`/`ToolCallUpdate` lifecycle. `Thinking` blocks are dropped
-/// (not shown in the thread view).
+/// text/images → `AgentMessageChunk`, assistant thinking →
+/// `AgentThoughtChunk`, and tool calls/results → the
+/// `ToolCall`/`ToolCallUpdate` lifecycle.
 fn replay_history(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
@@ -1086,6 +1093,11 @@ fn replay_history(
                             .into()])),
                     );
                     send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+                }
+                CoreBlock::Thinking(text) if message.role == Role::Assistant => {
+                    let chunk =
+                        ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
+                    send_notification(cx, session_id, SessionUpdate::AgentThoughtChunk(chunk));
                 }
                 CoreBlock::Thinking(_) => {}
             }
@@ -1661,8 +1673,14 @@ mod tests {
         ) -> crate::providers::LlmResponse {
             let response = self.complete(ctx, opts).await;
             for block in &response.content {
-                if let crate::providers::ContentBlock::Text(t) = block {
-                    on_event(StreamEvent::TextDelta(t.clone()));
+                match block {
+                    crate::providers::ContentBlock::Text(text) => {
+                        on_event(StreamEvent::TextDelta(text.clone()));
+                    }
+                    crate::providers::ContentBlock::Thinking(text) => {
+                        on_event(StreamEvent::ThinkingDelta(text.clone()));
+                    }
+                    _ => {}
                 }
             }
             response
@@ -1701,6 +1719,19 @@ mod tests {
                 output: 5,
                 ..Usage::default()
             },
+        }
+    }
+
+    fn thinking_resp(thinking: &str, text: &str) -> crate::providers::LlmResponse {
+        crate::providers::LlmResponse {
+            content: vec![
+                crate::providers::ContentBlock::Thinking(thinking.to_string()),
+                crate::providers::ContentBlock::Text(text.to_string()),
+            ],
+            stop_reason: crate::providers::StopReason::EndTurn,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage::default(),
         }
     }
 
@@ -3189,7 +3220,7 @@ mod tests {
         // A live session's in-memory history must be replayed back as
         // session/update notifications so Zed rebuilds the reopened thread.
         let dir = tempfile::tempdir().unwrap();
-        let make_provider = mock_factory(vec![end_turn_resp("recalled-text")]);
+        let make_provider = mock_factory(vec![thinking_resp("reasoning...", "recalled-text")]);
         let agent = build_agent(
             make_provider,
             dir.path(),
@@ -3253,6 +3284,28 @@ mod tests {
 
         let updates = updates.lock().unwrap();
         let replayed = &updates[replay_start..];
+        let thought_texts = |updates: &[SessionUpdate]| {
+            updates
+                .iter()
+                .filter_map(|update| match update {
+                    SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+                        AcpContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            thought_texts(&updates[..replay_start]),
+            vec!["reasoning..."],
+            "live thinking must stream as an AgentThoughtChunk"
+        );
+        assert_eq!(
+            thought_texts(replayed),
+            vec!["reasoning..."],
+            "session/load must replay persisted thinking"
+        );
         // UserMessageChunk is a kind the normal prompt path never emits, so
         // its presence during load proves replay ran.
         let user_texts: Vec<String> = replayed

@@ -255,12 +255,12 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784331517.6637468,
-    "ast_hash": "930e838d60e5e368c83f5a0e29babdee",
+    "mtime": 1784346889.668493,
+    "ast_hash": "c42cdabcff5b88c875be7e331b09cd2e",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784331172.3481688,
+    "mtime": 1784332046.849032,
     "ast_hash": "e2444b72c30158e00917ba28329ae5fd",
     "semantic_hash": ""
   },
@@ -290,7 +290,7 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784331493.543916,
+    "mtime": 1784332046.850032,
     "ast_hash": "f65b6c300a530a594cc438ce06a98cdf",
     "semantic_hash": ""
   },
@@ -375,7 +375,7 @@
     "semantic_hash": "87419cbcf60a37e69e4ba01b8a642fde"
   },
   "src/ops/exec_ops.rs": {
-    "mtime": 1784331387.9446568,
+    "mtime": 1784332046.850032,
     "ast_hash": "774f15a9afcd17003e03b9de52eb11ce",
     "semantic_hash": ""
   },
@@ -385,7 +385,7 @@
     "semantic_hash": "01a0e0db2555807ba5beeaffc6266e8d"
   },
   "src/ops/mod.rs": {
-    "mtime": 1784331157.4082737,
+    "mtime": 1784332046.850032,
     "ast_hash": "5c242a4a14b9bafdde988b3270d38e2a",
     "semantic_hash": ""
   },
@@ -520,7 +520,7 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784331168.1871982,
+    "mtime": 1784332046.850032,
     "ast_hash": "fa70ceeb9bf2a3244f587125389a08ad",
     "semantic_hash": ""
   },
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784331216.7798574,
+    "mtime": 1784332046.841032,
     "ast_hash": "a4220b4b298451267e2a98a47421b4f5",
     "semantic_hash": ""
   },
@@ -875,8 +875,8 @@
     "semantic_hash": ""
   },
   "docs/zed-acp-setup.md": {
-    "mtime": 1784331226.6526423,
-    "ast_hash": "74e536d8da2dbe85a509a680304f238f",
+    "mtime": 1784346916.1633072,
+    "ast_hash": "22504a8d1e908f0bf6d628d124a5e868",
     "semantic_hash": ""
   },
   "docs/zed-setup.md": {

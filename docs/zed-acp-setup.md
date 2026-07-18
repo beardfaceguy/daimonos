@@ -140,6 +140,8 @@ the equivalent notice.
   Image capability is advertised only when the configured provider adapter
   supports multimodal requests (the Anthropic and OpenRouter adapters do).
   Audio prompts are not advertised.
+- Provider thinking streams as collapsible thought chunks and is restored when
+  a saved session is loaded.
 - Tool execution and file access are handled entirely by daimonos's own
   tools — the `fs/*`/`terminal/*` client-proxy methods aren't used.
 - When Zed advertises its terminal-output metadata extension, foreground
