@@ -1,13 +1,16 @@
 //! Agent connection config, loaded from a dotenv-style **agent env file**
 //! (vikunja #949). `daimonos agent` reads provider/model/base_url/approval/key
-//! from this file and **errors out** if the file or any required value is
-//! missing — there are no baked-in defaults for these. This is deliberately
-//! separate from the TOML `Config` (which governs the rest of the daemon: the
-//! MCP server, indexer, kgl, etc.); the agent frontend does not read `[agent]`
-//! TOML anymore.
+//! from this file, then overlays non-empty process `DAIMONOS_AGENT_*` values
+//! (vikunja #1010). It **errors out** if the file or any required effective
+//! value is missing — there are no baked-in defaults for these. This is
+//! deliberately separate from the TOML `Config` (which governs the rest of
+//! the daemon: the MCP server, indexer, kgl, etc.); the agent frontend does not
+//! read `[agent]` TOML anymore.
 //!
 //! Resolution precedence for the file path:
 //!   `--agent-env <path>`  >  `$DAIMONOS_AGENT_ENV`  >  `~/.config/daimonos/agent.env`
+//! Value precedence after selecting that file:
+//!   non-empty process `$DAIMONOS_AGENT_*`  >  value parsed from the file
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,6 +104,26 @@ impl AgentEnv {
     /// Load + validate the agent env file. Returns a clear error (naming the
     /// path and any missing/invalid values) rather than falling back to defaults.
     pub fn load(flag: Option<PathBuf>) -> Result<AgentEnv, String> {
+        // Use vars_os so an unrelated non-Unicode process variable cannot
+        // panic agent startup. Non-Unicode agent keys/values are ignored.
+        let process_vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                let key = key.into_string().ok()?;
+                if !key.starts_with("DAIMONOS_AGENT_") {
+                    return None;
+                }
+                Some((key, value.into_string().ok()?))
+            })
+            .collect();
+        Self::load_with_process_vars(flag, &process_vars)
+    }
+
+    /// Injectable load seam used by tests to verify real file + process
+    /// precedence without mutating the process-global environment.
+    fn load_with_process_vars(
+        flag: Option<PathBuf>,
+        process_vars: &HashMap<String, String>,
+    ) -> Result<AgentEnv, String> {
         let path = Self::resolve_path(flag).ok_or_else(|| {
             "cannot resolve agent env file path — set --agent-env or $DAIMONOS_AGENT_ENV, \
              or ensure $HOME is set for ~/.config/daimonos/agent.env"
@@ -114,7 +137,9 @@ impl AgentEnv {
                 REQUIRED.join(", ")
             )
         })?;
-        Self::from_vars(&parse_dotenv(&content), &path)
+        let mut vars = parse_dotenv(&content);
+        merge_process_overrides(&mut vars, process_vars);
+        Self::from_vars(&vars, &path)
     }
 
     fn from_vars(vars: &HashMap<String, String>, path: &Path) -> Result<AgentEnv, String> {
@@ -132,7 +157,7 @@ impl AgentEnv {
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "agent env file {} is missing required value(s): {}",
+                "agent configuration for {} is missing required value(s) in both the file and process environment: {}",
                 path.display(),
                 missing.join(", ")
             ));
@@ -144,14 +169,14 @@ impl AgentEnv {
 
         if !matches!(provider.as_str(), "openrouter" | "anthropic") {
             return Err(format!(
-                "agent env file {}: DAIMONOS_AGENT_PROVIDER '{}' unsupported (valid: openrouter, anthropic)",
+                "agent configuration for {}: DAIMONOS_AGENT_PROVIDER '{}' unsupported (valid: openrouter, anthropic)",
                 path.display(),
                 provider
             ));
         }
         if !matches!(approval_mode.as_str(), "auto" | "interactive" | "paranoid") {
             return Err(format!(
-                "agent env file {}: DAIMONOS_AGENT_APPROVAL_MODE '{}' invalid (valid: auto, interactive, paranoid)",
+                "agent configuration for {}: DAIMONOS_AGENT_APPROVAL_MODE '{}' invalid (valid: auto, interactive, paranoid)",
                 path.display(),
                 approval_mode
             ));
@@ -296,7 +321,7 @@ fn parse_compaction(
                 .collect();
             if !missing.is_empty() {
                 return Err(format!(
-                    "agent env file {}: DAIMONOS_AGENT_COMPACTION=on also requires: {}",
+                    "agent configuration for {}: DAIMONOS_AGENT_COMPACTION=on also requires: {}",
                     path.display(),
                     missing.join(", ")
                 ));
@@ -305,7 +330,7 @@ fn parse_compaction(
                 let raw = present(k).unwrap();
                 raw.parse::<f64>().map_err(|_| {
                     format!(
-                        "agent env file {}: {k} '{raw}' is not a number",
+                        "agent configuration for {}: {k} '{raw}' is not a number",
                         path.display()
                     )
                 })
@@ -314,7 +339,7 @@ fn parse_compaction(
                 let raw = present(k).unwrap();
                 raw.parse::<u64>().map_err(|_| {
                     format!(
-                        "agent env file {}: {k} '{raw}' is not a whole number of tokens",
+                        "agent configuration for {}: {k} '{raw}' is not a whole number of tokens",
                         path.display()
                     )
                 })
@@ -325,7 +350,7 @@ fn parse_compaction(
 
             if !(low_water > 0.0 && low_water < high_water && high_water < 1.0) {
                 return Err(format!(
-                    "agent env file {}: compaction watermarks must satisfy 0 < LOW_WATER < HIGH_WATER < 1 (got low={low_water}, high={high_water})",
+                    "agent configuration for {}: compaction watermarks must satisfy 0 < LOW_WATER < HIGH_WATER < 1 (got low={low_water}, high={high_water})",
                     path.display()
                 ));
             }
@@ -340,13 +365,13 @@ fn parse_compaction(
                     let context_window = int("DAIMONOS_AGENT_CONTEXT_WINDOW")?;
                     if context_window == 0 {
                         return Err(format!(
-                            "agent env file {}: DAIMONOS_AGENT_CONTEXT_WINDOW must be > 0",
+                            "agent configuration for {}: DAIMONOS_AGENT_CONTEXT_WINDOW must be > 0",
                             path.display()
                         ));
                     }
                     if output_reservation >= context_window {
                         return Err(format!(
-                            "agent env file {}: DAIMONOS_AGENT_OUTPUT_RESERVATION ({output_reservation}) must be smaller than DAIMONOS_AGENT_CONTEXT_WINDOW ({context_window})",
+                            "agent configuration for {}: DAIMONOS_AGENT_OUTPUT_RESERVATION ({output_reservation}) must be smaller than DAIMONOS_AGENT_CONTEXT_WINDOW ({context_window})",
                             path.display()
                         ));
                     }
@@ -369,7 +394,7 @@ fn parse_compaction(
             }
         }
         other => Err(format!(
-            "agent env file {}: DAIMONOS_AGENT_COMPACTION '{other}' invalid (valid: on, off)",
+            "agent configuration for {}: DAIMONOS_AGENT_COMPACTION '{other}' invalid (valid: on, off)",
             path.display()
         )),
     }
@@ -399,6 +424,24 @@ fn parse_dotenv(content: &str) -> HashMap<String, String> {
         map.insert(key, val.to_string());
     }
     map
+}
+
+/// Overlay non-empty process values onto parsed agent-file values. The
+/// `DAIMONOS_AGENT_ENV` path selector is excluded: it chooses the file before
+/// this merge and is not an agent setting itself. Keeping this helper pure
+/// avoids process-global environment mutation in tests (vikunja #1010).
+fn merge_process_overrides(
+    file_vars: &mut HashMap<String, String>,
+    process_vars: &HashMap<String, String>,
+) {
+    for (key, value) in process_vars {
+        if key.starts_with("DAIMONOS_AGENT_")
+            && key != "DAIMONOS_AGENT_ENV"
+            && !value.trim().is_empty()
+        {
+            file_vars.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// Build the picker's candidate model list: `current` is always present
@@ -459,6 +502,19 @@ mod tests {
         AgentEnv::from_vars(&parse_dotenv(s), Path::new("<test>"))
     }
 
+    fn load_str_with_overrides(
+        content: &str,
+        overrides: &[(&str, &str)],
+    ) -> Result<AgentEnv, String> {
+        let mut vars = parse_dotenv(content);
+        let process_vars = overrides
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        merge_process_overrides(&mut vars, &process_vars);
+        AgentEnv::from_vars(&vars, Path::new("<test>"))
+    }
+
     #[test]
     fn parses_full_valid_file() {
         let e = load_str(&base()).unwrap();
@@ -470,6 +526,91 @@ mod tests {
         assert!(e.allowed_commands.is_empty() && e.denied_commands.is_empty());
         // No DAIMONOS_AGENT_MODELS → picker list is just the active model.
         assert_eq!(e.models, vec!["anthropic/claude-sonnet-4.6"]);
+    }
+
+    #[test]
+    fn process_values_override_file_scalars() {
+        let env = load_str_with_overrides(
+            &base(),
+            &[
+                ("DAIMONOS_AGENT_MODEL", "anthropic/claude-opus-4.8"),
+                ("DAIMONOS_AGENT_APPROVAL_MODE", "auto"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(env.model, "anthropic/claude-opus-4.8");
+        assert_eq!(env.approval_mode, "auto");
+        assert_eq!(env.models, vec!["anthropic/claude-opus-4.8"]);
+    }
+
+    #[test]
+    fn process_value_supplies_required_key_missing_from_file() {
+        let content = base().replace("DAIMONOS_AGENT_API_KEY=sk-test\n", "");
+        let env =
+            load_str_with_overrides(&content, &[("DAIMONOS_AGENT_API_KEY", "sk-from-process")])
+                .unwrap();
+
+        assert_eq!(env.api_key, "sk-from-process");
+    }
+
+    #[test]
+    fn file_load_applies_injected_process_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.env");
+        std::fs::write(
+            &path,
+            base().replace("DAIMONOS_AGENT_MODEL=anthropic/claude-sonnet-4.6\n", ""),
+        )
+        .unwrap();
+        let process_vars = HashMap::from([(
+            "DAIMONOS_AGENT_MODEL".to_string(),
+            "anthropic/claude-opus-4.8".to_string(),
+        )]);
+
+        let env = AgentEnv::load_with_process_vars(Some(path), &process_vars).unwrap();
+
+        assert_eq!(env.model, "anthropic/claude-opus-4.8");
+    }
+
+    #[test]
+    fn empty_process_value_does_not_override_file() {
+        let env = load_str_with_overrides(
+            &base(),
+            &[
+                ("DAIMONOS_AGENT_MODEL", "   "),
+                ("DAIMONOS_AGENT_APPROVAL_MODE", ""),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(env.model, "anthropic/claude-sonnet-4.6");
+        assert_eq!(env.approval_mode, "interactive");
+    }
+
+    #[test]
+    fn invalid_process_override_still_fails_validation() {
+        let error =
+            load_str_with_overrides(&base(), &[("DAIMONOS_AGENT_APPROVAL_MODE", "unattended")])
+                .unwrap_err();
+
+        assert!(error.contains("APPROVAL_MODE") && error.contains("invalid"));
+    }
+
+    #[test]
+    fn non_agent_and_path_selector_values_are_not_merged() {
+        let mut vars = parse_dotenv(&base());
+        let process_vars = HashMap::from([
+            ("NOT_AN_AGENT_KEY".to_string(), "ignored".to_string()),
+            (
+                "DAIMONOS_AGENT_ENV".to_string(),
+                "/different/file".to_string(),
+            ),
+        ]);
+        merge_process_overrides(&mut vars, &process_vars);
+
+        assert!(!vars.contains_key("NOT_AN_AGENT_KEY"));
+        assert!(!vars.contains_key("DAIMONOS_AGENT_ENV"));
     }
 
     #[test]
