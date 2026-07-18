@@ -39,6 +39,42 @@ marker and the file that wins (or `built-in defaults` if none exist), then
 exits without starting the server. In non-MCP modes daimonos also logs
 `config: loaded from …` to stderr at startup (add `--verbose` in `--mcp` mode).
 
+## Agent Environment File
+
+`daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,
+dotenv-style `agent.env` for provider credentials and agent behavior. The file
+is required; its location is selected in this order:
+
+1. `--agent-env <path>`
+2. `$DAIMONOS_AGENT_ENV`
+3. `~/.config/daimonos/agent.env`
+
+After reading the selected file, non-empty process variables named
+`DAIMONOS_AGENT_*` override values from the file. Empty or whitespace-only
+process values do not erase file values. Effective precedence is therefore:
+
+```text
+CLI behavior flags (for example --model) > process DAIMONOS_AGENT_* values
+> selected agent.env file values
+```
+
+Required effective values remain
+`DAIMONOS_AGENT_PROVIDER`, `DAIMONOS_AGENT_MODEL`,
+`DAIMONOS_AGENT_BASE_URL`, `DAIMONOS_AGENT_APPROVAL_MODE`,
+`DAIMONOS_AGENT_API_KEY`, and `DAIMONOS_AGENT_COMPACTION`. A required key may
+come from either the file or the process environment; startup fails clearly
+when it is absent from both. All existing provider, approval-mode, and
+compaction validation applies after the override merge.
+
+This makes one-off headless overrides possible without rewriting a complete
+temporary file:
+
+```bash
+DAIMONOS_AGENT_MODEL=anthropic/claude-opus-4.8 \
+DAIMONOS_AGENT_APPROVAL_MODE=auto \
+daimonos agent "review this change"
+```
+
 ## Settings
 
 ### `[index]` — Workspace Indexing
