@@ -22,14 +22,15 @@ use agent_client_protocol::schema::v1::{
     ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, DeleteSessionRequest,
     DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource, ImageContent,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
-    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason as AcpStopReason, TextContent, ToolCall,
+    ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
@@ -37,9 +38,11 @@ use agent_client_protocol::{
 
 use crate::agent::{
     AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook, BeforeHookResult,
-    TokenLogConfig, ToolCallInfo, ToolProgressHook,
+    RemoteToolHook, RemoteToolResult, TokenLogConfig, ToolCallInfo, ToolProgressHook,
 };
+use crate::analytics::AnalyticsStore;
 use crate::config::Config;
+use crate::mcp_bridge::{McpBridge, ServerSpec};
 use crate::providers::{
     CompleteOpts, ContentBlock as CoreBlock, LlmProvider, Message as CoreMessage, Role as CoreRole,
     StreamEvent, ToolSchema, Usage,
@@ -92,6 +95,10 @@ struct SessionHandle {
     connection: CurrentConnection,
     current_model: CurrentModel,
     cwd: PathBuf,
+    /// Per-session bridge to Zed-forwarded MCP servers (ADR-003). Empty when
+    /// the bridge is disabled or no servers were forwarded. Shut down on
+    /// session/delete.
+    bridge: Arc<McpBridge>,
 }
 
 /// Shared engine state across all sessions on one process.
@@ -118,6 +125,9 @@ struct AcpState {
     /// Context/window compaction policy (ADR-002), engine-wide from the
     /// agent env; cloned into each session's config. `None` = off.
     compaction: Option<crate::compaction::CompactionPolicy>,
+    /// Analytics store for attributing remote MCP tool calls (ADR-003).
+    /// `None` when analytics is disabled.
+    analytics: Option<Arc<AnalyticsStore>>,
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -771,8 +781,11 @@ fn build_agent_config(
     system_prompt: String,
     terminal_output: bool,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
+    bridge: Arc<McpBridge>,
 ) -> AgentConfig {
-    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
+    // Native tools first (OnDemand exclusion + per-tool context checks intact),
+    // then append the bridge's remote tools (ADR-003, D6).
+    let mut tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
         .into_iter()
         .map(|s| ToolSchema {
             name: s.name,
@@ -780,6 +793,7 @@ fn build_agent_config(
             input_schema: s.input_schema,
         })
         .collect();
+    tools.extend(bridge.tools().iter().cloned());
     let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
     AgentConfig {
         system: Some(system_prompt),
@@ -820,7 +834,50 @@ fn build_agent_config(
             label: "acp".to_string(),
         }),
         compaction,
+        remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge)),
     }
+}
+
+/// Convert Zed-forwarded `McpServer` entries into transport-neutral
+/// [`ServerSpec`]s. Stdio and HTTP are bridged; SSE and the unstable ACP
+/// transport are dropped (ADR-003, out of scope).
+fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
+    servers
+        .into_iter()
+        .filter_map(|server| match server {
+            McpServer::Stdio(s) => Some(ServerSpec::Stdio {
+                name: s.name,
+                command: s.command.to_string_lossy().into_owned(),
+                args: s.args,
+                env: s.env.into_iter().map(|e| (e.name, e.value)).collect(),
+            }),
+            McpServer::Http(s) => Some(ServerSpec::Http {
+                name: s.name,
+                url: s.url,
+                headers: s.headers.into_iter().map(|h| (h.name, h.value)).collect(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Dispatch hook consulted by the agent loop when the opcode facade doesn't
+/// serve a tool: routes `mcp__*` calls to the session's bridge (ADR-003, D5).
+fn build_remote_dispatch_hook(bridge: Arc<McpBridge>) -> RemoteToolHook {
+    Box::new(move |name: &str, input: &serde_json::Value| {
+        let bridge = Arc::clone(&bridge);
+        let name = name.to_string();
+        let input = input.clone();
+        Box::pin(async move {
+            bridge
+                .call(&name, &input)
+                .await
+                .map(|outcome| RemoteToolResult {
+                    content: outcome.content,
+                    is_error: outcome.is_error,
+                })
+        })
+    })
 }
 
 fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
@@ -1002,12 +1059,31 @@ async fn build_session_handle(
     token_log: Option<PathBuf>,
     session_id: SessionId,
     session_workspace: PathBuf,
+    mcp_specs: Vec<ServerSpec>,
     cx: ConnectionTo<AcpClientRole>,
 ) -> Result<Arc<SessionHandle>, String> {
     // Build a fresh provider for this session — Zed keeps one process across
     // multiple chat threads, so we can't reuse a single moved-once provider.
     let provider = (state.make_provider)()?;
     let connection: CurrentConnection = Arc::new(StdMutex::new(Some(cx)));
+    // Build the MCP bridge from the forwarded servers (fail-open). Native tool
+    // names are gathered first so they always win a name collision (ADR-003).
+    let descriptions = &cfg.prompts.resolved_tool_descriptions;
+    let native_tool_names: std::collections::HashSet<String> =
+        tool_facade::active_schemas(&session_workspace, descriptions)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+    let bridge = Arc::new(
+        McpBridge::build(
+            mcp_specs,
+            &cfg.acp.mcp,
+            &native_tool_names,
+            state.analytics.clone(),
+            crate::analytics::read_agent_session_id_env(),
+        )
+        .await,
+    );
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
@@ -1019,6 +1095,7 @@ async fn build_session_handle(
         crate::prompts::agent_system(cfg).await,
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
+        Arc::clone(&bridge),
     );
     let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     Ok(Arc::new(SessionHandle {
@@ -1027,6 +1104,7 @@ async fn build_session_handle(
         connection,
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
+        bridge,
     }))
 }
 
@@ -1121,11 +1199,16 @@ fn build_agent(
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
+    analytics: Option<Arc<AnalyticsStore>>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
     let supports_images = make_provider()
         .map(|provider| provider.supports_images())
         .unwrap_or(false);
+    // Advertise MCP transports so Zed forwards the matching server kinds
+    // (ADR-003, D8). stdio needs no capability flag; http is gated on it.
+    let mcp_enabled = cfg.acp.mcp.enabled;
+    let mcp_http = mcp_enabled && cfg.acp.mcp.allow_http;
     let state = Arc::new(AcpState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
@@ -1136,6 +1219,7 @@ fn build_agent(
         supports_terminal_output: AtomicBool::new(false),
         session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
+        analytics,
     });
 
     AcpAgentRole
@@ -1169,6 +1253,12 @@ fn build_agent(
                                     .list(SessionListCapabilities::new())
                                     .delete(SessionDeleteCapabilities::new()),
                             );
+                        }
+                        if mcp_enabled {
+                            // stdio is always supported; advertise http so Zed
+                            // forwards HTTP servers too (ADR-003, D8).
+                            capabilities = capabilities
+                                .mcp_capabilities(McpCapabilities::new().http(mcp_http));
                         }
                         responder.respond(
                             InitializeResponse::new(req.protocol_version)
@@ -1261,6 +1351,11 @@ fn build_agent(
                                 )),
                             );
                         }
+                        // Session file is gone; tear down its MCP clients so
+                        // Zed-spawned stdio servers don't linger (ADR-003, D7).
+                        if let Some(handle) = removed_handle {
+                            handle.bridge.shutdown().await;
+                        }
                         responder.respond(DeleteSessionResponse::new())
                     }
                 }
@@ -1284,6 +1379,9 @@ fn build_agent(
                     let token_log = token_log.clone();
                     async move {
                         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+                        // Zed forwards the user's configured MCP servers here
+                        // (ADR-003); bridge them into this session.
+                        let mcp_specs = to_server_specs(req.mcp_servers);
                         // Use the client-provided project root, not the CLI's
                         // own cwd — Zed passes the actual project it wants this
                         // session to operate on.
@@ -1299,6 +1397,7 @@ fn build_agent(
                             token_log,
                             session_id.clone(),
                             session_workspace,
+                            mcp_specs,
                             cx.clone(),
                         )
                         .await
@@ -1361,6 +1460,10 @@ fn build_agent(
                     let token_log = token_log.clone();
                     async move {
                         let session_id = req.session_id.clone();
+                        // Zed re-sends mcp_servers on every load; used only on
+                        // the rebuild path (case 2). Live sessions (case 1) keep
+                        // their existing bridge (ADR-003, D9).
+                        let mcp_specs = to_server_specs(req.mcp_servers);
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
                         let current_model = if let Some(handle) = existing {
                             // 1. Live in memory: replay the in-memory history.
@@ -1392,6 +1495,7 @@ fn build_agent(
                                 token_log,
                                 session_id.clone(),
                                 session_workspace,
+                                mcp_specs,
                                 cx.clone(),
                             )
                             .await
@@ -1606,6 +1710,7 @@ pub async fn run_acp(
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
+    analytics: Option<Arc<AnalyticsStore>>,
 ) -> anyhow::Result<()> {
     if let Err(e) = (make_provider)() {
         anyhow::bail!("provider init: {e}");
@@ -1620,6 +1725,7 @@ pub async fn run_acp(
         token_log,
         sessions_dir,
         compaction,
+        analytics,
     )
     .connect_to(Stdio::new())
     .await?;
@@ -1792,6 +1898,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -1873,6 +1980,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
@@ -1946,6 +2054,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
+            None,
             None,
         );
 
@@ -2198,6 +2307,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let (stop_a, stop_b) = AcpClientRole
@@ -2256,6 +2366,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,
@@ -2318,6 +2429,7 @@ mod tests {
             None,
             Some(sessions.path().to_path_buf()),
             None,
+            None,
         );
 
         let stop_reason = AcpClientRole
@@ -2373,6 +2485,7 @@ mod tests {
                 approval_mode: crate::safety::ApprovalMode::Interactive,
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
             None,
             None,
@@ -2464,6 +2577,7 @@ mod tests {
                 denied_commands: vec!["exec".into()],
                 ..crate::safety::SafetyPolicy::default()
             }),
+            None,
             None,
             None,
             None,
@@ -2607,6 +2721,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -2715,6 +2830,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let config_options = AcpClientRole
@@ -2767,6 +2883,7 @@ mod tests {
             "model-a".to_string(),
             models,
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,
@@ -2847,6 +2964,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let echoed_current = AcpClientRole
@@ -2900,6 +3018,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let load_session = AcpClientRole
@@ -2933,6 +3052,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let image_capabilities = AcpClientRole
             .builder()
@@ -2959,6 +3079,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,
@@ -2995,6 +3116,7 @@ mod tests {
             None,
             Some(sessions.path().to_path_buf()),
             None,
+            None,
         );
         let persistent_capabilities = AcpClientRole
             .builder()
@@ -3020,6 +3142,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,
@@ -3061,6 +3184,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
+            None,
             None,
         );
 
@@ -3160,6 +3284,7 @@ mod tests {
             None,
             Some(sessions.path().to_path_buf()),
             None,
+            None,
         );
         let store_for_client = store.clone();
 
@@ -3234,6 +3359,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,
@@ -3369,6 +3495,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let load_errored = AcpClientRole
@@ -3416,6 +3543,7 @@ mod tests {
             None,
             Some(sessions_dir.path().to_path_buf()),
             None,
+            None,
         );
         let ws1 = dir.path().to_path_buf();
         let session_id = AcpClientRole
@@ -3455,6 +3583,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions_dir.path().to_path_buf()),
+            None,
             None,
         );
 
@@ -3930,6 +4059,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
@@ -3988,6 +4118,7 @@ mod tests {
             "test-model".to_string(),
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
             None,
             None,
             None,

@@ -109,6 +109,30 @@ full_tool_schemas = false
 # an opaque continuation cursor when more sessions remain.
 session_list_page_size = 50
 
+[acp.mcp]
+# MCP-server bridge (ADR-003, #990). Zed forwards every configured context
+# server on session/new and session/load; when enabled, daimonos connects to
+# each as an MCP client, discovers its tools, and exposes them to the model as
+# `mcp__{server}__{tool}` alongside the native daimonos tools.
+enabled = true
+# Accept + advertise stdio-transport servers (command/args/env).
+allow_stdio = true
+# Accept + advertise HTTP-transport servers (url/headers).
+allow_http = true
+# Per-server budget (seconds) for the initialize + tools/list handshake. A
+# server that exceeds it is skipped (fail-open) — the session still gets the
+# remaining servers and all native tools.
+init_timeout_secs = 10
+# Per remote tools/call budget (seconds). On timeout the model receives an
+# error tool result and the turn continues.
+call_timeout_secs = 60
+# Upper bound on forwarded servers connected per session (bounds spawned
+# processes / connections). Extra servers are ignored.
+max_servers = 32
+# Upper bound on tools registered from any single server (bounds the exposed
+# tool set). Extra tools are ignored.
+max_tools_per_server = 128
+
 [discord]
 # Enable Discord integration tools. Defaults to false (off).
 enabled = false

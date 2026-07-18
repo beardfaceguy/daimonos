@@ -149,12 +149,16 @@ pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
 pub struct AcpConfig {
     /// Maximum saved sessions returned by one ACP session/list response.
     pub session_list_page_size: usize,
+    /// MCP-server bridge: consume the MCP servers Zed forwards on
+    /// session/new/load and expose their tools to the model (ADR-003, #990).
+    pub mcp: AcpMcpConfig,
 }
 
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             session_list_page_size: 50,
+            mcp: AcpMcpConfig::default(),
         }
     }
 }
@@ -163,6 +167,71 @@ impl AcpConfig {
     fn validate(&self) -> Result<(), String> {
         if self.session_list_page_size == 0 {
             return Err("acp.session_list_page_size must be greater than zero".to_string());
+        }
+        self.mcp.validate()?;
+        Ok(())
+    }
+}
+
+/// Configuration for the ACP MCP-server bridge (ADR-003, vikunja #990). Zed
+/// forwards every configured context server on session/new and session/load;
+/// when enabled, daimonos connects to each as an MCP client, discovers its
+/// tools, and exposes them to the model as `mcp__{server}__{tool}`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AcpMcpConfig {
+    /// Master switch for the bridge. When false, forwarded `mcp_servers` are
+    /// ignored and the `mcp` agent capability is not advertised.
+    pub enabled: bool,
+    /// Accept + advertise stdio-transport MCP servers (command/args/env).
+    pub allow_stdio: bool,
+    /// Accept + advertise HTTP-transport MCP servers (url/headers).
+    pub allow_http: bool,
+    /// Per-server budget (seconds) for the initialize + tools/list handshake.
+    /// A server that exceeds it is skipped (fail-open); the session proceeds
+    /// with the remaining servers and all native tools.
+    pub init_timeout_secs: u64,
+    /// Per remote `tools/call` budget (seconds). On timeout the model gets an
+    /// error tool result and the turn continues.
+    pub call_timeout_secs: u64,
+    /// Upper bound on forwarded servers connected per session (bounds spawned
+    /// processes / connections). Extra servers are ignored.
+    pub max_servers: usize,
+    /// Upper bound on tools registered from any single server (bounds the
+    /// exposed tool set). Extra tools are ignored.
+    pub max_tools_per_server: usize,
+}
+
+impl Default for AcpMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_stdio: true,
+            allow_http: true,
+            init_timeout_secs: 10,
+            call_timeout_secs: 60,
+            max_servers: 32,
+            max_tools_per_server: 128,
+        }
+    }
+}
+
+impl AcpMcpConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.init_timeout_secs == 0 {
+            return Err("acp.mcp.init_timeout_secs must be greater than zero".to_string());
+        }
+        if self.call_timeout_secs == 0 {
+            return Err("acp.mcp.call_timeout_secs must be greater than zero".to_string());
+        }
+        if self.max_servers == 0 {
+            return Err("acp.mcp.max_servers must be greater than zero".to_string());
+        }
+        if self.max_tools_per_server == 0 {
+            return Err("acp.mcp.max_tools_per_server must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -817,6 +886,68 @@ mod tests {
             .validate()
             .expect_err("zero page size must be rejected")
             .contains("acp.session_list_page_size"));
+    }
+
+    #[test]
+    fn acp_mcp_defaults_are_enabled_and_valid() {
+        let cfg = Config::default();
+        assert!(cfg.acp.mcp.enabled);
+        assert!(cfg.acp.mcp.allow_stdio);
+        assert!(cfg.acp.mcp.allow_http);
+        assert_eq!(cfg.acp.mcp.init_timeout_secs, 10);
+        assert_eq!(cfg.acp.mcp.call_timeout_secs, 60);
+        assert!(cfg.acp.mcp.max_servers > 0);
+        assert!(cfg.acp.mcp.max_tools_per_server > 0);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn acp_mcp_parses_overrides() {
+        let cfg: Config = toml::from_str(
+            "[acp.mcp]\nenabled = false\nallow_http = false\ninit_timeout_secs = 3\nmax_servers = 4\n",
+        )
+        .unwrap();
+        assert!(!cfg.acp.mcp.enabled);
+        assert!(!cfg.acp.mcp.allow_http);
+        assert!(cfg.acp.mcp.allow_stdio);
+        assert_eq!(cfg.acp.mcp.init_timeout_secs, 3);
+        assert_eq!(cfg.acp.mcp.max_servers, 4);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn acp_mcp_rejects_zero_timeouts_and_bounds_when_enabled() {
+        for (field, toml) in [
+            (
+                "acp.mcp.init_timeout_secs",
+                "[acp.mcp]\ninit_timeout_secs = 0\n",
+            ),
+            (
+                "acp.mcp.call_timeout_secs",
+                "[acp.mcp]\ncall_timeout_secs = 0\n",
+            ),
+            ("acp.mcp.max_servers", "[acp.mcp]\nmax_servers = 0\n"),
+            (
+                "acp.mcp.max_tools_per_server",
+                "[acp.mcp]\nmax_tools_per_server = 0\n",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(toml).unwrap();
+            assert!(cfg
+                .validate()
+                .expect_err("zero value must be rejected when enabled")
+                .contains(field));
+        }
+    }
+
+    #[test]
+    fn acp_mcp_disabled_skips_bound_validation() {
+        // With the bridge disabled, zero timeouts/bounds are irrelevant and
+        // must not fail startup validation.
+        let cfg: Config =
+            toml::from_str("[acp.mcp]\nenabled = false\ninit_timeout_secs = 0\nmax_servers = 0\n")
+                .unwrap();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

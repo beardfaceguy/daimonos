@@ -19,11 +19,17 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "gh",
 ];
 
-/// Whether `name` is in the destructive-tools list (exec, write_file, etc.) —
-/// shared with other approval surfaces (e.g. the ACP engine's permission
-/// requests) so "which tools need approval" stays defined in one place.
+/// Namespace prefix for remote (Zed-provided) MCP tools bridged into the tool
+/// list (ADR-003). Their behaviour is opaque to daimonos, so they are treated
+/// as destructive by default and gated like `exec`/`write_file`.
+pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
+
+/// Whether `name` is in the destructive-tools list (exec, write_file, etc.) or
+/// is a remote MCP tool (`mcp__*`) — shared with other approval surfaces (e.g.
+/// the ACP engine's permission requests) so "which tools need approval" stays
+/// defined in one place.
 pub fn is_destructive_tool(name: &str) -> bool {
-    DESTRUCTIVE_TOOLS.contains(&name)
+    DESTRUCTIVE_TOOLS.contains(&name) || name.starts_with(REMOTE_TOOL_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -117,7 +123,7 @@ impl SafetyPolicy {
         }
         let needs_approval = match self.approval_mode {
             ApprovalMode::Auto => false,
-            ApprovalMode::Interactive => DESTRUCTIVE_TOOLS.contains(&name),
+            ApprovalMode::Interactive => is_destructive_tool(name),
             ApprovalMode::Paranoid => true,
         };
         if !needs_approval {
@@ -294,6 +300,35 @@ mod tests {
                 "{name} should not be destructive"
             );
         }
+    }
+
+    #[test]
+    fn remote_mcp_tools_are_flagged_destructive() {
+        // ADR-003 D6: Zed-provided MCP tools are opaque, so they default to
+        // permission-required (gated like exec in Interactive mode).
+        for name in ["mcp__github__create_pr", "mcp__self__read_file"] {
+            assert!(is_destructive_tool(name), "{name} should be destructive");
+        }
+    }
+
+    #[test]
+    fn gate_needs_approval_for_remote_tool_in_interactive_mode() {
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            ..SafetyPolicy::default()
+        };
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn gate_auto_mode_allows_remote_tool() {
+        // Auto mode is fully unattended; remote tools follow the same policy as
+        // native ones (no prompt), consistent with the rest of the gate.
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Auto,
+            ..SafetyPolicy::default()
+        };
+        assert_eq!(policy.gate("mcp__github__create_pr"), Gate::Allow);
     }
 
     // --- gate / remember_always (vikunja #954: shared with ACP) ---

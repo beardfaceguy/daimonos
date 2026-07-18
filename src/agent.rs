@@ -45,6 +45,27 @@ pub type BeforeHook = Box<
 >;
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
 pub type ToolProgressHook = Box<dyn Fn(&ToolCallInfo, crate::ops::ExecProgress) + Send + Sync>;
+
+/// Provider-neutral outcome of a tool served outside the opcode facade (e.g. a
+/// remote MCP server bridged into an ACP session — ADR-003).
+pub struct RemoteToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// Dispatches a tool the opcode facade doesn't know. Consulted only when
+/// `tool_facade::invoke` returns `None`, before the "not available" fallback.
+/// `Some` = the tool was handled remotely (result used as-is); `None` = not a
+/// remote tool, fall through. Async so the call can await a network round-trip.
+pub type RemoteToolHook = Box<
+    dyn Fn(
+            &str,
+            &serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RemoteToolResult>> + Send>>
+        + Send
+        + Sync,
+>;
 /// Invoked with each `StreamEvent` as a turn streams in (vikunja #957).
 pub type StreamHook = Box<dyn Fn(StreamEvent) + Send + Sync>;
 /// Invoked after each compaction (ADR-002) so frontends can surface an
@@ -68,6 +89,9 @@ pub struct AgentConfig {
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
     pub on_tool_progress: Option<ToolProgressHook>,
+    /// Fallback dispatch for tools the opcode facade doesn't serve (remote MCP
+    /// tools bridged into an ACP session — ADR-003). `None` = ACP bridge off.
+    pub remote_tool_dispatch: Option<RemoteToolHook>,
     pub on_stream_event: Option<StreamHook>,
     pub token_log: Option<TokenLogConfig>,
     /// Context/window compaction (ADR-002). `None` = off.
@@ -292,7 +316,15 @@ pub async fn run(
                             let ok = r.ok;
                             (response_to_content(r), !ok)
                         }
-                        None => (format!("tool '{name}' not available in agent mode"), true),
+                        None => match &config.remote_tool_dispatch {
+                            Some(hook) => match hook(&name, &input).await {
+                                Some(r) => (r.content, r.is_error),
+                                None => {
+                                    (format!("tool '{name}' not available in agent mode"), true)
+                                }
+                            },
+                            None => (format!("tool '{name}' not available in agent mode"), true),
+                        },
                     };
 
                     // after_tool_call hook
@@ -780,6 +812,67 @@ mod tests {
             sess.history()[2].content[0],
             ContentBlock::ToolResult { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn remote_tool_dispatch_serves_unknown_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "mcp__srv__echo", json!({"msg": "hi"})),
+            end_turn_resp(),
+        ]));
+        let config = AgentConfig {
+            remote_tool_dispatch: Some(Box::new(|name: &str, input: &Value| {
+                let name = name.to_string();
+                let input = input.clone();
+                Box::pin(async move {
+                    (name == "mcp__srv__echo").then(|| RemoteToolResult {
+                        content: format!("echoed:{}", input["msg"].as_str().unwrap_or("")),
+                        is_error: false,
+                    })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), config);
+        let turn = sess.prompt("go").await;
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        match &sess.history()[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "echoed:hi");
+                assert!(!is_error);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_tool_dispatch_none_falls_through_to_not_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "totally_unknown", json!({})),
+            end_turn_resp(),
+        ]));
+        // Hook declines (returns None) → the loop's "not available" fallback applies.
+        let config = AgentConfig {
+            remote_tool_dispatch: Some(Box::new(|_name: &str, _input: &Value| {
+                Box::pin(async move { None })
+            })),
+            ..AgentConfig::default()
+        };
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), config);
+        sess.prompt("go").await;
+        match &sess.history()[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(content.contains("not available"));
+                assert!(is_error);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
     }
 
     #[tokio::test]
