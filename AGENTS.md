@@ -236,6 +236,10 @@ daimonos/
   `tools/list`. A `Session::tools_changed` dirty flag drives this and is
   set only on a real membership addition — not on the description re-render
   that happens on a tool's first use.
+- **Agent-only tools**: `ToolTier::AgentOnly` entries are available to the
+  built-in agent/chat/ACP loop but excluded from MCP `tools/list`,
+  `list_all_tools`, and MCP schema lookup. Use this only for frontend-local
+  side effects with no portable MCP meaning (currently `update_plan`).
 - **Proactive workspace context**: the MCP `instructions` field is built
   dynamically at startup with workspace path, detected project type
   (Cargo.toml → Rust, package.json → Node.js, etc.), VCS info, and

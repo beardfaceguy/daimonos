@@ -12,7 +12,7 @@
 //! Out of scope: the `fs/*`/`terminal/*` client-proxy methods — daimonos has
 //! its own file/exec tools and doesn't need to shell out through the client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -23,22 +23,25 @@ use agent_client_protocol::schema::v1::{
     DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource, ImageContent,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason as AcpStopReason, TextContent, ToolCall,
-    ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan as AcpPlan,
+    PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
+    PlanEntryStatus as AcpPlanStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
+    TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
 };
 
 use crate::agent::{
-    AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook, BeforeHookResult,
+    parse_plan_entries, AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook,
+    BeforeHookResult, PlanEntry as AgentPlanEntry, PlanHook, PlanPriority, PlanStatus,
     RemoteToolHook, RemoteToolResult, TokenLogConfig, ToolCallInfo, ToolProgressHook,
+    UPDATE_PLAN_TOOL,
 };
 use crate::analytics::AnalyticsStore;
 use crate::config::Config;
@@ -422,6 +425,36 @@ fn send_notification(
     let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
 }
 
+fn to_acp_plan(entries: &[AgentPlanEntry]) -> AcpPlan {
+    AcpPlan::new(
+        entries
+            .iter()
+            .map(|entry| {
+                let priority = match entry.priority {
+                    PlanPriority::High => AcpPlanPriority::High,
+                    PlanPriority::Medium => AcpPlanPriority::Medium,
+                    PlanPriority::Low => AcpPlanPriority::Low,
+                };
+                let status = match entry.status {
+                    PlanStatus::Pending => AcpPlanStatus::Pending,
+                    PlanStatus::InProgress => AcpPlanStatus::InProgress,
+                    PlanStatus::Completed => AcpPlanStatus::Completed,
+                };
+                AcpPlanEntry::new(entry.content.clone(), priority, status)
+            })
+            .collect(),
+    )
+}
+
+fn build_plan_hook(connection: CurrentConnection, session_id: SessionId) -> PlanHook {
+    Box::new(move |entries: &[AgentPlanEntry]| {
+        let Some(cx) = current_cx(&connection) else {
+            return;
+        };
+        send_notification(&cx, &session_id, SessionUpdate::Plan(to_acp_plan(entries)));
+    })
+}
+
 fn client_supports_terminal_output(req: &InitializeRequest) -> bool {
     req.client_capabilities
         .meta
@@ -582,6 +615,11 @@ fn build_before_tool_call_hook(
         let diff_stash = Arc::clone(&diff_stash);
         let workspace = workspace.clone();
         Box::pin(async move {
+            // update_plan has native ACP presentation via SessionUpdate::Plan;
+            // suppress redundant generic tool-call chrome and permissions.
+            if info.name == UPDATE_PLAN_TOOL && parse_plan_entries(&info.input).is_ok() {
+                return BeforeHookResult::Allow;
+            }
             let Some(cx) = current_cx(&connection) else {
                 return BeforeHookResult::Block("no active ACP connection".to_string());
             };
@@ -662,6 +700,9 @@ fn build_after_tool_call_hook(
     workspace: PathBuf,
 ) -> AfterHook {
     Box::new(move |info: &ToolCallInfo, content: &str, is_error: bool| {
+        if info.name == UPDATE_PLAN_TOOL && !is_error {
+            return AfterHookResult::Continue;
+        }
         // Always drain this call's stash entry (even on failure) so blocked
         // or failed edits don't leak entries.
         let old_text = diff_stash
@@ -832,6 +873,7 @@ fn build_agent_config(
             session_id.clone(),
             terminal_output,
         ),
+        on_plan_update: Some(build_plan_hook(Arc::clone(&connection), session_id.clone())),
         token_log: token_log.map(|path| TokenLogConfig {
             path,
             label: "acp".to_string(),
@@ -1124,6 +1166,7 @@ fn replay_history(
     history: &[crate::providers::Message],
 ) {
     use crate::providers::{ContentBlock as CoreBlock, Role};
+    let mut plan_tool_ids = HashSet::new();
     for message in history {
         for block in &message.content {
             match block {
@@ -1151,17 +1194,44 @@ fn replay_history(
                     send_notification(cx, session_id, update);
                 }
                 CoreBlock::ToolCall { id, name, input } => {
-                    let tool_call = ToolCall::new(id.clone(), name.clone())
-                        .kind(tool_kind_for(name))
-                        .status(ToolCallStatus::InProgress)
-                        .raw_input(Some(input.clone()));
-                    send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call));
+                    if name == UPDATE_PLAN_TOOL {
+                        match parse_plan_entries(input) {
+                            Ok(entries) => {
+                                plan_tool_ids.insert(id.clone());
+                                send_notification(
+                                    cx,
+                                    session_id,
+                                    SessionUpdate::Plan(to_acp_plan(&entries)),
+                                );
+                            }
+                            Err(_) => {
+                                let tool_call = ToolCall::new(id.clone(), name.clone())
+                                    .kind(tool_kind_for(name))
+                                    .status(ToolCallStatus::InProgress)
+                                    .raw_input(Some(input.clone()));
+                                send_notification(
+                                    cx,
+                                    session_id,
+                                    SessionUpdate::ToolCall(tool_call),
+                                );
+                            }
+                        }
+                    } else {
+                        let tool_call = ToolCall::new(id.clone(), name.clone())
+                            .kind(tool_kind_for(name))
+                            .status(ToolCallStatus::InProgress)
+                            .raw_input(Some(input.clone()));
+                        send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call));
+                    }
                 }
                 CoreBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => {
+                    if plan_tool_ids.contains(tool_use_id) {
+                        continue;
+                    }
                     let status = if *is_error {
                         ToolCallStatus::Failed
                     } else {
@@ -3415,7 +3485,19 @@ mod tests {
         // A live session's in-memory history must be replayed back as
         // session/update notifications so Zed rebuilds the reopened thread.
         let dir = tempfile::tempdir().unwrap();
-        let make_provider = mock_factory(vec![thinking_resp("reasoning...", "recalled-text")]);
+        let make_provider = mock_factory(vec![
+            tool_call_resp(
+                "plan-replay",
+                UPDATE_PLAN_TOOL,
+                serde_json::json!({
+                    "entries": [
+                        {"content": "inspect", "priority": "high", "status": "completed"},
+                        {"content": "implement", "priority": "medium", "status": "in_progress"}
+                    ]
+                }),
+            ),
+            thinking_resp("reasoning...", "recalled-text"),
+        ]);
         let agent = build_agent(
             make_provider,
             dir.path(),
@@ -3501,6 +3583,32 @@ mod tests {
             thought_texts(replayed),
             vec!["reasoning..."],
             "session/load must replay persisted thinking"
+        );
+        let plans = |updates: &[SessionUpdate]| {
+            updates
+                .iter()
+                .filter_map(|update| match update {
+                    SessionUpdate::Plan(plan) => Some(plan.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let live_plans = plans(&updates[..replay_start]);
+        let replayed_plans = plans(replayed);
+        assert_eq!(live_plans.len(), 1, "live plan update missing");
+        assert_eq!(replayed_plans.len(), 1, "replayed plan update missing");
+        assert_eq!(replayed_plans[0].entries.len(), 2);
+        assert_eq!(replayed_plans[0].entries[1].content, "implement");
+        assert_eq!(
+            replayed_plans[0].entries[1].status,
+            AcpPlanStatus::InProgress
+        );
+        assert!(
+            updates.iter().all(|update| !matches!(
+                update,
+                SessionUpdate::ToolCall(call) if call.title == UPDATE_PLAN_TOOL
+            )),
+            "update_plan should use native Plan UI without generic tool chrome"
         );
         // UserMessageChunk is a kind the normal prompt path never emits, so
         // its presence during load proves replay ran.
@@ -4161,6 +4269,42 @@ mod tests {
             .await
             .unwrap();
         Arc::try_unwrap(updates).unwrap().into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_input_surfaces_failed_tool_chrome() {
+        let workspace = tempfile::tempdir().unwrap();
+        let updates = run_tool_call_flow(
+            workspace.path(),
+            vec![
+                tool_call_resp(
+                    "bad-plan",
+                    UPDATE_PLAN_TOOL,
+                    serde_json::json!({
+                        "entries": [{
+                            "content": " ",
+                            "priority": "high",
+                            "status": "pending"
+                        }]
+                    }),
+                ),
+                end_turn_resp("done"),
+            ],
+        )
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCall(call) if call.title == UPDATE_PLAN_TOOL
+        )));
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCallUpdate(call)
+                if call.fields.status == Some(ToolCallStatus::Failed)
+        )));
+        assert!(!updates
+            .iter()
+            .any(|update| matches!(update, SessionUpdate::Plan(_))));
     }
 
     #[tokio::test]

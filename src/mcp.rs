@@ -220,7 +220,7 @@ async fn dispatch_tool_inner(
                 .collect();
 
             if results.is_empty() {
-                let known: Vec<&str> = tools::all_tool_names();
+                let known: Vec<&str> = tools::mcp_tool_names();
                 err_text(format!(
                     "unknown tool(s): {:?}. Available: {:?}",
                     names, known

@@ -54,6 +54,12 @@ terse = """Run a Starlark script; all tools as functions; returns `result`. Chea
 [execute_script.parameters]
 code = "Starlark source. Set `result` variable for output."
 timeout = "Max seconds (default: 60)"
+[update_plan]
+full = """Replace the current execution plan for a multi-step task. Send the complete list each time statuses change. Use an empty list to clear the plan."""
+terse = """Replace the complete multi-step execution plan and statuses."""
+
+[update_plan.parameters]
+entries = "Complete ordered plan entries with content, priority, and status"
 [kgl_query]
 full = """Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness."""
 terse = """Query KGL graph: find defs, deps, calls, state, open questions, blast radius; index/check."""

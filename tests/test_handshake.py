@@ -205,6 +205,7 @@ def test_list_tools_returns_core_tools(daimonos):
     hidden = {"diff_files", "tool_pipeline", "tool_repair"}
     for name in hidden:
         assert name not in tool_names, f"{name} should be hidden by default"
+    assert "update_plan" not in tool_names, "agent-only tool leaked into MCP mode"
 
 
 def test_list_all_tools_returns_catalog(daimonos):

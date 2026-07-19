@@ -46,6 +46,65 @@ pub type BeforeHook = Box<
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
 pub type ToolProgressHook = Box<dyn Fn(&ToolCallInfo, crate::ops::ExecProgress) + Send + Sync>;
 
+pub const UPDATE_PLAN_TOOL: &str = "update_plan";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPriority {
+    High,
+    Medium,
+    Low,
+}
+
+impl PlanPriority {
+    pub const VALUES: &'static [&'static str] = &["high", "medium", "low"];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStatus {
+    pub const VALUES: &'static [&'static str] = &["pending", "in_progress", "completed"];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: PlanPriority,
+    pub status: PlanStatus,
+}
+
+#[derive(serde::Deserialize)]
+struct PlanInput {
+    entries: Vec<PlanEntry>,
+}
+
+/// Parse and normalize a complete replacement plan from model tool input.
+/// Empty plans are valid (clear the current plan); entry content must be
+/// non-empty after trimming.
+pub fn parse_plan_entries(input: &Value) -> Result<Vec<PlanEntry>, String> {
+    let mut plan: PlanInput = serde_json::from_value(input.clone())
+        .map_err(|error| format!("invalid update_plan input: {error}"))?;
+    for (index, entry) in plan.entries.iter_mut().enumerate() {
+        let content = entry.content.trim();
+        if content.is_empty() {
+            return Err(format!(
+                "invalid update_plan input: entries[{index}].content must not be empty"
+            ));
+        }
+        entry.content = content.to_string();
+    }
+    Ok(plan.entries)
+}
+
+/// Receives each complete normalized plan replacement.
+pub type PlanHook = Box<dyn Fn(&[PlanEntry]) + Send + Sync>;
+
 /// Provider-neutral outcome of a tool served outside the opcode facade (e.g. a
 /// remote MCP server bridged into an ACP session — ADR-003).
 pub struct RemoteToolResult {
@@ -89,6 +148,7 @@ pub struct AgentConfig {
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
     pub on_tool_progress: Option<ToolProgressHook>,
+    pub on_plan_update: Option<PlanHook>,
     /// Fallback dispatch for tools the opcode facade doesn't serve (remote MCP
     /// tools bridged into an ACP session — ADR-003). `None` = ACP bridge off.
     pub remote_tool_dispatch: Option<RemoteToolHook>,
@@ -304,27 +364,44 @@ pub async fn run(
                         .on_tool_progress
                         .as_ref()
                         .map(|_| &on_progress as &crate::ops::ExecProgressCallback<'_>);
-                    let (content, is_error) = match tool_facade::invoke_with_progress(
-                        session,
-                        &name,
-                        &input,
-                        progress_callback,
-                    )
-                    .await
-                    {
-                        Some(r) => {
-                            let ok = r.ok;
-                            (response_to_content(r), !ok)
+                    let (content, is_error) = if name == UPDATE_PLAN_TOOL {
+                        match parse_plan_entries(&input) {
+                            Ok(entries) => {
+                                if let Some(hook) = &config.on_plan_update {
+                                    hook(&entries);
+                                }
+                                (
+                                    serde_json::json!({"updated": entries.len()}).to_string(),
+                                    false,
+                                )
+                            }
+                            Err(error) => (error, true),
                         }
-                        None => match &config.remote_tool_dispatch {
-                            Some(hook) => match hook(&name, &input).await {
-                                Some(r) => (r.content, r.is_error),
+                    } else {
+                        match tool_facade::invoke_with_progress(
+                            session,
+                            &name,
+                            &input,
+                            progress_callback,
+                        )
+                        .await
+                        {
+                            Some(r) => {
+                                let ok = r.ok;
+                                (response_to_content(r), !ok)
+                            }
+                            None => match &config.remote_tool_dispatch {
+                                Some(hook) => match hook(&name, &input).await {
+                                    Some(r) => (r.content, r.is_error),
+                                    None => {
+                                        (format!("tool '{name}' not available in agent mode"), true)
+                                    }
+                                },
                                 None => {
                                     (format!("tool '{name}' not available in agent mode"), true)
                                 }
                             },
-                            None => (format!("tool '{name}' not available in agent mode"), true),
-                        },
+                        }
                     };
 
                     // after_tool_call hook
@@ -845,6 +922,77 @@ mod tests {
                 assert!(!is_error);
             }
             other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_input_normalizes_and_validates_entries() {
+        let entries = parse_plan_entries(&json!({
+            "entries": [{
+                "content": "  implement feature  ",
+                "priority": "high",
+                "status": "in_progress"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![PlanEntry {
+                content: "implement feature".to_string(),
+                priority: PlanPriority::High,
+                status: PlanStatus::InProgress,
+            }]
+        );
+        assert!(parse_plan_entries(&json!({
+            "entries": [{"content": " ", "priority": "low", "status": "pending"}]
+        }))
+        .unwrap_err()
+        .contains("content must not be empty"));
+        assert!(parse_plan_entries(&json!({"entries": [], "extra": true})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_plan_invokes_hook_and_records_successful_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "plan-1",
+                UPDATE_PLAN_TOOL,
+                json!({
+                    "entries": [
+                        {"content": "inspect", "priority": "high", "status": "completed"},
+                        {"content": "implement", "priority": "medium", "status": "in_progress"}
+                    ]
+                }),
+            ),
+            end_turn_resp(),
+        ]));
+        let plans: Arc<std::sync::Mutex<Vec<Vec<PlanEntry>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plans_for_hook = Arc::clone(&plans);
+        let config = AgentConfig {
+            on_plan_update: Some(Box::new(move |entries| {
+                plans_for_hook.lock().unwrap().push(entries.to_vec());
+            })),
+            ..AgentConfig::default()
+        };
+        let mut session = AgentSession::new(provider, session_in(dir.path()), config);
+
+        let turn = session.prompt("do it").await;
+
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        let plans = plans.lock().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0][1].content, "implement");
+        assert_eq!(plans[0][1].status, PlanStatus::InProgress);
+        match &session.history()[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error);
+                assert_eq!(content, "{\"updated\":2}");
+            }
+            other => panic!("expected plan tool result, got {other:?}"),
         }
     }
 

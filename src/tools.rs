@@ -47,6 +47,9 @@ pub enum ToolTier {
     Terse,
     /// Hidden until activated via list_all_tools.
     OnDemand,
+    /// Available to the built-in agent/chat/ACP loop, but not exposed when
+    /// daimonos itself is serving tools over MCP.
+    AgentOnly,
 }
 
 // --- Tool definition ---
@@ -254,6 +257,30 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["code"]
             }),
             to_request: None, // Starlark runtime handled in mcp.rs
+            context_check: None,
+        },
+        ToolDef {
+            name: crate::agent::UPDATE_PLAN_TOOL,
+            tier: ToolTier::AgentOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "priority": {"type": "string", "enum": crate::agent::PlanPriority::VALUES},
+                                "status": {"type": "string", "enum": crate::agent::PlanStatus::VALUES}
+                            },
+                            "required": ["content", "priority", "status"]
+                        }
+                    }
+                },
+                "required": ["entries"]
+            }),
+            to_request: None,
             context_check: None,
         },
         ToolDef {
@@ -783,6 +810,7 @@ pub fn tool_definitions(
 ) -> Vec<rust_mcp_sdk::schema::Tool> {
     all_tools()
         .into_iter()
+        .filter(|tool| tool.tier != ToolTier::AgentOnly)
         .map(|td| {
             let input_schema = descriptions.schema_with_parameters(td.name, &td.schema);
             serde_json::from_value(json!({
@@ -795,9 +823,13 @@ pub fn tool_definitions(
         .collect()
 }
 
-/// All tool names in the registry.
-pub fn all_tool_names() -> Vec<&'static str> {
-    all_tools().iter().map(|t| t.name).collect()
+/// Tool names valid in MCP-server mode (excludes built-in-agent-only tools).
+pub fn mcp_tool_names() -> Vec<&'static str> {
+    all_tools()
+        .iter()
+        .filter(|tool| tool.tier != ToolTier::AgentOnly)
+        .map(|tool| tool.name)
+        .collect()
 }
 
 #[cfg(test)]
@@ -821,6 +853,7 @@ mod tests {
         assert!(names.contains(&"batch"));
         assert!(names.contains(&"get_tool_schema"));
         assert!(names.contains(&"execute_script"));
+        assert!(names.contains(&crate::agent::UPDATE_PLAN_TOOL));
         assert!(names.contains(&"git"));
         assert!(names.contains(&"discord"));
         assert!(names.contains(&"snapshot"));
@@ -879,8 +912,8 @@ mod tests {
             .sum();
         assert_eq!(
             rendered_count,
-            crate::tool_descriptions::DEFAULT_PARAMETER_DESCRIPTION_COUNT,
-            "rendered schemas must restore every migrated description"
+            crate::tool_descriptions::MCP_PARAMETER_DESCRIPTION_COUNT,
+            "MCP schemas must restore every non-agent-only description"
         );
     }
 
@@ -902,6 +935,11 @@ mod tests {
             .filter(|t| t.tier == ToolTier::OnDemand)
             .map(|t| t.name)
             .collect();
+        let agent_only: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.tier == ToolTier::AgentOnly)
+            .map(|t| t.name)
+            .collect();
 
         assert!(full.contains(&"read_file"));
         assert!(full.contains(&"exec"));
@@ -910,6 +948,30 @@ mod tests {
         assert!(terse.contains(&"snapshot"));
         assert!(on_demand.contains(&"diff_files"));
         assert!(on_demand.contains(&"tool_pipeline"));
+        assert_eq!(agent_only, vec![crate::agent::UPDATE_PLAN_TOOL]);
+        assert!(!tool_definitions(&descriptions())
+            .iter()
+            .any(|tool| tool.name == crate::agent::UPDATE_PLAN_TOOL));
+    }
+
+    #[test]
+    fn update_plan_schema_uses_core_wire_values() {
+        let tool = all_tools()
+            .into_iter()
+            .find(|tool| tool.name == crate::agent::UPDATE_PLAN_TOOL)
+            .unwrap();
+        assert_eq!(
+            tool.schema
+                .pointer("/properties/entries/items/properties/priority/enum")
+                .cloned(),
+            Some(json!(crate::agent::PlanPriority::VALUES))
+        );
+        assert_eq!(
+            tool.schema
+                .pointer("/properties/entries/items/properties/status/enum")
+                .cloned(),
+            Some(json!(crate::agent::PlanStatus::VALUES))
+        );
     }
 
     #[test]
