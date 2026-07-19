@@ -42,7 +42,7 @@ use crate::agent::{
 };
 use crate::analytics::AnalyticsStore;
 use crate::config::Config;
-use crate::mcp_bridge::{McpBridge, ServerSpec};
+use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
 use crate::providers::{
     CompleteOpts, ContentBlock as CoreBlock, LlmProvider, Message as CoreMessage, Role as CoreRole,
     StreamEvent, ToolSchema, Usage,
@@ -128,6 +128,9 @@ struct AcpState {
     /// Analytics store for attributing remote MCP tool calls (ADR-003).
     /// `None` when analytics is disabled.
     analytics: Option<Arc<AnalyticsStore>>,
+    /// Process-wide pool for deduplicating identical forwarded MCP server
+    /// configs across ACP sessions (#1008). Bridges retain explicit leases.
+    mcp_pool: McpClientPool,
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -1075,12 +1078,13 @@ async fn build_session_handle(
             .map(|s| s.name)
             .collect();
     let bridge = Arc::new(
-        McpBridge::build(
+        McpBridge::build_with_pool(
             mcp_specs,
             &cfg.acp.mcp,
             &native_tool_names,
             state.analytics.clone(),
             crate::analytics::read_agent_session_id_env(),
+            state.mcp_pool.clone(),
         )
         .await,
     );
@@ -1258,6 +1262,7 @@ fn build_agent_with_state(
         session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
         analytics,
+        mcp_pool: McpClientPool::new(),
     });
     *state_out = Some(Arc::clone(&state));
 

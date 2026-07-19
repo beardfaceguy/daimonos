@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784398910.1524022,
-    "ast_hash": "86f34c3ed500a8b488b954ad798f91f4",
+    "mtime": 1784425443.8780553,
+    "ast_hash": "de77ba78a2cac0c67a81ee933acbfbea",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -290,8 +290,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784405159.9273603,
-    "ast_hash": "d5cd077f7676c43b7a8fe21dd7d123ad",
+    "mtime": 1784425386.4694886,
+    "ast_hash": "b974c3ece91a956f85fb52a1d46ca8d6",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -520,7 +520,7 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784406848.4413636,
+    "mtime": 1784424766.2357092,
     "ast_hash": "8f8d671d87de57ad2fbc6587374e26d3",
     "semantic_hash": ""
   },
@@ -530,7 +530,7 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784424181.2699635,
+    "mtime": 1784424766.236709,
     "ast_hash": "8567b9aea8d6a07850fb28b6a9836ff1",
     "semantic_hash": ""
   },
@@ -605,7 +605,7 @@
     "semantic_hash": "acbca61bef7706f641f343b03274c30d"
   },
   "tests/test_handshake.py": {
-    "mtime": 1784406907.054946,
+    "mtime": 1784424766.236709,
     "ast_hash": "df0b1d180d0d5e254b55cfdad19dd13c",
     "semantic_hash": ""
   },
@@ -830,8 +830,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784406926.6118066,
-    "ast_hash": "d812ab0f2408443f193b87d466f42164",
+    "mtime": 1784425879.3931968,
+    "ast_hash": "7006ed7d7581c59571169214df608402",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -885,7 +885,7 @@
     "semantic_hash": ""
   },
   "prompts/README.md": {
-    "mtime": 1784406921.4028437,
+    "mtime": 1784424766.2357092,
     "ast_hash": "b018b1ad6309fea23cafa1541b13e35d",
     "semantic_hash": ""
   },
@@ -920,7 +920,7 @@
     "semantic_hash": ""
   },
   "src/tool_descriptions.rs": {
-    "mtime": 1784424176.850996,
+    "mtime": 1784424766.2357092,
     "ast_hash": "622c90619210a506be4db65239f3fc07",
     "semantic_hash": ""
   },
@@ -930,13 +930,13 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784405159.9273603,
-    "ast_hash": "1b31c5fd30501fe78521e869db8e65ad",
+    "mtime": 1784426575.899026,
+    "ast_hash": "2d58199109945b91f7f23ba2f5d10345",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
-    "mtime": 1784405159.9163604,
-    "ast_hash": "6f5c208c2233fc82fbffdf07eb98a4a7",
+    "mtime": 1784425916.7899191,
+    "ast_hash": "40b8c9c701388bfe8a6e0dee50ea5e7e",
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {

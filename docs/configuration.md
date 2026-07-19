@@ -207,11 +207,17 @@ remaining servers and all native tools. Remote tool calls flow through the same
 permission hooks as native destructive tools and are attributed in analytics
 under their `mcp__…` name.
 
+By default, identical transport configurations are initialized once and leased
+from a process-wide pool across ACP sessions. Tool names/routes and analytics
+attribution remain per session; the last lease shuts the client down. Disable
+pooling for context servers whose internal state must be isolated per chat.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Master switch. When `false`, forwarded `mcp_servers` are ignored and the `mcp` agent capability is not advertised. |
 | `allow_stdio` | `true` | Accept + advertise stdio-transport servers (`command`/`args`/`env`). |
 | `allow_http` | `true` | Accept + advertise HTTP-transport servers (`url`/`headers`). |
+| `shared_pool_enabled` | `true` | Reuse identical initialized clients across ACP sessions in one process. Set `false` for servers requiring per-chat state isolation. |
 | `init_timeout_secs` | `10` | Per-server budget for the `initialize` + `tools/list` handshake. Exceeding it skips that server. Must be > 0 when enabled. |
 | `call_timeout_secs` | `60` | Per remote `tools/call` budget. On timeout the model gets an error tool result and the turn continues. Must be > 0 when enabled. |
 | `max_servers` | `32` | Upper bound on forwarded servers connected per session. Must be > 0 when enabled. |
@@ -223,6 +229,7 @@ under their `mcp__…` name.
 enabled = true
 allow_stdio = true
 allow_http = true
+shared_pool_enabled = true
 init_timeout_secs = 10
 call_timeout_secs = 60
 max_servers = 32

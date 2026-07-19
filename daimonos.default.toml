@@ -119,6 +119,9 @@ enabled = true
 allow_stdio = true
 # Accept + advertise HTTP-transport servers (url/headers).
 allow_http = true
+# Reuse identical initialized clients across ACP sessions in this process.
+# Set false for servers that intentionally require per-chat state isolation.
+shared_pool_enabled = true
 # Per-server budget (seconds) for the initialize + tools/list handshake. A
 # server that exceeds it is skipped (fail-open) — the session still gets the
 # remaining servers and all native tools.
