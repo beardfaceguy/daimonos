@@ -16,8 +16,8 @@ pub struct NeutralToolSchema {
 
 /// Tool schemas visible to the agent loop for a given workspace.
 ///
-/// Returns Full + Terse tools whose context_check passes. OnDemand tools are
-/// excluded (they must be activated explicitly, same as in the MCP path).
+/// Returns Full + Terse + AgentOnly tools whose context_check passes.
+/// OnDemand tools are excluded (they must be activated explicitly).
 #[allow(dead_code)]
 pub fn active_schemas(
     workspace: &Path,
@@ -25,7 +25,12 @@ pub fn active_schemas(
 ) -> Vec<NeutralToolSchema> {
     tools::all_tools()
         .into_iter()
-        .filter(|t| t.tier != ToolTier::OnDemand)
+        .filter(|t| {
+            matches!(
+                t.tier,
+                ToolTier::Full | ToolTier::Terse | ToolTier::AgentOnly
+            )
+        })
         .filter(|t| tools::passes_context_check(t.name, workspace))
         .map(|t| NeutralToolSchema {
             name: t.name.to_string(),
@@ -79,6 +84,14 @@ mod tests {
     fn active_schemas_is_non_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!default_schemas(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn active_schemas_include_agent_only_plan_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(default_schemas(dir.path())
+            .iter()
+            .any(|schema| schema.name == crate::agent::UPDATE_PLAN_TOOL));
     }
 
     #[test]
