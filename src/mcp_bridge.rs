@@ -15,14 +15,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{stream, StreamExt};
+use futures_util::{future, stream, StreamExt};
 use serde_json::Value;
 
 use rust_mcp_sdk::mcp_client::ClientRuntime;
 use rust_mcp_sdk::mcp_client::{client_runtime, ClientHandler, McpClientOptions};
 use rust_mcp_sdk::schema::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ContentBlock, Implementation,
-    InitializeRequestParams, LATEST_PROTOCOL_VERSION,
+    InitializeRequestParams, Tool, LATEST_PROTOCOL_VERSION,
 };
 use rust_mcp_sdk::{
     McpClient, RequestOptions, StdioTransport, StreamableTransportOptions, ToMcpClientHandler,
@@ -32,6 +32,205 @@ use rust_mcp_sdk::{
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::AcpMcpConfig;
 use crate::providers::ToolSchema;
+
+/// Canonical transport identity for pooling. Display names are deliberately
+/// excluded: two sessions may alias the same server differently while sharing
+/// one transport/client. Map fields are sorted so insertion order cannot
+/// change identity.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ServerKey {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl From<&ServerSpec> for ServerKey {
+    fn from(spec: &ServerSpec) -> Self {
+        match spec {
+            ServerSpec::Stdio {
+                command, args, env, ..
+            } => Self::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: sorted_pairs(env),
+            },
+            ServerSpec::Http { url, headers, .. } => Self::Http {
+                url: url.clone(),
+                headers: sorted_pairs(headers),
+            },
+        }
+    }
+}
+
+fn sorted_pairs(values: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<_> = values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+struct PoolLease {
+    slot: Arc<PoolSlot>,
+    client: Arc<ClientRuntime>,
+    tools: Arc<Vec<Tool>>,
+}
+
+#[derive(Default)]
+struct PoolSlot {
+    state: tokio::sync::Mutex<PoolSlotState>,
+}
+
+#[derive(Default)]
+enum PoolSlotState {
+    #[default]
+    Empty,
+    Ready {
+        client: Arc<ClientRuntime>,
+        tools: Arc<Vec<Tool>>,
+        leases: usize,
+    },
+}
+
+#[derive(Default)]
+struct PoolInner {
+    slots: tokio::sync::Mutex<HashMap<ServerKey, std::sync::Weak<PoolSlot>>>,
+}
+
+/// Process-wide cache of initialized MCP clients. Clones share the same pool;
+/// `McpBridge` instances retain explicit leases and release them asynchronously
+/// on session deletion/process teardown.
+#[derive(Clone, Default)]
+pub struct McpClientPool {
+    inner: Arc<PoolInner>,
+}
+
+impl McpClientPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn acquire(
+        &self,
+        spec: &ServerSpec,
+        cfg: &AcpMcpConfig,
+        init_timeout: Duration,
+    ) -> Result<PoolLease, String> {
+        let key = ServerKey::from(spec);
+        let slot = {
+            let mut slots = self.inner.slots.lock().await;
+            // A Weak whose strong count reached zero cannot be resurrected, so
+            // pruning under this map lock is race-free.
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            match slots.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(slot) => slot,
+                None => {
+                    let slot = Arc::new(PoolSlot::default());
+                    slots.insert(key, Arc::downgrade(&slot));
+                    slot
+                }
+            }
+        };
+        let mut state = slot.state.lock().await;
+        if let PoolSlotState::Ready {
+            client,
+            tools,
+            leases,
+        } = &mut *state
+        {
+            *leases += 1;
+            return Ok(PoolLease {
+                slot: Arc::clone(&slot),
+                client: Arc::clone(client),
+                tools: Arc::clone(tools),
+            });
+        }
+
+        let (client, tools) = connect(spec, cfg, init_timeout).await?;
+        let tools = Arc::new(tools);
+        *state = PoolSlotState::Ready {
+            client: Arc::clone(&client),
+            tools: Arc::clone(&tools),
+            leases: 1,
+        };
+        Ok(PoolLease {
+            slot: Arc::clone(&slot),
+            client,
+            tools,
+        })
+    }
+
+    async fn release(&self, lease: PoolLease) {
+        let mut state = lease.slot.state.lock().await;
+        let shutdown = match &mut *state {
+            PoolSlotState::Ready { leases, .. } if *leases > 1 => {
+                *leases -= 1;
+                None
+            }
+            PoolSlotState::Ready { client, .. } => {
+                let client = Arc::clone(client);
+                *state = PoolSlotState::Empty;
+                Some(client)
+            }
+            PoolSlotState::Empty => None,
+        };
+        if let Some(client) = shutdown {
+            // Keep the slot locked until shutdown completes so a new acquirer
+            // cannot start a replacement while the old runtime is still live.
+            let _ = client.shut_down().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn entry_count(&self) -> usize {
+        let slots: Vec<_> = self
+            .inner
+            .slots
+            .lock()
+            .await
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        let mut count = 0;
+        for slot in slots {
+            if matches!(*slot.state.lock().await, PoolSlotState::Ready { .. }) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[cfg(test)]
+    async fn lease_count(&self) -> usize {
+        let slots: Vec<_> = self
+            .inner
+            .slots
+            .lock()
+            .await
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        let mut count = 0;
+        for slot in slots {
+            if let PoolSlotState::Ready { leases, .. } = *slot.state.lock().await {
+                count += leases;
+            }
+        }
+        count
+    }
+
+    #[cfg(test)]
+    async fn slot_count(&self) -> usize {
+        self.inner.slots.lock().await.len()
+    }
+}
 
 /// Transport-neutral description of one forwarded MCP server. Decoupled from
 /// the `agent_client_protocol` types so this module (and its tests) don't
@@ -69,17 +268,24 @@ pub struct RemoteToolOutcome {
 /// Maps an exposed (namespaced) tool name to the client that serves it and the
 /// original (un-namespaced) tool name to call on that server.
 struct Route {
-    client: usize,
+    lease: usize,
     original: String,
 }
 
-/// A per-session set of MCP clients plus the tools they expose. Built once per
-/// `session/new` (and per `session/load` rebuild); `shutdown` tears every
-/// client down on `session/delete` / process exit.
-pub struct McpBridge {
-    clients: Vec<Arc<ClientRuntime>>,
-    tools: Vec<ToolSchema>,
+#[derive(Default)]
+struct BridgeRuntime {
+    leases: Vec<PoolLease>,
     routes: HashMap<String, Route>,
+}
+
+/// A per-session set of MCP client leases plus the tools they expose. Built
+/// once per `session/new` (and per `session/load` rebuild); `shutdown` releases
+/// every lease on `session/delete` / process exit. The pool tears the runtime
+/// down when its final cross-session lease is released.
+pub struct McpBridge {
+    pool: McpClientPool,
+    runtime: tokio::sync::RwLock<BridgeRuntime>,
+    tools: Vec<ToolSchema>,
     analytics: Option<Arc<AnalyticsStore>>,
     external_session_id: Option<String>,
     call_timeout: Duration,
@@ -90,10 +296,11 @@ impl McpBridge {
     /// tools and never claims a tool name.
     #[cfg(test)]
     pub fn empty() -> Self {
+        let pool = McpClientPool::new();
         Self {
-            clients: Vec::new(),
+            pool,
+            runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
-            routes: HashMap::new(),
             analytics: None,
             external_session_id: None,
             call_timeout: Duration::from_secs(0),
@@ -105,6 +312,7 @@ impl McpBridge {
     /// skipped). Results are registered in forwarded order so network timing
     /// cannot change collision suffixes. `native_tool_names` are the daimonos
     /// tool names that must always win a name collision.
+    #[cfg(test)]
     pub async fn build(
         specs: Vec<ServerSpec>,
         cfg: &AcpMcpConfig,
@@ -112,10 +320,36 @@ impl McpBridge {
         analytics: Option<Arc<AnalyticsStore>>,
         external_session_id: Option<String>,
     ) -> Self {
+        Self::build_with_pool(
+            specs,
+            cfg,
+            native_tool_names,
+            analytics,
+            external_session_id,
+            McpClientPool::new(),
+        )
+        .await
+    }
+
+    /// Build using a process-shared client pool. When pooling is disabled in
+    /// config, a private pool preserves the original per-session isolation.
+    pub async fn build_with_pool(
+        specs: Vec<ServerSpec>,
+        cfg: &AcpMcpConfig,
+        native_tool_names: &HashSet<String>,
+        analytics: Option<Arc<AnalyticsStore>>,
+        external_session_id: Option<String>,
+        shared_pool: McpClientPool,
+    ) -> Self {
+        let pool = if cfg.shared_pool_enabled {
+            shared_pool
+        } else {
+            McpClientPool::new()
+        };
         let mut bridge = Self {
-            clients: Vec::new(),
+            pool: pool.clone(),
+            runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
-            routes: HashMap::new(),
             analytics,
             external_session_id,
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
@@ -133,10 +367,13 @@ impl McpBridge {
                 .into_iter()
                 .take(cfg.max_servers)
                 .enumerate()
-                .map(|(index, spec)| async move {
-                    let server_name = spec.name().to_string();
-                    let outcome = connect(&spec, cfg, init_timeout).await;
-                    (index, server_name, outcome)
+                .map(|(index, spec)| {
+                    let pool = pool.clone();
+                    async move {
+                        let server_name = spec.name().to_string();
+                        let outcome = pool.acquire(&spec, cfg, init_timeout).await;
+                        (index, server_name, outcome)
+                    }
                 });
         let mut outcomes = stream::iter(connect_futures)
             .buffer_unordered(concurrency)
@@ -146,10 +383,10 @@ impl McpBridge {
 
         for (_, server_name, outcome) in outcomes {
             match outcome {
-                Ok((client, tools)) => {
-                    let client_idx = bridge.clients.len();
+                Ok(lease) => {
+                    let lease_idx = bridge.runtime.get_mut().leases.len();
                     let mut registered_any = false;
-                    for tool in tools.into_iter().take(cfg.max_tools_per_server) {
+                    for tool in lease.tools.iter().take(cfg.max_tools_per_server) {
                         let Some(exposed) =
                             resolve_name(&server_name, &tool.name, native_tool_names, &mut used)
                         else {
@@ -170,20 +407,20 @@ impl McpBridge {
                             description,
                             input_schema,
                         });
-                        bridge.routes.insert(
+                        bridge.runtime.get_mut().routes.insert(
                             exposed,
                             Route {
-                                client: client_idx,
-                                original: tool.name,
+                                lease: lease_idx,
+                                original: tool.name.clone(),
                             },
                         );
                         registered_any = true;
                     }
                     if registered_any {
-                        bridge.clients.push(client);
+                        bridge.runtime.get_mut().leases.push(lease);
                     } else {
                         // Contributed no tools — don't keep an idle client.
-                        let _ = client.shut_down().await;
+                        bridge.pool.release(lease).await;
                     }
                 }
                 Err(e) => {
@@ -202,21 +439,32 @@ impl McpBridge {
     /// Number of connected servers (clients that contributed ≥1 tool).
     #[cfg(test)]
     pub fn server_count(&self) -> usize {
-        self.clients.len()
+        self.runtime
+            .try_read()
+            .expect("test must not inspect bridge during a call/shutdown")
+            .leases
+            .len()
     }
 
     /// Whether `name` is a remote tool this bridge serves.
     #[cfg(test)]
     pub fn handles(&self, name: &str) -> bool {
-        self.routes.contains_key(name)
+        self.runtime
+            .try_read()
+            .expect("test must not inspect bridge during a call/shutdown")
+            .routes
+            .contains_key(name)
     }
 
     /// Dispatch a remote tool call. Returns `None` if `name` is not a remote
     /// tool (so the caller falls through to native handling); `Some` with an
     /// error outcome when the call itself fails or times out.
     pub async fn call(&self, name: &str, input: &Value) -> Option<RemoteToolOutcome> {
-        let route = self.routes.get(name)?;
-        let client = self.clients.get(route.client)?;
+        // Hold a read lease through the request. Shutdown takes the write lock,
+        // so it waits for in-flight calls, clears routes, then releases clients.
+        let runtime = self.runtime.read().await;
+        let route = runtime.routes.get(name)?;
+        let client = &runtime.leases.get(route.lease)?.client;
         let params = CallToolRequestParams {
             name: route.original.clone(),
             arguments: input.as_object().cloned(),
@@ -249,12 +497,15 @@ impl McpBridge {
         Some(outcome)
     }
 
-    /// Shut down every client (and, for stdio, reap the child process). Called
-    /// on `session/delete` and process exit.
+    /// Release every pooled-client lease. The last release shuts down the MCP
+    /// runtime and (for stdio) reaps the child process. Idempotent.
     pub async fn shutdown(&self) {
-        for client in &self.clients {
-            let _ = client.shut_down().await;
-        }
+        let leases = {
+            let mut runtime = self.runtime.write().await;
+            runtime.routes.clear();
+            std::mem::take(&mut runtime.leases)
+        };
+        future::join_all(leases.into_iter().map(|lease| self.pool.release(lease))).await;
     }
 
     fn record(&self, name: &str, request_chars: usize, response_chars: usize, elapsed: Duration) {
@@ -482,6 +733,40 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn server_key_ignores_name_and_map_insertion_order() {
+        let first = ServerSpec::Stdio {
+            name: "linear-primary".to_string(),
+            command: "server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::from([
+                ("TOKEN".to_string(), "secret".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ]),
+        };
+        let second = ServerSpec::Stdio {
+            name: "linear-alias".to_string(),
+            command: "server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::from([
+                ("MODE".to_string(), "prod".to_string()),
+                ("TOKEN".to_string(), "secret".to_string()),
+            ]),
+        };
+        assert!(ServerKey::from(&first) == ServerKey::from(&second));
+
+        let different_credentials = ServerSpec::Stdio {
+            name: "linear-primary".to_string(),
+            command: "server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::from([
+                ("TOKEN".to_string(), "different".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ]),
+        };
+        assert!(ServerKey::from(&first) != ServerKey::from(&different_credentials));
+    }
+
     // --- namespaced_name ---
 
     #[test]
@@ -657,7 +942,10 @@ mod tests {
                 name: format!("asleep-{index}"),
                 command: "sleep".to_string(),
                 args: vec!["30".to_string()],
-                env: HashMap::new(),
+                // Distinct inert env values make these distinct transport
+                // configs. Identical configs are intentionally serialized and
+                // deduplicated by the shared pool (#1008).
+                env: HashMap::from([("TEST_SERVER_INDEX".to_string(), index.to_string())]),
             })
             .collect();
 
@@ -797,6 +1085,169 @@ mod tests {
         );
 
         bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shared_pool_deduplicates_concurrent_bridges_and_releases_last_lease() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("pooled-marker.txt"), "shared").unwrap();
+        let spec = |name: &str| ServerSpec::Stdio {
+            name: name.to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 30,
+            call_timeout_secs: 30,
+            shared_pool_enabled: true,
+            ..AcpMcpConfig::default()
+        };
+        let pool = McpClientPool::new();
+        let native = native_set(&[]);
+
+        let (first, second) = tokio::join!(
+            McpBridge::build_with_pool(
+                vec![spec("first")],
+                &cfg,
+                &native,
+                None,
+                Some("session-first".to_string()),
+                pool.clone(),
+            ),
+            McpBridge::build_with_pool(
+                vec![spec("second")],
+                &cfg,
+                &native,
+                None,
+                Some("session-second".to_string()),
+                pool.clone(),
+            )
+        );
+
+        assert_eq!(pool.entry_count().await, 1);
+        assert_eq!(pool.lease_count().await, 2);
+        assert_eq!(first.server_count(), 1);
+        assert_eq!(second.server_count(), 1);
+        assert!(first.handles("mcp__first__ls"));
+        assert!(second.handles("mcp__second__ls"));
+
+        first.shutdown().await;
+        assert_eq!(pool.entry_count().await, 1);
+        assert_eq!(pool.lease_count().await, 1);
+        let outcome = second
+            .call("mcp__second__ls", &serde_json::json!({}))
+            .await
+            .expect("second bridge should still route");
+        assert!(
+            !outcome.is_error && outcome.content.contains("pooled-marker.txt"),
+            "remaining lease should keep shared client alive: {}",
+            outcome.content
+        );
+
+        second.shutdown().await;
+        assert_eq!(pool.entry_count().await, 0);
+        assert_eq!(pool.lease_count().await, 0);
+        assert!(second
+            .call("mcp__second__ls", &serde_json::json!({}))
+            .await
+            .is_none());
+        // Idempotent repeated teardown must not underflow lease counts.
+        second.shutdown().await;
+        assert_eq!(pool.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_pool_does_not_cache_failed_connections() {
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 1,
+            shared_pool_enabled: true,
+            ..AcpMcpConfig::default()
+        };
+        let pool = McpClientPool::new();
+        let bad = ServerSpec::Stdio {
+            name: "broken".to_string(),
+            command: "daimonos-nonexistent-binary-xyz".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+
+        let bridge =
+            McpBridge::build_with_pool(vec![bad], &cfg, &native_set(&[]), None, None, pool.clone())
+                .await;
+
+        assert_eq!(bridge.server_count(), 0);
+        assert_eq!(pool.entry_count().await, 0);
+        assert_eq!(pool.lease_count().await, 0);
+
+        // A later acquisition prunes stale Weak slots before inserting its
+        // own, so repeated failures across distinct configs remain bounded.
+        let other_bad = ServerSpec::Stdio {
+            name: "also-broken".to_string(),
+            command: "another-nonexistent-binary-xyz".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let other_bridge = McpBridge::build_with_pool(
+            vec![other_bad],
+            &cfg,
+            &native_set(&[]),
+            None,
+            None,
+            pool.clone(),
+        )
+        .await;
+        assert_eq!(other_bridge.server_count(), 0);
+        assert!(pool.slot_count().await <= 1);
+    }
+
+    #[tokio::test]
+    async fn shared_pool_config_opt_out_uses_private_pool() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "isolated".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+        let cfg = AcpMcpConfig {
+            init_timeout_secs: 30,
+            shared_pool_enabled: false,
+            ..AcpMcpConfig::default()
+        };
+        let process_pool = McpClientPool::new();
+
+        let bridge = McpBridge::build_with_pool(
+            vec![spec],
+            &cfg,
+            &native_set(&[]),
+            None,
+            None,
+            process_pool.clone(),
+        )
+        .await;
+
+        assert_eq!(bridge.server_count(), 1);
+        assert_eq!(process_pool.entry_count().await, 0);
+        assert_eq!(bridge.pool.entry_count().await, 1);
+        bridge.shutdown().await;
+        assert_eq!(bridge.pool.entry_count().await, 0);
     }
 
     #[tokio::test]

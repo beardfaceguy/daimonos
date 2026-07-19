@@ -187,6 +187,9 @@ pub struct AcpMcpConfig {
     pub allow_stdio: bool,
     /// Accept + advertise HTTP-transport MCP servers (url/headers).
     pub allow_http: bool,
+    /// Reuse identical initialized clients across ACP sessions in one process.
+    /// Disable for servers that intentionally require per-chat state isolation.
+    pub shared_pool_enabled: bool,
     /// Per-server budget (seconds) for the initialize + tools/list handshake.
     /// A server that exceeds it is skipped (fail-open); the session proceeds
     /// with the remaining servers and all native tools.
@@ -212,6 +215,7 @@ impl Default for AcpMcpConfig {
             enabled: true,
             allow_stdio: true,
             allow_http: true,
+            shared_pool_enabled: true,
             init_timeout_secs: 10,
             call_timeout_secs: 60,
             max_servers: 32,
@@ -902,6 +906,7 @@ mod tests {
         assert!(cfg.acp.mcp.enabled);
         assert!(cfg.acp.mcp.allow_stdio);
         assert!(cfg.acp.mcp.allow_http);
+        assert!(cfg.acp.mcp.shared_pool_enabled);
         assert_eq!(cfg.acp.mcp.init_timeout_secs, 10);
         assert_eq!(cfg.acp.mcp.call_timeout_secs, 60);
         assert!(cfg.acp.mcp.max_servers > 0);
@@ -913,11 +918,12 @@ mod tests {
     #[test]
     fn acp_mcp_parses_overrides() {
         let cfg: Config = toml::from_str(
-            "[acp.mcp]\nenabled = false\nallow_http = false\ninit_timeout_secs = 3\nmax_servers = 4\nmax_concurrent_connects = 2\n",
+            "[acp.mcp]\nenabled = false\nallow_http = false\nshared_pool_enabled = false\ninit_timeout_secs = 3\nmax_servers = 4\nmax_concurrent_connects = 2\n",
         )
         .unwrap();
         assert!(!cfg.acp.mcp.enabled);
         assert!(!cfg.acp.mcp.allow_http);
+        assert!(!cfg.acp.mcp.shared_pool_enabled);
         assert!(cfg.acp.mcp.allow_stdio);
         assert_eq!(cfg.acp.mcp.init_timeout_secs, 3);
         assert_eq!(cfg.acp.mcp.max_servers, 4);

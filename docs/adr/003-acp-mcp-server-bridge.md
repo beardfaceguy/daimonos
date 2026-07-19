@@ -2,8 +2,9 @@
 
 **Date:** 2026-07-18
 **Status:** Accepted
-**Tracks:** vikunja #990 (consume `mcp_servers` from Zed), #982 (Zed integration analysis, precursor)
-**Relates to:** #1008 (deferred shared-pool/dedup optimization), ADR-001 (provider boundary),
+**Tracks:** vikunja #990 (consume `mcp_servers` from Zed), #1008 (shared client pool), #982 (Zed
+integration analysis, precursor)
+**Relates to:** ADR-001 (provider boundary),
 the tool facade (`src/tool_facade.rs`) and ACP frontend (`src/acp_cmd.rs`)
 
 ## Problem
@@ -49,13 +50,19 @@ top-level crate is added; `streamable-http`/`sse` pull a few transitive crates (
 client was rejected: it duplicates protocol code the SDK already provides and that the daimonos
 *server* half already relies on.
 
-### D2 — Per-session clients, not a shared pool
+### D2 — Shared client pool with per-session leases and routes
 
-Each ACP session builds its own set of MCP clients from that session's forwarded `mcp_servers`.
-Rationale: Zed forwards `mcp_servers` per session; different chat threads / projects can differ;
-lifecycle and failure isolation bind naturally to the session. Cross-session dedup of identical
-configs (one stdio process shared by N threads) is deferred to **#1008** — it is a pure
-optimization and must preserve the isolation and analytics guarantees below.
+Each ACP session still builds its own bridge, tool names/routes, permission flow, and analytics
+attribution from that session's forwarded `mcp_servers`. Identical transport configurations
+(stdio command+args+sorted env, or HTTP URL+sorted headers) acquire leases on one process-wide
+initialized client and cached `tools/list` result (#1008). Display names are excluded from the key,
+so sessions may alias one server differently without spawning duplicate processes/connections.
+
+Acquisition is synchronized per key: concurrent sessions deduplicate the same server while
+different servers still connect concurrently. Failed connections are not cached. Releasing a
+session decrements explicit lease counts; the last release shuts down the runtime and reaps stdio
+children. `shared_pool_enabled=false` gives a bridge a private pool for servers that intentionally
+require per-chat state isolation.
 
 ### D3 — Fail-open per server (failure isolation)
 
@@ -69,6 +76,11 @@ turn.
 Server handshakes run concurrently with bounded fan-out (`max_concurrent_connects`). Completed
 connections are collected and then registered in their original forwarded-server order, so network
 timing cannot change collision suffixes or route names (#1013).
+
+A shared client's runtime failure can make calls fail in every leasing session, but each failure is
+still returned as an error tool result and never aborts the ACP process. The pool does not
+transparently reconnect or replay server state; a later acquisition retries only after the failed
+entry has no remaining leases and is released.
 
 ### D4 — Collision-safe tool names: `mcp__{server}__{tool}`
 
@@ -170,6 +182,8 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
   and spawned processes bounded (bounded-collections rule).
 - `max_concurrent_connects` (usize, default `8`) — bounds simultaneous initialize/list handshakes;
   registration remains deterministic in forwarded order.
+- `shared_pool_enabled` (bool, default `true`) — reuse identical initialized clients across ACP
+  sessions; disable for intentionally session-stateful servers.
 - (transport enables) `allow_stdio` / `allow_http` (bool, default `true`) — advertise + accept
   each transport.
 
@@ -204,7 +218,6 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
 
 ## Out of scope
 
-- Cross-session client dedup / shared pool (**#1008**).
 - MCP resources/prompts/roots from remote servers (only `tools/*` is bridged here).
 - Persisting remote server configs across restarts (Zed re-sends them; D9).
 - The `unstable_mcp_over_acp` (`McpServer::Acp`) variant.
