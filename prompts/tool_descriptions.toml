@@ -1,20 +1,34 @@
-# Top-level tool descriptions shown to models. `full` is used by agent
-# runtimes and full-verbosity MCP schemas. Optional `terse` text replaces it
-# in compact/terse MCP list_tools responses.
+# Tool text shown to models. `full` is used by agent runtimes and
+# full-verbosity MCP schemas. Optional `terse` text replaces it in
+# compact/terse MCP list_tools responses. Nested `[tool.parameters]` tables
+# supply descriptions for top-level JSON Schema properties.
 
 [read_file]
 full = """Read file. Returns {content, lines} or {unchanged:true, lines} if already read and unmodified."""
 terse = """Read file → {content, lines}."""
 
+[read_file.parameters]
+path = "Relative path"
+offset = "Start line (0-based)"
+limit = "Max lines"
 [write_file]
 full = """Write file, creating parent dirs."""
 
+[write_file.parameters]
+path = "Relative path"
 [edit_file]
 full = """String-replace edits. Returns {applied, diffs} confirming each change."""
 
+[edit_file.parameters]
+path = "Relative path"
+edits = "[old, new, old, new, ...] pairs"
 [search]
 full = """Regex content search or trigram file-name search."""
 
+[search.parameters]
+mode = "Default: content"
+path = "Scope dir"
+glob = "e.g. *.rs"
 [workspace_info]
 full = """Detailed workspace info (session state, root listing, index stats). Basic info is already in server instructions — only call if you need index stats or full detail."""
 terse = """Workspace info: session, root listing, index stats."""
@@ -31,18 +45,27 @@ terse = """Run 2+ independent tools in one call; get_tool_schema for shape."""
 full = """Get full inputSchema for tool(s). Call before using a tool whose schema was not in list_tools."""
 terse = """Get full inputSchema for tool(s) before use."""
 
+[get_tool_schema.parameters]
+tools = "Tool name(s)"
 [execute_script]
 full = """Run a Starlark (Python-subset) script with all tools as built-in functions. Intermediate results stay in the sandbox; only `result` variable is returned. Much cheaper than sequential tool calls."""
 terse = """Run a Starlark script; all tools as functions; returns `result`. Cheaper than sequential calls."""
 
+[execute_script.parameters]
+code = "Starlark source. Set `result` variable for output."
+timeout = "Max seconds (default: 60)"
 [kgl_query]
 full = """Query the KGL knowledge graph to orient in a codebase WITHOUT reading source: find defs by intent/name, trace dependencies and calls, see what state a def reads/mutates, list open questions left by prior agents, and compute blast radius. Action 'index' (re)builds the graph from the workspace; 'check' reports KGL-completeness."""
 terse = """Query KGL graph: find defs, deps, calls, state, open questions, blast radius; index/check."""
 
+[kgl_query.parameters]
+args = "orient needs {task} (one bundled call: matching defs + intent/open-questions + edges + dependents — prefer this for orientation); node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
 [kgl_assert]
 full = """Declare the non-derivable KGL layer for a def: its intent/purpose (+ rationale, open questions), authoring provenance, or a typed edge (reads/mutates/calls/depends_on). This is how an authoring agent records WHY code exists and what it touches — the part no derived graph provides. Get the target def 'hash' from kgl_query find/node."""
 terse = """Declare KGL layer for a def: intent, provenance, or typed edge."""
 
+[kgl_assert.parameters]
+args = "intent: {hash, purpose, rationale?, open_questions?[]}; provenance: {hash, authored_by, session_id?, assumptions?[], supersedes?[]}; declare_edge: {from, to, kind} where kind is one of calls|depends_on|reads|mutates (snake_case)."
 [list_tool_signatures]
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 
@@ -50,61 +73,151 @@ full = """Python-style function signatures for all tool bindings available in ex
 full = """Git operations. Commands: status, log, diff, branch, add, commit, push, pull, checkout. All args besides 'command' are passed through."""
 terse = """Git: status, log, diff, branch, add, commit, push, pull, checkout."""
 
+[git.parameters]
+message = "commit: message"
+all = "commit: auto-stage (-a)"
+limit = "log: max commits (default 10)"
+oneline = "log: compact format (hash + subject per line)"
+path = "log: filter by path"
+mode = "diff: scope"
+paths = "add: files (default [\".\"])"
+branch = "checkout/push/pull: branch"
+create = "checkout: create new branch (-b)"
+files = "checkout: restore files"
+remote = "push/pull: remote (default origin)"
+set_upstream = "push: -u flag"
+rebase = "pull: --rebase"
 [cargo]
 full = """Cargo operations. Commands: test, build, check, clippy, fmt, add."""
 terse = """Cargo: test, build, check, clippy, fmt, add."""
 
+[cargo.parameters]
+package = "Target package (--package)"
+filter = "test: name filter"
+lib = "test: --lib flag"
+release = "build/check: --release flag"
+dev = "add: --dev flag"
 [pytest]
 full = """Python test runner. Commands: run (passed/failed/skipped + failure ids), collect (--collect-only test ids)."""
 terse = """Python tests: run, collect."""
 
+[pytest.parameters]
+path = "Test file or directory (default: pytest's auto-discovery)"
+filter = "run: -k expression (test name selector)"
+markers = "run: -m expression (marker selector)"
+verbose = "run: -v flag"
+failfast = "run: -x flag (stop on first failure)"
 [gh]
 full = """GitHub CLI (structured). Commands: pr_view, pr_list, pr_create, pr_diff, pr_checks, pr_merge, pr_checkout, run_list, run_view, issue_list, issue_view, issue_create, issue_comment, api, raw (arbitrary gh args)."""
 terse = """GitHub: pr_view/list/create/diff/checks/merge/checkout, run_list/view, issue_list/view/create/comment, api, raw."""
 
+[gh.parameters]
+number = "pr_view/pr_diff/pr_checks/pr_merge/pr_checkout/issue_view/issue_comment: PR or issue number (PR ops default to current branch)"
+state = "pr_list/issue_list: filter (default open; 'merged' is PR-only)"
+limit = "pr_list/run_list/issue_list: max results"
+author = "pr_list/issue_list: filter by author"
+title = "pr_create/issue_create: title (required)"
+body = "pr_create/pr_merge/issue_create/issue_comment: body text"
+base = "pr_create: base branch"
+draft = "pr_create: create as draft"
+merge_method = "pr_merge: merge strategy (default merge)"
+delete_branch = "pr_merge: delete the head branch after merge"
+subject = "pr_merge: commit subject line"
+branch = "pr_checkout: branch to check out; run_list: filter by branch"
+workflow = "run_list: filter by workflow name or file"
+status = "run_list: filter by run status (e.g. in_progress, completed)"
+run_id = "run_view: run databaseId (from run_list)"
+label = "issue_list/issue_create: label filter or label to add"
+args = "raw: full gh argv, e.g. [\"pr\", \"merge\", \"6\", \"--squash\"]"
+endpoint = "api: REST endpoint (e.g. repos/{owner}/{repo}/pulls)"
+method = "api: HTTP method (default GET)"
 [docker]
 full = """Docker operations. Commands: ps, logs, exec, images, inspect, stop, compose_up, compose_down, compose_ps."""
 terse = """Docker: ps, logs, exec, images, inspect, stop, compose_up/down/ps."""
 
+[docker.parameters]
+container = "logs/exec/inspect/stop: container name or id"
+tail = "logs: max lines (default 50)"
+file = "compose_*: path to compose file (-f)"
+detach = "compose_up: run detached (default true)"
 [curl]
 full = """HTTP request. Returns {status, headers, body (capped 16KB), timing_ms, url, method}. Auto-registered when curl is on PATH."""
 terse = """HTTP request → {status, headers, body, timing_ms}."""
 
+[curl.parameters]
+url = "Request URL (required)"
+method = "HTTP method (default: GET)"
+headers = "Request headers as key-value pairs, e.g. Content-Type: application/json"
+body = "Request body"
+timeout = "Timeout in seconds (default: 10)"
 [shellcheck]
 full = """Lint shell scripts via shellcheck. Returns {clean, diagnostics:[{file,line,col,level,code,message}]}. Auto-registered when shellcheck is on PATH."""
 terse = """Lint shell scripts → {clean, diagnostics}."""
 
+[shellcheck.parameters]
+file = "Path to a single script to check"
+files = "Paths to multiple scripts to check"
+shell = "Shell dialect (default: bash)"
 [npm]
 full = """npm package manager. Commands: install, run, test, build, audit. Returns {exit, ok, stdout, stderr} or {clean, vulnerabilities, findings} for audit. Auto-registered when npm is on PATH."""
 terse = """npm: install, run, test, build, audit."""
 
+[npm.parameters]
+command = "npm command to run"
+script = "Script name for 'run' command (e.g. lint, dev)"
 [discord]
 full = """Discord read-only operations. Commands: list_guilds, list_channels, read_messages, search_messages."""
 terse = """Discord read-only: list_guilds, list_channels, read_messages, search_messages."""
 
+[discord.parameters]
+guild_id = "list_channels: allowlisted guild id"
+channel_id = "read_messages: allowlisted channel id"
+query = "search_messages: case-insensitive substring query"
+limit = "read_messages/search_messages: max messages to fetch (clamped by config)"
+analytics_tag = "Optional analytics tag suffix for session_stats attribution"
 [snapshot]
 full = """Workspace snapshots. Actions: create (returns id), restore (rolls back), list, delete."""
 terse = """Workspace snapshots: create, restore, list, delete."""
 
+[snapshot.parameters]
+id = "restore/delete: snapshot id"
+tag = "create: optional label"
 [set_cwd]
 full = """Change working directory for all subsequent operations. Returns {cwd, previous}."""
 
+[set_cwd.parameters]
+path = "New working directory (absolute or relative to current cwd)"
 [ls]
 full = """List directory. Returns [{n,d,s}]. Skips .git/node_modules/target/__pycache__. Use glob to filter by filename pattern (e.g. *.rs), type to restrict to files (f) or dirs (d)."""
 terse = """List dir → [{n,d,s}]; skips vcs/build dirs; glob/type filters."""
 
+[ls.parameters]
+path = "Dir path (default: cwd)"
+depth = "Depth 1-5 (default: 1)"
+glob = "Filename glob filter, e.g. *.rs or test_*.py"
+type = "f=files only, d=dirs only"
+all = "Show dotfiles"
+stat = "Add mode+mtime"
 [session_stats]
 full = """Token analytics. Scopes: session (current totals), history (cross-session), daily (trend). Optional external_session_id filters history/daily to a single agent-runtime session id."""
 terse = """Token analytics: session, history, daily."""
 
+[session_stats.parameters]
+scope = "Default: session"
+days = "history/daily: lookback days (default 30)"
+external_session_id = "history/daily: restrict to this agent-runtime session id"
 [set_external_session_id]
 full = """Attach an agent-runtime session id (e.g. claude `--session-id` UUID) to every subsequent analytics row from this connection. Use to correlate daimonos analytics with the agent's own usage logs. Pass an empty string to clear."""
 terse = """Attach agent-runtime session id to analytics rows."""
 
+[set_external_session_id.parameters]
+id = "Agent-runtime session identifier; empty string clears."
 [set_verbosity]
 full = """Set this session's output verbosity: full (default, most detail), compact (tighter caps), terse (minimum viable — counts, exit codes, first error). Trades tool-output tokens for detail. Returns {verbosity, previous}."""
 terse = """Set output verbosity: full|compact|terse."""
 
+[set_verbosity.parameters]
+level = "Target verbosity level."
 [list_all_tools]
 full = """Show all available tools including extended ones (diff, pipelines, repair). Call once to unlock them."""
 terse = """Unlock extended tools (diff, pipelines, repair)."""
@@ -112,8 +225,13 @@ terse = """Unlock extended tools (diff, pipelines, repair)."""
 [diff_files]
 full = """Structured diff: hunks with =, +, - tagged lines."""
 
+[diff_files.parameters]
+content_b = "Alt: diff against string"
 [tool_pipeline]
 full = """Run tool stages sequentially, abort on failure."""
 
 [tool_repair]
 full = """Auto lint-fix loop until clean."""
+
+[tool_repair.parameters]
+max_iterations = "Default: 3"

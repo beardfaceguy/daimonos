@@ -30,7 +30,7 @@ pub fn active_schemas(
         .map(|t| NeutralToolSchema {
             name: t.name.to_string(),
             description: descriptions.full_or_name(t.name).to_string(),
-            input_schema: t.schema.clone(),
+            input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
         })
         .collect()
 }
@@ -123,9 +123,12 @@ mod tests {
     async fn active_schemas_use_runtime_description_override() {
         let dir = tempfile::tempdir().unwrap();
         let catalog_path = dir.path().join("tools.toml");
-        tokio::fs::write(&catalog_path, "[read_file]\nfull = \"CUSTOM AGENT READ\"\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            &catalog_path,
+            "[read_file]\nfull = \"CUSTOM AGENT READ\"\n\n[read_file.parameters]\npath = \"CUSTOM AGENT PATH\"\n",
+        )
+        .await
+        .unwrap();
         let descriptions = crate::tool_descriptions::ToolDescriptions::load(Some(
             catalog_path.to_string_lossy().as_ref(),
         ))
@@ -135,6 +138,10 @@ mod tests {
             .find(|schema| schema.name == "read_file")
             .unwrap();
         assert_eq!(read.description, "CUSTOM AGENT READ");
+        assert_eq!(
+            read.input_schema["properties"]["path"]["description"],
+            "CUSTOM AGENT PATH"
+        );
     }
 
     #[test]

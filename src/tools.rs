@@ -73,9 +73,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
-                    "offset": {"type": "integer", "description": "Start line (0-based)"},
-                    "limit": {"type": "integer", "description": "Max lines"}
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"}
                 },
                 "required": ["path"]
             }),
@@ -96,7 +96,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
+                    "path": {"type": "string"},
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"]
@@ -117,11 +117,10 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path"},
+                    "path": {"type": "string"},
                     "edits": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "[old, new, old, new, ...] pairs"
                     }
                 },
                 "required": ["path", "edits"]
@@ -143,9 +142,9 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["content", "files"], "description": "Default: content"},
-                    "path": {"type": "string", "description": "Scope dir"},
-                    "glob": {"type": "string", "description": "e.g. *.rs"},
+                    "mode": {"type": "string", "enum": ["content", "files"]},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
                     "max_results": {"type": "integer"}
                 },
                 "required": ["pattern"]
@@ -236,7 +235,6 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "tools": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Tool name(s)"
                     }
                 },
                 "required": ["tools"]
@@ -250,8 +248,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Starlark source. Set `result` variable for output."},
-                    "timeout": {"type": "integer", "description": "Max seconds (default: 60)"}
+                    "code": {"type": "string"},
+                    "timeout": {"type": "integer"}
                 },
                 "required": ["code"]
             }),
@@ -270,7 +268,6 @@ pub fn all_tools() -> Vec<ToolDef> {
                     },
                     "args": {
                         "type": "object",
-                        "description": "orient needs {task} (one bundled call: matching defs + intent/open-questions + edges + dependents — prefer this for orientation); node/neighbors/blast_radius need {hash}; find needs {q}; writers_of needs {resource}; neighbors optional {kind,dir}; check optional {mode}."
                     }
                 },
                 "required": ["query"]
@@ -290,7 +287,6 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "action": {"type": "string", "enum": ["intent", "provenance", "declare_edge"]},
                     "args": {
                         "type": "object",
-                        "description": "intent: {hash, purpose, rationale?, open_questions?[]}; provenance: {hash, authored_by, session_id?, assumptions?[], supersedes?[]}; declare_edge: {from, to, kind} where kind is one of calls|depends_on|reads|mutates (snake_case)."
                     }
                 },
                 "required": ["action"]
@@ -313,19 +309,19 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout"]},
-                    "message": {"type": "string", "description": "commit: message"},
-                    "all": {"type": "boolean", "description": "commit: auto-stage (-a)"},
-                    "limit": {"type": "integer", "description": "log: max commits (default 10)"},
-                    "oneline": {"type": "boolean", "description": "log: compact format (hash + subject per line)"},
-                    "path": {"type": "string", "description": "log: filter by path"},
-                    "mode": {"type": "string", "enum": ["unstaged", "staged"], "description": "diff: scope"},
-                    "paths": {"type": "array", "items": {"type": "string"}, "description": "add: files (default [\".\"])"},
-                    "branch": {"type": "string", "description": "checkout/push/pull: branch"},
-                    "create": {"type": "boolean", "description": "checkout: create new branch (-b)"},
-                    "files": {"type": "array", "items": {"type": "string"}, "description": "checkout: restore files"},
-                    "remote": {"type": "string", "description": "push/pull: remote (default origin)"},
-                    "set_upstream": {"type": "boolean", "description": "push: -u flag"},
-                    "rebase": {"type": "boolean", "description": "pull: --rebase"}
+                    "message": {"type": "string"},
+                    "all": {"type": "boolean"},
+                    "limit": {"type": "integer"},
+                    "oneline": {"type": "boolean"},
+                    "path": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["unstaged", "staged"]},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "branch": {"type": "string"},
+                    "create": {"type": "boolean"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "remote": {"type": "string"},
+                    "set_upstream": {"type": "boolean"},
+                    "rebase": {"type": "boolean"}
                 },
                 "required": ["command"]
             }),
@@ -339,11 +335,11 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["test", "build", "check", "clippy", "fmt", "add"]},
-                    "package": {"type": "string", "description": "Target package (--package)"},
-                    "filter": {"type": "string", "description": "test: name filter"},
-                    "lib": {"type": "boolean", "description": "test: --lib flag"},
-                    "release": {"type": "boolean", "description": "build/check: --release flag"},
-                    "dev": {"type": "boolean", "description": "add: --dev flag"}
+                    "package": {"type": "string"},
+                    "filter": {"type": "string"},
+                    "lib": {"type": "boolean"},
+                    "release": {"type": "boolean"},
+                    "dev": {"type": "boolean"}
                 },
                 "required": ["command"]
             }),
@@ -357,11 +353,11 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["run", "collect"]},
-                    "path": {"type": "string", "description": "Test file or directory (default: pytest's auto-discovery)"},
-                    "filter": {"type": "string", "description": "run: -k expression (test name selector)"},
-                    "markers": {"type": "string", "description": "run: -m expression (marker selector)"},
-                    "verbose": {"type": "boolean", "description": "run: -v flag"},
-                    "failfast": {"type": "boolean", "description": "run: -x flag (stop on first failure)"}
+                    "path": {"type": "string"},
+                    "filter": {"type": "string"},
+                    "markers": {"type": "string"},
+                    "verbose": {"type": "boolean"},
+                    "failfast": {"type": "boolean"}
                 },
                 "required": ["command"]
             }),
@@ -383,25 +379,25 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["pr_view", "pr_list", "pr_create", "pr_diff", "pr_checks", "pr_merge", "pr_checkout", "run_list", "run_view", "issue_list", "issue_view", "issue_create", "issue_comment", "api", "raw"]},
-                    "number": {"type": "integer", "description": "pr_view/pr_diff/pr_checks/pr_merge/pr_checkout/issue_view/issue_comment: PR or issue number (PR ops default to current branch)"},
-                    "state": {"type": "string", "enum": ["open", "closed", "merged", "all"], "description": "pr_list/issue_list: filter (default open; 'merged' is PR-only)"},
-                    "limit": {"type": "integer", "description": "pr_list/run_list/issue_list: max results"},
-                    "author": {"type": "string", "description": "pr_list/issue_list: filter by author"},
-                    "title": {"type": "string", "description": "pr_create/issue_create: title (required)"},
-                    "body": {"type": "string", "description": "pr_create/pr_merge/issue_create/issue_comment: body text"},
-                    "base": {"type": "string", "description": "pr_create: base branch"},
-                    "draft": {"type": "boolean", "description": "pr_create: create as draft"},
-                    "merge_method": {"type": "string", "enum": ["merge", "squash", "rebase"], "description": "pr_merge: merge strategy (default merge)"},
-                    "delete_branch": {"type": "boolean", "description": "pr_merge: delete the head branch after merge"},
-                    "subject": {"type": "string", "description": "pr_merge: commit subject line"},
-                    "branch": {"type": "string", "description": "pr_checkout: branch to check out; run_list: filter by branch"},
-                    "workflow": {"type": "string", "description": "run_list: filter by workflow name or file"},
-                    "status": {"type": "string", "description": "run_list: filter by run status (e.g. in_progress, completed)"},
-                    "run_id": {"type": "integer", "description": "run_view: run databaseId (from run_list)"},
-                    "label": {"type": "string", "description": "issue_list/issue_create: label filter or label to add"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "raw: full gh argv, e.g. [\"pr\", \"merge\", \"6\", \"--squash\"]"},
-                    "endpoint": {"type": "string", "description": "api: REST endpoint (e.g. repos/{owner}/{repo}/pulls)"},
-                    "method": {"type": "string", "description": "api: HTTP method (default GET)"}
+                    "number": {"type": "integer"},
+                    "state": {"type": "string", "enum": ["open", "closed", "merged", "all"]},
+                    "limit": {"type": "integer"},
+                    "author": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "base": {"type": "string"},
+                    "draft": {"type": "boolean"},
+                    "merge_method": {"type": "string", "enum": ["merge", "squash", "rebase"]},
+                    "delete_branch": {"type": "boolean"},
+                    "subject": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "workflow": {"type": "string"},
+                    "status": {"type": "string"},
+                    "run_id": {"type": "integer"},
+                    "label": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "endpoint": {"type": "string"},
+                    "method": {"type": "string"}
                 },
                 "required": ["command"]
             }),
@@ -415,10 +411,10 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["ps", "logs", "exec", "images", "inspect", "stop", "compose_up", "compose_down", "compose_ps"]},
-                    "container": {"type": "string", "description": "logs/exec/inspect/stop: container name or id"},
-                    "tail": {"type": "integer", "description": "logs: max lines (default 50)"},
-                    "file": {"type": "string", "description": "compose_*: path to compose file (-f)"},
-                    "detach": {"type": "boolean", "description": "compose_up: run detached (default true)"}
+                    "container": {"type": "string"},
+                    "tail": {"type": "integer"},
+                    "file": {"type": "string"},
+                    "detach": {"type": "boolean"}
                 },
                 "required": ["command"]
             }),
@@ -435,11 +431,11 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "Request URL (required)"},
-                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "description": "HTTP method (default: GET)"},
-                    "headers": {"type": "object", "description": "Request headers as key-value pairs, e.g. Content-Type: application/json"},
-                    "body": {"type": "string", "description": "Request body"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default: 10)"}
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+                    "headers": {"type": "object"},
+                    "body": {"type": "string"},
+                    "timeout": {"type": "integer"}
                 },
                 "required": ["url"]
             }),
@@ -452,9 +448,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "file": {"type": "string", "description": "Path to a single script to check"},
-                    "files": {"type": "array", "items": {"type": "string"}, "description": "Paths to multiple scripts to check"},
-                    "shell": {"type": "string", "enum": ["bash", "sh", "dash", "ksh"], "description": "Shell dialect (default: bash)"}
+                    "file": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "shell": {"type": "string", "enum": ["bash", "sh", "dash", "ksh"]}
                 }
             }),
             to_request: None, // uses ShellcheckPlugin via ToolRegistry
@@ -466,8 +462,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "enum": ["install", "run", "test", "build", "audit"], "description": "npm command to run"},
-                    "script": {"type": "string", "description": "Script name for 'run' command (e.g. lint, dev)"}
+                    "command": {"type": "string", "enum": ["install", "run", "test", "build", "audit"]},
+                    "script": {"type": "string"}
                 },
                 "required": ["command"]
             }),
@@ -481,11 +477,11 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "enum": ["list_guilds", "list_channels", "read_messages", "search_messages"]},
-                    "guild_id": {"type": "string", "description": "list_channels: allowlisted guild id"},
-                    "channel_id": {"type": "string", "description": "read_messages: allowlisted channel id"},
-                    "query": {"type": "string", "description": "search_messages: case-insensitive substring query"},
-                    "limit": {"type": "integer", "description": "read_messages/search_messages: max messages to fetch (clamped by config)"},
-                    "analytics_tag": {"type": "string", "description": "Optional analytics tag suffix for session_stats attribution"}
+                    "guild_id": {"type": "string"},
+                    "channel_id": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "analytics_tag": {"type": "string"}
                 },
                 "required": ["command"]
             }),
@@ -499,8 +495,8 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["create", "restore", "list", "delete"]},
-                    "id": {"type": "string", "description": "restore/delete: snapshot id"},
-                    "tag": {"type": "string", "description": "create: optional label"}
+                    "id": {"type": "string"},
+                    "tag": {"type": "string"}
                 },
                 "required": ["action"]
             }),
@@ -533,7 +529,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "New working directory (absolute or relative to current cwd)"}
+                    "path": {"type": "string"}
                 },
                 "required": ["path"]
             }),
@@ -546,12 +542,12 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Dir path (default: cwd)"},
-                    "depth": {"type": "integer", "description": "Depth 1-5 (default: 1)"},
-                    "glob": {"type": "string", "description": "Filename glob filter, e.g. *.rs or test_*.py"},
-                    "type": {"type": "string", "enum": ["f", "d"], "description": "f=files only, d=dirs only"},
-                    "all": {"type": "boolean", "description": "Show dotfiles"},
-                    "stat": {"type": "boolean", "description": "Add mode+mtime"}
+                    "path": {"type": "string"},
+                    "depth": {"type": "integer"},
+                    "glob": {"type": "string"},
+                    "type": {"type": "string", "enum": ["f", "d"]},
+                    "all": {"type": "boolean"},
+                    "stat": {"type": "boolean"}
                 }
             }),
             to_request: Some(|args| {
@@ -585,9 +581,9 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "scope": {"type": "string", "enum": ["session", "history", "daily"], "description": "Default: session"},
-                    "days": {"type": "integer", "description": "history/daily: lookback days (default 30)"},
-                    "external_session_id": {"type": "string", "description": "history/daily: restrict to this agent-runtime session id"}
+                    "scope": {"type": "string", "enum": ["session", "history", "daily"]},
+                    "days": {"type": "integer"},
+                    "external_session_id": {"type": "string"}
                 }
             }),
             to_request: None, // needs session.analytics access
@@ -599,7 +595,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Agent-runtime session identifier; empty string clears."}
+                    "id": {"type": "string"}
                 },
                 "required": ["id"]
             }),
@@ -612,7 +608,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "level": {"type": "string", "enum": ["full", "compact", "terse"], "description": "Target verbosity level."}
+                    "level": {"type": "string", "enum": ["full", "compact", "terse"]}
                 },
                 "required": ["level"]
             }),
@@ -635,7 +631,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "properties": {
                     "path_a": {"type": "string"},
                     "path_b": {"type": "string"},
-                    "content_b": {"type": "string", "description": "Alt: diff against string"}
+                    "content_b": {"type": "string"}
                 },
                 "required": ["path_a"]
             }),
@@ -680,7 +676,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "tool_id": {"type": "string"},
-                    "max_iterations": {"type": "integer", "description": "Default: 3"},
+                    "max_iterations": {"type": "integer"},
                     "cwd": {"type": "string"}
                 },
                 "required": ["tool_id"]
@@ -788,10 +784,11 @@ pub fn tool_definitions(
     all_tools()
         .into_iter()
         .map(|td| {
+            let input_schema = descriptions.schema_with_parameters(td.name, &td.schema);
             serde_json::from_value(json!({
                 "name": td.name,
                 "description": descriptions.full_or_name(td.name),
-                "inputSchema": td.schema,
+                "inputSchema": input_schema,
             }))
             .expect("valid tool definition")
         })
@@ -849,6 +846,42 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn parameter_descriptions_live_only_in_runtime_catalog() {
+        let raw_count: usize = all_tools()
+            .iter()
+            .filter_map(|tool| tool.schema.get("properties")?.as_object())
+            .map(|properties| {
+                properties
+                    .values()
+                    .filter(|property| property.get("description").is_some())
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            raw_count, 0,
+            "raw structural schemas must contain no model text"
+        );
+
+        let rendered_count: usize = tool_definitions(&descriptions())
+            .into_iter()
+            .filter_map(|tool| serde_json::to_value(tool.input_schema).ok())
+            .filter_map(|schema| schema.get("properties").cloned())
+            .filter_map(|properties| properties.as_object().cloned())
+            .map(|properties| {
+                properties
+                    .values()
+                    .filter(|property| property.get("description").is_some())
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            rendered_count,
+            crate::tool_descriptions::DEFAULT_PARAMETER_DESCRIPTION_COUNT,
+            "rendered schemas must restore every migrated description"
+        );
     }
 
     #[test]
