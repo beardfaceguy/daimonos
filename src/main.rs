@@ -596,6 +596,10 @@ async fn main() -> anyhow::Result<()> {
             // Resolve compaction against a probe provider built from the same
             // factory, querying the effective model's window when the env file
             // omits DAIMONOS_AGENT_CONTEXT_WINDOW (#965).
+            let compaction_follows_model = matches!(
+                &agent.compaction,
+                agent_env::CompactionConfig::NeedsWindow(_)
+            );
             let compaction = match make_provider() {
                 Ok(probe) => match agent
                     .resolve_compaction(probe.as_ref(), &effective_model)
@@ -648,7 +652,7 @@ async fn main() -> anyhow::Result<()> {
                 safety,
                 token_log,
                 sessions_dir,
-                compaction,
+                acp_cmd::AcpCompaction::new(compaction, compaction_follows_model),
                 analytics_store,
             )
             .await?;
