@@ -448,6 +448,9 @@ pub struct TurnResult {
     pub text: String,
     /// Token/cost usage for THIS turn.
     pub usage: Usage,
+    /// Usage from the turn's final provider request. Unlike `usage`, this is
+    /// one context snapshot rather than the sum of every tool-loop request.
+    pub last_call_usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
 }
@@ -598,6 +601,7 @@ impl AgentSession {
         TurnResult {
             text,
             usage: result.usage,
+            last_call_usage: result.last_call_usage,
             stop_reason: result.stop_reason,
             error_message: result.error_message,
         }
@@ -731,6 +735,17 @@ impl AgentSession {
     /// only the model sent on the next `prompt` changes.
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.config.opts.model = model.into();
+    }
+
+    /// Replace the policy used for subsequent turns. ACP uses this when its
+    /// model picker switches between models with different context windows.
+    pub fn set_compaction(&mut self, policy: Option<CompactionPolicy>) {
+        self.config.compaction = policy;
+    }
+
+    /// Ask this session's provider for a model's current context-window size.
+    pub async fn context_window(&self, model: &str) -> Option<u64> {
+        self.provider.context_window(model).await
     }
 
     /// The model currently configured for this session.

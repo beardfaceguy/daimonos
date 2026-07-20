@@ -46,6 +46,7 @@ use crate::agent::{
     UPDATE_PLAN_TOOL,
 };
 use crate::analytics::AnalyticsStore;
+use crate::compaction::CompactionPolicy;
 use crate::config::Config;
 use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
 use crate::providers::{
@@ -89,6 +90,50 @@ type CurrentModel = Arc<StdMutex<String>>;
 /// session — each `session/new` constructs its own.
 pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn LlmProvider>, String> + Send + Sync>;
 
+/// ACP compaction policy plus whether its context window follows the model
+/// picker. An explicitly configured `DAIMONOS_AGENT_CONTEXT_WINDOW` remains
+/// fixed; a provider-resolved window is refreshed for each selected model.
+#[derive(Clone)]
+pub struct AcpCompaction {
+    policy: Option<CompactionPolicy>,
+    follows_model_window: bool,
+}
+
+impl AcpCompaction {
+    pub fn new(policy: Option<CompactionPolicy>, follows_model_window: bool) -> Self {
+        Self {
+            policy,
+            follows_model_window,
+        }
+    }
+
+    fn policy_for(
+        &self,
+        model: &str,
+        context_window: Option<u64>,
+    ) -> Result<Option<CompactionPolicy>, String> {
+        let Some(mut policy) = self.policy.clone() else {
+            return Ok(None);
+        };
+        if self.follows_model_window {
+            let context_window = context_window.ok_or_else(|| {
+                format!(
+                    "could not determine the context window for model '{model}' from the provider"
+                )
+            })?;
+            if policy.output_reservation >= context_window {
+                return Err(format!(
+                    "DAIMONOS_AGENT_OUTPUT_RESERVATION ({}) must be smaller than the \
+                     provider-reported context window ({context_window}) for model '{model}'",
+                    policy.output_reservation
+                ));
+            }
+            policy.context_window = context_window;
+        }
+        Ok(Some(policy))
+    }
+}
+
 /// Per-session state. Each session gets its own session lock, cancel slot,
 /// connection cell, and current-model cell, so concurrent sessions (Zed can
 /// run several chat threads against one process) never block or cross-talk
@@ -105,6 +150,9 @@ struct SessionHandle {
     /// session/delete.
     bridge: Arc<McpBridge>,
     client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
+    compaction: AcpCompaction,
+    /// Provider-reported windows already resolved for this session's models.
+    context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
 }
 
 /// Shared engine state across all sessions on one process.
@@ -128,9 +176,8 @@ struct AcpState {
     supports_terminal_output: AtomicBool,
     /// Maximum sessions returned by one session/list response.
     session_list_page_size: usize,
-    /// Context/window compaction policy (ADR-002), engine-wide from the
-    /// agent env; cloned into each session's config. `None` = off.
-    compaction: Option<crate::compaction::CompactionPolicy>,
+    /// Context/window compaction configuration cloned into each session.
+    compaction: AcpCompaction,
     /// Analytics store for attributing remote MCP tool calls (ADR-003).
     /// `None` when analytics is disabled.
     analytics: Option<Arc<AnalyticsStore>>,
@@ -420,21 +467,6 @@ fn tool_kind_for(name: &str) -> ToolKind {
         | "batch" | "kgl_assert" => ToolKind::Execute,
         "curl" => ToolKind::Fetch,
         _ => ToolKind::Other,
-    }
-}
-
-/// Rough context-window budget per model family, for `UsageUpdate.size`.
-/// Best-effort — Zed only uses this to render a proportion, not an exact
-/// limit daimonos itself enforces.
-fn context_window_size_for(model: &str) -> u64 {
-    if model.contains("claude")
-        || model.contains("opus")
-        || model.contains("sonnet")
-        || model.contains("haiku")
-    {
-        200_000
-    } else {
-        128_000
     }
 }
 
@@ -789,15 +821,68 @@ fn build_stream_hook(
     })
 }
 
+async fn prepare_model(
+    handle: &SessionHandle,
+    session: &mut AgentSession,
+    model: &str,
+) -> Result<Option<u64>, String> {
+    let cached = handle.context_windows.lock().await.get(model).copied();
+    let context_window = match cached {
+        Some(window) => Some(window),
+        None => {
+            let resolved = session
+                .context_window(model)
+                .await
+                .filter(|&window| window > 0);
+            if let Some(window) = resolved {
+                handle
+                    .context_windows
+                    .lock()
+                    .await
+                    .insert(model.to_string(), window);
+            }
+            resolved
+        }
+    };
+    let policy = handle.compaction.policy_for(model, context_window)?;
+    session.set_model(model);
+    session.set_compaction(policy);
+    Ok(context_window.or_else(|| {
+        (!handle.compaction.follows_model_window)
+            .then(|| {
+                handle
+                    .compaction
+                    .policy
+                    .as_ref()
+                    .map(|policy| policy.context_window)
+            })
+            .flatten()
+    }))
+}
+
 fn emit_usage_update(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    model: &str,
-    usage: &Usage,
+    context_window: Option<u64>,
+    last_call_usage: &Usage,
+    cumulative_cost_usd: f64,
 ) {
-    let update = UsageUpdate::new(usage.input + usage.output, context_window_size_for(model))
-        .cost(AcpCost::new(usage.cost.total_usd, "USD"));
+    let Some(update) = usage_update(context_window, last_call_usage, cumulative_cost_usd) else {
+        return;
+    };
     send_notification(cx, session_id, SessionUpdate::UsageUpdate(update));
+}
+
+fn usage_update(
+    context_window: Option<u64>,
+    last_call_usage: &Usage,
+    cumulative_cost_usd: f64,
+) -> Option<UsageUpdate> {
+    let context_window = context_window?;
+    let used = last_call_usage
+        .prompt_tokens()
+        .saturating_add(last_call_usage.output);
+    Some(UsageUpdate::new(used, context_window).cost(AcpCost::new(cumulative_cost_usd, "USD")))
 }
 
 /// Build the single model-picker config option (vikunja #960): a `Select`
@@ -1101,7 +1186,19 @@ async fn run_prompt_turn(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    agent_session.set_model(model.clone());
+    let context_window = match prepare_model(handle, &mut agent_session, &model).await {
+        Ok(window) => window,
+        Err(error) => {
+            send_notification(
+                cx,
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                    TextContent::new(error),
+                ))),
+            );
+            return AcpStopReason::Refusal;
+        }
+    };
 
     if let Some(command) = direct_command_text(&user_message).and_then(parse_acp_command) {
         let response = run_acp_command(command, &mut agent_session);
@@ -1133,6 +1230,7 @@ async fn run_prompt_turn(
     // resume). A cancelled turn leaves history unchanged (prompt is
     // cancel-safe), so we only persist on completion.
     let history_snapshot = outcome.as_ref().map(|_| agent_session.history().to_vec());
+    let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
     let client_ids_snapshot = if outcome.is_some() {
         let mut client_ids = handle.client_user_message_ids.lock().await;
         client_ids.push(client_user_message_id.unwrap_or_default());
@@ -1159,7 +1257,13 @@ async fn run_prompt_turn(
 
     match outcome {
         Some(turn) => {
-            emit_usage_update(cx, session_id, &model, &turn.usage);
+            emit_usage_update(
+                cx,
+                session_id,
+                context_window,
+                &turn.last_call_usage,
+                cumulative_cost_usd,
+            );
             map_stop_reason(turn.stop_reason)
         }
         None => AcpStopReason::Cancelled,
@@ -1179,7 +1283,7 @@ async fn run_retry_turn(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    agent_session.set_model(model.clone());
+    let context_window = prepare_model(handle, &mut agent_session, &model).await?;
 
     let notify = Arc::new(tokio::sync::Notify::new());
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
@@ -1187,10 +1291,17 @@ async fn run_retry_turn(
         turn = agent_session.retry_last_turn() => Some(turn),
         _ = notify.notified() => None,
     };
+    let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
 
     let (stop_reason, history_snapshot) = match outcome {
         Some(Ok(turn)) => {
-            emit_usage_update(cx, session_id, &model, &turn.usage);
+            emit_usage_update(
+                cx,
+                session_id,
+                context_window,
+                &turn.last_call_usage,
+                cumulative_cost_usd,
+            );
             (
                 map_stop_reason(turn.stop_reason),
                 Some(agent_session.history().to_vec()),
@@ -1301,13 +1412,19 @@ async fn build_session_handle(
         session_id.clone(),
         safety,
         token_log,
-        state.compaction.clone(),
+        state.compaction.policy.clone(),
         crate::prompts::agent_system(cfg).await,
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
     );
     let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
+    let mut context_windows = HashMap::new();
+    if state.compaction.follows_model_window {
+        if let Some(policy) = &state.compaction.policy {
+            context_windows.insert(state.default_model.clone(), policy.context_window);
+        }
+    }
     Ok(Arc::new(SessionHandle {
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
@@ -1316,6 +1433,8 @@ async fn build_session_handle(
         cwd: session_workspace,
         bridge,
         client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
+        compaction: state.compaction.clone(),
+        context_windows: tokio::sync::Mutex::new(context_windows),
     }))
 }
 
@@ -1453,7 +1572,7 @@ fn build_agent(
         safety,
         token_log,
         sessions_dir,
-        compaction,
+        AcpCompaction::new(compaction, false),
         analytics,
         &mut None,
     )
@@ -1474,7 +1593,7 @@ fn build_agent_with_state(
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
-    compaction: Option<crate::compaction::CompactionPolicy>,
+    compaction: AcpCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     state_out: &mut Option<Arc<AcpState>>,
 ) -> impl ConnectTo<AcpClientRole> {
@@ -2097,7 +2216,7 @@ pub async fn run_acp(
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
-    compaction: Option<crate::compaction::CompactionPolicy>,
+    compaction: AcpCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> anyhow::Result<()> {
     if let Err(e) = (make_provider)() {
@@ -2204,6 +2323,10 @@ mod tests {
                 }
             }
             response
+        }
+
+        async fn context_window(&self, _model: &str) -> Option<u64> {
+            Some(200_000)
         }
     }
 
@@ -2395,7 +2518,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            None,
+            AcpCompaction::new(None, false),
             None,
             &mut state_out,
         );
@@ -3326,6 +3449,14 @@ mod tests {
             self.seen.lock().unwrap().push(opts.model.clone());
             end_turn_resp("ok")
         }
+
+        async fn context_window(&self, model: &str) -> Option<u64> {
+            Some(if model == "model-b" {
+                1_000_000
+            } else {
+                200_000
+            })
+        }
     }
 
     /// Pull the single model `SessionConfigOption` out of a config_options list.
@@ -3422,9 +3553,21 @@ mod tests {
             None,
             None,
         );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
 
         let echoed_current = AcpClientRole
             .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
             .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -3472,6 +3615,19 @@ mod tests {
             *seen.lock().unwrap(),
             vec!["model-b".to_string()],
             "the prompt turn must use the picked model"
+        );
+        let usage_size = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|update| match update {
+                SessionUpdate::UsageUpdate(usage) => Some(usage.size),
+                _ => None,
+            });
+        assert_eq!(
+            usage_size,
+            Some(1_000_000),
+            "usage must use the picked model's provider-reported window"
         );
     }
 
@@ -4249,17 +4405,49 @@ mod tests {
     }
 
     #[test]
-    fn context_window_size_claude_models() {
-        assert_eq!(context_window_size_for("claude-haiku-4-5"), 200_000);
-        assert_eq!(
-            context_window_size_for("anthropic/claude-opus-4-8"),
-            200_000
-        );
+    fn usage_update_reports_latest_context_snapshot() {
+        let usage = Usage {
+            input: 100,
+            output: 10,
+            cache_read: 30,
+            cache_write: 20,
+            ..Usage::default()
+        };
+        let update = usage_update(Some(1_000_000), &usage, 1.25).expect("usage update");
+        assert_eq!(update.used, 160);
+        assert_eq!(update.size, 1_000_000);
+        assert!(usage_update(None, &usage, 1.25).is_none());
     }
 
     #[test]
-    fn context_window_size_unknown_model_has_fallback() {
-        assert_eq!(context_window_size_for("some-other-model"), 128_000);
+    fn model_following_compaction_uses_selected_model_window() {
+        let base = CompactionPolicy {
+            high_water: 0.75,
+            low_water: 0.5,
+            context_window: 200_000,
+            output_reservation: 8192,
+            summary_model: None,
+            summary_prompt: None,
+        };
+        let dynamic = AcpCompaction::new(Some(base.clone()), true);
+        assert_eq!(
+            dynamic
+                .policy_for("anthropic/claude-opus-4.8", Some(1_000_000))
+                .unwrap()
+                .unwrap()
+                .context_window,
+            1_000_000
+        );
+
+        let explicit = AcpCompaction::new(Some(base), false);
+        assert_eq!(
+            explicit
+                .policy_for("anthropic/claude-opus-4.8", Some(1_000_000))
+                .unwrap()
+                .unwrap()
+                .context_window,
+            200_000
+        );
     }
 
     #[test]
@@ -4590,6 +4778,38 @@ mod tests {
             outputs[0]
         );
         assert_eq!(outputs[0]["content"], "hi\n");
+    }
+
+    #[tokio::test]
+    async fn acp_usage_uses_final_request_not_accumulated_tool_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
+        let mut tool_call = tool_call_resp("t1", "read_file", serde_json::json!({"path": "f.txt"}));
+        tool_call.usage = Usage {
+            input: 100_000,
+            output: 1_000,
+            ..Usage::default()
+        };
+        let mut final_response = end_turn_resp("done");
+        final_response.usage = Usage {
+            input: 20_000,
+            output: 500,
+            cache_read: 3_000,
+            cache_write: 2_000,
+            ..Usage::default()
+        };
+
+        let updates = run_tool_call_flow(dir.path(), vec![tool_call, final_response]).await;
+        let usage = updates
+            .iter()
+            .find_map(|update| match update {
+                SessionUpdate::UsageUpdate(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage update");
+
+        assert_eq!(usage.used, 25_500);
+        assert_eq!(usage.size, 200_000);
     }
 
     #[tokio::test]
