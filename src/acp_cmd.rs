@@ -34,8 +34,10 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch, Stdio,
+    Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch,
+    JsonRpcRequest, JsonRpcResponse, Stdio,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{
     parse_plan_entries, AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook,
@@ -102,6 +104,7 @@ struct SessionHandle {
     /// the bridge is disabled or no servers were forwarded. Shut down on
     /// session/delete.
     bridge: Arc<McpBridge>,
+    client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
 }
 
 /// Shared engine state across all sessions on one process.
@@ -138,6 +141,28 @@ struct AcpState {
 
 /// The `SessionConfigId` for the model picker option.
 const MODEL_CONFIG_ID: &str = "model";
+const CLIENT_USER_MESSAGE_IDS_META_KEY: &str = "zed.dev/clientUserMessageIds";
+const SESSION_RETRY_META_KEY: &str = "zed.dev/sessionRetry";
+const SESSION_TRUNCATE_META_KEY: &str = "zed.dev/sessionTruncate";
+const CLIENT_USER_MESSAGE_ID_META_KEY: &str = "zed.dev/clientUserMessageId";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(method = "_zed/session/retry", response = PromptResponse)]
+struct RetrySessionRequest {
+    session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(method = "_zed/session/truncate", response = TruncateSessionResponse)]
+struct TruncateSessionRequest {
+    session_id: SessionId,
+    client_user_message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct TruncateSessionResponse {}
 
 const ACP_HELP_TEXT: &str = "\
 Commands:
@@ -1020,6 +1045,17 @@ fn message_has_images(message: &CoreMessage) -> bool {
         .any(|block| matches!(block, CoreBlock::Image { .. }))
 }
 
+fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
+    if ids.len() > user_turn_count {
+        let excess = ids.len() - user_turn_count;
+        ids.drain(..excess);
+    } else if ids.len() < user_turn_count {
+        let mut padding = vec![String::new(); user_turn_count - ids.len()];
+        padding.append(ids);
+        *ids = padding;
+    }
+}
+
 /// Run one prompt turn against `handle`, racing it against `session/cancel`.
 /// Returns the ACP stop reason. Holds only this session's own lock, so other
 /// sessions run concurrently unaffected.
@@ -1028,6 +1064,7 @@ async fn run_prompt_turn(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     user_message: CoreMessage,
+    client_user_message_id: Option<String>,
     store: Option<&SessionStore>,
 ) -> AcpStopReason {
     // Acquire exclusive access to this session *before* publishing the
@@ -1035,6 +1072,23 @@ async fn run_prompt_turn(
     // session/prompt for the *same* session could overwrite the in-flight
     // turn's routing/cancellation handle while both wait on this lock.
     let mut agent_session = handle.session.lock().await;
+    {
+        let mut client_ids = handle.client_user_message_ids.lock().await;
+        align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
+        if let Some(id) = client_user_message_id.as_deref() {
+            if client_ids.iter().any(|existing| existing == id) {
+                let message = format!("duplicate client user message id '{id}'");
+                send_notification(
+                    cx,
+                    session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                        TextContent::new(message),
+                    ))),
+                );
+                return AcpStopReason::Refusal;
+            }
+        }
+    }
 
     // Now that we hold the lock, refresh the connection handle with *this*
     // dispatch's cx — see `CurrentConnection`'s doc comment for why.
@@ -1053,10 +1107,13 @@ async fn run_prompt_turn(
         let response = run_acp_command(command, &mut agent_session);
         let cleared_history =
             (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
+        if command == AcpCommand::Clear {
+            handle.client_user_message_ids.lock().await.clear();
+        }
         drop(agent_session);
 
         if let (Some(store), Some(messages)) = (store, cleared_history) {
-            store.save_with_cwd(&session_id.to_string(), &model, &messages, &handle.cwd);
+            store.save_acp(&session_id.to_string(), &model, &messages, &handle.cwd, &[]);
         }
         let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
         send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
@@ -1076,11 +1133,28 @@ async fn run_prompt_turn(
     // resume). A cancelled turn leaves history unchanged (prompt is
     // cancel-safe), so we only persist on completion.
     let history_snapshot = outcome.as_ref().map(|_| agent_session.history().to_vec());
+    let client_ids_snapshot = if outcome.is_some() {
+        let mut client_ids = handle.client_user_message_ids.lock().await;
+        client_ids.push(client_user_message_id.unwrap_or_default());
+        let user_turn_count = agent_session.user_turn_count();
+        align_client_user_message_ids(&mut client_ids, user_turn_count);
+        Some(client_ids.clone())
+    } else {
+        None
+    };
     drop(agent_session);
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
-    if let (Some(store), Some(messages)) = (store, history_snapshot) {
-        store.save_with_cwd(&session_id.to_string(), &model, &messages, &handle.cwd);
+    if let (Some(store), Some(messages), Some(client_ids)) =
+        (store, history_snapshot, client_ids_snapshot)
+    {
+        store.save_acp(
+            &session_id.to_string(),
+            &model,
+            &messages,
+            &handle.cwd,
+            &client_ids,
+        );
     }
 
     match outcome {
@@ -1090,6 +1164,96 @@ async fn run_prompt_turn(
         }
         None => AcpStopReason::Cancelled,
     }
+}
+
+async fn run_retry_turn(
+    handle: &Arc<SessionHandle>,
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    store: Option<&SessionStore>,
+) -> Result<AcpStopReason, String> {
+    let mut agent_session = handle.session.lock().await;
+    *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
+    let model = handle
+        .current_model
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    agent_session.set_model(model.clone());
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
+    let outcome = tokio::select! {
+        turn = agent_session.retry_last_turn() => Some(turn),
+        _ = notify.notified() => None,
+    };
+
+    let (stop_reason, history_snapshot) = match outcome {
+        Some(Ok(turn)) => {
+            emit_usage_update(cx, session_id, &model, &turn.usage);
+            (
+                map_stop_reason(turn.stop_reason),
+                Some(agent_session.history().to_vec()),
+            )
+        }
+        Some(Err(error)) => {
+            *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return Err(error);
+        }
+        None => (AcpStopReason::Cancelled, None),
+    };
+    let client_ids = handle.client_user_message_ids.lock().await.clone();
+    drop(agent_session);
+    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+    if let (Some(store), Some(messages)) = (store, history_snapshot) {
+        store.save_acp(
+            &session_id.to_string(),
+            &model,
+            &messages,
+            &handle.cwd,
+            &client_ids,
+        );
+    }
+    Ok(stop_reason)
+}
+
+async fn truncate_session(
+    handle: &Arc<SessionHandle>,
+    session_id: &SessionId,
+    client_user_message_id: &str,
+    store: Option<&SessionStore>,
+) -> Result<(), String> {
+    let mut agent_session = handle.session.lock().await;
+    let mut client_ids = handle.client_user_message_ids.lock().await;
+    let user_turn_count = agent_session.user_turn_count();
+    align_client_user_message_ids(&mut client_ids, user_turn_count);
+    let Some(turn_index) = client_ids
+        .iter()
+        .position(|id| id == client_user_message_id)
+    else {
+        return Err(format!(
+            "client user message id '{client_user_message_id}' not found"
+        ));
+    };
+    agent_session.truncate_from_user_turn(turn_index)?;
+    client_ids.truncate(turn_index);
+
+    if let Some(store) = store {
+        let model = handle
+            .current_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        store.save_acp(
+            &session_id.to_string(),
+            &model,
+            agent_session.history(),
+            &handle.cwd,
+            &client_ids,
+        );
+    }
+    Ok(())
 }
 
 /// Build a fresh session handle (provider + agent session + per-session
@@ -1151,6 +1315,7 @@ async fn build_session_handle(
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
         bridge,
+        client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -1374,10 +1539,106 @@ fn build_agent_with_state(
                             capabilities = capabilities
                                 .mcp_capabilities(McpCapabilities::new().http(mcp_http));
                         }
+                        capabilities = capabilities.meta(Meta::from_iter([
+                            (CLIENT_USER_MESSAGE_IDS_META_KEY.to_string(), true.into()),
+                            (SESSION_RETRY_META_KEY.to_string(), true.into()),
+                            (SESSION_TRUNCATE_META_KEY.to_string(), true.into()),
+                        ]));
                         responder.respond(
                             InitializeResponse::new(req.protocol_version)
                                 .agent_capabilities(capabilities),
                         )
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                move |req: RetrySessionRequest,
+                      responder: agent_client_protocol::Responder<PromptResponse>,
+                      cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let spawn_cx = cx.clone();
+                        let _ = cx.spawn(async move {
+                            let handle =
+                                state.sessions.lock().await.get(&req.session_id).cloned();
+                            match handle {
+                                Some(handle) => match run_retry_turn(
+                                    &handle,
+                                    &spawn_cx,
+                                    &req.session_id,
+                                    state.store.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(stop_reason) => {
+                                        responder.respond(PromptResponse::new(stop_reason))?;
+                                    }
+                                    Err(error) => {
+                                        responder.respond_with_error(
+                                            agent_client_protocol::util::internal_error(error),
+                                        )?;
+                                    }
+                                },
+                                None => {
+                                    responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(
+                                            "session not found",
+                                        ),
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        });
+                        Ok(())
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                move |req: TruncateSessionRequest,
+                      responder: agent_client_protocol::Responder<TruncateSessionResponse>,
+                      cx: ConnectionTo<AcpClientRole>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let _ = cx.spawn(async move {
+                            let handle =
+                                state.sessions.lock().await.get(&req.session_id).cloned();
+                            match handle {
+                                Some(handle) => match truncate_session(
+                                    &handle,
+                                    &req.session_id,
+                                    &req.client_user_message_id,
+                                    state.store.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        responder.respond(TruncateSessionResponse {})?;
+                                    }
+                                    Err(error) => {
+                                        responder.respond_with_error(
+                                            agent_client_protocol::util::internal_error(error),
+                                        )?;
+                                    }
+                                },
+                                None => {
+                                    responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(
+                                            "session not found",
+                                        ),
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        });
+                        Ok(())
                     }
                 }
             },
@@ -1628,6 +1889,12 @@ fn build_agent_with_state(
                                 let mut agent_session = handle.session.lock().await;
                                 agent_session.set_history(record.messages);
                                 agent_session.set_model(model.clone());
+                                let mut client_ids = record.client_user_message_ids;
+                                align_client_user_message_ids(
+                                    &mut client_ids,
+                                    agent_session.user_turn_count(),
+                                );
+                                *handle.client_user_message_ids.lock().await = client_ids;
                                 replay_history(&cx, &session_id, agent_session.history());
                             }
                             *handle
@@ -1679,6 +1946,12 @@ fn build_agent_with_state(
                         // ConnectionTo::spawn").
                         let spawn_cx = cx.clone();
                         let _ = cx.spawn(async move {
+                            let client_user_message_id = req
+                                .meta
+                                .as_ref()
+                                .and_then(|meta| meta.get(CLIENT_USER_MESSAGE_ID_META_KEY))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
                             let session_id = req.session_id;
                             let handle = state.sessions.lock().await.get(&session_id).cloned();
                             let stop_reason = match handle {
@@ -1701,6 +1974,7 @@ fn build_agent_with_state(
                                             &spawn_cx,
                                             &session_id,
                                             user_message,
+                                            client_user_message_id,
                                             state.store.as_ref(),
                                         )
                                         .await
@@ -2099,6 +2373,132 @@ mod tests {
             .map(|command| command.name.as_str())
             .collect();
         assert_eq!(command_names, vec!["clear", "usage", "help"]);
+    }
+
+    #[tokio::test]
+    async fn acp_zed_retry_and_truncate_extension_round_trips() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let make_provider = mock_factory(vec![
+            end_turn_resp("zero"),
+            end_turn_resp("first"),
+            end_turn_resp("second"),
+            end_turn_resp("second retried"),
+        ]);
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            make_provider,
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+            None,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let workspace_path = workspace.path().to_path_buf();
+
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                let initialized = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let meta = initialized
+                    .agent_capabilities
+                    .meta
+                    .expect("extension capabilities");
+                assert_eq!(
+                    meta.get(SESSION_RETRY_META_KEY),
+                    Some(&serde_json::json!(true))
+                );
+                assert_eq!(
+                    meta.get(SESSION_TRUNCATE_META_KEY),
+                    Some(&serde_json::json!(true))
+                );
+
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(&workspace_path))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("zero"))],
+                    ))
+                    .block_task()
+                    .await?;
+                for (id, text) in [("user-1", "one"), ("user-2", "two")] {
+                    let mut request = PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new(text))],
+                    );
+                    request.meta = Some(Meta::from_iter([(
+                        CLIENT_USER_MESSAGE_ID_META_KEY.to_string(),
+                        id.into(),
+                    )]));
+                    connection.send_request(request).block_task().await?;
+                    if id == "user-1" {
+                        let mut duplicate = PromptRequest::new(
+                            session_id.clone(),
+                            vec![AcpContentBlock::Text(TextContent::new("duplicate"))],
+                        );
+                        duplicate.meta = Some(Meta::from_iter([(
+                            CLIENT_USER_MESSAGE_ID_META_KEY.to_string(),
+                            id.into(),
+                        )]));
+                        let response = connection.send_request(duplicate).block_task().await?;
+                        assert_eq!(response.stop_reason, AcpStopReason::Refusal);
+                    }
+                }
+                connection
+                    .send_request(RetrySessionRequest {
+                        session_id: session_id.clone(),
+                    })
+                    .block_task()
+                    .await?;
+                assert!(connection
+                    .send_request(TruncateSessionRequest {
+                        session_id: session_id.clone(),
+                        client_user_message_id: "unknown".to_string(),
+                    })
+                    .block_task()
+                    .await
+                    .is_err());
+                connection
+                    .send_request(TruncateSessionRequest {
+                        session_id: session_id.clone(),
+                        client_user_message_id: "user-2".to_string(),
+                    })
+                    .block_task()
+                    .await?;
+                Ok(session_id)
+            })
+            .await
+            .unwrap();
+
+        let handle = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live session");
+        assert_eq!(handle.session.lock().await.user_turn_count(), 2);
+        assert_eq!(
+            *handle.client_user_message_ids.lock().await,
+            vec!["", "user-1"]
+        );
+        let persisted = SessionStore::new(sessions.path().to_path_buf())
+            .load(&session_id.to_string())
+            .expect("persisted session");
+        assert_eq!(persisted.client_user_message_ids, vec!["", "user-1"]);
     }
 
     #[tokio::test]
