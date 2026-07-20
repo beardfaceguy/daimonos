@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784430463.8276317,
-    "ast_hash": "a7beff06134a90ff214dd318c9aa2a96",
+    "mtime": 1784567535.230353,
+    "ast_hash": "a5774bc2342bedf3a73305f559b18185",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784430416.728975,
-    "ast_hash": "837085548edd8897bf998d1d8fae111b",
+    "mtime": 1784566204.8277242,
+    "ast_hash": "3ae10110f3518310968c6f7de158b08e",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -360,7 +360,7 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1784427859.618502,
+    "mtime": 1784431554.0016086,
     "ast_hash": "dc91de85c771bdb92359b0c9774790ce",
     "semantic_hash": ""
   },
@@ -510,8 +510,8 @@
     "semantic_hash": ""
   },
   "src/session_store.rs": {
-    "mtime": 1784327063.7599804,
-    "ast_hash": "362ac5adf01886302123f7846c7e8b8e",
+    "mtime": 1784566315.7170255,
+    "ast_hash": "eba30834ab536a53d7d26317315ef4d6",
     "semantic_hash": ""
   },
   "src/snapshot.rs": {
@@ -520,7 +520,7 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784427600.2464104,
+    "mtime": 1784431554.0026085,
     "ast_hash": "839a3522b8a1c043083aaca4c99f1736",
     "semantic_hash": ""
   },
@@ -530,7 +530,7 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784430485.7044723,
+    "mtime": 1784431554.0026085,
     "ast_hash": "3403d3ba7b8f2b8af0b2c77fc112dc10",
     "semantic_hash": ""
   },
@@ -605,7 +605,7 @@
     "semantic_hash": "acbca61bef7706f641f343b03274c30d"
   },
   "tests/test_handshake.py": {
-    "mtime": 1784427882.8793352,
+    "mtime": 1784431554.0026085,
     "ast_hash": "4297e23007f9f84b89c128163c83197a",
     "semantic_hash": ""
   },
@@ -745,7 +745,7 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1784427897.5392299,
+    "mtime": 1784431553.9896088,
     "ast_hash": "3c85c2e2e5821f789e1666910c57ee1f",
     "semantic_hash": ""
   },
@@ -890,7 +890,7 @@
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
-    "mtime": 1784427844.4636106,
+    "mtime": 1784431554.0006087,
     "ast_hash": "733fa71f68cacc83544699d47f9163fd",
     "semantic_hash": ""
   },
@@ -920,7 +920,7 @@
     "semantic_hash": ""
   },
   "src/tool_descriptions.rs": {
-    "mtime": 1784430041.9197075,
+    "mtime": 1784431554.0026085,
     "ast_hash": "2ee4c380525279e46ed807e10ac52401",
     "semantic_hash": ""
   },
@@ -945,8 +945,13 @@
     "semantic_hash": ""
   },
   "docs/adr/004-acp-plan-updates.md": {
-    "mtime": 1784427834.1976843,
+    "mtime": 1784431553.9906087,
     "ast_hash": "2104b003793e18428ac2ac22f2b7a8f1",
+    "semantic_hash": ""
+  },
+  "docs/adr/005-zed-session-editing-extension.md": {
+    "mtime": 1784566542.289598,
+    "ast_hash": "d66b34ebdc46c73d78392ee824384bac",
     "semantic_hash": ""
   }
 }

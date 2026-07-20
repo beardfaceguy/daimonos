@@ -24,6 +24,8 @@ pub struct PersistedSession {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_user_message_ids: Vec<String>,
     pub messages: Vec<Message>,
 }
 
@@ -66,17 +68,42 @@ impl SessionStore {
     /// Persist a session's history. Best-effort: a write failure is logged to
     /// stderr and never fails the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
-        self.save_record(id, model, messages, None);
+        self.save_record(id, model, messages, None, &[]);
     }
 
     /// Persist a session and the working directory needed by ACP session/list.
     /// The cwd is optional in the on-disk format so pre-existing records remain
     /// readable and the chat store can continue using [`Self::save`].
+    #[cfg(test)]
     pub fn save_with_cwd(&self, id: &str, model: &str, messages: &[Message], cwd: &Path) {
-        self.save_record(id, model, messages, Some(cwd.to_path_buf()));
+        self.save_record(id, model, messages, Some(cwd.to_path_buf()), &[]);
     }
 
-    fn save_record(&self, id: &str, model: &str, messages: &[Message], cwd: Option<PathBuf>) {
+    pub fn save_acp(
+        &self,
+        id: &str,
+        model: &str,
+        messages: &[Message],
+        cwd: &Path,
+        client_user_message_ids: &[String],
+    ) {
+        self.save_record(
+            id,
+            model,
+            messages,
+            Some(cwd.to_path_buf()),
+            client_user_message_ids,
+        );
+    }
+
+    fn save_record(
+        &self,
+        id: &str,
+        model: &str,
+        messages: &[Message],
+        cwd: Option<PathBuf>,
+        client_user_message_ids: &[String],
+    ) {
         let Some(name) = Self::file_name(id) else {
             return;
         };
@@ -85,6 +112,7 @@ impl SessionStore {
             session_id: id.to_string(),
             model: model.to_string(),
             cwd,
+            client_user_message_ids: client_user_message_ids.to_vec(),
             messages: messages.to_vec(),
         };
         if let Err(e) = self.write_atomic(&name, &record) {
@@ -230,6 +258,23 @@ mod tests {
     }
 
     #[test]
+    fn acp_client_user_message_ids_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save_acp(
+            "acp-ids",
+            "test-model",
+            &msgs(),
+            workspace.path(),
+            &["user-1".to_string()],
+        );
+
+        let loaded = store.load("acp-ids").expect("saved session should load");
+        assert_eq!(loaded.client_user_message_ids, vec!["user-1"]);
+    }
+
+    #[test]
     fn legacy_record_without_cwd_remains_readable() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
@@ -247,6 +292,7 @@ mod tests {
 
         let loaded = store.load("legacy").expect("legacy record should load");
         assert_eq!(loaded.cwd, None);
+        assert!(loaded.client_user_message_ids.is_empty());
         assert_eq!(store.list()[0].cwd, None);
     }
 

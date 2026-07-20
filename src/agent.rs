@@ -535,7 +535,15 @@ impl AgentSession {
     /// its messages. Usage and the measured occupancy are recorded either
     /// way (a failed attempt still spent/observed them).
     async fn attempt(&mut self, user_message: &Message) -> AgentResult {
-        let mut history = self.messages.clone();
+        self.attempt_with_history(self.messages.clone(), user_message)
+            .await
+    }
+
+    async fn attempt_with_history(
+        &mut self,
+        mut history: Vec<Message>,
+        user_message: &Message,
+    ) -> AgentResult {
         history.push(user_message.clone());
         let result = run(
             self.provider.as_ref(),
@@ -548,6 +556,39 @@ impl AgentSession {
             accumulate_usage(std::mem::take(&mut self.total_usage), result.usage.clone());
         self.last_prompt_tokens = result.last_call_usage.prompt_tokens();
         result
+    }
+
+    pub async fn retry_last_turn(&mut self) -> Result<TurnResult, String> {
+        let Some(user_index) = self.messages.iter().rposition(is_user_turn_message) else {
+            return Err("cannot retry: session has no user turn".to_string());
+        };
+        let user_message = self.messages[user_index].clone();
+        let base_history = self.messages[..user_index].to_vec();
+        let result = self.attempt_with_history(base_history, &user_message).await;
+        Ok(self.commit(result))
+    }
+
+    pub fn user_turn_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| is_user_turn_message(message))
+            .count()
+    }
+
+    pub fn truncate_from_user_turn(&mut self, turn_index: usize) -> Result<(), String> {
+        let Some(history_index) = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| is_user_turn_message(message))
+            .nth(turn_index)
+            .map(|(index, _)| index)
+        else {
+            return Err(format!("user turn index {turn_index} not found"));
+        };
+        self.messages.truncate(history_index);
+        self.last_prompt_tokens = 0;
+        Ok(())
     }
 
     /// Commit an attempt's outcome as this turn's result.
@@ -698,6 +739,22 @@ impl AgentSession {
     }
 }
 
+fn is_user_turn_message(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    message.content.iter().any(|block| match block {
+        ContentBlock::Text(text) => {
+            !text.starts_with("[Summary of earlier conversation:")
+                && !text.starts_with("[Earlier conversation truncated")
+        }
+        ContentBlock::Image { .. } => true,
+        ContentBlock::ToolResult { .. }
+        | ContentBlock::ToolCall { .. }
+        | ContentBlock::Thinking(_) => false,
+    })
+}
+
 /// Concatenate the `Text` blocks of the last assistant message in `messages`.
 fn last_assistant_text(messages: &[Message]) -> String {
     messages
@@ -773,8 +830,12 @@ mod tests {
     }
 
     fn end_turn_resp() -> LlmResponse {
+        end_turn_resp_with_text("done")
+    }
+
+    fn end_turn_resp_with_text(text: &str) -> LlmResponse {
         LlmResponse {
-            content: vec![ContentBlock::Text("done".to_string())],
+            content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: StopReason::EndTurn,
             error_message: None,
             context_overflow: false,
@@ -1074,6 +1135,49 @@ mod tests {
         );
         // History persists across the model switch (user + asst) x2.
         assert_eq!(sess.history().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_replaces_latest_turn_without_duplicate_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            end_turn_resp_with_text("first"),
+            end_turn_resp_with_text("second"),
+            end_turn_resp_with_text("second retried"),
+        ]));
+        let mut session =
+            AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        session.prompt("one").await;
+        session.prompt("two").await;
+
+        let retried = session.retry_last_turn().await.unwrap();
+
+        assert_eq!(retried.text, "second retried");
+        assert_eq!(session.user_turn_count(), 2);
+        assert_eq!(session.history().len(), 4);
+        assert!(matches!(
+            &session.history()[2].content[0],
+            ContentBlock::Text(text) if text == "two"
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncate_removes_selected_user_turn_and_everything_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            end_turn_resp_with_text("first"),
+            end_turn_resp_with_text("second"),
+        ]));
+        let mut session =
+            AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        session.prompt("one").await;
+        session.prompt("two").await;
+
+        session.truncate_from_user_turn(1).unwrap();
+
+        assert_eq!(session.user_turn_count(), 1);
+        assert_eq!(session.history().len(), 2);
+        assert!(session.truncate_from_user_turn(1).is_err());
     }
 
     // --- token_log (vikunja: --debug-tokens) ---
