@@ -1542,7 +1542,9 @@ async fn refresh_live_mcp_bridge(
         .get(session_id)
         .is_some_and(|current| Arc::ptr_eq(current, handle));
     if !still_live {
-        return Err(format!("session '{session_id}' was deleted during MCP refresh"));
+        return Err(format!(
+            "session '{session_id}' was deleted during MCP refresh"
+        ));
     }
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
@@ -2877,35 +2879,38 @@ mod tests {
 
         AcpClientRole
             .builder()
-            .connect_with(agent, move |connection: ConnectionTo<AcpAgentRole>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                let session_id = connection
-                    .send_request(NewSessionRequest::new(workspace_path))
-                    .block_task()
-                    .await?
-                    .session_id;
-                let handle = state_for_client
-                    .sessions
-                    .lock()
-                    .await
-                    .remove(&session_id)
-                    .expect("new session handle");
+            .connect_with(
+                agent,
+                move |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let session_id = connection
+                        .send_request(NewSessionRequest::new(workspace_path))
+                        .block_task()
+                        .await?
+                        .session_id;
+                    let handle = state_for_client
+                        .sessions
+                        .lock()
+                        .await
+                        .remove(&session_id)
+                        .expect("new session handle");
 
-                let error = refresh_live_mcp_bridge(
-                    &handle,
-                    &state_for_client,
-                    &cfg,
-                    &session_id,
-                    vec![],
-                )
-                .await
-                .expect_err("a deleted session must not install a replacement bridge");
-                assert!(error.contains("deleted"));
-                Ok(())
-            })
+                    let error = refresh_live_mcp_bridge(
+                        &handle,
+                        &state_for_client,
+                        &cfg,
+                        &session_id,
+                        vec![],
+                    )
+                    .await
+                    .expect_err("a deleted session must not install a replacement bridge");
+                    assert!(error.contains("deleted"));
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
     }
@@ -4679,10 +4684,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), closed.notified())
             .await
             .expect("input error must publish a stored close notification");
-        assert_eq!(
-            input_error.lock().unwrap().as_deref(),
-            Some("input failed")
-        );
+        assert_eq!(input_error.lock().unwrap().as_deref(), Some("input failed"));
     }
 
     #[test]
