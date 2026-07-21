@@ -150,8 +150,10 @@ the safety gate treat the `mcp__` prefix as destructive-by-default.
 - **Shutdown** the bridge (all clients: `shut_down()`, and stdio child processes reaped) on
   `session/delete` and on process exit / `Drop`, bounded by `shutdown_timeout_secs`. ACP stdio EOF
   independently terminates the process even if the protocol transport's outgoing actor remains
-  parked. This satisfies the resource-lifecycle rule (every spawned child + client has a teardown
-  path that cannot wedge the agent process).
+  parked. A timed-out pooled shutdown continues in a detached task while its slot remains
+  unavailable, so a replacement cannot overlap the still-live runtime. This satisfies the
+  resource-lifecycle rule (every spawned child + client has a teardown path that cannot wedge the
+  agent process).
 - **Cancellation:** a `session/cancel` (or `session/delete` mid-turn) best-effort-cancels in-flight
   remote calls. A remote `tools/call` is run inside the same cancel-raced turn; the SDK client is
   dropped/aborted on shutdown.

@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784594950.090654,
-    "ast_hash": "8ade1a20693b580b636cd16c250657ce",
+    "mtime": 1784596131.802311,
+    "ast_hash": "5fadf8fdf98d955395122a8a145a6a4a",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784594659.1498208,
-    "ast_hash": "2371b08b3bf6cc453cea689796882fa4",
+    "mtime": 1784595763.995212,
+    "ast_hash": "f7a4fea72afce70d67491038e059dafc",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -930,13 +930,13 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784594918.742891,
-    "ast_hash": "34f6c19629d7b6e32c60918e63f0c9b1",
+    "mtime": 1784595810.1488457,
+    "ast_hash": "8f3fedff121336cec71ee8f7e8c51065",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
-    "mtime": 1784595394.680163,
-    "ast_hash": "b4385796adfffc9f01aebfb52a97d01c",
+    "mtime": 1784595916.8030052,
+    "ast_hash": "18f22fe1ed84583e803c9281dc0a6f29",
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {

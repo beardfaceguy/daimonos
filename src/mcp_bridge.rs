@@ -93,6 +93,7 @@ struct PoolSlot {
 enum PoolSlotState {
     #[default]
     Empty,
+    ShuttingDown,
     Ready {
         client: Arc<ClientRuntime>,
         tools: Arc<Vec<Tool>>,
@@ -154,6 +155,9 @@ impl McpClientPool {
                 shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
             });
         }
+        if matches!(*state, PoolSlotState::ShuttingDown) {
+            return Err("matching MCP client is still shutting down".to_string());
+        }
 
         let (client, tools) = connect(spec, cfg, init_timeout).await?;
         let tools = Arc::new(tools);
@@ -180,15 +184,25 @@ impl McpClientPool {
             }
             PoolSlotState::Ready { client, .. } => {
                 let client = Arc::clone(client);
-                *state = PoolSlotState::Empty;
+                *state = PoolSlotState::ShuttingDown;
                 Some(client)
             }
-            PoolSlotState::Empty => None,
+            PoolSlotState::Empty | PoolSlotState::ShuttingDown => None,
         };
         if let Some(client) = shutdown {
-            // Keep the slot locked until shutdown completes so a new acquirer
-            // cannot start a replacement while the old runtime is still live.
-            if tokio::time::timeout(shutdown_timeout, client.shut_down())
+            drop(state);
+            let slot = Arc::clone(&lease.slot);
+            let mut shutdown_task = tokio::spawn(async move {
+                let _ = client.shut_down().await;
+                let mut state = slot.state.lock().await;
+                if matches!(*state, PoolSlotState::ShuttingDown) {
+                    *state = PoolSlotState::Empty;
+                }
+            });
+            // Dropping a timed-out JoinHandle detaches rather than cancels its
+            // task. The slot stays strongly held and ShuttingDown until the
+            // original runtime actually exits, preventing overlapping clients.
+            if tokio::time::timeout(shutdown_timeout, &mut shutdown_task)
                 .await
                 .is_err()
             {
@@ -953,19 +967,36 @@ mod tests {
 
     #[tokio::test]
     async fn limit_diagnostic_is_not_a_retryable_connection_failure() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
         let cfg = AcpMcpConfig {
-            max_servers: 0,
+            max_servers: 1,
             ..AcpMcpConfig::default()
         };
-        let spec = ServerSpec::Stdio {
-            name: "skipped".to_string(),
-            command: "unused".to_string(),
-            args: vec![],
-            env: HashMap::new(),
+        let spec = |name: &str| ServerSpec::Stdio {
+            name: name.to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::from([("SERVER_NAME".to_string(), name.to_string())]),
         };
-        let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
+        let bridge = McpBridge::build(
+            vec![spec("connected"), spec("skipped")],
+            &cfg,
+            &native_set(&[]),
+            None,
+            None,
+        )
+        .await;
         assert!(!bridge.diagnostics().is_empty());
         assert!(!bridge.had_connection_failures());
+        bridge.shutdown().await;
     }
 
     #[tokio::test]

@@ -204,6 +204,7 @@ fn response_to_content(resp: Response) -> String {
 
 fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
     let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
+        eprintln!("agent: list_all_tools returned a non-array catalog; remote tools omitted");
         return content;
     };
     let mut names: std::collections::HashSet<String> = entries

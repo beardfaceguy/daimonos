@@ -90,14 +90,20 @@ type CurrentModel = Arc<StdMutex<String>>;
 struct EofAwareReader<R> {
     inner: R,
     eof: Arc<tokio::sync::Notify>,
+    input_error: Arc<StdMutex<Option<String>>>,
     notified: bool,
 }
 
 impl<R> EofAwareReader<R> {
-    fn new(inner: R, eof: Arc<tokio::sync::Notify>) -> Self {
+    fn new(
+        inner: R,
+        eof: Arc<tokio::sync::Notify>,
+        input_error: Arc<StdMutex<Option<String>>>,
+    ) -> Self {
         Self {
             inner,
             eof,
+            input_error,
             notified: false,
         }
     }
@@ -110,8 +116,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for EofAwareReader<R> {
         buffer: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
-        if matches!(result, Poll::Ready(Ok(0))) && !self.notified {
+        if matches!(result, Poll::Ready(Ok(0) | Err(_))) && !self.notified {
             self.notified = true;
+            if let Poll::Ready(Err(error)) = &result {
+                *self
+                    .input_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+            }
+            // `Notify::notify_one` stores a permit even if input closes before
+            // the select begins polling its wait branch.
             self.eof.notify_one();
         }
         result
@@ -1514,12 +1528,22 @@ async fn build_session_handle(
 /// session. Holding the session lock prevents prompt dispatch while schemas
 /// and routing switch together, preserving provider/history/usage state.
 async fn refresh_live_mcp_bridge(
-    handle: &SessionHandle,
+    handle: &Arc<SessionHandle>,
     state: &AcpState,
     cfg: &Config,
+    session_id: &SessionId,
     mcp_specs: Vec<ServerSpec>,
-) {
+) -> Result<(), String> {
     let mut agent_session = handle.session.lock().await;
+    let still_live = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .is_some_and(|current| Arc::ptr_eq(current, handle));
+    if !still_live {
+        return Err(format!("session '{session_id}' was deleted during MCP refresh"));
+    }
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
         tool_facade::active_schemas(&handle.cwd, descriptions)
@@ -1545,6 +1569,7 @@ async fn refresh_live_mcp_bridge(
     *handle.mcp_specs.lock().await = mcp_specs;
     drop(agent_session);
     old_bridge.shutdown().await;
+    Ok(())
 }
 
 async fn session_bridge(handle: &SessionHandle) -> Arc<McpBridge> {
@@ -2101,13 +2126,19 @@ fn build_agent_with_state(
                                 // Zed re-sends MCP configuration on every load.
                                 // Refresh routing and schemas in place when it
                                 // changed, or retry servers that failed earlier.
-                                refresh_live_mcp_bridge(
+                                if let Err(error) = refresh_live_mcp_bridge(
                                     &handle,
                                     &state,
                                     &cfg,
+                                    &session_id,
                                     mcp_specs,
                                 )
-                                .await;
+                                .await
+                                {
+                                    return responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(error),
+                                    );
+                                }
                             }
                             // Live sessions always preserve provider, history,
                             // usage, compaction cache, and tool-session state.
@@ -2188,6 +2219,9 @@ fn build_agent_with_state(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
                         send_available_commands(&cx, &session_id);
+                        // Notifications must follow a successfully queued load
+                        // response: Zed registers the session while handling
+                        // that response, then accepts its session updates.
                         send_session_mcp_diagnostics(&cx, &session_id, &active_handle).await;
                         Ok(())
                     }
@@ -2388,22 +2422,42 @@ pub async fn run_acp(
     // on its internal channel forever, orphaning this process. Race the
     // connection against an EOF signal emitted by the reader itself.
     let eof = Arc::new(tokio::sync::Notify::new());
-    let eof_wait = eof.notified();
-    let stdin = EofAwareReader::new(blocking::Unblock::new(std::io::stdin()), Arc::clone(&eof));
+    let input_error = Arc::new(StdMutex::new(None));
+    let eof_wait = {
+        let eof = Arc::clone(&eof);
+        let input_error = Arc::clone(&input_error);
+        async move {
+            eof.notified().await;
+            input_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+    };
+    let stdin = EofAwareReader::new(
+        blocking::Unblock::new(std::io::stdin()),
+        Arc::clone(&eof),
+        input_error,
+    );
     let stdout = blocking::Unblock::new(std::io::stdout());
     let connection = agent.connect_to(ByteStreams::new(stdout, stdin));
     tokio::pin!(connection);
     tokio::pin!(eof_wait);
-    let result = tokio::select! {
-        result = &mut connection => result,
-        _ = &mut eof_wait => Ok(()),
+    let (result, input_error) = tokio::select! {
+        result = &mut connection => (Some(result), None),
+        input_error = &mut eof_wait => (None, input_error),
     };
     // stdin closed (or the connection errored): drain every live session's MCP
     // bridge so Zed-spawned stdio servers are reaped instead of leaking (D7/D8).
     if let Some(state) = state_out {
         shutdown_all_bridges(&state).await;
     }
-    result?;
+    if let Some(error) = input_error {
+        anyhow::bail!("ACP stdin read failed: {error}");
+    }
+    if let Some(result) = result {
+        result?;
+    }
     Ok(())
 }
 
@@ -2425,12 +2479,26 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::ProtocolVersion;
     use async_trait::async_trait;
+    use futures_util::io::AsyncReadExt;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     // --- MockProvider (mirrors agent.rs/agent_cmd.rs test doubles) ---
 
     struct MockProvider {
         responses: StdMutex<VecDeque<crate::providers::LlmResponse>>,
+    }
+
+    struct ErrorReader;
+
+    impl AsyncRead for ErrorReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            _buffer: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("input failed")))
+        }
     }
 
     impl MockProvider {
@@ -2783,6 +2851,63 @@ mod tests {
             .load(&session_id.to_string())
             .expect("persisted session");
         assert_eq!(persisted.client_user_message_ids, vec!["", "user-1"]);
+    }
+
+    #[tokio::test]
+    async fn live_mcp_refresh_rejects_a_session_removed_by_delete() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(Config::default());
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::clone(&cfg),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            AcpCompaction::new(None, false),
+            None,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let state_for_client = Arc::clone(&state);
+        let workspace_path = workspace.path().to_path_buf();
+
+        AcpClientRole
+            .builder()
+            .connect_with(agent, move |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(workspace_path))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let handle = state_for_client
+                    .sessions
+                    .lock()
+                    .await
+                    .remove(&session_id)
+                    .expect("new session handle");
+
+                let error = refresh_live_mcp_bridge(
+                    &handle,
+                    &state_for_client,
+                    &cfg,
+                    &session_id,
+                    vec![],
+                )
+                .await
+                .expect_err("a deleted session must not install a replacement bridge");
+                assert!(error.contains("deleted"));
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4541,6 +4666,24 @@ mod tests {
     }
 
     // --- pure mapping helpers ---
+
+    #[tokio::test]
+    async fn eof_aware_reader_notifies_on_input_error() {
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let input_error = Arc::new(StdMutex::new(None));
+        let mut reader =
+            EofAwareReader::new(ErrorReader, Arc::clone(&closed), Arc::clone(&input_error));
+        let mut buffer = [0_u8; 1];
+
+        assert!(reader.read(&mut buffer).await.is_err());
+        tokio::time::timeout(Duration::from_millis(100), closed.notified())
+            .await
+            .expect("input error must publish a stored close notification");
+        assert_eq!(
+            input_error.lock().unwrap().as_deref(),
+            Some("input failed")
+        );
+    }
 
     #[test]
     fn tool_kind_maps_read_tools() {
