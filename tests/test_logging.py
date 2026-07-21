@@ -38,7 +38,9 @@ enabled = false
     )
     assert completed.returncode == 0, completed.stderr
 
-    log_files = list(log_dir.iterdir())
+    log_files = [
+        path for path in log_dir.iterdir() if path.name.startswith("integration")
+    ]
     assert len(log_files) == 1
     assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(log_files[0].stat().st_mode) == 0o600

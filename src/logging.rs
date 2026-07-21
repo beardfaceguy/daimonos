@@ -1,9 +1,9 @@
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -12,21 +12,83 @@ use tracing_subscriber::Layer;
 
 use crate::config::LoggingConfig;
 
+#[derive(Clone, Copy)]
+enum LogRotation {
+    Hourly,
+    Daily,
+    Never,
+}
+
+impl LogRotation {
+    fn bucket(self) -> u64 {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match self {
+            Self::Hourly => seconds / 3_600,
+            Self::Daily => seconds / 86_400,
+            Self::Never => 0,
+        }
+    }
+}
+
 struct SecureRollingAppender {
-    inner: RollingFileAppender,
     directory: PathBuf,
     file_prefix: String,
+    rotation: LogRotation,
+    max_files: usize,
+    bucket: u64,
+    file: File,
+}
+
+impl SecureRollingAppender {
+    fn new(
+        directory: PathBuf,
+        file_prefix: String,
+        rotation: LogRotation,
+        max_files: usize,
+    ) -> std::io::Result<Self> {
+        secure_log_directory(&directory)?;
+        let bucket = rotation.bucket();
+        let current_path = log_path(&directory, &file_prefix, rotation, bucket);
+        let file = open_secure_log(&current_path)?;
+        prune_log_files(&directory, &file_prefix, max_files, &current_path)?;
+        Ok(Self {
+            directory,
+            file_prefix,
+            rotation,
+            max_files,
+            bucket,
+            file,
+        })
+    }
+
+    fn rotate_if_needed(&mut self) -> std::io::Result<()> {
+        let bucket = self.rotation.bucket();
+        if bucket == self.bucket {
+            return Ok(());
+        }
+        let current_path = log_path(&self.directory, &self.file_prefix, self.rotation, bucket);
+        self.file = open_secure_log(&current_path)?;
+        self.bucket = bucket;
+        prune_log_files(
+            &self.directory,
+            &self.file_prefix,
+            self.max_files,
+            &current_path,
+        )
+    }
 }
 
 impl Write for SecureRollingAppender {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        secure_log_files(&self.directory, &self.file_prefix)?;
-        Ok(written)
+        self.rotate_if_needed()?;
+        self.file.write(buffer)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.file.flush()
     }
 }
 
@@ -53,25 +115,18 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
     }
 
     let directory = config.resolved_directory();
-    std::fs::create_dir_all(&directory)?;
-    secure_log_directory(&directory)?;
     let rotation = match config.rotation.as_str() {
-        "hourly" => Rotation::HOURLY,
-        "daily" => Rotation::DAILY,
-        "never" => Rotation::NEVER,
+        "hourly" => LogRotation::Hourly,
+        "daily" => LogRotation::Daily,
+        "never" => LogRotation::Never,
         other => anyhow::bail!("unsupported log rotation '{other}'"),
     };
-    let appender = RollingFileAppender::builder()
-        .rotation(rotation)
-        .filename_prefix(&config.file_prefix)
-        .max_log_files(config.max_files)
-        .build(&directory)?;
-    let appender = SecureRollingAppender {
-        inner: appender,
-        directory: directory.clone(),
-        file_prefix: config.file_prefix.clone(),
-    };
-    secure_log_files(&directory, &config.file_prefix)?;
+    let appender = SecureRollingAppender::new(
+        directory,
+        config.file_prefix.clone(),
+        rotation,
+        config.max_files,
+    )?;
     let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
 
     let file_layer = fmt::layer()
@@ -104,35 +159,91 @@ fn daimonos_filter(level: &str) -> EnvFilter {
 
 #[cfg(unix)]
 fn secure_log_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn secure_log_directory(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
+fn secure_log_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)
 }
 
-#[cfg(unix)]
-fn secure_log_files(directory: &Path, file_prefix: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn open_secure_log(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
 
+fn log_path(directory: &Path, file_prefix: &str, rotation: LogRotation, bucket: u64) -> PathBuf {
+    let filename = match rotation {
+        LogRotation::Never => file_prefix.to_string(),
+        LogRotation::Hourly | LogRotation::Daily => format!("{file_prefix}.{bucket}"),
+    };
+    directory.join(filename)
+}
+
+fn prune_log_files(
+    directory: &Path,
+    file_prefix: &str,
+    max_files: usize,
+    current_path: &Path,
+) -> std::io::Result<()> {
+    let rotated_prefix = format!("{file_prefix}.");
+    let mut files = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with(file_prefix)
-            || !entry.file_type()?.is_file()
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        if (filename == file_prefix || filename.starts_with(&rotated_prefix))
+            && entry.file_type()?.is_file()
+            && entry.path() != current_path
         {
-            continue;
+            files.push((
+                entry
+                    .metadata()?
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+                entry.path(),
+            ));
         }
-        std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove_count = files.len().saturating_add(1).saturating_sub(max_files);
+    for (_, path) in files.into_iter().take(remove_count) {
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn secure_log_files(_directory: &Path, _file_prefix: &str) -> std::io::Result<()> {
-    Ok(())
+#[cfg(test)]
+fn log_file_mode(path: &Path) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
 }
 
 /// Emit bounded, content-free process telemetry. CPU is reported as the
@@ -288,32 +399,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn secures_log_directory_and_matching_files() {
+    fn creates_private_log_directory_and_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("logs");
-        std::fs::create_dir(&directory).unwrap();
-        let log = directory.join("daimonos.test");
-        let unrelated = directory.join("other.test");
-        std::fs::write(&log, "log").unwrap();
-        std::fs::write(&unrelated, "other").unwrap();
-
-        secure_log_directory(&directory).unwrap();
-        secure_log_files(&directory, "daimonos").unwrap();
+        let mut appender = SecureRollingAppender::new(
+            directory.clone(),
+            "daimonos".to_string(),
+            LogRotation::Never,
+            2,
+        )
+        .unwrap();
+        appender.write_all(b"test event\n").unwrap();
 
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(
-            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_ne!(
-            std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(log_file_mode(&directory.join("daimonos")).unwrap(), 0o600);
     }
 
     #[cfg(target_os = "linux")]

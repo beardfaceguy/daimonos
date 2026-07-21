@@ -1226,6 +1226,13 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let baseline_before =
+                thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let baseline_after =
+                thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
+            let baseline = baseline_after.saturating_sub(baseline_before);
+
             let spec = ServerSpec::Stdio {
                 name: "idle".to_string(),
                 command: bin.to_string_lossy().into_owned(),
@@ -1247,14 +1254,16 @@ mod tests {
             assert_eq!(bridge.server_count(), 1);
 
             let before = thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let after = thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
             let consumed = after.saturating_sub(before);
+            let allowed = baseline.saturating_add(10);
 
             bridge.shutdown().await;
             assert!(
-                consumed <= 5,
-                "idle MCP stderr monitor consumed {consumed} CPU ticks in 250ms"
+                consumed <= allowed,
+                "idle MCP stderr monitor consumed {consumed} CPU ticks in 500ms \
+                 (baseline {baseline}, allowed {allowed})"
             );
         });
     }

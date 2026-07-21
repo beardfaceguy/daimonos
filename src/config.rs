@@ -545,6 +545,14 @@ impl LoggingConfig {
         if self.file_prefix.trim().is_empty() {
             return Err("logging.file_prefix must not be empty".to_string());
         }
+        if matches!(self.file_prefix.as_str(), "." | "..")
+            || self.file_prefix.contains('/')
+            || self.file_prefix.contains('\\')
+        {
+            return Err(
+                "logging.file_prefix must be a filename prefix without path separators".to_string(),
+            );
+        }
         if self.max_files == 0 {
             return Err("logging.max_files must be greater than zero".to_string());
         }
@@ -950,6 +958,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.logging.rotation = "weekly".to_string();
         assert!(cfg.validate().unwrap_err().contains("logging.rotation"));
+
+        let mut cfg = Config::default();
+        cfg.logging.file_prefix = "../daimonos".to_string();
+        assert!(cfg.validate().unwrap_err().contains("logging.file_prefix"));
 
         let mut cfg = Config::default();
         cfg.logging.max_files = 0;
