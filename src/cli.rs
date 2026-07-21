@@ -124,11 +124,11 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     /// Legacy alias for `daimonos mcp`.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "mcp_socket")]
     pub mcp: bool,
 
     /// Legacy alias for `daimonos mcp --socket <PATH>`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "mcp")]
     pub mcp_socket: Option<PathBuf>,
 
     /// Emit informational stderr during MCP startup.
@@ -245,6 +245,13 @@ mod tests {
         assert_eq!(
             mode(&["daimonos", "--mcp", "agent", "do work", "--dry-run"]),
             RuntimeMode::Agent
+        );
+    }
+
+    #[test]
+    fn conflicting_legacy_mcp_transports_are_rejected() {
+        assert!(
+            Cli::try_parse_from(["daimonos", "--mcp", "--mcp-socket", "/tmp/mcp.sock",]).is_err()
         );
     }
 }

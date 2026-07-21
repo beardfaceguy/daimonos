@@ -23,7 +23,9 @@ def test_normalized_mcp_subcommand_performs_handshake(daimonos_binary, tmp_path)
         }
         process.stdin.write(json.dumps(request) + "\n")
         process.stdin.flush()
-        response = json.loads(process.stdout.readline())
+        response_line = process.stdout.readline()
+        assert response_line, process.stderr.read()
+        response = json.loads(response_line)
         assert response["id"] == 1
         assert response["result"]["serverInfo"]["name"] == "daimonos"
     finally:

@@ -133,7 +133,7 @@ pub async fn run_chat(
         resume,
         list,
     } = args;
-    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos/chat-sessions"));
+    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("chat-sessions"));
     if list {
         let sessions = sessions_dir
             .map(|directory| session_store::SessionStore::new(directory).list())
@@ -216,7 +216,7 @@ pub async fn run_acp(
     };
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let safety = agent.to_safety_policy(None);
-    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos/acp-sessions"));
+    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("acp-sessions"));
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {

@@ -970,13 +970,13 @@
     "semantic_hash": ""
   },
   "src/cli.rs": {
-    "mtime": 1784653485.1125028,
-    "ast_hash": "0b17237075ecb8aa815c7d7be52e1354",
+    "mtime": 1784656131.3592088,
+    "ast_hash": "619b54cd0594de5fdbfbec7ade26289a",
     "semantic_hash": ""
   },
   "tests/test_cli_modes.py": {
-    "mtime": 1784653881.4982147,
-    "ast_hash": "433e451a61f18b054232d2819fd87ffa",
+    "mtime": 1784656096.131414,
+    "ast_hash": "91cd93555e448733fbb70f6900e8318c",
     "semantic_hash": ""
   },
   "docs/runtime-modes.md": {
@@ -985,8 +985,8 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1784654300.8287864,
-    "ast_hash": "dd862596ab1d4e236940a9ad878221ca",
+    "mtime": 1784656131.3522089,
+    "ast_hash": "9649d966bb7def63eb20ddb26c7cfa05",
     "semantic_hash": ""
   }
 }
