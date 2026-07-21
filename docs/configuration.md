@@ -239,6 +239,43 @@ max_concurrent_connects = 8
 max_tools_per_server = 128
 ```
 
+### `[logging]` — Runtime Diagnostics
+
+Daimonos writes structured JSON logs to a rotating file independently of the
+ACP/MCP transport. Protocol stdout is never used for logging. Warning and error
+events are also mirrored to stderr so hosts such as Zed can surface failures.
+Logs intentionally exclude prompts, API keys, MCP headers, tool arguments, and
+file contents.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enables persistent structured logging. Initialization failure is fail-open and reported on stderr. |
+| `level` | `info` | File filter: `trace`, `debug`, `info`, `warn`, `error`, or `off`. |
+| `stderr_level` | `warn` | Stderr filter. ACP/MCP stdout remains protocol-only. |
+| `directory` | `$XDG_STATE_HOME/daimonos/logs` or `~/.local/state/daimonos/logs` | Rotated log directory. `~` is expanded. |
+| `file_prefix` | `daimonos` | Rotated filename prefix. |
+| `rotation` | `daily` | `hourly`, `daily`, or `never`. |
+| `max_files` | `14` | Maximum retained rotated files. Must be greater than zero. |
+| `resource_interval_secs` | `15` | Process telemetry interval. Set to `0` to disable. |
+
+```toml
+[logging]
+enabled = true
+level = "info"
+stderr_level = "warn"
+# directory = "~/.local/state/daimonos/logs"
+file_prefix = "daimonos"
+rotation = "daily"
+max_files = 14
+resource_interval_secs = 15
+```
+
+Each process emits lifecycle, ACP session, workspace-index, MCP bridge, remote
+tool timing, and shutdown events. `daimonos::telemetry` snapshots include PID,
+uptime, RSS, thread count, open file descriptors, cumulative CPU scheduler
+ticks, and interval CPU-tick deltas. To investigate a hot loop, temporarily set
+`level = "debug"` and follow the newest file in the configured directory.
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,

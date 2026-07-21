@@ -1985,6 +1985,12 @@ fn build_agent_with_state(
                       _cx: ConnectionTo<AcpClientRole>| {
                     let state = Arc::clone(&state);
                     async move {
+                        let started = std::time::Instant::now();
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_delete_started",
+                            session_id = %req.session_id,
+                        );
                         let Some(store) = state.store.clone() else {
                             return responder.respond_with_error(
                                 agent_client_protocol::util::internal_error(
@@ -2038,6 +2044,12 @@ fn build_agent_with_state(
                         if let Some(handle) = removed_handle {
                             shutdown_session_bridge(&handle).await;
                         }
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_delete_completed",
+                            session_id = %req.session_id,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                        );
                         responder.respond(DeleteSessionResponse::new())
                     }
                 }
@@ -2064,6 +2076,7 @@ fn build_agent_with_state(
                         // Zed forwards the user's configured MCP servers here
                         // (ADR-003); bridge them into this session.
                         let mcp_specs = to_server_specs(req.mcp_servers);
+                        let mcp_server_count = mcp_specs.len();
                         // Use the client-provided project root, not the CLI's
                         // own cwd — Zed passes the actual project it wants this
                         // session to operate on.
@@ -2072,6 +2085,14 @@ fn build_agent_with_state(
                         } else {
                             req.cwd
                         };
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_new_started",
+                            session_id = %session_id,
+                            workspace = %session_workspace.display(),
+                            mcp_servers = mcp_server_count,
+                        );
+                        let started = std::time::Instant::now();
                         let handle = match build_session_handle(
                             &state,
                             &cfg,
@@ -2109,6 +2130,12 @@ fn build_agent_with_state(
                         )?;
                         send_available_commands(&cx, &session_id);
                         send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_new_completed",
+                            session_id = %session_id,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                        );
                         Ok(())
                     }
                 }
@@ -2152,6 +2179,15 @@ fn build_agent_with_state(
                         let operation = session_operation_lock(&state, &session_id).await;
                         let _operation = operation.lock().await;
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
+                        let was_live = existing.is_some();
+                        let started = std::time::Instant::now();
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_load_started",
+                            session_id = %session_id,
+                            live = was_live,
+                            workspace = %session_workspace.display(),
+                        );
                         // Keep this guard through replay and response enqueue.
                         // session/delete takes the same guard before removing
                         // the handle, giving load/delete a single linear order.
@@ -2281,6 +2317,13 @@ fn build_agent_with_state(
                         if send_diagnostics {
                             send_session_mcp_diagnostics(&cx, &session_id, &active_handle).await;
                         }
+                        tracing::info!(
+                            target: "daimonos::acp",
+                            event = "session_load_completed",
+                            session_id = %session_id,
+                            live = was_live,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                        );
                         Ok(())
                     }
                 }
@@ -2311,6 +2354,12 @@ fn build_agent_with_state(
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string);
                             let session_id = req.session_id;
+                            let started = std::time::Instant::now();
+                            tracing::info!(
+                                target: "daimonos::acp",
+                                event = "prompt_started",
+                                session_id = %session_id,
+                            );
                             let handle = state.sessions.lock().await.get(&session_id).cloned();
                             let stop_reason = match handle {
                                 Some(handle) => {
@@ -2340,6 +2389,13 @@ fn build_agent_with_state(
                                 }
                                 None => AcpStopReason::Refusal,
                             };
+                            tracing::info!(
+                                target: "daimonos::acp",
+                                event = "prompt_completed",
+                                session_id = %session_id,
+                                stop_reason = ?stop_reason,
+                                duration_ms = started.elapsed().as_millis() as u64,
+                            );
                             let _ = responder.respond(PromptResponse::new(stop_reason));
                             Ok(())
                         });
@@ -2458,9 +2514,18 @@ pub async fn run_acp(
     compaction: AcpCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> anyhow::Result<()> {
+    tracing::info!(
+        target: "daimonos::acp",
+        event = "acp_starting",
+        workspace = %workspace.display(),
+        configured_models = models.len(),
+        persistence_enabled = sessions_dir.is_some(),
+    );
     if let Err(e) = (make_provider)() {
+        tracing::error!(target: "daimonos::acp", event = "provider_init_failed", error = %e);
         anyhow::bail!("provider init: {e}");
     }
+    tracing::info!(target: "daimonos::acp", event = "provider_validated");
     let mut state_out: Option<Arc<AcpState>> = None;
     let agent = build_agent_with_state(
         make_provider,
@@ -2505,10 +2570,17 @@ pub async fn run_acp(
         result = &mut connection => (Some(result), None),
         input_error = &mut eof_wait => (None, input_error),
     };
+    tracing::info!(
+        target: "daimonos::acp",
+        event = "acp_transport_stopped",
+        reason = if input_error.is_some() { "stdin_error" } else if result.is_some() { "connection_completed" } else { "stdin_eof" },
+    );
     // stdin closed (or the connection errored): drain every live session's MCP
     // bridge so Zed-spawned stdio servers are reaped instead of leaking (D7/D8).
     if let Some(state) = state_out {
+        tracing::info!(target: "daimonos::acp", event = "session_shutdown_started");
         shutdown_all_bridges(&state).await;
+        tracing::info!(target: "daimonos::acp", event = "session_shutdown_completed");
     }
     if let Some(error) = input_error {
         anyhow::bail!("ACP stdin read failed: {error}");
