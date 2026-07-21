@@ -1189,6 +1189,76 @@ mod tests {
         candidate.exists().then_some(candidate)
     }
 
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ticks(name: &str) -> Option<u64> {
+        for task in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+            let path = task.path();
+            let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
+                continue;
+            };
+            if comm.trim() != name {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(path.join("stat")) else {
+                continue;
+            };
+            let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+            let user = fields.get(11)?.parse::<u64>().ok()?;
+            let system = fields.get(12)?.parse::<u64>().ok()?;
+            return Some(user.saturating_add(system));
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_stdio_bridge_does_not_spin_runtime_worker() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("mcp-idle-test")
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let spec = ServerSpec::Stdio {
+                name: "idle".to_string(),
+                command: bin.to_string_lossy().into_owned(),
+                args: vec![
+                    "--mcp".to_string(),
+                    "-w".to_string(),
+                    workspace.path().to_string_lossy().into_owned(),
+                ],
+                env: HashMap::new(),
+            };
+            let bridge = McpBridge::build(
+                vec![spec],
+                &AcpMcpConfig::default(),
+                &native_set(&[]),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(bridge.server_count(), 1);
+
+            let before = thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let after = thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
+            let consumed = after.saturating_sub(before);
+
+            bridge.shutdown().await;
+            assert!(
+                consumed <= 5,
+                "idle MCP stderr monitor consumed {consumed} CPU ticks in 250ms"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn live_round_trip_against_daimonos_mcp() {
         let Some(bin) = daimonos_binary() else {

@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -10,6 +11,24 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 use crate::config::LoggingConfig;
+
+struct SecureRollingAppender {
+    inner: RollingFileAppender,
+    directory: PathBuf,
+    file_prefix: String,
+}
+
+impl Write for SecureRollingAppender {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        secure_log_files(&self.directory, &self.file_prefix)?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Keeps the non-blocking file writer alive until process teardown.
 pub struct LoggingGuard {
@@ -35,6 +54,7 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
 
     let directory = config.resolved_directory();
     std::fs::create_dir_all(&directory)?;
+    secure_log_directory(&directory)?;
     let rotation = match config.rotation.as_str() {
         "hourly" => Rotation::HOURLY,
         "daily" => Rotation::DAILY,
@@ -46,6 +66,12 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
         .filename_prefix(&config.file_prefix)
         .max_log_files(config.max_files)
         .build(&directory)?;
+    let appender = SecureRollingAppender {
+        inner: appender,
+        directory: directory.clone(),
+        file_prefix: config.file_prefix.clone(),
+    };
+    secure_log_files(&directory, &config.file_prefix)?;
     let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
 
     let file_layer = fmt::layer()
@@ -54,12 +80,12 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
         .with_current_span(false)
         .with_span_list(false)
         .with_writer(file_writer)
-        .with_filter(EnvFilter::new(config.level.clone()));
+        .with_filter(daimonos_filter(&config.level));
     let stderr_layer = fmt::layer()
         .compact()
         .with_ansi(false)
         .with_writer(std::io::stderr)
-        .with_filter(EnvFilter::new(config.stderr_level.clone()));
+        .with_filter(daimonos_filter(&config.stderr_level));
 
     tracing_subscriber::registry()
         .with(file_layer)
@@ -70,6 +96,43 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
         _file_guard: file_guard,
         started: std::time::Instant::now(),
     }))
+}
+
+fn daimonos_filter(level: &str) -> EnvFilter {
+    EnvFilter::new(format!("off,daimonos={level}"))
+}
+
+#[cfg(unix)]
+fn secure_log_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn secure_log_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_log_files(directory: &Path, file_prefix: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(file_prefix)
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_log_files(_directory: &Path, _file_prefix: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Emit bounded, content-free process telemetry. CPU is reported as the
@@ -163,6 +226,95 @@ fn read_status_value(path: &Path, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedGuard {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedWriter {
+        type Writer = CapturedGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedGuard(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn excludes_dependency_events_from_logs() {
+        let output = CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(output.clone())
+                .with_filter(daimonos_filter("info")),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "daimonos::test", event = "safe_event");
+            tracing::error!(
+                target: "dependency::transport",
+                message = "Authorization: Bearer secret-value"
+            );
+        });
+
+        let captured = String::from_utf8(
+            output
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .unwrap();
+        assert!(captured.contains("safe_event"));
+        assert!(!captured.contains("secret-value"));
+        assert!(!captured.contains("dependency::transport"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secures_log_directory_and_matching_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("logs");
+        std::fs::create_dir(&directory).unwrap();
+        let log = directory.join("daimonos.test");
+        let unrelated = directory.join("other.test");
+        std::fs::write(&log, "log").unwrap();
+        std::fs::write(&unrelated, "other").unwrap();
+
+        secure_log_directory(&directory).unwrap();
+        secure_log_files(&directory, "daimonos").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
+            std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -244,10 +244,15 @@ max_tools_per_server = 128
 Daimonos writes structured JSON logs to a rotating file independently of the
 ACP/MCP transport. Protocol stdout is never used for logging. Warning and error
 events are also mirrored to stderr so hosts such as Zed can surface failures.
-Logs intentionally exclude prompts, API keys, MCP headers, tool arguments, and
-file contents. They do retain operational metadata needed for diagnosis,
-including absolute workspace paths, session IDs, MCP server names, and tool
-names; protect the log directory accordingly.
+Both outputs allow only tracing targets owned by Daimonos; dependency events
+and raw MCP child-process stderr are dropped because they may contain secrets.
+The log directory is restricted to mode `0700` and matching log files to
+`0600` on Unix.
+
+Daimonos-owned events intentionally exclude prompts, API keys, MCP headers,
+tool arguments, and file contents. They do retain operational metadata needed
+for diagnosis, including absolute workspace paths, session IDs, MCP server
+names, and tool names.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

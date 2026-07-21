@@ -2657,9 +2657,8 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-sdk"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31bc179a103326562f0a30c0813bc08744eb0fdd5fb1a3577c7583559cb115e"
+version = "0.10.0"
+source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=bd84062d4ff594376468357bbb4768a902d5ddb5#bd84062d4ff594376468357bbb4768a902d5ddb5"
 dependencies = [
  "async-trait",
  "base64",
@@ -2675,15 +2674,15 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "rust-mcp-transport"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cccce04bbd0408eff35520fb1d33efc00ac402584557daebd72f5baa0ff8158e"
+version = "0.9.1"
+source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=bd84062d4ff594376468357bbb4768a902d5ddb5#bd84062d4ff594376468357bbb4768a902d5ddb5"
 dependencies = [
  "async-trait",
  "bytes",

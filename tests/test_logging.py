@@ -1,4 +1,5 @@
 import json
+import stat
 import subprocess
 
 
@@ -39,6 +40,8 @@ enabled = false
 
     log_files = list(log_dir.iterdir())
     assert len(log_files) == 1
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log_files[0].stat().st_mode) == 0o600
     events = [json.loads(line) for line in log_files[0].read_text().splitlines()]
     startup = next(event for event in events if event["fields"].get("event") == "process_start")
     assert startup["fields"]["mode"] == "stats"
