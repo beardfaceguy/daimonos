@@ -510,7 +510,9 @@ impl LoggingConfig {
             return crate::paths::expand_tilde(path);
         }
         if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
-            return std::path::PathBuf::from(state_home).join("daimonos").join("logs");
+            return std::path::PathBuf::from(state_home)
+                .join("daimonos")
+                .join("logs");
         }
         if let Some(home) = crate::paths::home_dir() {
             return home.join(".local/state/daimonos/logs");
@@ -521,13 +523,24 @@ impl LoggingConfig {
     fn validate(&self) -> Result<(), String> {
         const LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "off"];
         if !LEVELS.contains(&self.level.as_str()) {
-            return Err(format!("logging.level must be one of {}, got '{}'", LEVELS.join(", "), self.level));
+            return Err(format!(
+                "logging.level must be one of {}, got '{}'",
+                LEVELS.join(", "),
+                self.level
+            ));
         }
         if !LEVELS.contains(&self.stderr_level.as_str()) {
-            return Err(format!("logging.stderr_level must be one of {}, got '{}'", LEVELS.join(", "), self.stderr_level));
+            return Err(format!(
+                "logging.stderr_level must be one of {}, got '{}'",
+                LEVELS.join(", "),
+                self.stderr_level
+            ));
         }
         if !matches!(self.rotation.as_str(), "hourly" | "daily" | "never") {
-            return Err(format!("logging.rotation must be hourly, daily, or never, got '{}'", self.rotation));
+            return Err(format!(
+                "logging.rotation must be hourly, daily, or never, got '{}'",
+                self.rotation
+            ));
         }
         if self.file_prefix.trim().is_empty() {
             return Err("logging.file_prefix must not be empty".to_string());
