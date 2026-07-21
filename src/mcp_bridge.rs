@@ -33,6 +33,8 @@ use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::AcpMcpConfig;
 use crate::providers::ToolSchema;
 
+pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
+
 /// Canonical transport identity for pooling. Display names are deliberately
 /// excluded: two sessions may alias the same server differently while sharing
 /// one transport/client. Map fields are sorted so insertion order cannot
@@ -87,6 +89,7 @@ struct PoolLease {
 #[derive(Default)]
 struct PoolSlot {
     state: tokio::sync::Mutex<PoolSlotState>,
+    changed: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -140,24 +143,34 @@ impl McpClientPool {
                 }
             }
         };
-        let mut state = slot.state.lock().await;
-        if let PoolSlotState::Ready {
-            client,
-            tools,
-            leases,
-        } = &mut *state
-        {
-            *leases += 1;
-            return Ok(PoolLease {
-                slot: Arc::clone(&slot),
-                client: Arc::clone(client),
-                tools: Arc::clone(tools),
-                shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
-            });
-        }
-        if matches!(*state, PoolSlotState::ShuttingDown) {
-            return Err("matching MCP client is still shutting down".to_string());
-        }
+        let mut state = loop {
+            let mut state = slot.state.lock().await;
+            if let PoolSlotState::Ready {
+                client,
+                tools,
+                leases,
+            } = &mut *state
+            {
+                *leases += 1;
+                return Ok(PoolLease {
+                    slot: Arc::clone(&slot),
+                    client: Arc::clone(client),
+                    tools: Arc::clone(tools),
+                    shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
+                });
+            }
+            if matches!(*state, PoolSlotState::ShuttingDown) {
+                // Register before unlocking so completion cannot race between
+                // observing ShuttingDown and beginning the wait.
+                let changed = slot.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                drop(state);
+                changed.await;
+                continue;
+            }
+            break state;
+        };
 
         let (client, tools) = connect(spec, cfg, init_timeout).await?;
         let tools = Arc::new(tools);
@@ -198,6 +211,7 @@ impl McpClientPool {
                 if matches!(*state, PoolSlotState::ShuttingDown) {
                     *state = PoolSlotState::Empty;
                 }
+                slot.changed.notify_waiters();
             });
             // Dropping a timed-out JoinHandle detaches rather than cancels its
             // task. The slot stays strongly held and ShuttingDown until the
@@ -747,7 +761,7 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 /// (`^[a-zA-Z0-9_-]{1,64}$`) and truncated to 64 bytes. Non-conforming chars
 /// become `_`.
 fn namespaced_name(server: &str, tool: &str) -> String {
-    let raw = format!("mcp__{server}__{tool}");
+    let raw = format!("{REMOTE_TOOL_PREFIX}{server}__{tool}");
     let mut s: String = raw
         .chars()
         .map(|c| {

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::compaction::{self, CompactionEvent, CompactionPolicy, CompactionStrategy};
+use crate::mcp_bridge::REMOTE_TOOL_PREFIX;
 use crate::protocol::Response;
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role, StopReason, StreamEvent,
@@ -211,7 +212,10 @@ fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> Stri
         .iter()
         .filter_map(|entry| entry.get("name")?.as_str().map(str::to_string))
         .collect();
-    for tool in tools.iter().filter(|tool| tool.name.starts_with("mcp__")) {
+    for tool in tools
+        .iter()
+        .filter(|tool| tool.name.starts_with(REMOTE_TOOL_PREFIX))
+    {
         if names.insert(tool.name.clone()) {
             entries.push(serde_json::json!({
                 "name": tool.name,

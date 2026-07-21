@@ -188,6 +188,9 @@ impl AcpCompaction {
 /// with each other. Shared via `Arc` so a long prompt turn holds only this
 /// handle — not the sessions-map lock.
 struct SessionHandle {
+    /// Serializes session/load lifecycle work with session/delete so a bridge
+    /// cannot be refreshed or replayed after its handle is removed.
+    lifecycle: tokio::sync::Mutex<()>,
     session: tokio::sync::Mutex<AgentSession>,
     cancel: CancelSlot,
     connection: CurrentConnection,
@@ -1511,6 +1514,7 @@ async fn build_session_handle(
         }
     }
     Ok(Arc::new(SessionHandle {
+        lifecycle: tokio::sync::Mutex::new(()),
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
         connection,
@@ -1528,24 +1532,12 @@ async fn build_session_handle(
 /// session. Holding the session lock prevents prompt dispatch while schemas
 /// and routing switch together, preserving provider/history/usage state.
 async fn refresh_live_mcp_bridge(
-    handle: &Arc<SessionHandle>,
+    handle: &SessionHandle,
     state: &AcpState,
     cfg: &Config,
-    session_id: &SessionId,
     mcp_specs: Vec<ServerSpec>,
-) -> Result<(), String> {
+) {
     let mut agent_session = handle.session.lock().await;
-    let still_live = state
-        .sessions
-        .lock()
-        .await
-        .get(session_id)
-        .is_some_and(|current| Arc::ptr_eq(current, handle));
-    if !still_live {
-        return Err(format!(
-            "session '{session_id}' was deleted during MCP refresh"
-        ));
-    }
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
         tool_facade::active_schemas(&handle.cwd, descriptions)
@@ -1571,7 +1563,6 @@ async fn refresh_live_mcp_bridge(
     *handle.mcp_specs.lock().await = mcp_specs;
     drop(agent_session);
     old_bridge.shutdown().await;
-    Ok(())
 }
 
 async fn session_bridge(handle: &SessionHandle) -> Arc<McpBridge> {
@@ -1968,6 +1959,12 @@ fn build_agent_with_state(
                                 ),
                             );
                         };
+                        let existing_handle =
+                            state.sessions.lock().await.get(&req.session_id).cloned();
+                        let _lifecycle = match &existing_handle {
+                            Some(handle) => Some(handle.lifecycle.lock().await),
+                            None => None,
+                        };
                         let removed_handle = state.sessions.lock().await.remove(&req.session_id);
                         if let Some(handle) = &removed_handle {
                             let notify = handle
@@ -2115,9 +2112,32 @@ fn build_agent_with_state(
                             req.cwd
                         };
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
-                        let (current_model, active_handle) = if let Some(handle) = existing {
+                        // Keep this guard through replay and response enqueue.
+                        // session/delete takes the same guard before removing
+                        // the handle, giving load/delete a single linear order.
+                        let _lifecycle = match &existing {
+                            Some(handle) => Some(handle.lifecycle.lock().await),
+                            None => None,
+                        };
+                        if let Some(handle) = &existing {
+                            let still_current = state
+                                .sessions
+                                .lock()
+                                .await
+                                .get(&session_id)
+                                .is_some_and(|current| Arc::ptr_eq(current, handle));
+                            if !still_current {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::util::internal_error(format!(
+                                        "session '{session_id}' was deleted while loading"
+                                    )),
+                                );
+                            }
+                        }
+                        let (current_model, active_handle, send_diagnostics) =
+                            if let Some(handle) = &existing {
                             let current_specs = handle.mcp_specs.lock().await.clone();
-                            let bridge = session_bridge(&handle).await;
+                            let bridge = session_bridge(handle).await;
                             let refresh_bridge = should_refresh_mcp_bridge(
                                 &current_specs,
                                 &mcp_specs,
@@ -2128,19 +2148,13 @@ fn build_agent_with_state(
                                 // Zed re-sends MCP configuration on every load.
                                 // Refresh routing and schemas in place when it
                                 // changed, or retry servers that failed earlier.
-                                if let Err(error) = refresh_live_mcp_bridge(
-                                    &handle,
+                                refresh_live_mcp_bridge(
+                                    handle,
                                     &state,
                                     &cfg,
-                                    &session_id,
                                     mcp_specs,
                                 )
-                                .await
-                                {
-                                    return responder.respond_with_error(
-                                        agent_client_protocol::util::internal_error(error),
-                                    );
-                                }
+                                .await;
                             }
                             // Live sessions always preserve provider, history,
                             // usage, compaction cache, and tool-session state.
@@ -2152,7 +2166,7 @@ fn build_agent_with_state(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .clone();
-                            (model, handle)
+                            (model, Arc::clone(handle), refresh_bridge)
                         } else if let Some(record) = state
                             .store
                             .as_ref()
@@ -2204,7 +2218,7 @@ fn build_agent_with_state(
                                 .lock()
                                 .await
                                 .insert(session_id.clone(), Arc::clone(&handle));
-                            (model, handle)
+                            (model, handle, true)
                         } else {
                             // 3. Unknown: not live, nothing persisted. Match
                             // native providers — error rather than fake a resume.
@@ -2224,7 +2238,9 @@ fn build_agent_with_state(
                         // Notifications must follow a successfully queued load
                         // response: Zed registers the session while handling
                         // that response, then accepts its session updates.
-                        send_session_mcp_diagnostics(&cx, &session_id, &active_handle).await;
+                        if send_diagnostics {
+                            send_session_mcp_diagnostics(&cx, &session_id, &active_handle).await;
+                        }
                         Ok(())
                     }
                 }
@@ -2856,8 +2872,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_mcp_refresh_rejects_a_session_removed_by_delete() {
+    async fn session_delete_waits_for_live_load_lifecycle() {
         let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
         let cfg = Arc::new(Config::default());
         let mut state_out = None;
         let agent = build_agent_with_state(
@@ -2868,7 +2885,7 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
-            None,
+            Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
             &mut state_out,
@@ -2895,19 +2912,29 @@ mod tests {
                         .sessions
                         .lock()
                         .await
-                        .remove(&session_id)
+                        .get(&session_id)
+                        .cloned()
                         .expect("new session handle");
-
-                    let error = refresh_live_mcp_bridge(
-                        &handle,
-                        &state_for_client,
-                        &cfg,
-                        &session_id,
-                        vec![],
-                    )
-                    .await
-                    .expect_err("a deleted session must not install a replacement bridge");
-                    assert!(error.contains("deleted"));
+                    let lifecycle = handle.lifecycle.lock().await;
+                    let delete = connection
+                        .send_request(DeleteSessionRequest::new(session_id.clone()))
+                        .block_task();
+                    tokio::pin!(delete);
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), &mut delete)
+                            .await
+                            .is_err(),
+                        "delete must wait while load owns the lifecycle guard"
+                    );
+                    drop(lifecycle);
+                    tokio::time::timeout(Duration::from_secs(1), &mut delete)
+                        .await
+                        .expect("delete should continue after load releases lifecycle")?;
+                    assert!(!state_for_client
+                        .sessions
+                        .lock()
+                        .await
+                        .contains_key(&session_id));
                     Ok(())
                 },
             )
