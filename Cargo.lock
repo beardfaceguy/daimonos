@@ -681,6 +681,7 @@ dependencies = [
  "allocative",
  "anyhow",
  "async-trait",
+ "blocking",
  "chrono",
  "clap",
  "eventsource-stream",

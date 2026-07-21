@@ -129,6 +129,9 @@ init_timeout_secs = 10
 # Per remote tools/call budget (seconds). On timeout the model receives an
 # error tool result and the turn continues.
 call_timeout_secs = 60
+# Maximum time to wait for an MCP runtime and its child process to shut down.
+# Expiry is logged and ACP teardown continues instead of orphaning daimonos.
+shutdown_timeout_secs = 5
 # Upper bound on forwarded servers connected per session (bounds spawned
 # processes / connections). Extra servers are ignored.
 max_servers = 32

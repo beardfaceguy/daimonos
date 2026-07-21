@@ -201,6 +201,25 @@ fn response_to_content(resp: Response) -> String {
     }
 }
 
+fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
+    let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
+        return content;
+    };
+    let mut names: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.get("name")?.as_str().map(str::to_string))
+        .collect();
+    for tool in tools.iter().filter(|tool| tool.name.starts_with("mcp__")) {
+        if names.insert(tool.name.clone()) {
+            entries.push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+            }));
+        }
+    }
+    serde_json::to_string(&entries).unwrap_or(content)
+}
+
 /// Render one `--debug-tokens` log line for a single LLM API call.
 fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
     serde_json::json!({
@@ -388,7 +407,13 @@ pub async fn run(
                         {
                             Some(r) => {
                                 let ok = r.ok;
-                                (response_to_content(r), !ok)
+                                let content = response_to_content(r);
+                                let content = if name == "list_all_tools" {
+                                    append_remote_tools_to_catalog(content, &config.tools)
+                                } else {
+                                    content
+                                };
+                                (content, !ok)
                             }
                             None => match &config.remote_tool_dispatch {
                                 Some(hook) => match hook(&name, &input).await {
@@ -1336,6 +1361,40 @@ mod tests {
     fn content_falls_back_to_message() {
         let resp = Response::err(3, "tool failed");
         assert_eq!(response_to_content(resp), "tool failed");
+    }
+
+    #[test]
+    fn remote_tools_are_appended_to_list_all_tools_catalog() {
+        let native = serde_json::json!([
+            {"name": "read_file", "description": "Read a file"}
+        ])
+        .to_string();
+        let tools = vec![
+            ToolSchema {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolSchema {
+                name: "mcp__linear__get_issue".to_string(),
+                description: "Get a Linear issue".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+
+        let catalog = append_remote_tools_to_catalog(native, &tools);
+        let entries: Vec<Value> = serde_json::from_str(&catalog).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["name"] == "read_file")
+                .count(),
+            1
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry["name"] == "mcp__linear__get_issue"));
     }
 
     // --- streaming (vikunja #957) ---

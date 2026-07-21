@@ -14,8 +14,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context as TaskContext, Poll};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
@@ -34,9 +36,10 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent as AcpAgentRole, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch,
-    JsonRpcRequest, JsonRpcResponse, Stdio,
+    Agent as AcpAgentRole, ByteStreams, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch,
+    JsonRpcRequest, JsonRpcResponse,
 };
+use futures_util::io::AsyncRead;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{
@@ -83,6 +86,37 @@ type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 /// to the session at the top of each `run_prompt_turn`, so a switch takes
 /// effect on the next prompt (you can't change model mid-turn anyway).
 type CurrentModel = Arc<StdMutex<String>>;
+
+struct EofAwareReader<R> {
+    inner: R,
+    eof: Arc<tokio::sync::Notify>,
+    notified: bool,
+}
+
+impl<R> EofAwareReader<R> {
+    fn new(inner: R, eof: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            inner,
+            eof,
+            notified: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for EofAwareReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(0))) && !self.notified {
+            self.notified = true;
+            self.eof.notify_one();
+        }
+        result
+    }
+}
 
 /// Builds a fresh `LlmProvider` for a new session. `LlmProvider` isn't
 /// `Clone`, and Zed keeps one `daimonos acp` process alive across multiple
@@ -149,6 +183,7 @@ struct SessionHandle {
     /// the bridge is disabled or no servers were forwarded. Shut down on
     /// session/delete.
     bridge: Arc<McpBridge>,
+    mcp_specs: Vec<ServerSpec>,
     client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
     compaction: AcpCompaction,
     /// Provider-reported windows already resolved for this session's models.
@@ -250,6 +285,19 @@ fn send_available_commands(cx: &ConnectionTo<AcpClientRole>, session_id: &Sessio
         session_id,
         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
     );
+}
+
+fn send_mcp_diagnostics(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    bridge: &McpBridge,
+) {
+    for diagnostic in bridge.diagnostics() {
+        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(format!(
+            "[MCP bridge: {diagnostic}]"
+        ))));
+        send_notification(cx, session_id, SessionUpdate::AgentThoughtChunk(chunk));
+    }
 }
 
 fn run_acp_command(command: AcpCommand, session: &mut AgentSession) -> String {
@@ -1016,6 +1064,14 @@ fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
         .collect()
 }
 
+fn should_refresh_mcp_bridge(
+    current: &[ServerSpec],
+    requested: &[ServerSpec],
+    had_diagnostics: bool,
+) -> bool {
+    had_diagnostics || current != requested
+}
+
 /// Dispatch hook consulted by the agent loop when the opcode facade doesn't
 /// serve a tool: routes `mcp__*` calls to the session's bridge (ADR-003, D5).
 fn build_remote_dispatch_hook(bridge: Arc<McpBridge>) -> RemoteToolHook {
@@ -1396,7 +1452,7 @@ async fn build_session_handle(
             .collect();
     let bridge = Arc::new(
         McpBridge::build_with_pool(
-            mcp_specs,
+            mcp_specs.clone(),
             &cfg.acp.mcp,
             &native_tool_names,
             state.analytics.clone(),
@@ -1432,6 +1488,7 @@ async fn build_session_handle(
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
         bridge,
+        mcp_specs,
         client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
         compaction: state.compaction.clone(),
         context_windows: tokio::sync::Mutex::new(context_windows),
@@ -1909,7 +1966,7 @@ fn build_agent_with_state(
                             .sessions
                             .lock()
                             .await
-                            .insert(session_id.clone(), handle);
+                            .insert(session_id.clone(), Arc::clone(&handle));
 
                         // Advertise the model picker (vikunja #960); new sessions
                         // start on the default model.
@@ -1920,6 +1977,7 @@ fn build_agent_with_state(
                                 .config_options(Some(config_options)),
                         )?;
                         send_available_commands(&cx, &session_id);
+                        send_mcp_diagnostics(&cx, &session_id, &handle.bridge);
                         Ok(())
                     }
                 }
@@ -1954,21 +2012,83 @@ fn build_agent_with_state(
                     let token_log = token_log.clone();
                     async move {
                         let session_id = req.session_id.clone();
-                        // Zed re-sends mcp_servers on every load; used only on
-                        // the rebuild path (case 2). Live sessions (case 1) keep
-                        // their existing bridge (ADR-003, D9).
                         let mcp_specs = to_server_specs(req.mcp_servers);
+                        let session_workspace = if req.cwd.as_os_str().is_empty() {
+                            workspace_fallback
+                        } else {
+                            req.cwd
+                        };
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
-                        let current_model = if let Some(handle) = existing {
-                            // 1. Live in memory: replay the in-memory history.
-                            let agent_session = handle.session.lock().await;
-                            replay_history(&cx, &session_id, agent_session.history());
-                            drop(agent_session);
-                            handle
-                                .current_model
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .clone()
+                        let (current_model, active_handle) = if let Some(handle) = existing {
+                            let refresh_bridge = should_refresh_mcp_bridge(
+                                &handle.mcp_specs,
+                                &mcp_specs,
+                                !handle.bridge.diagnostics().is_empty(),
+                            );
+                            if refresh_bridge {
+                                // Zed re-sends MCP configuration on every load.
+                                // Rebuild a live session when that configuration
+                                // changed, or retry servers that failed earlier.
+                                let history = handle.session.lock().await.history().to_vec();
+                                let client_ids =
+                                    handle.client_user_message_ids.lock().await.clone();
+                                let model = handle
+                                    .current_model
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clone();
+                                let replacement = match build_session_handle(
+                                    &state,
+                                    &cfg,
+                                    Arc::clone(&safety),
+                                    token_log.clone(),
+                                    session_id.clone(),
+                                    session_workspace,
+                                    mcp_specs,
+                                    cx.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(handle) => handle,
+                                    Err(e) => {
+                                        return responder.respond_with_error(
+                                            agent_client_protocol::util::internal_error(format!(
+                                                "provider init: {e}"
+                                            )),
+                                        );
+                                    }
+                                };
+                                {
+                                    let mut session = replacement.session.lock().await;
+                                    session.set_history(history);
+                                    session.set_model(model.clone());
+                                    replay_history(&cx, &session_id, session.history());
+                                }
+                                *replacement.client_user_message_ids.lock().await = client_ids;
+                                *replacement
+                                    .current_model
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner()) = model.clone();
+                                state
+                                    .sessions
+                                    .lock()
+                                    .await
+                                    .insert(session_id.clone(), Arc::clone(&replacement));
+                                handle.bridge.shutdown().await;
+                                (model, replacement)
+                            } else {
+                                // Live and unchanged: preserve the existing
+                                // provider/session state and replay its history.
+                                let agent_session = handle.session.lock().await;
+                                replay_history(&cx, &session_id, agent_session.history());
+                                drop(agent_session);
+                                let model = handle
+                                    .current_model
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clone();
+                                (model, handle)
+                            }
                         } else if let Some(record) = state
                             .store
                             .as_ref()
@@ -1977,11 +2097,6 @@ fn build_agent_with_state(
                             // 2. Persisted on disk (process was restarted):
                             // rebuild the session, seed its history + model, then
                             // replay so Zed reconstructs the thread.
-                            let session_workspace = if req.cwd.as_os_str().is_empty() {
-                                workspace_fallback
-                            } else {
-                                req.cwd
-                            };
                             let handle = match build_session_handle(
                                 &state,
                                 &cfg,
@@ -2024,8 +2139,8 @@ fn build_agent_with_state(
                                 .sessions
                                 .lock()
                                 .await
-                                .insert(session_id.clone(), handle);
-                            model
+                                .insert(session_id.clone(), Arc::clone(&handle));
+                            (model, handle)
                         } else {
                             // 3. Unknown: not live, nothing persisted. Match
                             // native providers — error rather than fake a resume.
@@ -2042,6 +2157,7 @@ fn build_agent_with_state(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
                         send_available_commands(&cx, &session_id);
+                        send_mcp_diagnostics(&cx, &session_id, &active_handle.bridge);
                         Ok(())
                     }
                 }
@@ -2236,7 +2352,21 @@ pub async fn run_acp(
         analytics,
         &mut state_out,
     );
-    let result = agent.connect_to(Stdio::new()).await;
+    // The upstream ACP stdio transport waits for both its incoming and
+    // outgoing actors. After stdin EOF, the outgoing actor can remain parked
+    // on its internal channel forever, orphaning this process. Race the
+    // connection against an EOF signal emitted by the reader itself.
+    let eof = Arc::new(tokio::sync::Notify::new());
+    let eof_wait = eof.notified();
+    let stdin = EofAwareReader::new(blocking::Unblock::new(std::io::stdin()), Arc::clone(&eof));
+    let stdout = blocking::Unblock::new(std::io::stdout());
+    let connection = agent.connect_to(ByteStreams::new(stdout, stdin));
+    tokio::pin!(connection);
+    tokio::pin!(eof_wait);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        _ = &mut eof_wait => Ok(()),
+    };
     // stdin closed (or the connection errored): drain every live session's MCP
     // bridge so Zed-spawned stdio servers are reaped instead of leaking (D7/D8).
     if let Some(state) = state_out {
@@ -4402,6 +4532,21 @@ mod tests {
     #[test]
     fn tool_kind_unknown_tool_is_other() {
         assert_eq!(tool_kind_for("some_future_tool"), ToolKind::Other);
+    }
+
+    #[test]
+    fn live_session_refreshes_changed_or_failed_mcp_bridge() {
+        let spec = |name: &str| ServerSpec::Stdio {
+            name: name.to_string(),
+            command: "server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let current = vec![spec("one")];
+
+        assert!(!should_refresh_mcp_bridge(&current, &current, false));
+        assert!(should_refresh_mcp_bridge(&current, &[spec("two")], false));
+        assert!(should_refresh_mcp_bridge(&current, &current, true));
     }
 
     #[test]
