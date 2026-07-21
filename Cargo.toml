@@ -22,6 +22,7 @@ json-patch = "3"
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"
+blocking = "1"
 starlark = "0.13"
 allocative = "0.3"
 rust-mcp-sdk = { version = "0.9", default-features = false, features = ["server", "client", "stdio", "streamable-http", "sse"] }

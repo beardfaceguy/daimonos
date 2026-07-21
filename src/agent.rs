@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::compaction::{self, CompactionEvent, CompactionPolicy, CompactionStrategy};
+use crate::mcp_bridge::REMOTE_TOOL_PREFIX;
 use crate::protocol::Response;
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role, StopReason, StreamEvent,
@@ -12,6 +13,7 @@ use crate::providers::{
 };
 use crate::session::Session;
 use crate::tool_facade;
+use crate::tools::LIST_ALL_TOOLS_TOOL;
 
 // --- Hook types ---
 
@@ -201,6 +203,29 @@ fn response_to_content(resp: Response) -> String {
     }
 }
 
+fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
+    let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
+        eprintln!("agent: list_all_tools returned a non-array catalog; remote tools omitted");
+        return content;
+    };
+    let mut names: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.get("name")?.as_str().map(str::to_string))
+        .collect();
+    for tool in tools
+        .iter()
+        .filter(|tool| tool.name.starts_with(REMOTE_TOOL_PREFIX))
+    {
+        if names.insert(tool.name.clone()) {
+            entries.push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+            }));
+        }
+    }
+    serde_json::to_string(&entries).unwrap_or(content)
+}
+
 /// Render one `--debug-tokens` log line for a single LLM API call.
 fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
     serde_json::json!({
@@ -388,7 +413,13 @@ pub async fn run(
                         {
                             Some(r) => {
                                 let ok = r.ok;
-                                (response_to_content(r), !ok)
+                                let content = response_to_content(r);
+                                let content = if name == LIST_ALL_TOOLS_TOOL {
+                                    append_remote_tools_to_catalog(content, &config.tools)
+                                } else {
+                                    content
+                                };
+                                (content, !ok)
                             }
                             None => match &config.remote_tool_dispatch {
                                 Some(hook) => match hook(&name, &input).await {
@@ -741,6 +772,12 @@ impl AgentSession {
     /// model picker switches between models with different context windows.
     pub fn set_compaction(&mut self, policy: Option<CompactionPolicy>) {
         self.config.compaction = policy;
+    }
+
+    /// Replace the schemas sent on subsequent provider calls. ACP uses this
+    /// after refreshing its forwarded MCP bridge for a live session.
+    pub fn set_tools(&mut self, tools: Vec<ToolSchema>) {
+        self.config.tools = tools;
     }
 
     /// Ask this session's provider for a model's current context-window size.
@@ -1336,6 +1373,40 @@ mod tests {
     fn content_falls_back_to_message() {
         let resp = Response::err(3, "tool failed");
         assert_eq!(response_to_content(resp), "tool failed");
+    }
+
+    #[test]
+    fn remote_tools_are_appended_to_list_all_tools_catalog() {
+        let native = serde_json::json!([
+            {"name": "read_file", "description": "Read a file"}
+        ])
+        .to_string();
+        let tools = vec![
+            ToolSchema {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolSchema {
+                name: "mcp__linear__get_issue".to_string(),
+                description: "Get a Linear issue".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+
+        let catalog = append_remote_tools_to_catalog(native, &tools);
+        let entries: Vec<Value> = serde_json::from_str(&catalog).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["name"] == "read_file")
+                .count(),
+            1
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry["name"] == "mcp__linear__get_issue"));
     }
 
     // --- streaming (vikunja #957) ---

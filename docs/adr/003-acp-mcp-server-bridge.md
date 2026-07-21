@@ -68,8 +68,8 @@ require per-chat state isolation.
 
 Building the bridge never fails `session/new`/`session/load`. Each server is initialized
 independently with a bounded timeout; a server that fails to spawn, connect, initialize, or list
-tools is logged and **skipped**. The session proceeds with the remaining servers plus all native
-tools. One misconfigured server can never wedge a session. A remote `tools/call` that errors or
+tools is logged, surfaced as an ACP thought update, and **skipped**. The session proceeds with the
+remaining servers plus all native tools. One misconfigured server can never wedge a session. A remote `tools/call` that errors or
 times out returns an error *tool result* to the model (so it can recover) — it does not abort the
 turn.
 
@@ -137,16 +137,25 @@ the safety gate treat the `mcp__` prefix as destructive-by-default.
 
 ### D8 — Lifecycle: init, shutdown, cancellation
 
-- **Initialize** on `session/new` and on the `session/load` *rebuild* path (case 2 — process was
-  restarted). Each client does the MCP `initialize` handshake + `tools/list`, bounded by
-  `[acp.mcp] init_timeout_secs`.
+- **Initialize** on `session/new`, on the `session/load` rebuild path after a process restart, and
+  when a live session's forwarded configuration changed or a prior connection failed. Live refresh
+  swaps only the bridge and provider tool schemas while holding the existing session lock; it
+  preserves provider state, history, usage, context-window cache, and tool-session state. Each
+  client does the MCP `initialize` handshake + `tools/list`, bounded by `[acp.mcp]
+  init_timeout_secs`.
 - **Advertise capability** at ACP `initialize`: add
   `AgentCapabilities.mcp(McpCapabilities::new().stdio(..).http(..))` so Zed is spec-correct in
   forwarding `Http` servers (Zed gates `Http` on `session.mcp.http`). Gated by config so it can be
   disabled.
 - **Shutdown** the bridge (all clients: `shut_down()`, and stdio child processes reaped) on
-  `session/delete` and on process exit / `Drop`. This satisfies the resource-lifecycle rule (every
-  spawned child + client has a teardown path).
+  `session/delete` and on process exit / `Drop`, bounded by `shutdown_timeout_secs`. ACP stdio EOF
+  independently terminates the process even if the protocol transport's outgoing actor remains
+  parked. A timed-out pooled shutdown continues in a detached task while its slot remains
+  unavailable; new acquisitions wait for completion, so a replacement cannot overlap the
+  still-live runtime. A per-session lifecycle lock orders live load/refresh/replay against deletion,
+  while a per-session-id operation lock single-flights cold loads and deletion before a live handle
+  exists. This satisfies the resource-lifecycle rule (every spawned child + client has a teardown
+  path that cannot wedge the agent process).
 - **Cancellation:** a `session/cancel` (or `session/delete` mid-turn) best-effort-cancels in-flight
   remote calls. A remote `tools/call` is run inside the same cancel-raced turn; the SDK client is
   dropped/aborted on shutdown.
@@ -156,7 +165,10 @@ the safety gate treat the `mcp__` prefix as destructive-by-default.
 `SessionStore` persists messages + model + cwd only. Zed re-sends `mcp_servers` on **every**
 `session/load`/`session/resume`, so:
 
-- **Case 1 (live in memory):** keep the existing bridge (already initialized on `session/new`).
+- **Case 1 (live in memory):** keep the existing bridge when the forwarded configuration is
+  unchanged and healthy. Refresh the bridge in place when configuration changed or a prior
+  connection failed. Informational diagnostics such as configured tool/server limits or name
+  collisions do not cause repeated reconnects.
 - **Case 2 (rebuilt after restart):** build the bridge from the *request's* `mcp_servers`.
 - **Case 3 (unknown):** unchanged — error, no bridge.
 
@@ -178,6 +190,8 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
 - `enabled` (bool, default `true`) — master switch for the bridge.
 - `init_timeout_secs` (u64, default e.g. `10`) — per-server initialize+list-tools budget.
 - `call_timeout_secs` (u64, default e.g. `60`) — per remote `tools/call` budget.
+- `shutdown_timeout_secs` (u64, default `5`) — bounds runtime/child shutdown during session/process
+  teardown.
 - `max_servers` (usize) and `max_tools_per_server` (usize) — bounds to keep the exposed tool set
   and spawned processes bounded (bounded-collections rule).
 - `max_concurrent_connects` (usize, default `8`) — bounds simultaneous initialize/list handshakes;
@@ -195,10 +209,10 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
   `McpClientHandler` impl (no-op server-initiated requests).
 - **`src/agent.rs`** — add optional `remote_tool_dispatch` to `AgentConfig`; consult it in the
   `tool_facade::invoke → None` branch.
-- **`src/acp_cmd.rs`** — read `req.mcp_servers` in `session/new` and the `session/load` rebuild
-  path; build the bridge; append its schemas in `build_agent_config`; store bridge on
-  `SessionHandle`; wire the dispatch hook; shut down on delete/exit; advertise `mcp` capability at
-  initialize.
+- **`src/acp_cmd.rs`** — read `req.mcp_servers` in `session/new` and `session/load`; build or
+  atomically refresh the bridge; append its schemas in `build_agent_config`; store the swappable
+  bridge on `SessionHandle`; wire the dispatch hook; shut down on delete/exit; advertise `mcp`
+  capability at initialize.
 - **`src/config.rs` / `daimonos.default.toml` / `docs/configuration.md`** — `[acp.mcp]` config.
 - **`Cargo.toml`** — enable `client`, `streamable-http`, `sse` features on `rust-mcp-sdk`.
 

@@ -33,6 +33,8 @@ use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::AcpMcpConfig;
 use crate::providers::ToolSchema;
 
+pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
+
 /// Canonical transport identity for pooling. Display names are deliberately
 /// excluded: two sessions may alias the same server differently while sharing
 /// one transport/client. Map fields are sorted so insertion order cannot
@@ -81,17 +83,20 @@ struct PoolLease {
     slot: Arc<PoolSlot>,
     client: Arc<ClientRuntime>,
     tools: Arc<Vec<Tool>>,
+    shutdown_timeout: Duration,
 }
 
 #[derive(Default)]
 struct PoolSlot {
     state: tokio::sync::Mutex<PoolSlotState>,
+    changed: tokio::sync::Notify,
 }
 
 #[derive(Default)]
 enum PoolSlotState {
     #[default]
     Empty,
+    ShuttingDown,
     Ready {
         client: Arc<ClientRuntime>,
         tools: Arc<Vec<Tool>>,
@@ -138,20 +143,34 @@ impl McpClientPool {
                 }
             }
         };
-        let mut state = slot.state.lock().await;
-        if let PoolSlotState::Ready {
-            client,
-            tools,
-            leases,
-        } = &mut *state
-        {
-            *leases += 1;
-            return Ok(PoolLease {
-                slot: Arc::clone(&slot),
-                client: Arc::clone(client),
-                tools: Arc::clone(tools),
-            });
-        }
+        let mut state = loop {
+            let mut state = slot.state.lock().await;
+            if let PoolSlotState::Ready {
+                client,
+                tools,
+                leases,
+            } = &mut *state
+            {
+                *leases += 1;
+                return Ok(PoolLease {
+                    slot: Arc::clone(&slot),
+                    client: Arc::clone(client),
+                    tools: Arc::clone(tools),
+                    shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
+                });
+            }
+            if matches!(*state, PoolSlotState::ShuttingDown) {
+                // Register before unlocking so completion cannot race between
+                // observing ShuttingDown and beginning the wait.
+                let changed = slot.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                drop(state);
+                changed.await;
+                continue;
+            }
+            break state;
+        };
 
         let (client, tools) = connect(spec, cfg, init_timeout).await?;
         let tools = Arc::new(tools);
@@ -164,10 +183,12 @@ impl McpClientPool {
             slot: Arc::clone(&slot),
             client,
             tools,
+            shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
         })
     }
 
     async fn release(&self, lease: PoolLease) {
+        let shutdown_timeout = lease.shutdown_timeout;
         let mut state = lease.slot.state.lock().await;
         let shutdown = match &mut *state {
             PoolSlotState::Ready { leases, .. } if *leases > 1 => {
@@ -176,15 +197,34 @@ impl McpClientPool {
             }
             PoolSlotState::Ready { client, .. } => {
                 let client = Arc::clone(client);
-                *state = PoolSlotState::Empty;
+                *state = PoolSlotState::ShuttingDown;
                 Some(client)
             }
-            PoolSlotState::Empty => None,
+            PoolSlotState::Empty | PoolSlotState::ShuttingDown => None,
         };
         if let Some(client) = shutdown {
-            // Keep the slot locked until shutdown completes so a new acquirer
-            // cannot start a replacement while the old runtime is still live.
-            let _ = client.shut_down().await;
+            drop(state);
+            let slot = Arc::clone(&lease.slot);
+            let mut shutdown_task = tokio::spawn(async move {
+                let _ = client.shut_down().await;
+                let mut state = slot.state.lock().await;
+                if matches!(*state, PoolSlotState::ShuttingDown) {
+                    *state = PoolSlotState::Empty;
+                }
+                slot.changed.notify_waiters();
+            });
+            // Dropping a timed-out JoinHandle detaches rather than cancels its
+            // task. The slot stays strongly held and ShuttingDown until the
+            // original runtime actually exits, preventing overlapping clients.
+            if tokio::time::timeout(shutdown_timeout, &mut shutdown_task)
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "acp mcp bridge: client shutdown timed out after {}s",
+                    shutdown_timeout.as_secs()
+                );
+            }
         }
     }
 
@@ -286,6 +326,8 @@ pub struct McpBridge {
     pool: McpClientPool,
     runtime: tokio::sync::RwLock<BridgeRuntime>,
     tools: Vec<ToolSchema>,
+    diagnostics: Vec<String>,
+    had_connection_failures: bool,
     analytics: Option<Arc<AnalyticsStore>>,
     external_session_id: Option<String>,
     call_timeout: Duration,
@@ -301,6 +343,8 @@ impl McpBridge {
             pool,
             runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
+            diagnostics: Vec::new(),
+            had_connection_failures: false,
             analytics: None,
             external_session_id: None,
             call_timeout: Duration::from_secs(0),
@@ -350,6 +394,8 @@ impl McpBridge {
             pool: pool.clone(),
             runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
+            diagnostics: Vec::new(),
+            had_connection_failures: false,
             analytics,
             external_session_id,
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
@@ -362,6 +408,13 @@ impl McpBridge {
         let mut used: HashSet<String> = native_tool_names.clone();
         let init_timeout = Duration::from_secs(cfg.init_timeout_secs);
         let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
+        if specs.len() > cfg.max_servers {
+            bridge.diagnostics.push(format!(
+                "{} forwarded MCP server(s) were skipped by max_servers={}",
+                specs.len() - cfg.max_servers,
+                cfg.max_servers
+            ));
+        }
         let connect_futures =
             specs
                 .into_iter()
@@ -386,14 +439,23 @@ impl McpBridge {
                 Ok(lease) => {
                     let lease_idx = bridge.runtime.get_mut().leases.len();
                     let mut registered_any = false;
+                    if lease.tools.len() > cfg.max_tools_per_server {
+                        bridge.diagnostics.push(format!(
+                            "MCP server '{server_name}': {} tool(s) were skipped by max_tools_per_server={}",
+                            lease.tools.len() - cfg.max_tools_per_server,
+                            cfg.max_tools_per_server
+                        ));
+                    }
                     for tool in lease.tools.iter().take(cfg.max_tools_per_server) {
                         let Some(exposed) =
                             resolve_name(&server_name, &tool.name, native_tool_names, &mut used)
                         else {
-                            eprintln!(
-                                "acp mcp bridge: skipping remote tool '{}' from '{server_name}': name collides and cannot be de-duped",
+                            let message = format!(
+                                "MCP server '{server_name}': tool '{}' was skipped because its name collides and cannot be de-duplicated",
                                 tool.name
                             );
+                            eprintln!("acp mcp bridge: {message}");
+                            bridge.diagnostics.push(message);
                             continue;
                         };
                         let input_schema = serde_json::to_value(&tool.input_schema)
@@ -424,7 +486,10 @@ impl McpBridge {
                     }
                 }
                 Err(e) => {
-                    eprintln!("acp mcp bridge: skipping MCP server '{server_name}': {e}");
+                    let message = format!("MCP server '{server_name}' failed to connect: {e}");
+                    eprintln!("acp mcp bridge: {message}");
+                    bridge.diagnostics.push(message);
+                    bridge.had_connection_failures = true;
                 }
             }
         }
@@ -434,6 +499,19 @@ impl McpBridge {
     /// The tool schemas to append to the model's tool list.
     pub fn tools(&self) -> &[ToolSchema] {
         &self.tools
+    }
+
+    /// Connection/tool-registration problems to surface through ACP instead
+    /// of leaving them only on the child process's stderr pipe.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// Whether at least one server failed before tool discovery completed.
+    /// Unlike limit/collision diagnostics, these failures are worth retrying
+    /// when Zed reloads a live session.
+    pub fn had_connection_failures(&self) -> bool {
+        self.had_connection_failures
     }
 
     /// Number of connected servers (clients that contributed ≥1 tool).
@@ -547,7 +625,13 @@ async fn connect(
         Ok(tools) => Ok((client, tools)),
         Err(e) => {
             // Fail-open must not leak: tear down whatever start() spawned.
-            let _ = client.shut_down().await;
+            let shutdown_timeout = Duration::from_secs(cfg.shutdown_timeout_secs);
+            let mut shutdown_task = tokio::spawn(async move {
+                let _ = client.shut_down().await;
+            });
+            // Timeout bounds the caller, not cleanup: dropping JoinHandle
+            // detaches the task so it continues reaping a slow stdio child.
+            let _ = tokio::time::timeout(shutdown_timeout, &mut shutdown_task).await;
             Err(e)
         }
     }
@@ -682,7 +766,7 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 /// (`^[a-zA-Z0-9_-]{1,64}$`) and truncated to 64 bytes. Non-conforming chars
 /// become `_`.
 fn namespaced_name(server: &str, tool: &str) -> String {
-    let raw = format!("mcp__{server}__{tool}");
+    let raw = format!("{REMOTE_TOOL_PREFIX}{server}__{tool}");
     let mut s: String = raw
         .chars()
         .map(|c| {
@@ -890,6 +974,48 @@ mod tests {
         let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
         assert!(bridge.tools().is_empty());
         assert_eq!(bridge.server_count(), 0);
+        assert!(bridge.had_connection_failures());
+        assert!(
+            bridge
+                .diagnostics()
+                .iter()
+                .any(|message| message.contains("broken") && message.contains("failed")),
+            "failed server must remain visible to the ACP frontend"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_diagnostic_is_not_a_retryable_connection_failure() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let cfg = AcpMcpConfig {
+            max_servers: 1,
+            ..AcpMcpConfig::default()
+        };
+        let spec = |name: &str| ServerSpec::Stdio {
+            name: name.to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::from([("SERVER_NAME".to_string(), name.to_string())]),
+        };
+        let bridge = McpBridge::build(
+            vec![spec("connected"), spec("skipped")],
+            &cfg,
+            &native_set(&[]),
+            None,
+            None,
+        )
+        .await;
+        assert!(!bridge.diagnostics().is_empty());
+        assert!(!bridge.had_connection_failures());
+        bridge.shutdown().await;
     }
 
     #[tokio::test]
@@ -1084,6 +1210,47 @@ mod tests {
             outcome.content
         );
 
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn partial_connection_failure_keeps_healthy_server_and_diagnostic() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let broken = ServerSpec::Stdio {
+            name: "broken".to_string(),
+            command: "daimonos-nonexistent-binary-xyz".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let healthy = ServerSpec::Stdio {
+            name: "healthy".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+
+        let bridge = McpBridge::build(
+            vec![broken, healthy],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(bridge.handles("mcp__healthy__read_file"));
+        assert!(bridge
+            .diagnostics()
+            .iter()
+            .any(|message| message.contains("broken")));
         bridge.shutdown().await;
     }
 
