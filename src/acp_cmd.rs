@@ -1961,20 +1961,25 @@ fn build_agent_with_state(
                         };
                         let existing_handle =
                             state.sessions.lock().await.get(&req.session_id).cloned();
+                        // Signal cancellation before waiting on lifecycle: a
+                        // concurrent load may own lifecycle while waiting for
+                        // the active prompt's session lock.
+                        if let Some(handle) = &existing_handle {
+                            let notify = handle
+                                .cancel
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            if let Some(notify) = notify {
+                                notify.notify_one();
+                            }
+                        }
                         let _lifecycle = match &existing_handle {
                             Some(handle) => Some(handle.lifecycle.lock().await),
                             None => None,
                         };
                         let removed_handle = state.sessions.lock().await.remove(&req.session_id);
                         if let Some(handle) = &removed_handle {
-                            let notify = handle
-                                .cancel
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .clone();
-                            if let Some(notify) = notify {
-                                notify.notify_one();
-                            }
                             // Wait for a cancelled turn (or short direct command)
                             // to release the session before removing its file, so
                             // it cannot save itself again after deletion.

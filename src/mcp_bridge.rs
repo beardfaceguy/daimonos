@@ -626,7 +626,12 @@ async fn connect(
         Err(e) => {
             // Fail-open must not leak: tear down whatever start() spawned.
             let shutdown_timeout = Duration::from_secs(cfg.shutdown_timeout_secs);
-            let _ = tokio::time::timeout(shutdown_timeout, client.shut_down()).await;
+            let mut shutdown_task = tokio::spawn(async move {
+                let _ = client.shut_down().await;
+            });
+            // Timeout bounds the caller, not cleanup: dropping JoinHandle
+            // detaches the task so it continues reaping a slow stdio child.
+            let _ = tokio::time::timeout(shutdown_timeout, &mut shutdown_task).await;
             Err(e)
         }
     }
