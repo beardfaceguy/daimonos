@@ -80,16 +80,27 @@ You should see:
 ```
 Daimonos — agent-optimized OS layer
 
-Usage: daimonos [OPTIONS]
+Usage: daimonos [OPTIONS] [COMMAND]
+
+Commands:
+  agent   Run the agent on a one-shot task and exit
+  chat    Start an interactive chat REPL over a stateful agent session
+  acp     Run a native Agent Client Protocol engine over stdio
+  mcp     Run the MCP tool server over stdio or a Unix socket
+  daemon  Run the compact opcode protocol daemon over a Unix socket
 
 Options:
-  -s, --socket <SOCKET>        Unix socket path (ignored in --mcp mode) [default: /tmp/daimonos.sock]
+  -s, --socket <SOCKET>        Unix socket path used by daemon mode [default: /tmp/daimonos.sock]
   -w, --workspace <WORKSPACE>  Workspace root directory [default: .]
-      --debug                  Human-readable debug output (socket mode only)
+      --debug                  Human-readable debug output (daemon mode only)
   -c, --config <CONFIG>        Path to config file (default: search workspace then ~/.config/daimonos/)
-      --mcp                    Run as MCP server over stdio (for Cursor integration)
+      --mcp                    Legacy alias for `daimonos mcp`
+      --mcp-socket <PATH>      Legacy alias for `daimonos mcp --socket <PATH>`
   -h, --help                   Print help
 ```
+
+See [runtime modes](runtime-modes.md) for recommended invocations and
+compatibility details.
 
 ## Build Notes
 

@@ -2,8 +2,10 @@ mod acp_cmd;
 mod agent;
 mod agent_cmd;
 mod agent_env;
+mod agent_runtime;
 mod analytics;
 mod chat_cmd;
+mod cli;
 mod compaction;
 mod config;
 mod index;
@@ -29,12 +31,17 @@ mod tool_runner;
 mod tools;
 mod verbosity;
 
-use async_trait::async_trait;
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use cli::{Cli, Command, RuntimeMode};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+
+struct DaemonOptions {
+    socket: PathBuf,
+    debug: bool,
+}
 
 /// On Linux, ask the kernel to send SIGTERM to this process when its
 /// parent dies. Defends against the case where the editor that spawned
@@ -83,186 +90,6 @@ fn env_requests_mcp_startup_logs() -> bool {
     }
 }
 
-/// Build the LLM provider from a provider name + connection params.
-/// Fallible variant used by the ACP model factory (which builds one per
-/// session and must not kill the process on error).
-fn try_build_llm_provider(
-    provider: &str,
-    api_key: &str,
-    base_url: &str,
-) -> Result<Box<dyn providers::LlmProvider>, String> {
-    match provider {
-        "openrouter" => providers::openrouter::OpenRouterProvider::new(
-            api_key.to_string(),
-            base_url.to_string(),
-        )
-        .map(|p| Box::new(p) as Box<dyn providers::LlmProvider>),
-        "anthropic" => Ok(Box::new(
-            providers::anthropic::AnthropicProvider::new(api_key.to_string())
-                .with_base_url(base_url.to_string()),
-        )),
-        other => Err(format!(
-            "unsupported provider: {other} (valid: openrouter, anthropic)"
-        )),
-    }
-}
-
-/// Build the LLM provider for the `agent`/`chat` subcommands from the
-/// effective (flag-overridden) provider name and the loaded agent env config.
-/// Exits the process on an unsupported provider name or provider init failure.
-fn build_llm_provider(
-    effective_provider: &str,
-    agent: &agent_env::AgentEnv,
-) -> Box<dyn providers::LlmProvider> {
-    match try_build_llm_provider(effective_provider, &agent.api_key, &agent.base_url) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2);
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Run the agent on a one-shot task and exit
-    Agent {
-        /// Task description for the agent
-        task: String,
-        /// Model override (default: claude-opus-4-8)
-        #[arg(long)]
-        model: Option<String>,
-        /// LLM provider override (default: from the agent env file)
-        #[arg(long)]
-        provider: Option<String>,
-        /// Print available tools and task without calling the API
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
-        /// ~/.config/daimonos/agent.env)
-        #[arg(long)]
-        agent_env: Option<std::path::PathBuf>,
-    },
-    /// Start an interactive chat REPL over a stateful agent session
-    Chat {
-        /// Model override (default: from the agent env file)
-        #[arg(long)]
-        model: Option<String>,
-        /// LLM provider override (default: from the agent env file)
-        #[arg(long)]
-        provider: Option<String>,
-        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
-        /// ~/.config/daimonos/agent.env)
-        #[arg(long)]
-        agent_env: Option<std::path::PathBuf>,
-        /// Resume a saved chat session by id (see --list)
-        #[arg(long)]
-        resume: Option<String>,
-        /// List saved chat sessions and exit
-        #[arg(long, default_value_t = false)]
-        list: bool,
-    },
-    /// Run a native Agent Client Protocol engine over stdio (for Zed and
-    /// other ACP editors)
-    Acp {
-        /// Model override (default: from the agent env file)
-        #[arg(long)]
-        model: Option<String>,
-        /// LLM provider override (default: from the agent env file)
-        #[arg(long)]
-        provider: Option<String>,
-        /// Path to the agent env file (default: $DAIMONOS_AGENT_ENV or
-        /// ~/.config/daimonos/agent.env)
-        #[arg(long)]
-        agent_env: Option<std::path::PathBuf>,
-    },
-}
-
-#[derive(Parser)]
-#[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
-struct Cli {
-    /// Unix socket path (ignored in --mcp mode)
-    #[arg(short, long, default_value = "/tmp/daimonos.sock")]
-    socket: PathBuf,
-
-    /// Workspace root directory
-    #[arg(short, long, default_value = ".")]
-    workspace: PathBuf,
-
-    /// Human-readable debug output (socket mode only)
-    #[arg(long, default_value_t = false)]
-    debug: bool,
-
-    /// Path to config file (default: search workspace then ~/.config/daimonos/)
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-
-    /// Run as MCP server over stdio (for Cursor integration)
-    #[arg(long, default_value_t = false)]
-    mcp: bool,
-
-    /// Run as MCP server over a Unix socket (per-workspace shared daemon)
-    #[arg(long)]
-    mcp_socket: Option<PathBuf>,
-
-    /// Emit informational stderr during MCP startup (config source, plugins,
-    /// indexer stats, idle watchdog). Cursor classifies MCP subprocess stderr
-    /// as errors in the UI; omit this flag unless you are debugging daimonos.
-    #[arg(long, default_value_t = false)]
-    verbose: bool,
-
-    /// Print token analytics summary and exit
-    #[arg(long, default_value_t = false)]
-    stats: bool,
-
-    /// Print the config file search order (marking which file is used) and
-    /// exit. Honors --config and --workspace. Useful for discovering where to
-    /// put a config file / [prompts] overrides.
-    #[arg(long, default_value_t = false)]
-    print_config_path: bool,
-
-    /// Print one embedded baseline prompt to stdout and exit. Value is one of:
-    /// agent_system, mcp_instructions, kgl_hint, summary, tool_descriptions.
-    /// Use this to see or save the default you are overriding via [prompts].
-    #[arg(long, value_name = "NAME")]
-    print_prompt: Option<String>,
-
-    /// Write all embedded baseline prompts to a directory (default
-    /// ~/.config/daimonos/prompts), print a ready-to-enable [prompts] block,
-    /// and exit. Existing files are left untouched unless --force. Pass a
-    /// directory to override the target: --dump-prompts /path/to/dir.
-    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "")]
-    dump_prompts: Option<String>,
-
-    /// With --dump-prompts, overwrite existing prompt files instead of skipping
-    /// them.
-    #[arg(long, default_value_t = false, requires = "dump_prompts")]
-    force: bool,
-
-    /// Additional user instructions appended to the agent system prompt for
-    /// `agent`, `chat`, and ACP. Defaults to
-    /// ~/.config/daimonos/agent-instructions.md when that file exists.
-    #[arg(long, global = true, value_name = "PATH")]
-    agent_instructions: Option<PathBuf>,
-
-    /// With --stats, restrict the report to a single agent-runtime
-    /// session id (matches whatever `set_external_session_id` /
-    /// `DAIMONOS_AGENT_SESSION_ID` set on the recording side).
-    /// Useful with claude / cursor session ids: `daimonos --stats
-    /// --session-id $SID`.
-    #[arg(long)]
-    session_id: Option<String>,
-
-    /// Log per-LLM-call token usage (input/output/cache/cost) as one JSON
-    /// line per call to ~/.config/daimonos/token-debug.log. Applies to
-    /// `agent` and `chat`.
-    #[arg(long, default_value_t = false)]
-    debug_tokens: bool,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
 /// Resolve the fixed `--debug-tokens` log path, creating its parent
 /// directory if missing. Returns `None` (silently) if `$HOME` can't be
 /// resolved or the directory can't be created — a debug log must not be
@@ -274,27 +101,12 @@ fn debug_tokens_log_path() -> Option<PathBuf> {
     Some(dir.join("token-debug.log"))
 }
 
-fn process_mode(cli: &Cli) -> &'static str {
-    if cli.mcp {
-        return "mcp_stdio";
-    }
-    if cli.mcp_socket.is_some() {
-        return "mcp_socket";
-    }
-    match cli.command {
-        Some(Commands::Agent { .. }) => "agent",
-        Some(Commands::Chat { .. }) => "chat",
-        Some(Commands::Acp { .. }) => "acp",
-        None if cli.stats => "stats",
-        None => "socket",
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let runtime_mode = cli.runtime_mode();
 
-    if cli.mcp {
+    if runtime_mode.is_mcp_stdio() {
         install_parent_death_signal();
     }
 
@@ -380,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
-    let quiet_cfg_stderr = cli.mcp && !startup_logs_early;
+    let quiet_cfg_stderr = runtime_mode.is_mcp_stdio() && !startup_logs_early;
     let mut cfg = config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr);
     if let Err(e) = cfg.validate() {
         eprintln!(
@@ -404,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
         event = "process_start",
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
-        mode = process_mode(&cli),
+        mode = runtime_mode.log_name(),
         workspace = %workspace.display(),
         log_directory = %cfg.logging.resolved_directory().display(),
     );
@@ -414,10 +226,10 @@ async fn main() -> anyhow::Result<()> {
     // Pure inspection modes (`agent --dry-run`, `chat --list`) do not create an
     // agent and therefore do not need the file.
     let uses_agent_prompt = match &cli.command {
-        Some(Commands::Agent { dry_run, .. }) => !dry_run,
-        Some(Commands::Chat { list, .. }) => !list,
-        Some(Commands::Acp { .. }) => true,
-        None => false,
+        Some(Command::Agent(args)) => !args.dry_run,
+        Some(Command::Chat(args)) => !args.list,
+        Some(Command::Acp(_)) => true,
+        Some(Command::Mcp(_) | Command::Daemon) | None => false,
     };
     if uses_agent_prompt {
         cfg.prompts.additional_agent_instructions =
@@ -433,274 +245,47 @@ async fn main() -> anyhow::Result<()> {
     // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
     // index/watcher/plugin setup needed.
     match cli.command {
-        Some(Commands::Agent {
-            task,
-            model,
-            provider,
-            dry_run,
-            agent_env,
-        }) => {
-            // Dry-run prints tools + task without calling the API, so it needs
-            // neither the agent env file nor a provider/key.
-            struct DryRunProvider;
-            #[async_trait]
-            impl providers::LlmProvider for DryRunProvider {
-                async fn complete(
-                    &self,
-                    _: &providers::Context,
-                    _: &providers::CompleteOpts,
-                ) -> providers::LlmResponse {
-                    unreachable!("complete() called in dry-run mode")
-                }
-            }
-
-            if dry_run {
-                let args = agent_cmd::AgentCmdArgs {
-                    task,
-                    model,
-                    dry_run: true,
-                    safety: None,
-                    analytics: None,
-                    token_log: token_log.clone(),
-                };
-                let result = agent_cmd::run_agent(
-                    &DryRunProvider,
-                    &workspace,
-                    Arc::clone(&cfg),
-                    args,
-                    &mut std::io::stdout(),
-                )
-                .await?;
-                if result.stop_reason == providers::StopReason::Error {
-                    let msg = result.error_message.as_deref().unwrap_or("unknown error");
-                    eprintln!("agent error: {msg}");
-                    std::process::exit(1);
-                }
-                return Ok(());
-            }
-
-            // Real run: agent connection config comes from the agent env file and is
-            // REQUIRED — error out if the file or any value is missing (vikunja #949).
-            let agent = match agent_env::AgentEnv::load(agent_env) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("agent config: {e}");
-                    std::process::exit(2);
-                }
-            };
-            // --provider / --model flags override the env-file values (#948).
-            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-            let effective_model = model.unwrap_or_else(|| agent.model.clone());
-            let llm = build_llm_provider(&effective_provider, &agent);
-
-            let analytics_store = if cfg.analytics.enabled {
-                let db_path = cfg.analytics.resolved_db_path();
-                analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
-                    .ok()
-                    .map(Arc::new)
-            } else {
-                None
-            };
-            let approve_fn = if agent.approval_mode == "auto" {
-                None
-            } else {
-                Some(safety::SafetyPolicy::stdin_approve_fn())
-            };
-            let args = agent_cmd::AgentCmdArgs {
-                task,
-                model: Some(effective_model),
-                dry_run: false,
-                safety: Some(agent.to_safety_policy(approve_fn)),
-                analytics: analytics_store,
-                token_log: token_log.clone(),
-            };
-            let result = agent_cmd::run_agent(
-                llm.as_ref(),
-                &workspace,
-                Arc::clone(&cfg),
-                args,
-                &mut std::io::stdout(),
-            )
-            .await?;
-            if result.stop_reason == providers::StopReason::Error {
-                let msg = result.error_message.as_deref().unwrap_or("unknown error");
-                eprintln!("agent error: {msg}");
-                std::process::exit(1);
-            }
-            return Ok(());
+        Some(Command::Agent(args)) => {
+            return agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await;
         }
-        Some(Commands::Chat {
-            model,
-            provider,
-            agent_env,
-            resume,
-            list,
-        }) => {
-            // Chat sessions persist under ~/.daimonos so `--resume`/`--list`
-            // can restore a prior conversation (vikunja #963). Separate dir
-            // from acp-sessions to keep the two id namespaces from colliding.
-            let sessions_dir = paths::home_dir().map(|h| h.join(".daimonos").join("chat-sessions"));
-            // --list is a pure query: enumerate saved sessions and exit
-            // without loading the agent env / building a provider.
-            if list {
-                let sessions = sessions_dir
-                    .map(|d| session_store::SessionStore::new(d).list())
-                    .unwrap_or_default();
-                println!("{}", chat_cmd::format_session_list(&sessions));
-                return Ok(());
-            }
-            let agent = match agent_env::AgentEnv::load(agent_env) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("agent config: {e}");
-                    std::process::exit(2);
-                }
-            };
-            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-            // Whether the user explicitly passed --model: on --resume, an
-            // explicit flag wins, otherwise the resumed session's saved model
-            // is preferred (vikunja #963).
-            let model_explicit = model.is_some();
-            let effective_model = model.unwrap_or_else(|| agent.model.clone());
-            let llm = build_llm_provider(&effective_provider, &agent);
-            // Resolve compaction now that the provider + effective model are
-            // known: a provider-reported window (#965) is looked up for the
-            // model actually in use, honoring any --model override.
-            let compaction = match agent
-                .resolve_compaction(llm.as_ref(), &effective_model)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("agent config: {e}");
-                    std::process::exit(2);
-                }
-            };
-            // Apply the [prompts].summary override (vikunja #974) unless the
-            // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
-            let compaction = prompts::apply_summary_override(compaction, &cfg).await;
-            let approve_fn = if agent.approval_mode == "auto" {
-                None
-            } else {
-                Some(safety::SafetyPolicy::stdin_approve_fn())
-            };
-            let safety = agent.to_safety_policy(approve_fn);
-            chat_cmd::run_chat(
-                llm,
-                &workspace,
-                Arc::clone(&cfg),
-                effective_model,
-                model_explicit,
-                Some(safety),
-                token_log,
-                sessions_dir,
-                resume,
-                compaction,
-            )
-            .await?;
-            return Ok(());
+        Some(Command::Chat(args)) => {
+            return agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await;
         }
-        Some(Commands::Acp {
-            model,
-            provider,
-            agent_env,
-        }) => {
-            let agent = match agent_env::AgentEnv::load(agent_env) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("agent config: {e}");
-                    std::process::exit(2);
-                }
-            };
-            let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-            let effective_model = model.unwrap_or_else(|| agent.model.clone());
-            // Candidate models for the picker (vikunja #960): the env's list,
-            // with the effective model (which a --model flag may have
-            // overridden to something outside that list) guaranteed present.
-            let mut models = agent.models.clone();
-            if !models.iter().any(|m| m == &effective_model) {
-                models.insert(0, effective_model.clone());
-            }
-            // Provider factory: builds a fresh provider per session, since Zed
-            // keeps one `daimonos acp` process across multiple chat threads.
-            let make_provider: acp_cmd::ProviderFactory = {
-                let provider = effective_provider.clone();
-                let api_key = agent.api_key.clone();
-                let base_url = agent.base_url.clone();
-                Arc::new(move || try_build_llm_provider(&provider, &api_key, &base_url))
-            };
-            // Resolve compaction against a probe provider built from the same
-            // factory, querying the effective model's window when the env file
-            // omits DAIMONOS_AGENT_CONTEXT_WINDOW (#965).
-            let compaction_follows_model = matches!(
-                &agent.compaction,
-                agent_env::CompactionConfig::NeedsWindow(_)
-            );
-            let compaction = match make_provider() {
-                Ok(probe) => match agent
-                    .resolve_compaction(probe.as_ref(), &effective_model)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("agent config: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("agent config: {e}");
-                    std::process::exit(2);
-                }
-            };
-            // Apply the [prompts].summary override (vikunja #974) unless the
-            // agent-env DAIMONOS_AGENT_SUMMARY_PROMPT already set it.
-            let compaction = prompts::apply_summary_override(compaction, &cfg).await;
-            // No approve_fn: ACP asks the client via session/request_permission,
-            // not a stdin prompt — the denylist/allowlist/approval-mode gating
-            // (SafetyPolicy::gate) still applies the same as agent/chat.
-            let safety = agent.to_safety_policy(None);
-            // Persist ACP sessions under ~/.daimonos so session/load can
-            // resume a thread after this process exits and Zed re-requests a
-            // session id from a previous run (see acp_cmd::SessionStore).
-            let sessions_dir = paths::home_dir().map(|h| h.join(".daimonos").join("acp-sessions"));
-            // Analytics for the ACP arm: attributes remote (Zed-provided) MCP
-            // tool calls the same way socket/MCP sessions attribute native ones
-            // (ADR-003, D9). The global store below is built after this arm's
-            // early return, so build one here.
-            let analytics_store = if cfg.analytics.enabled {
-                let db_path = cfg.analytics.resolved_db_path();
-                match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
-                    Ok(store) => Some(Arc::new(store)),
-                    Err(e) => {
-                        eprintln!("analytics: disabled (init failed: {e})");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            acp_cmd::run_acp(
-                make_provider,
-                &workspace,
-                Arc::clone(&cfg),
-                effective_model,
-                models,
-                safety,
-                token_log,
-                sessions_dir,
-                acp_cmd::AcpCompaction::new(compaction, compaction_follows_model),
-                analytics_store,
-            )
-            .await?;
-            return Ok(());
+        Some(Command::Acp(args)) => {
+            return agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await;
         }
-        None => {}
+        Some(Command::Mcp(_) | Command::Daemon) | None => {}
     }
 
+    run_tool_service(
+        runtime_mode,
+        cli.socket,
+        cli.debug,
+        cli.session_id,
+        workspace,
+        cfg,
+        startup_logs_early,
+    )
+    .await
+}
+
+/// Launch the tool-serving half of Daimonos. Agent, chat, and ACP modes return
+/// before entering this function, so they cannot initialize workspace watchers,
+/// native tool plugins, or protocol-daemon listeners by accident.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_service(
+    runtime_mode: RuntimeMode,
+    socket: PathBuf,
+    debug: bool,
+    session_id: Option<String>,
+    workspace: PathBuf,
+    cfg: Arc<config::Config>,
+    startup_logs_early: bool,
+) -> anyhow::Result<()> {
     let startup_logs = startup_logs_early || cfg.mcp.startup_logs;
     // When MCP runs without startup diagnostics, avoid benign stderr lines —
     // Cursor surfaces subprocess stderr as `[error]` even for informational text.
-    let mcp_quiet_stderr = cli.mcp && !startup_logs;
+    let mcp_quiet_stderr = runtime_mode.is_mcp_stdio() && !startup_logs;
 
     script::configure_max_concurrent(cfg.process.max_script_threads);
 
@@ -846,7 +431,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Analytics: --stats prints summary and exits
-    if cli.stats {
+    if matches!(runtime_mode, RuntimeMode::Stats) {
         let db_path = cfg.analytics.resolved_db_path();
         if !db_path.exists() {
             eprintln!("No analytics data found at {}", db_path.display());
@@ -856,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(store) => {
                 let report = store.format_stats_report_filtered(
                     cfg.analytics.retention_days,
-                    cli.session_id.as_deref(),
+                    session_id.as_deref(),
                 );
                 eprint!("{report}");
             }
@@ -884,39 +469,46 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if cli.mcp {
-        mcp::run_mcp_server(
-            workspace,
-            cfg,
-            ws_index,
-            tool_reg,
-            pcache,
-            analytics_store,
-            startup_logs,
-        )
-        .await
-    } else if let Some(mcp_sock) = cli.mcp_socket {
-        run_mcp_socket_server(
-            mcp_sock,
-            workspace,
-            cfg,
-            ws_index,
-            tool_reg,
-            pcache,
-            analytics_store,
-        )
-        .await
-    } else {
-        run_socket_server(
-            cli,
-            workspace,
-            cfg,
-            ws_index,
-            tool_reg,
-            pcache,
-            analytics_store,
-        )
-        .await
+    match runtime_mode {
+        RuntimeMode::McpStdio => {
+            mcp::run_mcp_server(
+                workspace,
+                cfg,
+                ws_index,
+                tool_reg,
+                pcache,
+                analytics_store,
+                startup_logs,
+            )
+            .await
+        }
+        RuntimeMode::McpSocket(mcp_sock) => {
+            run_mcp_socket_server(
+                mcp_sock,
+                workspace,
+                cfg,
+                ws_index,
+                tool_reg,
+                pcache,
+                analytics_store,
+            )
+            .await
+        }
+        RuntimeMode::Daemon => {
+            run_socket_server(
+                DaemonOptions { socket, debug },
+                workspace,
+                cfg,
+                ws_index,
+                tool_reg,
+                pcache,
+                analytics_store,
+            )
+            .await
+        }
+        RuntimeMode::Agent | RuntimeMode::Chat | RuntimeMode::Acp | RuntimeMode::Stats => {
+            unreachable!("early-return runtime reached service dispatch")
+        }
     }
 }
 
@@ -966,7 +558,7 @@ async fn run_mcp_socket_server(
 }
 
 async fn run_socket_server(
-    cli: Cli,
+    options: DaemonOptions,
     workspace: PathBuf,
     cfg: Arc<config::Config>,
     ws_index: Arc<index::WorkspaceIndex>,
@@ -974,22 +566,22 @@ async fn run_socket_server(
     pcache: Arc<pipeline_cache::PipelineCache>,
     analytics: Option<Arc<analytics::AnalyticsStore>>,
 ) -> anyhow::Result<()> {
-    if cli.socket.exists() {
-        std::fs::remove_file(&cli.socket)?;
+    if options.socket.exists() {
+        std::fs::remove_file(&options.socket)?;
     }
 
     eprintln!("pipeline cache: watching {:?}", workspace);
 
-    let listener = UnixListener::bind(&cli.socket)?;
+    let listener = UnixListener::bind(&options.socket)?;
     eprintln!(
         "daimonos listening on {:?} (workspace: {:?})",
-        cli.socket, workspace
+        options.socket, workspace
     );
 
     loop {
         let (stream, _addr) = listener.accept().await?;
         let ws = workspace.clone();
-        let debug = cli.debug;
+        let debug = options.debug;
         let idx = ws_index.clone();
         let cfg_clone = cfg.clone();
         let tr = tool_reg.clone();

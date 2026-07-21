@@ -40,6 +40,10 @@ IDE or CLI spawns automatically. It provides the same operations agents already
 use — read files, write files, search, execute commands, git operations — but
 returns compact, structured JSON instead of raw text.
 
+The single binary also provides ACP, one-shot agent, interactive chat, and
+socket-daemon runtimes. See [Runtime modes](docs/runtime-modes.md) for the
+explicit subcommands and compatibility aliases.
+
 ```
 Agent: exec("cargo test")
 
