@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784597251.5069478,
-    "ast_hash": "d18cecb76367e753b4f0ff498cf73031",
+    "mtime": 1784597821.6610677,
+    "ast_hash": "44cff3104964ca98d3ca90bf9935d514",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -935,8 +935,8 @@
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
-    "mtime": 1784596895.4149573,
-    "ast_hash": "5a72f360198ec94e91de0df3c7a179e3",
+    "mtime": 1784597889.376487,
+    "ast_hash": "6706f538d9e198e7566d76fb580a6358",
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {

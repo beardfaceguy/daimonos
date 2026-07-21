@@ -214,6 +214,10 @@ struct AcpState {
     /// Active sessions keyed by id. The map lock is held only briefly to
     /// look up / insert a handle — never across a prompt turn.
     sessions: tokio::sync::Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
+    /// Per-id single-flight locks for load/delete, including persisted
+    /// sessions that do not yet have a live `SessionHandle`.
+    session_operations:
+        tokio::sync::Mutex<HashMap<SessionId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Builds a provider per new session (see [`ProviderFactory`]).
     make_provider: ProviderFactory,
     /// Candidate models for the picker (from `DAIMONOS_AGENT_MODELS`);
@@ -238,6 +242,34 @@ struct AcpState {
     /// Process-wide pool for deduplicating identical forwarded MCP server
     /// configs across ACP sessions (#1008). Bridges retain explicit leases.
     mcp_pool: McpClientPool,
+}
+
+async fn session_operation_lock(
+    state: &AcpState,
+    session_id: &SessionId,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut operations = state.session_operations.lock().await;
+    operations.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = operations
+        .get(session_id)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    operations.insert(session_id.clone(), Arc::downgrade(&lock));
+    lock
+}
+
+fn request_session_cancel(handle: &SessionHandle) {
+    let notify = handle
+        .cancel
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(notify) = notify {
+        notify.notify_one();
+    }
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -1751,6 +1783,7 @@ fn build_agent_with_state(
     let mcp_http = mcp_enabled && cfg.acp.mcp.allow_http;
     let state = Arc::new(AcpState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
+        session_operations: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
         models,
         default_model: model,
@@ -1959,20 +1992,20 @@ fn build_agent_with_state(
                                 ),
                             );
                         };
-                        let existing_handle =
-                            state.sessions.lock().await.get(&req.session_id).cloned();
                         // Signal cancellation before waiting on lifecycle: a
                         // concurrent load may own lifecycle while waiting for
                         // the active prompt's session lock.
+                        if let Some(handle) =
+                            state.sessions.lock().await.get(&req.session_id).cloned()
+                        {
+                            request_session_cancel(&handle);
+                        }
+                        let operation = session_operation_lock(&state, &req.session_id).await;
+                        let _operation = operation.lock().await;
+                        let existing_handle =
+                            state.sessions.lock().await.get(&req.session_id).cloned();
                         if let Some(handle) = &existing_handle {
-                            let notify = handle
-                                .cancel
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .clone();
-                            if let Some(notify) = notify {
-                                notify.notify_one();
-                            }
+                            request_session_cancel(handle);
                         }
                         let _lifecycle = match &existing_handle {
                             Some(handle) => Some(handle.lifecycle.lock().await),
@@ -2116,6 +2149,8 @@ fn build_agent_with_state(
                         } else {
                             req.cwd
                         };
+                        let operation = session_operation_lock(&state, &session_id).await;
+                        let _operation = operation.lock().await;
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
                         // Keep this guard through replay and response enqueue.
                         // session/delete takes the same guard before removing
@@ -2945,6 +2980,72 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_load_builds_persisted_session_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("persisted-single-flight");
+        SessionStore::new(sessions.path().to_path_buf()).save_acp(
+            &session_id.to_string(),
+            "test-model",
+            &[],
+            workspace.path(),
+            &[],
+        );
+
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let build_counter = Arc::clone(&builds);
+        let make_provider: ProviderFactory = Arc::new(move || {
+            build_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(MockProvider::new(vec![])))
+        });
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            make_provider,
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            AcpCompaction::new(None, false),
+            None,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        builds.store(0, Ordering::SeqCst);
+        let workspace_path = workspace.path().to_path_buf();
+        let id_for_client = session_id.clone();
+
+        AcpClientRole
+            .builder()
+            .connect_with(
+                agent,
+                move |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let first = connection.send_request(LoadSessionRequest::new(
+                        id_for_client.clone(),
+                        workspace_path.clone(),
+                    ));
+                    let second = connection
+                        .send_request(LoadSessionRequest::new(id_for_client, workspace_path));
+                    let (first, second) = tokio::join!(first.block_task(), second.block_task());
+                    first?;
+                    second?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(state.sessions.lock().await.len(), 1);
     }
 
     #[tokio::test]
