@@ -385,6 +385,15 @@ impl McpBridge {
         external_session_id: Option<String>,
         shared_pool: McpClientPool,
     ) -> Self {
+        let requested_servers = specs.len();
+        tracing::info!(
+            target: "daimonos::mcp_bridge",
+            event = "bridge_build_started",
+            requested_servers,
+            enabled = cfg.enabled,
+            shared_pool = cfg.shared_pool_enabled,
+            max_concurrent_connects = cfg.max_concurrent_connects,
+        );
         let pool = if cfg.shared_pool_enabled {
             shared_pool
         } else {
@@ -437,6 +446,12 @@ impl McpBridge {
         for (_, server_name, outcome) in outcomes {
             match outcome {
                 Ok(lease) => {
+                    tracing::info!(
+                        target: "daimonos::mcp_bridge",
+                        event = "server_connected",
+                        server = %server_name,
+                        discovered_tools = lease.tools.len(),
+                    );
                     let lease_idx = bridge.runtime.get_mut().leases.len();
                     let mut registered_any = false;
                     if lease.tools.len() > cfg.max_tools_per_server {
@@ -486,6 +501,12 @@ impl McpBridge {
                     }
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        target: "daimonos::mcp_bridge",
+                        event = "server_connection_failed",
+                        server = %server_name,
+                        error = %e,
+                    );
                     let message = format!("MCP server '{server_name}' failed to connect: {e}");
                     eprintln!("acp mcp bridge: {message}");
                     bridge.diagnostics.push(message);
@@ -493,6 +514,14 @@ impl McpBridge {
                 }
             }
         }
+        tracing::info!(
+            target: "daimonos::mcp_bridge",
+            event = "bridge_build_completed",
+            requested_servers,
+            connected_servers = bridge.runtime.get_mut().leases.len(),
+            exposed_tools = bridge.tools.len(),
+            diagnostics = bridge.diagnostics.len(),
+        );
         bridge
     }
 
@@ -551,6 +580,11 @@ impl McpBridge {
         };
         let request_chars = input.to_string().len();
         let started = Instant::now();
+        tracing::debug!(
+            target: "daimonos::mcp_bridge",
+            event = "remote_tool_started",
+            tool = %name,
+        );
         let outcome =
             match tokio::time::timeout(self.call_timeout, client.request_tool_call(params)).await {
                 Ok(Ok(result)) => result_to_outcome(result),
@@ -566,11 +600,14 @@ impl McpBridge {
                     is_error: true,
                 },
             };
-        self.record(
-            name,
-            request_chars,
-            outcome.content.len(),
-            started.elapsed(),
+        let elapsed = started.elapsed();
+        self.record(name, request_chars, outcome.content.len(), elapsed);
+        tracing::info!(
+            target: "daimonos::mcp_bridge",
+            event = "remote_tool_completed",
+            tool = %name,
+            is_error = outcome.is_error,
+            duration_ms = elapsed.as_millis() as u64,
         );
         Some(outcome)
     }
@@ -578,12 +615,20 @@ impl McpBridge {
     /// Release every pooled-client lease. The last release shuts down the MCP
     /// runtime and (for stdio) reaps the child process. Idempotent.
     pub async fn shutdown(&self) {
+        let started = Instant::now();
         let leases = {
             let mut runtime = self.runtime.write().await;
             runtime.routes.clear();
             std::mem::take(&mut runtime.leases)
         };
+        let lease_count = leases.len();
         future::join_all(leases.into_iter().map(|lease| self.pool.release(lease))).await;
+        tracing::info!(
+            target: "daimonos::mcp_bridge",
+            event = "bridge_shutdown_completed",
+            leases = lease_count,
+            duration_ms = started.elapsed().as_millis() as u64,
+        );
     }
 
     fn record(&self, name: &str, request_chars: usize, response_chars: usize, elapsed: Duration) {

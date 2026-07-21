@@ -75,6 +75,26 @@ exec_plugin_redirect = true
 # scripts; lower to fail fast under buggy script load.
 max_script_threads = 32
 
+[logging]
+# Persist structured JSON diagnostics independently of the ACP/MCP client.
+enabled = true
+# File log level: trace | debug | info | warn | error | off.
+level = "info"
+# Warnings/errors are also mirrored to stderr so Zed can surface them.
+# ACP/MCP protocol stdout is never used for logs.
+stderr_level = "warn"
+# Default: $XDG_STATE_HOME/daimonos/logs, then ~/.local/state/daimonos/logs.
+# directory = "~/.local/state/daimonos/logs"
+# Rotated filename prefix.
+file_prefix = "daimonos"
+# hourly | daily | never
+rotation = "daily"
+# Maximum number of rotated files retained.
+max_files = 14
+# Periodic process telemetry (RSS, threads, fds, cumulative/delta CPU ticks).
+# Set 0 to disable.
+resource_interval_secs = 15
+
 [analytics]
 # Track per-tool-call token usage, latency, and savings.
 # Data is stored in SQLite for cross-session history.

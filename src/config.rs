@@ -13,6 +13,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub process: ProcessConfig,
+    pub logging: LoggingConfig,
     pub analytics: AnalyticsConfig,
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
@@ -265,6 +266,27 @@ impl ProcessConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Persist structured process logs independently of the ACP/MCP client.
+    pub enabled: bool,
+    /// File-layer filter: trace, debug, info, warn, error, or off.
+    pub level: String,
+    /// Stderr-layer filter. ACP stdout is never used for logs.
+    pub stderr_level: String,
+    /// Log directory. `None` resolves through XDG_STATE_HOME, then ~/.local/state.
+    pub directory: Option<String>,
+    /// Prefix used for rotated log filenames.
+    pub file_prefix: String,
+    /// Rotation period: hourly, daily, or never.
+    pub rotation: String,
+    /// Maximum retained rotated files.
+    pub max_files: usize,
+    /// Seconds between process resource snapshots; 0 disables telemetry.
+    pub resource_interval_secs: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct AnalyticsConfig {
@@ -467,6 +489,69 @@ pub struct PipelineCacheConfig {
     pub max_entries: usize,
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "info".to_string(),
+            stderr_level: "warn".to_string(),
+            directory: None,
+            file_prefix: "daimonos".to_string(),
+            rotation: "daily".to_string(),
+            max_files: 14,
+            resource_interval_secs: 15,
+        }
+    }
+}
+
+impl LoggingConfig {
+    pub fn resolved_directory(&self) -> std::path::PathBuf {
+        if let Some(path) = &self.directory {
+            return crate::paths::expand_tilde(path);
+        }
+        if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+            return std::path::PathBuf::from(state_home)
+                .join("daimonos")
+                .join("logs");
+        }
+        if let Some(home) = crate::paths::home_dir() {
+            return home.join(".local/state/daimonos/logs");
+        }
+        std::path::PathBuf::from("/tmp/daimonos-logs")
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        const LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "off"];
+        if !LEVELS.contains(&self.level.as_str()) {
+            return Err(format!(
+                "logging.level must be one of {}, got '{}'",
+                LEVELS.join(", "),
+                self.level
+            ));
+        }
+        if !LEVELS.contains(&self.stderr_level.as_str()) {
+            return Err(format!(
+                "logging.stderr_level must be one of {}, got '{}'",
+                LEVELS.join(", "),
+                self.stderr_level
+            ));
+        }
+        if !matches!(self.rotation.as_str(), "hourly" | "daily" | "never") {
+            return Err(format!(
+                "logging.rotation must be hourly, daily, or never, got '{}'",
+                self.rotation
+            ));
+        }
+        if self.file_prefix.trim().is_empty() {
+            return Err("logging.file_prefix must not be empty".to_string());
+        }
+        if self.max_files == 0 {
+            return Err("logging.max_files must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
@@ -548,6 +633,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.acp.validate()?;
         self.process.validate()?;
+        self.logging.validate()?;
         self.discord.validate()
     }
 }
@@ -814,6 +900,12 @@ mod tests {
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
+        assert!(cfg.logging.enabled);
+        assert_eq!(cfg.logging.level, "info");
+        assert_eq!(cfg.logging.stderr_level, "warn");
+        assert_eq!(cfg.logging.rotation, "daily");
+        assert_eq!(cfg.logging.max_files, 14);
+        assert_eq!(cfg.logging.resource_interval_secs, 15);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
@@ -840,10 +932,40 @@ mod tests {
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.index.max_depth, 20);
+        assert!(cfg.logging.enabled);
+        assert_eq!(cfg.logging.level, "info");
+        assert_eq!(cfg.logging.max_files, 14);
         assert!(!cfg.mcp.startup_logs);
         assert!(!cfg.mcp.full_tool_schemas);
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
         assert_eq!(cfg.kgl.max_watches, 4_096);
+    }
+
+    #[test]
+    fn logging_validation_rejects_invalid_values() {
+        let mut cfg = Config::default();
+        cfg.logging.level = "verbose".to_string();
+        assert!(cfg.validate().unwrap_err().contains("logging.level"));
+
+        let mut cfg = Config::default();
+        cfg.logging.rotation = "weekly".to_string();
+        assert!(cfg.validate().unwrap_err().contains("logging.rotation"));
+
+        let mut cfg = Config::default();
+        cfg.logging.max_files = 0;
+        assert!(cfg.validate().unwrap_err().contains("logging.max_files"));
+    }
+
+    #[test]
+    fn logging_directory_honors_explicit_path() {
+        let cfg = LoggingConfig {
+            directory: Some("/tmp/daimonos-test-logs".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_directory(),
+            std::path::PathBuf::from("/tmp/daimonos-test-logs")
+        );
     }
 
     #[test]

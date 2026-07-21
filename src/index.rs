@@ -102,12 +102,24 @@ impl WorkspaceIndex {
     /// incremental update: skips files whose mtime hasn't changed, removes
     /// deleted files, and only re-extracts trigrams for new/modified files.
     pub fn spawn_reindex(&self) {
+        tracing::debug!(
+            target: "daimonos::index",
+            event = "index_requested",
+            root = %self.root.display(),
+            guarded = self.guard,
+        );
         // Over-broad roots are never auto-indexed: a large directory with no
         // project marker (e.g. $HOME inherited as cwd) would build a
         // multi-gigabyte trigram index over unrelated files. Leave the index
         // empty; an explicit -w or an MCP roots re-root replaces this index
         // with one on a real project.
         if self.guard {
+            tracing::info!(
+                target: "daimonos::index",
+                event = "index_skipped_overbroad_root",
+                root = %self.root.display(),
+                max_files = self.max_files,
+            );
             if self.log_progress {
                 eprintln!(
                     "index: skipping auto-index of over-broad root {:?} (exceeds max_files \
@@ -135,6 +147,13 @@ impl WorkspaceIndex {
             // one and let it rebuild the state.
             let _lock = reindex_lock.lock().unwrap_or_else(|p| p.into_inner());
             let start = Instant::now();
+            tracing::info!(
+                target: "daimonos::index",
+                event = "index_started",
+                root = %root.display(),
+                max_files,
+                max_depth,
+            );
 
             // Snapshot the previous state. We're on a `spawn_blocking`
             // worker thread, so the tokio-recommended pattern is
@@ -210,6 +229,14 @@ impl WorkspaceIndex {
                 current_files.insert(rel, mtime);
             }
 
+            if capped {
+                tracing::warn!(
+                    target: "daimonos::index",
+                    event = "index_file_cap_reached",
+                    root = %root.display(),
+                    max_files,
+                );
+            }
             if capped && log_progress {
                 eprintln!(
                     "index: file cap reached ({max_files}); indexing first {max_files} files \
@@ -343,6 +370,19 @@ impl WorkspaceIndex {
                 *guard = state;
             }
 
+            tracing::info!(
+                target: "daimonos::index",
+                event = "index_completed",
+                root = %root.display(),
+                first_index = is_first_index,
+                files = file_count,
+                trigrams = trigram_count,
+                skipped,
+                updated,
+                added,
+                removed,
+                duration_ms = start.elapsed().as_millis() as u64,
+            );
             if log_progress {
                 if is_first_index {
                     eprintln!(

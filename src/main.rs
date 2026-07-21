@@ -8,6 +8,7 @@ mod compaction;
 mod config;
 mod index;
 mod kgl;
+mod logging;
 mod mcp;
 mod mcp_bridge;
 mod ops;
@@ -273,6 +274,22 @@ fn debug_tokens_log_path() -> Option<PathBuf> {
     Some(dir.join("token-debug.log"))
 }
 
+fn process_mode(cli: &Cli) -> &'static str {
+    if cli.mcp {
+        return "mcp_stdio";
+    }
+    if cli.mcp_socket.is_some() {
+        return "mcp_socket";
+    }
+    match cli.command {
+        Some(Commands::Agent { .. }) => "agent",
+        Some(Commands::Chat { .. }) => "chat",
+        Some(Commands::Acp { .. }) => "acp",
+        None if cli.stats => "stats",
+        None => "socket",
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -372,6 +389,25 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    let _logging_guard = match logging::init(&cfg.logging) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("logging: initialization failed: {error}");
+            None
+        }
+    };
+    let _resource_telemetry = _logging_guard
+        .as_ref()
+        .and_then(|_| logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs));
+    tracing::info!(
+        target: "daimonos::lifecycle",
+        event = "process_start",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        mode = process_mode(&cli),
+        workspace = %workspace.display(),
+        log_directory = %cfg.logging.resolved_directory().display(),
+    );
     cfg.prompts.resolved_tool_descriptions =
         tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
     // Load optional extra user rules once, before any agent runtime starts.
