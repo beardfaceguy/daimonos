@@ -52,6 +52,8 @@ pub enum ToolTier {
     AgentOnly,
 }
 
+pub const LIST_ALL_TOOLS_TOOL: &str = "list_all_tools";
+
 // --- Tool definition ---
 
 pub struct ToolDef {
@@ -643,7 +645,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             context_check: None,
         },
         ToolDef {
-            name: "list_all_tools",
+            name: LIST_ALL_TOOLS_TOOL,
             tier: ToolTier::Terse,
             schema: json!({"type": "object", "properties": {}}),
             to_request: None, // activates on-demand tools in session

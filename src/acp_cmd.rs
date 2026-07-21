@@ -182,13 +182,15 @@ struct SessionHandle {
     /// Per-session bridge to Zed-forwarded MCP servers (ADR-003). Empty when
     /// the bridge is disabled or no servers were forwarded. Shut down on
     /// session/delete.
-    bridge: Arc<McpBridge>,
-    mcp_specs: Vec<ServerSpec>,
+    bridge: BridgeSlot,
+    mcp_specs: tokio::sync::Mutex<Vec<ServerSpec>>,
     client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
     compaction: AcpCompaction,
     /// Provider-reported windows already resolved for this session's models.
     context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
 }
+
+type BridgeSlot = Arc<tokio::sync::RwLock<Arc<McpBridge>>>;
 
 /// Shared engine state across all sessions on one process.
 struct AcpState {
@@ -984,18 +986,9 @@ fn build_agent_config(
     terminal_output: bool,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     bridge: Arc<McpBridge>,
+    bridge_slot: BridgeSlot,
 ) -> AgentConfig {
-    // Native tools first (OnDemand exclusion + per-tool context checks intact),
-    // then append the bridge's remote tools (ADR-003, D6).
-    let mut tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
-        .into_iter()
-        .map(|s| ToolSchema {
-            name: s.name,
-            description: s.description,
-            input_schema: s.input_schema,
-        })
-        .collect();
-    tools.extend(bridge.tools().iter().cloned());
+    let tools = agent_tools(workspace, descriptions, &bridge);
     let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
     AgentConfig {
         system: Some(system_prompt),
@@ -1037,8 +1030,27 @@ fn build_agent_config(
             label: "acp".to_string(),
         }),
         compaction,
-        remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge)),
+        remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge_slot)),
     }
+}
+
+/// Native tools first (OnDemand exclusion + per-tool context checks intact),
+/// then the currently connected bridge's remote tools (ADR-003, D6).
+fn agent_tools(
+    workspace: &Path,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
+    bridge: &McpBridge,
+) -> Vec<ToolSchema> {
+    let mut tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
+        .into_iter()
+        .map(|s| ToolSchema {
+            name: s.name,
+            description: s.description,
+            input_schema: s.input_schema,
+        })
+        .collect();
+    tools.extend(bridge.tools().iter().cloned());
+    tools
 }
 
 /// Convert Zed-forwarded `McpServer` entries into transport-neutral
@@ -1067,19 +1079,20 @@ fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
 fn should_refresh_mcp_bridge(
     current: &[ServerSpec],
     requested: &[ServerSpec],
-    had_diagnostics: bool,
+    had_connection_failures: bool,
 ) -> bool {
-    had_diagnostics || current != requested
+    had_connection_failures || current != requested
 }
 
 /// Dispatch hook consulted by the agent loop when the opcode facade doesn't
 /// serve a tool: routes `mcp__*` calls to the session's bridge (ADR-003, D5).
-fn build_remote_dispatch_hook(bridge: Arc<McpBridge>) -> RemoteToolHook {
+fn build_remote_dispatch_hook(bridge_slot: BridgeSlot) -> RemoteToolHook {
     Box::new(move |name: &str, input: &serde_json::Value| {
-        let bridge = Arc::clone(&bridge);
+        let bridge_slot = Arc::clone(&bridge_slot);
         let name = name.to_string();
         let input = input.clone();
         Box::pin(async move {
+            let bridge = Arc::clone(&*bridge_slot.read().await);
             bridge
                 .call(&name, &input)
                 .await
@@ -1461,6 +1474,7 @@ async fn build_session_handle(
         )
         .await,
     );
+    let bridge_slot = Arc::new(tokio::sync::RwLock::new(Arc::clone(&bridge)));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
@@ -1473,6 +1487,7 @@ async fn build_session_handle(
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
+        Arc::clone(&bridge_slot),
     );
     let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     let mut context_windows = HashMap::new();
@@ -1487,12 +1502,66 @@ async fn build_session_handle(
         connection,
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
-        bridge,
-        mcp_specs,
+        bridge: bridge_slot,
+        mcp_specs: tokio::sync::Mutex::new(mcp_specs),
         client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
         compaction: state.compaction.clone(),
         context_windows: tokio::sync::Mutex::new(context_windows),
     }))
+}
+
+/// Refresh a live session's forwarded MCP bridge without replacing its agent
+/// session. Holding the session lock prevents prompt dispatch while schemas
+/// and routing switch together, preserving provider/history/usage state.
+async fn refresh_live_mcp_bridge(
+    handle: &SessionHandle,
+    state: &AcpState,
+    cfg: &Config,
+    mcp_specs: Vec<ServerSpec>,
+) {
+    let mut agent_session = handle.session.lock().await;
+    let descriptions = &cfg.prompts.resolved_tool_descriptions;
+    let native_tool_names: std::collections::HashSet<String> =
+        tool_facade::active_schemas(&handle.cwd, descriptions)
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+    let new_bridge = Arc::new(
+        McpBridge::build_with_pool(
+            mcp_specs.clone(),
+            &cfg.acp.mcp,
+            &native_tool_names,
+            state.analytics.clone(),
+            crate::analytics::read_agent_session_id_env(),
+            state.mcp_pool.clone(),
+        )
+        .await,
+    );
+    agent_session.set_tools(agent_tools(&handle.cwd, descriptions, &new_bridge));
+    let old_bridge = {
+        let mut bridge = handle.bridge.write().await;
+        std::mem::replace(&mut *bridge, new_bridge)
+    };
+    *handle.mcp_specs.lock().await = mcp_specs;
+    drop(agent_session);
+    old_bridge.shutdown().await;
+}
+
+async fn session_bridge(handle: &SessionHandle) -> Arc<McpBridge> {
+    Arc::clone(&*handle.bridge.read().await)
+}
+
+async fn shutdown_session_bridge(handle: &SessionHandle) {
+    session_bridge(handle).await.shutdown().await;
+}
+
+async fn send_session_mcp_diagnostics(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    handle: &SessionHandle,
+) {
+    let bridge = session_bridge(handle).await;
+    send_mcp_diagnostics(cx, session_id, &bridge);
 }
 
 /// Replay a loaded session's in-memory history back to the client as
@@ -1905,7 +1974,7 @@ fn build_agent_with_state(
                         // Session file is gone; tear down its MCP clients so
                         // Zed-spawned stdio servers don't linger (ADR-003, D7).
                         if let Some(handle) = removed_handle {
-                            handle.bridge.shutdown().await;
+                            shutdown_session_bridge(&handle).await;
                         }
                         responder.respond(DeleteSessionResponse::new())
                     }
@@ -1977,7 +2046,7 @@ fn build_agent_with_state(
                                 .config_options(Some(config_options)),
                         )?;
                         send_available_commands(&cx, &session_id);
-                        send_mcp_diagnostics(&cx, &session_id, &handle.bridge);
+                        send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
                         Ok(())
                     }
                 }
@@ -2020,75 +2089,37 @@ fn build_agent_with_state(
                         };
                         let existing = state.sessions.lock().await.get(&session_id).cloned();
                         let (current_model, active_handle) = if let Some(handle) = existing {
+                            let current_specs = handle.mcp_specs.lock().await.clone();
+                            let bridge = session_bridge(&handle).await;
                             let refresh_bridge = should_refresh_mcp_bridge(
-                                &handle.mcp_specs,
+                                &current_specs,
                                 &mcp_specs,
-                                !handle.bridge.diagnostics().is_empty(),
+                                bridge.had_connection_failures(),
                             );
+                            drop(bridge);
                             if refresh_bridge {
                                 // Zed re-sends MCP configuration on every load.
-                                // Rebuild a live session when that configuration
+                                // Refresh routing and schemas in place when it
                                 // changed, or retry servers that failed earlier.
-                                let history = handle.session.lock().await.history().to_vec();
-                                let client_ids =
-                                    handle.client_user_message_ids.lock().await.clone();
-                                let model = handle
-                                    .current_model
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .clone();
-                                let replacement = match build_session_handle(
+                                refresh_live_mcp_bridge(
+                                    &handle,
                                     &state,
                                     &cfg,
-                                    Arc::clone(&safety),
-                                    token_log.clone(),
-                                    session_id.clone(),
-                                    session_workspace,
                                     mcp_specs,
-                                    cx.clone(),
                                 )
-                                .await
-                                {
-                                    Ok(handle) => handle,
-                                    Err(e) => {
-                                        return responder.respond_with_error(
-                                            agent_client_protocol::util::internal_error(format!(
-                                                "provider init: {e}"
-                                            )),
-                                        );
-                                    }
-                                };
-                                {
-                                    let mut session = replacement.session.lock().await;
-                                    session.set_history(history);
-                                    session.set_model(model.clone());
-                                    replay_history(&cx, &session_id, session.history());
-                                }
-                                *replacement.client_user_message_ids.lock().await = client_ids;
-                                *replacement
-                                    .current_model
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner()) = model.clone();
-                                state
-                                    .sessions
-                                    .lock()
-                                    .await
-                                    .insert(session_id.clone(), Arc::clone(&replacement));
-                                handle.bridge.shutdown().await;
-                                (model, replacement)
-                            } else {
-                                // Live and unchanged: preserve the existing
-                                // provider/session state and replay its history.
-                                let agent_session = handle.session.lock().await;
-                                replay_history(&cx, &session_id, agent_session.history());
-                                drop(agent_session);
-                                let model = handle
-                                    .current_model
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .clone();
-                                (model, handle)
+                                .await;
                             }
+                            // Live sessions always preserve provider, history,
+                            // usage, compaction cache, and tool-session state.
+                            let agent_session = handle.session.lock().await;
+                            replay_history(&cx, &session_id, agent_session.history());
+                            drop(agent_session);
+                            let model = handle
+                                .current_model
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            (model, handle)
                         } else if let Some(record) = state
                             .store
                             .as_ref()
@@ -2157,7 +2188,7 @@ fn build_agent_with_state(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
                         send_available_commands(&cx, &session_id);
-                        send_mcp_diagnostics(&cx, &session_id, &active_handle.bridge);
+                        send_session_mcp_diagnostics(&cx, &session_id, &active_handle).await;
                         Ok(())
                     }
                 }
@@ -2385,7 +2416,7 @@ async fn shutdown_all_bridges(state: &AcpState) {
         map.drain().map(|(_, handle)| handle).collect()
     };
     for handle in handles {
-        handle.bridge.shutdown().await;
+        shutdown_session_bridge(&handle).await;
     }
 }
 

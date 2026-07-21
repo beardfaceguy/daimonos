@@ -137,9 +137,12 @@ the safety gate treat the `mcp__` prefix as destructive-by-default.
 
 ### D8 — Lifecycle: init, shutdown, cancellation
 
-- **Initialize** on `session/new` and on the `session/load` *rebuild* path (case 2 — process was
-  restarted). Each client does the MCP `initialize` handshake + `tools/list`, bounded by
-  `[acp.mcp] init_timeout_secs`.
+- **Initialize** on `session/new`, on the `session/load` rebuild path after a process restart, and
+  when a live session's forwarded configuration changed or a prior connection failed. Live refresh
+  swaps only the bridge and provider tool schemas while holding the existing session lock; it
+  preserves provider state, history, usage, context-window cache, and tool-session state. Each
+  client does the MCP `initialize` handshake + `tools/list`, bounded by `[acp.mcp]
+  init_timeout_secs`.
 - **Advertise capability** at ACP `initialize`: add
   `AgentCapabilities.mcp(McpCapabilities::new().stdio(..).http(..))` so Zed is spec-correct in
   forwarding `Http` servers (Zed gates `Http` on `session.mcp.http`). Gated by config so it can be
@@ -159,7 +162,9 @@ the safety gate treat the `mcp__` prefix as destructive-by-default.
 `session/load`/`session/resume`, so:
 
 - **Case 1 (live in memory):** keep the existing bridge when the forwarded configuration is
-  unchanged and healthy. Rebuild it when configuration changed or a prior connection failed.
+  unchanged and healthy. Refresh the bridge in place when configuration changed or a prior
+  connection failed. Informational diagnostics such as configured tool/server limits or name
+  collisions do not cause repeated reconnects.
 - **Case 2 (rebuilt after restart):** build the bridge from the *request's* `mcp_servers`.
 - **Case 3 (unknown):** unchanged — error, no bridge.
 
@@ -200,10 +205,10 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
   `McpClientHandler` impl (no-op server-initiated requests).
 - **`src/agent.rs`** — add optional `remote_tool_dispatch` to `AgentConfig`; consult it in the
   `tool_facade::invoke → None` branch.
-- **`src/acp_cmd.rs`** — read `req.mcp_servers` in `session/new` and the `session/load` rebuild
-  path; build the bridge; append its schemas in `build_agent_config`; store bridge on
-  `SessionHandle`; wire the dispatch hook; shut down on delete/exit; advertise `mcp` capability at
-  initialize.
+- **`src/acp_cmd.rs`** — read `req.mcp_servers` in `session/new` and `session/load`; build or
+  atomically refresh the bridge; append its schemas in `build_agent_config`; store the swappable
+  bridge on `SessionHandle`; wire the dispatch hook; shut down on delete/exit; advertise `mcp`
+  capability at initialize.
 - **`src/config.rs` / `daimonos.default.toml` / `docs/configuration.md`** — `[acp.mcp]` config.
 - **`Cargo.toml`** — enable `client`, `streamable-http`, `sse` features on `rust-mcp-sdk`.
 

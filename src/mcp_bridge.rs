@@ -299,6 +299,7 @@ pub struct McpBridge {
     runtime: tokio::sync::RwLock<BridgeRuntime>,
     tools: Vec<ToolSchema>,
     diagnostics: Vec<String>,
+    had_connection_failures: bool,
     analytics: Option<Arc<AnalyticsStore>>,
     external_session_id: Option<String>,
     call_timeout: Duration,
@@ -315,6 +316,7 @@ impl McpBridge {
             runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
             diagnostics: Vec::new(),
+            had_connection_failures: false,
             analytics: None,
             external_session_id: None,
             call_timeout: Duration::from_secs(0),
@@ -365,6 +367,7 @@ impl McpBridge {
             runtime: tokio::sync::RwLock::new(BridgeRuntime::default()),
             tools: Vec::new(),
             diagnostics: Vec::new(),
+            had_connection_failures: false,
             analytics,
             external_session_id,
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
@@ -458,6 +461,7 @@ impl McpBridge {
                     let message = format!("MCP server '{server_name}' failed to connect: {e}");
                     eprintln!("acp mcp bridge: {message}");
                     bridge.diagnostics.push(message);
+                    bridge.had_connection_failures = true;
                 }
             }
         }
@@ -473,6 +477,13 @@ impl McpBridge {
     /// of leaving them only on the child process's stderr pipe.
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
+    }
+
+    /// Whether at least one server failed before tool discovery completed.
+    /// Unlike limit/collision diagnostics, these failures are worth retrying
+    /// when Zed reloads a live session.
+    pub fn had_connection_failures(&self) -> bool {
+        self.had_connection_failures
     }
 
     /// Number of connected servers (clients that contributed ≥1 tool).
@@ -930,6 +941,7 @@ mod tests {
         let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
         assert!(bridge.tools().is_empty());
         assert_eq!(bridge.server_count(), 0);
+        assert!(bridge.had_connection_failures());
         assert!(
             bridge
                 .diagnostics()
@@ -937,6 +949,23 @@ mod tests {
                 .any(|message| message.contains("broken") && message.contains("failed")),
             "failed server must remain visible to the ACP frontend"
         );
+    }
+
+    #[tokio::test]
+    async fn limit_diagnostic_is_not_a_retryable_connection_failure() {
+        let cfg = AcpMcpConfig {
+            max_servers: 0,
+            ..AcpMcpConfig::default()
+        };
+        let spec = ServerSpec::Stdio {
+            name: "skipped".to_string(),
+            command: "unused".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let bridge = McpBridge::build(vec![spec], &cfg, &native_set(&[]), None, None).await;
+        assert!(!bridge.diagnostics().is_empty());
+        assert!(!bridge.had_connection_failures());
     }
 
     #[tokio::test]
