@@ -114,7 +114,7 @@ pub async fn run_agent(
         let task_prefix: String = args.task.chars().take(200).collect();
         let turns = result.messages.len().saturating_sub(1) as u32;
         store.record_agent_run(&AgentRunRecord {
-            external_session_id: None,
+            external_session_id,
             task_prefix,
             input_tokens: result.usage.input,
             output_tokens: result.usage.output,
