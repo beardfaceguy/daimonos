@@ -1175,16 +1175,24 @@ fn error_has_token(error: &str, token: &str) -> bool {
 
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
+    let normalized = error.replace(['_', '-'], " ");
     // Authentication/authorization/rate-limit failures are the most
     // actionable and take precedence when a proxy returns several signals.
     if error_has_token(&error, "401")
         || error.contains("authentication")
         || error.contains("invalid api key")
+        || error.contains("unauthorized")
     {
         "Provider authentication failed (HTTP 401)."
-    } else if error_has_token(&error, "403") || error.contains("permission denied") {
+    } else if error_has_token(&error, "403")
+        || error.contains("permission denied")
+        || error.contains("forbidden")
+        || error.contains("not authorized")
+        || error.contains("authorization failed")
+        || error.contains("authorization error")
+    {
         "Provider authorization failed (HTTP 403)."
-    } else if error_has_token(&error, "429") || error.contains("rate limit") {
+    } else if error_has_token(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
     } else if context_overflow
         || error.contains("prompt is too long")
@@ -5244,6 +5252,18 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("request id 1401")),
             "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("Unauthorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("Authorization failed")),
+            "Provider authorization failed (HTTP 403)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("rate_limit_exceeded")),
+            "Provider rate limit exceeded (HTTP 429)."
         );
     }
 
