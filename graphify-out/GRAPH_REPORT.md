@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 194 files · ~209,689 words
+- 195 files · ~211,954 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4419 nodes · 9964 edges · 199 communities (179 shown, 20 thin omitted)
+- 4441 nodes · 10020 edges · 198 communities (179 shown, 19 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `6b0f607b`
+- Built from commit: `d2d42112`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -204,7 +204,6 @@
 - [[_COMMUNITY_Community 194|Community 194]]
 - [[_COMMUNITY_Community 195|Community 195]]
 - [[_COMMUNITY_Community 196|Community 196]]
-- [[_COMMUNITY_Community 198|Community 198]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 53 edges
@@ -252,7 +251,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (199 total, 20 thin omitted)
+## Communities (198 total, 19 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.19
@@ -275,8 +274,8 @@ Cohesion: 0.12
 Nodes (16): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+8 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.18
-Nodes (16): Span, attribute_map(), compaction_span_records_metadata_and_nests_summary_generation(), generation_span_is_child_and_exports_usage_without_content(), prompt_records_cancel_reason(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, remote_tool_span_records_server_and_timeout() (+8 more)
+Cohesion: 0.14
+Nodes (11): Span, CompactionOutcome, CompactionSpan, GenerationSpan, PromptSpan, RemoteToolSpan, RetrySpan, AtomicBool (+3 more)
 
 ### Community 6 - "Community 6"
 Cohesion: 0.09
@@ -747,27 +746,31 @@ Cohesion: 0.13
 Nodes (14): ADR-002: Context/window compaction for AgentSession, Amendment (2026-07-12, #965): provider-reported context window, Compaction boundary + tool-pair integrity (Q3), Configuration (agent env file; no values in code), Decision overview, Future work (explicitly out of scope), Implementation plan, Measuring context size (Q1) (+6 more)
 
 ### Community 139 - "Community 139"
-Cohesion: 0.13
+Cohesion: 0.14
 Nodes (13): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Linear project management, Manual testing, Prerequisites, Quick start (new agents) (+5 more)
+
+### Community 140 - "Community 140"
+Cohesion: 0.07
+Nodes (21): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines, 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended) (+13 more)
 
 ### Community 141 - "Community 141"
 Cohesion: 0.13
 Nodes (15): 1. Create the MCP config file, 2. Start the server, 3. Use in Copilot Chat, Context-aware tools missing, GitHub Copilot Setup, JetBrains IDEs Setup, "MCP servers in Copilot" policy error, Prerequisites (+7 more)
 
 ### Community 142 - "Community 142"
-Cohesion: 0.13
-Nodes (15): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Agent still uses built-in tools, Cursor IDE Setup, "daimonos" doesn't appear in MCP panel, MCP disconnects after ~10 minutes idle, MCP log lines marked `[error]` for benign text (`auto-registered…`, `index: …`) (+7 more)
+Cohesion: 0.29
+Nodes (7): Agent still uses built-in tools, "daimonos" doesn't appear in MCP panel, MCP disconnects after ~10 minutes idle, MCP log lines marked `[error]` for benign text (`auto-registered…`, `index: …`), "Permission denied" errors, Tools like `cargo` or `git` don't appear, Troubleshooting
 
 ### Community 143 - "Community 143"
-Cohesion: 0.15
+Cohesion: 0.14
 Nodes (13): 1) Create Discord Bot Credentials, 2) Set the Bot Token in Environment, 3) Configure Daimonos Discord Section, 429 / rate limit issues, 4) Find Guild/Channel IDs, 5) Verify in MCP, "discord integration disabled", Discord Integration Setup (+5 more)
 
 ### Community 144 - "Community 144"
-Cohesion: 0.15
+Cohesion: 0.14
 Nodes (13): Android Studio (Gemini Agent), AnythingLLM, BoltAI, ChatGPT Desktop, Claude Desktop, Continue.dev (VS Code / JetBrains), General Pattern, LibreChat (+5 more)
 
 ### Community 145 - "Community 145"
-Cohesion: 0.15
+Cohesion: 0.17
 Nodes (12): Batch Operations, Compact Mode (optional, non-MCP clients), Daimonos Protocol Specification v0.1, Error, Error Codes, MCP Mode (primary), Opcode Registry, Overview (+4 more)
 
 ### Community 146 - "Community 146"
@@ -775,7 +778,7 @@ Cohesion: 0.13
 Nodes (15): `[acp.mcp]` — MCP-server bridge, `[acp]` — Native agent protocol (`acp`), `[analytics]` — Token & Latency Tracking, Correlating with agent-runtime sessions, `[discord]` — Discord Integration Foundation, `[index]` — Workspace Indexing, `[kgl]` — Knowledge-Graph Layer, `[logging]` — Runtime Diagnostics (+7 more)
 
 ### Community 147 - "Community 147"
-Cohesion: 0.20
+Cohesion: 0.22
 Nodes (9): Does daimonos cut token costs? An honest three-arm measurement, First fix, validated same day, Limitations — read before quoting, Reproduce, Results, Setup, The claim being tested, Where the tools win and lose (per-task, means over n=4) (+1 more)
 
 ### Community 148 - "Community 148"
@@ -795,7 +798,7 @@ Cohesion: 0.22
 Nodes (9): Configure Your IDE, Daimonos — Installation & Setup, Further Reading, Option A: Pre-Built Binary (recommended), Option B: Build from Source, Optional Dependencies, Quick Start, Supported Platforms (+1 more)
 
 ### Community 152 - "Community 152"
-Cohesion: 0.25
+Cohesion: 0.22
 Nodes (8): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting
 
 ### Community 154 - "Community 154"
@@ -851,24 +854,24 @@ Cohesion: 0.16
 Nodes (17): RecordedCall, CaptureProvider, end_turn_resp(), end_turn_resp_with_text(), MockProvider, RecordingProvider, Arc, CompleteOpts (+9 more)
 
 ### Community 175 - "Community 175"
-Cohesion: 0.25
+Cohesion: 0.22
 Nodes (8): 1. Open MCP configuration, 2. Add daimonos as an MCP server, 3. Verify, Adding a Rules Directive (optional), Prerequisites, Setup, Troubleshooting, Windsurf Setup
 
 ### Community 176 - "Community 176"
 Cohesion: 0.09
-Nodes (42): EnvFilter, File, JoinHandle, Layer, MakeWriter, Registry, CapturedGuard, CapturedWriter (+34 more)
+Nodes (41): EnvFilter, File, Layer, MakeWriter, Registry, CapturedGuard, CapturedWriter, creates_private_log_directory_and_file() (+33 more)
 
 ### Community 177 - "Community 177"
 Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.11
-Nodes (21): ExporterBuildError, SocketAddr, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), disabled_runtime_does_not_resolve_credentials() (+13 more)
+Cohesion: 0.09
+Nodes (31): ExporterBuildError, JoinHandle, SdkTracerProvider, SocketAddr, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header() (+23 more)
 
 ### Community 179 - "Community 179"
-Cohesion: 0.29
-Nodes (9): E, blocked_tool_span_records_status_without_sizes(), build_provider(), prompt_root_omits_absent_session_id(), PromptMetadata, Path, Self, saturated_queue_drops_spans_without_blocking_producer() (+1 more)
+Cohesion: 0.27
+Nodes (8): E, build_provider(), CompactionMetadata, PromptMetadata, Path, Self, saturated_queue_drops_spans_without_blocking_producer(), workspace_id()
 
 ### Community 181 - "Community 181"
 Cohesion: 0.10
@@ -891,28 +894,28 @@ Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
 
 ### Community 186 - "Community 186"
-Cohesion: 0.18
-Nodes (13): InMemorySpanExporter, SdkTracerProvider, bridge_lifecycle_span_roots_own_trace_without_credentials(), GenerationMetadata, in_memory_subscriber(), ObservabilityRuntime, record_bridge_lifecycle(), remote_server_alias() (+5 more)
+Cohesion: 0.29
+Nodes (18): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), enabled_tracing_overhead_is_bounded(), exported_spans_contain_no_sensitive_values(), full_prompt_trace_hierarchy_nests_all_observation_types() (+10 more)
 
 ### Community 187 - "Community 187"
-Cohesion: 0.21
+Cohesion: 0.18
 Nodes (10): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Duration (+2 more)
 
 ### Community 188 - "Community 188"
-Cohesion: 0.29
-Nodes (7): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting
+Cohesion: 0.18
+Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
 
 ### Community 189 - "Community 189"
-Cohesion: 0.33
-Nodes (3): CompactionMetadata, CompactionOutcome, CompactionSpan
+Cohesion: 0.13
+Nodes (15): Comparing models & token-saving strategies, Content capture (opt-in), Credential rotation, Disable / rollback, Langfuse Cloud, LLM Observability (OpenTelemetry / Langfuse), Overhead & budgets, Retention (+7 more)
 
 ### Community 191 - "Community 191"
 Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.06
-Nodes (69): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+61 more)
+Cohesion: 0.08
+Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -923,16 +926,12 @@ Cohesion: 0.36
 Nodes (9): arr(), has_name(), names(), orient_from_graph_alone(), write_module(), Path, String, Value (+1 more)
 
 ### Community 195 - "Community 195"
-Cohesion: 0.33
-Nodes (3): GenerationSpan, AtomicBool, LlmResponse
+Cohesion: 0.40
+Nodes (4): generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), ToolStatus
 
 ### Community 196 - "Community 196"
 Cohesion: 0.31
 Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, String
-
-### Community 198 - "Community 198"
-Cohesion: 0.33
-Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -943,9 +942,9 @@ Nodes (5): Before opening a pull request, Contributing, Development setup, Proje
   README.md · relation: references
 
 ## Knowledge Gaps
-- **708 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+703 more)
+- **720 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+715 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **19 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -957,10 +956,10 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
-  _High betweenness centrality (0.011) - this node is a cross-community bridge._
+  _High betweenness centrality (0.014) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 0`, `Community 34`, `Community 167`, `Community 174`, `Community 182`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **Why does `build_before_tool_call_hook()` connect `Community 182` to `Community 34`, `Community 168`, `Community 48`, `Community 82`, `Community 181`?**
   _High betweenness centrality (0.003) - this node is a cross-community bridge._
 - **What connects `Load all task summaries from one run directory.`, `All run dirs belonging to (arm, tag), including -rN repetitions.`, `Per-task cross-run statistics: mean/min/max per metric, success rate,     contam` to the rest of the system?**
-  _911 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _923 weakly-connected nodes found - possible documentation gaps or missing edges._

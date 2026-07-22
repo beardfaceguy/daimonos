@@ -1719,4 +1719,341 @@ mod tests {
             Some("client")
         );
     }
+
+    // --- #1041 validation: hierarchy, privacy, overhead ---
+
+    use crate::providers::{Cost, LlmResponse, StopReason, ThinkingLevel, Usage};
+
+    fn sample_generation(ordinal: u64, kind: &'static str) -> GenerationSpan {
+        GenerationSpan::new(GenerationMetadata {
+            kind,
+            model: "test-model",
+            max_tokens: 1024,
+            thinking: ThinkingLevel::Off,
+            temperature: Some(0.0),
+            ordinal,
+            tools_exposed: 1,
+            stable_prefix_len: 0,
+        })
+    }
+
+    fn sample_response() -> LlmResponse {
+        LlmResponse {
+            content: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                cost: Cost {
+                    total_usd: 0.01,
+                    ..Cost::default()
+                },
+            },
+        }
+    }
+
+    /// End-to-end validation of the ADR-006 D4 hierarchy in one prompt trace:
+    /// generation, tool.call, mcp.remote_tool, context.compaction (with a
+    /// nested summary generation), and agent.retry (with a nested generation)
+    /// all share the prompt's trace and nest under the correct parent. This
+    /// is the deterministic local stand-in for the Langfuse smoke test.
+    #[test]
+    fn full_prompt_trace_hierarchy_nests_all_observation_types() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("full-hierarchy");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "acp",
+                session_id: Some("sess"),
+                model: "test-model",
+                workspace: std::path::Path::new("/w"),
+                turn_index: 0,
+                tools_exposed: 2,
+            });
+            prompt.span().in_scope(|| {
+                let generation = sample_generation(0, "agent");
+                generation.mark_first_token();
+                generation.finish(&sample_response());
+
+                let tool = ToolSpan::new("read_file", "native");
+                tool.finish(
+                    ToolStatus::Success,
+                    ToolOutcome {
+                        batch_size: 1,
+                        ..ToolOutcome::default()
+                    },
+                );
+
+                let remote = RemoteToolSpan::new("mcp__srv__echo", "srv");
+                remote.finish(ToolStatus::Success, 1, 1);
+
+                let compaction = CompactionSpan::new(CompactionMetadata {
+                    trigger: "proactive",
+                    strategy: "summarize",
+                    high_water: 0.75,
+                    low_water: 0.5,
+                    occupancy_tokens: 800,
+                    summary_model: "test-model",
+                });
+                compaction.span().in_scope(|| {
+                    let summary = sample_generation(1, "compaction_summary");
+                    summary.finish(&sample_response());
+                });
+                compaction.finish(CompactionOutcome {
+                    tokens_before_est: 800,
+                    tokens_after_est: 400,
+                    evicted_turns: 2,
+                    evicted_messages: 6,
+                    summary_retries: 0,
+                    fallback_drop: false,
+                });
+
+                let retry = RetrySpan::new("context_overflow", Some(0));
+                retry.span().in_scope(|| {
+                    let retried = sample_generation(2, "agent");
+                    retried.finish(&sample_response());
+                });
+                retry.finish(None);
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let by_name = |name: &str| spans.iter().filter(|s| s.name == name).collect::<Vec<_>>();
+        let prompt = by_name("agent.prompt");
+        assert_eq!(prompt.len(), 1);
+        let prompt = prompt[0];
+        let trace = prompt.span_context.trace_id();
+
+        assert_eq!(by_name("tool.call").len(), 1);
+        assert_eq!(by_name("mcp.remote_tool").len(), 1);
+        assert_eq!(by_name("context.compaction").len(), 1);
+        assert_eq!(by_name("agent.retry").len(), 1);
+        assert_eq!(by_name("llm.generation").len(), 3);
+
+        // Every span belongs to the one prompt trace.
+        for span in &spans {
+            assert_eq!(
+                span.span_context.trace_id(),
+                trace,
+                "span {} escaped the prompt trace",
+                span.name
+            );
+        }
+
+        let prompt_id = prompt.span_context.span_id();
+        for name in [
+            "tool.call",
+            "mcp.remote_tool",
+            "context.compaction",
+            "agent.retry",
+        ] {
+            assert_eq!(
+                by_name(name)[0].parent_span_id,
+                prompt_id,
+                "{name} must be a direct child of agent.prompt"
+            );
+        }
+
+        // The three generations nest under prompt, compaction, and retry.
+        let compaction_id = by_name("context.compaction")[0].span_context.span_id();
+        let retry_id = by_name("agent.retry")[0].span_context.span_id();
+        let generation_parents: std::collections::HashSet<_> = by_name("llm.generation")
+            .iter()
+            .map(|s| s.parent_span_id)
+            .collect();
+        assert!(
+            generation_parents.contains(&prompt_id),
+            "agent generation under prompt"
+        );
+        assert!(
+            generation_parents.contains(&compaction_id),
+            "summary generation under context.compaction"
+        );
+        assert!(
+            generation_parents.contains(&retry_id),
+            "retry generation under agent.retry"
+        );
+    }
+
+    /// Privacy gate (ADR-006 D6): drive the full hierarchy with a secret-
+    /// bearing workspace path and assert no exported span attribute leaks the
+    /// raw path (only its one-way hash), and that no forbidden content key
+    /// (prompt/output/thinking bodies) is present on any span.
+    #[test]
+    fn exported_spans_contain_no_sensitive_values() {
+        const SECRET_WORKSPACE: &str = "/home/dev/acme-topsecret-XYZZYPLUGH";
+
+        let (exporter, provider, subscriber) = in_memory_subscriber("secret-corpus");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "acp",
+                session_id: Some("sess"),
+                model: "test-model",
+                workspace: std::path::Path::new(SECRET_WORKSPACE),
+                turn_index: 0,
+                tools_exposed: 1,
+            });
+            prompt.span().in_scope(|| {
+                sample_generation(0, "agent").finish(&sample_response());
+                ToolSpan::new("read_file", "native")
+                    .finish(ToolStatus::Success, ToolOutcome::default());
+                RemoteToolSpan::new("mcp__srv__echo", "srv").finish(ToolStatus::Success, 1, 1);
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let expected_hash = workspace_id(std::path::Path::new(SECRET_WORKSPACE));
+        let mut saw_hash = false;
+        for span in &spans {
+            for attribute in span.attributes.iter() {
+                let key = attribute.key.as_str();
+                let value = attribute.value.to_string();
+                assert!(
+                    !value.contains(SECRET_WORKSPACE) && !value.contains("XYZZYPLUGH"),
+                    "span {} attribute {key} leaked the raw workspace path",
+                    span.name
+                );
+                // Forbidden content keys must never appear (D6).
+                for forbidden in [
+                    "langfuse.observation.input",
+                    "langfuse.observation.output",
+                    "daimonos.prompt.text",
+                    "daimonos.thinking.text",
+                ] {
+                    assert_ne!(key, forbidden, "forbidden content key {forbidden} exported");
+                }
+                if key == "daimonos.workspace.id" && value == expected_hash {
+                    saw_hash = true;
+                }
+            }
+        }
+        assert!(
+            saw_hash,
+            "workspace correlation must be present as a one-way hash"
+        );
+    }
+
+    /// Overhead guard: creating + finishing many spans under an active tracer
+    /// must stay well within a generous ceiling. Real cost is ~microseconds
+    /// per span; the loose bound only catches pathological regressions without
+    /// flaking on shared CI runners. Precise budgets live in docs/observability.md.
+    #[test]
+    fn enabled_tracing_overhead_is_bounded() {
+        let iterations = 5_000;
+        let (_exporter, provider, subscriber) = in_memory_subscriber("overhead");
+        let started = std::time::Instant::now();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..iterations {
+                let tool = ToolSpan::new("read_file", "native");
+                tool.finish(
+                    ToolStatus::Success,
+                    ToolOutcome {
+                        batch_size: 1,
+                        ..ToolOutcome::default()
+                    },
+                );
+            }
+        });
+        // Measure only the turn-thread span create+finish cost; draining the
+        // exporter is background work in production (BatchSpanProcessor) and
+        // is excluded from the budget.
+        let elapsed = started.elapsed();
+        provider.force_flush().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "enabled span overhead {elapsed:?} for {iterations} spans exceeds the CI ceiling"
+        );
+    }
+
+    /// Optional self-hosted Langfuse (or any OTLP) smoke test (ADR-006 D10.7).
+    /// Ignored by default — it needs a reachable endpoint and real
+    /// credentials, so it never runs in CI. Run manually after starting a
+    /// local Langfuse (see docs/observability.md):
+    ///
+    /// ```text
+    /// export LANGFUSE_PUBLIC_KEY=pk-... LANGFUSE_SECRET_KEY=sk-...
+    /// export DAIMONOS_SMOKE_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces
+    /// cargo test --bin daimonos observability::tests::self_hosted_langfuse_smoke_test -- --ignored --nocapture
+    /// ```
+    ///
+    /// It emits one prompt trace covering a generation, a tool call, and a
+    /// compaction (with its summary generation) so an operator can verify the
+    /// hierarchy, session grouping, usage/cost, TTFT, and tool/compaction
+    /// attributes render in the Langfuse UI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a live Langfuse/OTLP endpoint + credentials; run manually with --ignored"]
+    async fn self_hosted_langfuse_smoke_test() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let endpoint = std::env::var("DAIMONOS_SMOKE_OTLP_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:3000/api/public/otel/v1/traces".to_string());
+        let config = ObservabilityConfig {
+            enabled: true,
+            endpoint,
+            environment: "smoke-test".to_string(),
+            batch_delay_ms: 200,
+            flush_timeout_ms: 5_000,
+            ..ObservabilityConfig::default()
+        };
+        let mut runtime = ObservabilityRuntime::initialize(&config);
+        assert_eq!(
+            runtime.status(),
+            &ObservabilityStatus::Active,
+            "smoke test needs valid local config + LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY set; \
+             initialize validates config/credentials only (not endpoint reachability) — confirm \
+             delivery in the Langfuse UI"
+        );
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(runtime.tracer().unwrap()));
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "agent",
+                session_id: Some("smoke-session"),
+                model: "smoke-model",
+                workspace: std::path::Path::new("/smoke/workspace"),
+                turn_index: 0,
+                tools_exposed: 1,
+            });
+            prompt.span().in_scope(|| {
+                let generation = sample_generation(0, "agent");
+                generation.mark_first_token();
+                generation.finish(&sample_response());
+                ToolSpan::new("read_file", "native").finish(
+                    ToolStatus::Success,
+                    ToolOutcome {
+                        batch_size: 1,
+                        ..ToolOutcome::default()
+                    },
+                );
+                let compaction = CompactionSpan::new(CompactionMetadata {
+                    trigger: "proactive",
+                    strategy: "summarize",
+                    high_water: 0.75,
+                    low_water: 0.5,
+                    occupancy_tokens: 800,
+                    summary_model: "smoke-model",
+                });
+                compaction.span().in_scope(|| {
+                    sample_generation(1, "compaction_summary").finish(&sample_response());
+                });
+                compaction.finish(CompactionOutcome {
+                    tokens_before_est: 800,
+                    tokens_after_est: 400,
+                    evicted_turns: 1,
+                    evicted_messages: 3,
+                    summary_retries: 0,
+                    fallback_drop: false,
+                });
+            });
+            prompt.finish("end_turn", None);
+        });
+        runtime.shutdown().await;
+    }
 }
