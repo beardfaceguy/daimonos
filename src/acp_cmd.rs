@@ -2288,8 +2288,10 @@ fn build_agent_with_state(
                         // and can be resumed by session/load. Without this,
                         // session/new is in-memory only and a cold session/load
                         // for that id fails with "no session found" (vikunja
-                        // #1046). Best-effort: a store failure logs and never
-                        // fails session creation.
+                        // #1046). Best-effort and fire-and-forget like every
+                        // other save_acp call site: save_acp returns unit and
+                        // logs internally on a write error, so a persist failure
+                        // never fails session creation.
                         if let Some(store) = state.store.as_ref() {
                             store.save_acp(
                                 &session_id.to_string(),

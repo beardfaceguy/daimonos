@@ -1,7 +1,7 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 196 files · ~213,368 words
+- 196 files · ~213,387 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `f756ad17`
+- Built from commit: `eaf7684e`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -400,8 +400,8 @@ Cohesion: 0.16
 Nodes (31): compact_audit(), compact_audit_clean_project(), compact_audit_missing_metadata_defaults_clean(), compact_audit_with_vulnerabilities(), is_available(), npm_audit(), npm_audit_in_valid_project(), npm_audit_no_package_json_returns_error() (+23 more)
 
 ### Community 34 - "Community 34"
-Cohesion: 0.17
-Nodes (34): AcpClientRole, AcpStopReason, ConnectionTo, SessionId, acp_stop_reason_name(), align_client_user_message_ids(), build_agent_with_state(), build_session_handle() (+26 more)
+Cohesion: 0.13
+Nodes (42): AcpClientRole, AcpStopReason, CancelSlot, ConnectionTo, CurrentModel, McpBridge, SessionId, acp_stop_reason_name() (+34 more)
 
 ### Community 35 - "Community 35"
 Cohesion: 0.12
@@ -832,8 +832,8 @@ Cohesion: 0.14
 Nodes (17): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, retry_error_type(), Box, LlmProvider (+9 more)
 
 ### Community 168 - "Community 168"
-Cohesion: 0.10
-Nodes (39): AgentSession, BridgeSlot, CancelSlot, CurrentModel, McpBridge, McpClientPool, AcpCommand, AcpCompaction (+31 more)
+Cohesion: 0.13
+Nodes (28): AgentSession, McpClientPool, AcpCommand, AcpCompaction, AcpState, decode_session_list_cursor(), EofAwareReader, ModelCaptureProvider (+20 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.15
@@ -885,7 +885,7 @@ Nodes (33): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), a
 
 ### Community 182 - "Community 182"
 Cohesion: 0.08
-Nodes (41): AcpPlan, AgentPlanEntry, CurrentConnection, DiffStash, Meta, agent_tools(), build_after_tool_call_hook(), build_agent_config() (+33 more)
+Nodes (44): AcpPlan, AgentPlanEntry, BridgeSlot, CurrentConnection, DiffStash, Meta, agent_tools(), build_after_tool_call_hook() (+36 more)
 
 ### Community 183 - "Community 183"
 Cohesion: 0.33
