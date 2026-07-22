@@ -806,6 +806,15 @@ pub fn build_request(name: &str, args: &Value) -> Option<Result<Request, String>
     Some(to_request(args))
 }
 
+/// Whether `name` maps to an opcode `Request` served by `tool_facade`/`ops`
+/// (as opposed to a plugin/meta tool handled in `mcp.rs` or a remote MCP tool).
+/// Name-only so callers can classify a tool before dispatching it.
+pub fn has_opcode_mapping(name: &str) -> bool {
+    all_tools()
+        .iter()
+        .any(|tool| tool.name == name && tool.to_request.is_some())
+}
+
 /// Build MCP Tool objects from the registry for list_tools responses.
 pub fn tool_definitions(
     descriptions: &crate::tool_descriptions::ToolDescriptions,

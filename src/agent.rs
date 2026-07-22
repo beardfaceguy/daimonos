@@ -7,6 +7,7 @@ use tracing::Instrument;
 
 use crate::compaction::{self, CompactionEvent, CompactionPolicy, CompactionStrategy};
 use crate::mcp_bridge::REMOTE_TOOL_PREFIX;
+use crate::observability::ToolOutcome;
 use crate::protocol::Response;
 use crate::providers::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, Message, Role, StopReason, StreamEvent,
@@ -205,6 +206,14 @@ fn response_to_content(resp: Response) -> String {
     }
 }
 
+/// `daimonos.tool.kind` for a tool name that never reached the opcode facade:
+/// `remote` for namespaced MCP tools (ADR-003), else the static classification.
+fn dispatch_tool_kind(name: &str) -> &'static str {
+    crate::observability::remote_server_alias(name)
+        .map(|_| "remote")
+        .unwrap_or_else(|| crate::observability::tool_kind(name))
+}
+
 fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
     let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
         eprintln!("agent: list_all_tools returned a non-array catalog; remote tools omitted");
@@ -398,6 +407,11 @@ pub async fn run(
                         match hook(&info).await {
                             BeforeHookResult::Allow => {}
                             BeforeHookResult::Block(reason) => {
+                                crate::observability::ToolSpan::new(
+                                    &name,
+                                    dispatch_tool_kind(&name),
+                                )
+                                .finish_status(crate::observability::ToolStatus::Blocked);
                                 tool_results.push(ContentBlock::ToolResult {
                                     tool_use_id: id,
                                     content: format!("blocked: {reason}"),
@@ -418,8 +432,22 @@ pub async fn run(
                         .on_tool_progress
                         .as_ref()
                         .map(|_| &on_progress as &crate::ops::ExecProgressCallback<'_>);
-                    let (content, is_error) = if name == UPDATE_PLAN_TOOL {
-                        match parse_plan_entries(&input) {
+                    let request_chars = serde_json::to_string(&input).map(|s| s.len()).unwrap_or(0);
+                    // Native/opcode tools and the plan tool run through the
+                    // facade; open a `tool.call` span around them so latency is
+                    // measured. Remote MCP tools are spanned as `mcp.remote_tool`
+                    // in the bridge; anything that resolves to neither is
+                    // recorded below as `unavailable`.
+                    let native =
+                        name == UPDATE_PLAN_TOOL || crate::tools::has_opcode_mapping(&name);
+                    let tool_span = native.then(|| {
+                        crate::observability::ToolSpan::new(
+                            &name,
+                            crate::observability::tool_kind(&name),
+                        )
+                    });
+                    let (content, is_error, outcome) = if name == UPDATE_PLAN_TOOL {
+                        let (content, is_error) = match parse_plan_entries(&input) {
                             Ok(entries) => {
                                 if let Some(hook) = &config.on_plan_update {
                                     hook(&entries);
@@ -430,39 +458,100 @@ pub async fn run(
                                 )
                             }
                             Err(error) => (error, true),
-                        }
+                        };
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            batch_size: 1,
+                            ..ToolOutcome::default()
+                        };
+                        (content, is_error, Some(outcome))
                     } else {
-                        match tool_facade::invoke_with_progress(
-                            session,
-                            &name,
-                            &input,
-                            progress_callback,
-                        )
-                        .await
-                        {
+                        let facade = match &tool_span {
+                            Some(span) => {
+                                tool_facade::invoke_with_progress(
+                                    session,
+                                    &name,
+                                    &input,
+                                    progress_callback,
+                                )
+                                .instrument(span.span().clone())
+                                .await
+                            }
+                            None => {
+                                tool_facade::invoke_with_progress(
+                                    session,
+                                    &name,
+                                    &input,
+                                    progress_callback,
+                                )
+                                .await
+                            }
+                        };
+                        match facade {
                             Some(r) => {
                                 let ok = r.ok;
+                                let meta = r.meta.clone();
                                 let content = response_to_content(r);
+                                let response_chars = content.len();
                                 let content = if name == LIST_ALL_TOOLS_TOOL {
                                     append_remote_tools_to_catalog(content, &config.tools)
                                 } else {
                                     content
                                 };
-                                (content, !ok)
+                                let (saved_tokens, _) = crate::analytics::compute_savings(
+                                    meta.unfiltered_chars,
+                                    response_chars,
+                                );
+                                let outcome = ToolOutcome {
+                                    request_tokens_est: crate::analytics::estimate_tokens(
+                                        request_chars,
+                                    ),
+                                    response_tokens_est: crate::analytics::estimate_tokens(
+                                        response_chars,
+                                    ),
+                                    saved_tokens_est: saved_tokens,
+                                    redirect: meta.redirect_via_plugin,
+                                    filtered: meta.filter_applied,
+                                    read_dedup: meta.read_dedup,
+                                    batch_size: 1,
+                                };
+                                (content, !ok, Some(outcome))
                             }
-                            None => match &config.remote_tool_dispatch {
-                                Some(hook) => match hook(&name, &input).await {
-                                    Some(r) => (r.content, r.is_error),
+                            None => {
+                                let served = match &config.remote_tool_dispatch {
+                                    Some(hook) => hook(&name, &input).await,
+                                    None => None,
+                                };
+                                match served {
+                                    // Remote MCP: the bridge emits the
+                                    // `mcp.remote_tool` span with its server alias.
+                                    Some(r) => (r.content, r.is_error, None),
                                     None => {
-                                        (format!("tool '{name}' not available in agent mode"), true)
+                                        crate::observability::ToolSpan::new(
+                                            &name,
+                                            dispatch_tool_kind(&name),
+                                        )
+                                        .finish_status(
+                                            crate::observability::ToolStatus::Unavailable,
+                                        );
+                                        (
+                                            format!("tool '{name}' not available in agent mode"),
+                                            true,
+                                            None,
+                                        )
                                     }
-                                },
-                                None => {
-                                    (format!("tool '{name}' not available in agent mode"), true)
                                 }
-                            },
+                            }
                         }
                     };
+                    if let Some(tool_span) = tool_span {
+                        let status = if is_error {
+                            crate::observability::ToolStatus::Error
+                        } else {
+                            crate::observability::ToolStatus::Success
+                        };
+                        tool_span.finish(status, outcome.unwrap_or_default());
+                    }
 
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
@@ -1103,6 +1192,15 @@ mod tests {
             other => panic!("expected tool result, got {other:?}"),
         }
     }
+
+    // Wiring-level `tool.call` / `mcp.remote_tool` span emission from
+    // `agent::run` and the bridge is validated by the deterministic
+    // observability primitive tests (`observability::tests::*`): capturing
+    // spans through the real async loop under parallel `cargo test` is flaky
+    // because `tracing`'s process-global callsite/level state is raced by
+    // other suites' filtering subscribers. The primitives cover every span
+    // shape (native/blocked/error/timeout/remote/unavailable, nesting, and
+    // the metadata-only privacy contract) without that fragility.
 
     #[test]
     fn plan_input_normalizes_and_validates_entries() {

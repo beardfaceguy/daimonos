@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784748344.0813258,
+    "mtime": 1784750225.7768552,
     "ast_hash": "bb3e342b67bacccc49d965f1aa9fe392",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784748632.8183887,
-    "ast_hash": "c0a9bf80fa6a4cb55304ca7a81e09018",
+    "mtime": 1784753975.3483958,
+    "ast_hash": "974aacf92f38cab3468488621a32390d",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -485,7 +485,7 @@
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1784748107.032916,
+    "mtime": 1784750225.7778554,
     "ast_hash": "457c4232afc20bc537aab50b8f7b3cca",
     "semantic_hash": ""
   },
@@ -530,8 +530,8 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784650951.5111678,
-    "ast_hash": "31d08f06edfdac01614aa256827ee4c5",
+    "mtime": 1784751709.8830843,
+    "ast_hash": "362d20141f8a1c0134027a88fc2e6ce3",
     "semantic_hash": ""
   },
   "src/verbosity.rs": {
@@ -930,8 +930,8 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784692241.1792347,
-    "ast_hash": "ebd8ac827a6d2650827792cad10e19fc",
+    "mtime": 1784753975.4103954,
+    "ast_hash": "16b1bf31e9648341b0fefadd40a7817d",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784749287.87602,
-    "ast_hash": "7864a0b08147f92d24981435f58fefc7",
+    "mtime": 1784753975.4173954,
+    "ast_hash": "d6433b771a6dad60832b6962ce794a08",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
@@ -1005,8 +1005,8 @@
     "semantic_hash": ""
   },
   "bugs.md": {
-    "mtime": 1784738826.7891533,
-    "ast_hash": "b6dd359685450d10a61b7bb54d4a4d67",
+    "mtime": 1784750519.1859233,
+    "ast_hash": "3e8c4ae0ba6c4da8fa142cb24f8b4346",
     "semantic_hash": ""
   }
 }

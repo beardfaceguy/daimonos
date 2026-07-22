@@ -29,6 +29,8 @@ use rust_mcp_sdk::{
     TransportOptions,
 };
 
+use tracing::Instrument;
+
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::AcpMcpConfig;
 use crate::mcp::{DAIMONOS_MCP_META_KEY, DAIMONOS_MCP_META_VALUE};
@@ -484,6 +486,7 @@ impl McpBridge {
         reject_daimonos: bool,
     ) -> Self {
         let requested_servers = specs.len();
+        let build_started = Instant::now();
         tracing::info!(
             target: "daimonos::mcp_bridge",
             event = "bridge_build_started",
@@ -659,6 +662,16 @@ impl McpBridge {
             exposed_tools = bridge.tools.len(),
             diagnostics = bridge.diagnostics.len(),
         );
+        // Session-lifecycle span (ADR-006 D4): built outside any prompt, so it
+        // roots its own trace. Counts and duration only — no URIs/headers (D6).
+        crate::observability::record_bridge_lifecycle(
+            "build",
+            bridge.runtime.get_mut().leases.len() as u64,
+            build_started.elapsed().as_millis() as u64,
+            bridge
+                .had_connection_failures
+                .then_some("connection_failed"),
+        );
         bridge
     }
 
@@ -716,29 +729,56 @@ impl McpBridge {
             task: None,
         };
         let request_chars = input.to_string().len();
+        // `mcp.remote_tool` span (ADR-006 D4): nests under the active prompt
+        // root because `call` is awaited inside the agent loop's dispatch. The
+        // server alias is bounded by config and carries no headers/URIs (D6).
+        let server = crate::observability::remote_server_alias(name).unwrap_or("unknown");
+        let span = crate::observability::RemoteToolSpan::new(name, server);
         let started = Instant::now();
         tracing::debug!(
             target: "daimonos::mcp_bridge",
             event = "remote_tool_started",
             tool = %name,
         );
-        let outcome =
-            match tokio::time::timeout(self.call_timeout, client.request_tool_call(params)).await {
-                Ok(Ok(result)) => result_to_outcome(result),
-                Ok(Err(e)) => RemoteToolOutcome {
-                    content: format!("remote MCP tool '{name}' failed: {e}"),
-                    is_error: true,
-                },
-                Err(_) => RemoteToolOutcome {
-                    content: format!(
-                        "remote MCP tool '{name}' timed out after {}s",
-                        self.call_timeout.as_secs()
-                    ),
-                    is_error: true,
-                },
+        let (outcome, status) =
+            match tokio::time::timeout(self.call_timeout, client.request_tool_call(params))
+                .instrument(span.span().clone())
+                .await
+            {
+                Ok(Ok(result)) => {
+                    let outcome = result_to_outcome(result);
+                    let status = if outcome.is_error {
+                        crate::observability::ToolStatus::Error
+                    } else {
+                        crate::observability::ToolStatus::Success
+                    };
+                    (outcome, status)
+                }
+                Ok(Err(e)) => (
+                    RemoteToolOutcome {
+                        content: format!("remote MCP tool '{name}' failed: {e}"),
+                        is_error: true,
+                    },
+                    crate::observability::ToolStatus::Error,
+                ),
+                Err(_) => (
+                    RemoteToolOutcome {
+                        content: format!(
+                            "remote MCP tool '{name}' timed out after {}s",
+                            self.call_timeout.as_secs()
+                        ),
+                        is_error: true,
+                    },
+                    crate::observability::ToolStatus::Timeout,
+                ),
             };
         let elapsed = started.elapsed();
         self.record(name, request_chars, outcome.content.len(), elapsed);
+        span.finish(
+            status,
+            analytics::estimate_tokens(request_chars),
+            analytics::estimate_tokens(outcome.content.len()),
+        );
         tracing::info!(
             target: "daimonos::mcp_bridge",
             event = "remote_tool_completed",
@@ -760,11 +800,18 @@ impl McpBridge {
         };
         let lease_count = leases.len();
         future::join_all(leases.into_iter().map(|lease| self.pool.release(lease))).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         tracing::info!(
             target: "daimonos::mcp_bridge",
             event = "bridge_shutdown_completed",
             leases = lease_count,
-            duration_ms = started.elapsed().as_millis() as u64,
+            duration_ms,
+        );
+        crate::observability::record_bridge_lifecycle(
+            "shutdown",
+            lease_count as u64,
+            duration_ms,
+            None,
         );
     }
 
