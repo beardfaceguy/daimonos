@@ -57,3 +57,38 @@ DAIMONOS_AGENT_COMPACTION=off
     assert completed.returncode == 0
     assert "observability: initialization failed" in completed.stderr
     assert "DAIMONOS_TEST_MISSING_OTLP_PUBLIC" in completed.stderr
+
+
+def test_non_agent_mode_reports_ignored_observability(daimonos_binary, tmp_path):
+    config = tmp_path / "daimonos.toml"
+    config.write_text(
+        """
+[logging]
+enabled = false
+
+[analytics]
+enabled = false
+
+[observability]
+enabled = true
+basic_auth = false
+""",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            daimonos_binary,
+            "--config",
+            str(config),
+            "--workspace",
+            str(tmp_path),
+            "--stats",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0
+    assert "observability: ignored for runtime mode 'stats'" in completed.stderr

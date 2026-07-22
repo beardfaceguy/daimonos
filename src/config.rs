@@ -315,9 +315,6 @@ pub struct ObservabilityConfig {
     pub batch_delay_ms: u64,
     /// Maximum time allowed for exporter shutdown/flush.
     pub flush_timeout_ms: u64,
-    /// Explicit opt-in for redacted prompt/response capture. Instrumentation
-    /// remains metadata-only while false.
-    pub capture_content: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,7 +605,6 @@ impl Default for ObservabilityConfig {
             max_batch_size: 512,
             batch_delay_ms: 5_000,
             flush_timeout_ms: 3_000,
-            capture_content: false,
         }
     }
 }
@@ -689,6 +685,18 @@ impl ObservabilityConfig {
             return Err(format!(
                 "observability Basic Auth username env var '{}' must not contain ':'",
                 self.basic_auth_username_env
+            ));
+        }
+        if username.chars().any(char::is_control) {
+            return Err(format!(
+                "observability Basic Auth username env var '{}' must not contain control characters",
+                self.basic_auth_username_env
+            ));
+        }
+        if password.chars().any(char::is_control) {
+            return Err(format!(
+                "observability Basic Auth password env var '{}' must not contain control characters",
+                self.basic_auth_password_env
             ));
         }
         Ok(Some((username, password)))
@@ -1070,7 +1078,6 @@ mod tests {
         assert_eq!(cfg.observability.max_batch_size, 512);
         assert_eq!(cfg.observability.batch_delay_ms, 5_000);
         assert_eq!(cfg.observability.flush_timeout_ms, 3_000);
-        assert!(!cfg.observability.capture_content);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");

@@ -118,9 +118,6 @@ max_queue_size = 2048
 max_batch_size = 512
 batch_delay_ms = 5000
 flush_timeout_ms = 3000
-# Raw prompts, source, tool payloads, outputs, and thinking stay excluded while
-# false. Enabling this will only take effect once redacted capture is shipped.
-capture_content = false
 
 [analytics]
 # Track per-tool-call token usage, latency, and savings.

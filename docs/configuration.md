@@ -311,7 +311,6 @@ thinking, headers, and credentials are not exported under defaults.
 | `max_batch_size` | `512` | Maximum spans per request; cannot exceed queue size. |
 | `batch_delay_ms` | `5000` | Maximum delay before exporting a partial batch. |
 | `flush_timeout_ms` | `3000` | Bounded shutdown/flush timeout. |
-| `capture_content` | `false` | Reserved explicit opt-in. Content remains excluded until redacted capture support is implemented. |
 
 ```toml
 [observability]
@@ -327,7 +326,6 @@ max_queue_size = 2048
 max_batch_size = 512
 batch_delay_ms = 5000
 flush_timeout_ms = 3000
-capture_content = false
 ```
 
 Credential values are read only from the named environment variables and are
@@ -335,6 +333,9 @@ never included in configuration dumps or initialization errors. Langfuse's
 generic OTLP base endpoint ends in `/api/public/otel`; because Daimonos
 configures the signal-specific traces exporter directly, its endpoint includes
 the required `/v1/traces` suffix.
+Content capture is not currently configurable: export is unconditionally
+metadata-only. A future redacted content mode will add an explicit opt-in only
+when its privacy tests and limits ship with it.
 
 ### `[analytics]` — Token & Latency Tracking
 

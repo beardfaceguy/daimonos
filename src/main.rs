@@ -224,7 +224,8 @@ async fn main() -> anyhow::Result<()> {
             };
     }
     let mut observability_config = cfg.observability.clone();
-    if !uses_agent_prompt {
+    let observability_ignored = observability_config.enabled && !uses_agent_prompt;
+    if observability_ignored {
         observability_config.enabled = false;
     }
     let mut observability_runtime =
@@ -245,6 +246,20 @@ async fn main() -> anyhow::Result<()> {
             );
         } else {
             eprintln!("observability: initialization failed: {error}");
+        }
+    }
+    if observability_ignored {
+        if _logging_guard.is_some() {
+            tracing::warn!(
+                target: observability::LOCAL_DIAGNOSTIC_TARGET,
+                event = "telemetry_ignored_for_runtime_mode",
+                mode = runtime_mode.log_name(),
+            );
+        } else {
+            eprintln!(
+                "observability: ignored for runtime mode '{}'; supported modes: agent, chat, acp",
+                runtime_mode.log_name()
+            );
         }
     }
     let resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {

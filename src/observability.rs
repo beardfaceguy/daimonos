@@ -284,6 +284,31 @@ mod tests {
         assert!(!message.contains("public:invalid"));
     }
 
+    #[test]
+    fn basic_auth_credentials_reject_control_characters() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let username_env = "DAIMONOS_TEST_OTLP_CONTROL_PUBLIC";
+        let password_env = "DAIMONOS_TEST_OTLP_CONTROL_SECRET";
+        std::env::set_var(username_env, "public");
+        std::env::set_var(password_env, "secret\r\ninjected: value");
+        let config = ObservabilityConfig {
+            enabled: true,
+            basic_auth_username_env: username_env.to_string(),
+            basic_auth_password_env: password_env.to_string(),
+            ..ObservabilityConfig::default()
+        };
+
+        let runtime = ObservabilityRuntime::initialize(&config);
+
+        std::env::remove_var(username_env);
+        std::env::remove_var(password_env);
+        let ObservabilityStatus::Failed(message) = runtime.status() else {
+            panic!("control characters in Basic Auth must disable export");
+        };
+        assert!(message.contains("must not contain control characters"));
+        assert!(!message.contains("injected"));
+    }
+
     #[derive(Debug)]
     struct SlowExporter {
         exports: Arc<AtomicUsize>,
