@@ -2,8 +2,7 @@
 
 **Date:** 2026-07-18
 **Status:** Accepted
-**Tracks:** vikunja #990 (consume `mcp_servers` from Zed), #1008 (shared client pool), #982 (Zed
-integration analysis, precursor)
+**Tracks:** vikunja #990 (consume `mcp_servers` from Zed), #1008 (shared client pool), #1023 (self-server exclusion), #982 (Zed integration analysis, precursor)
 **Relates to:** ADR-001 (provider boundary),
 the tool facade (`src/tool_facade.rs`) and ACP frontend (`src/acp_cmd.rs`)
 
@@ -181,6 +180,25 @@ Native tools are recorded in the ops/MCP path; remote tools bypass ops, so the b
 remote call directly into the same `AnalyticsStore` under its `mcp__{server}__{tool}` name, with
 timing and `estimate_tokens` request/response token estimates. `session_stats` then attributes
 remote usage alongside native tools. Recording is best-effort and never blocks the turn.
+
+### D11 — ACP excludes the Daimonos MCP server itself
+
+Zed forwards every enabled context server to every external ACP agent and has no per-agent
+exclusion setting. The globally configured Daimonos MCP server must remain available to other ACP
+agents, but forwarding it back into Daimonos ACP would duplicate native tools, schemas, processes,
+and IPC.
+
+Daimonos MCP initialize responses therefore carry the namespaced metadata marker
+`io.daimonos/server-kind = "mcp"`. The ACP bridge rejects that marker after initialize and before
+`tools/list`, route registration, or shared-pool publication. Local stdio specs whose canonical
+command path equals the running ACP executable are skipped before launch as a fast path. Forwarded
+display names are never trusted for identity, so aliases cannot bypass exclusion and unrelated
+servers named `daimonos` remain valid.
+
+A self skip is intentional and non-retryable: it emits an operational diagnostic, contributes no
+remote schemas, and does not set the connection-failure flag that would cause repeated live-session
+refreshes. The ACP session continues with the same native Daimonos tools plus all other healthy
+forwarded MCP servers.
 
 ## Configuration
 

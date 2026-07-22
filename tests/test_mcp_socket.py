@@ -172,6 +172,7 @@ def test_mcp_socket_initialize_result_shape(mcp_socket_server):
         assert "protocolVersion" in result, f"missing protocolVersion: {result}"
         assert "serverInfo" in result, f"missing serverInfo: {result}"
         assert result["serverInfo"]["name"] == "daimonos"
+        assert result["_meta"]["io.daimonos/server-kind"] == "mcp"
     finally:
         client.close()
 

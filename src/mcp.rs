@@ -29,6 +29,16 @@ use crate::tool_facade;
 use crate::tool_runner::ToolRegistry;
 use crate::tools;
 
+pub(crate) const DAIMONOS_MCP_META_KEY: &str = "io.daimonos/server-kind";
+pub(crate) const DAIMONOS_MCP_META_VALUE: &str = "mcp";
+
+fn mcp_identity_meta() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        DAIMONOS_MCP_META_KEY.to_string(),
+        Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
+    )])
+}
+
 pub struct DaimonosHandler {
     session: Arc<Mutex<Session>>,
     /// Updated on every incoming request so the idle watchdog can detect
@@ -1372,7 +1382,7 @@ pub async fn run_mcp_server(
         },
         protocol_version: ProtocolVersion::V2025_11_25.into(),
         instructions: Some(instructions),
-        meta: None,
+        meta: Some(mcp_identity_meta()),
     };
 
     let transport = StdioTransport::new(TransportOptions::default())
@@ -1535,6 +1545,7 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
                             "version": env!("CARGO_PKG_VERSION"),
                         },
                         "instructions": instructions,
+                        "_meta": mcp_identity_meta(),
                     }),
                 ))
             }

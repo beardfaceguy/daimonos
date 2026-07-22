@@ -47,6 +47,7 @@ def test_initialize_returns_server_info(daimonos_binary, tmp_path):
         result = resp["result"]
         assert result["serverInfo"]["name"] == "daimonos"
         assert result["serverInfo"]["version"] == _expected_version()
+        assert result["_meta"]["io.daimonos/server-kind"] == "mcp"
         assert "protocolVersion" in result
         assert "capabilities" in result
         assert "tools" in result["capabilities"]

@@ -290,7 +290,7 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784659149.031109,
+    "mtime": 1784659957.2880418,
     "ast_hash": "60ff922f941fbc8b39f93498a6bf2a29",
     "semantic_hash": ""
   },
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1784431554.0016086,
-    "ast_hash": "dc91de85c771bdb92359b0c9774790ce",
+    "mtime": 1784669474.1589682,
+    "ast_hash": "bf527bba28793178be442733a99d07ae",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -605,8 +605,8 @@
     "semantic_hash": "acbca61bef7706f641f343b03274c30d"
   },
   "tests/test_handshake.py": {
-    "mtime": 1784431554.0026085,
-    "ast_hash": "4297e23007f9f84b89c128163c83197a",
+    "mtime": 1784669390.2055054,
+    "ast_hash": "5c794cd4f1bad2561adf60b511c6ae49",
     "semantic_hash": ""
   },
   "tests/test_index_guard.py": {
@@ -635,8 +635,8 @@
     "semantic_hash": "f6847dbcf090cb82dbcc5f6140ad5500"
   },
   "tests/test_mcp_socket.py": {
-    "mtime": 1784404010.8885543,
-    "ast_hash": "27a58b1df0a25497540bbc8dce3248fe",
+    "mtime": 1784669390.2055054,
+    "ast_hash": "b94b2e90447e7ad50871d050bdf810fe",
     "semantic_hash": ""
   },
   "tests/test_memory.py": {
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784658131.2543905,
+    "mtime": 1784659957.2290423,
     "ast_hash": "cb044d47745da1eea5bf7c6cc8d963d6",
     "semantic_hash": ""
   },
@@ -930,13 +930,13 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784659131.0522218,
-    "ast_hash": "5cbcfe51b00d36a8f1bf85ed04606693",
+    "mtime": 1784688953.03129,
+    "ast_hash": "51c1d4611c6788346b66a475f3c551b0",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {
-    "mtime": 1784650951.4881678,
-    "ast_hash": "6706f538d9e198e7566d76fb580a6358",
+    "mtime": 1784669639.707909,
+    "ast_hash": "097478c7d5123e81a60eaca83d01ef00",
     "semantic_hash": ""
   },
   "tests/test_tool_list_changed.py": {
@@ -960,12 +960,12 @@
     "semantic_hash": ""
   },
   "src/logging.rs": {
-    "mtime": 1784659225.642629,
+    "mtime": 1784659957.2880418,
     "ast_hash": "31e98708735cc7816f3b6100b8c13027",
     "semantic_hash": ""
   },
   "tests/test_logging.py": {
-    "mtime": 1784659138.2711766,
+    "mtime": 1784659957.289042,
     "ast_hash": "2b8cb49e3ec8faa5fd16a2feeb0e461d",
     "semantic_hash": ""
   },
