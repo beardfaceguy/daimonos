@@ -324,11 +324,17 @@ pub async fn run_chat(
                                 crate::providers::StopReason::Refusal => Some("refusal"),
                                 _ => None,
                             };
+                            // An `Aborted` turn was terminated by the policy
+                            // hook, not the client (ADR-006 D5).
+                            if matches!(turn.stop_reason, crate::providers::StopReason::Aborted) {
+                                prompt_span.record_cancel_reason("policy");
+                            }
                             prompt_span.finish(turn.stop_reason.as_str(), error_type);
                             true
                         }
                         None => {
                             eprintln!("\n[turn aborted]");
+                            prompt_span.record_cancel_reason("client");
                             prompt_span.finish("cancelled", Some("client_cancelled"));
                             false
                         }

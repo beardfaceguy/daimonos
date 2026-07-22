@@ -1522,10 +1522,18 @@ async fn run_prompt_turn(
                 }
                 _ => {}
             }
+            // A turn that completes with `Aborted` was terminated by the
+            // after-tool-call policy hook, not the client (ADR-006 D5).
+            if matches!(turn.stop_reason, crate::providers::StopReason::Aborted) {
+                tracing::Span::current().record("daimonos.cancel.reason", "policy");
+            }
             map_stop_reason(turn.stop_reason)
         }
         None => {
+            // The prompt future lost the select to the `session/cancel`
+            // notify: a client-initiated cancellation.
             tracing::Span::current().record("error.type", "client_cancelled");
+            tracing::Span::current().record("daimonos.cancel.reason", "client");
             AcpStopReason::Cancelled
         }
     }
