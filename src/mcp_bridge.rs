@@ -344,14 +344,34 @@ async fn canonicalize_command(
 ) -> Option<std::path::PathBuf> {
     let command_path = std::path::Path::new(command);
     if command_path.is_absolute() || command_path.components().count() > 1 {
-        return tokio::fs::canonicalize(command_path).await.ok();
+        return canonicalize_executable(command_path).await;
     }
     for directory in search_path.into_iter().flat_map(std::env::split_paths) {
-        if let Ok(path) = tokio::fs::canonicalize(directory.join(command_path)).await {
+        if let Some(path) = canonicalize_executable(&directory.join(command_path)).await {
             return Some(path);
         }
     }
     None
+}
+
+async fn canonicalize_executable(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if !metadata.is_file() || !metadata_is_executable(&metadata) {
+        return None;
+    }
+    tokio::fs::canonicalize(path).await.ok()
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Result of dispatching a remote tool call, in the shape the agent loop needs.
@@ -1082,6 +1102,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let command = directory.path().join("daimonos-path-test");
         std::fs::write(&command, "test").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let expected = command.canonicalize().unwrap();
         let search_path = std::env::join_paths([directory.path()]).unwrap();
 
@@ -1089,6 +1114,28 @@ mod tests {
             canonicalize_command("daimonos-path-test", Some(&search_path)).await,
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn bare_command_resolution_rejects_non_executables() {
+        let directory = tempfile::tempdir().unwrap();
+        let search_path = std::env::join_paths([directory.path()]).unwrap();
+        std::fs::create_dir(directory.path().join("directory")).unwrap();
+
+        assert_eq!(
+            canonicalize_command("directory", Some(&search_path)).await,
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let file = directory.path().join("plain-file");
+            std::fs::write(&file, "test").unwrap();
+            assert_eq!(
+                canonicalize_command("plain-file", Some(&search_path)).await,
+                None
+            );
+        }
     }
 
     #[test]
