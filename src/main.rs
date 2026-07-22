@@ -13,6 +13,7 @@ mod kgl;
 mod logging;
 mod mcp;
 mod mcp_bridge;
+mod observability;
 mod ops;
 mod paths;
 mod pipeline_cache;
@@ -201,25 +202,6 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    let _logging_guard = match logging::init(&cfg.logging) {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("logging: initialization failed: {error}");
-            None
-        }
-    };
-    let _resource_telemetry = _logging_guard
-        .as_ref()
-        .and_then(|_| logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs));
-    tracing::info!(
-        target: "daimonos::lifecycle",
-        event = "process_start",
-        pid = std::process::id(),
-        version = env!("CARGO_PKG_VERSION"),
-        mode = runtime_mode.log_name(),
-        workspace = %workspace.display(),
-        log_directory = %cfg.logging.resolved_directory().display(),
-    );
     cfg.prompts.resolved_tool_descriptions =
         tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
     // Load optional extra user rules once, before any agent runtime starts.
@@ -241,32 +223,89 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
     }
+    let mut observability_config = cfg.observability.clone();
+    let observability_ignored = observability_config.enabled && !uses_agent_prompt;
+    if observability_ignored {
+        observability_config.enabled = false;
+    }
+    let mut observability_runtime =
+        observability::ObservabilityRuntime::initialize(&observability_config);
+    let _logging_guard = match logging::init(&cfg.logging, observability_runtime.tracer()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("logging: initialization failed: {error}");
+            None
+        }
+    };
+    if let observability::ObservabilityStatus::Failed(error) = observability_runtime.status() {
+        if _logging_guard.is_some() {
+            tracing::warn!(
+                target: observability::LOCAL_DIAGNOSTIC_TARGET,
+                event = "telemetry_initialization_failed",
+                reason = %error,
+            );
+        } else {
+            eprintln!("observability: initialization failed: {error}");
+        }
+    }
+    if observability_ignored {
+        if _logging_guard.is_some() {
+            tracing::warn!(
+                target: observability::LOCAL_DIAGNOSTIC_TARGET,
+                event = "telemetry_ignored_for_runtime_mode",
+                mode = runtime_mode.log_name(),
+            );
+        } else {
+            eprintln!(
+                "observability: ignored for runtime mode '{}'; supported modes: agent, chat, acp",
+                runtime_mode.log_name()
+            );
+        }
+    }
+    let resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {
+        logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs)
+    } else {
+        None
+    };
+    tracing::info!(
+        target: "daimonos::lifecycle",
+        event = "process_start",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        mode = runtime_mode.log_name(),
+        workspace = %workspace.display(),
+        log_directory = %cfg.logging.resolved_directory().display(),
+    );
     let cfg = Arc::new(cfg);
-    // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
-    // index/watcher/plugin setup needed.
-    match cli.command {
+    // Agent frontends skip workspace service setup; tool-serving modes share
+    // the lower dispatcher. All paths rendezvous below for ordered telemetry
+    // teardown before the logging guard is dropped.
+    let result = match cli.command {
         Some(Command::Agent(args)) => {
-            return agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Chat(args)) => {
-            return agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Acp(args)) => {
-            return agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await
         }
-        Some(Command::Mcp(_) | Command::Daemon) | None => {}
-    }
-
-    run_tool_service(
-        runtime_mode,
-        cli.socket,
-        cli.debug,
-        cli.session_id,
-        workspace,
-        cfg,
-        startup_logs_early,
-    )
-    .await
+        Some(Command::Mcp(_) | Command::Daemon) | None => {
+            run_tool_service(
+                runtime_mode,
+                cli.socket,
+                cli.debug,
+                cli.session_id,
+                workspace,
+                cfg,
+                startup_logs_early,
+            )
+            .await
+        }
+    };
+    drop(resource_telemetry);
+    observability_runtime.shutdown().await;
+    result
 }
 
 /// Launch the tool-serving half of Daimonos. Agent, chat, and ACP modes return

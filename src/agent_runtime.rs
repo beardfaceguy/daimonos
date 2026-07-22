@@ -32,14 +32,9 @@ fn try_build_provider(
 fn build_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
-) -> Box<dyn providers::LlmProvider> {
-    match try_build_provider(effective_provider, &agent.api_key, &agent.base_url) {
-        Ok(provider) => provider,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(2);
-        }
-    }
+) -> anyhow::Result<Box<dyn providers::LlmProvider>> {
+    try_build_provider(effective_provider, &agent.api_key, &agent.base_url)
+        .map_err(anyhow::Error::msg)
 }
 
 pub async fn run_agent(
@@ -85,14 +80,14 @@ pub async fn run_agent(
             &mut std::io::stdout(),
         )
         .await?;
-        exit_on_agent_error(&result);
+        check_agent_result(&result)?;
         return Ok(());
     }
 
-    let agent = load_agent_env(agent_env);
+    let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(&effective_provider, &agent);
+    let llm = build_provider(&effective_provider, &agent)?;
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
@@ -116,8 +111,7 @@ pub async fn run_agent(
     };
     let result =
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
-    exit_on_agent_error(&result);
-    Ok(())
+    check_agent_result(&result)
 }
 
 pub async fn run_chat(
@@ -142,18 +136,15 @@ pub async fn run_chat(
         return Ok(());
     }
 
-    let agent = load_agent_env(agent_env);
+    let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let model_explicit = model.is_some();
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(&effective_provider, &agent);
-    let compaction = match agent
+    let llm = build_provider(&effective_provider, &agent)?;
+    let compaction = agent
         .resolve_compaction(llm.as_ref(), &effective_model)
         .await
-    {
-        Ok(compaction) => compaction,
-        Err(error) => exit_agent_config(error),
-    };
+        .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let approve_fn = if agent.approval_mode == "auto" {
         None
@@ -187,7 +178,7 @@ pub async fn run_acp(
         provider,
         agent_env,
     } = args;
-    let agent = load_agent_env(agent_env);
+    let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let mut models = agent.models.clone();
@@ -204,16 +195,11 @@ pub async fn run_acp(
         &agent.compaction,
         agent_env::CompactionConfig::NeedsWindow(_)
     );
-    let compaction = match make_provider() {
-        Ok(probe) => match agent
-            .resolve_compaction(probe.as_ref(), &effective_model)
-            .await
-        {
-            Ok(compaction) => compaction,
-            Err(error) => exit_agent_config(error),
-        },
-        Err(error) => exit_agent_config(error),
-    };
+    let probe = make_provider().map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
+    let compaction = agent
+        .resolve_compaction(probe.as_ref(), &effective_model)
+        .await
+        .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let safety = agent.to_safety_policy(None);
     let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("acp-sessions"));
@@ -244,22 +230,35 @@ pub async fn run_acp(
     .await
 }
 
-fn load_agent_env(path: Option<PathBuf>) -> agent_env::AgentEnv {
-    match agent_env::AgentEnv::load(path) {
-        Ok(agent) => agent,
-        Err(error) => exit_agent_config(error),
-    }
+fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {
+    agent_env::AgentEnv::load(path).map_err(|error| anyhow::anyhow!("agent config: {error}"))
 }
 
-fn exit_agent_config(error: impl std::fmt::Display) -> ! {
-    eprintln!("agent config: {error}");
-    std::process::exit(2);
-}
-
-fn exit_on_agent_error(result: &agent::AgentResult) {
+fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
     if result.stop_reason == providers::StopReason::Error {
         let message = result.error_message.as_deref().unwrap_or("unknown error");
-        eprintln!("agent error: {message}");
-        std::process::exit(1);
+        anyhow::bail!("agent error: {message}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_provider_error_returns_to_caller_for_ordered_shutdown() {
+        let result = agent::AgentResult {
+            messages: Vec::new(),
+            usage: Default::default(),
+            stop_reason: providers::StopReason::Error,
+            error_message: Some("provider unavailable".to_string()),
+            last_call_usage: Default::default(),
+            context_overflow: false,
+        };
+
+        let error = check_agent_result(&result).unwrap_err();
+
+        assert!(error.to_string().contains("provider unavailable"));
     }
 }

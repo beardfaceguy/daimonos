@@ -14,6 +14,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub process: ProcessConfig,
     pub logging: LoggingConfig,
+    pub observability: ObservabilityConfig,
     pub analytics: AnalyticsConfig,
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
@@ -285,6 +286,35 @@ pub struct LoggingConfig {
     pub max_files: usize,
     /// Seconds between process resource snapshots; 0 disables telemetry.
     pub resource_interval_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    /// Export OpenTelemetry traces. Disabled by default.
+    pub enabled: bool,
+    /// Exact signal-specific OTLP/HTTP traces endpoint.
+    pub endpoint: String,
+    /// Send RFC 7617 Basic Auth using credentials from the named env vars.
+    pub basic_auth: bool,
+    /// Environment variable containing the Basic Auth username/public key.
+    pub basic_auth_username_env: String,
+    /// Environment variable containing the Basic Auth password/secret key.
+    pub basic_auth_password_env: String,
+    /// Deployment environment attached to traces.
+    pub environment: String,
+    /// Optional release identifier attached to traces.
+    pub release: Option<String>,
+    /// Parent-based trace sample ratio in the inclusive range 0.0..=1.0.
+    pub sample_ratio: f64,
+    /// Maximum spans waiting for background export.
+    pub max_queue_size: usize,
+    /// Maximum spans sent in one export request.
+    pub max_batch_size: usize,
+    /// Maximum delay before a partial batch is exported.
+    pub batch_delay_ms: u64,
+    /// Maximum time allowed for exporter shutdown/flush.
+    pub flush_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -560,6 +590,129 @@ impl LoggingConfig {
     }
 }
 
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://localhost:3000/api/public/otel/v1/traces".to_string(),
+            basic_auth: true,
+            basic_auth_username_env: "LANGFUSE_PUBLIC_KEY".to_string(),
+            basic_auth_password_env: "LANGFUSE_SECRET_KEY".to_string(),
+            environment: "development".to_string(),
+            release: None,
+            sample_ratio: 1.0,
+            max_queue_size: 2_048,
+            max_batch_size: 512,
+            batch_delay_ms: 5_000,
+            flush_timeout_ms: 3_000,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint)
+            .map_err(|error| format!("observability.endpoint is invalid: {error}"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(
+                "observability.endpoint must use http or https for OTLP export".to_string(),
+            );
+        }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            return Err(
+                "observability.endpoint must not contain credentials; use environment variables"
+                    .to_string(),
+            );
+        }
+        if endpoint.query().is_some() || endpoint.fragment().is_some() {
+            return Err(
+                "observability.endpoint must not contain query parameters or fragments".to_string(),
+            );
+        }
+        if self.basic_auth && !is_valid_env_var_name(&self.basic_auth_username_env) {
+            return Err(format!(
+                "observability.basic_auth_username_env must be a valid env var name, got '{}'",
+                self.basic_auth_username_env
+            ));
+        }
+        if self.basic_auth && !is_valid_env_var_name(&self.basic_auth_password_env) {
+            return Err(format!(
+                "observability.basic_auth_password_env must be a valid env var name, got '{}'",
+                self.basic_auth_password_env
+            ));
+        }
+        if self.environment.trim().is_empty() {
+            return Err("observability.environment must not be empty".to_string());
+        }
+        if !self.sample_ratio.is_finite() || !(0.0..=1.0).contains(&self.sample_ratio) {
+            return Err(
+                "observability.sample_ratio must be finite and between 0.0 and 1.0".to_string(),
+            );
+        }
+        if self.max_queue_size == 0 {
+            return Err("observability.max_queue_size must be greater than zero".to_string());
+        }
+        if self.max_batch_size == 0 || self.max_batch_size > self.max_queue_size {
+            return Err(
+                "observability.max_batch_size must be between 1 and max_queue_size".to_string(),
+            );
+        }
+        if self.batch_delay_ms == 0 {
+            return Err("observability.batch_delay_ms must be greater than zero".to_string());
+        }
+        if self.flush_timeout_ms == 0 {
+            return Err("observability.flush_timeout_ms must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn resolve_basic_auth(&self) -> Result<Option<(String, String)>, String> {
+        if !self.basic_auth {
+            return Ok(None);
+        }
+        let username = resolve_nonempty_env(
+            &self.basic_auth_username_env,
+            "observability Basic Auth username",
+        )?;
+        let password = resolve_nonempty_env(
+            &self.basic_auth_password_env,
+            "observability Basic Auth password",
+        )?;
+        if username.contains(':') {
+            return Err(format!(
+                "observability Basic Auth username env var '{}' must not contain ':'",
+                self.basic_auth_username_env
+            ));
+        }
+        if username.chars().any(char::is_control) {
+            return Err(format!(
+                "observability Basic Auth username env var '{}' must not contain control characters",
+                self.basic_auth_username_env
+            ));
+        }
+        if password.chars().any(char::is_control) {
+            return Err(format!(
+                "observability Basic Auth password env var '{}' must not contain control characters",
+                self.basic_auth_password_env
+            ));
+        }
+        // RFC 7617 defaults to an implementation-defined legacy charset unless
+        // a server explicitly advertises UTF-8. Langfuse keys are ASCII, so
+        // reject ambiguous credentials instead of producing a header that may
+        // decode differently across OTLP collectors.
+        if !username.is_ascii() || !password.is_ascii() {
+            return Err(
+                "observability Basic Auth credentials must contain only ASCII characters"
+                    .to_string(),
+            );
+        }
+        Ok(Some((username, password)))
+    }
+}
+
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
@@ -642,6 +795,7 @@ impl Config {
         self.acp.validate()?;
         self.process.validate()?;
         self.logging.validate()?;
+        self.observability.validate()?;
         self.discord.validate()
     }
 }
@@ -742,6 +896,15 @@ fn is_valid_env_var_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn resolve_nonempty_env(name: &str, purpose: &str) -> Result<String, String> {
+    let value =
+        std::env::var(name).map_err(|_| format!("{purpose} env var '{name}' is not set"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{purpose} env var '{name}' is empty"));
+    }
+    Ok(value)
 }
 
 pub fn redact_secret(text: &str, secret: &str) -> String {
@@ -914,6 +1077,17 @@ mod tests {
         assert_eq!(cfg.logging.rotation, "daily");
         assert_eq!(cfg.logging.max_files, 14);
         assert_eq!(cfg.logging.resource_interval_secs, 15);
+        assert!(!cfg.observability.enabled);
+        assert_eq!(
+            cfg.observability.endpoint,
+            "http://localhost:3000/api/public/otel/v1/traces"
+        );
+        assert!(cfg.observability.basic_auth);
+        assert_eq!(cfg.observability.sample_ratio, 1.0);
+        assert_eq!(cfg.observability.max_queue_size, 2_048);
+        assert_eq!(cfg.observability.max_batch_size, 512);
+        assert_eq!(cfg.observability.batch_delay_ms, 5_000);
+        assert_eq!(cfg.observability.flush_timeout_ms, 3_000);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.discord.bot_token_env_var, "DISCORD_BOT_TOKEN");
         assert_eq!(cfg.discord.api_base_url, "https://discord.com/api/v10");
@@ -943,6 +1117,16 @@ mod tests {
         assert!(cfg.logging.enabled);
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.max_files, 14);
+        assert!(!cfg.observability.enabled);
+        assert!(cfg.observability.basic_auth);
+        assert_eq!(
+            cfg.observability.basic_auth_username_env,
+            "LANGFUSE_PUBLIC_KEY"
+        );
+        assert_eq!(
+            cfg.observability.basic_auth_password_env,
+            "LANGFUSE_SECRET_KEY"
+        );
         assert!(!cfg.mcp.startup_logs);
         assert!(!cfg.mcp.full_tool_schemas);
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
@@ -978,6 +1162,63 @@ mod tests {
             cfg.resolved_directory(),
             std::path::PathBuf::from("/tmp/daimonos-test-logs")
         );
+    }
+
+    #[test]
+    fn observability_validation_rejects_unsafe_or_unbounded_values() {
+        let mut disabled = Config::default();
+        disabled.observability.endpoint = "placeholder".to_string();
+        disabled.observability.basic_auth_username_env = "INVALID-NAME".to_string();
+        assert!(disabled.validate().is_ok());
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.endpoint = "file:///tmp/spans".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("observability.endpoint"));
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.endpoint =
+            "https://user:secret@example.com/api/public/otel/v1/traces".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("must not contain credentials"));
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.sample_ratio = f64::NAN;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("observability.sample_ratio"));
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.max_queue_size = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("observability.max_queue_size"));
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.max_batch_size = cfg.observability.max_queue_size + 1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("observability.max_batch_size"));
+
+        let mut cfg = Config::default();
+        cfg.observability.enabled = true;
+        cfg.observability.basic_auth_username_env = "INVALID-NAME".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("basic_auth_username_env"));
     }
 
     #[test]

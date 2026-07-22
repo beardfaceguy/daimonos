@@ -283,6 +283,60 @@ uptime, RSS, thread count, open file descriptors, cumulative CPU scheduler
 ticks, and interval CPU-tick deltas. To investigate a hot loop, temporarily set
 `level = "debug"` and follow the newest file in the configured directory.
 
+### `[observability]` — OTLP/Langfuse Tracing
+
+Optional OpenTelemetry export provides a causal trace view of agent prompts,
+LLM generations, tools, and context management (ADR-006). It is disabled by
+default and does not replace local SQLite analytics or secure process logs.
+Export uses a bounded background queue: a full queue drops spans rather than
+blocking an agent turn, and initialization/export/shutdown failures are
+fail-open.
+
+Only tracing spans with the dedicated `daimonos::observability` target may
+cross the OTLP boundary. Existing diagnostic events can contain local paths and
+are explicitly excluded. Prompt, source, command, tool payload, model output,
+thinking, headers, and credentials are not exported under defaults.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enables OTLP trace export. Missing credentials disable export without failing the runtime. |
+| `endpoint` | `http://localhost:3000/api/public/otel/v1/traces` | Exact OTLP/HTTP traces endpoint. Langfuse Cloud endpoints are region-specific. |
+| `basic_auth` | `true` | Sends Basic Auth credentials. Set false for an unauthenticated local collector. |
+| `basic_auth_username_env` | `LANGFUSE_PUBLIC_KEY` | Environment-variable name containing the Basic Auth username/public key. |
+| `basic_auth_password_env` | `LANGFUSE_SECRET_KEY` | Environment-variable name containing the Basic Auth password/secret key. |
+| `environment` | `development` | Deployment environment resource label. |
+| `release` | unset | Optional release identifier. |
+| `sample_ratio` | `1.0` | Parent-based sampling ratio from `0.0` through `1.0`. |
+| `max_queue_size` | `2048` | Maximum completed spans awaiting export. |
+| `max_batch_size` | `512` | Maximum spans per request; cannot exceed queue size. |
+| `batch_delay_ms` | `5000` | Maximum delay before exporting a partial batch. |
+| `flush_timeout_ms` | `3000` | Bounded shutdown/flush timeout. |
+
+```toml
+[observability]
+enabled = false
+endpoint = "http://localhost:3000/api/public/otel/v1/traces"
+basic_auth = true
+basic_auth_username_env = "LANGFUSE_PUBLIC_KEY"
+basic_auth_password_env = "LANGFUSE_SECRET_KEY"
+environment = "development"
+# release = "v0.1.1"
+sample_ratio = 1.0
+max_queue_size = 2048
+max_batch_size = 512
+batch_delay_ms = 5000
+flush_timeout_ms = 3000
+```
+
+Credential values are read only from the named environment variables and are
+never included in configuration dumps or initialization errors. Langfuse's
+generic OTLP base endpoint ends in `/api/public/otel`; because Daimonos
+configures the signal-specific traces exporter directly, its endpoint includes
+the required `/v1/traces` suffix.
+Content capture is not currently configurable: export is unconditionally
+metadata-only. A future redacted content mode will add an explicit opt-in only
+when its privacy tests and limits ship with it.
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,
