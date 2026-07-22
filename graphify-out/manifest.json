@@ -255,17 +255,17 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784746559.3622496,
-    "ast_hash": "d9e3e066d93a35178cd2037c2bf387e6",
+    "mtime": 1784748344.0813258,
+    "ast_hash": "bb3e342b67bacccc49d965f1aa9fe392",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784745861.8729577,
-    "ast_hash": "715cef7a129fbe40f84f4a45bc1defbd",
+    "mtime": 1784748632.8183887,
+    "ast_hash": "c0a9bf80fa6a4cb55304ca7a81e09018",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
-    "mtime": 1784747419.3484857,
+    "mtime": 1784747974.7217972,
     "ast_hash": "6173dc6921b82a8b4ffc989beb28ce76",
     "semantic_hash": ""
   },
@@ -280,7 +280,7 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1784746038.7417638,
+    "mtime": 1784747974.7217972,
     "ast_hash": "38e0748f514bc56ccf0457f0251929ca",
     "semantic_hash": ""
   },
@@ -485,8 +485,8 @@
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1784745491.13746,
-    "ast_hash": "df26431e6bb621d89341fb844cbbcab4",
+    "mtime": 1784748107.032916,
+    "ast_hash": "457c4232afc20bc537aab50b8f7b3cca",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784746631.8107607,
-    "ast_hash": "0a2fd2b66d84c2946671916760417398",
+    "mtime": 1784749287.87602,
+    "ast_hash": "7864a0b08147f92d24981435f58fefc7",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {

@@ -32,6 +32,141 @@ pub struct PromptSpan {
     started: std::time::Instant,
 }
 
+pub struct GenerationMetadata<'a> {
+    pub kind: &'a str,
+    pub model: &'a str,
+    pub max_tokens: u32,
+    pub thinking: crate::providers::ThinkingLevel,
+    pub temperature: Option<f64>,
+    pub ordinal: u64,
+    pub tools_exposed: usize,
+    pub stable_prefix_len: usize,
+}
+
+pub struct GenerationSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+    first_token_recorded: std::sync::atomic::AtomicBool,
+}
+
+impl GenerationSpan {
+    pub fn new(metadata: GenerationMetadata<'_>) -> Self {
+        let mut model_parameters = serde_json::json!({
+            "max_tokens": metadata.max_tokens,
+            "thinking": metadata.thinking.as_str(),
+        });
+        if let Some(temperature) = metadata.temperature {
+            model_parameters["temperature"] = serde_json::json!(temperature);
+        }
+        let model_parameters = model_parameters.to_string();
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "llm.generation",
+            otel.name = "llm.generation",
+            otel.kind = "client",
+            "langfuse.observation.type" = "generation",
+            "langfuse.observation.model.name" = metadata.model,
+            "langfuse.observation.model.parameters" = model_parameters,
+            "gen_ai.request.model" = metadata.model,
+            "gen_ai.request.max_tokens" = metadata.max_tokens as u64,
+            "gen_ai.request.temperature" = tracing::field::Empty,
+            "daimonos.thinking.level" = metadata.thinking.as_str(),
+            "daimonos.generation.kind" = metadata.kind,
+            "daimonos.generation.ordinal" = metadata.ordinal,
+            "daimonos.tools.exposed" = metadata.tools_exposed as u64,
+            "daimonos.stable_prefix_len" = metadata.stable_prefix_len as u64,
+            "daimonos.time_to_first_token_ms" = tracing::field::Empty,
+            "langfuse.observation.completion_start_time" = tracing::field::Empty,
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
+            "daimonos.usage.cache_read" = tracing::field::Empty,
+            "daimonos.usage.cache_write" = tracing::field::Empty,
+            "langfuse.observation.usage_details" = tracing::field::Empty,
+            "langfuse.observation.cost_details" = tracing::field::Empty,
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
+            "daimonos.context_overflow" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        if let Some(temperature) = metadata.temperature {
+            span.record("gen_ai.request.temperature", temperature);
+        }
+        Self {
+            span,
+            started: std::time::Instant::now(),
+            first_token_recorded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub fn mark_first_token(&self) {
+        use std::sync::atomic::Ordering;
+
+        if !self.first_token_recorded.swap(true, Ordering::Relaxed) {
+            self.span.record(
+                "daimonos.time_to_first_token_ms",
+                self.started.elapsed().as_millis() as u64,
+            );
+            self.span.record(
+                "langfuse.observation.completion_start_time",
+                chrono::Utc::now().to_rfc3339(),
+            );
+        }
+    }
+
+    pub fn finish(self, response: &crate::providers::LlmResponse) {
+        let usage = &response.usage;
+        self.span.record("gen_ai.usage.input_tokens", usage.input);
+        self.span.record("gen_ai.usage.output_tokens", usage.output);
+        self.span
+            .record("daimonos.usage.cache_read", usage.cache_read);
+        self.span
+            .record("daimonos.usage.cache_write", usage.cache_write);
+        self.span.record(
+            "langfuse.observation.usage_details",
+            serde_json::json!({
+                "input": usage.input,
+                "output": usage.output,
+                "cache_read": usage.cache_read,
+                "cache_write": usage.cache_write,
+            })
+            .to_string(),
+        );
+        self.span.record(
+            "langfuse.observation.cost_details",
+            serde_json::json!({
+                "input_usd": usage.cost.input_usd,
+                "output_usd": usage.cost.output_usd,
+                "cache_read_usd": usage.cost.cache_read_usd,
+                "cache_write_usd": usage.cost.cache_write_usd,
+                "total_usd": usage.cost.total_usd,
+            })
+            .to_string(),
+        );
+        self.span.record(
+            "gen_ai.response.finish_reasons",
+            serde_json::json!([response.stop_reason.as_str()]).to_string(),
+        );
+        self.span
+            .record("daimonos.context_overflow", response.context_overflow);
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        let error_type = match response.stop_reason {
+            crate::providers::StopReason::Error => Some("provider_error"),
+            crate::providers::StopReason::Refusal => Some("refusal"),
+            _ => None,
+        };
+        if let Some(error_type) = error_type {
+            self.span.record("error.type", error_type);
+        }
+    }
+}
+
 impl PromptSpan {
     pub fn new(metadata: PromptMetadata<'_>) -> Self {
         let workspace_id = workspace_id(metadata.workspace);
@@ -663,5 +798,96 @@ mod tests {
         let second = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0x81]));
 
         assert_ne!(workspace_id(&first), workspace_id(&second));
+    }
+
+    #[test]
+    fn generation_span_is_child_and_exports_usage_without_content() {
+        use crate::providers::{Cost, LlmResponse, StopReason, ThinkingLevel, Usage};
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("generation-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "agent",
+                session_id: Some("session"),
+                model: "test-model",
+                workspace: std::path::Path::new("/workspace"),
+                turn_index: 0,
+                tools_exposed: 3,
+            });
+            prompt.span().in_scope(|| {
+                let generation = GenerationSpan::new(GenerationMetadata {
+                    kind: "agent",
+                    model: "test-model",
+                    max_tokens: 4_096,
+                    thinking: ThinkingLevel::High,
+                    temperature: Some(0.2),
+                    ordinal: 0,
+                    tools_exposed: 3,
+                    stable_prefix_len: 2,
+                });
+                generation.mark_first_token();
+                generation.finish(&LlmResponse {
+                    content: Vec::new(),
+                    stop_reason: StopReason::EndTurn,
+                    error_message: None,
+                    context_overflow: false,
+                    usage: Usage {
+                        input: 100,
+                        output: 20,
+                        cache_read: 30,
+                        cache_write: 10,
+                        cost: Cost {
+                            total_usd: 0.0123,
+                            ..Cost::default()
+                        },
+                    },
+                });
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans
+            .iter()
+            .find(|span| span.name == "agent.prompt")
+            .unwrap();
+        let generation = spans
+            .iter()
+            .find(|span| span.name == "llm.generation")
+            .unwrap();
+        assert_eq!(
+            generation.span_context.trace_id(),
+            prompt.span_context.trace_id()
+        );
+        assert_eq!(generation.parent_span_id, prompt.span_context.span_id());
+        let attributes = generation
+            .attributes
+            .iter()
+            .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            attributes
+                .get("gen_ai.usage.input_tokens")
+                .map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.usage.cache_read")
+                .map(String::as_str),
+            Some("30")
+        );
+        assert!(attributes["langfuse.observation.model.parameters"].contains("\"max_tokens\":4096"));
+        assert!(!attributes.contains_key("langfuse.observation.input"));
+        assert!(!attributes.contains_key("langfuse.observation.output"));
     }
 }

@@ -133,6 +133,20 @@ pub enum ThinkingLevel {
     Max,
 }
 
+impl ThinkingLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
