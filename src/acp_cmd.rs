@@ -1181,9 +1181,15 @@ fn error_has_http_status(error: &str, status: &str) -> bool {
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .collect();
-    ["http", "api", "status"]
-        .iter()
-        .any(|prefix| compact.contains(&format!("{prefix}{status}")))
+    ["http", "api", "status"].iter().any(|prefix| {
+        let needle = format!("{prefix}{status}");
+        compact.match_indices(&needle).any(|(index, _)| {
+            compact[index + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_digit())
+        })
+    })
 }
 
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
@@ -1199,19 +1205,18 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("context length exceeded")
         || normalized.contains("context window exceeded")
         || normalized.contains("context window was exceeded")
-        || normalized.contains("context window limit")
     {
         "Provider rejected the prompt because the context window was exceeded."
     } else if error_has_http_status(&error, "401")
         || normalized.contains("authentication")
         || normalized.contains("invalid api key")
         || normalized.contains("unauthorized")
+        || normalized.contains("not authorized")
     {
         "Provider authentication failed (HTTP 401)."
     } else if error_has_http_status(&error, "403")
         || normalized.contains("permission denied")
         || normalized.contains("forbidden")
-        || normalized.contains("not authorized")
         || normalized.contains("authorization failed")
         || normalized.contains("authorization error")
     {
@@ -5278,6 +5283,10 @@ mod tests {
             "Provider authentication failed (HTTP 401)."
         );
         assert_eq!(
+            safe_provider_error_message(false, Some("not authorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
             safe_provider_error_message(false, Some("Authorization failed")),
             "Provider authorization failed (HTTP 403)."
         );
@@ -5290,12 +5299,20 @@ mod tests {
             "Provider authentication failed (HTTP 401)."
         );
         assert_eq!(
+            safe_provider_error_message(false, Some("HTTP4012 request id")),
+            "Provider request failed."
+        );
+        assert_eq!(
             safe_provider_error_message(false, Some("permission-denied")),
             "Provider authorization failed (HTTP 403)."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("context-overflow")),
             "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context window limit is 200k")),
+            "Provider request failed."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("context_length_exceeded")),

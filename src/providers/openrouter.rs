@@ -436,9 +436,12 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
             content.push(ContentBlock::ToolCall { id, name, input });
         }
     }
-    let error_message = (stop_reason == StopReason::Refusal)
-        .then(|| message["refusal"].as_str().map(str::to_string))
-        .flatten();
+    let error_message = (stop_reason == StopReason::Refusal).then(|| {
+        message["refusal"]
+            .as_str()
+            .unwrap_or("provider content policy refusal")
+            .to_string()
+    });
 
     LlmResponse {
         content,
@@ -763,6 +766,20 @@ mod tests {
         assert_eq!(
             response.error_message.as_deref(),
             Some("policy restriction")
+        );
+    }
+
+    #[test]
+    fn parse_content_filter_without_reason_uses_safe_default() {
+        let body = json!({
+            "choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}],
+            "usage": {}
+        });
+        let response = parse_response(&body);
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("provider content policy refusal")
         );
     }
 
