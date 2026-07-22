@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784757877.1302218,
-    "ast_hash": "1a6b41c8a565fafd95cd8d67c872898c",
+    "mtime": 1784758510.490126,
+    "ast_hash": "7b7dd5fb55f59c6421d61be3af93fb2c",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
