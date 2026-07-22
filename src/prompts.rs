@@ -320,7 +320,7 @@ mod tests {
     fn prompts_guide_context_offload_into_execute_script() {
         // vikunja #1047 (RLM LID): keep large outputs in-sandbox and return a
         // compact `result` rather than flooding the root context.
-        let agent = AGENT_SYSTEM_DEFAULT;
+        let agent = AGENT_SYSTEM_DEFAULT.to_lowercase();
         assert!(
             agent.contains("offload"),
             "agent system prompt must guide offloading large data"
@@ -330,7 +330,9 @@ mod tests {
             "agent system prompt must ask for a compact result"
         );
         assert!(
-            MCP_INSTRUCTIONS_DEFAULT.contains("Large outputs"),
+            MCP_INSTRUCTIONS_DEFAULT
+                .to_lowercase()
+                .contains("large outputs"),
             "MCP instructions must guide large-output offloading"
         );
     }
