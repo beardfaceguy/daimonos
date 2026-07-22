@@ -11,11 +11,84 @@ use opentelemetry_sdk::trace::{
     SpanExporter,
 };
 use opentelemetry_sdk::Resource;
+use sha2::{Digest, Sha256};
 
 use crate::config::ObservabilityConfig;
 
 pub const TRACE_TARGET: &str = "daimonos::observability";
 pub const LOCAL_DIAGNOSTIC_TARGET: &str = "daimonos::observability_local";
+
+pub struct PromptMetadata<'a> {
+    pub mode: &'a str,
+    pub session_id: Option<&'a str>,
+    pub model: &'a str,
+    pub workspace: &'a std::path::Path,
+    pub turn_index: usize,
+    pub tools_exposed: usize,
+}
+
+pub struct PromptSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl PromptSpan {
+    pub fn new(metadata: PromptMetadata<'_>) -> Self {
+        let workspace_id = workspace_id(metadata.workspace);
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            parent: None,
+            "agent.prompt",
+            otel.name = "agent.prompt",
+            otel.kind = "internal",
+            "langfuse.trace.name" = "agent.prompt",
+            "langfuse.session.id" = tracing::field::Empty,
+            "daimonos.runtime.mode" = metadata.mode,
+            "daimonos.workspace.id" = workspace_id,
+            "daimonos.turn.index" = metadata.turn_index as u64,
+            "daimonos.tools.exposed" = metadata.tools_exposed as u64,
+            "gen_ai.request.model" = metadata.model,
+            "daimonos.stop_reason" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        if let Some(session_id) = metadata.session_id {
+            span.record("langfuse.session.id", session_id);
+        }
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub fn finish(self, stop_reason: &str, error_type: Option<&str>) {
+        self.span.record("daimonos.stop_reason", stop_reason);
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        if let Some(error_type) = error_type {
+            self.span.record("error.type", error_type);
+        }
+    }
+}
+
+fn workspace_id(workspace: &std::path::Path) -> String {
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(workspace.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..16])
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservabilityStatus {
@@ -482,5 +555,113 @@ mod tests {
 
         assert!(request.starts_with("POST /v1/traces "));
         assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
+    fn prompt_roots_export_safe_metadata_and_distinct_traces() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("prompt-root-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            for turn in 0..2 {
+                let prompt = PromptSpan::new(PromptMetadata {
+                    mode: "acp",
+                    session_id: Some("session-123"),
+                    model: "test-model",
+                    workspace: std::path::Path::new("/private/workspace"),
+                    turn_index: turn,
+                    tools_exposed: 17,
+                });
+                prompt.span().in_scope(|| {
+                    if turn == 0 {
+                        tracing::Span::current().record("error.type", "provider_error");
+                    }
+                });
+                prompt.finish("end_turn", None);
+            }
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_ne!(
+            spans[0].span_context.trace_id(),
+            spans[1].span_context.trace_id()
+        );
+        assert!(spans[0].attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.type"
+                && attribute.value.to_string() == "provider_error"
+        }));
+        for span in spans {
+            let attributes = span
+                .attributes
+                .iter()
+                .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                attributes.get("langfuse.session.id").map(String::as_str),
+                Some("session-123")
+            );
+            assert_eq!(
+                attributes.get("daimonos.runtime.mode").map(String::as_str),
+                Some("acp")
+            );
+            assert_eq!(
+                attributes.get("gen_ai.request.model").map(String::as_str),
+                Some("test-model")
+            );
+            assert!(!format!("{attributes:?}").contains("/private/workspace"));
+        }
+    }
+
+    #[test]
+    fn prompt_root_omits_absent_session_id() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("no-session-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            PromptSpan::new(PromptMetadata {
+                mode: "agent",
+                session_id: None,
+                model: "test-model",
+                workspace: std::path::Path::new("/workspace"),
+                turn_index: 0,
+                tools_exposed: 1,
+            })
+            .finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(!spans[0]
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == "langfuse.session.id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_hash_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0x80]));
+        let second = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0x81]));
+
+        assert_ne!(workspace_id(&first), workspace_id(&second));
     }
 }

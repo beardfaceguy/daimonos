@@ -792,6 +792,10 @@ impl AgentSession {
     pub fn model(&self) -> &str {
         &self.config.opts.model
     }
+
+    pub fn tool_count(&self) -> usize {
+        self.config.tools.len()
+    }
 }
 
 fn is_user_turn_message(message: &Message) -> bool {

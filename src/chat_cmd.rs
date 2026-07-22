@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
+use tracing::Instrument;
 
 use crate::agent::{AgentConfig, AgentSession, TokenLogConfig};
 use crate::compaction::CompactionPolicy;
 use crate::config::Config;
+use crate::observability::{PromptMetadata, PromptSpan};
 use crate::providers::{
     CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema,
 };
@@ -294,8 +296,21 @@ pub async fn run_chat(
                     if text.is_empty() {
                         continue;
                     }
-                    let completed = tokio::select! {
-                        turn = session.prompt(text) => {
+                    let prompt_span = PromptSpan::new(PromptMetadata {
+                        mode: "chat",
+                        session_id: Some(&session_id),
+                        model: session.model(),
+                        workspace,
+                        turn_index: session.user_turn_count(),
+                        tools_exposed: session.tool_count(),
+                    });
+                    let prompt = session.prompt(text).instrument(prompt_span.span().clone());
+                    let outcome = tokio::select! {
+                        turn = prompt => Some(turn),
+                        _ = tokio::signal::ctrl_c() => None,
+                    };
+                    let completed = match outcome {
+                        Some(turn) => {
                             if let Some(err) = &turn.error_message {
                                 eprintln!("[error] {err}");
                             }
@@ -304,10 +319,17 @@ pub async fn run_chat(
                             if !turn.text.is_empty() {
                                 println!();
                             }
+                            let error_type = match turn.stop_reason {
+                                crate::providers::StopReason::Error => Some("provider_error"),
+                                crate::providers::StopReason::Refusal => Some("refusal"),
+                                _ => None,
+                            };
+                            prompt_span.finish(turn.stop_reason.as_str(), error_type);
                             true
                         }
-                        _ = tokio::signal::ctrl_c() => {
+                        None => {
                             eprintln!("\n[turn aborted]");
+                            prompt_span.finish("cancelled", Some("client_cancelled"));
                             false
                         }
                     };
