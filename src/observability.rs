@@ -184,6 +184,7 @@ impl PromptSpan {
             "daimonos.tools.exposed" = metadata.tools_exposed as u64,
             "gen_ai.request.model" = metadata.model,
             "daimonos.stop_reason" = tracing::field::Empty,
+            "daimonos.cancel.reason" = tracing::field::Empty,
             "daimonos.duration_ms" = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
         );
@@ -198,6 +199,13 @@ impl PromptSpan {
 
     pub fn span(&self) -> &tracing::Span {
         &self.span
+    }
+
+    /// Record the normalized cancellation cause (`client`, `transport`,
+    /// `timeout`, or `policy`) on the active prompt root (ADR-006 D5). Called
+    /// by the frontend that detects the cancellation before `finish`.
+    pub fn record_cancel_reason(&self, reason: &str) {
+        self.span.record("daimonos.cancel.reason", reason);
     }
 
     pub fn finish(self, stop_reason: &str, error_type: Option<&str>) {
@@ -445,6 +453,163 @@ pub fn record_bridge_lifecycle(
     // Enter once before the span drops: a never-entered span exports
     // unreliably under the OpenTelemetry layer (same reason ToolSpan::finish
     // enters). All attributes are already set at construction.
+    let _entered = span.enter();
+}
+
+/// Static metadata for a `context.compaction` span, known when compaction
+/// begins (ADR-006 D4/D5).
+pub struct CompactionMetadata<'a> {
+    /// `proactive` (pre-turn high-water) or `reactive_overflow` (post-overflow).
+    pub trigger: &'a str,
+    /// Normalized [`crate::compaction::CompactionStrategy`] name.
+    pub strategy: &'a str,
+    pub high_water: f64,
+    pub low_water: f64,
+    /// Measured/estimated prompt occupancy that led to compaction.
+    pub occupancy_tokens: u64,
+    /// Summarizer model (bounded by config; low-cardinality).
+    pub summary_model: &'a str,
+}
+
+/// Numeric result of a compaction, recorded when it completes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactionOutcome {
+    pub tokens_before_est: u64,
+    pub tokens_after_est: u64,
+    pub evicted_turns: u64,
+    pub evicted_messages: u64,
+    /// Summarization retries beyond the first attempt (0 or 1 today).
+    pub summary_retries: u64,
+    /// Summarizer failed and evicted turns were dropped with a marker.
+    pub fallback_drop: bool,
+}
+
+/// A `context.compaction` span. Enter it around the summary generation so the
+/// `llm.generation` (kind `compaction_summary`) nests beneath it (D4).
+pub struct CompactionSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl CompactionSpan {
+    pub fn new(metadata: CompactionMetadata<'_>) -> Self {
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "context.compaction",
+            otel.name = "context.compaction",
+            otel.kind = "internal",
+            "daimonos.compaction.trigger" = metadata.trigger,
+            "daimonos.compaction.strategy" = metadata.strategy,
+            "daimonos.compaction.high_water" = metadata.high_water,
+            "daimonos.compaction.low_water" = metadata.low_water,
+            "daimonos.context.used" = metadata.occupancy_tokens,
+            "daimonos.compaction.summary_model" = metadata.summary_model,
+            "daimonos.compaction.tokens_before_est" = tracing::field::Empty,
+            "daimonos.compaction.tokens_after_est" = tracing::field::Empty,
+            "daimonos.compaction.evicted_turns" = tracing::field::Empty,
+            "daimonos.compaction.evicted_messages" = tracing::field::Empty,
+            "daimonos.compaction.summary_retries" = tracing::field::Empty,
+            "daimonos.compaction.fallback_drop" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+        );
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub fn finish(self, outcome: CompactionOutcome) {
+        self.span.record(
+            "daimonos.compaction.tokens_before_est",
+            outcome.tokens_before_est,
+        );
+        self.span.record(
+            "daimonos.compaction.tokens_after_est",
+            outcome.tokens_after_est,
+        );
+        self.span
+            .record("daimonos.compaction.evicted_turns", outcome.evicted_turns);
+        self.span.record(
+            "daimonos.compaction.evicted_messages",
+            outcome.evicted_messages,
+        );
+        self.span.record(
+            "daimonos.compaction.summary_retries",
+            outcome.summary_retries,
+        );
+        self.span
+            .record("daimonos.compaction.fallback_drop", outcome.fallback_drop);
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+    }
+}
+
+/// An `agent.retry` span (ADR-006 D4). Enter it around the retried attempt so
+/// the retry's `llm.generation` children nest beneath it.
+pub struct RetrySpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl RetrySpan {
+    /// `reason` is `context_overflow`, `explicit`, or `transport_recovery`.
+    /// `trigger_generation_ordinal` links the retry to the generation that
+    /// failed (D5: "context-overflow retry links to failed generation").
+    pub fn new(reason: &str, trigger_generation_ordinal: Option<u64>) -> Self {
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "agent.retry",
+            otel.name = "agent.retry",
+            otel.kind = "internal",
+            "daimonos.retry.reason" = reason,
+            "daimonos.retry.trigger_generation.ordinal" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        if let Some(ordinal) = trigger_generation_ordinal {
+            span.record("daimonos.retry.trigger_generation.ordinal", ordinal);
+        }
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub fn finish(self, error_type: Option<&str>) {
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        if let Some(error_type) = error_type {
+            self.span.record("error.type", error_type);
+        }
+    }
+}
+
+/// Emit a one-shot `agent.truncate` span for a user-initiated history
+/// truncation (ADR-006 D5). Identifies the removed turn index and counts, no
+/// conversation content. Attaches to the active prompt root when one exists,
+/// else roots its own trace.
+pub fn record_truncation(turn_index: u64, evicted_turns: u64, evicted_messages: u64) {
+    let span = tracing::info_span!(
+        target: TRACE_TARGET,
+        "agent.truncate",
+        otel.name = "agent.truncate",
+        otel.kind = "internal",
+        "daimonos.truncate.turn_index" = turn_index,
+        "daimonos.truncate.evicted_turns" = evicted_turns,
+        "daimonos.truncate.evicted_messages" = evicted_messages,
+    );
     let _entered = span.enter();
 }
 
@@ -1352,5 +1517,206 @@ mod tests {
             Some("2")
         );
         assert!(!attributes.contains_key("error.type"));
+    }
+
+    #[test]
+    fn compaction_span_records_metadata_and_nests_summary_generation() {
+        use crate::providers::{Cost, LlmResponse, StopReason, ThinkingLevel, Usage};
+
+        let (exporter, provider, subscriber) = in_memory_subscriber("compaction-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "chat",
+                session_id: Some("s"),
+                model: "m",
+                workspace: std::path::Path::new("/w"),
+                turn_index: 0,
+                tools_exposed: 0,
+            });
+            prompt.span().in_scope(|| {
+                let compaction = CompactionSpan::new(CompactionMetadata {
+                    trigger: "reactive_overflow",
+                    strategy: "summarize",
+                    high_water: 0.75,
+                    low_water: 0.5,
+                    occupancy_tokens: 900,
+                    summary_model: "summary-model",
+                });
+                compaction.span().in_scope(|| {
+                    let generation = GenerationSpan::new(GenerationMetadata {
+                        kind: "compaction_summary",
+                        model: "summary-model",
+                        max_tokens: 256,
+                        thinking: ThinkingLevel::Off,
+                        temperature: Some(0.0),
+                        ordinal: 3,
+                        tools_exposed: 0,
+                        stable_prefix_len: 0,
+                    });
+                    generation.finish(&LlmResponse {
+                        content: Vec::new(),
+                        stop_reason: StopReason::EndTurn,
+                        error_message: None,
+                        context_overflow: false,
+                        usage: Usage {
+                            input: 10,
+                            output: 5,
+                            cache_read: 0,
+                            cache_write: 0,
+                            cost: Cost::default(),
+                        },
+                    });
+                });
+                compaction.finish(CompactionOutcome {
+                    tokens_before_est: 900,
+                    tokens_after_est: 400,
+                    evicted_turns: 4,
+                    evicted_messages: 12,
+                    summary_retries: 1,
+                    fallback_drop: false,
+                });
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans.iter().find(|s| s.name == "agent.prompt").unwrap();
+        let compaction = spans
+            .iter()
+            .find(|s| s.name == "context.compaction")
+            .unwrap();
+        let generation = spans.iter().find(|s| s.name == "llm.generation").unwrap();
+        assert_eq!(compaction.parent_span_id, prompt.span_context.span_id());
+        assert_eq!(
+            generation.parent_span_id,
+            compaction.span_context.span_id(),
+            "summary generation must nest under context.compaction"
+        );
+        let attributes = attribute_map(compaction);
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.trigger")
+                .map(String::as_str),
+            Some("reactive_overflow")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.tokens_after_est")
+                .map(String::as_str),
+            Some("400")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.evicted_turns")
+                .map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.summary_retries")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.fallback_drop")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.compaction.summary_model")
+                .map(String::as_str),
+            Some("summary-model")
+        );
+    }
+
+    #[test]
+    fn retry_span_records_reason_and_trigger_ordinal() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("retry-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "acp",
+                session_id: Some("s"),
+                model: "m",
+                workspace: std::path::Path::new("/w"),
+                turn_index: 0,
+                tools_exposed: 0,
+            });
+            prompt.span().in_scope(|| {
+                let retry = RetrySpan::new("context_overflow", Some(2));
+                retry.finish(None);
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans.iter().find(|s| s.name == "agent.prompt").unwrap();
+        let retry = spans.iter().find(|s| s.name == "agent.retry").unwrap();
+        assert_eq!(retry.parent_span_id, prompt.span_context.span_id());
+        let attributes = attribute_map(retry);
+        assert_eq!(
+            attributes.get("daimonos.retry.reason").map(String::as_str),
+            Some("context_overflow")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.retry.trigger_generation.ordinal")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn truncation_span_records_turn_index_and_counts() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("truncate-test");
+        tracing::subscriber::with_default(subscriber, || {
+            record_truncation(2, 3, 9);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let truncate = spans.iter().find(|s| s.name == "agent.truncate").unwrap();
+        let attributes = attribute_map(truncate);
+        assert_eq!(
+            attributes
+                .get("daimonos.truncate.turn_index")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.truncate.evicted_messages")
+                .map(String::as_str),
+            Some("9")
+        );
+    }
+
+    #[test]
+    fn prompt_records_cancel_reason() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("cancel-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "acp",
+                session_id: Some("s"),
+                model: "m",
+                workspace: std::path::Path::new("/w"),
+                turn_index: 0,
+                tools_exposed: 0,
+            });
+            prompt.record_cancel_reason("client");
+            prompt.finish("cancelled", Some("client_cancelled"));
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans.iter().find(|s| s.name == "agent.prompt").unwrap();
+        let attributes = attribute_map(prompt);
+        assert_eq!(
+            attributes.get("daimonos.cancel.reason").map(String::as_str),
+            Some("client")
+        );
     }
 }

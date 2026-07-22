@@ -214,6 +214,16 @@ fn dispatch_tool_kind(name: &str) -> &'static str {
         .unwrap_or_else(|| crate::observability::tool_kind(name))
 }
 
+/// Bounded `error.type` class for a retried attempt's outcome (agent.retry
+/// span). No message/content — only a normalized class.
+fn retry_error_type(result: &AgentResult) -> Option<&'static str> {
+    match result.stop_reason {
+        StopReason::Error => Some("provider_error"),
+        StopReason::Refusal => Some("refusal"),
+        _ => None,
+    }
+}
+
 fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
     let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
         eprintln!("agent: list_all_tools returned a non-array catalog; remote tools omitted");
@@ -672,7 +682,7 @@ impl AgentSession {
                 compaction::estimate_prompt_tokens(self.config.system.as_deref(), &self.messages)
             };
             if policy.should_compact(occupancy) {
-                self.compact().await;
+                self.compact("proactive").await;
             }
         }
 
@@ -682,11 +692,26 @@ impl AgentSession {
         // our between-turns measurement missed — compact and retry ONCE.
         // The failed attempt is not committed, so the retry runs against the
         // freshly compacted history.
-        let result = if result.context_overflow
-            && self.config.compaction.is_some()
-            && self.compact().await.is_some()
-        {
-            self.attempt(&user_message).await
+        let result = if result.context_overflow && self.config.compaction.is_some() {
+            // Ordinal of the generation that overflowed — links the retry to
+            // the failed generation (ADR-006 D5).
+            let failed_ordinal = self
+                .config
+                .generation_ordinal
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .checked_sub(1);
+            if self.compact("reactive_overflow").await.is_some() {
+                let retry =
+                    crate::observability::RetrySpan::new("context_overflow", failed_ordinal);
+                let retried = self
+                    .attempt(&user_message)
+                    .instrument(retry.span().clone())
+                    .await;
+                retry.finish(retry_error_type(&retried));
+                retried
+            } else {
+                result
+            }
         } else {
             result
         };
@@ -727,7 +752,12 @@ impl AgentSession {
         };
         let user_message = self.messages[user_index].clone();
         let base_history = self.messages[..user_index].to_vec();
-        let result = self.attempt_with_history(base_history, &user_message).await;
+        let retry = crate::observability::RetrySpan::new("explicit", None);
+        let result = self
+            .attempt_with_history(base_history, &user_message)
+            .instrument(retry.span().clone())
+            .await;
+        retry.finish(retry_error_type(&result));
         Ok(self.commit(result))
     }
 
@@ -749,8 +779,18 @@ impl AgentSession {
         else {
             return Err(format!("user turn index {turn_index} not found"));
         };
+        let evicted_messages = self.messages.len() - history_index;
+        let evicted_turns = self.messages[history_index..]
+            .iter()
+            .filter(|message| is_user_turn_message(message))
+            .count();
         self.messages.truncate(history_index);
         self.last_prompt_tokens = 0;
+        crate::observability::record_truncation(
+            turn_index as u64,
+            evicted_turns as u64,
+            evicted_messages as u64,
+        );
         Ok(())
     }
 
@@ -773,7 +813,7 @@ impl AgentSession {
     /// message produced by a deterministic one-shot LLM call (retried once;
     /// structural drop with a marker on repeated failure). Returns `None`
     /// when compaction is off or nothing is evictable.
-    async fn compact(&mut self) -> Option<CompactionEvent> {
+    async fn compact(&mut self, trigger: &str) -> Option<CompactionEvent> {
         let policy = self.config.compaction.as_ref()?;
         let cut = compaction::choose_cut(&self.messages, policy.target_tokens())?;
         let summary_model = policy
@@ -784,11 +824,32 @@ impl AgentSession {
             .summary_prompt
             .clone()
             .unwrap_or_else(compaction::default_summary_prompt);
+        // Snapshot policy thresholds and the occupancy that triggered this
+        // compaction for the span before the `policy` borrow is released.
+        let high_water = policy.high_water;
+        let low_water = policy.low_water;
+        let occupancy_tokens = if self.last_prompt_tokens > 0 {
+            self.last_prompt_tokens
+        } else {
+            compaction::estimate_prompt_tokens(self.config.system.as_deref(), &self.messages)
+        };
 
         let est_tokens_before = compaction::estimate_tokens(&self.messages);
         let evicted = &self.messages[..cut];
         let evicted_turns = compaction::turn_starts(evicted).len();
         let transcript = compaction::transcript_for_summary(evicted);
+
+        // context.compaction span (ADR-006 D4): the summary generation below
+        // is instrumented under it so the llm.generation nests beneath.
+        let compaction_span =
+            crate::observability::CompactionSpan::new(crate::observability::CompactionMetadata {
+                trigger,
+                strategy: CompactionStrategy::Summarize.as_str(),
+                high_water,
+                low_water,
+                occupancy_tokens,
+                summary_model: &summary_model,
+            });
 
         // One-shot, tool-free, deterministic summarization call. Text-in/
         // text-out so the request itself is never subject to tool-pair
@@ -809,55 +870,63 @@ impl AgentSession {
         };
 
         // One attempt + one retry (ADR-002 Q4); its tokens count toward the
-        // session's cumulative usage like any other call.
+        // session's cumulative usage like any other call. The whole loop is
+        // instrumented under the compaction span so each summary
+        // llm.generation nests beneath context.compaction (D4).
         let mut summary_text: Option<String> = None;
-        for _ in 0..2 {
-            let ordinal = self
-                .config
-                .generation_ordinal
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let generation = crate::observability::GenerationSpan::new(
-                crate::observability::GenerationMetadata {
-                    kind: "compaction_summary",
-                    model: &opts.model,
-                    max_tokens: opts.max_tokens,
-                    thinking: opts.thinking.clone(),
-                    temperature: opts.temperature,
-                    ordinal,
-                    tools_exposed: 0,
-                    stable_prefix_len: 0,
-                },
-            );
-            let resp = self
-                .provider
-                .complete(&ctx, &opts)
-                .instrument(generation.span().clone())
-                .await;
-            generation.finish(&resp);
-            self.total_usage =
-                accumulate_usage(std::mem::take(&mut self.total_usage), resp.usage.clone());
-            if let Some(log_cfg) = &self.config.token_log {
-                log_token_usage(log_cfg, &summary_model, &resp.usage);
-            }
-            if resp.error_message.is_none() {
-                let text: String = resp
-                    .content
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::Text(t) = b {
-                            Some(t.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.trim().is_empty() {
-                    summary_text = Some(text.trim().to_string());
-                    break;
+        let mut summary_attempts: u64 = 0;
+        async {
+            for _ in 0..2 {
+                summary_attempts += 1;
+                let ordinal = self
+                    .config
+                    .generation_ordinal
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let generation = crate::observability::GenerationSpan::new(
+                    crate::observability::GenerationMetadata {
+                        kind: "compaction_summary",
+                        model: &opts.model,
+                        max_tokens: opts.max_tokens,
+                        thinking: opts.thinking.clone(),
+                        temperature: opts.temperature,
+                        ordinal,
+                        tools_exposed: 0,
+                        stable_prefix_len: 0,
+                    },
+                );
+                let resp = self
+                    .provider
+                    .complete(&ctx, &opts)
+                    .instrument(generation.span().clone())
+                    .await;
+                generation.finish(&resp);
+                self.total_usage =
+                    accumulate_usage(std::mem::take(&mut self.total_usage), resp.usage.clone());
+                if let Some(log_cfg) = &self.config.token_log {
+                    log_token_usage(log_cfg, &summary_model, &resp.usage);
+                }
+                if resp.error_message.is_none() {
+                    let text: String = resp
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text(t) = b {
+                                Some(t.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        summary_text = Some(text.trim().to_string());
+                        break;
+                    }
                 }
             }
         }
+        .instrument(compaction_span.span().clone())
+        .await;
 
         let fallback_drop = summary_text.is_none();
         let replacement = match &summary_text {
@@ -872,11 +941,20 @@ impl AgentSession {
         // the next proactive check re-estimates.
         self.last_prompt_tokens = 0;
 
+        let est_tokens_after = compaction::estimate_tokens(&self.messages);
+        compaction_span.finish(crate::observability::CompactionOutcome {
+            tokens_before_est: est_tokens_before,
+            tokens_after_est: est_tokens_after,
+            evicted_turns: evicted_turns as u64,
+            evicted_messages: cut as u64,
+            summary_retries: summary_attempts.saturating_sub(1),
+            fallback_drop,
+        });
         let event = CompactionEvent {
             evicted_turns,
             evicted_messages: cut,
             est_tokens_before,
-            est_tokens_after: compaction::estimate_tokens(&self.messages),
+            est_tokens_after,
             summary_model,
             strategy: CompactionStrategy::Summarize,
             fallback_drop,
