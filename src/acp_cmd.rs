@@ -2283,6 +2283,25 @@ fn build_agent_with_state(
                             .await
                             .insert(session_id.clone(), Arc::clone(&handle));
 
+                        // Persist immediately with empty history so a thread the
+                        // user opens but never prompts survives a process restart
+                        // and can be resumed by session/load. Without this,
+                        // session/new is in-memory only and a cold session/load
+                        // for that id fails with "no session found" (vikunja
+                        // #1046). Best-effort and fire-and-forget like every
+                        // other save_acp call site: save_acp returns unit and
+                        // logs internally on a write error, so a persist failure
+                        // never fails session creation.
+                        if let Some(store) = state.store.as_ref() {
+                            store.save_acp(
+                                &session_id.to_string(),
+                                &state.default_model,
+                                &[],
+                                &handle.cwd,
+                                &[],
+                            );
+                        }
+
                         // Advertise the model picker (vikunja #960); new sessions
                         // start on the default model.
                         let config_options =
@@ -3323,6 +3342,63 @@ mod tests {
 
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(state.sessions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blank_session_is_persisted_at_new_for_cold_load() {
+        // vikunja #1046: a thread the user opens but never prompts must still
+        // be resumable after a process restart. session/new now persists an
+        // empty record so a cold session/load finds it instead of erroring
+        // with "no session found".
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            AcpCompaction::new(None, false),
+            None,
+            &mut state_out,
+        );
+        let _state = state_out.expect("ACP state");
+        let workspace_path = workspace.path().to_path_buf();
+
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(
+                agent,
+                move |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    // Create a thread but never prompt it — a blank thread.
+                    let session_id = connection
+                        .send_request(NewSessionRequest::new(workspace_path))
+                        .block_task()
+                        .await?
+                        .session_id;
+                    Ok(session_id)
+                },
+            )
+            .await
+            .unwrap();
+
+        // Simulate a process restart: a fresh store over the same dir must find
+        // the blank session persisted with empty history.
+        let persisted = SessionStore::new(sessions.path().to_path_buf())
+            .load(&session_id.to_string())
+            .expect("blank session must be persisted at session/new (vikunja #1046)");
+        assert!(
+            persisted.messages.is_empty(),
+            "a never-prompted session persists with no history"
+        );
     }
 
     #[tokio::test]

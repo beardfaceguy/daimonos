@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784757484.0227711,
-    "ast_hash": "39a116a23b053c14f056524d36d22817",
+    "mtime": 1784761139.9327683,
+    "ast_hash": "2e52f5e77b678034104dfc7bbb810d0c",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784757870.3772657,
+    "mtime": 1784758871.7058196,
     "ast_hash": "7c2bef1c87be9ffe3a42b8ddc9c7fb09",
     "semantic_hash": ""
   },
@@ -990,7 +990,7 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784758510.490126,
+    "mtime": 1784758871.7228196,
     "ast_hash": "7b7dd5fb55f59c6421d61be3af93fb2c",
     "semantic_hash": ""
   },
@@ -1005,8 +1005,13 @@
     "semantic_hash": ""
   },
   "docs/observability.md": {
-    "mtime": 1784757860.46633,
+    "mtime": 1784758871.7058196,
     "ast_hash": "f119dbb1d40f273611e23fcfa87a38a9",
+    "semantic_hash": ""
+  },
+  "docs/research/rlm-harness-evaluation.md": {
+    "mtime": 1784759830.4210837,
+    "ast_hash": "15924c0d2b7f76e963363c9f6e25a234",
     "semantic_hash": ""
   }
 }
