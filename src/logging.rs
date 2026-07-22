@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -94,7 +95,7 @@ impl Write for SecureRollingAppender {
 
 /// Keeps the non-blocking file writer alive until process teardown.
 pub struct LoggingGuard {
-    _file_guard: WorkerGuard,
+    _file_guard: Option<WorkerGuard>,
     started: std::time::Instant,
 }
 
@@ -109,40 +110,51 @@ impl Drop for LoggingGuard {
     }
 }
 
-pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
-    if !config.enabled {
+pub fn init(
+    config: &LoggingConfig,
+    telemetry_tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
+) -> anyhow::Result<Option<LoggingGuard>> {
+    if !config.enabled && telemetry_tracer.is_none() {
         return Ok(None);
     }
 
-    let directory = config.resolved_directory();
-    let rotation = match config.rotation.as_str() {
-        "hourly" => LogRotation::Hourly,
-        "daily" => LogRotation::Daily,
-        "never" => LogRotation::Never,
-        other => anyhow::bail!("unsupported log rotation '{other}'"),
+    let (file_layer, file_guard) = if config.enabled {
+        let directory = config.resolved_directory();
+        let rotation = match config.rotation.as_str() {
+            "hourly" => LogRotation::Hourly,
+            "daily" => LogRotation::Daily,
+            "never" => LogRotation::Never,
+            other => anyhow::bail!("unsupported log rotation '{other}'"),
+        };
+        let appender = SecureRollingAppender::new(
+            directory,
+            config.file_prefix.clone(),
+            rotation,
+            config.max_files,
+        )?;
+        let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
+        let layer = fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(file_writer)
+            .with_filter(daimonos_filter(&config.level));
+        (Some(layer), Some(file_guard))
+    } else {
+        (None, None)
     };
-    let appender = SecureRollingAppender::new(
-        directory,
-        config.file_prefix.clone(),
-        rotation,
-        config.max_files,
-    )?;
-    let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
-
-    let file_layer = fmt::layer()
-        .json()
-        .with_ansi(false)
-        .with_current_span(false)
-        .with_span_list(false)
-        .with_writer(file_writer)
-        .with_filter(daimonos_filter(&config.level));
-    let stderr_layer = fmt::layer()
-        .compact()
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .with_filter(daimonos_filter(&config.stderr_level));
-
+    let stderr_layer = config.enabled.then(|| {
+        fmt::layer()
+            .compact()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .with_filter(daimonos_filter(&config.stderr_level))
+    });
+    // Only dedicated observability spans cross the OTLP boundary. Existing
+    // diagnostic events include local paths and must remain in secure logs.
     tracing_subscriber::registry()
+        .with(observability_layer(telemetry_tracer))
         .with(file_layer)
         .with(stderr_layer)
         .try_init()?;
@@ -151,6 +163,18 @@ pub fn init(config: &LoggingConfig) -> anyhow::Result<Option<LoggingGuard>> {
         _file_guard: file_guard,
         started: std::time::Instant::now(),
     }))
+}
+
+fn observability_layer(
+    tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
+) -> Option<impl Layer<tracing_subscriber::Registry>> {
+    tracer.map(|tracer| {
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter_fn(|metadata| {
+                metadata.target() == "daimonos::observability"
+            }))
+    })
 }
 
 fn daimonos_filter(level: &str) -> EnvFilter {
@@ -395,6 +419,40 @@ mod tests {
         assert!(captured.contains("safe_event"));
         assert!(!captured.contains("secret-value"));
         assert!(!captured.contains("dependency::transport"));
+    }
+
+    #[test]
+    fn otlp_layer_only_exports_dedicated_observability_spans() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(observability_layer(Some(provider.tracer("test"))));
+
+        tracing::subscriber::with_default(subscriber, || {
+            {
+                let span = tracing::info_span!(target: "daimonos::observability", "agent.prompt");
+                let _entered = span.enter();
+            }
+            {
+                let span = tracing::info_span!(
+                    target: "daimonos::acp",
+                    "diagnostic",
+                    workspace = "/private/source"
+                );
+                let _entered = span.enter();
+            }
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "agent.prompt");
+        assert!(!format!("{:?}", spans[0].attributes).contains("/private/source"));
     }
 
     #[cfg(unix)]

@@ -95,6 +95,31 @@ max_files = 14
 # Set 0 to disable.
 resource_interval_secs = 15
 
+[observability]
+# Export agent traces over OTLP/HTTP. Disabled by default; local analytics and
+# secure process logs remain available independently.
+enabled = false
+# Langfuse self-hosted default. Langfuse Cloud users should set their regional
+# OTLP endpoint. Any compatible OTLP/HTTP endpoint may be used.
+endpoint = "http://localhost:3000/api/public/otel/v1/traces"
+# Only environment-variable NAMES are stored here. Secret values are never
+# serialized into configuration or diagnostic logs.
+basic_auth_username_env = "LANGFUSE_PUBLIC_KEY"
+basic_auth_password_env = "LANGFUSE_SECRET_KEY"
+environment = "development"
+# release = "git-sha-or-release-name"
+# Parent-based sampling ratio, inclusive 0.0..=1.0.
+sample_ratio = 1.0
+# Bounded batch exporter. Queue saturation drops telemetry instead of blocking
+# an agent turn.
+max_queue_size = 2048
+max_batch_size = 512
+batch_delay_ms = 5000
+flush_timeout_ms = 3000
+# Raw prompts, source, tool payloads, outputs, and thinking stay excluded while
+# false. Enabling this will only take effect once redacted capture is shipped.
+capture_content = false
+
 [analytics]
 # Track per-tool-call token usage, latency, and savings.
 # Data is stored in SQLite for cross-session history.

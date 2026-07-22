@@ -13,6 +13,7 @@ mod kgl;
 mod logging;
 mod mcp;
 mod mcp_bridge;
+mod observability;
 mod ops;
 mod paths;
 mod pipeline_cache;
@@ -201,16 +202,31 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    let _logging_guard = match logging::init(&cfg.logging) {
+    let _observability_runtime =
+        observability::ObservabilityRuntime::initialize(&cfg.observability);
+    let _logging_guard = match logging::init(&cfg.logging, _observability_runtime.tracer()) {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("logging: initialization failed: {error}");
             None
         }
     };
-    let _resource_telemetry = _logging_guard
-        .as_ref()
-        .and_then(|_| logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs));
+    if let observability::ObservabilityStatus::Failed(error) = _observability_runtime.status() {
+        if _logging_guard.is_some() {
+            tracing::warn!(
+                target: "daimonos::observability",
+                event = "telemetry_initialization_failed",
+                reason = %error,
+            );
+        } else {
+            eprintln!("observability: initialization failed: {error}");
+        }
+    }
+    let _resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {
+        logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs)
+    } else {
+        None
+    };
     tracing::info!(
         target: "daimonos::lifecycle",
         event = "process_start",
