@@ -202,8 +202,33 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    cfg.prompts.resolved_tool_descriptions =
+        tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
+    // Load optional extra user rules once, before any agent runtime starts.
+    // Pure inspection modes (`agent --dry-run`, `chat --list`) do not create an
+    // agent and therefore do not need the file.
+    let uses_agent_prompt = match &cli.command {
+        Some(Command::Agent(args)) => !args.dry_run,
+        Some(Command::Chat(args)) => !args.list,
+        Some(Command::Acp(_)) => true,
+        Some(Command::Mcp(_) | Command::Daemon) | None => false,
+    };
+    if uses_agent_prompt {
+        cfg.prompts.additional_agent_instructions =
+            match prompts::load_agent_instructions(cli.agent_instructions.as_deref()).await {
+                Ok(instructions) => instructions,
+                Err(e) => {
+                    eprintln!("agent instructions: {e}");
+                    std::process::exit(2);
+                }
+            };
+    }
+    let mut observability_config = cfg.observability.clone();
+    if !uses_agent_prompt {
+        observability_config.enabled = false;
+    }
     let mut observability_runtime =
-        observability::ObservabilityRuntime::initialize(&cfg.observability);
+        observability::ObservabilityRuntime::initialize(&observability_config);
     let _logging_guard = match logging::init(&cfg.logging, observability_runtime.tracer()) {
         Ok(guard) => guard,
         Err(error) => {
@@ -236,27 +261,6 @@ async fn main() -> anyhow::Result<()> {
         workspace = %workspace.display(),
         log_directory = %cfg.logging.resolved_directory().display(),
     );
-    cfg.prompts.resolved_tool_descriptions =
-        tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
-    // Load optional extra user rules once, before any agent runtime starts.
-    // Pure inspection modes (`agent --dry-run`, `chat --list`) do not create an
-    // agent and therefore do not need the file.
-    let uses_agent_prompt = match &cli.command {
-        Some(Command::Agent(args)) => !args.dry_run,
-        Some(Command::Chat(args)) => !args.list,
-        Some(Command::Acp(_)) => true,
-        Some(Command::Mcp(_) | Command::Daemon) | None => false,
-    };
-    if uses_agent_prompt {
-        cfg.prompts.additional_agent_instructions =
-            match prompts::load_agent_instructions(cli.agent_instructions.as_deref()).await {
-                Ok(instructions) => instructions,
-                Err(e) => {
-                    eprintln!("agent instructions: {e}");
-                    std::process::exit(2);
-                }
-            };
-    }
     let cfg = Arc::new(cfg);
     // Agent frontends skip workspace service setup; tool-serving modes share
     // the lower dispatcher. All paths rendezvous below for ordered telemetry

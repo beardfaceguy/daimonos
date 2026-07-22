@@ -23,6 +23,18 @@ basic_auth_password_env = "DAIMONOS_TEST_MISSING_OTLP_SECRET"
     env = os.environ.copy()
     env.pop("DAIMONOS_TEST_MISSING_OTLP_PUBLIC", None)
     env.pop("DAIMONOS_TEST_MISSING_OTLP_SECRET", None)
+    agent_env = tmp_path / "agent.env"
+    agent_env.write_text(
+        """
+DAIMONOS_AGENT_PROVIDER=openrouter
+DAIMONOS_AGENT_MODEL=test-model
+DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:9
+DAIMONOS_AGENT_API_KEY=test-only-key
+DAIMONOS_AGENT_APPROVAL_MODE=auto
+DAIMONOS_AGENT_COMPACTION=off
+""",
+        encoding="utf-8",
+    )
 
     completed = subprocess.run(
         [
@@ -31,8 +43,11 @@ basic_auth_password_env = "DAIMONOS_TEST_MISSING_OTLP_SECRET"
             str(config),
             "--workspace",
             str(tmp_path),
-            "--stats",
+            "acp",
+            "--agent-env",
+            str(agent_env),
         ],
+        input="",
         capture_output=True,
         text=True,
         timeout=15,
