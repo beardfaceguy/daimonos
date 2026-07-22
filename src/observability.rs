@@ -35,7 +35,6 @@ pub struct PromptSpan {
 impl PromptSpan {
     pub fn new(metadata: PromptMetadata<'_>) -> Self {
         let workspace_id = workspace_id(metadata.workspace);
-        let session_id = metadata.session_id.unwrap_or_default();
         let span = tracing::info_span!(
             target: TRACE_TARGET,
             parent: None,
@@ -43,7 +42,7 @@ impl PromptSpan {
             otel.name = "agent.prompt",
             otel.kind = "internal",
             "langfuse.trace.name" = "agent.prompt",
-            "langfuse.session.id" = session_id,
+            "langfuse.session.id" = tracing::field::Empty,
             "daimonos.runtime.mode" = metadata.mode,
             "daimonos.workspace.id" = workspace_id,
             "daimonos.turn.index" = metadata.turn_index as u64,
@@ -53,6 +52,9 @@ impl PromptSpan {
             "daimonos.duration_ms" = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
         );
+        if let Some(session_id) = metadata.session_id {
+            span.record("langfuse.session.id", session_id);
+        }
         Self {
             span,
             started: std::time::Instant::now(),
@@ -76,7 +78,15 @@ impl PromptSpan {
 }
 
 fn workspace_id(workspace: &std::path::Path) -> String {
-    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(workspace.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
     hex::encode(&digest[..16])
 }
 
@@ -569,7 +579,11 @@ mod tests {
                     turn_index: turn,
                     tools_exposed: 17,
                 });
-                prompt.span().in_scope(|| {});
+                prompt.span().in_scope(|| {
+                    if turn == 0 {
+                        tracing::Span::current().record("error.type", "provider_error");
+                    }
+                });
                 prompt.finish("end_turn", None);
             }
         });
@@ -581,6 +595,10 @@ mod tests {
             spans[0].span_context.trace_id(),
             spans[1].span_context.trace_id()
         );
+        assert!(spans[0].attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.type"
+                && attribute.value.to_string() == "provider_error"
+        }));
         for span in spans {
             let attributes = span
                 .attributes
@@ -601,5 +619,49 @@ mod tests {
             );
             assert!(!format!("{attributes:?}").contains("/private/workspace"));
         }
+    }
+
+    #[test]
+    fn prompt_root_omits_absent_session_id() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("no-session-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            PromptSpan::new(PromptMetadata {
+                mode: "agent",
+                session_id: None,
+                model: "test-model",
+                workspace: std::path::Path::new("/workspace"),
+                turn_index: 0,
+                tools_exposed: 1,
+            })
+            .finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(!spans[0]
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == "langfuse.session.id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_hash_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0x80]));
+        let second = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0x81]));
+
+        assert_ne!(workspace_id(&first), workspace_id(&second));
     }
 }

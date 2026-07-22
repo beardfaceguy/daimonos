@@ -1264,6 +1264,7 @@ fn send_provider_error_diagnostic(
     error: Option<&str>,
 ) {
     let message = safe_provider_error_message(context_overflow, error);
+    tracing::Span::current().record("error.type", "provider_error");
     send_notification(
         cx,
         session_id,
@@ -1522,7 +1523,10 @@ async fn run_prompt_turn(
             }
             map_stop_reason(turn.stop_reason)
         }
-        None => AcpStopReason::Cancelled,
+        None => {
+            tracing::Span::current().record("error.type", "client_cancelled");
+            AcpStopReason::Cancelled
+        }
     }
 }
 
@@ -2557,8 +2561,11 @@ fn build_agent_with_state(
                                         .instrument(prompt_span.span().clone())
                                         .await
                                     };
-                                    let error_type =
-                                        (stop_reason == AcpStopReason::Refusal).then_some("refusal");
+                                    let error_type = match stop_reason {
+                                        AcpStopReason::Refusal => Some("refusal"),
+                                        AcpStopReason::Cancelled => Some("client_cancelled"),
+                                        _ => None,
+                                    };
                                     prompt_span.finish(
                                         acp_stop_reason_name(&stop_reason),
                                         error_type,

@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784745921.2245572,
-    "ast_hash": "ccb39c6e2c59550c0e8aea44d4f8219a",
+    "mtime": 1784746559.3622496,
+    "ast_hash": "d9e3e066d93a35178cd2037c2bf387e6",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784746083.2504635,
-    "ast_hash": "bedac13cc7914a60c985c9bf6ad894dc",
+    "mtime": 1784746631.8107607,
+    "ast_hash": "0a2fd2b66d84c2946671916760417398",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
