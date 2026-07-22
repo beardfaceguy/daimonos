@@ -103,6 +103,7 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     Error,
+    Refusal,
     Aborted,
     MaxTokens,
 }
@@ -113,6 +114,7 @@ impl StopReason {
             StopReason::EndTurn => "end_turn",
             StopReason::ToolUse => "tool_use",
             StopReason::Error => "error",
+            StopReason::Refusal => "refusal",
             StopReason::Aborted => "aborted",
             StopReason::MaxTokens => "max_tokens",
         }
@@ -386,6 +388,7 @@ mod tests {
         assert_eq!(StopReason::EndTurn.as_str(), "end_turn");
         assert_eq!(StopReason::ToolUse.as_str(), "tool_use");
         assert_eq!(StopReason::Error.as_str(), "error");
+        assert_eq!(StopReason::Refusal.as_str(), "refusal");
         assert_eq!(StopReason::Aborted.as_str(), "aborted");
         assert_eq!(StopReason::MaxTokens.as_str(), "max_tokens");
     }
@@ -396,6 +399,7 @@ mod tests {
             StopReason::EndTurn,
             StopReason::ToolUse,
             StopReason::Error,
+            StopReason::Refusal,
             StopReason::Aborted,
             StopReason::MaxTokens,
         ];

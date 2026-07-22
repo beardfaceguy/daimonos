@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784652465.8353825,
-    "ast_hash": "e6f9ca09c433a7aa5d1c15a7dbde1535",
+    "mtime": 1784738260.3435342,
+    "ast_hash": "e1bce7e5c9f2d5b80d0ded98f5795675",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784650951.5101676,
-    "ast_hash": "37efd2b2b72533863692e63002f8cf9e",
+    "mtime": 1784738086.9725697,
+    "ast_hash": "5eda58bc81b372770d8f6858afdb32e3",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -290,7 +290,7 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784736162.2383194,
+    "mtime": 1784737833.1150858,
     "ast_hash": "1b2a6ff6c8ce11a745454b74920f33ee",
     "semantic_hash": ""
   },
@@ -355,7 +355,7 @@
     "semantic_hash": "29d87aa5b9a85a57c458a264e9cb684e"
   },
   "src/main.rs": {
-    "mtime": 1784735362.0300584,
+    "mtime": 1784737833.116086,
     "ast_hash": "79a8b10fa36e305f91e7fb40ba6df590",
     "semantic_hash": ""
   },
@@ -480,18 +480,18 @@
     "semantic_hash": "ae8b2eb11a1219fe71e48dc25bdd9df4"
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1784329420.6912117,
-    "ast_hash": "ac166bfd7f00875db2cdf6f55e67d586",
+    "mtime": 1784738003.868066,
+    "ast_hash": "3204409c53168bdc60b6fa177c0bf6e4",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1784329420.6912117,
-    "ast_hash": "3f740c1912f8defbfe77fb13bbef8e36",
+    "mtime": 1784738096.2865143,
+    "ast_hash": "df26431e6bb621d89341fb844cbbcab4",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1784329420.6922119,
-    "ast_hash": "626afc98132e7b87f271fc86bd2caf61",
+    "mtime": 1784738246.6126163,
+    "ast_hash": "c0ba97e3503485d087095a861a1d69af",
     "semantic_hash": ""
   },
   "src/safety.rs": {
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1784735351.8541226,
+    "mtime": 1784737833.0940862,
     "ast_hash": "d5b137cee1d936c989d06d6bffbba6d6",
     "semantic_hash": ""
   },
@@ -960,7 +960,7 @@
     "semantic_hash": ""
   },
   "src/logging.rs": {
-    "mtime": 1784733445.986272,
+    "mtime": 1784737833.116086,
     "ast_hash": "f9c8ad6ff4df882cde89465a9c6448e0",
     "semantic_hash": ""
   },
@@ -985,17 +985,17 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1784734571.7092493,
+    "mtime": 1784737833.1150858,
     "ast_hash": "c53480c3cfb127aa541c93eccc235083",
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784736178.849219,
+    "mtime": 1784737833.116086,
     "ast_hash": "1c37b2e3306b4da1a3a48f9af7942861",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
-    "mtime": 1784735372.375993,
+    "mtime": 1784737833.116086,
     "ast_hash": "7fb5d668aebb61776671c4d4ffbb6483",
     "semantic_hash": ""
   },

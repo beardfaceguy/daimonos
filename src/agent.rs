@@ -331,6 +331,7 @@ pub async fn run(
         match resp.stop_reason {
             StopReason::EndTurn
             | StopReason::MaxTokens
+            | StopReason::Refusal
             | StopReason::Aborted
             | StopReason::Error => {
                 return AgentResult {

@@ -1159,8 +1159,56 @@ fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
         StopReason::EndTurn | StopReason::ToolUse => AcpStopReason::EndTurn,
         StopReason::MaxTokens => AcpStopReason::MaxTokens,
         StopReason::Aborted => AcpStopReason::Cancelled,
-        StopReason::Error => AcpStopReason::Refusal,
+        StopReason::Refusal => AcpStopReason::Refusal,
+        // ACP has no infrastructure-error stop reason. The prompt path emits a
+        // safe diagnostic chunk and ends normally so Zed does not mislabel a
+        // provider/network failure as a content-policy refusal.
+        StopReason::Error => AcpStopReason::EndTurn,
     }
+}
+
+fn safe_provider_error_message(error: Option<&str>) -> &'static str {
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    if error.contains("context") && (error.contains("overflow") || error.contains("too long")) {
+        "Provider rejected the prompt because the context window was exceeded."
+    } else if error.contains("401") || error.contains("authentication") {
+        "Provider authentication failed (HTTP 401)."
+    } else if error.contains("403") || error.contains("permission") {
+        "Provider authorization failed (HTTP 403)."
+    } else if error.contains("429") || error.contains("rate limit") {
+        "Provider rate limit exceeded (HTTP 429)."
+    } else if error.contains("timeout") || error.contains("timed out") {
+        "Provider request timed out."
+    } else if error.contains("network") || error.contains("connection") {
+        "Provider network request failed."
+    } else if error.contains("parse") || error.contains("decode") {
+        "Provider returned an invalid response."
+    } else if error.contains("stream") {
+        "Provider response stream failed."
+    } else {
+        "Provider request failed."
+    }
+}
+
+fn send_provider_error_diagnostic(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    error: Option<&str>,
+) {
+    let message = safe_provider_error_message(error);
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+            TextContent::new(message),
+        ))),
+    );
+    tracing::warn!(
+        target: "daimonos::acp",
+        event = "provider_request_failed",
+        session_id = %session_id,
+        class = message,
+    );
 }
 
 /// Convert ACP prompt content into the provider-neutral message shape without
@@ -1288,7 +1336,7 @@ async fn run_prompt_turn(
                         TextContent::new(message),
                     ))),
                 );
-                return AcpStopReason::Refusal;
+                return AcpStopReason::EndTurn;
             }
         }
     }
@@ -1314,7 +1362,7 @@ async fn run_prompt_turn(
                     TextContent::new(error),
                 ))),
             );
-            return AcpStopReason::Refusal;
+            return AcpStopReason::EndTurn;
         }
     };
 
@@ -1382,6 +1430,9 @@ async fn run_prompt_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
+            if turn.stop_reason == crate::providers::StopReason::Error {
+                send_provider_error_diagnostic(cx, session_id, turn.error_message.as_deref());
+            }
             map_stop_reason(turn.stop_reason)
         }
         None => AcpStopReason::Cancelled,
@@ -1420,6 +1471,9 @@ async fn run_retry_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
+            if turn.stop_reason == crate::providers::StopReason::Error {
+                send_provider_error_diagnostic(cx, session_id, turn.error_message.as_deref());
+            }
             (
                 map_stop_reason(turn.stop_reason),
                 Some(agent_session.history().to_vec()),
@@ -2374,7 +2428,7 @@ fn build_agent_with_state(
                                                 )),
                                             )),
                                         );
-                                        AcpStopReason::Refusal
+                                        AcpStopReason::EndTurn
                                     } else {
                                         run_prompt_turn(
                                             &handle,
@@ -2387,7 +2441,18 @@ fn build_agent_with_state(
                                         .await
                                     }
                                 }
-                                None => AcpStopReason::Refusal,
+                                None => {
+                                    send_notification(
+                                        &spawn_cx,
+                                        &session_id,
+                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                            AcpContentBlock::Text(TextContent::new(
+                                                "ACP session is not available.",
+                                            )),
+                                        )),
+                                    );
+                                    AcpStopReason::EndTurn
+                                }
                             };
                             tracing::info!(
                                 target: "daimonos::acp",
@@ -2936,7 +3001,7 @@ mod tests {
                             id.into(),
                         )]));
                         let response = connection.send_request(duplicate).block_task().await?;
-                        assert_eq!(response.stop_reason, AcpStopReason::Refusal);
+                        assert_eq!(response.stop_reason, AcpStopReason::EndTurn);
                     }
                 }
                 connection
@@ -3121,7 +3186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_refuses_images_when_provider_is_text_only() {
+    async fn acp_reports_unsupported_images_without_policy_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let agent = build_agent(
             mock_factory(vec![end_turn_resp("must not run")]),
@@ -3174,7 +3239,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop_reason, AcpStopReason::Refusal);
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
         let texts: Vec<String> = updates
             .lock()
             .unwrap()
@@ -3190,6 +3255,78 @@ mod tests {
         assert!(texts
             .iter()
             .any(|text| text.contains("does not support image prompts")));
+    }
+
+    #[tokio::test]
+    async fn acp_surfaces_provider_failure_without_false_refusal_or_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![crate::providers::LlmResponse::error(
+                "network error: Authorization: Bearer secret-token",
+            )]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let response = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
+        let text = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Provider network request failed"));
+        assert!(!text.contains("secret-token"));
+        assert!(!text.contains("Authorization"));
     }
 
     #[tokio::test]
@@ -4993,9 +5130,15 @@ mod tests {
     }
 
     #[test]
-    fn map_stop_reason_error_is_refusal() {
+    fn map_stop_reason_error_is_end_turn_not_false_refusal() {
         use crate::providers::StopReason;
-        assert_eq!(map_stop_reason(StopReason::Error), AcpStopReason::Refusal);
+        assert_eq!(map_stop_reason(StopReason::Error), AcpStopReason::EndTurn);
+    }
+
+    #[test]
+    fn map_stop_reason_genuine_refusal_is_refusal() {
+        use crate::providers::StopReason;
+        assert_eq!(map_stop_reason(StopReason::Refusal), AcpStopReason::Refusal);
     }
 
     #[test]
@@ -5004,6 +5147,22 @@ mod tests {
         assert_eq!(
             map_stop_reason(StopReason::MaxTokens),
             AcpStopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn provider_error_diagnostics_are_bounded_classes() {
+        assert_eq!(
+            safe_provider_error_message(Some("API 401: echoed-secret")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(Some("openrouter 429: slow down")),
+            "Provider rate limit exceeded (HTTP 429)."
+        );
+        assert_eq!(
+            safe_provider_error_message(Some("unexpected private payload")),
+            "Provider request failed."
         );
     }
 
