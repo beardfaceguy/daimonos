@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 195 files · ~205,183 words
+- 195 files · ~205,240 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4346 nodes · 9722 edges · 207 communities (187 shown, 20 thin omitted)
+- 4346 nodes · 9722 edges · 207 communities (185 shown, 22 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `74de877c`
+- Built from commit: `75fd6090`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -259,7 +259,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (207 total, 20 thin omitted)
+## Communities (207 total, 22 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.17
@@ -742,8 +742,8 @@ Cohesion: 0.11
 Nodes (19): Daimonos Token Usage Benchmark, Environment variables, Environment variables, Interpreting results, Metrics captured, Models, Normalized metric schema, Options (+11 more)
 
 ### Community 136 - "Community 136"
-Cohesion: 0.13
-Nodes (19): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, Box, LlmProvider, Message (+11 more)
+Cohesion: 0.12
+Nodes (21): AgentConfig, AgentResult, AgentSession, is_user_turn_message(), AfterHook, BeforeHook, Box, CompactionHook (+13 more)
 
 ### Community 137 - "Community 137"
 Cohesion: 0.11
@@ -851,11 +851,11 @@ Nodes (19): ADR-003: Consume Zed-provided MCP servers in ACP sessions, Component
 
 ### Community 173 - "Community 173"
 Cohesion: 0.24
-Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_none_falls_through_to_not_available(), CompactionPolicy (+7 more)
+Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_serves_unknown_tool(), CompactionPolicy (+7 more)
 
 ### Community 174 - "Community 174"
-Cohesion: 0.17
-Nodes (15): RecordedCall, CaptureProvider, MockProvider, RecordingProvider, Arc, CompleteOpts, Context, FnMut (+7 more)
+Cohesion: 0.18
+Nodes (14): RecordedCall, CaptureProvider, MockProvider, RecordingProvider, Arc, CompleteOpts, Context, FnMut (+6 more)
 
 ### Community 175 - "Community 175"
 Cohesion: 0.25
@@ -878,8 +878,8 @@ Cohesion: 0.38
 Nodes (9): Popen, _handshake(), Process lifecycle tests for daimonos --mcp.  Bug being prevented: a daimonos --m, The leak scenario: parent stays alive (stdin write-end stays open)     but never, Tool calls reset the idle clock so an active session is never killed., _send(), _spawn(), test_idle_timeout_does_not_fire_during_active_use() (+1 more)
 
 ### Community 181 - "Community 181"
-Cohesion: 0.12
-Nodes (29): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, BeforeHookResult, compaction_log_line() (+21 more)
+Cohesion: 0.09
+Nodes (39): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult (+31 more)
 
 ### Community 182 - "Community 182"
 Cohesion: 0.09
@@ -900,10 +900,6 @@ Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySub
 ### Community 186 - "Community 186"
 Cohesion: 0.29
 Nodes (6): Pygments, pytest, tests/requirements.txt (Test Dependencies), CI smoke test for the deterministic server-bench harness.  Runs a single task at, End-to-end: bench.py spawns daimonos, runs read_100 × 2 replicates,     writes a, test_bench_harness_runs_one_task()
-
-### Community 187 - "Community 187"
-Cohesion: 0.33
-Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
 
 ### Community 188 - "Community 188"
 Cohesion: 0.29
@@ -932,10 +928,6 @@ Nodes (14): canonical_json(), content_hash(), filtered_walk_builder(), IndexResu
 ### Community 196 - "Community 196"
 Cohesion: 0.31
 Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, String
-
-### Community 198 - "Community 198"
-Cohesion: 0.17
-Nodes (11): AgentConfig, append_remote_tools_to_catalog(), remote_tools_are_appended_to_list_all_tools_catalog(), AfterHook, BeforeHook, CompactionHook, PlanHook, RemoteToolHook (+3 more)
 
 ### Community 199 - "Community 199"
 Cohesion: 0.14
@@ -980,7 +972,7 @@ Nodes (7): IndexState, Arc, HashSet, Mutex, PathBuf, RwLock, WorkspaceIndex
 ## Knowledge Gaps
 - **704 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+699 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **22 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -993,7 +985,7 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
   _High betweenness centrality (0.014) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 0`, `Community 34`, `Community 136`, `Community 174`, `Community 182`?**
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 136`, `Community 0`, `Community 34`, `Community 182`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **Why does `build_before_tool_call_hook()` connect `Community 182` to `Community 34`, `Community 168`, `Community 48`, `Community 82`, `Community 181`?**
   _High betweenness centrality (0.003) - this node is a cross-community bridge._

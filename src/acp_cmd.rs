@@ -1189,9 +1189,18 @@ fn error_has_http_status(error: &str, status: &str) -> bool {
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
     let normalized = error.replace(['_', '-'], " ");
-    // Authentication/authorization/rate-limit failures are the most
-    // actionable and take precedence when a proxy returns several signals.
-    if error_has_http_status(&error, "401")
+    // An explicit/strong context-overflow signal takes precedence because the
+    // caller can recover through compaction; other classes are informational.
+    if context_overflow
+        || normalized.contains("prompt is too long")
+        || normalized.contains("exceed context limit")
+        || normalized.contains("maximum context length")
+        || normalized.contains("context overflow")
+        || normalized.contains("context length exceeded")
+        || normalized.contains("context window")
+    {
+        "Provider rejected the prompt because the context window was exceeded."
+    } else if error_has_http_status(&error, "401")
         || normalized.contains("authentication")
         || normalized.contains("invalid api key")
         || normalized.contains("unauthorized")
@@ -1207,25 +1216,21 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         "Provider authorization failed (HTTP 403)."
     } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
-    } else if context_overflow
-        || normalized.contains("prompt is too long")
-        || normalized.contains("exceed context limit")
-        || normalized.contains("maximum context length")
-        || normalized.contains("context overflow")
+    } else if normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("time out")
     {
-        "Provider rejected the prompt because the context window was exceeded."
-    } else if error.contains("timeout") || error.contains("timed out") {
         "Provider request timed out."
-    } else if error.contains("network")
-        || error.contains("connection")
-        || error.contains("upstream")
+    } else if normalized.contains("network")
+        || normalized.contains("connection")
+        || normalized.contains("upstream")
     {
         "Provider network request failed."
-    } else if error.contains("parse") || error.contains("decode") {
+    } else if normalized.contains("parse") || normalized.contains("decode") {
         "Provider returned an invalid response."
-    } else if error.contains("stream error")
-        || error.contains("stream failed")
-        || error.contains("response stream")
+    } else if normalized.contains("stream error")
+        || normalized.contains("stream failed")
+        || normalized.contains("response stream")
     {
         "Provider response stream failed."
     } else {
@@ -5289,6 +5294,22 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("context-overflow")),
             "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context_length_exceeded")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("429 context-overflow")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("timed_out")),
+            "Provider request timed out."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("stream_error")),
+            "Provider response stream failed."
         );
     }
 
