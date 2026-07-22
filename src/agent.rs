@@ -527,13 +527,20 @@ pub async fn run(
                                     // `mcp.remote_tool` span with its server alias.
                                     Some(r) => (r.content, r.is_error, None),
                                     None => {
-                                        crate::observability::ToolSpan::new(
-                                            &name,
-                                            dispatch_tool_kind(&name),
-                                        )
-                                        .finish_status(
-                                            crate::observability::ToolStatus::Unavailable,
-                                        );
+                                        // Emit a standalone span only when no
+                                        // `tool_span` is open for this call
+                                        // (i.e. a non-native tool). Guarding on
+                                        // `tool_span` avoids double-spanning
+                                        // should an opcode tool ever reach here.
+                                        if tool_span.is_none() {
+                                            crate::observability::ToolSpan::new(
+                                                &name,
+                                                dispatch_tool_kind(&name),
+                                            )
+                                            .finish_status(
+                                                crate::observability::ToolStatus::Unavailable,
+                                            );
+                                        }
                                         (
                                             format!("tool '{name}' not available in agent mode"),
                                             true,

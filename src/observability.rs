@@ -219,6 +219,11 @@ impl PromptSpan {
 /// first-class tools on the MCP-server path; `script` = the `execute_script`
 /// Starlark runtime. Remote MCP tools are classified as `remote` at dispatch,
 /// not here.
+///
+/// The plugin set mirrors the `ToolRegistry` plugins in `tools.rs`; keep it in
+/// sync when adding/renaming a plugin tool, or it falls back to `native`. The
+/// label is cosmetic (a misclassification never affects dispatch), so an exact
+/// compile-time link is deliberately not enforced.
 pub fn tool_kind(name: &str) -> &'static str {
     match name {
         "execute_script" => "script",
@@ -233,7 +238,7 @@ pub fn tool_kind(name: &str) -> &'static str {
 /// follow the scheme. Collision suffixes attach to the tool segment, so the
 /// server segment is recovered reliably and stays low-cardinality (D8).
 pub fn remote_server_alias(name: &str) -> Option<&str> {
-    name.strip_prefix("mcp__")
+    name.strip_prefix(crate::mcp_bridge::REMOTE_TOOL_PREFIX)
         .and_then(|rest| rest.split_once("__"))
         .map(|(server, _tool)| server)
 }
@@ -437,6 +442,9 @@ pub fn record_bridge_lifecycle(
     if let Some(error_class) = error_class {
         span.record("error.type", error_class);
     }
+    // Enter once before the span drops: a never-entered span exports
+    // unreliably under the OpenTelemetry layer (same reason ToolSpan::finish
+    // enters). All attributes are already set at construction.
     let _entered = span.enter();
 }
 

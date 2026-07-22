@@ -1,7 +1,7 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 195 files · ~208,391 words
+- 195 files · ~208,505 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `c7c86ca1`
+- Built from commit: `81f83d61`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -271,8 +271,8 @@ Cohesion: 0.06
 Nodes (80): CallToolError, CallToolRequestParams, ListToolsResult, PaginatedRequestParams, Root, RpcError, ScriptResult, ServerHandler (+72 more)
 
 ### Community 4 - "Community 4"
-Cohesion: 0.13
-Nodes (14): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+6 more)
+Cohesion: 0.12
+Nodes (16): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+8 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.18
@@ -807,8 +807,8 @@ Cohesion: 0.25
 Nodes (7): Adding a task, Output schema, Quick start, server-bench, Tasks, What this doesn't replace, Why
 
 ### Community 156 - "Community 156"
-Cohesion: 0.13
-Nodes (11): AcpConfig, AcpMcpConfig, AnalyticsConfig, effective_verbosity(), McpConfig, PipelineCacheConfig, AcpMcpConfig, Default (+3 more)
+Cohesion: 0.16
+Nodes (9): AcpConfig, AcpMcpConfig, LoggingConfig, McpConfig, PipelineCacheConfig, AcpMcpConfig, Default, Self (+1 more)
 
 ### Community 157 - "Community 157"
 Cohesion: 0.29
@@ -827,8 +827,8 @@ Cohesion: 0.11
 Nodes (47): AgentSession, BridgeSlot, CancelSlot, CurrentModel, McpBridge, McpClientPool, AcpCompaction, AcpState (+39 more)
 
 ### Community 169 - "Community 169"
-Cohesion: 0.24
-Nodes (9): dirs_next(), load(), load_falls_back_to_defaults(), load_from_explicit_path(), load_from_workspace_file(), Path, PathBuf, search_candidates() (+1 more)
+Cohesion: 0.15
+Nodes (14): AnalyticsConfig, dirs_next(), load(), load_falls_back_to_defaults(), load_from_explicit_path(), load_from_workspace_file(), PromptsConfig, Option (+6 more)
 
 ### Community 170 - "Community 170"
 Cohesion: 0.50
@@ -844,7 +844,7 @@ Nodes (19): ADR-003: Consume Zed-provided MCP servers in ACP sessions, Component
 
 ### Community 173 - "Community 173"
 Cohesion: 0.24
-Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_none_falls_through_to_not_available(), CompactionPolicy (+7 more)
+Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_serves_unknown_tool(), CompactionPolicy (+7 more)
 
 ### Community 174 - "Community 174"
 Cohesion: 0.16
@@ -923,8 +923,8 @@ Cohesion: 0.25
 Nodes (8): Context compaction (required config), Model picker, Prerequisites, Scope, Setup, Troubleshooting, Verify, Zed Editor Setup (native ACP agent)
 
 ### Community 196 - "Community 196"
-Cohesion: 0.20
-Nodes (10): LoggingConfig, ObservabilityConfig, ProcessConfig, PromptsConfig, resolve_nonempty_env(), Option, Result, String (+2 more)
+Cohesion: 0.31
+Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, String
 
 ### Community 198 - "Community 198"
 Cohesion: 0.33
