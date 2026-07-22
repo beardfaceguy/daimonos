@@ -297,6 +297,11 @@ cross the OTLP boundary. Existing diagnostic events can contain local paths and
 are explicitly excluded. Prompt, source, command, tool payload, model output,
 thinking, headers, and credentials are not exported under defaults.
 
+See **[observability.md](observability.md)** for the operational runbook: cloud
+and self-host setup, the smoke test, credential rotation, sampling, retention,
+overhead budgets, troubleshooting, disable/rollback, and comparing models and
+token-saving strategies.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Enables OTLP trace export. Missing credentials disable export without failing the runtime. |
