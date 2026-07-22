@@ -255,7 +255,7 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784761139.9327683,
+    "mtime": 1784761463.7735984,
     "ast_hash": "2e52f5e77b678034104dfc7bbb810d0c",
     "semantic_hash": ""
   },
@@ -470,8 +470,8 @@
     "semantic_hash": "17bd493a4f351e18a645d99c18e7612b"
   },
   "src/prompts.rs": {
-    "mtime": 1784352158.971194,
-    "ast_hash": "7fbbc6d1be642be98a21ecb414f6bcb5",
+    "mtime": 1784762186.5978377,
+    "ast_hash": "282c72b24d681df8421ffe9e7c199e90",
     "semantic_hash": ""
   },
   "src/protocol.rs": {
@@ -890,8 +890,8 @@
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
-    "mtime": 1784431554.0006087,
-    "ast_hash": "733fa71f68cacc83544699d47f9163fd",
+    "mtime": 1784761679.9402368,
+    "ast_hash": "58b7c2ea6d96abad499159d9ee2d3d1a",
     "semantic_hash": ""
   },
   "prompts/kgl_hint.md": {
@@ -900,8 +900,8 @@
     "semantic_hash": ""
   },
   "prompts/mcp_instructions.md": {
-    "mtime": 1784092846.1650639,
-    "ast_hash": "e8ad5a0f7687b388b30ade4669d0acf2",
+    "mtime": 1784761685.6502,
+    "ast_hash": "5cf82d675ea2bad18f09add0798a5009",
     "semantic_hash": ""
   },
   "prompts/summary.md": {
