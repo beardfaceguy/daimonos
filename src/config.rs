@@ -293,8 +293,10 @@ pub struct LoggingConfig {
 pub struct ObservabilityConfig {
     /// Export OpenTelemetry traces. Disabled by default.
     pub enabled: bool,
-    /// OTLP/HTTP base endpoint. Langfuse uses `/api/public/otel`.
+    /// Exact signal-specific OTLP/HTTP traces endpoint.
     pub endpoint: String,
+    /// Send RFC 7617 Basic Auth using credentials from the named env vars.
+    pub basic_auth: bool,
     /// Environment variable containing the Basic Auth username/public key.
     pub basic_auth_username_env: String,
     /// Environment variable containing the Basic Auth password/secret key.
@@ -596,6 +598,7 @@ impl Default for ObservabilityConfig {
         Self {
             enabled: false,
             endpoint: "http://localhost:3000/api/public/otel/v1/traces".to_string(),
+            basic_auth: true,
             basic_auth_username_env: "LANGFUSE_PUBLIC_KEY".to_string(),
             basic_auth_password_env: "LANGFUSE_SECRET_KEY".to_string(),
             environment: "development".to_string(),
@@ -612,6 +615,9 @@ impl Default for ObservabilityConfig {
 
 impl ObservabilityConfig {
     fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
         let endpoint = reqwest::Url::parse(&self.endpoint)
             .map_err(|error| format!("observability.endpoint is invalid: {error}"))?;
         if !matches!(endpoint.scheme(), "http" | "https") {
@@ -630,13 +636,13 @@ impl ObservabilityConfig {
                 "observability.endpoint must not contain query parameters or fragments".to_string(),
             );
         }
-        if !is_valid_env_var_name(&self.basic_auth_username_env) {
+        if self.basic_auth && !is_valid_env_var_name(&self.basic_auth_username_env) {
             return Err(format!(
                 "observability.basic_auth_username_env must be a valid env var name, got '{}'",
                 self.basic_auth_username_env
             ));
         }
-        if !is_valid_env_var_name(&self.basic_auth_password_env) {
+        if self.basic_auth && !is_valid_env_var_name(&self.basic_auth_password_env) {
             return Err(format!(
                 "observability.basic_auth_password_env must be a valid env var name, got '{}'",
                 self.basic_auth_password_env
@@ -667,7 +673,10 @@ impl ObservabilityConfig {
         Ok(())
     }
 
-    pub fn resolve_basic_auth(&self) -> Result<(String, String), String> {
+    pub fn resolve_basic_auth(&self) -> Result<Option<(String, String)>, String> {
+        if !self.basic_auth {
+            return Ok(None);
+        }
         let username = resolve_nonempty_env(
             &self.basic_auth_username_env,
             "observability Basic Auth username",
@@ -676,7 +685,13 @@ impl ObservabilityConfig {
             &self.basic_auth_password_env,
             "observability Basic Auth password",
         )?;
-        Ok((username, password))
+        if username.contains(':') {
+            return Err(format!(
+                "observability Basic Auth username env var '{}' must not contain ':'",
+                self.basic_auth_username_env
+            ));
+        }
+        Ok(Some((username, password)))
     }
 }
 
@@ -1049,6 +1064,7 @@ mod tests {
             cfg.observability.endpoint,
             "http://localhost:3000/api/public/otel/v1/traces"
         );
+        assert!(cfg.observability.basic_auth);
         assert_eq!(cfg.observability.sample_ratio, 1.0);
         assert_eq!(cfg.observability.max_queue_size, 2_048);
         assert_eq!(cfg.observability.max_batch_size, 512);
@@ -1085,6 +1101,7 @@ mod tests {
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.max_files, 14);
         assert!(!cfg.observability.enabled);
+        assert!(cfg.observability.basic_auth);
         assert_eq!(
             cfg.observability.basic_auth_username_env,
             "LANGFUSE_PUBLIC_KEY"
@@ -1132,6 +1149,11 @@ mod tests {
 
     #[test]
     fn observability_validation_rejects_unsafe_or_unbounded_values() {
+        let mut disabled = Config::default();
+        disabled.observability.endpoint = "placeholder".to_string();
+        disabled.observability.basic_auth_username_env = "INVALID-NAME".to_string();
+        assert!(disabled.validate().is_ok());
+
         let mut cfg = Config::default();
         cfg.observability.enabled = true;
         cfg.observability.endpoint = "file:///tmp/spans".to_string();
@@ -1141,6 +1163,7 @@ mod tests {
             .contains("observability.endpoint"));
 
         let mut cfg = Config::default();
+        cfg.observability.enabled = true;
         cfg.observability.endpoint =
             "https://user:secret@example.com/api/public/otel/v1/traces".to_string();
         assert!(cfg
@@ -1149,6 +1172,7 @@ mod tests {
             .contains("must not contain credentials"));
 
         let mut cfg = Config::default();
+        cfg.observability.enabled = true;
         cfg.observability.sample_ratio = f64::NAN;
         assert!(cfg
             .validate()
@@ -1156,6 +1180,7 @@ mod tests {
             .contains("observability.sample_ratio"));
 
         let mut cfg = Config::default();
+        cfg.observability.enabled = true;
         cfg.observability.max_queue_size = 0;
         assert!(cfg
             .validate()
@@ -1163,6 +1188,7 @@ mod tests {
             .contains("observability.max_queue_size"));
 
         let mut cfg = Config::default();
+        cfg.observability.enabled = true;
         cfg.observability.max_batch_size = cfg.observability.max_queue_size + 1;
         assert!(cfg
             .validate()
@@ -1170,6 +1196,7 @@ mod tests {
             .contains("observability.max_batch_size"));
 
         let mut cfg = Config::default();
+        cfg.observability.enabled = true;
         cfg.observability.basic_auth_username_env = "INVALID-NAME".to_string();
         assert!(cfg
             .validate()

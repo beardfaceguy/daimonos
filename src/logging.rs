@@ -12,6 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 use crate::config::LoggingConfig;
+use crate::observability::TRACE_TARGET;
 
 #[derive(Clone, Copy)]
 enum LogRotation {
@@ -171,9 +172,7 @@ fn observability_layer(
     tracer.map(|tracer| {
         tracing_opentelemetry::layer()
             .with_tracer(tracer)
-            .with_filter(filter_fn(|metadata| {
-                metadata.target() == "daimonos::observability"
-            }))
+            .with_filter(filter_fn(|metadata| metadata.target() == TRACE_TARGET))
     })
 }
 
@@ -274,11 +273,19 @@ fn log_file_mode(path: &Path) -> std::io::Result<u32> {
 /// delta of Linux scheduler ticks since the prior sample; this makes runaway
 /// processes visible without adding a platform-specific system-information
 /// dependency. Unsupported platforms still report PID and uptime.
-pub fn spawn_resource_telemetry(interval_secs: u64) -> Option<tokio::task::JoinHandle<()>> {
+pub struct ResourceTelemetryGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ResourceTelemetryGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub fn spawn_resource_telemetry(interval_secs: u64) -> Option<ResourceTelemetryGuard> {
     if interval_secs == 0 {
         return None;
     }
-    Some(tokio::spawn(async move {
+    Some(ResourceTelemetryGuard(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let started = std::time::Instant::now();
@@ -303,7 +310,7 @@ pub fn spawn_resource_telemetry(interval_secs: u64) -> Option<tokio::task::JoinH
                 cpu_delta_ticks,
             );
         }
-    }))
+    })))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -435,7 +442,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             {
-                let span = tracing::info_span!(target: "daimonos::observability", "agent.prompt");
+                let span = tracing::info_span!(target: TRACE_TARGET, "agent.prompt");
                 let _entered = span.enter();
             }
             {

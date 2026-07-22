@@ -14,6 +14,9 @@ use opentelemetry_sdk::Resource;
 
 use crate::config::ObservabilityConfig;
 
+pub const TRACE_TARGET: &str = "daimonos::observability";
+pub const LOCAL_DIAGNOSTIC_TARGET: &str = "daimonos::observability_local";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservabilityStatus {
     Disabled,
@@ -38,7 +41,7 @@ impl ObservabilityRuntime {
             };
         }
 
-        let (username, password) = match config.resolve_basic_auth() {
+        let credentials = match config.resolve_basic_auth() {
             Ok(credentials) => credentials,
             Err(error) => {
                 return Self {
@@ -48,7 +51,7 @@ impl ObservabilityRuntime {
                 };
             }
         };
-        let exporter = match build_exporter(config, &username, &password) {
+        let exporter = match build_exporter(config, credentials.as_ref()) {
             Ok(exporter) => exporter,
             Err(error) => {
                 return Self {
@@ -84,13 +87,16 @@ impl ObservabilityRuntime {
             .map(|provider| provider.tracer("daimonos"))
     }
 
-    pub fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
         if let Some(provider) = self.provider.take() {
-            if provider.shutdown_with_timeout(self.flush_timeout).is_err() {
+            let flush_timeout = self.flush_timeout;
+            let shutdown =
+                tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(flush_timeout));
+            if tokio::time::timeout(flush_timeout, shutdown).await.is_err() {
                 tracing::warn!(
-                    target: "daimonos::observability",
+                    target: LOCAL_DIAGNOSTIC_TARGET,
                     event = "telemetry_shutdown_failed",
-                    timeout_ms = self.flush_timeout.as_millis() as u64,
+                    timeout_ms = flush_timeout.as_millis() as u64,
                 );
             }
         }
@@ -99,7 +105,17 @@ impl ObservabilityRuntime {
 
 impl Drop for ObservabilityRuntime {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Some(provider) = self.provider.take() {
+            let flush_timeout = self.flush_timeout;
+            // Normal runtime paths call async `shutdown` explicitly. This
+            // fallback prevents an accidental Drop from blocking a Tokio
+            // worker while still giving cleanup a best-effort opportunity.
+            let _ = std::thread::Builder::new()
+                .name("daimonos-otel-shutdown".to_string())
+                .spawn(move || {
+                    let _ = provider.shutdown_with_timeout(flush_timeout);
+                });
+        }
     }
 }
 
@@ -111,7 +127,7 @@ impl<E: SpanExporter> SpanExporter for LoggingExporter<E> {
         let result = self.0.export(batch).await;
         if result.is_err() {
             tracing::warn!(
-                target: "daimonos::observability",
+                target: LOCAL_DIAGNOSTIC_TARGET,
                 event = "telemetry_export_failed",
             );
         }
@@ -163,18 +179,18 @@ fn build_provider<E: SpanExporter + 'static>(
 
 fn build_exporter(
     config: &ObservabilityConfig,
-    username: &str,
-    password: &str,
+    credentials: Option<&(String, String)>,
 ) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::ExporterBuildError> {
-    let headers = HashMap::from([(
-        "authorization".to_string(),
-        basic_authorization_header(username, password),
-    )]);
-    opentelemetry_otlp::SpanExporter::builder()
+    let mut builder = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(config.endpoint.clone())
-        .with_headers(headers)
-        .build()
+        .with_endpoint(config.endpoint.clone());
+    if let Some((username, password)) = credentials {
+        builder = builder.with_headers(HashMap::from([(
+            "authorization".to_string(),
+            basic_authorization_header(username, password),
+        )]));
+    }
+    builder.build()
 }
 
 fn basic_authorization_header(username: &str, password: &str) -> String {
@@ -243,6 +259,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn basic_auth_username_rejects_colon() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let username_env = "DAIMONOS_TEST_OTLP_COLON_PUBLIC";
+        let password_env = "DAIMONOS_TEST_OTLP_COLON_SECRET";
+        std::env::set_var(username_env, "public:invalid");
+        std::env::set_var(password_env, "secret");
+        let config = ObservabilityConfig {
+            enabled: true,
+            basic_auth_username_env: username_env.to_string(),
+            basic_auth_password_env: password_env.to_string(),
+            ..ObservabilityConfig::default()
+        };
+
+        let runtime = ObservabilityRuntime::initialize(&config);
+
+        std::env::remove_var(username_env);
+        std::env::remove_var(password_env);
+        let ObservabilityStatus::Failed(message) = runtime.status() else {
+            panic!("colon in Basic Auth username must disable export");
+        };
+        assert!(message.contains("must not contain ':'"));
+        assert!(!message.contains("public:invalid"));
+    }
+
     #[derive(Debug)]
     struct SlowExporter {
         exports: Arc<AtomicUsize>,
@@ -289,12 +330,9 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exports_otlp_http_with_basic_auth() {
+    async fn mock_otlp_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let username_env = "DAIMONOS_TEST_OTLP_PUBLIC";
-        let password_env = "DAIMONOS_TEST_OTLP_SECRET";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -307,8 +345,22 @@ mod tests {
                     break;
                 }
                 request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
                 }
             }
             socket
@@ -317,6 +369,14 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&request).into_owned()
         });
+        (address, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exports_otlp_http_with_basic_auth() {
+        let username_env = "DAIMONOS_TEST_OTLP_PUBLIC";
+        let password_env = "DAIMONOS_TEST_OTLP_SECRET";
+        let (address, server) = mock_otlp_server().await;
         let mut runtime = {
             let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
             std::env::set_var(username_env, "public");
@@ -338,7 +398,7 @@ mod tests {
         assert_eq!(runtime.status(), &ObservabilityStatus::Active);
         let mut span = runtime.tracer().unwrap().start("export-test");
         span.end();
-        runtime.shutdown();
+        runtime.shutdown().await;
         let request = tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()
@@ -347,5 +407,30 @@ mod tests {
         assert!(request
             .to_ascii_lowercase()
             .contains("authorization: basic chvibgljonnly3jlda=="));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exports_to_unauthenticated_otlp_collector() {
+        let (address, server) = mock_otlp_server().await;
+        let config = ObservabilityConfig {
+            enabled: true,
+            endpoint: format!("http://{address}/v1/traces"),
+            basic_auth: false,
+            batch_delay_ms: 10,
+            flush_timeout_ms: 2_000,
+            ..ObservabilityConfig::default()
+        };
+        let mut runtime = ObservabilityRuntime::initialize(&config);
+        assert_eq!(runtime.status(), &ObservabilityStatus::Active);
+        let mut span = runtime.tracer().unwrap().start("unauthenticated");
+        span.end();
+        runtime.shutdown().await;
+        let request = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(request.starts_with("POST /v1/traces "));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
     }
 }

@@ -301,6 +301,7 @@ thinking, headers, and credentials are not exported under defaults.
 |---------|---------|-------------|
 | `enabled` | `false` | Enables OTLP trace export. Missing credentials disable export without failing the runtime. |
 | `endpoint` | `http://localhost:3000/api/public/otel/v1/traces` | Exact OTLP/HTTP traces endpoint. Langfuse Cloud endpoints are region-specific. |
+| `basic_auth` | `true` | Sends Basic Auth credentials. Set false for an unauthenticated local collector. |
 | `basic_auth_username_env` | `LANGFUSE_PUBLIC_KEY` | Environment-variable name containing the Basic Auth username/public key. |
 | `basic_auth_password_env` | `LANGFUSE_SECRET_KEY` | Environment-variable name containing the Basic Auth password/secret key. |
 | `environment` | `development` | Deployment environment resource label. |
@@ -316,6 +317,7 @@ thinking, headers, and credentials are not exported under defaults.
 [observability]
 enabled = false
 endpoint = "http://localhost:3000/api/public/otel/v1/traces"
+basic_auth = true
 basic_auth_username_env = "LANGFUSE_PUBLIC_KEY"
 basic_auth_password_env = "LANGFUSE_SECRET_KEY"
 environment = "development"

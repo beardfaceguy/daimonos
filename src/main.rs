@@ -202,19 +202,19 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    let _observability_runtime =
+    let mut observability_runtime =
         observability::ObservabilityRuntime::initialize(&cfg.observability);
-    let _logging_guard = match logging::init(&cfg.logging, _observability_runtime.tracer()) {
+    let _logging_guard = match logging::init(&cfg.logging, observability_runtime.tracer()) {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("logging: initialization failed: {error}");
             None
         }
     };
-    if let observability::ObservabilityStatus::Failed(error) = _observability_runtime.status() {
+    if let observability::ObservabilityStatus::Failed(error) = observability_runtime.status() {
         if _logging_guard.is_some() {
             tracing::warn!(
-                target: "daimonos::observability",
+                target: observability::LOCAL_DIAGNOSTIC_TARGET,
                 event = "telemetry_initialization_failed",
                 reason = %error,
             );
@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("observability: initialization failed: {error}");
         }
     }
-    let _resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {
+    let resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {
         logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs)
     } else {
         None
@@ -258,31 +258,35 @@ async fn main() -> anyhow::Result<()> {
             };
     }
     let cfg = Arc::new(cfg);
-    // Dispatch `daimonos agent "<task>"` / `daimonos chat` early — no
-    // index/watcher/plugin setup needed.
-    match cli.command {
+    // Agent frontends skip workspace service setup; tool-serving modes share
+    // the lower dispatcher. All paths rendezvous below for ordered telemetry
+    // teardown before the logging guard is dropped.
+    let result = match cli.command {
         Some(Command::Agent(args)) => {
-            return agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Chat(args)) => {
-            return agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Acp(args)) => {
-            return agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await;
+            agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await
         }
-        Some(Command::Mcp(_) | Command::Daemon) | None => {}
-    }
-
-    run_tool_service(
-        runtime_mode,
-        cli.socket,
-        cli.debug,
-        cli.session_id,
-        workspace,
-        cfg,
-        startup_logs_early,
-    )
-    .await
+        Some(Command::Mcp(_) | Command::Daemon) | None => {
+            run_tool_service(
+                runtime_mode,
+                cli.socket,
+                cli.debug,
+                cli.session_id,
+                workspace,
+                cfg,
+                startup_logs_early,
+            )
+            .await
+        }
+    };
+    drop(resource_telemetry);
+    observability_runtime.shutdown().await;
+    result
 }
 
 /// Launch the tool-serving half of Daimonos. Agent, chat, and ACP modes return
