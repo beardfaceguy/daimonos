@@ -1159,8 +1159,122 @@ fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
         StopReason::EndTurn | StopReason::ToolUse => AcpStopReason::EndTurn,
         StopReason::MaxTokens => AcpStopReason::MaxTokens,
         StopReason::Aborted => AcpStopReason::Cancelled,
-        StopReason::Error => AcpStopReason::Refusal,
+        StopReason::Refusal => AcpStopReason::Refusal,
+        // ACP has no infrastructure-error stop reason. The prompt path emits a
+        // safe diagnostic chunk and ends normally so Zed does not mislabel a
+        // provider/network failure as a content-policy refusal.
+        StopReason::Error => AcpStopReason::EndTurn,
     }
+}
+
+fn error_has_token(error: &str, token: &str) -> bool {
+    error
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+fn error_has_http_status(error: &str, status: &str) -> bool {
+    if error_has_token(error, status) {
+        return true;
+    }
+    let compact: String = error
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    ["http", "api", "status"].iter().any(|prefix| {
+        let needle = format!("{prefix}{status}");
+        compact.match_indices(&needle).any(|(index, _)| {
+            compact[index + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_digit())
+        })
+    })
+}
+
+fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    let normalized = error.replace(['_', '-'], " ");
+    // An explicit/strong context-overflow signal takes precedence because the
+    // caller can recover through compaction; other classes are informational.
+    if context_overflow
+        || normalized.contains("prompt is too long")
+        || normalized.contains("exceed context limit")
+        || normalized.contains("maximum context length")
+        || normalized.contains("context overflow")
+        || normalized.contains("context length exceeded")
+        || normalized.contains("context window exceeded")
+        || normalized.contains("context window was exceeded")
+    {
+        "Provider rejected the prompt because the context window was exceeded."
+    } else if error_has_http_status(&error, "401")
+        || normalized.contains("authentication")
+        || normalized.contains("invalid api key")
+        || normalized.contains("unauthorized")
+        || normalized.contains("not authorized")
+    {
+        "Provider authentication failed (HTTP 401)."
+    } else if error_has_http_status(&error, "403")
+        || normalized.contains("permission denied")
+        || normalized.contains("forbidden")
+        || normalized.contains("authorization failed")
+        || normalized.contains("authorization error")
+    {
+        "Provider authorization failed (HTTP 403)."
+    } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
+        "Provider rate limit exceeded (HTTP 429)."
+    } else if normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("time out")
+    {
+        "Provider request timed out."
+    } else if normalized.contains("network")
+        || normalized.contains("connection")
+        || normalized.contains("upstream")
+    {
+        "Provider network request failed."
+    } else if normalized.contains("parse") || normalized.contains("decode") {
+        "Provider returned an invalid response."
+    } else if normalized.contains("stream error")
+        || normalized.contains("stream failed")
+        || normalized.contains("response stream")
+    {
+        "Provider response stream failed."
+    } else {
+        "Provider request failed."
+    }
+}
+
+fn send_provider_error_diagnostic(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    context_overflow: bool,
+    error: Option<&str>,
+) {
+    let message = safe_provider_error_message(context_overflow, error);
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
+            TextContent::new(message),
+        ))),
+    );
+    tracing::warn!(
+        target: "daimonos::acp",
+        event = "provider_request_failed",
+        session_id = %session_id,
+        class = message,
+    );
+}
+
+fn send_refusal_diagnostic(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
+            TextContent::new("Provider refused the request based on content policy."),
+        ))),
+    );
 }
 
 /// Convert ACP prompt content into the provider-neutral message shape without
@@ -1288,7 +1402,7 @@ async fn run_prompt_turn(
                         TextContent::new(message),
                     ))),
                 );
-                return AcpStopReason::Refusal;
+                return AcpStopReason::EndTurn;
             }
         }
     }
@@ -1314,7 +1428,7 @@ async fn run_prompt_turn(
                     TextContent::new(error),
                 ))),
             );
-            return AcpStopReason::Refusal;
+            return AcpStopReason::EndTurn;
         }
     };
 
@@ -1382,6 +1496,18 @@ async fn run_prompt_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
+            match turn.stop_reason {
+                crate::providers::StopReason::Error => send_provider_error_diagnostic(
+                    cx,
+                    session_id,
+                    turn.context_overflow,
+                    turn.error_message.as_deref(),
+                ),
+                crate::providers::StopReason::Refusal => {
+                    send_refusal_diagnostic(cx, session_id);
+                }
+                _ => {}
+            }
             map_stop_reason(turn.stop_reason)
         }
         None => AcpStopReason::Cancelled,
@@ -1420,6 +1546,18 @@ async fn run_retry_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
+            match turn.stop_reason {
+                crate::providers::StopReason::Error => send_provider_error_diagnostic(
+                    cx,
+                    session_id,
+                    turn.context_overflow,
+                    turn.error_message.as_deref(),
+                ),
+                crate::providers::StopReason::Refusal => {
+                    send_refusal_diagnostic(cx, session_id);
+                }
+                _ => {}
+            }
             (
                 map_stop_reason(turn.stop_reason),
                 Some(agent_session.history().to_vec()),
@@ -2374,7 +2512,7 @@ fn build_agent_with_state(
                                                 )),
                                             )),
                                         );
-                                        AcpStopReason::Refusal
+                                        AcpStopReason::EndTurn
                                     } else {
                                         run_prompt_turn(
                                             &handle,
@@ -2387,7 +2525,18 @@ fn build_agent_with_state(
                                         .await
                                     }
                                 }
-                                None => AcpStopReason::Refusal,
+                                None => {
+                                    send_notification(
+                                        &spawn_cx,
+                                        &session_id,
+                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                            AcpContentBlock::Text(TextContent::new(
+                                                "ACP session is not available.",
+                                            )),
+                                        )),
+                                    );
+                                    AcpStopReason::EndTurn
+                                }
                             };
                             tracing::info!(
                                 target: "daimonos::acp",
@@ -2936,7 +3085,7 @@ mod tests {
                             id.into(),
                         )]));
                         let response = connection.send_request(duplicate).block_task().await?;
-                        assert_eq!(response.stop_reason, AcpStopReason::Refusal);
+                        assert_eq!(response.stop_reason, AcpStopReason::EndTurn);
                     }
                 }
                 connection
@@ -3121,7 +3270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_refuses_images_when_provider_is_text_only() {
+    async fn acp_reports_unsupported_images_without_policy_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let agent = build_agent(
             mock_factory(vec![end_turn_resp("must not run")]),
@@ -3174,7 +3323,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop_reason, AcpStopReason::Refusal);
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
         let texts: Vec<String> = updates
             .lock()
             .unwrap()
@@ -3190,6 +3339,96 @@ mod tests {
         assert!(texts
             .iter()
             .any(|text| text.contains("does not support image prompts")));
+    }
+
+    #[tokio::test]
+    async fn acp_distinguishes_provider_failure_from_genuine_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![
+                crate::providers::LlmResponse::error(
+                    "network error: Authorization: Bearer secret-token",
+                ),
+                crate::providers::LlmResponse {
+                    content: Vec::new(),
+                    stop_reason: crate::providers::StopReason::Refusal,
+                    error_message: None,
+                    context_overflow: false,
+                    usage: Usage::default(),
+                },
+            ]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let failure = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                let refusal = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("refuse"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok((failure.stop_reason, refusal.stop_reason))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason.0, AcpStopReason::EndTurn);
+        assert_eq!(stop_reason.1, AcpStopReason::Refusal);
+        let text = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Provider network request failed"));
+        assert!(text.contains("Provider refused the request based on content policy"));
+        assert!(!text.contains("secret-token"));
+        assert!(!text.contains("Authorization"));
     }
 
     #[tokio::test]
@@ -4993,9 +5232,15 @@ mod tests {
     }
 
     #[test]
-    fn map_stop_reason_error_is_refusal() {
+    fn map_stop_reason_error_is_end_turn_not_false_refusal() {
         use crate::providers::StopReason;
-        assert_eq!(map_stop_reason(StopReason::Error), AcpStopReason::Refusal);
+        assert_eq!(map_stop_reason(StopReason::Error), AcpStopReason::EndTurn);
+    }
+
+    #[test]
+    fn map_stop_reason_genuine_refusal_is_refusal() {
+        use crate::providers::StopReason;
+        assert_eq!(map_stop_reason(StopReason::Refusal), AcpStopReason::Refusal);
     }
 
     #[test]
@@ -5004,6 +5249,90 @@ mod tests {
         assert_eq!(
             map_stop_reason(StopReason::MaxTokens),
             AcpStopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn provider_error_diagnostics_are_bounded_classes() {
+        assert_eq!(
+            safe_provider_error_message(false, Some("API 401: echoed-secret")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("openrouter 429: slow down")),
+            "Provider rate limit exceeded (HTTP 429)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("unexpected private payload")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("prompt is too long")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("upstream gateway error")),
+            "Provider network request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("request id 1401")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("Unauthorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("not authorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("Authorization failed")),
+            "Provider authorization failed (HTTP 403)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("rate_limit_exceeded")),
+            "Provider rate limit exceeded (HTTP 429)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("HTTP401 Unauthorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("HTTP4012 request id")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("permission-denied")),
+            "Provider authorization failed (HTTP 403)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context-overflow")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context window limit is 200k")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context_length_exceeded")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("could not inspect context window metadata")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("429 context-overflow")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("timed_out")),
+            "Provider request timed out."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("stream_error")),
+            "Provider response stream failed."
         );
     }
 

@@ -225,6 +225,7 @@ pub(crate) fn map_stop_reason(s: Option<&str>) -> StopReason {
         Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
         Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::MaxTokens,
+        Some("refusal") => StopReason::Refusal,
         _ => StopReason::Error,
     }
 }
@@ -700,6 +701,11 @@ mod tests {
     #[test]
     fn stop_reason_max_tokens() {
         assert_eq!(map_stop_reason(Some("max_tokens")), StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_reason_refusal() {
+        assert_eq!(map_stop_reason(Some("refusal")), StopReason::Refusal);
     }
 
     #[test]

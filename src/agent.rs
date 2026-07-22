@@ -331,6 +331,7 @@ pub async fn run(
         match resp.stop_reason {
             StopReason::EndTurn
             | StopReason::MaxTokens
+            | StopReason::Refusal
             | StopReason::Aborted
             | StopReason::Error => {
                 return AgentResult {
@@ -484,6 +485,7 @@ pub struct TurnResult {
     pub last_call_usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
+    pub context_overflow: bool,
 }
 
 /// A stateful, re-promptable agent conversation wrapping the one-shot [`run`]
@@ -635,6 +637,7 @@ impl AgentSession {
             last_call_usage: result.last_call_usage,
             stop_reason: result.stop_reason,
             error_message: result.error_message,
+            context_overflow: result.context_overflow,
         }
     }
 

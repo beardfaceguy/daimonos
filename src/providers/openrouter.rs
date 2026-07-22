@@ -436,11 +436,17 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
             content.push(ContentBlock::ToolCall { id, name, input });
         }
     }
+    let error_message = (stop_reason == StopReason::Refusal).then(|| {
+        message["refusal"]
+            .as_str()
+            .unwrap_or("provider content policy refusal")
+            .to_string()
+    });
 
     LlmResponse {
         content,
         stop_reason,
-        error_message: None,
+        error_message,
         context_overflow: false,
         usage,
     }
@@ -451,6 +457,7 @@ pub(crate) fn map_finish_reason(reason: Option<&str>) -> StopReason {
         Some("stop") | Some("end_turn") => StopReason::EndTurn,
         Some("tool_calls") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::MaxTokens,
+        Some("content_filter") | Some("refusal") => StopReason::Refusal,
         _ => StopReason::Error,
     }
 }
@@ -749,12 +756,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_finish_reason_is_error() {
+    fn parse_content_filter_is_refusal() {
+        let body = json!({
+            "choices": [{"message": {"content": "", "refusal": "policy restriction"}, "finish_reason": "content_filter"}],
+            "usage": {}
+        });
+        let response = parse_response(&body);
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("policy restriction")
+        );
+    }
+
+    #[test]
+    fn parse_content_filter_without_reason_uses_safe_default() {
         let body = json!({
             "choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}],
             "usage": {}
         });
-        assert_eq!(parse_response(&body).stop_reason, StopReason::Error);
+        let response = parse_response(&body);
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("provider content policy refusal")
+        );
     }
 
     #[test]
@@ -944,7 +970,10 @@ mod tests {
         assert_eq!(map_finish_reason(Some("end_turn")), StopReason::EndTurn);
         assert_eq!(map_finish_reason(Some("tool_calls")), StopReason::ToolUse);
         assert_eq!(map_finish_reason(Some("max_tokens")), StopReason::MaxTokens);
-        assert_eq!(map_finish_reason(Some("content_filter")), StopReason::Error);
+        assert_eq!(
+            map_finish_reason(Some("content_filter")),
+            StopReason::Refusal
+        );
         assert_eq!(map_finish_reason(Some("unknown_future")), StopReason::Error);
         assert_eq!(map_finish_reason(None), StopReason::Error);
     }
