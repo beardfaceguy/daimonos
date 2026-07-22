@@ -41,6 +41,7 @@ use agent_client_protocol::{
 };
 use futures_util::io::AsyncRead;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::agent::{
     parse_plan_entries, AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook,
@@ -52,6 +53,7 @@ use crate::analytics::AnalyticsStore;
 use crate::compaction::CompactionPolicy;
 use crate::config::Config;
 use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
+use crate::observability::{PromptMetadata, PromptSpan};
 use crate::providers::{
     CompleteOpts, ContentBlock as CoreBlock, LlmProvider, Message as CoreMessage, Role as CoreRole,
     StreamEvent, ToolSchema, Usage,
@@ -1164,6 +1166,16 @@ fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
         // safe diagnostic chunk and ends normally so Zed does not mislabel a
         // provider/network failure as a content-policy refusal.
         StopReason::Error => AcpStopReason::EndTurn,
+    }
+}
+
+fn acp_stop_reason_name(stop_reason: &AcpStopReason) -> &'static str {
+    match stop_reason {
+        AcpStopReason::EndTurn => "end_turn",
+        AcpStopReason::MaxTokens => "max_tokens",
+        AcpStopReason::Refusal => "refusal",
+        AcpStopReason::Cancelled => "cancelled",
+        _ => "unknown",
     }
 }
 
@@ -2501,8 +2513,28 @@ fn build_agent_with_state(
                             let handle = state.sessions.lock().await.get(&session_id).cloned();
                             let stop_reason = match handle {
                                 Some(handle) => {
+                                    let model = handle
+                                        .current_model
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clone();
+                                    let (turn_index, tools_exposed) = {
+                                        let session = handle.session.lock().await;
+                                        (session.user_turn_count(), session.tool_count())
+                                    };
+                                    let session_key = session_id.to_string();
+                                    let prompt_span = PromptSpan::new(PromptMetadata {
+                                        mode: "acp",
+                                        session_id: Some(&session_key),
+                                        model: &model,
+                                        workspace: &handle.cwd,
+                                        turn_index,
+                                        tools_exposed,
+                                    });
                                     let user_message = prompt_message(req.prompt);
-                                    if message_has_images(&user_message) && !state.supports_images {
+                                    let stop_reason = if message_has_images(&user_message)
+                                        && !state.supports_images
+                                    {
                                         send_notification(
                                             &spawn_cx,
                                             &session_id,
@@ -2522,8 +2554,16 @@ fn build_agent_with_state(
                                             client_user_message_id,
                                             state.store.as_ref(),
                                         )
+                                        .instrument(prompt_span.span().clone())
                                         .await
-                                    }
+                                    };
+                                    let error_type =
+                                        (stop_reason == AcpStopReason::Refusal).then_some("refusal");
+                                    prompt_span.finish(
+                                        acp_stop_reason_name(&stop_reason),
+                                        error_type,
+                                    );
+                                    stop_reason
                                 }
                                 None => {
                                     send_notification(

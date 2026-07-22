@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 195 files · ~205,359 words
+- 195 files · ~205,823 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4347 nodes · 9725 edges · 198 communities (178 shown, 20 thin omitted)
+- 4359 nodes · 9756 edges · 195 communities (175 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `5e6fea5a`
+- Built from commit: `52ccabba`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -187,15 +187,12 @@
 - [[_COMMUNITY_Community 176|Community 176]]
 - [[_COMMUNITY_Community 177|Community 177]]
 - [[_COMMUNITY_Community 178|Community 178]]
-- [[_COMMUNITY_Community 179|Community 179]]
 - [[_COMMUNITY_Community 180|Community 180]]
 - [[_COMMUNITY_Community 181|Community 181]]
 - [[_COMMUNITY_Community 182|Community 182]]
 - [[_COMMUNITY_Community 183|Community 183]]
 - [[_COMMUNITY_Community 184|Community 184]]
 - [[_COMMUNITY_Community 185|Community 185]]
-- [[_COMMUNITY_Community 186|Community 186]]
-- [[_COMMUNITY_Community 187|Community 187]]
 - [[_COMMUNITY_Community 188|Community 188]]
 - [[_COMMUNITY_Community 191|Community 191]]
 - [[_COMMUNITY_Community 192|Community 192]]
@@ -208,7 +205,7 @@
 1. `build_agent()` - 53 edges
 2. `session_in()` - 52 edges
 3. `write()` - 48 edges
-4. `build_agent_with_state()` - 45 edges
+4. `build_agent_with_state()` - 46 edges
 5. `session_in()` - 38 edges
 6. `Option` - 31 edges
 7. `run()` - 31 edges
@@ -250,7 +247,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (198 total, 20 thin omitted)
+## Communities (195 total, 20 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.17
@@ -389,8 +386,8 @@ Cohesion: 0.16
 Nodes (31): compact_audit(), compact_audit_clean_project(), compact_audit_missing_metadata_defaults_clean(), compact_audit_with_vulnerabilities(), is_available(), npm_audit(), npm_audit_in_valid_project(), npm_audit_no_package_json_returns_error() (+23 more)
 
 ### Community 34 - "Community 34"
-Cohesion: 0.20
-Nodes (26): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, SessionId, available_commands(), emit_usage_update(), map_stop_reason() (+18 more)
+Cohesion: 0.12
+Nodes (40): AcpClientRole, AcpPlan, AcpStopReason, AgentPlanEntry, ConnectionTo, CurrentConnection, DiffStash, SessionId (+32 more)
 
 ### Community 35 - "Community 35"
 Cohesion: 0.12
@@ -441,12 +438,12 @@ Cohesion: 0.17
 Nodes (25): acp_client_user_message_ids_round_trip(), atomic_write_leaves_no_tmp_file(), delete_is_idempotent_and_rejects_unsafe_ids(), first_user_line(), legacy_record_without_cwd_remains_readable(), list_breaks_equal_mtime_ties_by_session_id(), list_returns_saved_sessions_with_labels(), load_unknown_id_is_none() (+17 more)
 
 ### Community 47 - "Community 47"
-Cohesion: 0.17
-Nodes (21): McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content., tools/call write_file creates a file on disk. (+13 more)
+Cohesion: 0.14
+Nodes (25): mcp_socket_server(), McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file. (+17 more)
 
 ### Community 48 - "Community 48"
-Cohesion: 0.04
-Nodes (62): AcpContentBlock, AcpDiff, CoreMessage, InitializeRequest, SessionInfo, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff() (+54 more)
+Cohesion: 0.05
+Nodes (50): AcpContentBlock, AcpDiff, AvailableCommand, CoreMessage, InitializeRequest, SessionInfo, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output() (+42 more)
 
 ### Community 49 - "Community 49"
 Cohesion: 0.07
@@ -458,7 +455,7 @@ Nodes (18): Path, CallSample, Client, find_binary(), load_task(), main(), proc_r
 
 ### Community 51 - "Community 51"
 Cohesion: 0.13
-Nodes (33): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+25 more)
+Nodes (32): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+24 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.09
@@ -485,8 +482,8 @@ Cohesion: 0.16
 Nodes (14): Debug, AnthropicImageSource, AnthropicProvider, AnthropicThinking, complete_returns_error_on_api_401(), context_window_returns_none_on_http_error(), from_env_errors_when_key_not_set(), Client (+6 more)
 
 ### Community 58 - "Community 58"
-Cohesion: 0.16
-Nodes (15): acp_usage_uses_final_request_not_accumulated_tool_loop(), end_turn_resp(), ImageCapableProvider, MockProvider, CompleteOpts, Context, FnMut, LlmProvider (+7 more)
+Cohesion: 0.15
+Nodes (17): acp_usage_uses_final_request_not_accumulated_tool_loop(), end_turn_resp(), ImageCapableProvider, MockProvider, ModelCaptureProvider, CompleteOpts, Context, FnMut (+9 more)
 
 ### Community 59 - "Community 59"
 Cohesion: 0.16
@@ -517,8 +514,8 @@ Cohesion: 0.17
 Nodes (12): daimonos(), daimonos_binary(), daimonos_observe(), DaimonosClient, _find_binary(), Spawn a daimonos MCP subprocess, perform the handshake,     and yield a Daimonos, Manages a daimonos subprocess and sends JSON-RPC over stdio., Like `daimonos`, but with KGL observed-provenance capture enabled     (DAIMONOS_ (+4 more)
 
 ### Community 66 - "Community 66"
-Cohesion: 0.21
-Nodes (15): Unit tests for benchmarks/analyze-results.py aggregation (#928).  Pure-python: s, Create a fake run dir with one summary json per task., test_aggregate_all_incorrect_falls_back_to_all_rows(), test_aggregate_backcompat_runs_without_correct_field(), test_aggregate_correct_rate(), test_aggregate_excludes_incorrect_runs_from_metrics(), test_aggregate_handles_task_missing_from_some_runs(), test_aggregate_means_across_runs() (+7 more)
+Cohesion: 0.07
+Nodes (40): Popen, Pygments, pytest, tests/requirements.txt (Test Dependencies), Unit tests for benchmarks/analyze-results.py aggregation (#928).  Pure-python: s, Create a fake run dir with one summary json per task., test_aggregate_all_incorrect_falls_back_to_all_rows(), test_aggregate_backcompat_runs_without_correct_field() (+32 more)
 
 ### Community 67 - "Community 67"
 Cohesion: 0.17
@@ -581,8 +578,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.15
-Nodes (33): ConnectTo, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_commands_execute_without_llm_and_clear_persisted_history() (+25 more)
+Cohesion: 0.14
+Nodes (34): ConnectTo, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_commands_execute_without_llm_and_clear_persisted_history() (+26 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -725,16 +722,16 @@ Cohesion: 0.83
 Nodes (3): main(), parse_iso(), to_int()
 
 ### Community 121 - "Community 121"
-Cohesion: 0.11
-Nodes (20): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+12 more)
+Cohesion: 0.10
+Nodes (21): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+13 more)
 
 ### Community 122 - "Community 122"
 Cohesion: 0.11
 Nodes (19): Daimonos Token Usage Benchmark, Environment variables, Environment variables, Interpreting results, Metrics captured, Models, Normalized metric schema, Options (+11 more)
 
 ### Community 136 - "Community 136"
-Cohesion: 0.12
-Nodes (21): AgentConfig, AgentResult, AgentSession, is_user_turn_message(), AfterHook, BeforeHook, Box, CompactionHook (+13 more)
+Cohesion: 0.13
+Nodes (15): AgentConfig, AgentSession, AfterHook, BeforeHook, Box, CompactionHook, LlmProvider, Option (+7 more)
 
 ### Community 137 - "Community 137"
 Cohesion: 0.11
@@ -817,12 +814,12 @@ Cohesion: 0.25
 Nodes (4): discord_redact_sensitive_hides_env_token(), DiscordConfig, redact_secret(), redact_secret_hides_token_value()
 
 ### Community 167 - "Community 167"
-Cohesion: 0.24
-Nodes (10): _err_text(), Regression tests for set_cwd (vikunja #249, fix #7).  The bug: `set_cwd` checked, Non-existent path must produce a canonicalize/resolve error,     not a 'not a di, When set_cwd is given a path to a regular file, the error must     reference the, When set_cwd is given a symlink pointing at a file, the error must     reference, Sanity check: setting cwd to a real subdirectory should succeed     and report t, test_set_cwd_missing_path_returns_canonicalize_error(), test_set_cwd_on_directory_succeeds() (+2 more)
+Cohesion: 0.19
+Nodes (12): AgentResult, append_remote_tools_to_catalog(), is_user_turn_message(), last_assistant_text(), remote_tools_are_appended_to_list_all_tools_catalog(), RemoteToolResult, Message, Result (+4 more)
 
 ### Community 168 - "Community 168"
-Cohesion: 0.13
-Nodes (42): AgentSession, CancelSlot, CurrentModel, McpClientPool, AcpCompaction, AcpState, align_client_user_message_ids(), build_agent_with_state() (+34 more)
+Cohesion: 0.11
+Nodes (47): AgentSession, BridgeSlot, CancelSlot, CurrentModel, McpBridge, McpClientPool, AcpCompaction, AcpState (+39 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.15
@@ -845,8 +842,8 @@ Cohesion: 0.24
 Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_serves_unknown_tool(), CompactionPolicy (+7 more)
 
 ### Community 174 - "Community 174"
-Cohesion: 0.18
-Nodes (14): RecordedCall, CaptureProvider, MockProvider, RecordingProvider, Arc, CompleteOpts, Context, FnMut (+6 more)
+Cohesion: 0.17
+Nodes (15): RecordedCall, CaptureProvider, MockProvider, RecordingProvider, Arc, CompleteOpts, Context, FnMut (+7 more)
 
 ### Community 175 - "Community 175"
 Cohesion: 0.25
@@ -854,27 +851,23 @@ Nodes (8): 1. Open MCP configuration, 2. Add daimonos as an MCP server, 3. Verif
 
 ### Community 176 - "Community 176"
 Cohesion: 0.09
-Nodes (42): EnvFilter, File, JoinHandle, Layer, MakeWriter, Registry, CapturedGuard, CapturedWriter (+34 more)
+Nodes (41): EnvFilter, File, Layer, MakeWriter, Registry, CapturedGuard, CapturedWriter, creates_private_log_directory_and_file() (+33 more)
 
 ### Community 177 - "Community 177"
 Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.08
-Nodes (36): E, ExporterBuildError, OTelSdkResult, Resource, SdkTracerProvider, SocketAddr, SpanData, SpanExporter (+28 more)
-
-### Community 179 - "Community 179"
-Cohesion: 0.38
-Nodes (9): Popen, _handshake(), Process lifecycle tests for daimonos --mcp.  Bug being prevented: a daimonos --m, The leak scenario: parent stays alive (stdin write-end stays open)     but never, Tool calls reset the idle clock so an active session is never killed., _send(), _spawn(), test_idle_timeout_does_not_fire_during_active_use() (+1 more)
+Cohesion: 0.07
+Nodes (44): E, ExporterBuildError, JoinHandle, OTelSdkResult, Resource, SdkTracerProvider, SocketAddr, Span (+36 more)
 
 ### Community 181 - "Community 181"
-Cohesion: 0.09
-Nodes (39): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult (+31 more)
+Cohesion: 0.11
+Nodes (32): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, BeforeHookResult, compaction_log_line() (+24 more)
 
 ### Community 182 - "Community 182"
-Cohesion: 0.09
-Nodes (35): AcpPlan, AgentPlanEntry, BridgeSlot, CurrentConnection, DiffStash, McpBridge, Meta, agent_tools() (+27 more)
+Cohesion: 0.11
+Nodes (26): Meta, build_before_tool_call_hook(), diff_for_completed_edit(), diff_for_edit_file_falls_back_without_applied_diffs(), diff_for_edit_file_falls_back_without_pre_edit_capture(), diff_for_edit_file_replays_applied_pairs(), diff_for_write_file_new_file_has_no_old_text(), diff_for_write_file_uses_input_content() (+18 more)
 
 ### Community 183 - "Community 183"
 Cohesion: 0.33
@@ -887,14 +880,6 @@ Nodes (22): AcpArgs, AgentArgs, AgentEnv, ChatArgs, agent_provider_error_returns
 ### Community 185 - "Community 185"
 Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
-
-### Community 186 - "Community 186"
-Cohesion: 0.29
-Nodes (6): Pygments, pytest, tests/requirements.txt (Test Dependencies), CI smoke test for the deterministic server-bench harness.  Runs a single task at, End-to-end: bench.py spawns daimonos, runs read_100 × 2 replicates,     writes a, test_bench_harness_runs_one_task()
-
-### Community 187 - "Community 187"
-Cohesion: 0.33
-Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
 
 ### Community 188 - "Community 188"
 Cohesion: 0.29
@@ -947,8 +932,8 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
-  _High betweenness centrality (0.014) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 136`, `Community 0`, `Community 34`, `Community 182`?**
+  _High betweenness centrality (0.013) - this node is a cross-community bridge._
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 0`, `Community 34`, `Community 167`, `Community 174`, `Community 182`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **Why does `build_before_tool_call_hook()` connect `Community 182` to `Community 34`, `Community 168`, `Community 48`, `Community 82`, `Community 181`?**
   _High betweenness centrality (0.003) - this node is a cross-community bridge._

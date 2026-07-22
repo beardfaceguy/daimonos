@@ -5,10 +5,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
+use tracing::Instrument;
 
 use crate::agent::{AgentConfig, AgentResult, TokenLogConfig};
 use crate::analytics::{AgentRunRecord, AnalyticsStore};
 use crate::config::Config;
+use crate::observability::{PromptMetadata, PromptSpan};
 use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, ToolSchema};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
@@ -89,7 +91,24 @@ pub async fn run_agent(
 
     let mut session = Session::new(workspace.to_path_buf(), cfg);
     let initial = vec![Message::user(&args.task)];
-    let result = crate::agent::run(provider, &mut session, initial, &config).await;
+    let external_session_id = crate::analytics::read_agent_session_id_env();
+    let prompt_span = PromptSpan::new(PromptMetadata {
+        mode: "agent",
+        session_id: external_session_id.as_deref(),
+        model: &config.opts.model,
+        workspace,
+        turn_index: 0,
+        tools_exposed: config.tools.len(),
+    });
+    let result = crate::agent::run(provider, &mut session, initial, &config)
+        .instrument(prompt_span.span().clone())
+        .await;
+    let error_type = match result.stop_reason {
+        crate::providers::StopReason::Error => Some("provider_error"),
+        crate::providers::StopReason::Refusal => Some("refusal"),
+        _ => None,
+    };
+    prompt_span.finish(result.stop_reason.as_str(), error_type);
 
     if let Some(store) = args.analytics {
         let task_prefix: String = args.task.chars().take(200).collect();

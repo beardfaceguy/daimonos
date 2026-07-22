@@ -255,18 +255,18 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784744946.0781286,
-    "ast_hash": "67d9075db34cda3f56be77a2fc17cb79",
+    "mtime": 1784745921.2245572,
+    "ast_hash": "ccb39c6e2c59550c0e8aea44d4f8219a",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784739005.2800932,
-    "ast_hash": "b23f6eaa349ada9ff38bdc60fec19827",
+    "mtime": 1784745861.8729577,
+    "ast_hash": "715cef7a129fbe40f84f4a45bc1defbd",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
-    "mtime": 1784352158.969194,
-    "ast_hash": "6828dcfa62e82e558b0bb3f289bbd8f4",
+    "mtime": 1784746019.002897,
+    "ast_hash": "8c087c28f7682ed745e923c0f6bc136f",
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
@@ -280,8 +280,8 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1784352158.9701939,
-    "ast_hash": "f5a2768da1b62e476ef1b454db2090c4",
+    "mtime": 1784746038.7417638,
+    "ast_hash": "38e0748f514bc56ccf0457f0251929ca",
     "semantic_hash": ""
   },
   "src/compaction.rs": {
@@ -480,17 +480,17 @@
     "semantic_hash": "ae8b2eb11a1219fe71e48dc25bdd9df4"
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1784738003.868066,
+    "mtime": 1784745491.13646,
     "ast_hash": "3204409c53168bdc60b6fa177c0bf6e4",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1784738096.2865143,
+    "mtime": 1784745491.13746,
     "ast_hash": "df26431e6bb621d89341fb844cbbcab4",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1784744946.2331276,
+    "mtime": 1784745491.13746,
     "ast_hash": "e5a265e576374005b78684343223bbf7",
     "semantic_hash": ""
   },
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784737833.116086,
-    "ast_hash": "1c37b2e3306b4da1a3a48f9af7942861",
+    "mtime": 1784746083.2504635,
+    "ast_hash": "bedac13cc7914a60c985c9bf6ad894dc",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
