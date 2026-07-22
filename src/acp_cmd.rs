@@ -1173,32 +1173,45 @@ fn error_has_token(error: &str, token: &str) -> bool {
         .any(|part| part == token)
 }
 
+fn error_has_http_status(error: &str, status: &str) -> bool {
+    if error_has_token(error, status) {
+        return true;
+    }
+    let compact: String = error
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    ["http", "api", "status"]
+        .iter()
+        .any(|prefix| compact.contains(&format!("{prefix}{status}")))
+}
+
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
     let normalized = error.replace(['_', '-'], " ");
     // Authentication/authorization/rate-limit failures are the most
     // actionable and take precedence when a proxy returns several signals.
-    if error_has_token(&error, "401")
-        || error.contains("authentication")
-        || error.contains("invalid api key")
-        || error.contains("unauthorized")
+    if error_has_http_status(&error, "401")
+        || normalized.contains("authentication")
+        || normalized.contains("invalid api key")
+        || normalized.contains("unauthorized")
     {
         "Provider authentication failed (HTTP 401)."
-    } else if error_has_token(&error, "403")
-        || error.contains("permission denied")
-        || error.contains("forbidden")
-        || error.contains("not authorized")
-        || error.contains("authorization failed")
-        || error.contains("authorization error")
+    } else if error_has_http_status(&error, "403")
+        || normalized.contains("permission denied")
+        || normalized.contains("forbidden")
+        || normalized.contains("not authorized")
+        || normalized.contains("authorization failed")
+        || normalized.contains("authorization error")
     {
         "Provider authorization failed (HTTP 403)."
-    } else if error_has_token(&error, "429") || normalized.contains("rate limit") {
+    } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
     } else if context_overflow
-        || error.contains("prompt is too long")
-        || error.contains("exceed context limit")
-        || error.contains("maximum context length")
-        || error.contains("context overflow")
+        || normalized.contains("prompt is too long")
+        || normalized.contains("exceed context limit")
+        || normalized.contains("maximum context length")
+        || normalized.contains("context overflow")
     {
         "Provider rejected the prompt because the context window was exceeded."
     } else if error.contains("timeout") || error.contains("timed out") {
@@ -5264,6 +5277,18 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("rate_limit_exceeded")),
             "Provider rate limit exceeded (HTTP 429)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("HTTP401 Unauthorized")),
+            "Provider authentication failed (HTTP 401)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("permission-denied")),
+            "Provider authorization failed (HTTP 403)."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("context-overflow")),
+            "Provider rejected the prompt because the context window was exceeded."
         );
     }
 
