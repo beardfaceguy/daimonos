@@ -212,6 +212,242 @@ impl PromptSpan {
     }
 }
 
+/// Static `daimonos.tool.kind` classification by tool name.
+///
+/// `native` = opcode/file/exec/search tools dispatched through the opcode
+/// facade; `plugin` = `ToolRegistry` plugin tools (git/cargo/…) that run as
+/// first-class tools on the MCP-server path; `script` = the `execute_script`
+/// Starlark runtime. Remote MCP tools are classified as `remote` at dispatch,
+/// not here.
+///
+/// The plugin set mirrors the `ToolRegistry` plugins in `tools.rs`; keep it in
+/// sync when adding/renaming a plugin tool, or it falls back to `native`. The
+/// label is cosmetic (a misclassification never affects dispatch), so an exact
+/// compile-time link is deliberately not enforced.
+pub fn tool_kind(name: &str) -> &'static str {
+    match name {
+        "execute_script" => "script",
+        "git" | "cargo" | "gh" | "docker" | "pytest" | "npm" | "curl" | "shellcheck"
+        | "discord" => "plugin",
+        _ => "native",
+    }
+}
+
+/// Forwarded-server alias for a namespaced remote tool name of the documented
+/// `mcp__{server}__{tool}` form (ADR-003). Returns `None` for names that don't
+/// follow the scheme. Collision suffixes attach to the tool segment, so the
+/// server segment is recovered reliably and stays low-cardinality (D8).
+pub fn remote_server_alias(name: &str) -> Option<&str> {
+    name.strip_prefix(crate::mcp_bridge::REMOTE_TOOL_PREFIX)
+        .and_then(|rest| rest.split_once("__"))
+        .map(|(server, _tool)| server)
+}
+
+/// Normalized terminal state of one tool call, kept low-cardinality for D5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Success,
+    Error,
+    Blocked,
+    Timeout,
+    Unavailable,
+}
+
+impl ToolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolStatus::Success => "success",
+            ToolStatus::Error => "error",
+            ToolStatus::Blocked => "blocked",
+            ToolStatus::Timeout => "timeout",
+            ToolStatus::Unavailable => "unavailable",
+        }
+    }
+
+    /// The bounded `error.type` class for a non-success status, or `None` when
+    /// the call succeeded. Never carries a provider or message string (D6).
+    fn error_type(self) -> Option<&'static str> {
+        match self {
+            ToolStatus::Success => None,
+            ToolStatus::Error => Some("tool_error"),
+            ToolStatus::Blocked => Some("blocked"),
+            ToolStatus::Timeout => Some("timeout"),
+            ToolStatus::Unavailable => Some("unavailable"),
+        }
+    }
+}
+
+/// Metadata-only outcome of a tool call. Sizes are coarse token estimates; no
+/// argument, command, or result bodies are ever included (D6).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ToolOutcome {
+    pub request_tokens_est: u64,
+    pub response_tokens_est: u64,
+    pub saved_tokens_est: i64,
+    pub redirect: bool,
+    pub filtered: bool,
+    pub read_dedup: bool,
+    pub batch_size: u64,
+}
+
+/// A `tool.call` span for a native/plugin/script tool executed under a prompt
+/// root. Created as a child of the current span; closed via [`ToolSpan::finish`].
+pub struct ToolSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl ToolSpan {
+    pub fn new(name: &str, kind: &str) -> Self {
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "tool.call",
+            otel.name = "tool.call",
+            otel.kind = "internal",
+            "daimonos.tool.name" = name,
+            "daimonos.tool.kind" = kind,
+            "daimonos.tool.status" = tracing::field::Empty,
+            "daimonos.tool.request_tokens_est" = tracing::field::Empty,
+            "daimonos.tool.response_tokens_est" = tracing::field::Empty,
+            "daimonos.tool.saved_tokens_est" = tracing::field::Empty,
+            "daimonos.tool.redirect" = tracing::field::Empty,
+            "daimonos.tool.filtered" = tracing::field::Empty,
+            "daimonos.tool.read_dedup" = tracing::field::Empty,
+            "daimonos.tool.batch_size" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    /// Record the terminal status plus metadata-only sizes/flags, then close
+    /// the span with its measured duration.
+    pub fn finish(self, status: ToolStatus, outcome: ToolOutcome) {
+        // Enter while recording so the span is active at least once. Native
+        // calls are entered via `.instrument()` around the facade await, but
+        // blocked/unavailable calls never execute a body; entering here keeps
+        // their export path identical to instrumented spans.
+        let _entered = self.span.enter();
+        self.span.record("daimonos.tool.status", status.as_str());
+        self.span.record(
+            "daimonos.tool.request_tokens_est",
+            outcome.request_tokens_est,
+        );
+        self.span.record(
+            "daimonos.tool.response_tokens_est",
+            outcome.response_tokens_est,
+        );
+        self.span
+            .record("daimonos.tool.saved_tokens_est", outcome.saved_tokens_est);
+        self.span.record("daimonos.tool.redirect", outcome.redirect);
+        self.span.record("daimonos.tool.filtered", outcome.filtered);
+        self.span
+            .record("daimonos.tool.read_dedup", outcome.read_dedup);
+        self.span
+            .record("daimonos.tool.batch_size", outcome.batch_size);
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        if let Some(error_type) = status.error_type() {
+            self.span.record("error.type", error_type);
+        }
+    }
+
+    /// Close a span for a call that never executed (blocked / unavailable):
+    /// records only the status and duration.
+    pub fn finish_status(self, status: ToolStatus) {
+        self.finish(status, ToolOutcome::default());
+    }
+}
+
+/// An `mcp.remote_tool` span for a forwarded MCP tool call (ADR-003, D4).
+pub struct RemoteToolSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl RemoteToolSpan {
+    /// `server` is the forwarded-server alias — bounded by config, carrying no
+    /// credentials, headers, or URIs (D6).
+    pub fn new(name: &str, server: &str) -> Self {
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "mcp.remote_tool",
+            otel.name = "mcp.remote_tool",
+            otel.kind = "client",
+            "daimonos.tool.name" = name,
+            "daimonos.tool.kind" = "remote",
+            "daimonos.mcp.server" = server,
+            "daimonos.tool.status" = tracing::field::Empty,
+            "daimonos.tool.request_tokens_est" = tracing::field::Empty,
+            "daimonos.tool.response_tokens_est" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    pub fn finish(self, status: ToolStatus, request_tokens_est: u64, response_tokens_est: u64) {
+        self.span.record("daimonos.tool.status", status.as_str());
+        self.span
+            .record("daimonos.tool.request_tokens_est", request_tokens_est);
+        self.span
+            .record("daimonos.tool.response_tokens_est", response_tokens_est);
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        if let Some(error_type) = status.error_type() {
+            self.span.record("error.type", error_type);
+        }
+    }
+}
+
+/// Emit a one-shot MCP bridge lifecycle span. These occur outside any prompt
+/// (D4) so they root their own session-lifecycle trace, and carry only an
+/// event label, server count, and duration — never URIs, headers, or
+/// credentials (D6). `error_class` is a bounded class when the event failed.
+pub fn record_bridge_lifecycle(
+    event: &str,
+    servers: u64,
+    duration_ms: u64,
+    error_class: Option<&str>,
+) {
+    let span = tracing::info_span!(
+        target: TRACE_TARGET,
+        parent: None,
+        "mcp.bridge",
+        otel.name = "mcp.bridge",
+        otel.kind = "internal",
+        "daimonos.mcp.event" = event,
+        "daimonos.mcp.servers" = servers,
+        "daimonos.duration_ms" = duration_ms,
+        "error.type" = tracing::field::Empty,
+    );
+    if let Some(error_class) = error_class {
+        span.record("error.type", error_class);
+    }
+    // Enter once before the span drops: a never-entered span exports
+    // unreliably under the OpenTelemetry layer (same reason ToolSpan::finish
+    // enters). All attributes are already set at construction.
+    let _entered = span.enter();
+}
+
 fn workspace_id(workspace: &std::path::Path) -> String {
     let mut hasher = Sha256::new();
     #[cfg(unix)]
@@ -889,5 +1125,232 @@ mod tests {
         assert!(attributes["langfuse.observation.model.parameters"].contains("\"max_tokens\":4096"));
         assert!(!attributes.contains_key("langfuse.observation.input"));
         assert!(!attributes.contains_key("langfuse.observation.output"));
+    }
+
+    #[test]
+    fn tool_kind_classifies_native_plugin_and_script() {
+        assert_eq!(tool_kind("read_file"), "native");
+        assert_eq!(tool_kind("exec"), "native");
+        assert_eq!(tool_kind("git"), "plugin");
+        assert_eq!(tool_kind("cargo"), "plugin");
+        assert_eq!(tool_kind("execute_script"), "script");
+        assert_eq!(tool_kind("mcp__srv__tool"), "native");
+    }
+
+    #[test]
+    fn remote_server_alias_parses_namespaced_names() {
+        assert_eq!(remote_server_alias("mcp__vikunja__tasks"), Some("vikunja"));
+        // Collision suffix attaches to the tool segment, not the server.
+        assert_eq!(
+            remote_server_alias("mcp__vikunja__tasks__2"),
+            Some("vikunja")
+        );
+        assert_eq!(remote_server_alias("read_file"), None);
+        assert_eq!(remote_server_alias("mcp__only"), None);
+    }
+
+    /// Build an in-memory-exporter subscriber for the span tests below.
+    fn in_memory_subscriber(
+        name: &'static str,
+    ) -> (
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+        impl tracing::Subscriber,
+    ) {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer(name)));
+        (exporter, provider, subscriber)
+    }
+
+    fn attribute_map(
+        span: &opentelemetry_sdk::trace::SpanData,
+    ) -> std::collections::HashMap<String, String> {
+        span.attributes
+            .iter()
+            .map(|attribute| (attribute.key.to_string(), attribute.value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tool_call_span_is_child_and_metadata_only() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("tool-call-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "agent",
+                session_id: Some("session"),
+                model: "test-model",
+                workspace: std::path::Path::new("/private/workspace"),
+                turn_index: 0,
+                tools_exposed: 3,
+            });
+            prompt.span().in_scope(|| {
+                let tool = ToolSpan::new("exec", tool_kind("exec"));
+                tool.span().in_scope(|| {
+                    // Simulate work done under the span; no content recorded.
+                });
+                tool.finish(
+                    ToolStatus::Success,
+                    ToolOutcome {
+                        request_tokens_est: 12,
+                        response_tokens_est: 4,
+                        saved_tokens_est: 30,
+                        redirect: true,
+                        filtered: true,
+                        read_dedup: false,
+                        batch_size: 1,
+                    },
+                );
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans.iter().find(|s| s.name == "agent.prompt").unwrap();
+        let tool = spans.iter().find(|s| s.name == "tool.call").unwrap();
+        assert_eq!(tool.span_context.trace_id(), prompt.span_context.trace_id());
+        assert_eq!(tool.parent_span_id, prompt.span_context.span_id());
+        let attributes = attribute_map(tool);
+        assert_eq!(
+            attributes.get("daimonos.tool.name").map(String::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            attributes.get("daimonos.tool.kind").map(String::as_str),
+            Some("native")
+        );
+        assert_eq!(
+            attributes.get("daimonos.tool.status").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            attributes.get("daimonos.tool.redirect").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.tool.saved_tokens_est")
+                .map(String::as_str),
+            Some("30")
+        );
+        assert!(!attributes.contains_key("error.type"));
+        // Metadata-only: no argument/result/command bodies leak (D6).
+        let rendered = format!("{attributes:?}");
+        assert!(!rendered.contains("/private/workspace"));
+    }
+
+    #[test]
+    fn blocked_tool_span_records_status_without_sizes() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("blocked-tool-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let tool = ToolSpan::new("write_file", "native");
+            tool.finish_status(ToolStatus::Blocked);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let tool = spans.iter().find(|s| s.name == "tool.call").unwrap();
+        let attributes = attribute_map(tool);
+        assert_eq!(
+            attributes.get("daimonos.tool.status").map(String::as_str),
+            Some("blocked")
+        );
+        assert_eq!(
+            attributes.get("error.type").map(String::as_str),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn tool_status_strings_and_error_classes_are_bounded() {
+        assert_eq!(ToolStatus::Success.as_str(), "success");
+        assert_eq!(ToolStatus::Error.as_str(), "error");
+        assert_eq!(ToolStatus::Blocked.as_str(), "blocked");
+        assert_eq!(ToolStatus::Timeout.as_str(), "timeout");
+        assert_eq!(ToolStatus::Unavailable.as_str(), "unavailable");
+        assert_eq!(ToolStatus::Success.error_type(), None);
+        assert_eq!(ToolStatus::Error.error_type(), Some("tool_error"));
+        assert_eq!(ToolStatus::Blocked.error_type(), Some("blocked"));
+        assert_eq!(ToolStatus::Timeout.error_type(), Some("timeout"));
+        assert_eq!(ToolStatus::Unavailable.error_type(), Some("unavailable"));
+    }
+
+    #[test]
+    fn remote_tool_span_records_server_and_timeout() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("remote-tool-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let prompt = PromptSpan::new(PromptMetadata {
+                mode: "acp",
+                session_id: Some("session"),
+                model: "test-model",
+                workspace: std::path::Path::new("/workspace"),
+                turn_index: 0,
+                tools_exposed: 1,
+            });
+            prompt.span().in_scope(|| {
+                let remote = RemoteToolSpan::new("mcp__vikunja__tasks", "vikunja");
+                remote.finish(ToolStatus::Timeout, 10, 0);
+            });
+            prompt.finish("end_turn", None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let prompt = spans.iter().find(|s| s.name == "agent.prompt").unwrap();
+        let remote = spans.iter().find(|s| s.name == "mcp.remote_tool").unwrap();
+        assert_eq!(
+            remote.span_context.trace_id(),
+            prompt.span_context.trace_id()
+        );
+        assert_eq!(remote.parent_span_id, prompt.span_context.span_id());
+        let attributes = attribute_map(remote);
+        assert_eq!(
+            attributes.get("daimonos.mcp.server").map(String::as_str),
+            Some("vikunja")
+        );
+        assert_eq!(
+            attributes.get("daimonos.tool.kind").map(String::as_str),
+            Some("remote")
+        );
+        assert_eq!(
+            attributes.get("daimonos.tool.status").map(String::as_str),
+            Some("timeout")
+        );
+        assert_eq!(
+            attributes.get("error.type").map(String::as_str),
+            Some("timeout")
+        );
+    }
+
+    #[test]
+    fn bridge_lifecycle_span_roots_own_trace_without_credentials() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("bridge-lifecycle-test");
+        tracing::subscriber::with_default(subscriber, || {
+            record_bridge_lifecycle("build", 2, 42, None);
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let bridge = spans.iter().find(|s| s.name == "mcp.bridge").unwrap();
+        // No prompt parent: lifecycle spans root their own trace (D4).
+        assert!(!bridge.parent_span_id.to_string().chars().any(|c| c != '0'));
+        let attributes = attribute_map(bridge);
+        assert_eq!(
+            attributes.get("daimonos.mcp.event").map(String::as_str),
+            Some("build")
+        );
+        assert_eq!(
+            attributes.get("daimonos.mcp.servers").map(String::as_str),
+            Some("2")
+        );
+        assert!(!attributes.contains_key("error.type"));
     }
 }
