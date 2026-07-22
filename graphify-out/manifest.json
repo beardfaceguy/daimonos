@@ -930,8 +930,8 @@
     "semantic_hash": ""
   },
   "src/mcp_bridge.rs": {
-    "mtime": 1784688953.03129,
-    "ast_hash": "51c1d4611c6788346b66a475f3c551b0",
+    "mtime": 1784689786.3083875,
+    "ast_hash": "371a2c32fbda0518486ba104882b5b15",
     "semantic_hash": ""
   },
   "docs/adr/003-acp-mcp-server-bridge.md": {

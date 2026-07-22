@@ -304,16 +304,14 @@ impl ServerSpec {
         }
     }
 
-    fn points_to_current_executable(&self) -> bool {
+    async fn points_to_current_executable(&self, current_executable: &std::path::Path) -> bool {
         let ServerSpec::Stdio { command, .. } = self else {
             return false;
         };
-        let Ok(command) = std::fs::canonicalize(command) else {
+        let Ok(command) = tokio::fs::canonicalize(command).await else {
             return false;
         };
-        std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .is_ok_and(|current| current == command)
+        current_executable == command
     }
 }
 
@@ -454,9 +452,21 @@ impl McpBridge {
             return bridge;
         }
 
+        let current_executable = if reject_daimonos {
+            match std::env::current_exe() {
+                Ok(path) => tokio::fs::canonicalize(path).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let mut connect_specs = Vec::with_capacity(specs.len());
         for spec in specs {
-            if reject_daimonos && spec.points_to_current_executable() {
+            let points_to_current = match &current_executable {
+                Some(current) => spec.points_to_current_executable(current).await,
+                None => false,
+            };
+            if points_to_current {
                 record_self_skip(&mut bridge, spec.name(), "matching ACP executable");
             } else {
                 connect_specs.push(spec);
@@ -986,9 +996,9 @@ mod tests {
         assert!(ServerKey::from(&first) != ServerKey::from(&different_credentials));
     }
 
-    #[test]
-    fn current_executable_detection_is_path_based() {
-        let current = std::env::current_exe().unwrap();
+    #[tokio::test]
+    async fn current_executable_detection_is_path_based() {
+        let current = std::env::current_exe().unwrap().canonicalize().unwrap();
         let current_spec = ServerSpec::Stdio {
             name: "any-alias".to_string(),
             command: current.to_string_lossy().into_owned(),
@@ -1005,8 +1015,8 @@ mod tests {
             env: HashMap::new(),
         };
 
-        assert!(current_spec.points_to_current_executable());
-        assert!(!other_spec.points_to_current_executable());
+        assert!(current_spec.points_to_current_executable(&current).await);
+        assert!(!other_spec.points_to_current_executable(&current).await);
     }
 
     #[test]
@@ -1360,6 +1370,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            tokio::spawn(async {}).await.unwrap();
             let baseline_before =
                 thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
             tokio::time::sleep(Duration::from_millis(500)).await;
