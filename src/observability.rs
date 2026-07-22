@@ -51,12 +51,14 @@ pub struct GenerationSpan {
 
 impl GenerationSpan {
     pub fn new(metadata: GenerationMetadata<'_>) -> Self {
-        let model_parameters = serde_json::json!({
+        let mut model_parameters = serde_json::json!({
             "max_tokens": metadata.max_tokens,
             "thinking": metadata.thinking.as_str(),
-            "temperature": metadata.temperature,
-        })
-        .to_string();
+        });
+        if let Some(temperature) = metadata.temperature {
+            model_parameters["temperature"] = serde_json::json!(temperature);
+        }
+        let model_parameters = model_parameters.to_string();
         let span = tracing::info_span!(
             target: TRACE_TARGET,
             "llm.generation",
@@ -157,7 +159,6 @@ impl GenerationSpan {
         let error_type = match response.stop_reason {
             crate::providers::StopReason::Error => Some("provider_error"),
             crate::providers::StopReason::Refusal => Some("refusal"),
-            crate::providers::StopReason::Aborted => Some("aborted"),
             _ => None,
         };
         if let Some(error_type) = error_type {

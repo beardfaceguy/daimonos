@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-22)
 
 ## Corpus Check
-- 195 files · ~206,617 words
+- 195 files · ~206,626 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4373 nodes · 9789 edges · 200 communities (179 shown, 21 thin omitted)
+- 4373 nodes · 9789 edges · 199 communities (180 shown, 19 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `ac3cccd6`
+- Built from commit: `9dc1c202`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -204,7 +204,6 @@
 - [[_COMMUNITY_Community 195|Community 195]]
 - [[_COMMUNITY_Community 196|Community 196]]
 - [[_COMMUNITY_Community 198|Community 198]]
-- [[_COMMUNITY_Community 199|Community 199]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 53 edges
@@ -252,7 +251,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (200 total, 21 thin omitted)
+## Communities (199 total, 19 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.18
@@ -735,8 +734,8 @@ Cohesion: 0.11
 Nodes (19): Daimonos Token Usage Benchmark, Environment variables, Environment variables, Interpreting results, Metrics captured, Models, Normalized metric schema, Options (+11 more)
 
 ### Community 136 - "Community 136"
-Cohesion: 0.15
-Nodes (12): AgentConfig, append_remote_tools_to_catalog(), remote_tools_are_appended_to_list_all_tools_catalog(), AfterHook, AtomicU64, BeforeHook, CompactionHook, PlanHook (+4 more)
+Cohesion: 0.13
+Nodes (15): AgentConfig, AgentSession, AfterHook, AtomicU64, BeforeHook, Box, CompactionHook, LlmProvider (+7 more)
 
 ### Community 137 - "Community 137"
 Cohesion: 0.11
@@ -823,8 +822,8 @@ Cohesion: 0.25
 Nodes (4): discord_redact_sensitive_hides_env_token(), DiscordConfig, redact_secret(), redact_secret_hides_token_value()
 
 ### Community 167 - "Community 167"
-Cohesion: 0.15
-Nodes (15): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, Box, LlmProvider, Message (+7 more)
+Cohesion: 0.23
+Nodes (10): AgentResult, is_user_turn_message(), last_assistant_text(), RemoteToolResult, Message, Result, StopReason, String (+2 more)
 
 ### Community 168 - "Community 168"
 Cohesion: 0.11
@@ -876,7 +875,7 @@ Nodes (13): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, 
 
 ### Community 181 - "Community 181"
 Cohesion: 0.11
-Nodes (30): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, BeforeHookResult, compaction_log_line() (+22 more)
+Nodes (32): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult (+24 more)
 
 ### Community 182 - "Community 182"
 Cohesion: 0.11
@@ -930,6 +929,10 @@ Nodes (6): Pygments, pytest, tests/requirements.txt (Test Dependencies), CI smok
 Cohesion: 0.31
 Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, String
 
+### Community 198 - "Community 198"
+Cohesion: 0.33
+Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
+
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
   AGENTS.md · relation: references
@@ -941,7 +944,7 @@ Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, S
 ## Knowledge Gaps
 - **706 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+701 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **21 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **19 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
