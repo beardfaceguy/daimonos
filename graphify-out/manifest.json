@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784743484.4826014,
-    "ast_hash": "346dce5d72ee73354fb702535a589caa",
+    "mtime": 1784744279.6164505,
+    "ast_hash": "75a1d182cc7c487597310de96a9e41f6",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -490,8 +490,8 @@
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1784738246.6126163,
-    "ast_hash": "c0ba97e3503485d087095a861a1d69af",
+    "mtime": 1784744318.6061978,
+    "ast_hash": "8c2e746129c8d871cc31f805d1339e93",
     "semantic_hash": ""
   },
   "src/safety.rs": {

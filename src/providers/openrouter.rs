@@ -436,11 +436,14 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
             content.push(ContentBlock::ToolCall { id, name, input });
         }
     }
+    let error_message = (stop_reason == StopReason::Refusal)
+        .then(|| message["refusal"].as_str().map(str::to_string))
+        .flatten();
 
     LlmResponse {
         content,
         stop_reason,
-        error_message: None,
+        error_message,
         context_overflow: false,
         usage,
     }
@@ -752,10 +755,15 @@ mod tests {
     #[test]
     fn parse_content_filter_is_refusal() {
         let body = json!({
-            "choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}],
+            "choices": [{"message": {"content": "", "refusal": "policy restriction"}, "finish_reason": "content_filter"}],
             "usage": {}
         });
-        assert_eq!(parse_response(&body).stop_reason, StopReason::Refusal);
+        let response = parse_response(&body);
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("policy restriction")
+        );
     }
 
     #[test]

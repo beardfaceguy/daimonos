@@ -1197,7 +1197,9 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("maximum context length")
         || normalized.contains("context overflow")
         || normalized.contains("context length exceeded")
-        || normalized.contains("context window")
+        || normalized.contains("context window exceeded")
+        || normalized.contains("context window was exceeded")
+        || normalized.contains("context window limit")
     {
         "Provider rejected the prompt because the context window was exceeded."
     } else if error_has_http_status(&error, "401")
@@ -5298,6 +5300,10 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("context_length_exceeded")),
             "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("could not inspect context window metadata")),
+            "Provider request failed."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("429 context-overflow")),
