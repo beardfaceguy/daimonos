@@ -31,6 +31,7 @@ use rust_mcp_sdk::{
 
 use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::AcpMcpConfig;
+use crate::mcp::{DAIMONOS_MCP_META_KEY, DAIMONOS_MCP_META_VALUE};
 use crate::providers::ToolSchema;
 
 pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
@@ -86,6 +87,11 @@ struct PoolLease {
     shutdown_timeout: Duration,
 }
 
+enum ConnectOutcome {
+    Ready(Arc<ClientRuntime>, Vec<Tool>),
+    RejectedSelf(Arc<ClientRuntime>),
+}
+
 #[derive(Default)]
 struct PoolSlot {
     state: tokio::sync::Mutex<PoolSlotState>,
@@ -127,7 +133,8 @@ impl McpClientPool {
         spec: &ServerSpec,
         cfg: &AcpMcpConfig,
         init_timeout: Duration,
-    ) -> Result<PoolLease, String> {
+        reject_daimonos: bool,
+    ) -> Result<Option<PoolLease>, String> {
         let key = ServerKey::from(spec);
         let slot = {
             let mut slots = self.inner.slots.lock().await;
@@ -152,12 +159,12 @@ impl McpClientPool {
             } = &mut *state
             {
                 *leases += 1;
-                return Ok(PoolLease {
+                return Ok(Some(PoolLease {
                     slot: Arc::clone(&slot),
                     client: Arc::clone(client),
                     tools: Arc::clone(tools),
                     shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
-                });
+                }));
             }
             if matches!(*state, PoolSlotState::ShuttingDown) {
                 // Register before unlocking so completion cannot race between
@@ -172,19 +179,32 @@ impl McpClientPool {
             break state;
         };
 
-        let (client, tools) = connect(spec, cfg, init_timeout).await?;
+        let (client, tools) = match connect(spec, cfg, init_timeout, reject_daimonos).await? {
+            ConnectOutcome::Ready(client, tools) => (client, tools),
+            ConnectOutcome::RejectedSelf(client) => {
+                *state = PoolSlotState::ShuttingDown;
+                drop(state);
+                shutdown_slot_client(
+                    Arc::clone(&slot),
+                    client,
+                    Duration::from_secs(cfg.shutdown_timeout_secs),
+                )
+                .await;
+                return Ok(None);
+            }
+        };
         let tools = Arc::new(tools);
         *state = PoolSlotState::Ready {
             client: Arc::clone(&client),
             tools: Arc::clone(&tools),
             leases: 1,
         };
-        Ok(PoolLease {
+        Ok(Some(PoolLease {
             slot: Arc::clone(&slot),
             client,
             tools,
             shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
-        })
+        }))
     }
 
     async fn release(&self, lease: PoolLease) {
@@ -204,27 +224,7 @@ impl McpClientPool {
         };
         if let Some(client) = shutdown {
             drop(state);
-            let slot = Arc::clone(&lease.slot);
-            let mut shutdown_task = tokio::spawn(async move {
-                let _ = client.shut_down().await;
-                let mut state = slot.state.lock().await;
-                if matches!(*state, PoolSlotState::ShuttingDown) {
-                    *state = PoolSlotState::Empty;
-                }
-                slot.changed.notify_waiters();
-            });
-            // Dropping a timed-out JoinHandle detaches rather than cancels its
-            // task. The slot stays strongly held and ShuttingDown until the
-            // original runtime actually exits, preventing overlapping clients.
-            if tokio::time::timeout(shutdown_timeout, &mut shutdown_task)
-                .await
-                .is_err()
-            {
-                eprintln!(
-                    "acp mcp bridge: client shutdown timed out after {}s",
-                    shutdown_timeout.as_secs()
-                );
-            }
+            shutdown_slot_client(Arc::clone(&lease.slot), client, shutdown_timeout).await;
         }
     }
 
@@ -272,6 +272,33 @@ impl McpClientPool {
     }
 }
 
+async fn shutdown_slot_client(
+    slot: Arc<PoolSlot>,
+    client: Arc<ClientRuntime>,
+    shutdown_timeout: Duration,
+) {
+    let mut shutdown_task = tokio::spawn(async move {
+        let _ = client.shut_down().await;
+        let mut state = slot.state.lock().await;
+        if matches!(*state, PoolSlotState::ShuttingDown) {
+            *state = PoolSlotState::Empty;
+        }
+        slot.changed.notify_waiters();
+    });
+    // Dropping a timed-out JoinHandle detaches rather than cancels its task.
+    // The slot stays strongly held and ShuttingDown until the original
+    // runtime exits, preventing overlapping clients.
+    if tokio::time::timeout(shutdown_timeout, &mut shutdown_task)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "acp mcp bridge: client shutdown timed out after {}s",
+            shutdown_timeout.as_secs()
+        );
+    }
+}
+
 /// Transport-neutral description of one forwarded MCP server. Decoupled from
 /// the `agent_client_protocol` types so this module (and its tests) don't
 /// depend on ACP; `acp_cmd.rs` converts `acp::McpServer` into this.
@@ -296,6 +323,55 @@ impl ServerSpec {
             ServerSpec::Stdio { name, .. } | ServerSpec::Http { name, .. } => name,
         }
     }
+
+    async fn points_to_current_executable(
+        &self,
+        current_executable: &std::path::Path,
+        search_path: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        let ServerSpec::Stdio { command, .. } = self else {
+            return false;
+        };
+        canonicalize_command(command, search_path)
+            .await
+            .is_some_and(|command| current_executable == command)
+    }
+}
+
+async fn canonicalize_command(
+    command: &str,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let command_path = std::path::Path::new(command);
+    if command_path.is_absolute() || command_path.components().count() > 1 {
+        return canonicalize_executable(command_path).await;
+    }
+    for directory in search_path.into_iter().flat_map(std::env::split_paths) {
+        if let Some(path) = canonicalize_executable(&directory.join(command_path)).await {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn canonicalize_executable(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if !metadata.is_file() || !metadata_is_executable(&metadata) {
+        return None;
+    }
+    tokio::fs::canonicalize(path).await.ok()
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Result of dispatching a remote tool call, in the shape the agent loop needs.
@@ -364,13 +440,14 @@ impl McpBridge {
         analytics: Option<Arc<AnalyticsStore>>,
         external_session_id: Option<String>,
     ) -> Self {
-        Self::build_with_pool(
+        Self::build_with_pool_policy(
             specs,
             cfg,
             native_tool_names,
             analytics,
             external_session_id,
             McpClientPool::new(),
+            false,
         )
         .await
     }
@@ -384,6 +461,27 @@ impl McpBridge {
         analytics: Option<Arc<AnalyticsStore>>,
         external_session_id: Option<String>,
         shared_pool: McpClientPool,
+    ) -> Self {
+        Self::build_with_pool_policy(
+            specs,
+            cfg,
+            native_tool_names,
+            analytics,
+            external_session_id,
+            shared_pool,
+            true,
+        )
+        .await
+    }
+
+    async fn build_with_pool_policy(
+        specs: Vec<ServerSpec>,
+        cfg: &AcpMcpConfig,
+        native_tool_names: &HashSet<String>,
+        analytics: Option<Arc<AnalyticsStore>>,
+        external_session_id: Option<String>,
+        shared_pool: McpClientPool,
+        reject_daimonos: bool,
     ) -> Self {
         let requested_servers = specs.len();
         tracing::info!(
@@ -413,30 +511,66 @@ impl McpBridge {
             return bridge;
         }
 
+        let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
+        let current_executable = if reject_daimonos {
+            match std::env::current_exe() {
+                Ok(path) => tokio::fs::canonicalize(path).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let search_path = std::env::var_os("PATH");
+        let checked_specs = stream::iter(specs.into_iter().map(|spec| {
+            let current_executable = current_executable.clone();
+            let search_path = search_path.clone();
+            async move {
+                let points_to_current = match current_executable {
+                    Some(current) => {
+                        spec.points_to_current_executable(&current, search_path.as_deref())
+                            .await
+                    }
+                    None => false,
+                };
+                (spec, points_to_current)
+            }
+        }))
+        .buffered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        let mut connect_specs = Vec::with_capacity(checked_specs.len());
+        for (spec, points_to_current) in checked_specs {
+            if points_to_current {
+                record_self_skip(&mut bridge, spec.name(), "matching ACP executable");
+            } else {
+                connect_specs.push(spec);
+            }
+        }
+
         // Names already taken: native tools win, then earlier remote tools.
         let mut used: HashSet<String> = native_tool_names.clone();
         let init_timeout = Duration::from_secs(cfg.init_timeout_secs);
-        let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
-        if specs.len() > cfg.max_servers {
+        if connect_specs.len() > cfg.max_servers {
             bridge.diagnostics.push(format!(
                 "{} forwarded MCP server(s) were skipped by max_servers={}",
-                specs.len() - cfg.max_servers,
+                connect_specs.len() - cfg.max_servers,
                 cfg.max_servers
             ));
         }
-        let connect_futures =
-            specs
-                .into_iter()
-                .take(cfg.max_servers)
-                .enumerate()
-                .map(|(index, spec)| {
-                    let pool = pool.clone();
-                    async move {
-                        let server_name = spec.name().to_string();
-                        let outcome = pool.acquire(&spec, cfg, init_timeout).await;
-                        (index, server_name, outcome)
-                    }
-                });
+        let connect_futures = connect_specs
+            .into_iter()
+            .take(cfg.max_servers)
+            .enumerate()
+            .map(|(index, spec)| {
+                let pool = pool.clone();
+                async move {
+                    let server_name = spec.name().to_string();
+                    let outcome = pool
+                        .acquire(&spec, cfg, init_timeout, reject_daimonos)
+                        .await;
+                    (index, server_name, outcome)
+                }
+            });
         let mut outcomes = stream::iter(connect_futures)
             .buffer_unordered(concurrency)
             .collect::<Vec<_>>()
@@ -445,7 +579,7 @@ impl McpBridge {
 
         for (_, server_name, outcome) in outcomes {
             match outcome {
-                Ok(lease) => {
+                Ok(Some(lease)) => {
                     tracing::info!(
                         target: "daimonos::mcp_bridge",
                         event = "server_connected",
@@ -499,6 +633,9 @@ impl McpBridge {
                         // Contributed no tools — don't keep an idle client.
                         bridge.pool.release(lease).await;
                     }
+                }
+                Ok(None) => {
+                    record_self_skip(&mut bridge, &server_name, "MCP identity marker");
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -653,6 +790,30 @@ impl McpBridge {
     }
 }
 
+fn record_self_skip(bridge: &mut McpBridge, server_name: &str, detected_by: &str) {
+    tracing::info!(
+        target: "daimonos::mcp_bridge",
+        event = "self_server_skipped",
+        server = %server_name,
+        detected_by,
+    );
+    bridge.diagnostics.push(format!(
+        "MCP server '{server_name}' was skipped because it is a Daimonos MCP \
+         server and this ACP session already exposes Daimonos native tools"
+    ));
+}
+
+fn has_daimonos_identity(client: &ClientRuntime) -> bool {
+    let info = client.server_info();
+    metadata_has_daimonos_identity(info.as_ref().and_then(|info| info.meta.as_ref()))
+}
+
+fn metadata_has_daimonos_identity(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    meta.and_then(|meta| meta.get(DAIMONOS_MCP_META_KEY))
+        .and_then(Value::as_str)
+        == Some(DAIMONOS_MCP_META_VALUE)
+}
+
 /// Connect to one server and list its tools. `init_timeout` is a single
 /// handshake deadline covering `start()` (initialize) *and* `tools/list`, so N
 /// slow/non-responsive servers cannot add up to `N * 2 * init_timeout` and
@@ -663,23 +824,28 @@ async fn connect(
     spec: &ServerSpec,
     cfg: &AcpMcpConfig,
     init_timeout: Duration,
-) -> Result<(Arc<ClientRuntime>, Vec<rust_mcp_sdk::schema::Tool>), String> {
+    reject_daimonos: bool,
+) -> Result<ConnectOutcome, String> {
     let client = create_client(spec, cfg)?;
     let deadline = tokio::time::Instant::now() + init_timeout;
-    match handshake(&client, deadline).await {
-        Ok(tools) => Ok((client, tools)),
+    match handshake(&client, deadline, reject_daimonos).await {
+        Ok(Some(tools)) => Ok(ConnectOutcome::Ready(client, tools)),
+        Ok(None) => Ok(ConnectOutcome::RejectedSelf(client)),
         Err(e) => {
-            // Fail-open must not leak: tear down whatever start() spawned.
-            let shutdown_timeout = Duration::from_secs(cfg.shutdown_timeout_secs);
-            let mut shutdown_task = tokio::spawn(async move {
-                let _ = client.shut_down().await;
-            });
-            // Timeout bounds the caller, not cleanup: dropping JoinHandle
-            // detaches the task so it continues reaping a slow stdio child.
-            let _ = tokio::time::timeout(shutdown_timeout, &mut shutdown_task).await;
+            shutdown_rejected_client(client, cfg).await;
             Err(e)
         }
     }
+}
+
+async fn shutdown_rejected_client(client: Arc<ClientRuntime>, cfg: &AcpMcpConfig) {
+    let shutdown_timeout = Duration::from_secs(cfg.shutdown_timeout_secs);
+    let mut shutdown_task = tokio::spawn(async move {
+        let _ = client.shut_down().await;
+    });
+    // Timeout bounds the caller, not cleanup: dropping JoinHandle detaches the
+    // task so it continues reaping a slow stdio child.
+    let _ = tokio::time::timeout(shutdown_timeout, &mut shutdown_task).await;
 }
 
 /// Initialize then list tools against an already-created client, both bounded
@@ -687,16 +853,20 @@ async fn connect(
 async fn handshake(
     client: &Arc<ClientRuntime>,
     deadline: tokio::time::Instant,
-) -> Result<Vec<rust_mcp_sdk::schema::Tool>, String> {
+    reject_daimonos: bool,
+) -> Result<Option<Vec<rust_mcp_sdk::schema::Tool>>, String> {
     tokio::time::timeout_at(deadline, client.clone().start())
         .await
         .map_err(|_| "initialize timed out".to_string())?
         .map_err(|e| format!("initialize failed: {e}"))?;
+    if reject_daimonos && has_daimonos_identity(client) {
+        return Ok(None);
+    }
     let result = tokio::time::timeout_at(deadline, client.request_tool_list(None))
         .await
         .map_err(|_| "tools/list timed out".to_string())?
         .map_err(|e| format!("tools/list failed: {e}"))?;
-    Ok(result.tools)
+    Ok(Some(result.tools))
 }
 
 fn client_details() -> InitializeRequestParams {
@@ -894,6 +1064,99 @@ mod tests {
             ]),
         };
         assert!(ServerKey::from(&first) != ServerKey::from(&different_credentials));
+    }
+
+    #[tokio::test]
+    async fn current_executable_detection_is_path_based() {
+        let current = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let current_spec = ServerSpec::Stdio {
+            name: "any-alias".to_string(),
+            command: current.to_string_lossy().into_owned(),
+            args: vec!["--mcp".to_string()],
+            env: HashMap::new(),
+        };
+        let other_spec = ServerSpec::Stdio {
+            name: "daimonos".to_string(),
+            command: current
+                .with_extension("other")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["--mcp".to_string()],
+            env: HashMap::new(),
+        };
+
+        assert!(
+            current_spec
+                .points_to_current_executable(&current, None)
+                .await
+        );
+        assert!(
+            !other_spec
+                .points_to_current_executable(&current, None)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_command_resolution_uses_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("daimonos-path-test");
+        std::fs::write(&command, "test").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let expected = command.canonicalize().unwrap();
+        let search_path = std::env::join_paths([directory.path()]).unwrap();
+
+        assert_eq!(
+            canonicalize_command("daimonos-path-test", Some(&search_path)).await,
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_command_resolution_rejects_non_executables() {
+        let directory = tempfile::tempdir().unwrap();
+        let search_path = std::env::join_paths([directory.path()]).unwrap();
+        std::fs::create_dir(directory.path().join("directory")).unwrap();
+
+        assert_eq!(
+            canonicalize_command("directory", Some(&search_path)).await,
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let file = directory.path().join("plain-file");
+            std::fs::write(&file, "test").unwrap();
+            assert_eq!(
+                canonicalize_command("plain-file", Some(&search_path)).await,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn identity_detection_requires_exact_namespaced_marker() {
+        let matching = serde_json::Map::from_iter([(
+            DAIMONOS_MCP_META_KEY.to_string(),
+            Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
+        )]);
+        let wrong_value = serde_json::Map::from_iter([(
+            DAIMONOS_MCP_META_KEY.to_string(),
+            Value::String("acp".to_string()),
+        )]);
+        let name_only = serde_json::Map::from_iter([(
+            "name".to_string(),
+            Value::String("daimonos".to_string()),
+        )]);
+
+        assert!(metadata_has_daimonos_identity(Some(&matching)));
+        assert!(!metadata_has_daimonos_identity(Some(&wrong_value)));
+        assert!(!metadata_has_daimonos_identity(Some(&name_only)));
+        assert!(!metadata_has_daimonos_identity(None));
     }
 
     // --- namespaced_name ---
@@ -1226,6 +1489,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            tokio::spawn(async {}).await.unwrap();
             let baseline_before =
                 thread_cpu_ticks("mcp-idle-test").expect("runtime worker must exist");
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1338,6 +1602,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_bridge_rejects_daimonos_mcp_identity() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "renamed-global-server".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+        let pool = McpClientPool::new();
+        let bridge = McpBridge::build_with_pool(
+            vec![spec],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+            pool.clone(),
+        )
+        .await;
+
+        assert_eq!(bridge.server_count(), 0);
+        assert!(bridge.tools().is_empty());
+        assert!(!bridge.had_connection_failures());
+        assert!(bridge
+            .diagnostics()
+            .iter()
+            .any(|message| message.contains("renamed-global-server")
+                && message.contains("Daimonos MCP")));
+        assert_eq!(pool.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn production_bridge_skips_current_executable_before_launch() {
+        let current = std::env::current_exe().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "local-daimonos".to_string(),
+            command: current.to_string_lossy().into_owned(),
+            args: vec!["this-would-run-the-test-harness".to_string()],
+            env: HashMap::new(),
+        };
+        let pool = McpClientPool::new();
+        let bridge = McpBridge::build_with_pool(
+            vec![spec],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+            pool.clone(),
+        )
+        .await;
+
+        assert_eq!(bridge.server_count(), 0);
+        assert!(!bridge.had_connection_failures());
+        assert!(bridge
+            .diagnostics()
+            .iter()
+            .any(|message| message.contains("local-daimonos")));
+        assert_eq!(pool.slot_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn partial_connection_failure_keeps_healthy_server_and_diagnostic() {
         let Some(bin) = daimonos_binary() else {
             eprintln!("skipping: daimonos binary not found next to test exe");
@@ -1406,21 +1738,23 @@ mod tests {
         let native = native_set(&[]);
 
         let (first, second) = tokio::join!(
-            McpBridge::build_with_pool(
+            McpBridge::build_with_pool_policy(
                 vec![spec("first")],
                 &cfg,
                 &native,
                 None,
                 Some("session-first".to_string()),
                 pool.clone(),
+                false,
             ),
-            McpBridge::build_with_pool(
+            McpBridge::build_with_pool_policy(
                 vec![spec("second")],
                 &cfg,
                 &native,
                 None,
                 Some("session-second".to_string()),
                 pool.clone(),
+                false,
             )
         );
 
@@ -1524,13 +1858,14 @@ mod tests {
         };
         let process_pool = McpClientPool::new();
 
-        let bridge = McpBridge::build_with_pool(
+        let bridge = McpBridge::build_with_pool_policy(
             vec![spec],
             &cfg,
             &native_set(&[]),
             None,
             None,
             process_pool.clone(),
+            false,
         )
         .await;
 
