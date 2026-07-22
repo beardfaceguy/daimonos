@@ -1167,23 +1167,45 @@ fn map_stop_reason(stop_reason: crate::providers::StopReason) -> AcpStopReason {
     }
 }
 
-fn safe_provider_error_message(error: Option<&str>) -> &'static str {
+fn error_has_token(error: &str, token: &str) -> bool {
+    error
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
-    if error.contains("context") && (error.contains("overflow") || error.contains("too long")) {
-        "Provider rejected the prompt because the context window was exceeded."
-    } else if error.contains("401") || error.contains("authentication") {
+    // Authentication/authorization/rate-limit failures are the most
+    // actionable and take precedence when a proxy returns several signals.
+    if error_has_token(&error, "401")
+        || error.contains("authentication")
+        || error.contains("invalid api key")
+    {
         "Provider authentication failed (HTTP 401)."
-    } else if error.contains("403") || error.contains("permission") {
+    } else if error_has_token(&error, "403") || error.contains("permission denied") {
         "Provider authorization failed (HTTP 403)."
-    } else if error.contains("429") || error.contains("rate limit") {
+    } else if error_has_token(&error, "429") || error.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
+    } else if context_overflow
+        || error.contains("prompt is too long")
+        || error.contains("exceed context limit")
+        || error.contains("maximum context length")
+        || error.contains("context overflow")
+    {
+        "Provider rejected the prompt because the context window was exceeded."
     } else if error.contains("timeout") || error.contains("timed out") {
         "Provider request timed out."
-    } else if error.contains("network") || error.contains("connection") {
+    } else if error.contains("network")
+        || error.contains("connection")
+        || error.contains("upstream")
+    {
         "Provider network request failed."
     } else if error.contains("parse") || error.contains("decode") {
         "Provider returned an invalid response."
-    } else if error.contains("stream") {
+    } else if error.contains("stream error")
+        || error.contains("stream failed")
+        || error.contains("response stream")
+    {
         "Provider response stream failed."
     } else {
         "Provider request failed."
@@ -1193,13 +1215,14 @@ fn safe_provider_error_message(error: Option<&str>) -> &'static str {
 fn send_provider_error_diagnostic(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
+    context_overflow: bool,
     error: Option<&str>,
 ) {
-    let message = safe_provider_error_message(error);
+    let message = safe_provider_error_message(context_overflow, error);
     send_notification(
         cx,
         session_id,
-        SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
             TextContent::new(message),
         ))),
     );
@@ -1208,6 +1231,16 @@ fn send_provider_error_diagnostic(
         event = "provider_request_failed",
         session_id = %session_id,
         class = message,
+    );
+}
+
+fn send_refusal_diagnostic(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
+            TextContent::new("Provider refused the request based on content policy."),
+        ))),
     );
 }
 
@@ -1430,8 +1463,17 @@ async fn run_prompt_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
-            if turn.stop_reason == crate::providers::StopReason::Error {
-                send_provider_error_diagnostic(cx, session_id, turn.error_message.as_deref());
+            match turn.stop_reason {
+                crate::providers::StopReason::Error => send_provider_error_diagnostic(
+                    cx,
+                    session_id,
+                    turn.context_overflow,
+                    turn.error_message.as_deref(),
+                ),
+                crate::providers::StopReason::Refusal => {
+                    send_refusal_diagnostic(cx, session_id);
+                }
+                _ => {}
             }
             map_stop_reason(turn.stop_reason)
         }
@@ -1471,8 +1513,17 @@ async fn run_retry_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
-            if turn.stop_reason == crate::providers::StopReason::Error {
-                send_provider_error_diagnostic(cx, session_id, turn.error_message.as_deref());
+            match turn.stop_reason {
+                crate::providers::StopReason::Error => send_provider_error_diagnostic(
+                    cx,
+                    session_id,
+                    turn.context_overflow,
+                    turn.error_message.as_deref(),
+                ),
+                crate::providers::StopReason::Refusal => {
+                    send_refusal_diagnostic(cx, session_id);
+                }
+                _ => {}
             }
             (
                 map_stop_reason(turn.stop_reason),
@@ -3258,12 +3309,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_surfaces_provider_failure_without_false_refusal_or_secrets() {
+    async fn acp_distinguishes_provider_failure_from_genuine_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let agent = build_agent(
-            mock_factory(vec![crate::providers::LlmResponse::error(
-                "network error: Authorization: Bearer secret-token",
-            )]),
+            mock_factory(vec![
+                crate::providers::LlmResponse::error(
+                    "network error: Authorization: Bearer secret-token",
+                ),
+                crate::providers::LlmResponse {
+                    content: Vec::new(),
+                    stop_reason: crate::providers::StopReason::Refusal,
+                    error_message: None,
+                    context_overflow: false,
+                    usage: Usage::default(),
+                },
+            ]),
             dir.path(),
             Arc::new(Config::default()),
             "test-model".to_string(),
@@ -3298,25 +3358,33 @@ mod tests {
                     .send_request(NewSessionRequest::new(dir.path()))
                     .block_task()
                     .await?;
-                let response = connection
+                let failure = connection
                     .send_request(PromptRequest::new(
-                        session.session_id,
+                        session.session_id.clone(),
                         vec![AcpContentBlock::Text(TextContent::new("go"))],
                     ))
                     .block_task()
                     .await?;
-                Ok(response.stop_reason)
+                let refusal = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("refuse"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok((failure.stop_reason, refusal.stop_reason))
             })
             .await
             .unwrap();
 
-        assert_eq!(stop_reason, AcpStopReason::EndTurn);
+        assert_eq!(stop_reason.0, AcpStopReason::EndTurn);
+        assert_eq!(stop_reason.1, AcpStopReason::Refusal);
         let text = updates
             .lock()
             .unwrap()
             .iter()
             .filter_map(|update| match update {
-                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
                     AcpContentBlock::Text(text) => Some(text.text.as_str()),
                     _ => None,
                 },
@@ -3325,6 +3393,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Provider network request failed"));
+        assert!(text.contains("Provider refused the request based on content policy"));
         assert!(!text.contains("secret-token"));
         assert!(!text.contains("Authorization"));
     }
@@ -5153,15 +5222,27 @@ mod tests {
     #[test]
     fn provider_error_diagnostics_are_bounded_classes() {
         assert_eq!(
-            safe_provider_error_message(Some("API 401: echoed-secret")),
+            safe_provider_error_message(false, Some("API 401: echoed-secret")),
             "Provider authentication failed (HTTP 401)."
         );
         assert_eq!(
-            safe_provider_error_message(Some("openrouter 429: slow down")),
+            safe_provider_error_message(false, Some("openrouter 429: slow down")),
             "Provider rate limit exceeded (HTTP 429)."
         );
         assert_eq!(
-            safe_provider_error_message(Some("unexpected private payload")),
+            safe_provider_error_message(false, Some("unexpected private payload")),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("prompt is too long")),
+            "Provider rejected the prompt because the context window was exceeded."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("upstream gateway error")),
+            "Provider network request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("request id 1401")),
             "Provider request failed."
         );
     }

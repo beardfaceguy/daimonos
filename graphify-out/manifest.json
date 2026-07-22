@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784738260.3435342,
-    "ast_hash": "e1bce7e5c9f2d5b80d0ded98f5795675",
+    "mtime": 1784739059.1487734,
+    "ast_hash": "2023fbe957c8dd92c42989b580947904",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784738086.9725697,
-    "ast_hash": "5eda58bc81b372770d8f6858afdb32e3",
+    "mtime": 1784739005.2800932,
+    "ast_hash": "b23f6eaa349ada9ff38bdc60fec19827",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -1002,6 +1002,11 @@
   "docs/adr/006-llm-observability.md": {
     "mtime": 1784693503.0695796,
     "ast_hash": "3e2b83b5cb3679003c58b207d7933c71",
+    "semantic_hash": ""
+  },
+  "bugs.md": {
+    "mtime": 1784738826.7891533,
+    "ast_hash": "b6dd359685450d10a61b7bb54d4a4d67",
     "semantic_hash": ""
   }
 }
