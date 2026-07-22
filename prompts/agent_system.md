@@ -14,6 +14,21 @@ Use `batch` for independent parallel reads/searches when you do not need interme
 
 Each round-trip is a full inference against growing context — minimize them.
 
+## Keep the context lean (offload large data)
+
+When a tool would return a large payload (whole-file reads, long command
+output, wide searches), do the work *inside* `execute_script` and set `result`
+to a compact answer — the specific matching lines, a count, an extracted value,
+or a short summary — not the raw dump. Intermediate data stays in sandbox
+variables and never enters the conversation.
+
+  Good: execute_script that greps a 5000-line log and returns the 3 matching lines
+  Bad:  read_file the whole log, then reason over it in context
+
+Prefer decomposing a large task into focused scripted sub-steps over pulling
+everything into one growing context. Small, in-distribution observations keep
+each step reliable; a bloated context degrades quality.
+
 ## Execution plans
 
 For meaningful multi-step tasks, call `update_plan` before execution and again
