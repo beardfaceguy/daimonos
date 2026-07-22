@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::compaction::{self, CompactionEvent, CompactionPolicy, CompactionStrategy};
 use crate::mcp_bridge::REMOTE_TOOL_PREFIX;
@@ -159,6 +160,7 @@ pub struct AgentConfig {
     /// Context/window compaction (ADR-002). `None` = off.
     pub compaction: Option<CompactionPolicy>,
     pub on_compaction: Option<CompactionHook>,
+    pub generation_ordinal: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct AgentResult {
@@ -309,14 +311,40 @@ pub async fn run(
             stable_prefix_len: 0,
         };
 
+        let ordinal = config
+            .generation_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let generation =
+            crate::observability::GenerationSpan::new(crate::observability::GenerationMetadata {
+                kind: "agent",
+                model: &config.opts.model,
+                max_tokens: config.opts.max_tokens,
+                thinking: config.opts.thinking.clone(),
+                temperature: config.opts.temperature,
+                ordinal,
+                tools_exposed: ctx.tools.len(),
+                stable_prefix_len: ctx.stable_prefix_len,
+            });
         let resp = match &config.on_stream_event {
             Some(hook) => {
                 provider
-                    .stream(&ctx, &config.opts, &mut |ev| hook(ev))
+                    .stream(&ctx, &config.opts, &mut |ev| {
+                        generation.mark_first_token();
+                        hook(ev);
+                    })
+                    .instrument(generation.span().clone())
                     .await
             }
-            None => provider.stream(&ctx, &config.opts, &mut |_| {}).await,
+            None => {
+                provider
+                    .stream(&ctx, &config.opts, &mut |_| {
+                        generation.mark_first_token();
+                    })
+                    .instrument(generation.span().clone())
+                    .await
+            }
         };
+        generation.finish(&resp);
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
         if let Some(log_cfg) = &config.token_log {
             log_token_usage(log_cfg, &config.opts.model, &resp.usage);
@@ -534,6 +562,9 @@ impl AgentSession {
     /// serialization, history persistence, and retries.
     pub async fn prompt_message(&mut self, user_message: Message) -> TurnResult {
         debug_assert_eq!(user_message.role, Role::User);
+        self.config
+            .generation_ordinal
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Proactive compaction (ADR-002): compact BEFORE the turn when the
         // last measured occupancy (or, if never measured, an estimate)
@@ -685,7 +716,28 @@ impl AgentSession {
         // session's cumulative usage like any other call.
         let mut summary_text: Option<String> = None;
         for _ in 0..2 {
-            let resp = self.provider.complete(&ctx, &opts).await;
+            let ordinal = self
+                .config
+                .generation_ordinal
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let generation = crate::observability::GenerationSpan::new(
+                crate::observability::GenerationMetadata {
+                    kind: "compaction_summary",
+                    model: &opts.model,
+                    max_tokens: opts.max_tokens,
+                    thinking: opts.thinking.clone(),
+                    temperature: opts.temperature,
+                    ordinal,
+                    tools_exposed: 0,
+                    stable_prefix_len: 0,
+                },
+            );
+            let resp = self
+                .provider
+                .complete(&ctx, &opts)
+                .instrument(generation.span().clone())
+                .await;
+            generation.finish(&resp);
             self.total_usage =
                 accumulate_usage(std::mem::take(&mut self.total_usage), resp.usage.clone());
             if let Some(log_cfg) = &self.config.token_log {
@@ -1009,6 +1061,13 @@ mod tests {
             sess.history()[2].content[0],
             ContentBlock::ToolResult { .. }
         ));
+        assert_eq!(
+            sess.config
+                .generation_ordinal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "tool loop must assign one ordinal per provider generation"
+        );
     }
 
     #[tokio::test]
@@ -1450,6 +1509,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_forwards_stream_events_to_hook() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         let provider = StreamingMockProvider {
@@ -1465,7 +1529,17 @@ mod tests {
             on_stream_event: Some(Box::new(move |ev| seen_clone.lock().unwrap().push(ev))),
             ..AgentConfig::default()
         };
-        let result = run(&provider, &mut s, vec![Message::user("hi")], &config).await;
+        let exporter = InMemorySpanExporter::default();
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("agent-run-test")),
+        );
+        let result = run(&provider, &mut s, vec![Message::user("hi")], &config)
+            .with_subscriber(subscriber)
+            .await;
+        tracer_provider.force_flush().unwrap();
         assert_eq!(result.stop_reason, StopReason::EndTurn);
         let seen = seen.lock().unwrap();
         assert_eq!(
@@ -1475,6 +1549,15 @@ mod tests {
                 StreamEvent::TextDelta("lo".into())
             ]
         );
+        let spans = exporter.get_finished_spans().unwrap();
+        let generation = spans
+            .iter()
+            .find(|span| span.name == "llm.generation")
+            .unwrap();
+        assert!(generation
+            .attributes
+            .iter()
+            .any(|attribute| { attribute.key.as_str() == "daimonos.time_to_first_token_ms" }));
     }
 
     #[tokio::test]
