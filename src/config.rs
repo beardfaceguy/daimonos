@@ -699,6 +699,16 @@ impl ObservabilityConfig {
                 self.basic_auth_password_env
             ));
         }
+        // RFC 7617 defaults to an implementation-defined legacy charset unless
+        // a server explicitly advertises UTF-8. Langfuse keys are ASCII, so
+        // reject ambiguous credentials instead of producing a header that may
+        // decode differently across OTLP collectors.
+        if !username.is_ascii() || !password.is_ascii() {
+            return Err(
+                "observability Basic Auth credentials must contain only ASCII characters"
+                    .to_string(),
+            );
+        }
         Ok(Some((username, password)))
     }
 }
