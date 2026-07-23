@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-23)
 
 ## Corpus Check
-- 198 files · ~216,464 words
+- 198 files · ~216,812 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4495 nodes · 10101 edges · 210 communities (192 shown, 18 thin omitted)
+- 4498 nodes · 10120 edges · 206 communities (188 shown, 18 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `1df7ee84`
+- Built from commit: `5a035d49`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -211,11 +211,7 @@
 - [[_COMMUNITY_Community 202|Community 202]]
 - [[_COMMUNITY_Community 203|Community 203]]
 - [[_COMMUNITY_Community 204|Community 204]]
-- [[_COMMUNITY_Community 205|Community 205]]
 - [[_COMMUNITY_Community 206|Community 206]]
-- [[_COMMUNITY_Community 207|Community 207]]
-- [[_COMMUNITY_Community 208|Community 208]]
-- [[_COMMUNITY_Community 209|Community 209]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 53 edges
@@ -263,7 +259,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (210 total, 18 thin omitted)
+## Communities (206 total, 18 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.21
@@ -275,7 +271,7 @@ Nodes (74): agent_runs_summary_aggregates_correctly(), agent_runs_summary_empty_
 
 ### Community 2 - "Community 2"
 Cohesion: 0.05
-Nodes (80): Dict, Globals, GlobalsBuilder, Handle, Heap, OnceLock, Semaphore, build_globals() (+72 more)
+Nodes (83): Dict, Globals, GlobalsBuilder, Handle, Heap, OnceLock, Semaphore, build_globals() (+75 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.06
@@ -326,8 +322,8 @@ Cohesion: 0.12
 Nodes (41): AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider(), dry_run_prints_task_in_output() (+33 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.32
-Nodes (15): concurrent_reindexes_serialize_correctly(), gated_root_skips_indexing(), incremental_adds_new_files(), incremental_combined_add_delete_modify(), incremental_removes_deleted_files(), incremental_skips_unchanged_files(), incremental_updates_modified_files(), index_and_search_fixture_dir() (+7 more)
+Cohesion: 0.10
+Nodes (49): IndexState, concurrent_reindexes_serialize_correctly(), eager_index_small_root_regardless_of_marker(), extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), gate_allows_large_marked_root() (+41 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.11
@@ -918,8 +914,8 @@ Cohesion: 0.23
 Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
 ### Community 188 - "Community 188"
-Cohesion: 0.14
-Nodes (19): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+11 more)
+Cohesion: 0.08
+Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
 
 ### Community 189 - "Community 189"
 Cohesion: 0.13
@@ -954,8 +950,8 @@ Cohesion: 0.16
 Nodes (14): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus (+6 more)
 
 ### Community 199 - "Community 199"
-Cohesion: 0.18
-Nodes (14): canonical_json(), content_hash(), filtered_walk_builder(), IndexResult, Substrate, DefNode, Edge, EffectFacts (+6 more)
+Cohesion: 0.23
+Nodes (7): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, RemoteToolSpan, Instant, ToolSpan
 
 ### Community 200 - "Community 200"
 Cohesion: 0.15
@@ -966,36 +962,20 @@ Cohesion: 0.25
 Nodes (11): SessionInfo, encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), paginate_session_summaries(), pagination_summary(), SessionSummary, session_info(), session_list_pagination_filters_before_slicing() (+3 more)
 
 ### Community 202 - "Community 202"
-Cohesion: 0.14
-Nodes (16): extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), IndexState, IndexStats, query_to_trigrams(), query_to_trigrams_normal() (+8 more)
+Cohesion: 0.29
+Nodes (7): full_prompt_trace_hierarchy_nests_all_observation_types(), GenerationSpan, AtomicBool, LlmResponse, sample_generation(), sample_response(), self_hosted_langfuse_smoke_test()
 
 ### Community 203 - "Community 203"
-Cohesion: 0.30
-Nodes (11): eager_index_small_root_regardless_of_marker(), gate_allows_large_marked_root(), gate_allows_large_root_with_git_dir(), gate_blocks_large_unmarked_root(), gate_disabled_always_eager(), has_project_marker(), preflight_within_budget(), IndexConfig (+3 more)
+Cohesion: 0.33
+Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
 
 ### Community 204 - "Community 204"
-Cohesion: 0.29
-Nodes (7): IndexState, Arc, HashSet, Mutex, PathBuf, RwLock, WorkspaceIndex
-
-### Community 205 - "Community 205"
-Cohesion: 0.23
-Nodes (7): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, RemoteToolSpan, Instant, ToolSpan
+Cohesion: 0.50
+Nodes (4): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Setup
 
 ### Community 206 - "Community 206"
 Cohesion: 0.25
 Nodes (7): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting
-
-### Community 207 - "Community 207"
-Cohesion: 0.29
-Nodes (7): full_prompt_trace_hierarchy_nests_all_observation_types(), GenerationSpan, AtomicBool, LlmResponse, sample_generation(), sample_response(), self_hosted_langfuse_smoke_test()
-
-### Community 208 - "Community 208"
-Cohesion: 0.50
-Nodes (4): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Setup
-
-### Community 209 - "Community 209"
-Cohesion: 0.33
-Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -1020,7 +1000,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
-  _High betweenness centrality (0.014) - this node is a cross-community bridge._
+  _High betweenness centrality (0.015) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 0`, `Community 34`, `Community 167`, `Community 136`, `Community 182`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **Why does `build_before_tool_call_hook()` connect `Community 182` to `Community 34`, `Community 168`, `Community 48`, `Community 82`, `Community 181`?**

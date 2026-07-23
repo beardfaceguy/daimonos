@@ -495,10 +495,14 @@ pub async fn run(
                             .await
                             .used_tools
                             .insert(EXECUTE_SCRIPT_TOOL.to_string());
-                        let script_fut = crate::script::execute(
+                        // Caller-owned op counter so batch_size reflects the ops
+                        // that ran even when the script errors mid-run.
+                        let op_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let script_fut = crate::script::execute_with_op_count(
                             &code,
                             std::sync::Arc::clone(&session),
                             std::time::Duration::from_secs(timeout_secs),
+                            std::sync::Arc::clone(&op_count),
                         );
                         let script_result = match &tool_span {
                             Some(span) => script_fut.instrument(span.span().clone()).await,
@@ -517,7 +521,9 @@ pub async fn run(
                         let outcome = ToolOutcome {
                             request_tokens_est: crate::analytics::estimate_tokens(request_chars),
                             response_tokens_est: crate::analytics::estimate_tokens(content.len()),
-                            batch_size: 1,
+                            // Child-op count (D5); read after the run so it holds
+                            // even on a mid-run script error.
+                            batch_size: op_count.load(std::sync::atomic::Ordering::Relaxed) as u64,
                             ..ToolOutcome::default()
                         };
                         (content, is_error, Some(outcome))

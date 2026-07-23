@@ -8,7 +8,7 @@ use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
 use starlark::values::{Heap, Value as StarlarkValue};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -134,10 +134,26 @@ impl Drop for CancelOnDrop {
 ///    its thread until that inner op completes.
 /// 3. Spawn failure — `std::thread::Builder::spawn` can fail under
 ///    extreme resource pressure; we surface this as an error.
+///
+/// Run a Starlark script, discarding the dispatched-op count. Most callers
+/// (the MCP server, tests) don't need it; the agent loop uses
+/// [`execute_with_op_count`] to feed the parent span's batch_size.
 pub async fn execute(
     code: &str,
     session: Arc<Mutex<Session>>,
     timeout: Duration,
+) -> Result<ScriptResult, String> {
+    execute_with_op_count(code, session, timeout, Arc::new(AtomicUsize::new(0))).await
+}
+
+/// As [`execute`], but the caller owns the op counter so it can read the
+/// number of tool ops the script dispatched even if the script errors
+/// mid-run (used as the execute_script span's `daimonos.tool.batch_size`).
+pub async fn execute_with_op_count(
+    code: &str,
+    session: Arc<Mutex<Session>>,
+    timeout: Duration,
+    op_count: Arc<AtomicUsize>,
 ) -> Result<ScriptResult, String> {
     let code = code.to_string();
     let handle = tokio::runtime::Handle::current();
@@ -204,8 +220,8 @@ pub async fn execute(
             // `in_scope` keeps the parent span active for exactly the
             // synchronous script run on this dedicated thread, rather than
             // holding an `enter()` guard across the whole closure.
-            let result =
-                parent_span.in_scope(|| run_starlark(&code, session, handle, cancel_for_thread));
+            let result = parent_span
+                .in_scope(|| run_starlark(&code, session, handle, cancel_for_thread, op_count));
             let _ = tx.send(result);
         })
         .map_err(|e| format!("spawn script thread: {e}"))?;
@@ -369,12 +385,13 @@ fn run_starlark(
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
     cancel: Arc<AtomicBool>,
+    op_count: Arc<AtomicUsize>,
 ) -> Result<ScriptResult, String> {
     let code = normalize_string_literals(code);
     let ast = AstModule::parse("script", code, &Dialect::Standard)
         .map_err(|e| format!("parse error: {e}"))?;
 
-    let globals = build_globals(session, handle, cancel);
+    let globals = build_globals(session, handle, cancel, op_count);
     let module = Module::new();
 
     PRINT_LOG.with(|log| log.borrow_mut().clear());
@@ -447,6 +464,7 @@ fn build_globals(
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
     cancel: Arc<AtomicBool>,
+    op_count: Arc<AtomicUsize>,
 ) -> Globals {
     // We store session + handle + cancel flag in a thread-local so the
     // starlark_module functions can access them without capturing closures.
@@ -455,6 +473,7 @@ fn build_globals(
             session,
             handle,
             cancel,
+            op_count,
         });
     });
 
@@ -471,6 +490,11 @@ struct ToolContext {
     /// checks this flag and short-circuits with an error so the Starlark
     /// evaluator unwinds and the script thread exits.
     cancel: Arc<AtomicBool>,
+    /// Caller-owned counter of tool ops dispatched via `dispatch_request`,
+    /// surfaced as the parent execute_script span's batch_size (ADR-006 D5).
+    /// Owned by the caller so the count survives even when the script errors
+    /// after dispatching some ops.
+    op_count: Arc<AtomicUsize>,
 }
 
 thread_local! {
@@ -534,32 +558,61 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
     let started = std::time::Instant::now();
 
     with_ctx(|ctx| {
+        ctx.op_count.fetch_add(1, Ordering::Relaxed);
+        // Child `tool.call` span for this script op. It nests under the
+        // execute_script parent span propagated onto this thread (ADR-006 D4,
+        // vikunja #1045) and reuses the same signals as the analytics record.
+        // Metadata-only — no command/args/result bodies (D6).
+        let child_span =
+            crate::observability::ToolSpan::new(label, crate::observability::tool_kind(label));
         let session = ctx.session.clone();
-        let resp = ctx.handle.block_on(async {
-            let mut s = session.lock().await;
-            let resp = ops::dispatch(&mut s, request).await;
-            if let Some(analytics) = s.analytics.clone() {
-                let resp_chars = response_chars(&resp);
-                let (saved_tokens, savings_pct) =
-                    analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
-                let record = ToolCallRecord {
-                    tool_name: format!("script:{label}"),
-                    command,
-                    request_tokens: analytics::estimate_tokens(request_chars),
-                    response_tokens: analytics::estimate_tokens(resp_chars),
-                    saved_tokens,
-                    savings_pct,
-                    exec_time_ms: started.elapsed().as_millis() as u64,
-                    was_redirect: resp.meta.redirect_via_plugin,
-                    was_filtered: resp.meta.filter_applied,
-                    read_dedup: resp.meta.read_dedup,
-                    batch_size,
-                    external_session_id: s.external_session_id.clone(),
-                };
-                analytics.record_async(record);
-            }
-            resp
+        let resp = child_span.span().in_scope(|| {
+            ctx.handle.block_on(async {
+                let mut s = session.lock().await;
+                let resp = ops::dispatch(&mut s, request).await;
+                if let Some(analytics) = s.analytics.clone() {
+                    let resp_chars = response_chars(&resp);
+                    let (saved_tokens, savings_pct) =
+                        analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
+                    let record = ToolCallRecord {
+                        tool_name: format!("script:{label}"),
+                        command,
+                        request_tokens: analytics::estimate_tokens(request_chars),
+                        response_tokens: analytics::estimate_tokens(resp_chars),
+                        saved_tokens,
+                        savings_pct,
+                        exec_time_ms: started.elapsed().as_millis() as u64,
+                        was_redirect: resp.meta.redirect_via_plugin,
+                        was_filtered: resp.meta.filter_applied,
+                        read_dedup: resp.meta.read_dedup,
+                        batch_size,
+                        external_session_id: s.external_session_id.clone(),
+                    };
+                    analytics.record_async(record);
+                }
+                resp
+            })
         });
+        let resp_chars = response_chars(&resp);
+        let (saved_tokens_est, _) =
+            analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
+        let status = if resp.ok {
+            crate::observability::ToolStatus::Success
+        } else {
+            crate::observability::ToolStatus::Error
+        };
+        child_span.finish(
+            status,
+            crate::observability::ToolOutcome {
+                request_tokens_est: analytics::estimate_tokens(request_chars),
+                response_tokens_est: analytics::estimate_tokens(resp_chars),
+                saved_tokens_est,
+                redirect: resp.meta.redirect_via_plugin,
+                filtered: resp.meta.filter_applied,
+                read_dedup: resp.meta.read_dedup,
+                batch_size: batch_size as u64,
+            },
+        );
         Ok(resp)
     })
 }
@@ -1153,6 +1206,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn execute_counts_dispatched_ops_for_batch_size() {
+        // vikunja #1045: op_count is surfaced as the parent execute_script
+        // span's batch_size. Two read_file dispatches -> op_count 2.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "B").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+        let op_count = Arc::new(AtomicUsize::new(0));
+        let code = "_a = read_file(\"a.txt\")\n_b = read_file(\"b.txt\")\nresult = \"done\"";
+        execute_with_op_count(
+            code,
+            session,
+            Duration::from_secs(10),
+            Arc::clone(&op_count),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            op_count.load(Ordering::Relaxed),
+            2,
+            "two read_file ops should be counted"
+        );
     }
 
     #[tokio::test]
