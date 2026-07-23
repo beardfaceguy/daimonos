@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
+use tracing::Instrument;
 
 use crate::analytics::{self, ToolCallRecord};
 use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
@@ -883,14 +884,35 @@ fn reserve_subcalls(env: &SubcallEnv, n: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Run one LLM sub-call synchronously on the script thread: emit a
-/// `script_subcall` generation span, block on the provider, fold spend into
-/// the shared usage accumulator, and return the completion text (or error).
-fn run_one_subcall(
-    ctx: &ToolContext,
-    env: &SubcallEnv,
-    prompt: &str,
-) -> Result<String, anyhow::Error> {
+/// Classify a sub-call response into an error message, or `None` if it is a
+/// usable completion. Only `EndTurn`/`MaxTokens` (and the tools-less
+/// `ToolUse`) yield text — `MaxTokens` is truncated but still usable, whereas
+/// a `Refusal`, `Aborted`, or `Error` must not masquerade as a successful
+/// empty result.
+fn classify_subcall_failure(resp: &crate::providers::LlmResponse) -> Option<String> {
+    match resp.stop_reason {
+        StopReason::EndTurn | StopReason::MaxTokens | StopReason::ToolUse => None,
+        StopReason::Error => Some(
+            resp.error_message
+                .clone()
+                .unwrap_or_else(|| "llm sub-call failed".to_string()),
+        ),
+        StopReason::Refusal => Some("llm sub-call refused".to_string()),
+        StopReason::Aborted => Some("llm sub-call aborted".to_string()),
+    }
+}
+
+/// Run one LLM sub-call: emit a `script_subcall` generation span, call the
+/// provider, fold spend into the shared usage accumulator (regardless of
+/// outcome — a failed call can still have burned input tokens), and return
+/// the completion text or a per-call error string.
+///
+/// NOTE: an in-flight sub-call is not interrupted by the parent
+/// `execute_script` timeout/cancel. Like a native tool op, cancellation is
+/// observed *between* sandbox operations (in `with_ctx`), not mid-call, so a
+/// slow provider call can outlive the turn. Callers needing a hard bound
+/// should keep sub-call prompts small.
+async fn run_one_subcall_async(env: &SubcallEnv, prompt: &str) -> Result<String, String> {
     let ordinal = env.ordinal.fetch_add(1, Ordering::Relaxed);
     let generation =
         crate::observability::GenerationSpan::new(crate::observability::GenerationMetadata {
@@ -915,24 +937,33 @@ fn run_one_subcall(
         thinking: ThinkingLevel::Off,
         temperature: None,
     };
-    let resp = generation
-        .span()
-        .in_scope(|| ctx.handle.block_on(env.provider.complete(&context, &opts)));
-    // Fold spend into the shared accumulator regardless of outcome — a failed
-    // call can still have burned input tokens.
+    let resp = env
+        .provider
+        .complete(&context, &opts)
+        .instrument(generation.span().clone())
+        .await;
     if let Ok(mut acc) = env.usage.lock() {
         *acc = crate::agent::accumulate_usage(std::mem::take(&mut *acc), resp.usage.clone());
     }
     let text = subcall_text(&resp.content);
-    let is_error = resp.stop_reason == StopReason::Error;
-    let error_message = resp.error_message.clone();
+    let failure = classify_subcall_failure(&resp);
     generation.finish(&resp);
-    if is_error {
-        return Err(anyhow::anyhow!(
-            error_message.unwrap_or_else(|| "llm sub-call failed".to_string())
-        ));
+    match failure {
+        Some(msg) => Err(msg),
+        None => Ok(text),
     }
-    Ok(text)
+}
+
+/// `llm_query` helper: drive a single sub-call to completion on the script
+/// thread, surfacing any provider/refusal error as an `anyhow` error.
+fn run_one_subcall(
+    ctx: &ToolContext,
+    env: &SubcallEnv,
+    prompt: &str,
+) -> Result<String, anyhow::Error> {
+    ctx.handle
+        .block_on(run_one_subcall_async(env, prompt))
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Build a `{ok, text, error}` outcome dict for one batched sub-call.
@@ -1000,11 +1031,21 @@ fn subcall_functions(builder: &mut GlobalsBuilder) {
                 ));
             }
             reserve_subcalls(env, prompts.len())?;
-            let mut items = Vec::with_capacity(prompts.len());
-            for prompt in &prompts {
-                let dict = match run_one_subcall(ctx, env, prompt) {
+            // Fan the prompts out concurrently on the script thread's runtime
+            // — batching exists for latency (ADR-008). Results keep prompt
+            // order; each yields an outcome dict so one failure does not abort
+            // the batch.
+            let outcomes: Vec<Result<String, String>> = ctx.handle.block_on(async {
+                futures_util::future::join_all(
+                    prompts.iter().map(|p| run_one_subcall_async(env, p)),
+                )
+                .await
+            });
+            let mut items = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                let dict = match outcome {
                     Ok(text) => outcome_dict(heap, true, Some(text), None),
-                    Err(e) => outcome_dict(heap, false, None, Some(e.to_string())),
+                    Err(e) => outcome_dict(heap, false, None, Some(e)),
                 };
                 items.push(heap.alloc(dict));
             }
@@ -2142,5 +2183,36 @@ result = {"lines": lines, "status": "ok"}
         .await
         .unwrap_err();
         assert!(err.contains("max_script_subcall_batch"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn llm_query_treats_refusal_as_error() {
+        // A Refusal/Aborted stop reason must not surface as a successful
+        // (possibly empty) completion.
+        struct RefusingProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for RefusingProvider {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                LlmResponse {
+                    content: vec![ContentBlock::Text("partial".into())],
+                    stop_reason: StopReason::Refusal,
+                    error_message: None,
+                    context_overflow: false,
+                    usage: Usage::default(),
+                }
+            }
+        }
+        let provider: Arc<dyn LlmProvider> = Arc::new(RefusingProvider);
+        let (env, _usage) = subcall_env(provider, 8, 4);
+        let err = execute_with_op_count(
+            "result = llm_query(\"hi\")",
+            test_session(),
+            Duration::from_secs(5),
+            Arc::new(AtomicUsize::new(0)),
+            Some(env),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("refused"), "got: {err}");
     }
 }
