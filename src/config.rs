@@ -134,6 +134,15 @@ pub struct ProcessConfig {
     /// `execute_script` calls block until a slot is free, capped by the
     /// caller's script timeout.
     pub max_script_threads: usize,
+    /// Enable in-script LLM sub-calls (`llm_query`/`llm_query_batched`,
+    /// ADR-008). Off by default; only engaged in agent/chat/ACP mode where a
+    /// provider is available.
+    pub script_llm_enabled: bool,
+    /// Max LLM sub-calls a single `execute_script` run may issue (fan-out +
+    /// sequential total). Bounds cost/latency blast radius.
+    pub max_script_subcalls: usize,
+    /// Max prompts a single `llm_query_batched` call may take.
+    pub max_script_subcall_batch: usize,
 }
 
 /// Default cap for `ProcessConfig::max_script_threads`. Exposed so the
@@ -770,6 +779,9 @@ impl Default for ProcessConfig {
             exec_output_filters: true,
             exec_plugin_redirect: true,
             max_script_threads: DEFAULT_MAX_SCRIPT_THREADS,
+            script_llm_enabled: false,
+            max_script_subcalls: 32,
+            max_script_subcall_batch: 16,
         }
     }
 }

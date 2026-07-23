@@ -1,7 +1,7 @@
 # ADR-008: Programmatic LLM sub-calls in `execute_script`
 
 **Date:** 2026-07-22
-**Status:** Proposed
+**Status:** Accepted (2026-07-23)
 **Tracks:** Vikunja #1049 (project 183); follows the RLM research spike #1044
 **Relates to:** ADR-001 (provider boundary), ADR-006 (observability),
 ADR-007 (context-offload handles), ADR-002 (compaction).

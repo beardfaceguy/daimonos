@@ -1082,6 +1082,7 @@ fn build_agent_config(
         }),
         compaction,
         remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge_slot)),
+        subcall_provider: None,
         generation_ordinal: Default::default(),
     }
 }

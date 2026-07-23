@@ -1158,6 +1158,54 @@ mod tests {
     }
 
     #[test]
+    fn generation_span_records_time_to_first_token() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ttft-test")));
+        // Fully synchronous span lifecycle under `with_default` — the
+        // deterministic pattern (no tokio/async in the export path).
+        tracing::subscriber::with_default(subscriber, || {
+            let generation = GenerationSpan::new(GenerationMetadata {
+                kind: "agent",
+                model: "test-model",
+                max_tokens: 100,
+                thinking: crate::providers::ThinkingLevel::Off,
+                temperature: None,
+                ordinal: 0,
+                tools_exposed: 0,
+                stable_prefix_len: 0,
+            });
+            // The first observed token records time-to-first-token (ADR-006).
+            generation.mark_first_token();
+            generation.finish(&crate::providers::LlmResponse {
+                content: vec![],
+                stop_reason: crate::providers::StopReason::EndTurn,
+                error_message: None,
+                context_overflow: false,
+                usage: crate::providers::Usage::default(),
+            });
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let generation = spans
+            .iter()
+            .find(|span| span.name == "llm.generation")
+            .expect("llm.generation span must be exported");
+        assert!(generation
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == "daimonos.time_to_first_token_ms"));
+    }
+
+    #[test]
     fn prompt_root_omits_absent_session_id() {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};

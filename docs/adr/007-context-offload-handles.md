@@ -1,7 +1,7 @@
 # ADR-007: Context-offload handles for tool outputs
 
 **Date:** 2026-07-22
-**Status:** Proposed
+**Status:** Accepted (2026-07-23)
 **Tracks:** Vikunja #1048 (project 183); follows the RLM research spike #1044
 **Relates to:** ADR-006 (LLM observability), ADR-002 (compaction);
 depends on the "execute_script reachable in the internal agent loop"
