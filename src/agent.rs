@@ -504,20 +504,22 @@ pub async fn run(
                             Some(span) => script_fut.instrument(span.span().clone()).await,
                             None => script_fut.await,
                         };
-                        let (content, is_error) = match script_result {
+                        let (content, is_error, op_count) = match script_result {
                             Ok(result) => {
+                                // Child-op count → parent span batch_size (D5).
+                                let op_count = result.op_count as u64;
                                 let mut response = serde_json::json!({ "result": result.value });
                                 if !result.logs.is_empty() {
                                     response["logs"] = serde_json::json!(result.logs);
                                 }
-                                (response.to_string(), false)
+                                (response.to_string(), false, op_count)
                             }
-                            Err(error) => (error, true),
+                            Err(error) => (error, true, 0),
                         };
                         let outcome = ToolOutcome {
                             request_tokens_est: crate::analytics::estimate_tokens(request_chars),
                             response_tokens_est: crate::analytics::estimate_tokens(content.len()),
-                            batch_size: 1,
+                            batch_size: op_count,
                             ..ToolOutcome::default()
                         };
                         (content, is_error, Some(outcome))

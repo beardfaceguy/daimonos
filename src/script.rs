@@ -82,6 +82,9 @@ thread_local! {
 pub struct ScriptResult {
     pub value: Value,
     pub logs: Vec<String>,
+    /// Number of tool operations the script dispatched, used as the parent
+    /// execute_script span's `daimonos.tool.batch_size` (ADR-006 D5).
+    pub op_count: usize,
 }
 
 /// Drop-guard that flips a cancellation `AtomicBool` when dropped.
@@ -397,10 +400,13 @@ fn run_starlark(
     };
 
     let logs = PRINT_LOG.with(|log| log.borrow().clone());
+    let op_count =
+        TOOL_CTX.with(|ctx| ctx.borrow().as_ref().map(|c| c.op_count.get()).unwrap_or(0));
 
     Ok(ScriptResult {
         value: json_val,
         logs,
+        op_count,
     })
 }
 
@@ -455,6 +461,7 @@ fn build_globals(
             session,
             handle,
             cancel,
+            op_count: std::cell::Cell::new(0),
         });
     });
 
@@ -471,6 +478,9 @@ struct ToolContext {
     /// checks this flag and short-circuits with an error so the Starlark
     /// evaluator unwinds and the script thread exits.
     cancel: Arc<AtomicBool>,
+    /// Count of tool ops dispatched via `dispatch_request`, surfaced as the
+    /// parent execute_script span's batch_size (ADR-006 D5).
+    op_count: std::cell::Cell<usize>,
 }
 
 thread_local! {
@@ -534,32 +544,61 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
     let started = std::time::Instant::now();
 
     with_ctx(|ctx| {
+        ctx.op_count.set(ctx.op_count.get() + 1);
+        // Child `tool.call` span for this script op. It nests under the
+        // execute_script parent span propagated onto this thread (ADR-006 D4,
+        // vikunja #1045) and reuses the same signals as the analytics record.
+        // Metadata-only — no command/args/result bodies (D6).
+        let child_span =
+            crate::observability::ToolSpan::new(label, crate::observability::tool_kind(label));
         let session = ctx.session.clone();
-        let resp = ctx.handle.block_on(async {
-            let mut s = session.lock().await;
-            let resp = ops::dispatch(&mut s, request).await;
-            if let Some(analytics) = s.analytics.clone() {
-                let resp_chars = response_chars(&resp);
-                let (saved_tokens, savings_pct) =
-                    analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
-                let record = ToolCallRecord {
-                    tool_name: format!("script:{label}"),
-                    command,
-                    request_tokens: analytics::estimate_tokens(request_chars),
-                    response_tokens: analytics::estimate_tokens(resp_chars),
-                    saved_tokens,
-                    savings_pct,
-                    exec_time_ms: started.elapsed().as_millis() as u64,
-                    was_redirect: resp.meta.redirect_via_plugin,
-                    was_filtered: resp.meta.filter_applied,
-                    read_dedup: resp.meta.read_dedup,
-                    batch_size,
-                    external_session_id: s.external_session_id.clone(),
-                };
-                analytics.record_async(record);
-            }
-            resp
+        let resp = child_span.span().in_scope(|| {
+            ctx.handle.block_on(async {
+                let mut s = session.lock().await;
+                let resp = ops::dispatch(&mut s, request).await;
+                if let Some(analytics) = s.analytics.clone() {
+                    let resp_chars = response_chars(&resp);
+                    let (saved_tokens, savings_pct) =
+                        analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
+                    let record = ToolCallRecord {
+                        tool_name: format!("script:{label}"),
+                        command,
+                        request_tokens: analytics::estimate_tokens(request_chars),
+                        response_tokens: analytics::estimate_tokens(resp_chars),
+                        saved_tokens,
+                        savings_pct,
+                        exec_time_ms: started.elapsed().as_millis() as u64,
+                        was_redirect: resp.meta.redirect_via_plugin,
+                        was_filtered: resp.meta.filter_applied,
+                        read_dedup: resp.meta.read_dedup,
+                        batch_size,
+                        external_session_id: s.external_session_id.clone(),
+                    };
+                    analytics.record_async(record);
+                }
+                resp
+            })
         });
+        let resp_chars = response_chars(&resp);
+        let (saved_tokens_est, _) =
+            analytics::compute_savings(resp.meta.unfiltered_chars, resp_chars);
+        let status = if resp.ok {
+            crate::observability::ToolStatus::Success
+        } else {
+            crate::observability::ToolStatus::Error
+        };
+        child_span.finish(
+            status,
+            crate::observability::ToolOutcome {
+                request_tokens_est: analytics::estimate_tokens(request_chars),
+                response_tokens_est: analytics::estimate_tokens(resp_chars),
+                saved_tokens_est,
+                redirect: resp.meta.redirect_via_plugin,
+                filtered: resp.meta.filter_applied,
+                read_dedup: resp.meta.read_dedup,
+                batch_size: batch_size as u64,
+            },
+        );
         Ok(resp)
     })
 }
@@ -1153,6 +1192,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn execute_counts_dispatched_ops_for_batch_size() {
+        // vikunja #1045: op_count is surfaced as the parent execute_script
+        // span's batch_size. Two read_file dispatches -> op_count 2.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "B").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+        let code = "_a = read_file(\"a.txt\")\n_b = read_file(\"b.txt\")\nresult = \"done\"";
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(result.op_count, 2, "two read_file ops should be counted");
     }
 
     #[tokio::test]
