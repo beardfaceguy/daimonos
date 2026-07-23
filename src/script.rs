@@ -185,6 +185,12 @@ pub async fn execute(
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<ScriptResult, String>>();
 
+    // Carry the caller's tracing context (the `agent.prompt` / `tool.call`
+    // span, when execute_script runs under the internal agent loop) onto the
+    // dedicated OS thread, so spans created during dispatch nest under it
+    // instead of orphaning. A no-op when there is no active span.
+    let parent_span = tracing::Span::current();
+
     std::thread::Builder::new()
         // Linux truncates `/proc/<pid>/task/<tid>/comm` to 15 chars
         // (`TASK_COMM_LEN - 1`). Keep this prefix short so it shows
@@ -195,7 +201,11 @@ pub async fn execute(
             // closure exits, whether by completion, eval error, or the
             // cancel-flag unwind path.
             let _permit = permit;
-            let result = run_starlark(&code, session, handle, cancel_for_thread);
+            // `in_scope` keeps the parent span active for exactly the
+            // synchronous script run on this dedicated thread, rather than
+            // holding an `enter()` guard across the whole closure.
+            let result =
+                parent_span.in_scope(|| run_starlark(&code, session, handle, cancel_for_thread));
             let _ = tx.send(result);
         })
         .map_err(|e| format!("spawn script thread: {e}"))?;

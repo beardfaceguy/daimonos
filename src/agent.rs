@@ -52,6 +52,16 @@ pub type ToolProgressHook = Box<dyn Fn(&ToolCallInfo, crate::ops::ExecProgress) 
 
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 
+/// The Starlark scripting tool. Dispatched specially in [`run`] because its
+/// sandbox thread shares the live session via `Arc<Mutex<Session>>`.
+pub const EXECUTE_SCRIPT_TOOL: &str = "execute_script";
+
+/// Upper safety ceiling for a model-supplied `execute_script` timeout (1 hour).
+/// Not a user-tunable knob — it only prevents a malformed/oversized value from
+/// tying up a bounded script-thread slot near-indefinitely; it sits well above
+/// any realistic script run (default is 60s).
+const MAX_SCRIPT_TIMEOUT_SECS: i64 = 3600;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPriority {
@@ -315,7 +325,7 @@ fn log_compaction_event(cfg: &TokenLogConfig, event: &CompactionEvent) {
 
 pub async fn run(
     provider: &dyn LlmProvider,
-    session: &mut Session,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
     initial_messages: Vec<Message>,
     config: &AgentConfig,
 ) -> AgentResult {
@@ -448,15 +458,70 @@ pub async fn run(
                     // measured. Remote MCP tools are spanned as `mcp.remote_tool`
                     // in the bridge; anything that resolves to neither is
                     // recorded below as `unavailable`.
-                    let native =
-                        name == UPDATE_PLAN_TOOL || crate::tools::has_opcode_mapping(&name);
-                    let tool_span = native.then(|| {
+                    // Tools dispatched inside this loop (opcode/native via the
+                    // facade, the plan tool, and execute_script) get a
+                    // `tool.call` span. Remote MCP tools are spanned as
+                    // `mcp.remote_tool` in the bridge; anything resolving to
+                    // neither is recorded below as `unavailable`.
+                    let dispatched = name == UPDATE_PLAN_TOOL
+                        || name == EXECUTE_SCRIPT_TOOL
+                        || crate::tools::has_opcode_mapping(&name);
+                    let tool_span = dispatched.then(|| {
                         crate::observability::ToolSpan::new(
                             &name,
                             crate::observability::tool_kind(&name),
                         )
                     });
-                    let (content, is_error, outcome) = if name == UPDATE_PLAN_TOOL {
+                    let (content, is_error, outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                        // execute_script shares the live session with its
+                        // Starlark sandbox thread, so the loop hands it an
+                        // `Arc<Mutex<Session>>` clone rather than a `&mut`.
+                        let code = input
+                            .get("code")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let timeout_secs = input
+                            .get("timeout")
+                            .and_then(serde_json::Value::as_i64)
+                            // Non-positive → default (also guards a negative
+                            // value wrapping to a huge u64); clamp the upper
+                            // bound to the safety ceiling.
+                            .filter(|secs| *secs > 0)
+                            .map(|secs| secs.min(MAX_SCRIPT_TIMEOUT_SECS))
+                            .unwrap_or(60) as u64;
+                        session
+                            .lock()
+                            .await
+                            .used_tools
+                            .insert(EXECUTE_SCRIPT_TOOL.to_string());
+                        let script_fut = crate::script::execute(
+                            &code,
+                            std::sync::Arc::clone(&session),
+                            std::time::Duration::from_secs(timeout_secs),
+                        );
+                        let script_result = match &tool_span {
+                            Some(span) => script_fut.instrument(span.span().clone()).await,
+                            None => script_fut.await,
+                        };
+                        let (content, is_error) = match script_result {
+                            Ok(result) => {
+                                let mut response = serde_json::json!({ "result": result.value });
+                                if !result.logs.is_empty() {
+                                    response["logs"] = serde_json::json!(result.logs);
+                                }
+                                (response.to_string(), false)
+                            }
+                            Err(error) => (error, true),
+                        };
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            response_tokens_est: crate::analytics::estimate_tokens(content.len()),
+                            batch_size: 1,
+                            ..ToolOutcome::default()
+                        };
+                        (content, is_error, Some(outcome))
+                    } else if name == UPDATE_PLAN_TOOL {
                         let (content, is_error) = match parse_plan_entries(&input) {
                             Ok(entries) => {
                                 if let Some(hook) = &config.on_plan_update {
@@ -476,25 +541,37 @@ pub async fn run(
                         };
                         (content, is_error, Some(outcome))
                     } else {
-                        let facade = match &tool_span {
-                            Some(span) => {
-                                tool_facade::invoke_with_progress(
-                                    session,
-                                    &name,
-                                    &input,
-                                    progress_callback,
-                                )
-                                .instrument(span.span().clone())
-                                .await
-                            }
-                            None => {
-                                tool_facade::invoke_with_progress(
-                                    session,
-                                    &name,
-                                    &input,
-                                    progress_callback,
-                                )
-                                .await
+                        // A native tool needs exclusive `&mut Session` for its
+                        // whole execution, so the guard is held across the call.
+                        // That starves no one: tool calls in a turn are
+                        // sequential and each session's `run` is serialized by
+                        // the frontend, so nothing else (including the sandbox
+                        // thread, which only runs inside the execute_script
+                        // branch of another iteration) contends for it here.
+                        // Locking per call — not for the whole turn — is what
+                        // lets that later execute_script branch acquire it.
+                        let facade = {
+                            let mut session_guard = session.lock().await;
+                            match &tool_span {
+                                Some(span) => {
+                                    tool_facade::invoke_with_progress(
+                                        &mut session_guard,
+                                        &name,
+                                        &input,
+                                        progress_callback,
+                                    )
+                                    .instrument(span.span().clone())
+                                    .await
+                                }
+                                None => {
+                                    tool_facade::invoke_with_progress(
+                                        &mut session_guard,
+                                        &name,
+                                        &input,
+                                        progress_callback,
+                                    )
+                                    .await
+                                }
                             }
                         };
                         match facade {
@@ -628,7 +705,10 @@ pub struct TurnResult {
 /// core for the REPL and ACP frontends (project #183).
 pub struct AgentSession {
     provider: Box<dyn LlmProvider>,
-    tool_session: Session,
+    /// Shared with `execute_script`'s Starlark sandbox thread, so it is an
+    /// `Arc<Mutex<Session>>` rather than an owned `Session`. The tool loop
+    /// locks it per native call and clones the `Arc` for script execution.
+    tool_session: std::sync::Arc<tokio::sync::Mutex<Session>>,
     config: AgentConfig,
     messages: Vec<Message>,
     total_usage: Usage,
@@ -644,7 +724,7 @@ impl AgentSession {
     pub fn new(provider: Box<dyn LlmProvider>, tool_session: Session, config: AgentConfig) -> Self {
         AgentSession {
             provider,
-            tool_session,
+            tool_session: std::sync::Arc::new(tokio::sync::Mutex::new(tool_session)),
             config,
             messages: Vec::new(),
             total_usage: Usage::default(),
@@ -735,7 +815,7 @@ impl AgentSession {
         history.push(user_message.clone());
         let result = run(
             self.provider.as_ref(),
-            &mut self.tool_session,
+            std::sync::Arc::clone(&self.tool_session),
             history,
             &self.config,
         )
@@ -1146,6 +1226,12 @@ mod tests {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
     }
 
+    /// Wrap a session for `run`, which now shares it with execute_script's
+    /// sandbox thread via `Arc<Mutex<Session>>` (vikunja #1050).
+    fn shared(session: Session) -> Arc<tokio::sync::Mutex<Session>> {
+        Arc::new(tokio::sync::Mutex::new(session))
+    }
+
     // --- AgentSession (multi-turn, project #183) ---
 
     #[tokio::test]
@@ -1242,6 +1328,37 @@ mod tests {
             2,
             "tool loop must assign one ordinal per provider generation"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_script_runs_in_the_agent_loop() {
+        // vikunja #1050 phase (a): execute_script is now dispatchable inside
+        // agent::run (previously it fell through to "not available in agent
+        // mode"). Its Starlark sandbox shares the loop's session.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "execute_script", json!({"code": "result = 40 + 2"})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("compute").await;
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        assert_eq!(sess.history().len(), 4);
+        match &sess.history()[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(
+                    !is_error,
+                    "execute_script errored in the agent loop: {content}"
+                );
+                assert!(
+                    content.contains("42"),
+                    "expected the script result 42, got: {content}"
+                );
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1540,7 +1657,7 @@ mod tests {
     async fn run_writes_token_log_when_configured() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("tokens.log");
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
         let config = AgentConfig {
             token_log: Some(TokenLogConfig {
@@ -1549,7 +1666,7 @@ mod tests {
             }),
             ..AgentConfig::default()
         };
-        run(&provider, &mut s, vec![Message::user("hi")], &config).await;
+        run(&provider, shared(s), vec![Message::user("hi")], &config).await;
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(content.lines().count(), 1);
         assert!(content.contains("\"cmd\":\"agent\""));
@@ -1559,11 +1676,11 @@ mod tests {
     async fn run_does_not_write_token_log_when_not_configured() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("tokens.log");
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
         run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("hi")],
             &AgentConfig::default(),
         )
@@ -1698,7 +1815,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = StreamingMockProvider {
             events: vec![
                 StreamEvent::TextDelta("hel".into()),
@@ -1719,7 +1836,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(
             tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("agent-run-test")),
         );
-        let result = run(&provider, &mut s, vec![Message::user("hi")], &config)
+        let result = run(&provider, shared(s), vec![Message::user("hi")], &config)
             .with_subscriber(subscriber)
             .await;
         tracer_provider.force_flush().unwrap();
@@ -1746,14 +1863,14 @@ mod tests {
     #[tokio::test]
     async fn run_without_hook_still_calls_stream_and_ignores_events() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = StreamingMockProvider {
             events: vec![StreamEvent::TextDelta("x".into())],
             response: end_turn_resp(),
         };
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("hi")],
             &AgentConfig::default(),
         )
@@ -1766,11 +1883,11 @@ mod tests {
     #[tokio::test]
     async fn end_turn_stops_loop() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![end_turn_resp()]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("hi")],
             &AgentConfig::default(),
         )
@@ -1783,11 +1900,11 @@ mod tests {
     #[tokio::test]
     async fn provider_error_stops_loop_cleanly() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse::error("API failed")]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("hi")],
             &AgentConfig::default(),
         )
@@ -1799,7 +1916,7 @@ mod tests {
     #[tokio::test]
     async fn max_tokens_stops_loop_cleanly() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse {
             content: vec![],
             stop_reason: StopReason::MaxTokens,
@@ -1809,7 +1926,7 @@ mod tests {
         }]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("go")],
             &AgentConfig::default(),
         )
@@ -1820,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn usage_accumulates_across_turns() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "nonexistent_tool", json!({})),
             LlmResponse {
@@ -1833,7 +1950,7 @@ mod tests {
         ]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("go")],
             &AgentConfig::default(),
         )
@@ -1845,14 +1962,14 @@ mod tests {
     #[tokio::test]
     async fn assistant_appended_before_tool_results() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "nonexistent_tool", json!({})),
             end_turn_resp(),
         ]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("go")],
             &AgentConfig::default(),
         )
@@ -1874,14 +1991,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_becomes_is_error_result() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "does_not_exist", json!({})),
             end_turn_resp(),
         ]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("go")],
             &AgentConfig::default(),
         )
@@ -1896,14 +2013,14 @@ mod tests {
     async fn real_tool_call_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("test.txt"), "hello agent").unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "read_file", json!({"path": "test.txt"})),
             end_turn_resp(),
         ]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("read it")],
             &AgentConfig::default(),
         )
@@ -1922,7 +2039,7 @@ mod tests {
     #[tokio::test]
     async fn before_hook_block_returns_error_result() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "exec", json!({"command": "rm -rf /"})),
             end_turn_resp(),
@@ -1935,7 +2052,7 @@ mod tests {
             })),
             ..AgentConfig::default()
         };
-        let result = run(&provider, &mut s, vec![Message::user("go")], &config).await;
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
         assert_eq!(result.stop_reason, StopReason::EndTurn);
         assert!(matches!(
             &result.messages[2].content[0],
@@ -1946,7 +2063,7 @@ mod tests {
     #[tokio::test]
     async fn tool_progress_hook_receives_exec_output_and_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut session = session_in(dir.path());
+        let session = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "exec", json!({"command": "printf streamed-output"})),
             end_turn_resp(),
@@ -1965,7 +2082,7 @@ mod tests {
 
         run(
             &provider,
-            &mut session,
+            shared(session),
             vec![Message::user("run command")],
             &config,
         )
@@ -1991,7 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn after_hook_terminate_exits_with_aborted() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "nonexistent_tool", json!({})),
             end_turn_resp(), // should not be reached
@@ -2000,7 +2117,7 @@ mod tests {
             after_tool_call: Some(Box::new(|_, _, _| AfterHookResult::Terminate)),
             ..AgentConfig::default()
         };
-        let result = run(&provider, &mut s, vec![Message::user("go")], &config).await;
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
         assert_eq!(result.stop_reason, StopReason::Aborted);
         assert!(result
             .error_message
@@ -2012,7 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn thinking_blocks_retained_in_assistant_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = session_in(dir.path());
+        let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse {
             content: vec![
                 ContentBlock::Thinking("my reasoning".into()),
@@ -2025,7 +2142,7 @@ mod tests {
         }]);
         let result = run(
             &provider,
-            &mut s,
+            shared(s),
             vec![Message::user("think")],
             &AgentConfig::default(),
         )
