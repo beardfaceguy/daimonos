@@ -870,7 +870,11 @@ fn subcall_text(content: &[ContentBlock]) -> String {
 }
 
 /// Reserve `n` sub-call slots against the per-script budget, or error.
-/// Race-free: `count` is touched only on the single script thread.
+///
+/// `count` is mutated only here, and the builtins call this from the single
+/// Starlark script thread *before* any fan-out — `llm_query_batched` reserves
+/// its whole batch up front, and the concurrent per-prompt futures never touch
+/// `count`. So the non-atomic load+store cannot race.
 fn reserve_subcalls(env: &SubcallEnv, n: usize) -> Result<(), anyhow::Error> {
     let used = env.count.load(Ordering::Relaxed);
     if used + n > env.max_subcalls {
@@ -942,9 +946,11 @@ async fn run_one_subcall_async(env: &SubcallEnv, prompt: &str) -> Result<String,
         .complete(&context, &opts)
         .instrument(generation.span().clone())
         .await;
-    if let Ok(mut acc) = env.usage.lock() {
-        *acc = crate::agent::accumulate_usage(std::mem::take(&mut *acc), resp.usage.clone());
-    }
+    // Recover a poisoned lock's inner value rather than silently dropping this
+    // sub-call's spend (matches the caller-side fold-in in the agent loop).
+    let mut acc = env.usage.lock().unwrap_or_else(|p| p.into_inner());
+    *acc = crate::agent::accumulate_usage(std::mem::take(&mut *acc), resp.usage.clone());
+    drop(acc);
     let text = subcall_text(&resp.content);
     let failure = classify_subcall_failure(&resp);
     generation.finish(&resp);
