@@ -89,7 +89,10 @@ pub async fn run_agent(
         ..AgentConfig::default()
     };
 
-    let mut session = Session::new(workspace.to_path_buf(), cfg);
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(Session::new(
+        workspace.to_path_buf(),
+        cfg,
+    )));
     let initial = vec![Message::user(&args.task)];
     let external_session_id = crate::analytics::read_agent_session_id_env();
     let prompt_span = PromptSpan::new(PromptMetadata {
@@ -100,7 +103,7 @@ pub async fn run_agent(
         turn_index: 0,
         tools_exposed: config.tools.len(),
     });
-    let result = crate::agent::run(provider, &mut session, initial, &config)
+    let result = crate::agent::run(provider, session, initial, &config)
         .instrument(prompt_span.span().clone())
         .await;
     let error_type = match result.stop_reason {

@@ -260,13 +260,13 @@
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784757484.0237713,
-    "ast_hash": "dbad4a2b4407db5c311e3e4932d63313",
+    "mtime": 1784817738.628826,
+    "ast_hash": "facc40c12ed06237456b8562229d659e",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
-    "mtime": 1784747974.7217972,
-    "ast_hash": "6173dc6921b82a8b4ffc989beb28ce76",
+    "mtime": 1784817350.8643348,
+    "ast_hash": "d90787ddba2860708dbf0945815ad0e0",
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
@@ -470,7 +470,7 @@
     "semantic_hash": "17bd493a4f351e18a645d99c18e7612b"
   },
   "src/prompts.rs": {
-    "mtime": 1784762186.5978377,
+    "mtime": 1784762617.5780985,
     "ast_hash": "282c72b24d681df8421ffe9e7c199e90",
     "semantic_hash": ""
   },
@@ -500,9 +500,9 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1783897689.4920225,
-    "ast_hash": "2961487e925a6228dac02d70ccc3c621",
-    "semantic_hash": "2961487e925a6228dac02d70ccc3c621"
+    "mtime": 1784817312.5445828,
+    "ast_hash": "c7a0115e55f0269f6d2c29c628c79c8d",
+    "semantic_hash": ""
   },
   "src/session.rs": {
     "mtime": 1784402264.433214,
@@ -890,7 +890,7 @@
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
-    "mtime": 1784761679.9402368,
+    "mtime": 1784762617.5770984,
     "ast_hash": "58b7c2ea6d96abad499159d9ee2d3d1a",
     "semantic_hash": ""
   },
@@ -900,7 +900,7 @@
     "semantic_hash": ""
   },
   "prompts/mcp_instructions.md": {
-    "mtime": 1784761685.6502,
+    "mtime": 1784762617.5770984,
     "ast_hash": "5cf82d675ea2bad18f09add0798a5009",
     "semantic_hash": ""
   },
@@ -1012,6 +1012,16 @@
   "docs/research/rlm-harness-evaluation.md": {
     "mtime": 1784759830.4210837,
     "ast_hash": "15924c0d2b7f76e963363c9f6e25a234",
+    "semantic_hash": ""
+  },
+  "docs/adr/007-context-offload-handles.md": {
+    "mtime": 1784780229.0566974,
+    "ast_hash": "1a6ce14ea8e88e78513b2f29a70a038c",
+    "semantic_hash": ""
+  },
+  "docs/adr/008-programmatic-llm-subcalls.md": {
+    "mtime": 1784781276.57512,
+    "ast_hash": "4794d3d150e6ff1ef5a31f433f9de050",
     "semantic_hash": ""
   }
 }
