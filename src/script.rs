@@ -8,7 +8,7 @@ use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
 use starlark::values::{Heap, Value as StarlarkValue};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -17,6 +17,9 @@ use crate::analytics::{self, ToolCallRecord};
 use crate::config::DEFAULT_MAX_SCRIPT_THREADS;
 use crate::ops;
 use crate::protocol::{Request, Response};
+use crate::providers::{
+    CompleteOpts, ContentBlock, Context, LlmProvider, Message, StopReason, ThinkingLevel, Usage,
+};
 use crate::session::Session;
 use crate::tools;
 
@@ -143,7 +146,7 @@ pub async fn execute(
     session: Arc<Mutex<Session>>,
     timeout: Duration,
 ) -> Result<ScriptResult, String> {
-    execute_with_op_count(code, session, timeout, Arc::new(AtomicUsize::new(0))).await
+    execute_with_op_count(code, session, timeout, Arc::new(AtomicUsize::new(0)), None).await
 }
 
 /// As [`execute`], but the caller owns the op counter so it can read the
@@ -154,6 +157,7 @@ pub async fn execute_with_op_count(
     session: Arc<Mutex<Session>>,
     timeout: Duration,
     op_count: Arc<AtomicUsize>,
+    subcall: Option<SubcallEnv>,
 ) -> Result<ScriptResult, String> {
     let code = code.to_string();
     let handle = tokio::runtime::Handle::current();
@@ -220,8 +224,9 @@ pub async fn execute_with_op_count(
             // `in_scope` keeps the parent span active for exactly the
             // synchronous script run on this dedicated thread, rather than
             // holding an `enter()` guard across the whole closure.
-            let result = parent_span
-                .in_scope(|| run_starlark(&code, session, handle, cancel_for_thread, op_count));
+            let result = parent_span.in_scope(|| {
+                run_starlark(&code, session, handle, cancel_for_thread, op_count, subcall)
+            });
             let _ = tx.send(result);
         })
         .map_err(|e| format!("spawn script thread: {e}"))?;
@@ -386,12 +391,13 @@ fn run_starlark(
     handle: tokio::runtime::Handle,
     cancel: Arc<AtomicBool>,
     op_count: Arc<AtomicUsize>,
+    subcall: Option<SubcallEnv>,
 ) -> Result<ScriptResult, String> {
     let code = normalize_string_literals(code);
     let ast = AstModule::parse("script", code, &Dialect::Standard)
         .map_err(|e| format!("parse error: {e}"))?;
 
-    let globals = build_globals(session, handle, cancel, op_count);
+    let globals = build_globals(session, handle, cancel, op_count, subcall);
     let module = Module::new();
 
     PRINT_LOG.with(|log| log.borrow_mut().clear());
@@ -465,6 +471,7 @@ fn build_globals(
     handle: tokio::runtime::Handle,
     cancel: Arc<AtomicBool>,
     op_count: Arc<AtomicUsize>,
+    subcall: Option<SubcallEnv>,
 ) -> Globals {
     // We store session + handle + cancel flag in a thread-local so the
     // starlark_module functions can access them without capturing closures.
@@ -472,6 +479,7 @@ fn build_globals(
         *ctx.borrow_mut() = Some(ToolContext {
             session,
             handle,
+            subcall,
             cancel,
             op_count,
         });
@@ -480,12 +488,42 @@ fn build_globals(
     GlobalsBuilder::standard()
         .with(builtin_functions)
         .with(tool_functions)
+        .with(subcall_functions)
         .build()
+}
+
+/// Everything an in-script LLM sub-call (`llm_query` / `llm_query_batched`,
+/// ADR-008) needs. Present only in agent/chat/ACP mode with a provider
+/// attached and `process.script_llm_enabled` set; `None` disables the
+/// builtins (they raise a clear error). Constructed by the execute_script
+/// branch of the agent loop, which owns the same `usage`/`count` `Arc`s and
+/// reads them back after the script finishes to fold sub-call spend into the
+/// turn total.
+pub struct SubcallEnv {
+    pub provider: Arc<dyn LlmProvider>,
+    pub model: String,
+    pub max_tokens: u32,
+    /// Total sub-calls a single script may issue (`llm_query` counts as 1,
+    /// `llm_query_batched` as its prompt count).
+    pub max_subcalls: usize,
+    /// Max prompts a single `llm_query_batched` call may take.
+    pub max_batch: usize,
+    /// Accumulated usage across every sub-call this script issued; read by
+    /// the caller after the run to fold into the agent turn's total.
+    pub usage: Arc<std::sync::Mutex<Usage>>,
+    /// Sub-calls issued so far, enforcing `max_subcalls`. Mutated only on the
+    /// single script thread, so plain load/store is race-free.
+    pub count: Arc<AtomicUsize>,
+    /// Shared generation-ordinal sequence, so sub-call `llm.generation` spans
+    /// interleave correctly with the agent's own generations (ADR-006).
+    pub ordinal: Arc<AtomicU64>,
 }
 
 struct ToolContext {
     session: Arc<Mutex<Session>>,
     handle: tokio::runtime::Handle,
+    /// In-script LLM sub-call environment (ADR-008); `None` when disabled.
+    subcall: Option<SubcallEnv>,
     /// Set to `true` by `execute()` when the timeout fires. Tool dispatch
     /// checks this flag and short-circuits with an error so the Starlark
     /// evaluator unwinds and the script thread exits.
@@ -813,6 +851,165 @@ fn builtin_functions(builder: &mut GlobalsBuilder) {
         let text = parts.join(" ");
         PRINT_LOG.with(|log| log.borrow_mut().push(text));
         Ok(NoneType)
+    }
+}
+
+// --- In-script LLM sub-call bindings (ADR-008) ---
+
+/// Concatenate the text blocks of a sub-call response. Thinking and any
+/// (unused) tool blocks are dropped — a sub-call is a plain text completion.
+fn subcall_text(content: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in content {
+        if let ContentBlock::Text(t) = block {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+/// Reserve `n` sub-call slots against the per-script budget, or error.
+/// Race-free: `count` is touched only on the single script thread.
+fn reserve_subcalls(env: &SubcallEnv, n: usize) -> Result<(), anyhow::Error> {
+    let used = env.count.load(Ordering::Relaxed);
+    if used + n > env.max_subcalls {
+        return Err(anyhow::anyhow!(
+            "llm sub-call budget exhausted: {used} used + {n} requested \
+             > max_script_subcalls = {}",
+            env.max_subcalls
+        ));
+    }
+    env.count.store(used + n, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Run one LLM sub-call synchronously on the script thread: emit a
+/// `script_subcall` generation span, block on the provider, fold spend into
+/// the shared usage accumulator, and return the completion text (or error).
+fn run_one_subcall(
+    ctx: &ToolContext,
+    env: &SubcallEnv,
+    prompt: &str,
+) -> Result<String, anyhow::Error> {
+    let ordinal = env.ordinal.fetch_add(1, Ordering::Relaxed);
+    let generation =
+        crate::observability::GenerationSpan::new(crate::observability::GenerationMetadata {
+            kind: "script_subcall",
+            model: &env.model,
+            max_tokens: env.max_tokens,
+            thinking: ThinkingLevel::Off,
+            temperature: None,
+            ordinal,
+            tools_exposed: 0,
+            stable_prefix_len: 0,
+        });
+    let context = Context {
+        messages: vec![Message::user(prompt)],
+        system: None,
+        tools: vec![],
+        stable_prefix_len: 0,
+    };
+    let opts = CompleteOpts {
+        model: env.model.clone(),
+        max_tokens: env.max_tokens,
+        thinking: ThinkingLevel::Off,
+        temperature: None,
+    };
+    let resp = generation
+        .span()
+        .in_scope(|| ctx.handle.block_on(env.provider.complete(&context, &opts)));
+    // Fold spend into the shared accumulator regardless of outcome — a failed
+    // call can still have burned input tokens.
+    if let Ok(mut acc) = env.usage.lock() {
+        *acc = crate::agent::accumulate_usage(std::mem::take(&mut *acc), resp.usage.clone());
+    }
+    let text = subcall_text(&resp.content);
+    let is_error = resp.stop_reason == StopReason::Error;
+    let error_message = resp.error_message.clone();
+    generation.finish(&resp);
+    if is_error {
+        return Err(anyhow::anyhow!(
+            error_message.unwrap_or_else(|| "llm sub-call failed".to_string())
+        ));
+    }
+    Ok(text)
+}
+
+/// Build a `{ok, text, error}` outcome dict for one batched sub-call.
+fn outcome_dict<'v>(
+    heap: &'v Heap,
+    ok: bool,
+    text: Option<String>,
+    error: Option<String>,
+) -> Dict<'v> {
+    let mut m = starlark::collections::SmallMap::new();
+    let ok_key = heap.alloc_str("ok").to_value();
+    m.insert_hashed(ok_key.get_hashed().expect("string key"), heap.alloc(ok));
+    let text_key = heap.alloc_str("text").to_value();
+    let text_val = match text {
+        Some(t) => heap.alloc(t),
+        None => StarlarkValue::new_none(),
+    };
+    m.insert_hashed(text_key.get_hashed().expect("string key"), text_val);
+    let err_key = heap.alloc_str("error").to_value();
+    let err_val = match error {
+        Some(e) => heap.alloc(e),
+        None => StarlarkValue::new_none(),
+    };
+    m.insert_hashed(err_key.get_hashed().expect("string key"), err_val);
+    Dict::new(m)
+}
+
+const SUBCALL_DISABLED: &str = "in-script LLM sub-calls are off \
+    (set process.script_llm_enabled) or no provider is attached \
+    (one-shot / agent-cmd mode)";
+
+#[starlark_module]
+fn subcall_functions(builder: &mut GlobalsBuilder) {
+    /// `llm_query(prompt) -> str`: one blocking LLM completion. Raises on
+    /// provider error or when the sub-call budget is exhausted.
+    fn llm_query(prompt: &str) -> anyhow::Result<String> {
+        with_ctx(|ctx| {
+            let env = ctx
+                .subcall
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("llm_query unavailable: {SUBCALL_DISABLED}"))?;
+            reserve_subcalls(env, 1)?;
+            run_one_subcall(ctx, env, prompt)
+        })
+    }
+
+    /// `llm_query_batched(prompts) -> list[{ok, text, error}]`: fan out one
+    /// completion per prompt. Each prompt yields an outcome dict so a single
+    /// failure does not abort the batch (ADR-008). Raises only for a disabled
+    /// environment, an over-`max_batch` request, or an exhausted budget.
+    fn llm_query_batched<'v>(
+        prompts: UnpackList<String>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<StarlarkValue<'v>> {
+        with_ctx(|ctx| {
+            let env = ctx.subcall.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("llm_query_batched unavailable: {SUBCALL_DISABLED}")
+            })?;
+            let prompts = prompts.items;
+            if prompts.len() > env.max_batch {
+                return Err(anyhow::anyhow!(
+                    "llm_query_batched given {} prompts but max_script_subcall_batch = {}",
+                    prompts.len(),
+                    env.max_batch
+                ));
+            }
+            reserve_subcalls(env, prompts.len())?;
+            let mut items = Vec::with_capacity(prompts.len());
+            for prompt in &prompts {
+                let dict = match run_one_subcall(ctx, env, prompt) {
+                    Ok(text) => outcome_dict(heap, true, Some(text), None),
+                    Err(e) => outcome_dict(heap, false, None, Some(e.to_string())),
+                };
+                items.push(heap.alloc(dict));
+            }
+            Ok(heap.alloc(items))
+        })
     }
 }
 
@@ -1226,6 +1423,7 @@ mod tests {
             session,
             Duration::from_secs(10),
             Arc::clone(&op_count),
+            None,
         )
         .await
         .unwrap();
@@ -1790,5 +1988,159 @@ result = {"lines": lines, "status": "ok"}
         assert_eq!(back["count"], 42);
         assert_eq!(back["items"], serde_json::json!([1, 2, 3]));
         assert_eq!(back["nested"]["a"], true);
+    }
+
+    // --- In-script LLM sub-calls (ADR-008) ---
+
+    use crate::providers::LlmResponse;
+
+    /// Provider double: echoes the prompt as `echo:<prompt>`, or returns an
+    /// error response when the prompt matches `fail_on`. Reports `out_tokens`
+    /// output tokens so usage roll-up is observable.
+    struct MockProvider {
+        fail_on: Option<String>,
+        out_tokens: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            let prompt = ctx
+                .messages
+                .last()
+                .and_then(|m| {
+                    m.content.iter().find_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            if self.fail_on.as_deref() == Some(prompt.as_str()) {
+                return LlmResponse::error("boom");
+            }
+            LlmResponse {
+                content: vec![ContentBlock::Text(format!("echo:{prompt}"))],
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage {
+                    output: self.out_tokens,
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
+    fn subcall_env(
+        provider: Arc<dyn LlmProvider>,
+        max_subcalls: usize,
+        max_batch: usize,
+    ) -> (SubcallEnv, Arc<std::sync::Mutex<Usage>>) {
+        let usage = Arc::new(std::sync::Mutex::new(Usage::default()));
+        let env = SubcallEnv {
+            provider,
+            model: "test-model".to_string(),
+            max_tokens: 128,
+            max_subcalls,
+            max_batch,
+            usage: Arc::clone(&usage),
+            count: Arc::new(AtomicUsize::new(0)),
+            ordinal: Arc::new(AtomicU64::new(0)),
+        };
+        (env, usage)
+    }
+
+    #[tokio::test]
+    async fn llm_query_returns_text_and_accumulates_usage() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            fail_on: None,
+            out_tokens: 5,
+        });
+        let (env, usage) = subcall_env(provider, 8, 4);
+        let result = execute_with_op_count(
+            "result = llm_query(\"hi\")",
+            test_session(),
+            Duration::from_secs(5),
+            Arc::new(AtomicUsize::new(0)),
+            Some(env),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.value, serde_json::json!("echo:hi"));
+        assert_eq!(usage.lock().unwrap().output, 5);
+    }
+
+    #[tokio::test]
+    async fn llm_query_unavailable_without_env() {
+        let err = execute(
+            "result = llm_query(\"hi\")",
+            test_session(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("llm_query unavailable"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn llm_query_batched_reports_per_item_outcomes() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            fail_on: Some("bad".to_string()),
+            out_tokens: 2,
+        });
+        let (env, _usage) = subcall_env(provider, 8, 4);
+        let result = execute_with_op_count(
+            "result = llm_query_batched([\"good\", \"bad\"])",
+            test_session(),
+            Duration::from_secs(5),
+            Arc::new(AtomicUsize::new(0)),
+            Some(env),
+        )
+        .await
+        .unwrap();
+        let arr = result.value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["ok"], serde_json::json!(true));
+        assert_eq!(arr[0]["text"], serde_json::json!("echo:good"));
+        assert_eq!(arr[1]["ok"], serde_json::json!(false));
+        assert!(arr[1]["error"].as_str().unwrap().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn subcall_budget_is_enforced() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            fail_on: None,
+            out_tokens: 1,
+        });
+        let (env, _usage) = subcall_env(provider, 1, 4);
+        let err = execute_with_op_count(
+            "llm_query(\"a\")\nresult = llm_query(\"b\")",
+            test_session(),
+            Duration::from_secs(5),
+            Arc::new(AtomicUsize::new(0)),
+            Some(env),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("budget exhausted"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn llm_query_batched_rejects_oversized_batch() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            fail_on: None,
+            out_tokens: 1,
+        });
+        let (env, _usage) = subcall_env(provider, 8, 2);
+        let err = execute_with_op_count(
+            "result = llm_query_batched([\"a\", \"b\", \"c\"])",
+            test_session(),
+            Duration::from_secs(5),
+            Arc::new(AtomicUsize::new(0)),
+            Some(env),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("max_script_subcall_batch"), "got: {err}");
     }
 }

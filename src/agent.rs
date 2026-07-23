@@ -171,6 +171,10 @@ pub struct AgentConfig {
     /// Context/window compaction (ADR-002). `None` = off.
     pub compaction: Option<CompactionPolicy>,
     pub on_compaction: Option<CompactionHook>,
+    /// Provider handle for in-script LLM sub-calls (ADR-008 `llm_query` /
+    /// `llm_query_batched`). Injected by `AgentSession::new`; `None` for
+    /// one-shot/agent-cmd runs and tests, where sub-calls are unavailable.
+    pub subcall_provider: Option<std::sync::Arc<dyn LlmProvider>>,
     pub generation_ordinal: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -490,11 +494,36 @@ pub async fn run(
                             .filter(|secs| *secs > 0)
                             .map(|secs| secs.min(MAX_SCRIPT_TIMEOUT_SECS))
                             .unwrap_or(60) as u64;
-                        session
-                            .lock()
-                            .await
-                            .used_tools
-                            .insert(EXECUTE_SCRIPT_TOOL.to_string());
+                        let cfg = {
+                            let mut guard = session.lock().await;
+                            guard.used_tools.insert(EXECUTE_SCRIPT_TOOL.to_string());
+                            std::sync::Arc::clone(&guard.cfg)
+                        };
+                        // Accumulates the spend of any in-script LLM sub-calls
+                        // (ADR-008), read back after the run and folded into the
+                        // turn total. Shared with the sandbox `SubcallEnv`.
+                        let subcall_usage =
+                            std::sync::Arc::new(std::sync::Mutex::new(Usage::default()));
+                        // Sub-calls are available only when a provider was
+                        // injected (agent/chat/ACP mode) AND the operator opted
+                        // in via `process.script_llm_enabled`. `None` leaves the
+                        // `llm_query*` builtins raising a clear error.
+                        let subcall = config.subcall_provider.as_ref().and_then(|provider| {
+                            cfg.process
+                                .script_llm_enabled
+                                .then(|| crate::script::SubcallEnv {
+                                    provider: std::sync::Arc::clone(provider),
+                                    model: config.opts.model.clone(),
+                                    max_tokens: config.opts.max_tokens,
+                                    max_subcalls: cfg.process.max_script_subcalls,
+                                    max_batch: cfg.process.max_script_subcall_batch,
+                                    usage: std::sync::Arc::clone(&subcall_usage),
+                                    count: std::sync::Arc::new(
+                                        std::sync::atomic::AtomicUsize::new(0),
+                                    ),
+                                    ordinal: std::sync::Arc::clone(&config.generation_ordinal),
+                                })
+                        });
                         // Caller-owned op counter so batch_size reflects the ops
                         // that ran even when the script errors mid-run.
                         let op_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -503,11 +532,18 @@ pub async fn run(
                             std::sync::Arc::clone(&session),
                             std::time::Duration::from_secs(timeout_secs),
                             std::sync::Arc::clone(&op_count),
+                            subcall,
                         );
                         let script_result = match &tool_span {
                             Some(span) => script_fut.instrument(span.span().clone()).await,
                             None => script_fut.await,
                         };
+                        // Fold any in-script LLM sub-call spend into the turn
+                        // total (ADR-008). A no-op when no sub-calls ran.
+                        total_usage = accumulate_usage(
+                            total_usage,
+                            subcall_usage.lock().map(|u| u.clone()).unwrap_or_default(),
+                        );
                         let (content, is_error) = match script_result {
                             Ok(result) => {
                                 let mut response = serde_json::json!({ "result": result.value });
@@ -710,7 +746,9 @@ pub struct TurnResult {
 /// safety hook), and the running message history + accumulated usage. Shared
 /// core for the REPL and ACP frontends (project #183).
 pub struct AgentSession {
-    provider: Box<dyn LlmProvider>,
+    /// `Arc` (not `Box`) so it can be cloned into `AgentConfig.subcall_provider`
+    /// for in-script LLM sub-calls (ADR-008).
+    provider: std::sync::Arc<dyn LlmProvider>,
     /// Shared with `execute_script`'s Starlark sandbox thread, so it is an
     /// `Arc<Mutex<Session>>` rather than an owned `Session`. The tool loop
     /// locks it per native call and clones the `Arc` for script execution.
@@ -727,7 +765,15 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub fn new(provider: Box<dyn LlmProvider>, tool_session: Session, config: AgentConfig) -> Self {
+    pub fn new(
+        provider: Box<dyn LlmProvider>,
+        tool_session: Session,
+        mut config: AgentConfig,
+    ) -> Self {
+        let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
+        // Expose the provider to in-script LLM sub-calls (ADR-008); the sandbox
+        // reads it from the config on the execute_script path.
+        config.subcall_provider = Some(std::sync::Arc::clone(&provider));
         AgentSession {
             provider,
             tool_session: std::sync::Arc::new(tokio::sync::Mutex::new(tool_session)),
@@ -1817,7 +1863,6 @@ mod tests {
     async fn run_forwards_stream_events_to_hook() {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-        use tracing::instrument::WithSubscriber;
         use tracing_subscriber::layer::SubscriberExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1842,9 +1887,14 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(
             tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("agent-run-test")),
         );
-        let result = run(&provider, shared(s), vec![Message::user("hi")], &config)
-            .with_subscriber(subscriber)
-            .await;
+        // Hold the subscriber as the thread default for the WHOLE run rather
+        // than via `.with_subscriber(future)`. The latter installs the
+        // subscriber only during each `poll()`, so the generation span's
+        // close/export event — if it lands outside a poll boundary under
+        // parallel-test scheduling — was dropped, making the export assertion
+        // flaky. A thread-wide guard covers every span operation.
+        let _default = tracing::subscriber::set_default(subscriber);
+        let result = run(&provider, shared(s), vec![Message::user("hi")], &config).await;
         tracer_provider.force_flush().unwrap();
         assert_eq!(result.stop_reason, StopReason::EndTurn);
         let seen = seen.lock().unwrap();
@@ -2168,19 +2218,22 @@ mod tests {
     /// Scripted responses plus per-call recording.
     struct RecordingProvider {
         responses: std::sync::Mutex<VecDeque<LlmResponse>>,
-        calls: std::sync::Mutex<Vec<RecordedCall>>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
     }
 
     impl RecordingProvider {
         fn new(responses: Vec<LlmResponse>) -> Self {
             RecordingProvider {
                 responses: std::sync::Mutex::new(VecDeque::from(responses)),
-                calls: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
-        fn calls(&self) -> Vec<RecordedCall> {
-            self.calls.lock().unwrap().clone()
+        /// A shared handle to the recorded calls that stays valid after the
+        /// provider is moved into `AgentSession::new` (which relocates it into
+        /// an `Arc`, so a raw pointer to the boxed provider would dangle).
+        fn calls_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>> {
+            std::sync::Arc::clone(&self.calls)
         }
     }
 
@@ -2291,13 +2344,12 @@ mod tests {
             end_turn_with_usage("a2", 700),
             end_turn_with_usage("a3", 100),
         ]));
-        let raw = provider.as_ref() as *const RecordingProvider;
+        let calls_handle = provider.calls_handle();
         let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
         sess.prompt(big_text("t1")).await;
         sess.prompt(big_text("t2")).await;
         sess.prompt("t3").await;
-        // SAFETY: provider outlives the session; read-only access for assertion.
-        let calls = unsafe { &*raw }.calls();
+        let calls = calls_handle.lock().unwrap().clone();
         assert_eq!(calls.len(), 3, "no summarization call must be made");
         assert_eq!(sess.history().len(), 6, "nothing evicted");
     }
@@ -2367,7 +2419,7 @@ mod tests {
             end_turn_with_usage("the summary", 50),
             end_turn_with_usage("a3", 100),
         ]));
-        let raw = provider.as_ref() as *const RecordingProvider;
+        let calls_handle = provider.calls_handle();
         let policy = CompactionPolicy {
             summary_model: Some("cheap-summarizer".to_string()),
             summary_prompt: Some("Custom summary instructions.".to_string()),
@@ -2379,7 +2431,7 @@ mod tests {
         sess.prompt(big_text("t2")).await;
         sess.prompt("t3").await;
 
-        let calls = unsafe { &*raw }.calls();
+        let calls = calls_handle.lock().unwrap().clone();
         assert_eq!(calls.len(), 4);
         let (model, temperature, system) = &calls[2]; // the summarization call
         assert_eq!(model, "cheap-summarizer");

@@ -74,6 +74,17 @@ exec_plugin_redirect = true
 # new execute_script calls. Raise if you legitimately run many concurrent
 # scripts; lower to fail fast under buggy script load.
 max_script_threads = 32
+# In-script LLM sub-calls (ADR-008): let execute_script call the agent's own
+# model via `llm_query(prompt)` / `llm_query_batched(prompts)`. Off by default
+# — turn on only where a provider is attached (agent/chat/ACP mode). Sub-call
+# spend rolls into the turn's usage/cost and emits `script_subcall` generation
+# spans.
+script_llm_enabled = false
+# Max total sub-calls one execute_script run may issue (llm_query = 1,
+# llm_query_batched = its prompt count). Bounds cost/latency blast radius.
+max_script_subcalls = 32
+# Max prompts a single llm_query_batched call may take.
+max_script_subcall_batch = 16
 
 [logging]
 # Persist structured JSON diagnostics independently of the ACP/MCP client.
