@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-23)
 
 ## Corpus Check
-- 198 files · ~216,407 words
+- 198 files · ~216,464 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4495 nodes · 10101 edges · 207 communities (189 shown, 18 thin omitted)
+- 4495 nodes · 10101 edges · 210 communities (192 shown, 18 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `675beca5`
+- Built from commit: `1df7ee84`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -211,7 +211,10 @@
 - [[_COMMUNITY_Community 202|Community 202]]
 - [[_COMMUNITY_Community 203|Community 203]]
 - [[_COMMUNITY_Community 204|Community 204]]
+- [[_COMMUNITY_Community 205|Community 205]]
 - [[_COMMUNITY_Community 206|Community 206]]
+- [[_COMMUNITY_Community 207|Community 207]]
+- [[_COMMUNITY_Community 208|Community 208]]
 - [[_COMMUNITY_Community 209|Community 209]]
 
 ## God Nodes (most connected - your core abstractions)
@@ -260,7 +263,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (207 total, 18 thin omitted)
+## Communities (210 total, 18 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.21
@@ -759,8 +762,8 @@ Cohesion: 0.14
 Nodes (13): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Linear project management, Manual testing, Prerequisites, Quick start (new agents) (+5 more)
 
 ### Community 140 - "Community 140"
-Cohesion: 0.08
-Nodes (17): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting (+9 more)
+Cohesion: 0.10
+Nodes (13): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting (+5 more)
 
 ### Community 141 - "Community 141"
 Cohesion: 0.12
@@ -879,12 +882,12 @@ Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.11
-Nodes (18): ExporterBuildError, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CompactionOutcome, disabled_runtime_does_not_resolve_credentials() (+10 more)
+Cohesion: 0.20
+Nodes (12): ExporterBuildError, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), disabled_runtime_does_not_resolve_credentials(), LoggingExporter (+4 more)
 
 ### Community 179 - "Community 179"
-Cohesion: 0.23
-Nodes (9): E, build_provider(), CompactionMetadata, prompt_root_omits_absent_session_id(), PromptMetadata, Path, Self, saturated_queue_drops_spans_without_blocking_producer() (+1 more)
+Cohesion: 0.28
+Nodes (11): E, blocked_tool_span_records_status_without_sizes(), build_provider(), enabled_tracing_overhead_is_bounded(), exported_spans_contain_no_sensitive_values(), prompt_root_omits_absent_session_id(), PromptMetadata, Path (+3 more)
 
 ### Community 181 - "Community 181"
 Cohesion: 0.11
@@ -907,8 +910,8 @@ Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
 
 ### Community 186 - "Community 186"
-Cohesion: 0.27
-Nodes (19): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), enabled_tracing_overhead_is_bounded(), exported_spans_contain_no_sensitive_values(), full_prompt_trace_hierarchy_nests_all_observation_types() (+11 more)
+Cohesion: 0.15
+Nodes (15): InMemorySpanExporter, attribute_map(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), in_memory_subscriber(), prompt_records_cancel_reason(), PromptSpan, record_bridge_lifecycle() (+7 more)
 
 ### Community 187 - "Community 187"
 Cohesion: 0.23
@@ -939,8 +942,8 @@ Cohesion: 0.36
 Nodes (9): arr(), has_name(), names(), orient_from_graph_alone(), write_module(), Path, String, Value (+1 more)
 
 ### Community 195 - "Community 195"
-Cohesion: 0.15
-Nodes (12): Span, CompactionSpan, generation_span_is_child_and_exports_usage_without_content(), GenerationSpan, prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, RemoteToolSpan, AtomicBool (+4 more)
+Cohesion: 0.29
+Nodes (6): generation_span_is_child_and_exports_usage_without_content(), prompt_roots_export_safe_metadata_and_distinct_traces(), remote_tool_span_records_server_and_timeout(), RetrySpan, tool_call_span_is_child_and_metadata_only(), ToolStatus
 
 ### Community 196 - "Community 196"
 Cohesion: 0.31
@@ -948,7 +951,7 @@ Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, S
 
 ### Community 198 - "Community 198"
 Cohesion: 0.16
-Nodes (14): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, record_bridge_lifecycle() (+6 more)
+Nodes (14): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus (+6 more)
 
 ### Community 199 - "Community 199"
 Cohesion: 0.18
@@ -974,9 +977,21 @@ Nodes (11): eager_index_small_root_regardless_of_marker(), gate_allows_large_mar
 Cohesion: 0.29
 Nodes (7): IndexState, Arc, HashSet, Mutex, PathBuf, RwLock, WorkspaceIndex
 
+### Community 205 - "Community 205"
+Cohesion: 0.23
+Nodes (7): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, RemoteToolSpan, Instant, ToolSpan
+
 ### Community 206 - "Community 206"
 Cohesion: 0.25
 Nodes (7): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting
+
+### Community 207 - "Community 207"
+Cohesion: 0.29
+Nodes (7): full_prompt_trace_hierarchy_nests_all_observation_types(), GenerationSpan, AtomicBool, LlmResponse, sample_generation(), sample_response(), self_hosted_langfuse_smoke_test()
+
+### Community 208 - "Community 208"
+Cohesion: 0.50
+Nodes (4): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Setup
 
 ### Community 209 - "Community 209"
 Cohesion: 0.33
