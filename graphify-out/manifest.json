@@ -260,8 +260,8 @@
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784820069.9479873,
-    "ast_hash": "57c0a84ac0ae06676bf57143b231ef12",
+    "mtime": 1784821251.5285697,
+    "ast_hash": "1760935f712b5046ee3a515d44b11709",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -500,8 +500,8 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1784820153.7284603,
-    "ast_hash": "a14b6e812d40f047ea6c92ae70e4ab5e",
+    "mtime": 1784821429.866451,
+    "ast_hash": "978f01f61df621621e1fc53c8a38bc6d",
     "semantic_hash": ""
   },
   "src/session.rs": {
