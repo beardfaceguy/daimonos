@@ -41,7 +41,7 @@ mechanism that guidance can point at.
 When a tool produces an output larger than a configured threshold and handles
 are enabled, it may return a handle envelope instead of the raw body:
 
-```json
+```jsonc
 { "handle": "h:7",
   "kind": "file",            // file | exec | search | script
   "bytes": 48213,
@@ -50,10 +50,13 @@ are enabled, it may return a handle envelope instead of the raw body:
   "head": "first ~500 chars…" }
 ```
 
-The `head` (and/or a one-line summary) is the only content inlined — enough for
-the model to decide what to do. The full body lives server-side, bound to the
-handle id. This preserves the ADR-006 D6 boundary: only size/hash/head metadata
-is ever eligible for telemetry, never the full body.
+The `head` (and/or a one-line summary) is the only content inlined into the
+model context — enough for the model to decide what to do. The full body lives
+server-side, bound to the handle id. Telemetry eligibility is narrower than
+model-context eligibility: only the size/hash/kind metadata
+(`bytes`/`lines`/`sha256`/`kind`) is ever eligible for OTLP export. The `head`
+is body content and, like the full body, is **never** exported to telemetry
+(ADR-006 D6) — it is shown to the model only.
 
 ### D2 — Handles live in a bounded, session-scoped store
 
