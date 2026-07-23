@@ -87,6 +87,17 @@ mod tests {
     }
 
     #[test]
+    fn active_schemas_includes_execute_script() {
+        // execute_script is Full-tier, so it is always exposed to the model.
+        // The agent loop now dispatches it (vikunja #1050), so it must stay in
+        // the catalog the frontends build from active_schemas.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(default_schemas(dir.path())
+            .iter()
+            .any(|schema| schema.name == "execute_script"));
+    }
+
+    #[test]
     fn active_schemas_include_agent_only_plan_tool() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_schemas(dir.path())

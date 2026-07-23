@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-23)
 
 ## Corpus Check
-- 198 files · ~216,251 words
+- 198 files · ~216,407 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4494 nodes · 10100 edges · 203 communities (185 shown, 18 thin omitted)
+- 4495 nodes · 10101 edges · 207 communities (189 shown, 18 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 31 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `27905e29`
+- Built from commit: `675beca5`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -205,8 +205,12 @@
 - [[_COMMUNITY_Community 195|Community 195]]
 - [[_COMMUNITY_Community 196|Community 196]]
 - [[_COMMUNITY_Community 198|Community 198]]
+- [[_COMMUNITY_Community 199|Community 199]]
 - [[_COMMUNITY_Community 200|Community 200]]
 - [[_COMMUNITY_Community 201|Community 201]]
+- [[_COMMUNITY_Community 202|Community 202]]
+- [[_COMMUNITY_Community 203|Community 203]]
+- [[_COMMUNITY_Community 204|Community 204]]
 - [[_COMMUNITY_Community 206|Community 206]]
 - [[_COMMUNITY_Community 209|Community 209]]
 
@@ -256,7 +260,7 @@
 - 1-file cycle: `src/kgl/substrate_graphify.rs -> src/kgl/substrate_graphify.rs`
 - 1-file cycle: `src/kgl/substrate_x07.rs -> src/kgl/substrate_x07.rs`
 
-## Communities (203 total, 18 thin omitted)
+## Communities (207 total, 18 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.21
@@ -319,8 +323,8 @@ Cohesion: 0.12
 Nodes (41): AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider(), dry_run_prints_task_in_output() (+33 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.10
-Nodes (49): IndexState, concurrent_reindexes_serialize_correctly(), eager_index_small_root_regardless_of_marker(), extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), gate_allows_large_marked_root() (+41 more)
+Cohesion: 0.32
+Nodes (15): concurrent_reindexes_serialize_correctly(), gated_root_skips_indexing(), incremental_adds_new_files(), incremental_combined_add_delete_modify(), incremental_removes_deleted_files(), incremental_skips_unchanged_files(), incremental_updates_modified_files(), index_and_search_fixture_dir() (+7 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.11
@@ -407,7 +411,7 @@ Cohesion: 0.18
 Nodes (29): build_tool_args(), build_tool_args_empty(), build_tool_args_with_fields(), build_tool_args_with_kv(), test_session_no_registry(), test_session_with_registry(), tool_list(), tool_list_no_registry() (+21 more)
 
 ### Community 37 - "Community 37"
-Cohesion: 0.14
+Cohesion: 0.13
 Nodes (31): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+23 more)
 
 ### Community 38 - "Community 38"
@@ -755,8 +759,8 @@ Cohesion: 0.14
 Nodes (13): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Linear project management, Manual testing, Prerequisites, Quick start (new agents) (+5 more)
 
 ### Community 140 - "Community 140"
-Cohesion: 0.10
-Nodes (13): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting (+5 more)
+Cohesion: 0.08
+Nodes (17): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting (+9 more)
 
 ### Community 141 - "Community 141"
 Cohesion: 0.12
@@ -911,8 +915,8 @@ Cohesion: 0.23
 Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
 ### Community 188 - "Community 188"
-Cohesion: 0.50
-Nodes (4): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Setup
+Cohesion: 0.14
+Nodes (19): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+11 more)
 
 ### Community 189 - "Community 189"
 Cohesion: 0.13
@@ -923,8 +927,8 @@ Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.06
-Nodes (69): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+61 more)
+Cohesion: 0.18
+Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -946,6 +950,10 @@ Nodes (5): ObservabilityConfig, ProcessConfig, resolve_nonempty_env(), Result, S
 Cohesion: 0.16
 Nodes (14): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, record_bridge_lifecycle() (+6 more)
 
+### Community 199 - "Community 199"
+Cohesion: 0.18
+Nodes (14): canonical_json(), content_hash(), filtered_walk_builder(), IndexResult, Substrate, DefNode, Edge, EffectFacts (+6 more)
+
 ### Community 200 - "Community 200"
 Cohesion: 0.15
 Nodes (12): 1. Context offloading as a first-class primitive — **KEEP (design)**, 2. Programmatic LLM sub-calls in the sandbox — **KEEP (ADR first)**, 3. Harness/prompt guidance toward decomposition — **KEEP (cheap, ship soon)**, 4. Overhead trade-off — **SKIP as standalone; fold into #1049**, 5. LID for the future bare-metal OS interface — **KEEP as a design tenet**, Caveats, Cross-cutting observation, Decisions summary (+4 more)
@@ -953,6 +961,18 @@ Nodes (12): 1. Context offloading as a first-class primitive — **KEEP (design)
 ### Community 201 - "Community 201"
 Cohesion: 0.25
 Nodes (11): SessionInfo, encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), paginate_session_summaries(), pagination_summary(), SessionSummary, session_info(), session_list_pagination_filters_before_slicing() (+3 more)
+
+### Community 202 - "Community 202"
+Cohesion: 0.14
+Nodes (16): extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), IndexState, IndexStats, query_to_trigrams(), query_to_trigrams_normal() (+8 more)
+
+### Community 203 - "Community 203"
+Cohesion: 0.30
+Nodes (11): eager_index_small_root_regardless_of_marker(), gate_allows_large_marked_root(), gate_allows_large_root_with_git_dir(), gate_blocks_large_unmarked_root(), gate_disabled_always_eager(), has_project_marker(), preflight_within_budget(), IndexConfig (+3 more)
+
+### Community 204 - "Community 204"
+Cohesion: 0.29
+Nodes (7): IndexState, Arc, HashSet, Mutex, PathBuf, RwLock, WorkspaceIndex
 
 ### Community 206 - "Community 206"
 Cohesion: 0.25

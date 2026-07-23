@@ -201,8 +201,11 @@ pub async fn execute(
             // closure exits, whether by completion, eval error, or the
             // cancel-flag unwind path.
             let _permit = permit;
-            let _entered = parent_span.enter();
-            let result = run_starlark(&code, session, handle, cancel_for_thread);
+            // `in_scope` keeps the parent span active for exactly the
+            // synchronous script run on this dedicated thread, rather than
+            // holding an `enter()` guard across the whole closure.
+            let result =
+                parent_span.in_scope(|| run_starlark(&code, session, handle, cancel_for_thread));
             let _ = tx.send(result);
         })
         .map_err(|e| format!("spawn script thread: {e}"))?;

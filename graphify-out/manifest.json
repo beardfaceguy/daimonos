@@ -260,8 +260,8 @@
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784817738.628826,
-    "ast_hash": "facc40c12ed06237456b8562229d659e",
+    "mtime": 1784818586.046375,
+    "ast_hash": "2101b02185a54d59295a65baba181bde",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -500,8 +500,8 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1784817312.5445828,
-    "ast_hash": "c7a0115e55f0269f6d2c29c628c79c8d",
+    "mtime": 1784818604.13826,
+    "ast_hash": "bdd073b5dd1abb1cd7eb968c5ce035fb",
     "semantic_hash": ""
   },
   "src/session.rs": {
@@ -520,8 +520,8 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784431554.0026085,
-    "ast_hash": "839a3522b8a1c043083aaca4c99f1736",
+    "mtime": 1784818597.9222994,
+    "ast_hash": "148fd07c12722d4eebccb593ce7baab8",
     "semantic_hash": ""
   },
   "src/tool_runner.rs": {

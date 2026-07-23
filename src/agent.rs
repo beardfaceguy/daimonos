@@ -478,6 +478,9 @@ pub async fn run(
                         let timeout_secs = input
                             .get("timeout")
                             .and_then(serde_json::Value::as_i64)
+                            // Guard against a negative timeout wrapping to a
+                            // huge u64 (never timing out); non-positive → default.
+                            .filter(|secs| *secs > 0)
                             .unwrap_or(60) as u64;
                         session
                             .lock()
@@ -530,9 +533,15 @@ pub async fn run(
                         };
                         (content, is_error, Some(outcome))
                     } else {
-                        // Lock only for the duration of the native call so the
-                        // execute_script branch (and its sandbox thread) can
-                        // acquire the same session lock on other iterations.
+                        // A native tool needs exclusive `&mut Session` for its
+                        // whole execution, so the guard is held across the call.
+                        // That starves no one: tool calls in a turn are
+                        // sequential and each session's `run` is serialized by
+                        // the frontend, so nothing else (including the sandbox
+                        // thread, which only runs inside the execute_script
+                        // branch of another iteration) contends for it here.
+                        // Locking per call — not for the whole turn — is what
+                        // lets that later execute_script branch acquire it.
                         let facade = {
                             let mut session_guard = session.lock().await;
                             match &tool_span {
