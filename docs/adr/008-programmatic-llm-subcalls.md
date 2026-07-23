@@ -51,20 +51,28 @@ handle is present:
 ```
 llm_query(prompt: str, *, model: str = <session model>,
           max_tokens: int = <cfg>, temperature: float = 0.0) -> str
-llm_query_batched(prompts: list[str], **opts) -> list[str]
+llm_query_batched(prompts: list[str], **opts) -> list[dict]
 ```
 
-Outputs are plain strings that land in sandbox variables. As with all
-`execute_script` data, they never enter the conversation unless the script
-copies them into `result` — which the offload guidance (#1047) tells the model
-not to do wholesale.
+`llm_query` returns the completion string. `llm_query_batched` returns a list of
+per-prompt **outcome values** aligned to the input list — e.g.
+`{"ok": bool, "text": str, "error": str}` — so a single failed prompt does not
+abort the whole fan-out and the script branches on the value (see D2 for why
+this is a value, not an exception). Outputs land in sandbox variables and never
+enter the conversation unless the script copies them into `result` — which the
+offload guidance (#1047) tells the model not to do wholesale.
 
 ### D2 — Provider boundary (ADR-001)
 
 Sub-calls go through the existing `LlmProvider` the session already holds — not
 a new client, key, or endpoint. Provider-specific parsing/error-classification
-stays in the adapter (ADR-001). A failed sub-call surfaces as a typed Starlark
-error the script can catch; it never silently returns wrong data.
+stays in the adapter (ADR-001). Starlark (starlark-rust) has no exception
+handling, so error semantics are explicit and value-based, never try/except:
+`llm_query` **raises** a Starlark evaluation error on failure, which aborts the
+script and surfaces as the tool's error result (fail-fast for a single call);
+`llm_query_batched` instead returns a per-prompt outcome value (D1) whose
+`ok`/`error` fields the script inspects, so partial failures in a fan-out are
+handled without aborting. Neither ever silently returns wrong data.
 
 ### D3 — Bounded controls (all required)
 
@@ -145,8 +153,9 @@ implementation) gates it: `enabled`, `max_subcalls_per_script`, `max_batch`,
   prompt guidance.
 
 ## Follow-up implementation issues (create on acceptance, in order)
-1. **`execute_script` reachable in the internal agent loop** with a provider/
-   session handle (the prerequisite; also unblocks #1045 and ADR-007 path 2).
+1. **`execute_script` reachable in the internal agent loop** with a
+   provider/session handle (the prerequisite; also unblocks #1045 and ADR-007
+   path 2).
 2. `llm_query` / `llm_query_batched` builtins + provider wiring (ADR-001).
 3. Bounded controls: budget, fan-out cap, concurrency, depth, timeout/cancel.
 4. Usage/cost roll-up + analytics.
