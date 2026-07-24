@@ -143,6 +143,44 @@ terse = """Fetch a thread's messages (oldest-first, bounded)."""
 
 [fetch_thread.parameters]
 thread_id = "Id of the thread to fetch (from a message or a send/reply receipt)."
+[reserve_paths]
+full = """Post ADVISORY reservations on file glob patterns for this workspace (agent mail, ADR-009) — a soft \"I'm working here\" signal to other agents, NOT a lock (it never blocks a write). Returns the granted reservations plus any conflicts with other agents' active exclusive reservations. Patterns are opaque globs (e.g. src/api/*.rs), never resolved against the filesystem."""
+terse = """Advisory-reserve file globs (soft signal, not a lock); reports conflicts."""
+
+[reserve_paths.parameters]
+agent = "Your registered agent name (the reservation holder)."
+paths = "Glob pattern(s) to reserve (array), e.g. [\"src/api/*.rs\"]."
+exclusive = "Whether THIS reservation is exclusive (default true). Recorded for future callers: another agent's check overlapping YOUR exclusive reservation is reported a conflict; a shared (exclusive=false) reservation never causes a conflict for others. It does not change whether conflicts against others are reported to you on this call — those are always reported."
+reason = "Optional short note on why you're reserving these paths."
+ttl_secs = "Lifetime in seconds; clamped to the configured [60, max] range. Defaults to the configured default TTL."
+[renew_reservations]
+full = """Extend the expiry of all your own active reservations in this workspace (agent mail, ADR-009). Only your unreleased, unexpired reservations are touched."""
+terse = """Extend expiry of your own active reservations."""
+
+[renew_reservations.parameters]
+agent = "Your registered agent name."
+ttl_secs = "New lifetime in seconds from now; clamped to the configured [60, max] range."
+[release_reservations]
+full = """Release your own reservations in this workspace (agent mail, ADR-009). Omit `paths` to release ALL your active reservations; otherwise release only those whose pattern exactly matches one you give. Idempotent."""
+terse = """Release your own reservations (all, or by exact pattern)."""
+
+[release_reservations.parameters]
+agent = "Your registered agent name."
+paths = "Optional exact pattern(s) to release (array). Omit to release all your active reservations."
+[check_conflicts]
+full = """Read-only pre-edit check: do the given glob patterns overlap another agent's active exclusive reservation? (agent mail, ADR-009.) Ignores your own reservations and mutates nothing. Use before editing to see if someone else signaled they're working there."""
+terse = """Read-only: check paths against others' active reservations."""
+
+[check_conflicts.parameters]
+agent = "Your registered agent name (your own reservations are ignored)."
+paths = "Glob pattern(s) to check (array)."
+[list_reservations]
+full = """List your own active (unreleased, unexpired) reservations in this workspace (agent mail, ADR-009)."""
+terse = """List your own active reservations."""
+
+[list_reservations.parameters]
+agent = "Your registered agent name."
+limit = "Max reservations to return (most-recent first)."
 [list_tool_signatures]
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 

@@ -16,9 +16,10 @@
 
 use serde_json::{json, Value};
 
+use crate::config::CoordinationConfig;
 use crate::coordination::{
     names, workspace_db_path, AgentRecord, CoordinationStore, Importance, InboxEntry, InboxFilter,
-    MessageRecord,
+    MessageRecord, ReservationConflict, ReservationRecord,
 };
 use crate::protocol::{Op, Response};
 use crate::session::Session;
@@ -83,6 +84,11 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
         "fetch_thread" => fetch_thread(&store, &body, cfg.thread_max_messages.max(1)),
         "mark_read" => mark_read(&store, &body, &now),
         "acknowledge" => acknowledge(&store, &body, &now),
+        "reserve_paths" => reserve_paths(&store, &body, cfg, &now),
+        "renew_reservations" => renew_reservations(&store, &body, cfg, &now),
+        "release_reservations" => release_reservations(&store, &body, &now),
+        "check_conflicts" => check_conflicts(&store, &body, &now),
+        "list_reservations" => list_reservations(&store, &body, &now),
         other => Response::err(ERR_BAD_REQUEST, &format!("coord: unknown verb '{other}'")),
     }
 }
@@ -390,17 +396,187 @@ fn acknowledge(store: &CoordinationStore, body: &Value, now: &str) -> Response {
 /// Shared arg extraction for mark_read/acknowledge: `{agent, message_id}`.
 /// Returns an error *message* (not a `Response`) so the small-error variant
 /// keeps `Result` compact (clippy::result_large_err); callers wrap it.
+/// Delegates agent-name validation to `agent_arg` to avoid drift.
 fn read_agent_and_id(body: &Value) -> Result<(String, i64), String> {
-    let agent = match body.get("agent").and_then(|v| v.as_str()) {
-        Some(a) if names::is_valid(a) => a.to_string(),
-        Some(_) => return Err("coord: 'agent' is not a valid name".to_string()),
-        None => return Err("coord: 'agent' is required".to_string()),
-    };
+    let agent = agent_arg(body)?;
     let message_id = match body.get("message_id").and_then(|v| v.as_i64()) {
         Some(id) => id,
         None => return Err("coord: 'message_id' is required".to_string()),
     };
     Ok((agent, message_id))
+}
+
+/// Reservation scan cap for conflict detection — bounds how many existing
+/// active reservations we examine. Fixed (not yet configurable); generous but
+/// finite so conflict detection can't scan an unbounded set.
+const RESERVATION_SCAN_CAP: i64 = 1000;
+
+/// Compute an RFC-3339 `expires_ts` = now + clamped TTL seconds. The requested
+/// TTL (or the config default when omitted) is clamped to
+/// `[60, max_reservation_ttl_secs]` so a caller can't set a zero/negative or
+/// absurd lifetime. On any arithmetic/parse failure, fall back to the default
+/// TTL from `now` (never panics).
+fn compute_expiry(body: &Value, cfg: &CoordinationConfig, now: &str) -> String {
+    let requested = body
+        .get("ttl_secs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(cfg.default_reservation_ttl_secs as i64);
+    let max = cfg.max_reservation_ttl_secs.max(60) as i64;
+    let ttl = requested.clamp(60, max);
+    let base = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    (base + chrono::Duration::seconds(ttl)).to_rfc3339()
+}
+
+fn reserve_paths(
+    store: &CoordinationStore,
+    body: &Value,
+    cfg: &CoordinationConfig,
+    now: &str,
+) -> Response {
+    let agent = match agent_arg(body) {
+        Ok(a) => a,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    let patterns = str_array(body, "paths");
+    if patterns.is_empty() {
+        return Response::err(ERR_BAD_REQUEST, "coord: 'paths' must be a non-empty array");
+    }
+    let exclusive = body
+        .get("exclusive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let reason = body.get("reason").and_then(|v| v.as_str());
+    let expires_ts = compute_expiry(body, cfg, now);
+
+    match store.reserve_paths(
+        &agent,
+        &patterns,
+        exclusive,
+        reason,
+        now,
+        &expires_ts,
+        RESERVATION_SCAN_CAP,
+    ) {
+        Ok((granted, conflicts, scan_truncated)) => Response::ok(json!({
+            "granted": granted.iter().map(reservation_json).collect::<Vec<_>>(),
+            "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+            "scan_truncated": scan_truncated,
+            "expires_ts": expires_ts,
+        })),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: reserve failed: {e}"),
+        ),
+    }
+}
+
+fn renew_reservations(
+    store: &CoordinationStore,
+    body: &Value,
+    cfg: &CoordinationConfig,
+    now: &str,
+) -> Response {
+    let agent = match agent_arg(body) {
+        Ok(a) => a,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    let new_expires_ts = compute_expiry(body, cfg, now);
+    match store.renew_reservations(&agent, now, &new_expires_ts) {
+        Ok(n) => Response::ok(json!({ "renewed": n, "expires_ts": new_expires_ts })),
+        Err(e) => Response::err(ERR_STORE_UNAVAILABLE, &format!("coord: renew failed: {e}")),
+    }
+}
+
+fn release_reservations(store: &CoordinationStore, body: &Value, now: &str) -> Response {
+    let agent = match agent_arg(body) {
+        Ok(a) => a,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    // Optional `paths`: empty => release all of the caller's active reservations.
+    let patterns = str_array(body, "paths");
+    match store.release_reservations(&agent, &patterns, now) {
+        Ok(n) => Response::ok(json!({ "released": n })),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: release failed: {e}"),
+        ),
+    }
+}
+
+fn check_conflicts(store: &CoordinationStore, body: &Value, now: &str) -> Response {
+    let agent = match agent_arg(body) {
+        Ok(a) => a,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    let patterns = str_array(body, "paths");
+    if patterns.is_empty() {
+        return Response::err(ERR_BAD_REQUEST, "coord: 'paths' must be a non-empty array");
+    }
+    match store.check_conflicts(&agent, &patterns, now, RESERVATION_SCAN_CAP) {
+        // `conflict_free` requires BOTH an empty conflict list AND a complete
+        // scan — a truncated scan means we can't guarantee all-clear.
+        Ok((conflicts, scan_truncated)) => Response::ok(json!({
+            "conflict_free": conflicts.is_empty() && !scan_truncated,
+            "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+            "scan_truncated": scan_truncated,
+        })),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: check_conflicts failed: {e}"),
+        ),
+    }
+}
+
+fn list_reservations(store: &CoordinationStore, body: &Value, now: &str) -> Response {
+    let agent = match agent_arg(body) {
+        Ok(a) => a,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    let limit = body.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+    match store.list_reservations(&agent, now, limit) {
+        Ok(rs) => Response::ok(json!({
+            "reservations": rs.iter().map(reservation_json).collect::<Vec<_>>(),
+            "count": rs.len(),
+        })),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: list_reservations failed: {e}"),
+        ),
+    }
+}
+
+/// Extract + validate the required `agent` name arg. Returns an error message
+/// (small `Err` variant — clippy::result_large_err) for the caller to wrap.
+fn agent_arg(body: &Value) -> Result<String, String> {
+    match body.get("agent").and_then(|v| v.as_str()) {
+        Some(a) if names::is_valid(a) => Ok(a.to_string()),
+        Some(_) => Err("coord: 'agent' is not a valid name".to_string()),
+        None => Err("coord: 'agent' is required".to_string()),
+    }
+}
+
+fn reservation_json(r: &ReservationRecord) -> Value {
+    json!({
+        "id": r.id,
+        "agent_name": r.agent_name,
+        "pattern": r.pattern,
+        "exclusive": r.exclusive,
+        "reason": r.reason,
+        "created_ts": r.created_ts,
+        "expires_ts": r.expires_ts,
+        "released_ts": r.released_ts,
+    })
+}
+
+fn conflict_json(c: &ReservationConflict) -> Value {
+    json!({
+        "pattern": c.pattern,
+        "held_by": c.held_by,
+        "conflicting_pattern": c.conflicting_pattern,
+        "reservation_id": c.reservation_id,
+    })
 }
 
 fn message_json(m: &MessageRecord) -> Value {
@@ -756,6 +932,70 @@ mod tests {
         let r = call(&mut s, json!({"verb": "fetch_inbox"}));
         assert!(!r.ok);
         assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn reserve_conflict_release_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        // A reserves; conflict-free.
+        let r = call(
+            &mut s,
+            json!({"verb": "reserve_paths", "agent": "A", "paths": ["src/api/*.rs"], "reason": "refactor"}),
+        );
+        assert!(r.ok, "reserve failed: {:?}", r.m);
+        let d = r.d.unwrap();
+        assert_eq!(d["granted"].as_array().unwrap().len(), 1);
+        assert_eq!(d["conflicts"].as_array().unwrap().len(), 0);
+
+        // B checks an overlapping path -> conflict (read-only).
+        let chk = call(
+            &mut s,
+            json!({"verb": "check_conflicts", "agent": "B", "paths": ["src/api/users.rs"]}),
+        );
+        assert!(chk.ok);
+        let cd = chk.d.unwrap();
+        assert_eq!(cd["conflict_free"], false);
+        assert_eq!(cd["conflicts"][0]["held_by"], "A");
+
+        // A lists its own reservation.
+        let list = call(&mut s, json!({"verb": "list_reservations", "agent": "A"}));
+        assert_eq!(list.d.unwrap()["count"], 1);
+
+        // A releases; B is now conflict-free.
+        let rel = call(
+            &mut s,
+            json!({"verb": "release_reservations", "agent": "A"}),
+        );
+        assert_eq!(rel.d.unwrap()["released"], 1);
+        let chk2 = call(
+            &mut s,
+            json!({"verb": "check_conflicts", "agent": "B", "paths": ["src/api/users.rs"]}),
+        );
+        assert_eq!(chk2.d.unwrap()["conflict_free"], true);
+    }
+
+    #[test]
+    fn reserve_requires_agent_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let no_agent = call(&mut s, json!({"verb": "reserve_paths", "paths": ["a"]}));
+        assert_eq!(no_agent.e, Some(ERR_BAD_REQUEST));
+        let no_paths = call(&mut s, json!({"verb": "reserve_paths", "agent": "A"}));
+        assert_eq!(no_paths.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn reserve_clamps_ttl_and_returns_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        // A tiny ttl is clamped up to the 60s floor; response carries expires_ts.
+        let r = call(
+            &mut s,
+            json!({"verb": "reserve_paths", "agent": "A", "paths": ["x/*"], "ttl_secs": 1}),
+        );
+        assert!(r.ok);
+        assert!(r.d.unwrap()["expires_ts"].is_string());
     }
 
     #[test]
