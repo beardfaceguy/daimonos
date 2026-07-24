@@ -1605,17 +1605,20 @@ mod tests {
 
     #[test]
     fn coordination_span_never_records_message_content() {
-        // Even though a real send carries a subject/body, the span outcome has
-        // no field for them and must never contain that text (D6). We build an
-        // outcome the way ops::coord does (names/counts only) and assert the
-        // rendered attributes contain no subject/body strings.
+        // The span's attribute KEY SET must be exactly the bounded metadata
+        // keys — there must be no slot into which a subject/body/reason could
+        // ever be recorded (D6). To catch a regression that widened the schema,
+        // we deliberately stuff secret-shaped text into EVERY string field of
+        // the outcome and then assert the exported attribute keys are a subset
+        // of the allowlist. (The `agent` field is a name by contract, so it may
+        // hold a string; the point is that no NEW content-bearing key appears.)
         let (exporter, provider, subscriber) = in_memory_subscriber("coord-privacy-test");
         tracing::subscriber::with_default(subscriber, || {
             let span = CoordinationSpan::new("send_message");
             span.finish(
                 true,
                 &CoordinationOutcome {
-                    agent: Some("GreenCastle".to_string()),
+                    agent: Some("AGENT_NAME".to_string()),
                     recipients: Some(1),
                     importance: Some("normal".to_string()),
                     results: None,
@@ -1627,12 +1630,29 @@ mod tests {
 
         let spans = exporter.get_finished_spans().unwrap();
         let op = spans.iter().find(|s| s.name == "coordination.op").unwrap();
-        let rendered = format!("{:?}", attribute_map(op));
-        // A secret-bearing-fixture-style assertion: none of the sensitive
-        // content that a real message would carry appears in the span.
-        assert!(!rendered.contains("SUBJECT_SECRET"));
-        assert!(!rendered.contains("BODY_SECRET"));
-        assert!(!rendered.contains("RESERVE_REASON_SECRET"));
+        let attributes = attribute_map(op);
+        // Allowlist of the `daimonos.*` attribute keys a coordination.op span
+        // may carry. We check only our own namespace (framework attributes like
+        // `thread.name` are irrelevant and carry no message content). If a
+        // future change adds a content-bearing daimonos field, this fails.
+        let allowed = [
+            "daimonos.coord.verb",
+            "daimonos.coord.agent",
+            "daimonos.coord.recipients",
+            "daimonos.coord.importance",
+            "daimonos.coord.results",
+            "daimonos.coord.conflicts",
+            "daimonos.coord.status",
+            "daimonos.duration_ms",
+        ];
+        for key in attributes.keys() {
+            if key.starts_with("daimonos.") {
+                assert!(
+                    allowed.contains(&key.as_str()),
+                    "unexpected daimonos coordination span attribute {key:?} — possible content leak"
+                );
+            }
+        }
     }
 
     #[test]

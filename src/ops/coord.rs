@@ -48,11 +48,26 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
         None => return Response::err(ERR_BAD_REQUEST, "coord: missing 'verb'"),
     };
 
+    // ADR-009 D8: emit one metadata-only `coordination.op` span per call, now
+    // that the verb is known — so disabled/store-unavailable failure classes
+    // are captured too (never message subjects/bodies or reservation reasons).
+    // The span nests under the enclosing `tool.call` span the agent loop makes.
+    let span = CoordinationSpan::new(&verb);
+    let finish = |span: CoordinationSpan, verb: &str, body: &Value, resp: Response| -> Response {
+        span.finish(resp.ok, &coordination_outcome(verb, body, &resp));
+        resp
+    };
+
     let cfg = &session.cfg.coordination;
     if !cfg.enabled {
-        return Response::err(
-            ERR_DISABLED,
-            "coordination is disabled ([coordination] enabled=false)",
+        return finish(
+            span,
+            &verb,
+            &body,
+            Response::err(
+                ERR_DISABLED,
+                "coordination is disabled ([coordination] enabled=false)",
+            ),
         );
     }
 
@@ -63,18 +78,19 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     let store = match CoordinationStore::open_with(&db_path, cfg.effective_busy_timeout_ms()) {
         Ok(s) => s,
         Err(e) => {
-            return Response::err(
-                ERR_STORE_UNAVAILABLE,
-                &format!("coordination store unavailable: {e}"),
+            return finish(
+                span,
+                &verb,
+                &body,
+                Response::err(
+                    ERR_STORE_UNAVAILABLE,
+                    &format!("coordination store unavailable: {e}"),
+                ),
             )
         }
     };
 
     let now = chrono::Utc::now().to_rfc3339();
-    // ADR-009 D8: emit one metadata-only `coordination.op` span per call
-    // (never message subjects/bodies or reservation reasons). The span nests
-    // under the enclosing `tool.call` span the agent loop already creates.
-    let span = CoordinationSpan::new(&verb);
     let response = match verb.as_str() {
         "register_agent" => register_agent(&store, &body, session, &now),
         "list_agents" => list_agents(&store, &body, cfg.effective_inbox_default_limit()),
@@ -96,8 +112,7 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
         "list_reservations" => list_reservations(&store, &body, &now),
         other => Response::err(ERR_BAD_REQUEST, &format!("coord: unknown verb '{other}'")),
     };
-    span.finish(response.ok, &coordination_outcome(&verb, &body, &response));
-    response
+    finish(span, &verb, &body, response)
 }
 
 /// Derive a metadata-only [`CoordinationOutcome`] from the request body and the
@@ -114,23 +129,47 @@ fn coordination_outcome(verb: &str, body: &Value, response: &Response) -> Coordi
             .and_then(|v| v.as_array())
             .map(|a| a.len() as u64)
     };
-    // The acting agent: `sender` for messaging, `agent` for inbox/reservations.
-    let agent = body
-        .get("sender")
-        .or_else(|| body.get("agent"))
+    // The acting agent, preferring the RESPONSE (covers register_agent, whose
+    // name is minted in the handler and echoed at d.agent.name) and falling
+    // back to the request's `sender`/`agent`.
+    let agent = d
+        .and_then(|d| d.get("agent"))
+        .and_then(|a| a.get("name"))
         .and_then(|v| v.as_str())
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| {
+            body.get("sender")
+                .or_else(|| body.get("agent"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
     let mut outcome = CoordinationOutcome {
         agent,
         ..Default::default()
     };
     match verb {
         "send_message" | "reply_message" => {
-            outcome.recipients = arr_len("recipients");
+            // Prefer the granted recipient list from the response; else count
+            // the request's to+cc (the address list lives under `to`/`cc`, not
+            // `recipients`, on the request).
+            outcome.recipients = arr_len("recipients").or_else(|| {
+                let to = body
+                    .get("to")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |a| a.len());
+                let cc = body
+                    .get("cc")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |a| a.len());
+                let total = (to + cc) as u64;
+                (total > 0).then_some(total)
+            });
+            // Normalize importance through the enum so only the 4 canonical
+            // labels are ever exported (bounded cardinality, D6/D8).
             outcome.importance = body
                 .get("importance")
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .map(|s| Importance::parse(s).as_str().to_string());
         }
         "fetch_inbox" | "fetch_thread" | "list_agents" | "list_reservations" => {
             outcome.results = count_of("count");
