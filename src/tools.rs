@@ -392,7 +392,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "cc": {"type": "array", "items": {"type": "string"}},
                     "subject": {"type": "string"},
                     "body": {"type": "string"},
-                    "importance": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
+                    "importance": {"type": "string", "enum": crate::coordination::Importance::schema_values()},
                     "ack_required": {"type": "boolean"}
                 },
                 "required": ["sender", "subject"]

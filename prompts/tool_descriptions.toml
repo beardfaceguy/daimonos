@@ -94,7 +94,7 @@ terse = """Send a directed message (to/cc, subject, body, importance, ack) — n
 
 [send_message.parameters]
 sender = "Your registered agent name (the message's from)."
-to = "Primary recipient agent names (array). At least one of to/cc is required."
+to = "Primary recipient agent names (array). Provide recipients via to and/or cc; a message with no recipients is rejected (no broadcast)."
 cc = "Carbon-copy recipient agent names (array)."
 subject = "Short subject line."
 body = "Message body (Markdown)."

@@ -74,7 +74,12 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
         "list_agents" => list_agents(&store, &body, cfg.effective_inbox_default_limit()),
         "send_message" => send_message(&store, &body, &now, /* is_reply */ false),
         "reply_message" => send_message(&store, &body, &now, /* is_reply */ true),
-        "fetch_inbox" => fetch_inbox(&store, &body, cfg.effective_inbox_default_limit()),
+        "fetch_inbox" => fetch_inbox(
+            &store,
+            &body,
+            cfg.effective_inbox_default_limit(),
+            cfg.effective_inbox_max_limit(),
+        ),
         "fetch_thread" => fetch_thread(&store, &body, cfg.thread_max_messages.max(1)),
         "mark_read" => mark_read(&store, &body, &now),
         "acknowledge" => acknowledge(&store, &body, &now),
@@ -212,8 +217,10 @@ fn send_message(store: &CoordinationStore, body: &Value, now: &str, is_reply: bo
     let mut to = str_array(body, "to");
     let cc = str_array(body, "cc");
 
-    // reply_message: resolve the parent, default `to` to the original sender
-    // when the caller didn't specify recipients.
+    // reply_message: ALWAYS validate the parent exists (regardless of whether
+    // the caller gave explicit recipients), so a bad `reply_to` can't create
+    // an orphan thread rooted at a non-existent message (codeJung finding).
+    // Default `to` to the parent's sender only when no recipients were given.
     let reply_to = body.get("reply_to").and_then(|v| v.as_i64());
     if is_reply {
         let parent_id = match reply_to {
@@ -222,21 +229,23 @@ fn send_message(store: &CoordinationStore, body: &Value, now: &str, is_reply: bo
                 return Response::err(ERR_BAD_REQUEST, "coord: reply_message requires 'reply_to'")
             }
         };
-        if to.is_empty() && cc.is_empty() {
-            match store.message(parent_id) {
-                Ok(Some(parent)) => to = vec![parent.sender],
-                Ok(None) => {
-                    return Response::err(
-                        ERR_BAD_REQUEST,
-                        &format!("coord: reply_to message {parent_id} not found"),
-                    )
+        match store.message(parent_id) {
+            Ok(Some(parent)) => {
+                if to.is_empty() && cc.is_empty() {
+                    to = vec![parent.sender];
                 }
-                Err(e) => {
-                    return Response::err(
-                        ERR_STORE_UNAVAILABLE,
-                        &format!("coord: reply lookup failed: {e}"),
-                    )
-                }
+            }
+            Ok(None) => {
+                return Response::err(
+                    ERR_BAD_REQUEST,
+                    &format!("coord: reply_to message {parent_id} not found"),
+                )
+            }
+            Err(e) => {
+                return Response::err(
+                    ERR_STORE_UNAVAILABLE,
+                    &format!("coord: reply lookup failed: {e}"),
+                )
             }
         }
     } else if reply_to.is_some() {
@@ -244,6 +253,17 @@ fn send_message(store: &CoordinationStore, body: &Value, now: &str, is_reply: bo
         return Response::err(
             ERR_BAD_REQUEST,
             "coord: use reply_message (not send_message) to reply within a thread",
+        );
+    }
+
+    // Pre-validate the no-recipient case as a bad request HERE, so that any
+    // error the store still returns is a genuine fault -> ERR_STORE_UNAVAILABLE
+    // (matching list_agents/fetch_inbox classification). This keeps a real DB
+    // fault from being mislabeled a bad request (codeJung finding).
+    if to.is_empty() && cc.is_empty() {
+        return Response::err(
+            ERR_BAD_REQUEST,
+            "coord: at least one recipient required (no broadcast)",
         );
     }
 
@@ -263,12 +283,17 @@ fn send_message(store: &CoordinationStore, body: &Value, now: &str, is_reply: bo
             "thread_id": receipt.thread_id,
             "recipients": receipt.recipients,
         })),
-        // A missing recipient (no broadcast) is a bad request, not a store fault.
-        Err(e) => Response::err(ERR_BAD_REQUEST, &format!("coord: send failed: {e}")),
+        // Recipients were validated above, so a failure here is a store fault.
+        Err(e) => Response::err(ERR_STORE_UNAVAILABLE, &format!("coord: send failed: {e}")),
     }
 }
 
-fn fetch_inbox(store: &CoordinationStore, body: &Value, default_limit: i64) -> Response {
+fn fetch_inbox(
+    store: &CoordinationStore,
+    body: &Value,
+    default_limit: i64,
+    max_limit: i64,
+) -> Response {
     let agent = match body.get("agent").and_then(|v| v.as_str()) {
         Some(a) if names::is_valid(a) => a.to_string(),
         Some(_) => return Response::err(ERR_BAD_REQUEST, "coord: 'agent' is not a valid name"),
@@ -285,10 +310,14 @@ fn fetch_inbox(store: &CoordinationStore, body: &Value, default_limit: i64) -> R
             .map(Importance::parse),
         since: body.get("since").and_then(|v| v.as_str()).map(String::from),
     };
+    // Clamp a caller-supplied limit to the configured ceiling so a huge value
+    // can't force an unbounded inbox read (codeJung finding); the store also
+    // floors it at 1.
     let limit = body
         .get("limit")
         .and_then(|v| v.as_i64())
-        .unwrap_or(default_limit);
+        .unwrap_or(default_limit)
+        .min(max_limit);
     match store.fetch_inbox(&agent, &filter, limit) {
         Ok(entries) => {
             let arr: Vec<Value> = entries.iter().map(inbox_entry_json).collect();
@@ -672,6 +701,43 @@ mod tests {
         assert_eq!(d["count"], 2);
         assert_eq!(d["messages"][0]["subject"], "root");
         assert_eq!(d["messages"][1]["subject"], "re");
+    }
+
+    #[test]
+    fn reply_to_nonexistent_parent_is_rejected_even_with_explicit_recipients() {
+        // codeJung: an explicit-recipient reply with a bad reply_to must NOT
+        // create an orphan thread — the parent is always validated.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let r = call(
+            &mut s,
+            json!({"verb": "reply_message", "sender": "A", "to": ["B"], "reply_to": 9999, "subject": "re"}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn fetch_inbox_clamps_huge_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coorddb");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        cfg.coordination.inbox_max_limit = 2;
+        let mut s = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        for i in 0..5 {
+            call(
+                &mut s,
+                json!({"verb": "send_message", "sender": "A", "to": ["Z"], "subject": format!("m{i}")}),
+            );
+        }
+        // A caller asking for 1000 is clamped to inbox_max_limit (2).
+        let inbox = call(
+            &mut s,
+            json!({"verb": "fetch_inbox", "agent": "Z", "limit": 1000}),
+        );
+        assert!(inbox.ok);
+        assert_eq!(inbox.d.unwrap()["count"], 2);
     }
 
     #[test]

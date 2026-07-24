@@ -505,6 +505,9 @@ pub struct CoordinationConfig {
     pub max_reservation_ttl_secs: u64,
     /// Default `fetch_inbox` page size when the caller omits `limit`.
     pub inbox_default_limit: i64,
+    /// Hard ceiling on `fetch_inbox` results, so a caller-supplied `limit`
+    /// cannot force an unbounded inbox read (parallels `thread_max_messages`).
+    pub inbox_max_limit: i64,
     /// Hard cap on messages returned when reconstructing a thread — bounds the
     /// read so a long/adversarial reply chain cannot blow up a response
     /// (ADR-009 D3/D7; no recursion).
@@ -520,6 +523,7 @@ impl Default for CoordinationConfig {
             default_reservation_ttl_secs: 3_600,
             max_reservation_ttl_secs: 86_400,
             inbox_default_limit: 20,
+            inbox_max_limit: 500,
             thread_max_messages: 500,
         }
     }
@@ -565,6 +569,13 @@ impl CoordinationConfig {
     /// every fetch return nothing). Callers use this rather than the raw field.
     pub fn effective_inbox_default_limit(&self) -> i64 {
         self.inbox_default_limit.max(1)
+    }
+
+    /// Inbox hard ceiling clamped to at least 1. `fetch_inbox` clamps a
+    /// caller-supplied `limit` to this so a huge value can't force an
+    /// unbounded read.
+    pub fn effective_inbox_max_limit(&self) -> i64 {
+        self.inbox_max_limit.max(1)
     }
 }
 

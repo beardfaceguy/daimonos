@@ -46,6 +46,13 @@ impl Importance {
             Importance::Urgent => "urgent",
         }
     }
+
+    /// The canonical importance values, in ascending rank order. Single source
+    /// of truth for the tool-schema `enum` so the three coordination schemas
+    /// can't drift from `parse`/`as_str` (codeJung finding).
+    pub fn schema_values() -> &'static [&'static str] {
+        &["low", "normal", "high", "urgent"]
+    }
 }
 
 /// The outcome of a `send_message`: the new message id and the thread it
@@ -419,32 +426,37 @@ impl CoordinationStore {
     /// Single-row read; panic-free. Used by `reply_message` to default the
     /// reply's recipient to the parent's sender.
     pub fn message(&self, message_id: i64) -> Result<Option<MessageRecord>> {
-        let rec = self
-            .conn
-            .query_row(
-                "SELECT id, thread_id, reply_to, sender, subject, body,
-                        importance, ack_required, created_ts
-                 FROM message WHERE id = ?1",
-                params![message_id],
-                Self::row_to_message,
-            )
-            .ok();
-        Ok(rec)
+        // Distinguish "no such message" (Ok(None)) from a real DB fault (Err):
+        // mapping every failure to Ok(None) via `.ok()` would report a broken
+        // store as "message not found", defeating the caller's fail-open
+        // classification (codeJung finding).
+        match self.conn.query_row(
+            "SELECT id, thread_id, reply_to, sender, subject, body,
+                    importance, ack_required, created_ts
+             FROM message WHERE id = ?1",
+            params![message_id],
+            Self::row_to_message,
+        ) {
+            Ok(rec) => Ok(Some(rec)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("lookup message"),
+        }
     }
 
     /// The thread id of a message, or `None` if the message doesn't exist.
-    /// Single-row read; never recurses.
+    /// Single-row read; never recurses. A real DB fault propagates as `Err`
+    /// (only a genuine "no such row" is `Ok(None)`), so a broken store is not
+    /// silently mistaken for a new-thread root.
     fn thread_id_of(&self, message_id: i64) -> Result<Option<i64>> {
-        let tid = self
-            .conn
-            .query_row(
-                "SELECT thread_id FROM message WHERE id = ?1",
-                params![message_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .ok()
-            .flatten();
-        Ok(tid)
+        match self.conn.query_row(
+            "SELECT thread_id FROM message WHERE id = ?1",
+            params![message_id],
+            |row| row.get::<_, Option<i64>>(0),
+        ) {
+            Ok(tid) => Ok(tid),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("lookup thread id"),
+        }
     }
 
     /// An agent's inbox, newest-first, bounded by `limit` (clamped to >= 1).
