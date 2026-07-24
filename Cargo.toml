@@ -25,9 +25,14 @@ async-trait = "0.1"
 blocking = "1"
 starlark = "0.13"
 allocative = "0.3"
-# Temporary pin for rust-mcp-stack/rust-mcp-sdk#215. Return to crates.io
-# after the upstream fix is released.
-rust-mcp-sdk = { git = "https://github.com/beardfaceguy/rust-mcp-sdk", rev = "bd84062d4ff594376468357bbb4768a902d5ddb5", default-features = false, features = ["server", "client", "stdio", "streamable-http", "sse"] }
+# Pinned to our fork (branch fix/stateless-sse-stream-close): the #215 stderr
+# busy-loop fix plus two streamable-HTTP client fixes needed for stateless,
+# POST-only servers like Linear MCP — (1) a graceful POST-stream close is
+# end-of-stream, not a fatal error, and (2) the SSE parser no longer discards
+# the trailing partial line, so large multi-chunk responses assemble. Return
+# to crates.io once these land upstream (rust-mcp-stack/rust-mcp-sdk#215 +
+# follow-ups).
+rust-mcp-sdk = { git = "https://github.com/beardfaceguy/rust-mcp-sdk", rev = "0d9ecb4f9adb275d25a29e84c79635431f6fbd8d", default-features = false, features = ["server", "client", "stdio", "streamable-http", "sse"] }
 similar = "3"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
