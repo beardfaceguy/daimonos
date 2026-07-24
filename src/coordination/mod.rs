@@ -26,7 +26,9 @@
 pub mod names;
 pub mod store;
 
-pub use store::{AgentRecord, CoordinationStore};
+pub use store::{
+    AgentRecord, CoordinationStore, Importance, InboxEntry, InboxFilter, MessageRecord,
+};
 
 use std::path::Path;
 

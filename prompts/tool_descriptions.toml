@@ -88,6 +88,61 @@ terse = """List workspace agents (most-recently-seen first)."""
 
 [list_agents.parameters]
 limit = "Max agents to return (most-recently-seen first). Defaults to the configured inbox page size."
+[send_message]
+full = """Send a directed message to one or more agents in this workspace (agent mail, ADR-009). Addressed by agent name via `to` (and optional `cc`); at least one recipient is required — there is deliberately NO broadcast. Set `importance` and `ack_required` to flag messages that need explicit acknowledgement. Use `reply_message` (not this) to reply within a thread."""
+terse = """Send a directed message (to/cc, subject, body, importance, ack) — no broadcast."""
+
+[send_message.parameters]
+sender = "Your registered agent name (the message's from)."
+to = "Primary recipient agent names (array). At least one of to/cc is required."
+cc = "Carbon-copy recipient agent names (array)."
+subject = "Short subject line."
+body = "Message body (Markdown)."
+importance = "One of low|normal|high|urgent (default normal)."
+ack_required = "If true, recipients should acknowledge receipt."
+[reply_message]
+full = """Reply to an existing message, staying in its thread (agent mail, ADR-009). Give the parent message id as `reply_to`; if you omit `to`/`cc`, the reply is addressed back to the original sender. Inherits the parent's importance/ack semantics unless you override them."""
+terse = """Reply within a message's thread; defaults recipient to the original sender."""
+
+[reply_message.parameters]
+sender = "Your registered agent name (the reply's from)."
+reply_to = "Id of the message you are replying to."
+to = "Optional explicit recipients (array); defaults to the original sender."
+cc = "Optional carbon-copy recipients (array)."
+subject = "Subject line (typically 'Re: ...')."
+body = "Reply body (Markdown)."
+importance = "One of low|normal|high|urgent."
+ack_required = "If true, recipients should acknowledge receipt."
+[fetch_inbox]
+full = """Fetch your inbox for this workspace, newest-first (agent mail, ADR-009). Filter with `unread_only`, `min_importance`, `since`, and `limit`. Each entry includes the message plus your per-recipient read/ack state. Reading does not auto-acknowledge — use mark_read / acknowledge."""
+terse = """Fetch your inbox (newest-first) with unread/importance/since/limit filters."""
+
+[fetch_inbox.parameters]
+agent = "Your registered agent name (whose inbox to read)."
+unread_only = "If true, only return messages you haven't read yet."
+min_importance = "Only return messages at or above this level (low|normal|high|urgent)."
+since = "Only messages created strictly after this RFC-3339 timestamp."
+limit = "Max messages to return. Defaults to the configured inbox page size."
+[mark_read]
+full = """Mark one message read for you (agent mail, ADR-009). Idempotent: a second call keeps the original read time. Per-recipient — only affects your view."""
+terse = """Mark one message read (per-recipient; idempotent)."""
+
+[mark_read.parameters]
+agent = "Your registered agent name."
+message_id = "Id of the message to mark read."
+[acknowledge]
+full = """Acknowledge one message addressed to you (also marks it read) — a lightweight non-textual reply for ack_required messages (agent mail, ADR-009). Idempotent: repeat calls keep the original ack time."""
+terse = """Acknowledge one message (also marks read; idempotent)."""
+
+[acknowledge.parameters]
+agent = "Your registered agent name."
+message_id = "Id of the message to acknowledge."
+[fetch_thread]
+full = """Fetch every message in a thread, oldest-first, bounded by a hard cap (agent mail, ADR-009). Pass the `thread_id` from a message or a send/reply receipt. Reconstruction is a flat, bounded read — never a recursive walk."""
+terse = """Fetch a thread's messages (oldest-first, bounded)."""
+
+[fetch_thread.parameters]
+thread_id = "Id of the thread to fetch (from a message or a send/reply receipt)."
 [list_tool_signatures]
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 

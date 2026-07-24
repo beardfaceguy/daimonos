@@ -16,7 +16,10 @@
 
 use serde_json::{json, Value};
 
-use crate::coordination::{names, workspace_db_path, AgentRecord, CoordinationStore};
+use crate::coordination::{
+    names, workspace_db_path, AgentRecord, CoordinationStore, Importance, InboxEntry, InboxFilter,
+    MessageRecord,
+};
 use crate::protocol::{Op, Response};
 use crate::session::Session;
 
@@ -69,6 +72,12 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     match verb.as_str() {
         "register_agent" => register_agent(&store, &body, session, &now),
         "list_agents" => list_agents(&store, &body, cfg.effective_inbox_default_limit()),
+        "send_message" => send_message(&store, &body, &now, /* is_reply */ false),
+        "reply_message" => send_message(&store, &body, &now, /* is_reply */ true),
+        "fetch_inbox" => fetch_inbox(&store, &body, cfg.effective_inbox_default_limit()),
+        "fetch_thread" => fetch_thread(&store, &body, cfg.thread_max_messages.max(1)),
+        "mark_read" => mark_read(&store, &body, &now),
+        "acknowledge" => acknowledge(&store, &body, &now),
         other => Response::err(ERR_BAD_REQUEST, &format!("coord: unknown verb '{other}'")),
     }
 }
@@ -159,6 +168,234 @@ fn list_agents(store: &CoordinationStore, body: &Value, default_limit: i64) -> R
         }
         Err(e) => Response::err(ERR_STORE_UNAVAILABLE, &format!("coord: list failed: {e}")),
     }
+}
+
+/// Extract a required string-array of agent names from `body[key]`. Missing =>
+/// empty vec (so a caller can pass only `to` or only `cc`).
+fn str_array(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn send_message(store: &CoordinationStore, body: &Value, now: &str, is_reply: bool) -> Response {
+    let sender = match body.get("sender").and_then(|v| v.as_str()) {
+        Some(s) if names::is_valid(s) => s.to_string(),
+        Some(_) => return Response::err(ERR_BAD_REQUEST, "coord: 'sender' is not a valid name"),
+        None => return Response::err(ERR_BAD_REQUEST, "coord: 'sender' is required"),
+    };
+    let subject = body
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let msg_body = body
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let importance = Importance::parse(
+        body.get("importance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("normal"),
+    );
+    let ack_required = body
+        .get("ack_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut to = str_array(body, "to");
+    let cc = str_array(body, "cc");
+
+    // reply_message: resolve the parent, default `to` to the original sender
+    // when the caller didn't specify recipients.
+    let reply_to = body.get("reply_to").and_then(|v| v.as_i64());
+    if is_reply {
+        let parent_id = match reply_to {
+            Some(id) => id,
+            None => {
+                return Response::err(ERR_BAD_REQUEST, "coord: reply_message requires 'reply_to'")
+            }
+        };
+        if to.is_empty() && cc.is_empty() {
+            match store.message(parent_id) {
+                Ok(Some(parent)) => to = vec![parent.sender],
+                Ok(None) => {
+                    return Response::err(
+                        ERR_BAD_REQUEST,
+                        &format!("coord: reply_to message {parent_id} not found"),
+                    )
+                }
+                Err(e) => {
+                    return Response::err(
+                        ERR_STORE_UNAVAILABLE,
+                        &format!("coord: reply lookup failed: {e}"),
+                    )
+                }
+            }
+        }
+    } else if reply_to.is_some() {
+        // send_message doesn't take reply_to; steer callers to reply_message.
+        return Response::err(
+            ERR_BAD_REQUEST,
+            "coord: use reply_message (not send_message) to reply within a thread",
+        );
+    }
+
+    match store.send_message(
+        &sender,
+        &to,
+        &cc,
+        &subject,
+        &msg_body,
+        importance,
+        ack_required,
+        if is_reply { reply_to } else { None },
+        now,
+    ) {
+        Ok(receipt) => Response::ok(json!({
+            "message_id": receipt.message_id,
+            "thread_id": receipt.thread_id,
+            "recipients": receipt.recipients,
+        })),
+        // A missing recipient (no broadcast) is a bad request, not a store fault.
+        Err(e) => Response::err(ERR_BAD_REQUEST, &format!("coord: send failed: {e}")),
+    }
+}
+
+fn fetch_inbox(store: &CoordinationStore, body: &Value, default_limit: i64) -> Response {
+    let agent = match body.get("agent").and_then(|v| v.as_str()) {
+        Some(a) if names::is_valid(a) => a.to_string(),
+        Some(_) => return Response::err(ERR_BAD_REQUEST, "coord: 'agent' is not a valid name"),
+        None => return Response::err(ERR_BAD_REQUEST, "coord: 'agent' is required"),
+    };
+    let filter = InboxFilter {
+        unread_only: body
+            .get("unread_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        min_importance: body
+            .get("min_importance")
+            .and_then(|v| v.as_str())
+            .map(Importance::parse),
+        since: body.get("since").and_then(|v| v.as_str()).map(String::from),
+    };
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(default_limit);
+    match store.fetch_inbox(&agent, &filter, limit) {
+        Ok(entries) => {
+            let arr: Vec<Value> = entries.iter().map(inbox_entry_json).collect();
+            Response::ok(json!({ "messages": arr, "count": arr.len() }))
+        }
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: fetch_inbox failed: {e}"),
+        ),
+    }
+}
+
+fn fetch_thread(store: &CoordinationStore, body: &Value, cap: i64) -> Response {
+    let thread_id = match body.get("thread_id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Response::err(ERR_BAD_REQUEST, "coord: 'thread_id' is required"),
+    };
+    match store.thread(thread_id, cap) {
+        Ok(msgs) => {
+            let arr: Vec<Value> = msgs.iter().map(message_json).collect();
+            Response::ok(json!({ "thread_id": thread_id, "messages": arr, "count": arr.len() }))
+        }
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: fetch_thread failed: {e}"),
+        ),
+    }
+}
+
+fn mark_read(store: &CoordinationStore, body: &Value, now: &str) -> Response {
+    let (agent, message_id) = match read_agent_and_id(body) {
+        Ok(v) => v,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    match store.mark_read(&agent, message_id, now) {
+        Ok(Some(ts)) => Response::ok(json!({ "message_id": message_id, "read_ts": ts })),
+        Ok(None) => Response::err(
+            ERR_BAD_REQUEST,
+            &format!("coord: {agent} is not a recipient of message {message_id}"),
+        ),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: mark_read failed: {e}"),
+        ),
+    }
+}
+
+fn acknowledge(store: &CoordinationStore, body: &Value, now: &str) -> Response {
+    let (agent, message_id) = match read_agent_and_id(body) {
+        Ok(v) => v,
+        Err(msg) => return Response::err(ERR_BAD_REQUEST, &msg),
+    };
+    match store.acknowledge(&agent, message_id, now) {
+        Ok(Some((read_ts, ack_ts))) => Response::ok(json!({
+            "message_id": message_id,
+            "read_ts": read_ts,
+            "ack_ts": ack_ts,
+        })),
+        Ok(None) => Response::err(
+            ERR_BAD_REQUEST,
+            &format!("coord: {agent} is not a recipient of message {message_id}"),
+        ),
+        Err(e) => Response::err(
+            ERR_STORE_UNAVAILABLE,
+            &format!("coord: acknowledge failed: {e}"),
+        ),
+    }
+}
+
+/// Shared arg extraction for mark_read/acknowledge: `{agent, message_id}`.
+/// Returns an error *message* (not a `Response`) so the small-error variant
+/// keeps `Result` compact (clippy::result_large_err); callers wrap it.
+fn read_agent_and_id(body: &Value) -> Result<(String, i64), String> {
+    let agent = match body.get("agent").and_then(|v| v.as_str()) {
+        Some(a) if names::is_valid(a) => a.to_string(),
+        Some(_) => return Err("coord: 'agent' is not a valid name".to_string()),
+        None => return Err("coord: 'agent' is required".to_string()),
+    };
+    let message_id = match body.get("message_id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Err("coord: 'message_id' is required".to_string()),
+    };
+    Ok((agent, message_id))
+}
+
+fn message_json(m: &MessageRecord) -> Value {
+    json!({
+        "id": m.id,
+        "thread_id": m.thread_id,
+        "reply_to": m.reply_to,
+        "sender": m.sender,
+        "subject": m.subject,
+        "body": m.body,
+        "importance": m.importance,
+        "ack_required": m.ack_required,
+        "created_ts": m.created_ts,
+    })
+}
+
+fn inbox_entry_json(e: &InboxEntry) -> Value {
+    let mut v = message_json(&e.message);
+    if let Value::Object(map) = &mut v {
+        map.insert("kind".to_string(), json!(e.kind));
+        map.insert("read_ts".to_string(), json!(e.read_ts));
+        map.insert("ack_ts".to_string(), json!(e.ack_ts));
+    }
+    v
 }
 
 fn agent_json(rec: &AgentRecord) -> Value {
@@ -322,6 +559,137 @@ mod tests {
         );
         assert!(!r.ok, "broken store must not succeed");
         assert_eq!(r.e, Some(ERR_STORE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn send_fetch_read_ack_reply_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        // Send BlueLake -> GreenCastle.
+        let sent = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "BlueLake", "to": ["GreenCastle"],
+                   "subject": "plan", "body": "see below", "importance": "high", "ack_required": true}),
+        );
+        assert!(sent.ok, "send failed: {:?}", sent.m);
+        let sent_d = sent.d.unwrap();
+        let mid = sent_d["message_id"].as_i64().unwrap();
+        assert_eq!(sent_d["recipients"][0], "GreenCastle");
+
+        // GreenCastle fetches inbox.
+        let inbox = call(
+            &mut s,
+            json!({"verb": "fetch_inbox", "agent": "GreenCastle"}),
+        );
+        assert!(inbox.ok);
+        let d = inbox.d.unwrap();
+        assert_eq!(d["count"], 1);
+        assert_eq!(d["messages"][0]["subject"], "plan");
+        assert_eq!(d["messages"][0]["importance"], "high");
+        assert!(d["messages"][0]["read_ts"].is_null());
+
+        // Acknowledge (sets read + ack).
+        let ack = call(
+            &mut s,
+            json!({"verb": "acknowledge", "agent": "GreenCastle", "message_id": mid}),
+        );
+        assert!(ack.ok);
+        assert!(ack.d.unwrap()["ack_ts"].is_string());
+
+        // Reply defaults `to` back to the original sender and shares the thread.
+        let reply = call(
+            &mut s,
+            json!({"verb": "reply_message", "sender": "GreenCastle", "reply_to": mid,
+                   "subject": "re: plan", "body": "ack"}),
+        );
+        assert!(reply.ok, "reply failed: {:?}", reply.m);
+        assert_eq!(reply.d.unwrap()["thread_id"], sent_d["thread_id"]);
+
+        // BlueLake now has the reply in its inbox.
+        let blue = call(&mut s, json!({"verb": "fetch_inbox", "agent": "BlueLake"}));
+        assert_eq!(blue.d.unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn send_without_recipient_is_bad_request_no_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let r = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "BlueLake", "subject": "x"}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn send_message_rejects_reply_to_steering_to_reply_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let r = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "A", "to": ["B"], "reply_to": 1}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn mark_read_and_ack_on_non_recipient_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let sent = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "A", "to": ["B"], "subject": "s"}),
+        );
+        let mid = sent.d.unwrap()["message_id"].as_i64().unwrap();
+        let r = call(
+            &mut s,
+            json!({"verb": "mark_read", "agent": "Nobody", "message_id": mid}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn fetch_thread_returns_ordered_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let root = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "A", "to": ["B"], "subject": "root"}),
+        );
+        let rd = root.d.unwrap();
+        let mid = rd["message_id"].as_i64().unwrap();
+        let tid = rd["thread_id"].as_i64().unwrap();
+        call(
+            &mut s,
+            json!({"verb": "reply_message", "sender": "B", "reply_to": mid, "subject": "re"}),
+        );
+        let thread = call(&mut s, json!({"verb": "fetch_thread", "thread_id": tid}));
+        assert!(thread.ok);
+        let d = thread.d.unwrap();
+        assert_eq!(d["count"], 2);
+        assert_eq!(d["messages"][0]["subject"], "root");
+        assert_eq!(d["messages"][1]["subject"], "re");
+    }
+
+    #[test]
+    fn fetch_thread_requires_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let r = call(&mut s, json!({"verb": "fetch_thread"}));
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
+    }
+
+    #[test]
+    fn fetch_inbox_requires_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let r = call(&mut s, json!({"verb": "fetch_inbox"}));
+        assert!(!r.ok);
+        assert_eq!(r.e, Some(ERR_BAD_REQUEST));
     }
 
     #[test]

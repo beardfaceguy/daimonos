@@ -17,6 +17,81 @@ use std::time::Duration;
 /// mis-parsed (mirrors `session_store::SESSION_PERSIST_VERSION`).
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Message importance levels (ADR-009 D3). Free-form-tolerant on read, but
+/// `send_message` normalizes an input to one of these (unknown -> `Normal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Importance {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+impl Importance {
+    /// Parse a caller-supplied importance, defaulting unknown/empty to Normal.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Importance::Low,
+            "high" => Importance::High,
+            "urgent" => Importance::Urgent,
+            _ => Importance::Normal,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Importance::Low => "low",
+            Importance::Normal => "normal",
+            Importance::High => "high",
+            Importance::Urgent => "urgent",
+        }
+    }
+}
+
+/// The outcome of a `send_message`: the new message id and the thread it
+/// belongs to (a fresh message threads under its own id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReceipt {
+    pub message_id: i64,
+    pub thread_id: i64,
+    pub recipients: Vec<String>,
+}
+
+/// One message as stored (sender-side / thread view; no per-recipient state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRecord {
+    pub id: i64,
+    pub thread_id: i64,
+    pub reply_to: Option<i64>,
+    pub sender: String,
+    pub subject: String,
+    pub body: String,
+    pub importance: String,
+    pub ack_required: bool,
+    pub created_ts: String,
+}
+
+/// One inbox entry: a message joined with the *reading agent's* per-recipient
+/// delivery state (`kind`/`read_ts`/`ack_ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxEntry {
+    pub message: MessageRecord,
+    /// 'to' or 'cc' for this recipient.
+    pub kind: String,
+    pub read_ts: Option<String>,
+    pub ack_ts: Option<String>,
+}
+
+/// Filters for `fetch_inbox` (all optional; ADR-009 D3).
+#[derive(Debug, Clone, Default)]
+pub struct InboxFilter {
+    pub unread_only: bool,
+    /// Restrict to messages at or above this importance, by rank.
+    pub min_importance: Option<Importance>,
+    /// Only messages created strictly after this RFC-3339 timestamp.
+    pub since: Option<String>,
+}
+
 /// One registered agent identity (ADR-009 D2/D6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
@@ -246,6 +321,330 @@ impl CoordinationStore {
             last_seen_ts: row.get(6)?,
         })
     }
+
+    // ---- messaging (ADR-009 D3) ----
+
+    /// Send a directed message. `to`/`cc` are agent names; **at least one
+    /// recipient is required** (there is deliberately NO broadcast — the spam
+    /// vector agent_mail omits). When `reply_to` names a parent message, the
+    /// new message inherits that parent's thread (or, if the parent had none,
+    /// the parent's id becomes the thread root); otherwise the new message
+    /// starts its own thread (thread_id = its own id). Duplicate names across
+    /// to+cc collapse to one recipient row (`to` wins). The sender is never
+    /// auto-added as a recipient. Returns the message id + thread id.
+    ///
+    /// All writes happen in one transaction so a partial send can't leave a
+    /// message with no recipients.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_message(
+        &self,
+        sender: &str,
+        to: &[String],
+        cc: &[String],
+        subject: &str,
+        body: &str,
+        importance: Importance,
+        ack_required: bool,
+        reply_to: Option<i64>,
+        now: &str,
+    ) -> Result<SendReceipt> {
+        // De-dupe recipients, `to` taking precedence over `cc`, and drop the
+        // sender if they addressed themselves. Order is preserved for a stable
+        // recipient list in the receipt.
+        let mut seen = std::collections::HashSet::new();
+        let mut recipients: Vec<(String, &'static str)> = Vec::new();
+        for name in to {
+            if name != sender && seen.insert(name.clone()) {
+                recipients.push((name.clone(), "to"));
+            }
+        }
+        for name in cc {
+            if name != sender && seen.insert(name.clone()) {
+                recipients.push((name.clone(), "cc"));
+            }
+        }
+        if recipients.is_empty() {
+            anyhow::bail!("send_message requires at least one recipient (no broadcast)");
+        }
+
+        // Resolve the parent's thread up front (a bounded single-row read), so
+        // the transaction below is pure writes.
+        let inherited_thread = match reply_to {
+            Some(pid) => Some(self.thread_id_of(pid)?.unwrap_or(pid)),
+            None => None,
+        };
+
+        let tx = self.conn.unchecked_transaction().context("begin send tx")?;
+        tx.execute(
+            "INSERT INTO message
+                (thread_id, reply_to, sender, subject, body, importance, ack_required, created_ts)
+             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                reply_to,
+                sender,
+                subject,
+                body,
+                importance.as_str(),
+                ack_required as i64,
+                now
+            ],
+        )
+        .context("insert message")?;
+        let message_id = tx.last_insert_rowid();
+        // A fresh message threads under its own id; a reply inherits the parent
+        // thread. Set it now that we know the id.
+        let thread_id = inherited_thread.unwrap_or(message_id);
+        tx.execute(
+            "UPDATE message SET thread_id = ?1 WHERE id = ?2",
+            params![thread_id, message_id],
+        )
+        .context("set thread_id")?;
+        for (name, kind) in &recipients {
+            tx.execute(
+                "INSERT INTO recipient (message_id, agent_name, kind) VALUES (?1, ?2, ?3)",
+                params![message_id, name, kind],
+            )
+            .context("insert recipient")?;
+        }
+        tx.commit().context("commit send tx")?;
+
+        Ok(SendReceipt {
+            message_id,
+            thread_id,
+            recipients: recipients.into_iter().map(|(n, _)| n).collect(),
+        })
+    }
+
+    /// Fetch one message by id (no per-recipient state), or `None` if absent.
+    /// Single-row read; panic-free. Used by `reply_message` to default the
+    /// reply's recipient to the parent's sender.
+    pub fn message(&self, message_id: i64) -> Result<Option<MessageRecord>> {
+        let rec = self
+            .conn
+            .query_row(
+                "SELECT id, thread_id, reply_to, sender, subject, body,
+                        importance, ack_required, created_ts
+                 FROM message WHERE id = ?1",
+                params![message_id],
+                Self::row_to_message,
+            )
+            .ok();
+        Ok(rec)
+    }
+
+    /// The thread id of a message, or `None` if the message doesn't exist.
+    /// Single-row read; never recurses.
+    fn thread_id_of(&self, message_id: i64) -> Result<Option<i64>> {
+        let tid = self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM message WHERE id = ?1",
+                params![message_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(tid)
+    }
+
+    /// An agent's inbox, newest-first, bounded by `limit` (clamped to >= 1).
+    /// Filters (all optional): `unread_only`, `min_importance` (by rank),
+    /// `since` (created strictly after). This is a single indexed join with a
+    /// hard LIMIT — no recursion, no unbounded scan.
+    pub fn fetch_inbox(
+        &self,
+        agent: &str,
+        filter: &InboxFilter,
+        limit: i64,
+    ) -> Result<Vec<InboxEntry>> {
+        let limit = limit.max(1);
+        // Build the WHERE incrementally with bound params (no string interp of
+        // user data). Importance rank is computed inline so the comparison is
+        // ordinal, not lexical.
+        let mut sql = String::from(
+            "SELECT m.id, m.thread_id, m.reply_to, m.sender, m.subject, m.body,
+                    m.importance, m.ack_required, m.created_ts,
+                    r.kind, r.read_ts, r.ack_ts
+             FROM recipient r JOIN message m ON m.id = r.message_id
+             WHERE r.agent_name = ?1",
+        );
+        if filter.unread_only {
+            sql.push_str(" AND r.read_ts IS NULL");
+        }
+        if filter.since.is_some() {
+            sql.push_str(" AND m.created_ts > ?2");
+        }
+        if let Some(min) = filter.min_importance {
+            // Inline the rank floor as a literal integer (not user input).
+            sql.push_str(&format!(
+                " AND {} >= {}",
+                importance_rank_sql("m.importance"),
+                importance_rank(min)
+            ));
+        }
+        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?3");
+
+        let mut stmt = self.conn.prepare(&sql).context("prepare fetch_inbox")?;
+        // `since` is optional but the placeholder ?2 must always bind; pass an
+        // empty string when unused (the clause referencing it is only added
+        // when Some, so an empty bind is inert otherwise).
+        let since_bind = filter.since.clone().unwrap_or_default();
+        let rows = stmt
+            .query_map(params![agent, since_bind, limit], Self::row_to_inbox_entry)
+            .context("query fetch_inbox")?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(entry) => out.push(entry),
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark one message read for `agent`. Idempotent: a second call keeps the
+    /// original `read_ts`. Returns the effective read timestamp, or `None` if
+    /// the agent is not a recipient of that message.
+    pub fn mark_read(&self, agent: &str, message_id: i64, now: &str) -> Result<Option<String>> {
+        self.conn
+            .execute(
+                "UPDATE recipient SET read_ts = ?1
+                 WHERE message_id = ?2 AND agent_name = ?3 AND read_ts IS NULL",
+                params![now, message_id, agent],
+            )
+            .context("mark_read")?;
+        self.recipient_read_ts(agent, message_id)
+    }
+
+    /// Acknowledge one message for `agent` (also marks it read). Idempotent:
+    /// a second call keeps the original `ack_ts`. Returns `(read_ts, ack_ts)`,
+    /// or `None` if the agent is not a recipient.
+    pub fn acknowledge(
+        &self,
+        agent: &str,
+        message_id: i64,
+        now: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        self.conn
+            .execute(
+                "UPDATE recipient
+                    SET read_ts = COALESCE(read_ts, ?1),
+                        ack_ts  = COALESCE(ack_ts, ?1)
+                 WHERE message_id = ?2 AND agent_name = ?3",
+                params![now, message_id, agent],
+            )
+            .context("acknowledge")?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT read_ts, ack_ts FROM recipient
+                 WHERE message_id = ?1 AND agent_name = ?2",
+                params![message_id, agent],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    fn recipient_read_ts(&self, agent: &str, message_id: i64) -> Result<Option<String>> {
+        let ts = self
+            .conn
+            .query_row(
+                "SELECT read_ts FROM recipient WHERE message_id = ?1 AND agent_name = ?2",
+                params![message_id, agent],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(ts)
+    }
+
+    /// All messages in a thread, oldest-first, bounded by `cap` (clamped to at
+    /// least 1). This is a flat indexed select on `thread_id` with a hard
+    /// LIMIT. It deliberately does not walk the `reply_to` chain recursively,
+    /// so a long or self-referential reply chain can never overflow the stack
+    /// (ADR-009 D3/D7; #1053 lesson 1).
+    pub fn thread(&self, thread_id: i64, cap: i64) -> Result<Vec<MessageRecord>> {
+        let cap = cap.max(1);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, thread_id, reply_to, sender, subject, body,
+                        importance, ack_required, created_ts
+                 FROM message WHERE thread_id = ?1
+                 ORDER BY created_ts ASC, id ASC LIMIT ?2",
+            )
+            .context("prepare thread")?;
+        let rows = stmt
+            .query_map(params![thread_id, cap], Self::row_to_message)
+            .context("query thread")?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(m) => out.push(m),
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
+    fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+        Ok(MessageRecord {
+            id: row.get(0)?,
+            thread_id: row.get(1)?,
+            reply_to: row.get(2)?,
+            sender: row.get(3)?,
+            subject: row.get(4)?,
+            body: row.get(5)?,
+            importance: row.get(6)?,
+            ack_required: row.get::<_, i64>(7)? != 0,
+            created_ts: row.get(8)?,
+        })
+    }
+
+    fn row_to_inbox_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxEntry> {
+        Ok(InboxEntry {
+            message: MessageRecord {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                reply_to: row.get(2)?,
+                sender: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                importance: row.get(6)?,
+                ack_required: row.get::<_, i64>(7)? != 0,
+                created_ts: row.get(8)?,
+            },
+            kind: row.get(9)?,
+            read_ts: row.get(10)?,
+            ack_ts: row.get(11)?,
+        })
+    }
+}
+
+/// Ordinal rank of an importance level, for `min_importance` filtering.
+fn importance_rank(i: Importance) -> i64 {
+    match i {
+        Importance::Low => 0,
+        Importance::Normal => 1,
+        Importance::High => 2,
+        Importance::Urgent => 3,
+    }
+}
+
+/// A SQL `CASE` expression mapping an importance column to its ordinal rank, so
+/// the `min_importance` comparison is ordinal rather than lexical. The argument
+/// is a column name we control (never user input).
+fn importance_rank_sql(col: &str) -> String {
+    format!(
+        "(CASE {col} WHEN 'low' THEN 0 WHEN 'normal' THEN 1 \
+          WHEN 'high' THEN 2 WHEN 'urgent' THEN 3 ELSE 1 END)"
+    )
 }
 
 #[cfg(test)]
@@ -456,5 +855,346 @@ mod tests {
         let s2 = CoordinationStore::open_with(&path, 5_000).unwrap();
         assert_eq!(s2.schema_version().unwrap(), Some(SCHEMA_VERSION));
         assert_eq!(s2.list_agents(100).unwrap().len(), 1);
+    }
+
+    // ---- messaging ----
+
+    fn send(
+        s: &CoordinationStore,
+        sender: &str,
+        to: &[&str],
+        cc: &[&str],
+        subject: &str,
+        now: &str,
+    ) -> SendReceipt {
+        let to: Vec<String> = to.iter().map(|x| x.to_string()).collect();
+        let cc: Vec<String> = cc.iter().map(|x| x.to_string()).collect();
+        s.send_message(
+            sender,
+            &to,
+            &cc,
+            subject,
+            "body",
+            Importance::Normal,
+            false,
+            None,
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn send_lands_in_recipient_inbox_not_sender() {
+        let s = store();
+        let r = send(
+            &s,
+            "BlueLake",
+            &["GreenCastle"],
+            &[],
+            "hi",
+            "2026-07-24T00:00:00Z",
+        );
+        assert_eq!(r.recipients, vec!["GreenCastle"]);
+
+        let inbox = s
+            .fetch_inbox("GreenCastle", &InboxFilter::default(), 100)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message.subject, "hi");
+        assert_eq!(inbox[0].message.sender, "BlueLake");
+        assert_eq!(inbox[0].kind, "to");
+        assert!(inbox[0].read_ts.is_none());
+
+        // Sender does not receive their own message.
+        let sender_inbox = s
+            .fetch_inbox("BlueLake", &InboxFilter::default(), 100)
+            .unwrap();
+        assert!(sender_inbox.is_empty());
+    }
+
+    #[test]
+    fn cc_recipients_get_kind_cc_and_dedupe_with_to() {
+        let s = store();
+        // Overlap: GreenCastle in both to and cc -> single row, kind 'to' wins.
+        s.send_message(
+            "BlueLake",
+            &["GreenCastle".into()],
+            &["GreenCastle".into(), "Ridge".into()],
+            "s",
+            "b",
+            Importance::Normal,
+            false,
+            None,
+            "2026-07-24T00:00:00Z",
+        )
+        .unwrap();
+        let gc = s
+            .fetch_inbox("GreenCastle", &InboxFilter::default(), 10)
+            .unwrap();
+        assert_eq!(
+            gc.len(),
+            1,
+            "overlapping recipient must collapse to one row"
+        );
+        assert_eq!(gc[0].kind, "to");
+        let ridge = s.fetch_inbox("Ridge", &InboxFilter::default(), 10).unwrap();
+        assert_eq!(ridge[0].kind, "cc");
+    }
+
+    #[test]
+    fn send_requires_a_recipient_no_broadcast() {
+        let s = store();
+        // Empty to+cc -> error.
+        let empty = s.send_message(
+            "BlueLake",
+            &[],
+            &[],
+            "s",
+            "b",
+            Importance::Normal,
+            false,
+            None,
+            "t",
+        );
+        assert!(
+            empty.is_err(),
+            "a message with no recipients must be rejected"
+        );
+        // Addressing only yourself also yields zero recipients -> error.
+        let self_only = s.send_message(
+            "BlueLake",
+            &["BlueLake".into()],
+            &[],
+            "s",
+            "b",
+            Importance::Normal,
+            false,
+            None,
+            "t",
+        );
+        assert!(self_only.is_err());
+    }
+
+    #[test]
+    fn inbox_filters_unread_importance_since() {
+        let s = store();
+        s.send_message(
+            "A",
+            &["Z".into()],
+            &[],
+            "low",
+            "b",
+            Importance::Low,
+            false,
+            None,
+            "2026-07-24T00:00:01Z",
+        )
+        .unwrap();
+        let high = s
+            .send_message(
+                "A",
+                &["Z".into()],
+                &[],
+                "high",
+                "b",
+                Importance::High,
+                false,
+                None,
+                "2026-07-24T00:00:02Z",
+            )
+            .unwrap();
+        s.send_message(
+            "A",
+            &["Z".into()],
+            &[],
+            "urgent",
+            "b",
+            Importance::Urgent,
+            false,
+            None,
+            "2026-07-24T00:00:03Z",
+        )
+        .unwrap();
+
+        // Newest-first ordering.
+        let all = s.fetch_inbox("Z", &InboxFilter::default(), 100).unwrap();
+        let subjects: Vec<&str> = all.iter().map(|e| e.message.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["urgent", "high", "low"]);
+
+        // min_importance = High -> only high + urgent.
+        let f = InboxFilter {
+            min_importance: Some(Importance::High),
+            ..Default::default()
+        };
+        let hi = s.fetch_inbox("Z", &f, 100).unwrap();
+        assert_eq!(hi.len(), 2);
+        assert!(hi.iter().all(|e| e.message.subject != "low"));
+
+        // since -> strictly-after.
+        let f = InboxFilter {
+            since: Some("2026-07-24T00:00:01Z".into()),
+            ..Default::default()
+        };
+        let since = s.fetch_inbox("Z", &f, 100).unwrap();
+        assert_eq!(since.len(), 2);
+        assert!(since.iter().all(|e| e.message.subject != "low"));
+
+        // Read the high message, then unread_only excludes it.
+        s.mark_read("Z", high.message_id, "2026-07-24T01:00:00Z")
+            .unwrap();
+        let f = InboxFilter {
+            unread_only: true,
+            ..Default::default()
+        };
+        let unread = s.fetch_inbox("Z", &f, 100).unwrap();
+        assert_eq!(unread.len(), 2);
+        assert!(unread.iter().all(|e| e.message.subject != "high"));
+    }
+
+    #[test]
+    fn mark_read_and_acknowledge_are_idempotent_and_scoped() {
+        let s = store();
+        let r = send(&s, "A", &["Z"], &[], "s", "2026-07-24T00:00:00Z");
+        // First read sets ts; second keeps it.
+        let first = s
+            .mark_read("Z", r.message_id, "2026-07-24T01:00:00Z")
+            .unwrap();
+        assert_eq!(first.as_deref(), Some("2026-07-24T01:00:00Z"));
+        let second = s
+            .mark_read("Z", r.message_id, "2026-07-24T02:00:00Z")
+            .unwrap();
+        assert_eq!(
+            second.as_deref(),
+            Some("2026-07-24T01:00:00Z"),
+            "read_ts must not change"
+        );
+
+        // Acknowledge sets ack (and read if unset); idempotent.
+        let ack = s
+            .acknowledge("Z", r.message_id, "2026-07-24T03:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.1.as_deref(), Some("2026-07-24T03:00:00Z"));
+        let ack2 = s
+            .acknowledge("Z", r.message_id, "2026-07-24T04:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ack2.1.as_deref(),
+            Some("2026-07-24T03:00:00Z"),
+            "ack_ts must not change"
+        );
+
+        // A non-recipient gets None, not an error.
+        assert!(s.mark_read("Nobody", r.message_id, "t").unwrap().is_none());
+        assert!(s
+            .acknowledge("Nobody", r.message_id, "t")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reply_inherits_thread_and_new_message_starts_own_thread() {
+        let s = store();
+        let root = send(&s, "A", &["B"], &[], "root", "2026-07-24T00:00:00Z");
+        // A fresh message threads under its own id.
+        assert_eq!(root.thread_id, root.message_id);
+
+        // B replies to A within the same thread.
+        let reply = s
+            .send_message(
+                "B",
+                &["A".into()],
+                &[],
+                "re",
+                "b",
+                Importance::Normal,
+                false,
+                Some(root.message_id),
+                "2026-07-24T00:01:00Z",
+            )
+            .unwrap();
+        assert_eq!(reply.thread_id, root.thread_id);
+
+        // A reply to the reply still lands in the same root thread.
+        let reply2 = s
+            .send_message(
+                "A",
+                &["B".into()],
+                &[],
+                "re re",
+                "b",
+                Importance::Normal,
+                false,
+                Some(reply.message_id),
+                "2026-07-24T00:02:00Z",
+            )
+            .unwrap();
+        assert_eq!(reply2.thread_id, root.thread_id);
+
+        let thread = s.thread(root.thread_id, 100).unwrap();
+        assert_eq!(thread.len(), 3);
+        // Oldest-first.
+        assert_eq!(thread[0].subject, "root");
+        assert_eq!(thread[2].subject, "re re");
+    }
+
+    #[test]
+    fn thread_is_bounded_and_never_recurses_on_self_referential_chain() {
+        let s = store();
+        let root = send(&s, "A", &["B"], &[], "m0", "2026-07-24T00:00:00Z");
+        // Build a long chain, each replying to the previous.
+        let mut prev = root.message_id;
+        for i in 1..50 {
+            let r = s
+                .send_message(
+                    "A",
+                    &["B".into()],
+                    &[],
+                    &format!("m{i}"),
+                    "b",
+                    Importance::Normal,
+                    false,
+                    Some(prev),
+                    &format!("2026-07-24T00:{:02}:00Z", i),
+                )
+                .unwrap();
+            assert_eq!(r.thread_id, root.thread_id);
+            prev = r.message_id;
+        }
+        // A hard cap bounds the read regardless of chain length (no recursion).
+        let capped = s.thread(root.thread_id, 10).unwrap();
+        assert_eq!(capped.len(), 10, "thread read must honor the hard cap");
+        let full = s.thread(root.thread_id, 1000).unwrap();
+        assert_eq!(full.len(), 50);
+    }
+
+    #[test]
+    fn messaging_survives_two_connections_to_one_wal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coord.db");
+        let a = CoordinationStore::open_with(&path, 5_000).unwrap();
+        let b = CoordinationStore::open_with(&path, 5_000).unwrap();
+        // A sends; B (a separate connection) reads it and acks; A sees the ack.
+        let r = a
+            .send_message(
+                "A",
+                &["B".into()],
+                &[],
+                "s",
+                "b",
+                Importance::High,
+                true,
+                None,
+                "2026-07-24T00:00:00Z",
+            )
+            .unwrap();
+        let inbox = b.fetch_inbox("B", &InboxFilter::default(), 10).unwrap();
+        assert_eq!(inbox.len(), 1);
+        b.acknowledge("B", r.message_id, "2026-07-24T01:00:00Z")
+            .unwrap();
+        // A re-reads via its own connection and sees B's ack.
+        let seen = a.fetch_inbox("B", &InboxFilter::default(), 10).unwrap();
+        assert_eq!(seen[0].ack_ts.as_deref(), Some("2026-07-24T01:00:00Z"));
     }
 }
