@@ -279,6 +279,10 @@ pub mod op {
     pub const ENV_SET: u8 = 16;
     pub const ENV_GET: u8 = 17;
     pub const SESSION: u8 = 18;
+    /// Agent-to-agent coordination ("agent mail", ADR-009). One opcode carries
+    /// a JSON body in `s` (a `{verb, ...}` object) decoded by `ops::coord`; the
+    /// compact positional `Op` fields are too narrow for rich mail payloads.
+    pub const COORD: u8 = 19;
     pub const TOOL_RUN: u8 = 20;
     pub const TOOL_REPAIR: u8 = 21;
     pub const TOOL_PIPELINE: u8 = 22;

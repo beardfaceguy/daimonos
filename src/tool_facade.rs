@@ -300,6 +300,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoke_dispatches_coordination_tools_from_agent_loop() {
+        // ADR-009 D5 / #1050: coordination tools must be reachable from the
+        // internal agent loop via tool_facade::invoke (i.e. opcode-backed,
+        // returning Some), NOT MCP-only special tools that return None.
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coorddb");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+
+        let reg = invoke(
+            &mut session,
+            "register_agent",
+            &json!({"name": "BlueLake", "program": "codex-cli"}),
+        )
+        .await;
+        assert!(reg.is_some(), "register_agent must dispatch via the facade");
+        assert!(reg.unwrap().ok);
+
+        let list = invoke(&mut session, "list_agents", &json!({})).await;
+        assert!(list.is_some(), "list_agents must dispatch via the facade");
+        let resp = list.unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.d.unwrap()["agents"][0]["name"], "BlueLake");
+    }
+
+    #[tokio::test]
     async fn invoke_returns_error_response_for_bad_args() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = session_in(dir.path());

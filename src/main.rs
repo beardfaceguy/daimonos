@@ -8,6 +8,7 @@ mod chat_cmd;
 mod cli;
 mod compaction;
 mod config;
+mod coordination;
 mod index;
 mod kgl;
 mod logging;

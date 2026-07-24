@@ -282,6 +282,33 @@ blast_radius_max = 500
 # registering watches (build/vcs churn + our own store).
 skip_dirs = ["target", ".git", ".jj", "node_modules", ".kgl", "graphify-out"]
 
+[coordination]
+# Native agent-to-agent coordination ("agent mail", ADR-009). Lets multiple
+# daimonos processes on one workspace share identity, exchange directed
+# messages, and post advisory file reservations over a single dedicated SQLite
+# DB at ~/.daimonos/coordination/<workspace-key>.db (WAL; opened directly by
+# each process; no broker, no HTTP). The DB lives OUTSIDE the target repo tree.
+#
+# Master switch. When false, coordination tools return a soft "disabled" error
+# and never touch disk (fail-open).
+enabled = true
+# SQLite busy-timeout (ms) for every coordination connection. WAL lets
+# concurrent processes proceed; the timeout absorbs brief write contention
+# instead of surfacing SQLITE_BUSY.
+busy_timeout_ms = 5000
+# Optional override for the coordination base directory. Unset => the default
+# ~/.daimonos/coordination (the ~/.daimonos/ global-state convention).
+# db_dir = "~/.daimonos/coordination"
+# Default reservation TTL (seconds) when a caller omits one, and the hard
+# ceiling to which larger requests are clamped.
+default_reservation_ttl_secs = 3600
+max_reservation_ttl_secs = 86400
+# Default fetch_inbox page size when the caller omits `limit`.
+inbox_default_limit = 20
+# Hard cap on messages returned when reconstructing a thread — bounds the read
+# so a long/adversarial reply chain cannot blow up a response (no recursion).
+thread_max_messages = 500
+
 [prompts]
 # Runtime overrides for the model-facing prompts (vikunja #974). Each key is a
 # path to a file whose contents REPLACE the built-in default embedded in the

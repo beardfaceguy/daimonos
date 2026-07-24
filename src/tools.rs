@@ -37,6 +37,24 @@ pub fn get_str_map(args: &Value, key: &str) -> Option<std::collections::HashMap<
     Some(map)
 }
 
+/// Build a `COORD` opcode request for an agent-coordination tool: inject the
+/// `verb` into the caller's args object and carry the whole JSON body in the
+/// op's `s` field (ADR-009 D5). Non-object args are rejected as a bad request.
+fn coord_request(verb: &str, args: &Value) -> Result<Request, String> {
+    let mut body = match args {
+        Value::Object(map) => map.clone(),
+        Value::Null => serde_json::Map::new(),
+        _ => return Err("coordination tool args must be an object".to_string()),
+    };
+    body.insert("verb".to_string(), Value::String(verb.to_string()));
+    let s = Value::Object(body).to_string();
+    Ok(Request::Single(Op {
+        c: protocol::op::COORD,
+        s: Some(s),
+        ..Default::default()
+    }))
+}
+
 // --- Tool tier ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +346,39 @@ pub fn all_tools() -> Vec<ToolDef> {
             tier: ToolTier::OnDemand,
             schema: json!({"type": "object", "properties": {}}),
             to_request: None, // returns static string
+            context_check: None,
+        },
+        // ============ Agent coordination ("agent mail", ADR-009) ============
+        // Opcode-backed (COORD) so they reach BOTH the internal agent loop (via
+        // tool_facade::invoke) AND the MCP server, with no special-casing — the
+        // reachability requirement from ADR-009 D5 / #1050. Each tool serializes
+        // its args into the COORD op's JSON body with the `verb` injected.
+        ToolDef {
+            name: "register_agent",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9]+$"},
+                    "program": {"type": "string"},
+                    "model": {"type": "string"},
+                    "task": {"type": "string"},
+                    "session_id": {"type": "string"}
+                }
+            }),
+            to_request: Some(|args| coord_request("register_agent", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "list_agents",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"}
+                }
+            }),
+            to_request: Some(|args| coord_request("list_agents", args)),
             context_check: None,
         },
         // ===================== Tier 1: Terse schema =====================
