@@ -197,6 +197,18 @@ max_concurrent_connects = 8
 # Upper bound on tools registered from any single server (bounds the exposed
 # tool set). Extra tools are ignored.
 max_tools_per_server = 128
+# Fallback for unpatched Zed: when Zed forwards an EMPTY MCP server list at
+# session start (a cold-start race where its context-server store isn't
+# populated yet, and it never re-forwards to a live session), read Zed's own
+# `context_servers` settings directly and bridge those. Off by default because
+# it reads an external app's config and spawns that config's stdio servers, so
+# it must not fire for non-Zed ACP clients. Enable it only when running
+# daimonos as Zed's ACP agent on an unpatched Zed. Only triggers on an empty
+# forwarded list — servers Zed did forward are never overridden.
+zed_config_fallback = false
+# Path to Zed's settings.json for the fallback above. Empty/unset derives it
+# from $XDG_CONFIG_HOME/$HOME (~/.config/zed/settings.json).
+# zed_settings_path = "/home/you/.config/zed/settings.json"
 
 [discord]
 # Enable Discord integration tools. Defaults to false (off).

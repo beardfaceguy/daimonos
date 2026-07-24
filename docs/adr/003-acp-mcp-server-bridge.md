@@ -253,3 +253,36 @@ New `[acp.mcp]` section (validated in `config.rs`, documented in `daimonos.defau
 - MCP resources/prompts/roots from remote servers (only `tools/*` is bridged here).
 - Persisting remote server configs across restarts (Zed re-sends them; D9).
 - The `unstable_mcp_over_acp` (`McpServer::Acp`) variant.
+
+## Amendment: empty-forward fallback for unpatched Zed (2026-07-24)
+
+**Problem.** Zed forwards the MCP server list to an external ACP agent *only*
+inside `session/new` / `session/load`, built synchronously from its
+`ContextServerStore` (`mcp_servers_for_project`). That store is populated
+asynchronously from settings (`observe_global::<SettingsStore>`), so a session
+created right after a Zed (re)start — e.g. an auto-restored thread — can race
+ahead of it and receive an **empty** `mcpServers`. Zed never re-forwards to a
+live session (the only `mcp_servers` sites are new/load; its settings observer
+refreshes the agent's launch config, not session servers). The result is a
+daimonos ACP session with **zero MCP tools** until it is reloaded. Confirmed
+from `daimonos::mcp_bridge` logs: cold-start sessions show `requested=0,
+exposed=0`; later/reloaded sessions in the same workspace show the full set.
+This is a Zed-side race; daimonos's bridge is correct.
+
+**Decision.** When the forwarded list is empty, optionally fall back to reading
+Zed's own `settings.json` `context_servers` directly (`src/zed_config.rs`) and
+building the same `ServerSpec`s Zed would have forwarded, so daimonos is robust
+on **unpatched** Zed. Gated by `acp.mcp.zed_config_fallback` (**default off**)
+with an optional `acp.mcp.zed_settings_path`. It is default-off and only fires
+on an empty forward because it reads an external app's config file and spawns
+that config's stdio servers — it must never fire for non-Zed ACP clients or in
+tests. Servers Zed *did* forward are never overridden.
+
+**Limitations.** Only what the settings file itself carries is recoverable:
+stdio `command`/`args`/`env` and inline HTTP `headers`. Servers that depend on
+Zed's OAuth/keychain sessions (no usable token in the file) still cannot
+connect (same failure as today). Project-local `.zed/settings.json` overrides
+are not merged in this version. The daimonos self-entry is still skipped by the
+bridge's existing executable match (D11). A complementary fix in the Zed fork
+(gate the restored session on store-readiness, or re-forward on store change)
+is tracked separately.
