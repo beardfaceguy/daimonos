@@ -381,6 +381,103 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: Some(|args| coord_request("list_agents", args)),
             context_check: None,
         },
+        ToolDef {
+            name: "send_message",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "sender": {"type": "string"},
+                    "to": {"type": "array", "items": {"type": "string"}},
+                    "cc": {"type": "array", "items": {"type": "string"}},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "importance": {"type": "string", "enum": crate::coordination::Importance::schema_values()},
+                    "ack_required": {"type": "boolean"}
+                },
+                "required": ["sender", "subject"]
+            }),
+            to_request: Some(|args| coord_request("send_message", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "reply_message",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "sender": {"type": "string"},
+                    "reply_to": {"type": "integer"},
+                    "to": {"type": "array", "items": {"type": "string"}},
+                    "cc": {"type": "array", "items": {"type": "string"}},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "importance": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
+                    "ack_required": {"type": "boolean"}
+                },
+                "required": ["sender", "reply_to"]
+            }),
+            to_request: Some(|args| coord_request("reply_message", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "fetch_inbox",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "unread_only": {"type": "boolean"},
+                    "min_importance": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
+                    "since": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["agent"]
+            }),
+            to_request: Some(|args| coord_request("fetch_inbox", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "mark_read",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "message_id": {"type": "integer"}
+                },
+                "required": ["agent", "message_id"]
+            }),
+            to_request: Some(|args| coord_request("mark_read", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "acknowledge",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "message_id": {"type": "integer"}
+                },
+                "required": ["agent", "message_id"]
+            }),
+            to_request: Some(|args| coord_request("acknowledge", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "fetch_thread",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": {"type": "integer"}
+                },
+                "required": ["thread_id"]
+            }),
+            to_request: Some(|args| coord_request("fetch_thread", args)),
+            context_check: None,
+        },
         // ===================== Tier 1: Terse schema =====================
         ToolDef {
             name: "git",

@@ -305,6 +305,9 @@ default_reservation_ttl_secs = 3600
 max_reservation_ttl_secs = 86400
 # Default fetch_inbox page size when the caller omits `limit`.
 inbox_default_limit = 20
+# Hard ceiling on fetch_inbox results: a caller-supplied `limit` is clamped to
+# this so a huge value cannot force an unbounded inbox read.
+inbox_max_limit = 500
 # Hard cap on messages returned when reconstructing a thread — bounds the read
 # so a long/adversarial reply chain cannot blow up a response (no recursion).
 thread_max_messages = 500
