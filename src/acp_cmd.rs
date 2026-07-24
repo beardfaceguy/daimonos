@@ -1318,6 +1318,82 @@ fn send_provider_error_diagnostic(
         session_id = %session_id,
         class = message,
     );
+    // The `warn` above is privacy-safe: it carries only the friendly `class`,
+    // never the provider's raw error. The raw text is the only way to diagnose
+    // the catch-all "Provider request failed." bucket, so log it separately at
+    // DEBUG (see `log_raw_provider_error`).
+    log_raw_provider_error(session_id, message, error);
+}
+
+/// Max characters of the raw provider error we ever emit. Bounds accidental
+/// dumping of a large payload (prompt/tool echo) into logs (codeJung finding).
+const RAW_ERROR_LOG_CAP: usize = 500;
+
+/// Best-effort scrub of obvious secret shapes from a provider error body
+/// before it is logged, then a hard length cap. This is defense-in-depth for a
+/// DEBUG-only diagnostic: providers occasionally echo an `Authorization`
+/// header, a bearer token, or an `sk-`/`or-` API key into their error text,
+/// and enabling debug logging must not ship those into a log collector
+/// (codeJung finding, impact 7). Not a guarantee — the length cap is the
+/// backstop for anything the patterns miss.
+fn sanitize_provider_error(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(RAW_ERROR_LOG_CAP) + 16);
+    let mut truncated = false;
+    for token in raw.split_inclusive(char::is_whitespace) {
+        let trimmed = token.trim_end();
+        let lower = trimmed.to_ascii_lowercase();
+        // Mask a token that looks like a secret: a bearer/authorization value,
+        // or a long key-ish run (sk-..., or-..., or any >=20-char alnum/_/-
+        // blob). Keep short/ordinary words so the message stays useful.
+        let looks_secret = lower.starts_with("bearer")
+            || lower.starts_with("authorization")
+            || lower.starts_with("sk-")
+            || lower.starts_with("or-")
+            || (trimmed.len() >= 20
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        if looks_secret {
+            out.push_str("[REDACTED]");
+            // Preserve the original trailing whitespace so words stay separated.
+            out.push_str(&token[trimmed.len()..]);
+        } else {
+            out.push_str(token);
+        }
+        if out.len() >= RAW_ERROR_LOG_CAP {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        // Truncate on a char boundary at/below the cap, then flag it.
+        while !out.is_char_boundary(RAW_ERROR_LOG_CAP.min(out.len())) {
+            out.pop();
+        }
+        out.truncate(RAW_ERROR_LOG_CAP.min(out.len()));
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+/// Emit the provider's raw error at DEBUG on `daimonos::acp` — off by default,
+/// one env var away (`RUST_LOG=daimonos::acp=debug`). This is the only place
+/// the provider error text is surfaced: it is never sent to the client (which
+/// sees the friendly `class`) and never recorded on an OTel span (ADR-006
+/// privacy-first). The body is passed through [`sanitize_provider_error`]
+/// (secret-shape scrub + length cap) before logging. No-op when there is no
+/// raw error. Factored out of `send_provider_error_diagnostic` so it can be
+/// unit-tested without a live ACP connection (#1062).
+fn log_raw_provider_error(session_id: impl std::fmt::Display, class: &str, error: Option<&str>) {
+    if let Some(raw) = error {
+        tracing::debug!(
+            target: "daimonos::acp",
+            event = "provider_request_raw",
+            session_id = %session_id,
+            class = class,
+            raw_error = sanitize_provider_error(raw),
+        );
+    }
 }
 
 fn send_refusal_diagnostic(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
@@ -5541,6 +5617,155 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("stream_error")),
             "Provider response stream failed."
+        );
+    }
+
+    // --- raw provider-error debug logging (#1062) ---
+
+    // Minimal in-memory tracing layer that records events on the
+    // `daimonos::acp` target whose `event` field == "provider_request_raw",
+    // capturing their `raw_error` field. Used to assert the DEBUG gate without
+    // adding a test-only dependency.
+    #[derive(Clone, Default)]
+    struct RawErrorCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RawErrorCapture {
+        fn captured(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RawErrorCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "daimonos::acp" {
+                return;
+            }
+            struct Visitor {
+                is_raw_event: bool,
+                raw_error: Option<String>,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    match field.name() {
+                        "event" if value == "provider_request_raw" => self.is_raw_event = true,
+                        "raw_error" => self.raw_error = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let rendered = format!("{value:?}");
+                    let trimmed = rendered.trim_matches('"').to_string();
+                    match field.name() {
+                        "event" if trimmed == "provider_request_raw" => self.is_raw_event = true,
+                        "raw_error" => self.raw_error = Some(trimmed),
+                        _ => {}
+                    }
+                }
+            }
+            let mut visitor = Visitor {
+                is_raw_event: false,
+                raw_error: None,
+            };
+            event.record(&mut visitor);
+            if visitor.is_raw_event {
+                if let Some(raw) = visitor.raw_error {
+                    self.events
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(raw);
+                }
+            }
+        }
+    }
+
+    fn capture_raw_error_logging(level: tracing::level_filters::LevelFilter) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer as _;
+        let capture = RawErrorCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(level));
+        tracing::subscriber::with_default(subscriber, || {
+            // Unclassified error => "Provider request failed." bucket.
+            log_raw_provider_error(
+                "session-xyz",
+                "Provider request failed.",
+                Some("openrouter: unexpected response shape (id 8842)"),
+            );
+            // No raw error => no emission regardless of level.
+            log_raw_provider_error("session-xyz", "Provider request failed.", None);
+        });
+        capture.captured()
+    }
+
+    #[test]
+    fn raw_provider_error_not_logged_at_default_level() {
+        // WARN is the effective default; the DEBUG raw-error event must be filtered out.
+        let captured = capture_raw_error_logging(tracing::level_filters::LevelFilter::WARN);
+        assert!(
+            captured.is_empty(),
+            "raw provider error must not be emitted at the default (warn) level"
+        );
+    }
+
+    #[test]
+    fn raw_provider_error_logged_when_debug_enabled() {
+        let captured = capture_raw_error_logging(tracing::level_filters::LevelFilter::DEBUG);
+        assert_eq!(
+            captured,
+            vec!["openrouter: unexpected response shape (id 8842)".to_string()],
+            "with debug enabled the raw error must be emitted once (and never when error is None)"
+        );
+    }
+
+    #[test]
+    fn sanitize_provider_error_masks_secret_shapes_and_caps_length() {
+        // Bearer tokens / Authorization / sk-/or- keys / long alnum blobs are masked.
+        let s = sanitize_provider_error("auth failed Bearer abc123XYZ token");
+        assert!(s.contains("[REDACTED]"), "bearer token must be masked: {s}");
+        assert!(!s.contains("abc123XYZ") || s.contains("[REDACTED]"));
+
+        let key = sanitize_provider_error("bad key sk-abcdef0123456789ABCDEF here");
+        assert!(key.contains("[REDACTED]"), "sk- key must be masked: {key}");
+        assert!(!key.contains("sk-abcdef0123456789ABCDEF"));
+
+        let blob = sanitize_provider_error("leaked ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 blob");
+        assert!(
+            blob.contains("[REDACTED]"),
+            "long key-ish blob must be masked: {blob}"
+        );
+        assert!(!blob.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"));
+
+        // Ordinary short words are preserved (message stays useful).
+        let ordinary = sanitize_provider_error("upstream returned an empty body");
+        assert_eq!(ordinary, "upstream returned an empty body");
+
+        // Length is hard-capped.
+        let long = "x ".repeat(1000);
+        let capped = sanitize_provider_error(&long);
+        assert!(capped.len() <= RAW_ERROR_LOG_CAP + "…[truncated]".len());
+        assert!(capped.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn client_facing_message_stays_friendly_for_unclassified_error() {
+        // The client-facing classification is unchanged: an unclassified raw
+        // error yields the catch-all friendly message; raw text never leaks in.
+        let raw = "openrouter: unexpected response shape (id 8842)";
+        assert_eq!(
+            safe_provider_error_message(false, Some(raw)),
+            "Provider request failed."
         );
     }
 
