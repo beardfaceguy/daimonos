@@ -99,6 +99,32 @@ pub struct InboxFilter {
     pub since: Option<String>,
 }
 
+/// One advisory file reservation (ADR-009 D4/D6). A soft "I'm working here"
+/// signal, NOT a lock: it never blocks a write. `pattern` is an opaque glob
+/// (never resolved against the filesystem). A reservation is *active* while it
+/// is unreleased and its `expires_ts` is in the future.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationRecord {
+    pub id: i64,
+    pub agent_name: String,
+    pub pattern: String,
+    pub exclusive: bool,
+    pub reason: Option<String>,
+    pub created_ts: String,
+    pub expires_ts: String,
+    pub released_ts: Option<String>,
+}
+
+/// A conflict surfaced by `reserve_paths` / `check_conflicts`: the caller's
+/// `pattern` overlaps an active exclusive reservation `held_by` another agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationConflict {
+    pub pattern: String,
+    pub held_by: String,
+    pub conflicting_pattern: String,
+    pub reservation_id: i64,
+}
+
 /// One registered agent identity (ADR-009 D2/D6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
@@ -637,6 +663,260 @@ impl CoordinationStore {
             ack_ts: row.get(11)?,
         })
     }
+
+    // ---- advisory file reservations (ADR-009 D4) ----
+
+    /// Claim advisory reservations on `patterns` for `agent`, each expiring at
+    /// `expires_ts`. Returns the granted reservations plus any conflicts with
+    /// *other* agents' active exclusive reservations (symmetric glob overlap).
+    /// Reservations are advisory: a conflict is reported, never enforced, and
+    /// the reservation is still granted (agents cooperate). `scan_cap` bounds
+    /// how many existing active reservations are examined for conflicts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_paths(
+        &self,
+        agent: &str,
+        patterns: &[String],
+        exclusive: bool,
+        reason: Option<&str>,
+        created_ts: &str,
+        expires_ts: &str,
+        scan_cap: i64,
+    ) -> Result<(Vec<ReservationRecord>, Vec<ReservationConflict>)> {
+        // Conflicts are computed against the pre-existing active set, before we
+        // insert (so a batch doesn't self-conflict).
+        let existing = self.active_reservations_excluding(agent, created_ts, scan_cap)?;
+        let mut conflicts = Vec::new();
+        for pat in patterns {
+            for other in &existing {
+                if other.exclusive && patterns_overlap(pat, &other.pattern) {
+                    conflicts.push(ReservationConflict {
+                        pattern: pat.clone(),
+                        held_by: other.agent_name.clone(),
+                        conflicting_pattern: other.pattern.clone(),
+                        reservation_id: other.id,
+                    });
+                }
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin reserve tx")?;
+        let mut granted = Vec::with_capacity(patterns.len());
+        for pat in patterns {
+            tx.execute(
+                "INSERT INTO reservation
+                    (agent_name, pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                params![agent, pat, exclusive as i64, reason, created_ts, expires_ts],
+            )
+            .context("insert reservation")?;
+            let id = tx.last_insert_rowid();
+            granted.push(ReservationRecord {
+                id,
+                agent_name: agent.to_string(),
+                pattern: pat.clone(),
+                exclusive,
+                reason: reason.map(String::from),
+                created_ts: created_ts.to_string(),
+                expires_ts: expires_ts.to_string(),
+                released_ts: None,
+            });
+        }
+        tx.commit().context("commit reserve tx")?;
+        Ok((granted, conflicts))
+    }
+
+    /// Check `patterns` against other agents' active exclusive reservations
+    /// WITHOUT mutating anything (read-only pre-edit guard). Ignores the
+    /// caller's own reservations.
+    pub fn check_conflicts(
+        &self,
+        agent: &str,
+        patterns: &[String],
+        now: &str,
+        scan_cap: i64,
+    ) -> Result<Vec<ReservationConflict>> {
+        let existing = self.active_reservations_excluding(agent, now, scan_cap)?;
+        let mut conflicts = Vec::new();
+        for pat in patterns {
+            for other in &existing {
+                if other.exclusive && patterns_overlap(pat, &other.pattern) {
+                    conflicts.push(ReservationConflict {
+                        pattern: pat.clone(),
+                        held_by: other.agent_name.clone(),
+                        conflicting_pattern: other.pattern.clone(),
+                        reservation_id: other.id,
+                    });
+                }
+            }
+        }
+        Ok(conflicts)
+    }
+
+    /// List an agent's own active (unreleased, unexpired) reservations,
+    /// bounded. `now` is the RFC-3339 cutoff for expiry.
+    pub fn list_reservations(
+        &self,
+        agent: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<ReservationRecord>> {
+        let limit = limit.max(1);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, agent_name, pattern, exclusive, reason, created_ts, expires_ts, released_ts
+                 FROM reservation
+                 WHERE agent_name = ?1 AND released_ts IS NULL AND expires_ts > ?2
+                 ORDER BY created_ts DESC, id DESC LIMIT ?3",
+            )
+            .context("prepare list_reservations")?;
+        let rows = stmt
+            .query_map(params![agent, now, limit], Self::row_to_reservation)
+            .context("query list_reservations")?;
+        let mut out = Vec::new();
+        for r in rows.flatten() {
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    /// Extend the caller's own active reservations' `expires_ts` to
+    /// `new_expires_ts`. Only the caller's unreleased, unexpired reservations
+    /// are touched. Returns the number renewed.
+    pub fn renew_reservations(
+        &self,
+        agent: &str,
+        now: &str,
+        new_expires_ts: &str,
+    ) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE reservation SET expires_ts = ?1
+                 WHERE agent_name = ?2 AND released_ts IS NULL AND expires_ts > ?3",
+                params![new_expires_ts, agent, now],
+            )
+            .context("renew_reservations")?;
+        Ok(n)
+    }
+
+    /// Release the caller's own active reservations (sets `released_ts`).
+    /// When `patterns` is empty, releases all of the caller's active
+    /// reservations; otherwise only those whose pattern exactly matches one of
+    /// `patterns`. Returns the number released. Idempotent.
+    pub fn release_reservations(
+        &self,
+        agent: &str,
+        patterns: &[String],
+        now: &str,
+    ) -> Result<usize> {
+        if patterns.is_empty() {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE reservation SET released_ts = ?1
+                     WHERE agent_name = ?2 AND released_ts IS NULL",
+                    params![now, agent],
+                )
+                .context("release_reservations (all)")?;
+            return Ok(n);
+        }
+        let mut released = 0usize;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin release tx")?;
+        for pat in patterns {
+            released += tx
+                .execute(
+                    "UPDATE reservation SET released_ts = ?1
+                     WHERE agent_name = ?2 AND pattern = ?3 AND released_ts IS NULL",
+                    params![now, agent, pat],
+                )
+                .context("release_reservations (pattern)")?;
+        }
+        tx.commit().context("commit release tx")?;
+        Ok(released)
+    }
+
+    /// Prune reservations that expired before `cutoff` (housekeeping). Bounded
+    /// single DELETE; returns the number removed. Optional — expired rows are
+    /// already inert because every read filters on `expires_ts`, so no verb
+    /// exposes this yet; it's a tested maintenance primitive for a future
+    /// background-prune task.
+    #[allow(dead_code)]
+    pub fn prune_expired_reservations(&self, cutoff: &str) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM reservation WHERE expires_ts <= ?1",
+                params![cutoff],
+            )
+            .context("prune_expired_reservations")?;
+        Ok(n)
+    }
+
+    /// Active reservations held by agents OTHER than `agent`, bounded by
+    /// `scan_cap`. "Active" = unreleased and not yet expired at `now`. Used for
+    /// conflict detection; the caller does the in-memory glob overlap so there
+    /// is no recursion and no filesystem walk.
+    fn active_reservations_excluding(
+        &self,
+        agent: &str,
+        now: &str,
+        scan_cap: i64,
+    ) -> Result<Vec<ReservationRecord>> {
+        let scan_cap = scan_cap.max(1);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, agent_name, pattern, exclusive, reason, created_ts, expires_ts, released_ts
+                 FROM reservation
+                 WHERE agent_name <> ?1 AND released_ts IS NULL AND expires_ts > ?2
+                 ORDER BY id DESC LIMIT ?3",
+            )
+            .context("prepare active_reservations")?;
+        let rows = stmt
+            .query_map(params![agent, now, scan_cap], Self::row_to_reservation)
+            .context("query active_reservations")?;
+        let mut out = Vec::new();
+        for r in rows.flatten() {
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReservationRecord> {
+        Ok(ReservationRecord {
+            id: row.get(0)?,
+            agent_name: row.get(1)?,
+            pattern: row.get(2)?,
+            exclusive: row.get::<_, i64>(3)? != 0,
+            reason: row.get(4)?,
+            created_ts: row.get(5)?,
+            expires_ts: row.get(6)?,
+            released_ts: row.get(7)?,
+        })
+    }
+}
+
+/// Symmetric glob overlap: true if `a` matches `b` as a glob, or `b` matches
+/// `a`, or they are exactly equal. Patterns are opaque globs compared against
+/// each other — never resolved against the filesystem, so this cannot probe
+/// outside the workspace and does no directory walk (ADR-009 D4 / #1053
+/// lesson 1). A pattern that fails to compile falls back to exact string
+/// equality (still total and panic-free).
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_matches_b = glob::Pattern::new(a).map(|p| p.matches(b)).unwrap_or(false);
+    let b_matches_a = glob::Pattern::new(b).map(|p| p.matches(a)).unwrap_or(false);
+    a_matches_b || b_matches_a
 }
 
 /// Ordinal rank of an importance level, for `min_importance` filtering.
@@ -1208,5 +1488,245 @@ mod tests {
         // A re-reads via its own connection and sees B's ack.
         let seen = a.fetch_inbox("B", &InboxFilter::default(), 10).unwrap();
         assert_eq!(seen[0].ack_ts.as_deref(), Some("2026-07-24T01:00:00Z"));
+    }
+
+    // ---- reservations ----
+
+    const FAR: &str = "2999-01-01T00:00:00Z"; // far-future expiry (active)
+
+    fn reserve(
+        s: &CoordinationStore,
+        agent: &str,
+        pats: &[&str],
+        exclusive: bool,
+    ) -> Vec<ReservationConflict> {
+        let pats: Vec<String> = pats.iter().map(|x| x.to_string()).collect();
+        s.reserve_paths(
+            agent,
+            &pats,
+            exclusive,
+            None,
+            "2026-07-24T00:00:00Z",
+            FAR,
+            1000,
+        )
+        .unwrap()
+        .1
+    }
+
+    #[test]
+    fn reserve_is_visible_and_conflicts_only_with_other_agents_exclusive() {
+        let s = store();
+        let c = reserve(&s, "A", &["src/api/*.rs"], true);
+        assert!(c.is_empty(), "first reservation has no conflict");
+        assert_eq!(
+            s.list_reservations("A", "2026-07-24T00:00:00Z", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // B reserving an overlapping glob sees a conflict against A.
+        let c = reserve(&s, "B", &["src/api/users.rs"], true);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].held_by, "A");
+        assert_eq!(c[0].conflicting_pattern, "src/api/*.rs");
+
+        // A non-overlapping path is conflict-free.
+        let c = reserve(&s, "B", &["docs/readme.md"], true);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn own_reservation_never_conflicts_with_self() {
+        let s = store();
+        reserve(&s, "A", &["src/**"], true);
+        let c = reserve(&s, "A", &["src/api/users.rs"], true);
+        assert!(
+            c.is_empty(),
+            "an agent never conflicts with its own reservations"
+        );
+    }
+
+    #[test]
+    fn shared_nonexclusive_reservations_do_not_conflict() {
+        let s = store();
+        reserve(&s, "A", &["src/api/*.rs"], false);
+        let c = reserve(&s, "B", &["src/api/users.rs"], true);
+        assert!(
+            c.is_empty(),
+            "a non-exclusive holder does not cause a conflict"
+        );
+    }
+
+    #[test]
+    fn expired_reservation_is_inert() {
+        let s = store();
+        s.reserve_paths(
+            "A",
+            &["src/*".into()],
+            true,
+            None,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            1000,
+        )
+        .unwrap();
+        let c = s
+            .check_conflicts("B", &["src/main.rs".into()], "2026-07-24T00:00:00Z", 1000)
+            .unwrap();
+        assert!(c.is_empty(), "an expired reservation must not conflict");
+        assert!(s
+            .list_reservations("A", "2026-07-24T00:00:00Z", 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn renew_extends_and_release_drops() {
+        let s = store();
+        s.reserve_paths(
+            "A",
+            &["src/*".into()],
+            true,
+            None,
+            "2026-07-24T00:00:00Z",
+            "2026-07-24T01:00:00Z",
+            1000,
+        )
+        .unwrap();
+        assert!(s
+            .list_reservations("A", "2026-07-24T02:00:00Z", 100)
+            .unwrap()
+            .is_empty());
+        let renewed = s
+            .renew_reservations("A", "2026-07-24T00:30:00Z", FAR)
+            .unwrap();
+        assert_eq!(renewed, 1);
+        assert_eq!(
+            s.list_reservations("A", "2026-07-24T02:00:00Z", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let released = s
+            .release_reservations("A", &[], "2026-07-24T03:00:00Z")
+            .unwrap();
+        assert_eq!(released, 1);
+        assert!(s
+            .list_reservations("A", "2026-07-24T03:00:00Z", 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn release_by_pattern_only_targets_that_pattern() {
+        let s = store();
+        reserve(&s, "A", &["src/a.rs", "src/b.rs"], true);
+        let n = s
+            .release_reservations("A", &["src/a.rs".into()], "2026-07-24T03:00:00Z")
+            .unwrap();
+        assert_eq!(n, 1);
+        let remaining = s
+            .list_reservations("A", "2026-07-24T03:00:00Z", 100)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].pattern, "src/b.rs");
+    }
+
+    #[test]
+    fn check_conflicts_is_read_only_and_ignores_own() {
+        let s = store();
+        reserve(&s, "A", &["src/api/*.rs"], true);
+        let before = s
+            .list_reservations("A", "2026-07-24T00:00:00Z", 100)
+            .unwrap()
+            .len();
+        let c = s
+            .check_conflicts(
+                "A",
+                &["src/api/users.rs".into()],
+                "2026-07-24T00:00:00Z",
+                1000,
+            )
+            .unwrap();
+        assert!(c.is_empty());
+        let after = s
+            .list_reservations("A", "2026-07-24T00:00:00Z", 100)
+            .unwrap()
+            .len();
+        assert_eq!(before, after, "check_conflicts must not mutate");
+        let c = s
+            .check_conflicts(
+                "B",
+                &["src/api/users.rs".into()],
+                "2026-07-24T00:00:00Z",
+                1000,
+            )
+            .unwrap();
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn prune_removes_expired_only() {
+        let s = store();
+        s.reserve_paths(
+            "A",
+            &["old/*".into()],
+            true,
+            None,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            1000,
+        )
+        .unwrap();
+        s.reserve_paths(
+            "A",
+            &["new/*".into()],
+            true,
+            None,
+            "2026-07-24T00:00:00Z",
+            FAR,
+            1000,
+        )
+        .unwrap();
+        let pruned = s
+            .prune_expired_reservations("2026-07-24T00:00:00Z")
+            .unwrap();
+        assert_eq!(pruned, 1, "only the expired reservation is pruned");
+        assert_eq!(
+            s.list_reservations("A", "2026-07-24T00:00:00Z", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reservations_share_across_two_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coord.db");
+        let a = CoordinationStore::open_with(&path, 5_000).unwrap();
+        let b = CoordinationStore::open_with(&path, 5_000).unwrap();
+        a.reserve_paths(
+            "A",
+            &["src/api/*.rs".into()],
+            true,
+            None,
+            "2026-07-24T00:00:00Z",
+            FAR,
+            1000,
+        )
+        .unwrap();
+        let c = b
+            .check_conflicts(
+                "B",
+                &["src/api/users.rs".into()],
+                "2026-07-24T00:00:00Z",
+                1000,
+            )
+            .unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].held_by, "A");
     }
 }

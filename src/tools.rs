@@ -478,6 +478,79 @@ pub fn all_tools() -> Vec<ToolDef> {
             to_request: Some(|args| coord_request("fetch_thread", args)),
             context_check: None,
         },
+        ToolDef {
+            name: "reserve_paths",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "exclusive": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                    "ttl_secs": {"type": "integer"}
+                },
+                "required": ["agent", "paths"]
+            }),
+            to_request: Some(|args| coord_request("reserve_paths", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "renew_reservations",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "ttl_secs": {"type": "integer"}
+                },
+                "required": ["agent"]
+            }),
+            to_request: Some(|args| coord_request("renew_reservations", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "release_reservations",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["agent"]
+            }),
+            to_request: Some(|args| coord_request("release_reservations", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "check_conflicts",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["agent", "paths"]
+            }),
+            to_request: Some(|args| coord_request("check_conflicts", args)),
+            context_check: None,
+        },
+        ToolDef {
+            name: "list_reservations",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["agent"]
+            }),
+            to_request: Some(|args| coord_request("list_reservations", args)),
+            context_check: None,
+        },
         // ===================== Tier 1: Terse schema =====================
         ToolDef {
             name: "git",

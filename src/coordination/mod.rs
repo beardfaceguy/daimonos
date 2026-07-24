@@ -28,6 +28,7 @@ pub mod store;
 
 pub use store::{
     AgentRecord, CoordinationStore, Importance, InboxEntry, InboxFilter, MessageRecord,
+    ReservationConflict, ReservationRecord,
 };
 
 use std::path::Path;
