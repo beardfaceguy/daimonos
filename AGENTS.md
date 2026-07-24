@@ -137,6 +137,10 @@ daimonos/
     ├── tools.rs                   # ToolDef registry: single source of truth for all tool definitions
     ├── script.rs                  # Starlark interpreter: execute_script tool, tool function bindings
     ├── snapshot.rs                # Workspace snapshot store (create, restore, list, delete)
+    ├── coordination/              # Agent-to-agent coordination "agent mail" (ADR-009): per-workspace WAL SQLite
+    │   ├── mod.rs                 # Workspace-keyed DB path (~/.daimonos/coordination/<hash>.db)
+    │   ├── store.rs               # CoordinationStore: identity, messages/inbox/threads, advisory reservations
+    │   └── names.rs               # Memorable AdjectiveNoun agent-name minting
     ├── index.rs                   # Background trigram workspace indexer
     ├── pipeline_cache.rs          # inotify-based tool output cache
     ├── tool_runner.rs             # ToolPlugin trait, registry, repair loop
@@ -148,6 +152,7 @@ daimonos/
     │   ├── diff_ops.rs            # Opcode 14: diff (in-process structured diffing)
     │   ├── snap_ops.rs            # Opcodes 12-13, 25-26: snap, restore, snap_list, snap_delete
     │   ├── tool_ops.rs            # Opcodes 20-24: tool_run, repair, pipeline, register, list
+    │   ├── coord.rs               # Opcode 19: agent coordination (register/list agents, send/fetch/ack/thread, reserve/release/check paths)
     │   └── schema.rs              # Opcode 255: self-describing schema registry
     └── plugins/
         ├── mod.rs                 # Plugin module

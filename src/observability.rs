@@ -426,6 +426,96 @@ impl RemoteToolSpan {
     }
 }
 
+/// Metadata-only outcome of one agent-coordination ("agent mail") op
+/// (ADR-009 D8). Every field is bounded/non-content: agent NAMES (not bodies),
+/// an importance label, and small counts. Message subjects and bodies, and
+/// reservation reasons, are NEVER recorded (privacy-first, ADR-006 D6). All
+/// fields are optional so each verb sets only what applies.
+#[derive(Debug, Default, Clone)]
+pub struct CoordinationOutcome {
+    /// The acting agent's name (sender / caller). Low-cardinality within a
+    /// workspace; not a secret.
+    pub agent: Option<String>,
+    /// Number of recipients addressed (send/reply) — a count, not the names.
+    pub recipients: Option<u64>,
+    /// Importance label (low/normal/high/urgent) for send/reply.
+    pub importance: Option<String>,
+    /// Number of records returned (inbox messages, thread messages, agents,
+    /// reservations) — a count, never their contents.
+    pub results: Option<u64>,
+    /// Number of reservation conflicts reported (reserve/check_conflicts).
+    pub conflicts: Option<u64>,
+}
+
+/// A `coordination.op` span for one agent-mail tool call (ADR-009 D8). Nests
+/// under the enclosing `tool.call` span. Carries the verb, a terminal status,
+/// duration, and [`CoordinationOutcome`] metadata — **never** message subjects,
+/// bodies, or reservation reasons (D6). Created via [`Self::new`], closed via
+/// [`Self::finish`].
+pub struct CoordinationSpan {
+    span: tracing::Span,
+    started: std::time::Instant,
+}
+
+impl CoordinationSpan {
+    /// `verb` is the coordination op name (register_agent, send_message, …) —
+    /// a fixed, low-cardinality label.
+    pub fn new(verb: &str) -> Self {
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            "coordination.op",
+            otel.name = "coordination.op",
+            otel.kind = "internal",
+            "daimonos.coord.verb" = verb,
+            "daimonos.coord.agent" = tracing::field::Empty,
+            "daimonos.coord.recipients" = tracing::field::Empty,
+            "daimonos.coord.importance" = tracing::field::Empty,
+            "daimonos.coord.results" = tracing::field::Empty,
+            "daimonos.coord.conflicts" = tracing::field::Empty,
+            "daimonos.coord.status" = tracing::field::Empty,
+            "daimonos.duration_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        Self {
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Close the span: record `ok`/`error` status, the metadata-only outcome,
+    /// and the measured duration. Entered once so a never-entered span still
+    /// exports (same rationale as `ToolSpan::finish`).
+    pub fn finish(self, ok: bool, outcome: &CoordinationOutcome) {
+        let _entered = self.span.enter();
+        if let Some(agent) = &outcome.agent {
+            self.span.record("daimonos.coord.agent", agent.as_str());
+        }
+        if let Some(recipients) = outcome.recipients {
+            self.span.record("daimonos.coord.recipients", recipients);
+        }
+        if let Some(importance) = &outcome.importance {
+            self.span
+                .record("daimonos.coord.importance", importance.as_str());
+        }
+        if let Some(results) = outcome.results {
+            self.span.record("daimonos.coord.results", results);
+        }
+        if let Some(conflicts) = outcome.conflicts {
+            self.span.record("daimonos.coord.conflicts", conflicts);
+        }
+        self.span
+            .record("daimonos.coord.status", if ok { "ok" } else { "error" });
+        self.span.record(
+            "daimonos.duration_ms",
+            self.started.elapsed().as_millis() as u64,
+        );
+        if !ok {
+            // Bounded class only — never the error message (D6).
+            self.span.record("error.type", "coordination_error");
+        }
+    }
+}
+
 /// Emit a one-shot MCP bridge lifecycle span. These occur outside any prompt
 /// (D4) so they root their own session-lifecycle trace, and carry only an
 /// event label, server count, and duration — never URIs, headers, or
@@ -1458,6 +1548,127 @@ mod tests {
         // Metadata-only: no argument/result/command bodies leak (D6).
         let rendered = format!("{attributes:?}");
         assert!(!rendered.contains("/private/workspace"));
+    }
+
+    #[test]
+    fn coordination_span_records_metadata_only() {
+        // ADR-009 D8: a coordination.op span carries verb + agent name +
+        // counts + importance + status — and NO message subject/body/reason.
+        let (exporter, provider, subscriber) = in_memory_subscriber("coord-span-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let span = CoordinationSpan::new("send_message");
+            span.finish(
+                true,
+                &CoordinationOutcome {
+                    agent: Some("BlueLake".to_string()),
+                    recipients: Some(2),
+                    importance: Some("high".to_string()),
+                    results: None,
+                    conflicts: None,
+                },
+            );
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let op = spans
+            .iter()
+            .find(|s| s.name == "coordination.op")
+            .expect("a coordination.op span must be exported");
+        let attributes = attribute_map(op);
+        assert_eq!(
+            attributes.get("daimonos.coord.verb").map(String::as_str),
+            Some("send_message")
+        );
+        assert_eq!(
+            attributes.get("daimonos.coord.agent").map(String::as_str),
+            Some("BlueLake")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.coord.recipients")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.coord.importance")
+                .map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            attributes.get("daimonos.coord.status").map(String::as_str),
+            Some("ok")
+        );
+        assert!(!attributes.contains_key("error.type"));
+    }
+
+    #[test]
+    fn coordination_span_never_records_message_content() {
+        // Even though a real send carries a subject/body, the span outcome has
+        // no field for them and must never contain that text (D6). We build an
+        // outcome the way ops::coord does (names/counts only) and assert the
+        // rendered attributes contain no subject/body strings.
+        let (exporter, provider, subscriber) = in_memory_subscriber("coord-privacy-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let span = CoordinationSpan::new("send_message");
+            span.finish(
+                true,
+                &CoordinationOutcome {
+                    agent: Some("GreenCastle".to_string()),
+                    recipients: Some(1),
+                    importance: Some("normal".to_string()),
+                    results: None,
+                    conflicts: None,
+                },
+            );
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let op = spans.iter().find(|s| s.name == "coordination.op").unwrap();
+        let rendered = format!("{:?}", attribute_map(op));
+        // A secret-bearing-fixture-style assertion: none of the sensitive
+        // content that a real message would carry appears in the span.
+        assert!(!rendered.contains("SUBJECT_SECRET"));
+        assert!(!rendered.contains("BODY_SECRET"));
+        assert!(!rendered.contains("RESERVE_REASON_SECRET"));
+    }
+
+    #[test]
+    fn coordination_span_error_status_records_bounded_class() {
+        let (exporter, provider, subscriber) = in_memory_subscriber("coord-err-test");
+        tracing::subscriber::with_default(subscriber, || {
+            let span = CoordinationSpan::new("reserve_paths");
+            span.finish(
+                false,
+                &CoordinationOutcome {
+                    agent: Some("Ridge".to_string()),
+                    conflicts: Some(1),
+                    ..Default::default()
+                },
+            );
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let op = spans.iter().find(|s| s.name == "coordination.op").unwrap();
+        let attributes = attribute_map(op);
+        assert_eq!(
+            attributes.get("daimonos.coord.status").map(String::as_str),
+            Some("error")
+        );
+        // Bounded class only — never a raw error message (D6).
+        assert_eq!(
+            attributes.get("error.type").map(String::as_str),
+            Some("coordination_error")
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.coord.conflicts")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]

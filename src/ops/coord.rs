@@ -21,6 +21,7 @@ use crate::coordination::{
     names, workspace_db_path, AgentRecord, CoordinationStore, Importance, InboxEntry, InboxFilter,
     MessageRecord, ReservationConflict, ReservationRecord,
 };
+use crate::observability::{CoordinationOutcome, CoordinationSpan};
 use crate::protocol::{Op, Response};
 use crate::session::Session;
 
@@ -70,7 +71,11 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     };
 
     let now = chrono::Utc::now().to_rfc3339();
-    match verb.as_str() {
+    // ADR-009 D8: emit one metadata-only `coordination.op` span per call
+    // (never message subjects/bodies or reservation reasons). The span nests
+    // under the enclosing `tool.call` span the agent loop already creates.
+    let span = CoordinationSpan::new(&verb);
+    let response = match verb.as_str() {
         "register_agent" => register_agent(&store, &body, session, &now),
         "list_agents" => list_agents(&store, &body, cfg.effective_inbox_default_limit()),
         "send_message" => send_message(&store, &body, &now, /* is_reply */ false),
@@ -90,7 +95,56 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
         "check_conflicts" => check_conflicts(&store, &body, &now),
         "list_reservations" => list_reservations(&store, &body, &now),
         other => Response::err(ERR_BAD_REQUEST, &format!("coord: unknown verb '{other}'")),
+    };
+    span.finish(response.ok, &coordination_outcome(&verb, &body, &response));
+    response
+}
+
+/// Derive a metadata-only [`CoordinationOutcome`] from the request body and the
+/// response payload — agent NAMES and COUNTS only, never subjects, bodies, or
+/// reservation reasons (ADR-009 D8 / ADR-006 D6). Counts are read from the
+/// structured response `d` (which the handlers already shaped), so this adds no
+/// new content exposure.
+fn coordination_outcome(verb: &str, body: &Value, response: &Response) -> CoordinationOutcome {
+    let d = response.d.as_ref();
+    let count_of =
+        |key: &str| -> Option<u64> { d.and_then(|d| d.get(key)).and_then(|v| v.as_u64()) };
+    let arr_len = |key: &str| -> Option<u64> {
+        d.and_then(|d| d.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len() as u64)
+    };
+    // The acting agent: `sender` for messaging, `agent` for inbox/reservations.
+    let agent = body
+        .get("sender")
+        .or_else(|| body.get("agent"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let mut outcome = CoordinationOutcome {
+        agent,
+        ..Default::default()
+    };
+    match verb {
+        "send_message" | "reply_message" => {
+            outcome.recipients = arr_len("recipients");
+            outcome.importance = body
+                .get("importance")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        "fetch_inbox" | "fetch_thread" | "list_agents" | "list_reservations" => {
+            outcome.results = count_of("count");
+        }
+        "reserve_paths" => {
+            outcome.results = arr_len("granted");
+            outcome.conflicts = arr_len("conflicts");
+        }
+        "check_conflicts" => {
+            outcome.conflicts = arr_len("conflicts");
+        }
+        _ => {}
     }
+    outcome
 }
 
 fn register_agent(
@@ -914,6 +968,22 @@ mod tests {
         );
         assert!(inbox.ok);
         assert_eq!(inbox.d.unwrap()["count"], 2);
+    }
+
+    #[test]
+    fn coordination_works_with_observability_disabled() {
+        // ADR-009 D8 / ADR-006: spans are no-ops without a tracing subscriber
+        // (observability off by default), so every coordination op must still
+        // function. This test runs with NO subscriber installed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let sent = call(
+            &mut s,
+            json!({"verb": "send_message", "sender": "A", "to": ["B"], "subject": "s", "body": "b"}),
+        );
+        assert!(sent.ok, "send must work with observability disabled");
+        let inbox = call(&mut s, json!({"verb": "fetch_inbox", "agent": "B"}));
+        assert_eq!(inbox.d.unwrap()["count"], 1);
     }
 
     #[test]

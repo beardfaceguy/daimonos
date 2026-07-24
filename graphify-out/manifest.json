@@ -255,7 +255,7 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784926766.5571947,
+    "mtime": 1784927773.5518,
     "ast_hash": "76d6cdaeb4856d613970fb43904713b4",
     "semantic_hash": ""
   },
@@ -745,8 +745,8 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1784431553.9896088,
-    "ast_hash": "3c85c2e2e5821f789e1666910c57ee1f",
+    "mtime": 1784928062.2446964,
+    "ast_hash": "bab6d7c940018611ddd96bbc0134db85",
     "semantic_hash": ""
   },
   "CHANGELOG.md": {
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784833584.762154,
-    "ast_hash": "89c01f65fe168f5021ad219b60bb2046",
+    "mtime": 1784928067.4136589,
+    "ast_hash": "8669fa6e4d16f838a9785589547e22aa",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
@@ -1040,8 +1040,8 @@
     "semantic_hash": ""
   },
   "src/ops/coord.rs": {
-    "mtime": 1784924987.966949,
-    "ast_hash": "25743dff79ccb716fdc2ef8b978c1f69",
+    "mtime": 1784928067.4176588,
+    "ast_hash": "1385eef48270b274320a2de3f5e39407",
     "semantic_hash": ""
   },
   "docs/adr/009-agent-coordination.md": {
