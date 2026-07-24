@@ -488,7 +488,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                     "paths": {"type": "array", "items": {"type": "string"}},
                     "exclusive": {"type": "boolean"},
                     "reason": {"type": "string"},
-                    "ttl_secs": {"type": "integer"}
+                    "ttl_secs": {"type": "integer", "minimum": 60}
                 },
                 "required": ["agent", "paths"]
             }),
@@ -502,7 +502,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "agent": {"type": "string"},
-                    "ttl_secs": {"type": "integer"}
+                    "ttl_secs": {"type": "integer", "minimum": 60}
                 },
                 "required": ["agent"]
             }),

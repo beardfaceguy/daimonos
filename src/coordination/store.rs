@@ -671,7 +671,10 @@ impl CoordinationStore {
     /// *other* agents' active exclusive reservations (symmetric glob overlap).
     /// Reservations are advisory: a conflict is reported, never enforced, and
     /// the reservation is still granted (agents cooperate). `scan_cap` bounds
-    /// how many existing active reservations are examined for conflicts.
+    /// how many existing active reservations are examined for conflicts; the
+    /// returned `scan_truncated` flag is true when the active set exceeded the
+    /// cap (so an empty `conflicts` is not a guaranteed all-clear — codeJung
+    /// finding).
     #[allow(clippy::too_many_arguments)]
     pub fn reserve_paths(
         &self,
@@ -682,10 +685,11 @@ impl CoordinationStore {
         created_ts: &str,
         expires_ts: &str,
         scan_cap: i64,
-    ) -> Result<(Vec<ReservationRecord>, Vec<ReservationConflict>)> {
+    ) -> Result<(Vec<ReservationRecord>, Vec<ReservationConflict>, bool)> {
         // Conflicts are computed against the pre-existing active set, before we
         // insert (so a batch doesn't self-conflict).
-        let existing = self.active_reservations_excluding(agent, created_ts, scan_cap)?;
+        let (existing, scan_truncated) =
+            self.active_reservations_excluding(agent, created_ts, scan_cap)?;
         let mut conflicts = Vec::new();
         for pat in patterns {
             for other in &existing {
@@ -726,20 +730,23 @@ impl CoordinationStore {
             });
         }
         tx.commit().context("commit reserve tx")?;
-        Ok((granted, conflicts))
+        Ok((granted, conflicts, scan_truncated))
     }
 
     /// Check `patterns` against other agents' active exclusive reservations
     /// WITHOUT mutating anything (read-only pre-edit guard). Ignores the
-    /// caller's own reservations.
+    /// caller's own reservations. Returns `(conflicts, scan_truncated)`;
+    /// `scan_truncated` is true when more active foreign reservations existed
+    /// than `scan_cap`, so an empty `conflicts` is not a guaranteed all-clear.
     pub fn check_conflicts(
         &self,
         agent: &str,
         patterns: &[String],
         now: &str,
         scan_cap: i64,
-    ) -> Result<Vec<ReservationConflict>> {
-        let existing = self.active_reservations_excluding(agent, now, scan_cap)?;
+    ) -> Result<(Vec<ReservationConflict>, bool)> {
+        let (existing, scan_truncated) =
+            self.active_reservations_excluding(agent, now, scan_cap)?;
         let mut conflicts = Vec::new();
         for pat in patterns {
             for other in &existing {
@@ -753,7 +760,7 @@ impl CoordinationStore {
                 }
             }
         }
-        Ok(conflicts)
+        Ok((conflicts, scan_truncated))
     }
 
     /// List an agent's own active (unreleased, unexpired) reservations,
@@ -804,10 +811,13 @@ impl CoordinationStore {
         Ok(n)
     }
 
-    /// Release the caller's own active reservations (sets `released_ts`).
-    /// When `patterns` is empty, releases all of the caller's active
+    /// Release the caller's own *unreleased* reservations (sets `released_ts`).
+    /// When `patterns` is empty, releases all of the caller's unreleased
     /// reservations; otherwise only those whose pattern exactly matches one of
-    /// `patterns`. Returns the number released. Idempotent.
+    /// `patterns`. This intentionally finalizes unreleased-but-expired rows too
+    /// (benign cleanup) — the count reflects rows actually transitioned, so it
+    /// does not claim to touch only unexpired reservations. Returns the number
+    /// released. Idempotent.
     pub fn release_reservations(
         &self,
         agent: &str,
@@ -863,14 +873,19 @@ impl CoordinationStore {
     /// Active reservations held by agents OTHER than `agent`, bounded by
     /// `scan_cap`. "Active" = unreleased and not yet expired at `now`. Used for
     /// conflict detection; the caller does the in-memory glob overlap so there
-    /// is no recursion and no filesystem walk.
+    /// is no recursion and no filesystem walk. Returns `(rows, truncated)`
+    /// where `truncated` is true if more than `scan_cap` active foreign
+    /// reservations exist (we query one extra to detect it) — so callers can
+    /// surface that an empty conflict list may be incomplete.
     fn active_reservations_excluding(
         &self,
         agent: &str,
         now: &str,
         scan_cap: i64,
-    ) -> Result<Vec<ReservationRecord>> {
+    ) -> Result<(Vec<ReservationRecord>, bool)> {
         let scan_cap = scan_cap.max(1);
+        // Fetch one extra row to detect truncation without a separate COUNT.
+        let fetch = scan_cap.saturating_add(1);
         let mut stmt = self
             .conn
             .prepare(
@@ -881,13 +896,17 @@ impl CoordinationStore {
             )
             .context("prepare active_reservations")?;
         let rows = stmt
-            .query_map(params![agent, now, scan_cap], Self::row_to_reservation)
+            .query_map(params![agent, now, fetch], Self::row_to_reservation)
             .context("query active_reservations")?;
         let mut out = Vec::new();
         for r in rows.flatten() {
             out.push(r);
         }
-        Ok(out)
+        let truncated = out.len() as i64 > scan_cap;
+        if truncated {
+            out.truncate(scan_cap as usize);
+        }
+        Ok((out, truncated))
     }
 
     fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReservationRecord> {
@@ -1572,7 +1591,7 @@ mod tests {
             1000,
         )
         .unwrap();
-        let c = s
+        let (c, _) = s
             .check_conflicts("B", &["src/main.rs".into()], "2026-07-24T00:00:00Z", 1000)
             .unwrap();
         assert!(c.is_empty(), "an expired reservation must not conflict");
@@ -1642,7 +1661,7 @@ mod tests {
             .list_reservations("A", "2026-07-24T00:00:00Z", 100)
             .unwrap()
             .len();
-        let c = s
+        let (c, _) = s
             .check_conflicts(
                 "A",
                 &["src/api/users.rs".into()],
@@ -1656,7 +1675,7 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(before, after, "check_conflicts must not mutate");
-        let c = s
+        let (c, _) = s
             .check_conflicts(
                 "B",
                 &["src/api/users.rs".into()],
@@ -1703,6 +1722,41 @@ mod tests {
     }
 
     #[test]
+    fn scan_truncation_is_surfaced_when_active_set_exceeds_cap() {
+        // codeJung (impact 7): with more active foreign reservations than the
+        // scan cap, an empty conflict list must NOT be reported as all-clear —
+        // the truncated flag tells the caller the scan was incomplete.
+        let s = store();
+        // Three other-agent reservations on non-overlapping paths.
+        for i in 0..3 {
+            s.reserve_paths(
+                &format!("Other{i}"),
+                &[format!("unrelated/dir{i}/*")],
+                true,
+                None,
+                "2026-07-24T00:00:00Z",
+                FAR,
+                1000,
+            )
+            .unwrap();
+        }
+        // Scan cap of 2 < 3 active foreign reservations => truncated.
+        let (conflicts, truncated) = s
+            .check_conflicts("Me", &["src/main.rs".into()], "2026-07-24T00:00:00Z", 2)
+            .unwrap();
+        assert!(conflicts.is_empty(), "no overlap, so no conflicts found");
+        assert!(
+            truncated,
+            "scan hit the cap, so truncation must be surfaced"
+        );
+        // A cap comfortably above the active set is not truncated.
+        let (_c, truncated) = s
+            .check_conflicts("Me", &["src/main.rs".into()], "2026-07-24T00:00:00Z", 100)
+            .unwrap();
+        assert!(!truncated, "a cap above the active set is a complete scan");
+    }
+
+    #[test]
     fn reservations_share_across_two_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coord.db");
@@ -1718,7 +1772,7 @@ mod tests {
             1000,
         )
         .unwrap();
-        let c = b
+        let (c, _) = b
             .check_conflicts(
                 "B",
                 &["src/api/users.rs".into()],

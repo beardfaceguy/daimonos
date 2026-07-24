@@ -396,12 +396,9 @@ fn acknowledge(store: &CoordinationStore, body: &Value, now: &str) -> Response {
 /// Shared arg extraction for mark_read/acknowledge: `{agent, message_id}`.
 /// Returns an error *message* (not a `Response`) so the small-error variant
 /// keeps `Result` compact (clippy::result_large_err); callers wrap it.
+/// Delegates agent-name validation to `agent_arg` to avoid drift.
 fn read_agent_and_id(body: &Value) -> Result<(String, i64), String> {
-    let agent = match body.get("agent").and_then(|v| v.as_str()) {
-        Some(a) if names::is_valid(a) => a.to_string(),
-        Some(_) => return Err("coord: 'agent' is not a valid name".to_string()),
-        None => return Err("coord: 'agent' is required".to_string()),
-    };
+    let agent = agent_arg(body)?;
     let message_id = match body.get("message_id").and_then(|v| v.as_i64()) {
         Some(id) => id,
         None => return Err("coord: 'message_id' is required".to_string()),
@@ -462,9 +459,10 @@ fn reserve_paths(
         &expires_ts,
         RESERVATION_SCAN_CAP,
     ) {
-        Ok((granted, conflicts)) => Response::ok(json!({
+        Ok((granted, conflicts, scan_truncated)) => Response::ok(json!({
             "granted": granted.iter().map(reservation_json).collect::<Vec<_>>(),
             "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+            "scan_truncated": scan_truncated,
             "expires_ts": expires_ts,
         })),
         Err(e) => Response::err(
@@ -517,9 +515,12 @@ fn check_conflicts(store: &CoordinationStore, body: &Value, now: &str) -> Respon
         return Response::err(ERR_BAD_REQUEST, "coord: 'paths' must be a non-empty array");
     }
     match store.check_conflicts(&agent, &patterns, now, RESERVATION_SCAN_CAP) {
-        Ok(conflicts) => Response::ok(json!({
-            "conflict_free": conflicts.is_empty(),
+        // `conflict_free` requires BOTH an empty conflict list AND a complete
+        // scan — a truncated scan means we can't guarantee all-clear.
+        Ok((conflicts, scan_truncated)) => Response::ok(json!({
+            "conflict_free": conflicts.is_empty() && !scan_truncated,
             "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+            "scan_truncated": scan_truncated,
         })),
         Err(e) => Response::err(
             ERR_STORE_UNAVAILABLE,

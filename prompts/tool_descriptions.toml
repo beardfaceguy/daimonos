@@ -150,7 +150,7 @@ terse = """Advisory-reserve file globs (soft signal, not a lock); reports confli
 [reserve_paths.parameters]
 agent = "Your registered agent name (the reservation holder)."
 paths = "Glob pattern(s) to reserve (array), e.g. [\"src/api/*.rs\"]."
-exclusive = "If true (default), overlapping reservations by others are reported as conflicts."
+exclusive = "Whether THIS reservation is exclusive (default true). Recorded for future callers: another agent's check overlapping YOUR exclusive reservation is reported a conflict; a shared (exclusive=false) reservation never causes a conflict for others. It does not change whether conflicts against others are reported to you on this call — those are always reported."
 reason = "Optional short note on why you're reserving these paths."
 ttl_secs = "Lifetime in seconds; clamped to the configured [60, max] range. Defaults to the configured default TTL."
 [renew_reservations]

@@ -530,8 +530,8 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784923044.4358628,
-    "ast_hash": "884aeed47dc7efe9d1077c1314dfd5ba",
+    "mtime": 1784924588.0087812,
+    "ast_hash": "0a83b6f47904c0b699c26e92a632772e",
     "semantic_hash": ""
   },
   "src/verbosity.rs": {
@@ -1035,13 +1035,13 @@
     "semantic_hash": ""
   },
   "src/coordination/store.rs": {
-    "mtime": 1784923351.1776752,
-    "ast_hash": "06d296c830eb364846ea9b528868de7e",
+    "mtime": 1784924610.196624,
+    "ast_hash": "c35a0995426eea2fdc7f555b55991083",
     "semantic_hash": ""
   },
   "src/ops/coord.rs": {
-    "mtime": 1784923312.6459525,
-    "ast_hash": "d95d1e604fd592e863c8fbf7c4469b2f",
+    "mtime": 1784924073.9234605,
+    "ast_hash": "25743dff79ccb716fdc2ef8b978c1f69",
     "semantic_hash": ""
   },
   "docs/adr/009-agent-coordination.md": {
