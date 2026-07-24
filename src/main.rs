@@ -31,6 +31,7 @@ mod tool_facade;
 mod tool_runner;
 mod tools;
 mod verbosity;
+mod zed_config;
 
 use clap::Parser;
 use cli::{Cli, Command, RuntimeMode};

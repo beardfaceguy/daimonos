@@ -221,6 +221,21 @@ pub struct AcpMcpConfig {
     /// Upper bound on tools registered from any single server (bounds the
     /// exposed tool set). Extra tools are ignored.
     pub max_tools_per_server: usize,
+    /// When Zed forwards an EMPTY MCP server list at session/new|load (a
+    /// cold-start race in unpatched Zed: its context-server store isn't
+    /// populated when it issues the restored session, and it never re-forwards
+    /// to a live session), fall back to reading Zed's own `context_servers`
+    /// settings directly and bridge those. Only triggers on an empty forwarded
+    /// list — never overrides servers Zed did forward.
+    ///
+    /// **Opt-in (default false):** it reads an external app's config file and
+    /// spawns that config's stdio servers, so it must not fire for non-Zed ACP
+    /// clients or in tests. Enable it only when running daimonos as Zed's ACP
+    /// agent on an unpatched Zed.
+    pub zed_config_fallback: bool,
+    /// Path to Zed's `settings.json` for `zed_config_fallback`. `None` derives
+    /// it from `$XDG_CONFIG_HOME`/`$HOME` (`~/.config/zed/settings.json`).
+    pub zed_settings_path: Option<String>,
 }
 
 impl Default for AcpMcpConfig {
@@ -236,6 +251,8 @@ impl Default for AcpMcpConfig {
             max_servers: 32,
             max_concurrent_connects: 8,
             max_tools_per_server: 128,
+            zed_config_fallback: false,
+            zed_settings_path: None,
         }
     }
 }

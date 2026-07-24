@@ -1129,6 +1129,44 @@ fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
         .collect()
 }
 
+/// Resolve the MCP servers to bridge for a session. Normally these are the
+/// list Zed forwards in `session/new`/`session/load`. But unpatched Zed has a
+/// cold-start race where it forwards an EMPTY list (its context-server store
+/// isn't populated when it issues a restored session) and never re-forwards to
+/// a live session — leaving the session with no MCP tools. So when the
+/// forwarded list is empty (and the fallback is enabled), read Zed's own
+/// `context_servers` settings directly and bridge those instead (see
+/// [`crate::zed_config`]). Only the empty case triggers the fallback; servers
+/// Zed did forward are never overridden.
+fn resolve_mcp_specs(forwarded: Vec<McpServer>, cfg: &Config) -> Vec<ServerSpec> {
+    let specs = to_server_specs(forwarded);
+    if !specs.is_empty() || !cfg.acp.mcp.enabled || !cfg.acp.mcp.zed_config_fallback {
+        return specs;
+    }
+    match crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()) {
+        Ok(fallback) if !fallback.is_empty() => {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "mcp_forward_empty_fallback",
+                recovered = fallback.len(),
+                "Zed forwarded no MCP servers; recovered them from Zed settings \
+                 (unpatched-Zed cold-start race)"
+            );
+            fallback
+        }
+        Ok(_) => specs,
+        Err(e) => {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "mcp_fallback_failed",
+                error = %e,
+                "Zed forwarded no MCP servers and reading Zed settings failed"
+            );
+            specs
+        }
+    }
+}
+
 fn should_refresh_mcp_bridge(
     current: &[ServerSpec],
     requested: &[ServerSpec],
@@ -2238,8 +2276,10 @@ fn build_agent_with_state(
                     async move {
                         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
                         // Zed forwards the user's configured MCP servers here
-                        // (ADR-003); bridge them into this session.
-                        let mcp_specs = to_server_specs(req.mcp_servers);
+                        // (ADR-003); bridge them into this session. Falls back
+                        // to Zed's settings when the forwarded list is empty
+                        // (unpatched-Zed cold-start race).
+                        let mcp_specs = resolve_mcp_specs(req.mcp_servers, &cfg);
                         let mcp_server_count = mcp_specs.len();
                         // Use the client-provided project root, not the CLI's
                         // own cwd — Zed passes the actual project it wants this
@@ -2353,7 +2393,9 @@ fn build_agent_with_state(
                     let token_log = token_log.clone();
                     async move {
                         let session_id = req.session_id.clone();
-                        let mcp_specs = to_server_specs(req.mcp_servers);
+                        // Same empty-forward fallback as session/new: a
+                        // reloaded thread must also recover its MCP servers.
+                        let mcp_specs = resolve_mcp_specs(req.mcp_servers, &cfg);
                         let session_workspace = if req.cwd.as_os_str().is_empty() {
                             workspace_fallback
                         } else {
@@ -2836,6 +2878,39 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::io::AsyncReadExt;
     use std::collections::VecDeque;
+
+    #[test]
+    fn resolve_mcp_specs_fallback_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{ "context_servers": { "x": { "url": "http://127.0.0.1:9/mcp/" } } }"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.acp.mcp.zed_settings_path = Some(path.to_string_lossy().into_owned());
+
+        // Enabled + empty forward -> read Zed config fallback.
+        cfg.acp.mcp.zed_config_fallback = true;
+        assert_eq!(resolve_mcp_specs(vec![], &cfg).len(), 1);
+
+        // Disabled (the default) -> no fallback, even with an empty forward.
+        cfg.acp.mcp.zed_config_fallback = false;
+        assert!(resolve_mcp_specs(vec![], &cfg).is_empty());
+
+        // A non-empty forward is never overridden by the fallback.
+        cfg.acp.mcp.zed_config_fallback = true;
+        let forwarded = vec![McpServer::Http(
+            agent_client_protocol::schema::v1::McpServerHttp::new(
+                "fwd".to_string(),
+                "http://127.0.0.1:10/".to_string(),
+            ),
+        )];
+        let specs = resolve_mcp_specs(forwarded, &cfg);
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "fwd"));
+    }
     use std::time::Duration;
 
     // --- MockProvider (mirrors agent.rs/agent_cmd.rs test doubles) ---
