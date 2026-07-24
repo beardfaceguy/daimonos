@@ -21,6 +21,7 @@ pub struct Config {
     pub acp: AcpConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
+    pub coordination: CoordinationConfig,
     pub prompts: PromptsConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
@@ -480,6 +481,64 @@ fn default_kgl_skip_dirs() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// Native agent-to-agent coordination ("agent mail") — ADR-009, vikunja #1057.
+/// Governs the per-workspace coordination SQLite store shared by concurrent
+/// daimonos processes. All fields are optional in TOML (`#[serde(default)]`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CoordinationConfig {
+    /// Master switch. When false, coordination tools return a soft "disabled"
+    /// error and never touch disk (fail-open; ADR-009 D7).
+    pub enabled: bool,
+    /// SQLite busy-timeout in milliseconds for every coordination connection
+    /// (WAL lets concurrent processes proceed; the timeout absorbs contention).
+    pub busy_timeout_ms: u64,
+    /// Optional override for the coordination base directory. When unset,
+    /// defaults to `~/.daimonos/coordination` (the `~/.daimonos/` global-state
+    /// convention; the DB lives OUTSIDE the target repo tree).
+    pub db_dir: Option<String>,
+    /// Default reservation TTL (seconds) when a caller omits one.
+    pub default_reservation_ttl_secs: u64,
+    /// Hard ceiling on a reservation TTL (seconds); larger requests are clamped.
+    pub max_reservation_ttl_secs: u64,
+    /// Default `fetch_inbox` page size when the caller omits `limit`.
+    pub inbox_default_limit: i64,
+    /// Hard cap on messages returned when reconstructing a thread — bounds the
+    /// read so a long/adversarial reply chain cannot blow up a response
+    /// (ADR-009 D3/D7; no recursion).
+    pub thread_max_messages: i64,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            busy_timeout_ms: 5_000,
+            db_dir: None,
+            default_reservation_ttl_secs: 3_600,
+            max_reservation_ttl_secs: 86_400,
+            inbox_default_limit: 20,
+            thread_max_messages: 500,
+        }
+    }
+}
+
+impl CoordinationConfig {
+    /// Resolve the coordination base directory: explicit `db_dir` (tilde
+    /// expanded), else `~/.daimonos/coordination`, else a `/tmp` fallback if
+    /// `$HOME` can't be resolved (never blocks startup — matches analytics).
+    pub fn resolved_db_dir(&self) -> std::path::PathBuf {
+        if let Some(dir) = &self.db_dir {
+            return crate::paths::expand_tilde(dir);
+        }
+        if let Some(home) = crate::paths::home_dir() {
+            home.join(".daimonos").join("coordination")
+        } else {
+            std::path::PathBuf::from("/tmp/daimonos-coordination")
+        }
+    }
 }
 
 /// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.

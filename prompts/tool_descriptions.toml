@@ -72,6 +72,22 @@ terse = """Declare KGL layer for a def: intent, provenance, or typed edge."""
 
 [kgl_assert.parameters]
 args = "intent: {hash, purpose, rationale?, open_questions?[]}; provenance: {hash, authored_by, session_id?, assumptions?[], supersedes?[]}; declare_edge: {from, to, kind} where kind is one of calls|depends_on|reads|mutates (snake_case)."
+[register_agent]
+full = """Register (or refresh) your agent identity for this workspace so other daimonos agents can address you (agent mail, ADR-009). Idempotent by name: re-registering the same name updates your profile and last-seen time and keeps your original identity. Omit 'name' to be assigned a memorable AdjectiveNoun handle (e.g. BlueLake). Names are unique per workspace."""
+terse = """Register/refresh your agent identity (memorable name) for this workspace; minted if omitted."""
+
+[register_agent.parameters]
+name = "Memorable AdjectiveNoun handle (ASCII alphanumeric, 1-64 chars). Minted for you if omitted. Unique per workspace."
+program = "Optional: the agent program you run as (e.g. codex-cli, claude-code)."
+model = "Optional: the underlying model (e.g. gpt5, opus)."
+task = "Optional: a short description of what you're currently working on."
+session_id = "Optional: your agent-runtime session id; defaults to the daimonos session id when omitted."
+[list_agents]
+full = """List agents registered in this workspace, most-recently-seen first (agent mail, ADR-009). Use this to discover who else is working here and the names you can address messages to."""
+terse = """List workspace agents (most-recently-seen first)."""
+
+[list_agents.parameters]
+limit = "Max agents to return (most-recently-seen first). Defaults to the configured inbox page size."
 [list_tool_signatures]
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 

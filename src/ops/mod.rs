@@ -1,3 +1,4 @@
+mod coord;
 mod diff_ops;
 pub mod exec_filter;
 mod exec_ops;
@@ -82,6 +83,7 @@ async fn dispatch_op(
         protocol::op::ENV_SET => env_set(session, &op),
         protocol::op::ENV_GET => env_get(session, &op),
         protocol::op::SESSION => session_info(session),
+        protocol::op::COORD => coord::coord(session, &op),
         protocol::op::SCHEMA => schema::schema(&op),
         _ => Response::err(3, &format!("unknown opcode: {}", op.c)),
     }
