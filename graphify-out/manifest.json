@@ -290,8 +290,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784915187.0792477,
-    "ast_hash": "0a1bbf7da57eced223c9c02a613eb276",
+    "mtime": 1784915961.4167514,
+    "ast_hash": "efe318dd0e0e8680869552a93e003b77",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -530,8 +530,8 @@
     "semantic_hash": "8b174e06547abee2b4363829a1d0dd14"
   },
   "src/tools.rs": {
-    "mtime": 1784915427.8315387,
-    "ast_hash": "89a92ff5a4cb33f1f84e0bb3d9da1755",
+    "mtime": 1784915999.5824804,
+    "ast_hash": "913003d2a61cf75cc4a7fe32159e4f62",
     "semantic_hash": ""
   },
   "src/verbosity.rs": {
@@ -1025,8 +1025,8 @@
     "semantic_hash": ""
   },
   "src/coordination/mod.rs": {
-    "mtime": 1784915366.6229732,
-    "ast_hash": "a3439e5f7eea2e66c86e4bff8e214326",
+    "mtime": 1784915923.3620214,
+    "ast_hash": "db19af458b808c2e322046f0014dc8c8",
     "semantic_hash": ""
   },
   "src/coordination/names.rs": {
@@ -1035,13 +1035,13 @@
     "semantic_hash": ""
   },
   "src/coordination/store.rs": {
-    "mtime": 1784915366.6249733,
-    "ast_hash": "de321e01266f629ac27538c73afab82a",
+    "mtime": 1784915948.354844,
+    "ast_hash": "22033801f10022bab94296de8458ac99",
     "semantic_hash": ""
   },
   "src/ops/coord.rs": {
-    "mtime": 1784915366.669973,
-    "ast_hash": "c4dccb19ec3b293d0abe6a91a9e85c43",
+    "mtime": 1784915990.5855443,
+    "ast_hash": "1b8cffa68cba68906c9d82b1df2366a3",
     "semantic_hash": ""
   },
   "docs/adr/009-agent-coordination.md": {

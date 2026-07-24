@@ -536,8 +536,35 @@ impl CoordinationConfig {
         if let Some(home) = crate::paths::home_dir() {
             home.join(".daimonos").join("coordination")
         } else {
-            std::path::PathBuf::from("/tmp/daimonos-coordination")
+            // $HOME unresolvable: fall back under a per-user temp dir. Namespacing
+            // by uid keeps two users from racing on / hijacking / sharing one
+            // world-writable coordination DB (the workspace is the trust
+            // boundary; a shared /tmp path would breach it). Best-effort: a
+            // missing uid degrades to the unscoped name.
+            let uid = std::env::var("UID")
+                .ok()
+                .or_else(|| std::env::var("USER").ok())
+                .unwrap_or_default();
+            let name = if uid.is_empty() {
+                "daimonos-coordination".to_string()
+            } else {
+                format!("daimonos-coordination-{uid}")
+            };
+            std::env::temp_dir().join(name)
         }
+    }
+
+    /// Busy-timeout clamped to a sane floor so a misconfigured `0` can't make a
+    /// contended writer fail immediately with `SQLITE_BUSY` (same class as the
+    /// `debounce_secs=0` concern). Callers use this rather than the raw field.
+    pub fn effective_busy_timeout_ms(&self) -> u64 {
+        self.busy_timeout_ms.max(100)
+    }
+
+    /// Inbox page size clamped to at least 1 (a `0`/negative default would make
+    /// every fetch return nothing). Callers use this rather than the raw field.
+    pub fn effective_inbox_default_limit(&self) -> i64 {
+        self.inbox_default_limit.max(1)
     }
 }
 

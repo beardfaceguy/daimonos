@@ -46,9 +46,12 @@ pub fn workspace_db_path(base: &Path, workspace: &Path) -> std::path::PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
-    // 16 hex chars (64 bits) is ample to avoid collisions across a user's
-    // workspaces while keeping the filename short and readable.
-    let key: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    // Full 256-bit digest as hex (64 chars). A truncated key could let two
+    // distinct workspaces collide onto one DB and cross-contaminate identity
+    // and messages across the trust boundary (ADR-009: the workspace IS the
+    // trust boundary), so we keep the whole digest — the filename length is a
+    // non-issue for a hidden state file.
+    let key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     base.join(format!("{key}.db"))
 }
 

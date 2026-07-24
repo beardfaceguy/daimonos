@@ -55,7 +55,7 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     // agent continues (constraint 2).
     let base = cfg.resolved_db_dir();
     let db_path = workspace_db_path(&base, &session.workspace);
-    let store = match CoordinationStore::open_with(&db_path, cfg.busy_timeout_ms) {
+    let store = match CoordinationStore::open_with(&db_path, cfg.effective_busy_timeout_ms()) {
         Ok(s) => s,
         Err(e) => {
             return Response::err(
@@ -68,7 +68,7 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     let now = chrono::Utc::now().to_rfc3339();
     match verb.as_str() {
         "register_agent" => register_agent(&store, &body, session, &now),
-        "list_agents" => list_agents(&store, &body, cfg.inbox_default_limit),
+        "list_agents" => list_agents(&store, &body, cfg.effective_inbox_default_limit()),
         other => Response::err(ERR_BAD_REQUEST, &format!("coord: unknown verb '{other}'")),
     }
 }
@@ -92,7 +92,7 @@ fn register_agent(
             }
             n.to_string()
         }
-        None => match mint_available_name(store, now) {
+        None => match mint_available_name(store) {
             Some(n) => n,
             None => {
                 return Response::err(
@@ -124,10 +124,16 @@ fn register_agent(
 /// Try to mint a name not already taken, bounded by the name space so a nearly
 /// full store can't loop unbounded (constraint 1). Salt the seed with the clock
 /// and attempt index so retries differ.
-fn mint_available_name(store: &CoordinationStore, now: &str) -> Option<String> {
-    let base_seed = now
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64));
+fn mint_available_name(store: &CoordinationStore) -> Option<String> {
+    // Seed from the wall clock (nanoseconds, not the second-granular `now`
+    // string) mixed with the process id, so two processes minting in the same
+    // second start from different candidate sequences and don't churn the same
+    // collision-retry walk on the shared WAL DB.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let base_seed = nanos ^ ((std::process::id() as u64) << 32);
     let attempts = names::name_space().min(256);
     for i in 0..attempts {
         let candidate = names::mint(base_seed.wrapping_add(i as u64));

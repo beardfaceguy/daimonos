@@ -119,20 +119,34 @@ impl CoordinationStore {
                     ON reservation(agent_name, released_ts, expires_ts);",
             )
             .context("init coordination schema")?;
-        // Record the version once (id is pinned to 1 by the CHECK).
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, ?1)",
-                params![SCHEMA_VERSION],
-            )
-            .context("record schema version")?;
+        // Detect an incompatible on-disk version rather than mis-parsing it
+        // (ADR-009 D6 / #1053 lesson 3 spirit): if a version row already exists
+        // and differs from ours, refuse to open. `open_with`'s caller
+        // (`ops::coord`) turns this Err into a soft error, so a version skew
+        // fails open — it never panics or corrupts data.
+        if let Some(existing) = self.schema_version()? {
+            if existing != SCHEMA_VERSION {
+                anyhow::bail!(
+                    "coordination store schema version {existing} != supported {SCHEMA_VERSION}"
+                );
+            }
+        } else {
+            // Fresh (or pre-meta) store: record our version once. The CHECK
+            // pins id=1, and OR IGNORE keeps two racing initializers safe.
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, ?1)",
+                    params![SCHEMA_VERSION],
+                )
+                .context("record schema version")?;
+        }
         Ok(())
     }
 
     /// The recorded schema version, if any. `Ok(None)` on a store that predates
     /// the meta row (treated by callers as "not this version"). Public API for
-    /// future migration/compat checks; exercised by the store's own tests.
-    #[allow(dead_code)]
+    /// future migration/compat checks; consulted by `init` to reject an
+    /// incompatible on-disk version.
     pub fn schema_version(&self) -> Result<Option<u32>> {
         let v = self
             .conn
@@ -403,6 +417,30 @@ mod tests {
             .collect();
         assert!(names_a.contains(&"FromA".to_string()) && names_a.contains(&"FromB".to_string()));
         assert!(names_b.contains(&"FromA".to_string()) && names_b.contains(&"FromB".to_string()));
+    }
+
+    #[test]
+    fn incompatible_schema_version_is_rejected_not_misparsed() {
+        // A store written by a future/incompatible version must fail to open
+        // (Err), which callers turn into a soft error — never silently opened
+        // and mis-parsed (ADR-009 D6).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coord.db");
+        {
+            let s = CoordinationStore::open_with(&path, 5_000).unwrap();
+            // Bump the recorded version out from under us.
+            s.conn
+                .execute(
+                    "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+                    params![SCHEMA_VERSION + 1],
+                )
+                .unwrap();
+        }
+        let reopened = CoordinationStore::open_with(&path, 5_000);
+        assert!(
+            reopened.is_err(),
+            "an incompatible schema version must be rejected on open"
+        );
     }
 
     #[test]

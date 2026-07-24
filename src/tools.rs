@@ -359,7 +359,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9]+$"},
                     "program": {"type": "string"},
                     "model": {"type": "string"},
                     "task": {"type": "string"},
