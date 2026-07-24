@@ -1318,6 +1318,30 @@ fn send_provider_error_diagnostic(
         session_id = %session_id,
         class = message,
     );
+    // The `warn` above is privacy-safe: it carries only the friendly `class`,
+    // never the provider's raw error. The raw text is the only way to diagnose
+    // the catch-all "Provider request failed." bucket, so log it separately at
+    // DEBUG (see `log_raw_provider_error`).
+    log_raw_provider_error(&session_id.to_string(), message, error);
+}
+
+/// Emit the provider's RAW error string at DEBUG on `daimonos::acp` — off by
+/// default, one env var away (`RUST_LOG=daimonos::acp=debug`). This is the only
+/// place the unredacted provider error is surfaced: it is never sent to the
+/// client (which sees the friendly `class`) and never recorded on an OTel span
+/// (ADR-006 privacy-first). No-op when there is no raw error. Factored out of
+/// `send_provider_error_diagnostic` so it can be unit-tested without a live ACP
+/// connection (#1062).
+fn log_raw_provider_error(session_id: &str, class: &str, error: Option<&str>) {
+    if let Some(raw) = error {
+        tracing::debug!(
+            target: "daimonos::acp",
+            event = "provider_request_raw",
+            session_id = %session_id,
+            class = class,
+            raw_error = raw,
+        );
+    }
 }
 
 fn send_refusal_diagnostic(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
@@ -5541,6 +5565,126 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("stream_error")),
             "Provider response stream failed."
+        );
+    }
+
+    // --- raw provider-error debug logging (#1062) ---
+
+    // Minimal in-memory tracing layer that records events on the
+    // `daimonos::acp` target whose `event` field == "provider_request_raw",
+    // capturing their `raw_error` field. Used to assert the DEBUG gate without
+    // adding a test-only dependency.
+    #[derive(Clone, Default)]
+    struct RawErrorCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RawErrorCapture {
+        fn captured(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RawErrorCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "daimonos::acp" {
+                return;
+            }
+            struct Visitor {
+                is_raw_event: bool,
+                raw_error: Option<String>,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    match field.name() {
+                        "event" if value == "provider_request_raw" => self.is_raw_event = true,
+                        "raw_error" => self.raw_error = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let rendered = format!("{value:?}");
+                    let trimmed = rendered.trim_matches('"').to_string();
+                    match field.name() {
+                        "event" if trimmed == "provider_request_raw" => self.is_raw_event = true,
+                        "raw_error" => self.raw_error = Some(trimmed),
+                        _ => {}
+                    }
+                }
+            }
+            let mut visitor = Visitor {
+                is_raw_event: false,
+                raw_error: None,
+            };
+            event.record(&mut visitor);
+            if visitor.is_raw_event {
+                if let Some(raw) = visitor.raw_error {
+                    self.events
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(raw);
+                }
+            }
+        }
+    }
+
+    fn capture_raw_error_logging(level: tracing::level_filters::LevelFilter) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer as _;
+        let capture = RawErrorCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(level));
+        tracing::subscriber::with_default(subscriber, || {
+            // Unclassified error => "Provider request failed." bucket.
+            log_raw_provider_error(
+                "session-xyz",
+                "Provider request failed.",
+                Some("openrouter: unexpected response shape (id 8842)"),
+            );
+            // No raw error => no emission regardless of level.
+            log_raw_provider_error("session-xyz", "Provider request failed.", None);
+        });
+        capture.captured()
+    }
+
+    #[test]
+    fn raw_provider_error_not_logged_at_default_level() {
+        // WARN is the effective default; the DEBUG raw-error event must be filtered out.
+        let captured = capture_raw_error_logging(tracing::level_filters::LevelFilter::WARN);
+        assert!(
+            captured.is_empty(),
+            "raw provider error must not be emitted at the default (warn) level"
+        );
+    }
+
+    #[test]
+    fn raw_provider_error_logged_when_debug_enabled() {
+        let captured = capture_raw_error_logging(tracing::level_filters::LevelFilter::DEBUG);
+        assert_eq!(
+            captured,
+            vec!["openrouter: unexpected response shape (id 8842)".to_string()],
+            "with debug enabled the raw error must be emitted once (and never when error is None)"
+        );
+    }
+
+    #[test]
+    fn client_facing_message_stays_friendly_for_unclassified_error() {
+        // The client-facing classification is unchanged: an unclassified raw
+        // error yields the catch-all friendly message; raw text never leaks in.
+        let raw = "openrouter: unexpected response shape (id 8842)";
+        assert_eq!(
+            safe_provider_error_message(false, Some(raw)),
+            "Provider request failed."
         );
     }
 
