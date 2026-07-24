@@ -2989,7 +2989,7 @@ dependencies = [
 [[package]]
 name = "rust-mcp-sdk"
 version = "0.10.0"
-source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=bd84062d4ff594376468357bbb4768a902d5ddb5#bd84062d4ff594376468357bbb4768a902d5ddb5"
+source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=0d9ecb4f9adb275d25a29e84c79635431f6fbd8d#0d9ecb4f9adb275d25a29e84c79635431f6fbd8d"
 dependencies = [
  "async-trait",
  "base64",
@@ -3013,7 +3013,7 @@ dependencies = [
 [[package]]
 name = "rust-mcp-transport"
 version = "0.9.1"
-source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=bd84062d4ff594376468357bbb4768a902d5ddb5#bd84062d4ff594376468357bbb4768a902d5ddb5"
+source = "git+https://github.com/beardfaceguy/rust-mcp-sdk?rev=0d9ecb4f9adb275d25a29e84c79635431f6fbd8d#0d9ecb4f9adb275d25a29e84c79635431f6fbd8d"
 dependencies = [
  "async-trait",
  "bytes",
