@@ -89,6 +89,114 @@ type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 /// effect on the next prompt (you can't change model mid-turn anyway).
 type CurrentModel = Arc<StdMutex<String>>;
 
+/// Blocking stdio adapter for ACP that treats `WouldBlock`/EAGAIN as transient
+/// pipe backpressure instead of a fatal transport error. Zed's ACP connection
+/// tears down the entire agent when any transport I/O error escapes. Retry on
+/// the blocking worker (never the async executor), with a small sleep to avoid
+/// spinning. Other errors retain their kind and gain directional context.
+struct ResilientStdio<T> {
+    inner: T,
+    direction: &'static str,
+    /// At 1ms backoff this defaults to about five seconds. Prevents a
+    /// permanently misconfigured nonblocking fd from hanging ACP forever.
+    max_would_block_attempts: u64,
+}
+
+impl<T> ResilientStdio<T> {
+    fn new(inner: T, direction: &'static str) -> Self {
+        Self {
+            inner,
+            direction,
+            max_would_block_attempts: 5_000,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_retry_limit(inner: T, direction: &'static str, limit: u64) -> Self {
+        Self {
+            inner,
+            direction,
+            max_would_block_attempts: limit.max(1),
+        }
+    }
+
+    fn contextual_error(&self, operation: &str, error: std::io::Error) -> std::io::Error {
+        std::io::Error::new(
+            error.kind(),
+            format!("ACP {} {operation} failed: {error}", self.direction),
+        )
+    }
+
+    fn note_would_block(&self, operation: &str, attempts: u64) -> std::io::Result<()> {
+        if attempts == 1 || attempts.is_multiple_of(1_000) {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_retry",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
+        }
+        if attempts >= self.max_would_block_attempts {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "ACP {} {operation} remained blocked after {attempts} attempts",
+                    self.direction
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(())
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for ResilientStdio<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("read", attempts)?;
+                }
+                Err(error) => return Err(self.contextual_error("read", error)),
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for ResilientStdio<T> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.write(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("write", attempts)?;
+                }
+                Err(error) => return Err(self.contextual_error("write", error)),
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.flush() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("flush", attempts)?;
+                }
+                Err(error) => return Err(self.contextual_error("flush", error)),
+                result => return result,
+            }
+        }
+    }
+}
+
 struct EofAwareReader<R> {
     inner: R,
     eof: Arc<tokio::sync::Notify>,
@@ -3005,11 +3113,11 @@ pub async fn run_acp(
         }
     };
     let stdin = EofAwareReader::new(
-        blocking::Unblock::new(std::io::stdin()),
+        blocking::Unblock::new(ResilientStdio::new(std::io::stdin(), "stdin")),
         Arc::clone(&eof),
         input_error,
     );
-    let stdout = blocking::Unblock::new(std::io::stdout());
+    let stdout = blocking::Unblock::new(ResilientStdio::new(std::io::stdout(), "stdout"));
     let connection = agent.connect_to(ByteStreams::new(stdout, stdin));
     tokio::pin!(connection);
     tokio::pin!(eof_wait);
@@ -3058,6 +3166,121 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::io::AsyncReadExt;
     use std::collections::VecDeque;
+
+    struct TransientReader {
+        would_block_remaining: usize,
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl std::io::Read for TransientReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.would_block_remaining > 0 {
+                self.would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let remaining = &self.bytes[self.offset..];
+            let count = remaining.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&remaining[..count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    #[derive(Default)]
+    struct TransientWriter {
+        write_would_block_remaining: usize,
+        flush_would_block_remaining: usize,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for TransientWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.write_would_block_remaining > 0 {
+                self.write_would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_would_block_remaining > 0 {
+                self.flush_would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct AlwaysWouldBlockReader;
+
+    impl std::io::Read for AlwaysWouldBlockReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    struct FatalReader;
+
+    impl std::io::Read for FatalReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+    }
+
+    #[test]
+    fn resilient_stdio_retries_transient_read_would_block() {
+        let inner = TransientReader {
+            would_block_remaining: 2,
+            bytes: b"hello".to_vec(),
+            offset: 0,
+        };
+        let mut reader = ResilientStdio::new(inner, "stdin");
+        let mut buffer = [0u8; 5];
+        let count = std::io::Read::read(&mut reader, &mut buffer).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(&buffer, b"hello");
+    }
+
+    #[test]
+    fn resilient_stdio_retries_transient_write_and_flush_would_block() {
+        let inner = TransientWriter {
+            write_would_block_remaining: 2,
+            flush_would_block_remaining: 1,
+            ..Default::default()
+        };
+        let mut writer = ResilientStdio::new(inner, "stdout");
+        assert_eq!(std::io::Write::write(&mut writer, b"hello").unwrap(), 5);
+        std::io::Write::flush(&mut writer).unwrap();
+        assert_eq!(writer.inner.bytes, b"hello");
+        assert_eq!(writer.inner.flushes, 1);
+    }
+
+    #[test]
+    fn resilient_stdio_times_out_persistent_would_block() {
+        let mut reader = ResilientStdio::with_retry_limit(AlwaysWouldBlockReader, "stdin", 3);
+        let error = std::io::Read::read(&mut reader, &mut [0u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error
+            .to_string()
+            .contains("ACP stdin read remained blocked"));
+        assert!(error.to_string().contains("3 attempts"));
+    }
+
+    #[test]
+    fn resilient_stdio_preserves_real_error_kind_and_adds_direction() {
+        let mut reader = ResilientStdio::new(FatalReader, "stdin");
+        let error = std::io::Read::read(&mut reader, &mut [0u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("ACP stdin read failed"));
+        assert!(error.to_string().contains("denied"));
+    }
 
     #[tokio::test]
     async fn coordination_ui_poll_skips_while_agent_session_is_busy() {
