@@ -89,6 +89,134 @@ type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 /// effect on the next prompt (you can't change model mid-turn anyway).
 type CurrentModel = Arc<StdMutex<String>>;
 
+/// Blocking stdout adapter for ACP that treats `WouldBlock`/EAGAIN as
+/// transient pipe backpressure instead of a fatal transport error. Zed tears
+/// down the entire agent when an output transport error escapes. Retry on the
+/// blocking worker (never the async executor), with a small sleep to avoid
+/// spinning. Other errors retain their kind and gain directional context.
+///
+/// This deliberately wraps stdout only. Stdin must remain an indefinite
+/// blocking read while the agent is idle; a bounded WouldBlock retry there
+/// would incorrectly time out a healthy idle session.
+struct ResilientWriter<T> {
+    inner: T,
+    direction: &'static str,
+    /// With capped exponential backoff, 100 attempts is roughly five seconds.
+    /// Prevents a permanently blocked fd from hanging ACP forever.
+    max_would_block_attempts: u64,
+}
+
+impl<T> ResilientWriter<T> {
+    fn new(inner: T, direction: &'static str) -> Self {
+        Self {
+            inner,
+            direction,
+            max_would_block_attempts: 100,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_retry_limit(inner: T, direction: &'static str, limit: u64) -> Self {
+        Self {
+            inner,
+            direction,
+            max_would_block_attempts: limit.max(1),
+        }
+    }
+
+    fn contextual_error(&self, operation: &str, error: std::io::Error) -> std::io::Error {
+        std::io::Error::new(
+            error.kind(),
+            format!("ACP {} {operation} failed: {error}", self.direction),
+        )
+    }
+
+    fn note_would_block(&self, operation: &str, attempts: u64) -> std::io::Result<()> {
+        if attempts == 1 {
+            // A single pipe-backpressure retry is expected under bursts; keep
+            // it out of warn-level logs.
+            tracing::debug!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_retry",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
+        } else if attempts.is_multiple_of(25) && attempts < self.max_would_block_attempts {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_sustained",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
+        }
+        if attempts >= self.max_would_block_attempts {
+            tracing::error!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_timeout",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "ACP {} {operation} remained blocked after {attempts} attempts",
+                    self.direction
+                ),
+            ));
+        }
+        // Exponential backoff (1,2,4,…), capped at 50ms. This absorbs short
+        // bursts cheaply without tight polling during sustained backpressure.
+        let shift = attempts.saturating_sub(1).min(6) as u32;
+        let delay_ms = (1u64 << shift).min(50);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        Ok(())
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.write(buffer) {
+                // Empty writes are required to succeed immediately.
+                Ok(0) if buffer.is_empty() => return Ok(0),
+                // A zero-length write for a nonempty buffer is transient
+                // backpressure for this pipe transport. Letting it escape makes
+                // write_all convert it to fatal WriteZero.
+                Ok(0) => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("write_zero", attempts)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("write", attempts)?;
+                }
+                Err(error) => return Err(self.contextual_error("write", error)),
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.flush() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("flush", attempts)?;
+                }
+                Err(error) => return Err(self.contextual_error("flush", error)),
+                result => return result,
+            }
+        }
+    }
+}
+
 struct EofAwareReader<R> {
     inner: R,
     eof: Arc<tokio::sync::Notify>,
@@ -3009,7 +3137,7 @@ pub async fn run_acp(
         Arc::clone(&eof),
         input_error,
     );
-    let stdout = blocking::Unblock::new(std::io::stdout());
+    let stdout = blocking::Unblock::new(ResilientWriter::new(std::io::stdout(), "stdout"));
     let connection = agent.connect_to(ByteStreams::new(stdout, stdin));
     tokio::pin!(connection);
     tokio::pin!(eof_wait);
@@ -3058,6 +3186,113 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::io::AsyncReadExt;
     use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct TransientWriter {
+        write_interrupted_remaining: usize,
+        write_zero_remaining: usize,
+        write_would_block_remaining: usize,
+        flush_interrupted_remaining: usize,
+        flush_would_block_remaining: usize,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for TransientWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.write_interrupted_remaining > 0 {
+                self.write_interrupted_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            if self.write_would_block_remaining > 0 {
+                self.write_would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if self.write_zero_remaining > 0 {
+                self.write_zero_remaining -= 1;
+                return Ok(0);
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_interrupted_remaining > 0 {
+                self.flush_interrupted_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            if self.flush_would_block_remaining > 0 {
+                self.flush_would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct AlwaysWouldBlockWriter;
+
+    impl std::io::Write for AlwaysWouldBlockWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FatalWriter;
+
+    impl std::io::Write for FatalWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resilient_writer_retries_transient_write_and_flush_would_block() {
+        let inner = TransientWriter {
+            write_interrupted_remaining: 1,
+            write_zero_remaining: 1,
+            write_would_block_remaining: 2,
+            flush_interrupted_remaining: 1,
+            flush_would_block_remaining: 1,
+            ..Default::default()
+        };
+        let mut writer = ResilientWriter::new(inner, "stdout");
+        assert_eq!(std::io::Write::write(&mut writer, b"hello").unwrap(), 5);
+        std::io::Write::flush(&mut writer).unwrap();
+        assert_eq!(writer.inner.bytes, b"hello");
+        assert_eq!(writer.inner.flushes, 1);
+    }
+
+    #[test]
+    fn resilient_writer_times_out_persistent_would_block() {
+        let mut writer = ResilientWriter::with_retry_limit(AlwaysWouldBlockWriter, "stdout", 3);
+        let error = std::io::Write::write(&mut writer, b"x").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error
+            .to_string()
+            .contains("ACP stdout write remained blocked"));
+        assert!(error.to_string().contains("3 attempts"));
+    }
+
+    #[test]
+    fn resilient_writer_preserves_real_error_kind_and_adds_direction() {
+        let mut writer = ResilientWriter::new(FatalWriter, "stdout");
+        let error = std::io::Write::write(&mut writer, b"x").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("ACP stdout write failed"));
+        assert!(error.to_string().contains("denied"));
+    }
 
     #[tokio::test]
     async fn coordination_ui_poll_skips_while_agent_session_is_busy() {
