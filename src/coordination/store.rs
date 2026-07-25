@@ -294,6 +294,15 @@ impl CoordinationStore {
         // Upsert: on conflict keep inception_ts, refresh the rest. COALESCE lets
         // a re-register with omitted fields preserve the prior value rather than
         // nulling it.
+        if let Some(session_id) = session_id {
+            // One live ACP session binds to one coordination identity. Explicit
+            // re-registration transfers the binding instead of leaving an
+            // ambiguous many-agent session-id mapping.
+            self.conn.execute(
+                "UPDATE agent SET session_id = NULL WHERE session_id = ?1 AND name <> ?2",
+                params![session_id, name],
+            )?;
+        }
         self.conn
             .execute(
                 "INSERT INTO agent
@@ -572,33 +581,37 @@ impl CoordinationStore {
         &self,
         agent: &str,
         after_message_id: i64,
-        scan_cap: i64,
     ) -> Result<Option<UnreadSummary>> {
-        let scan_cap = scan_cap.clamp(1, 1_000);
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.importance
+        // Exact aggregate over metadata-only indexed rows: no subject/body is
+        // selected, and no LIMIT can hide older unread rows after advancing the
+        // watermark. CASE supplies a bounded ordinal importance rank.
+        let row = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(m.id), 0),
+                    COALESCE(MAX(CASE m.importance
+                        WHEN 'low' THEN 0 WHEN 'normal' THEN 1
+                        WHEN 'high' THEN 2 WHEN 'urgent' THEN 3 ELSE 1 END), 0)
              FROM recipient r JOIN message m ON m.id = r.message_id
-             WHERE r.agent_name = ?1 AND r.read_ts IS NULL AND m.id > ?2
-             ORDER BY m.id DESC LIMIT ?3",
+             WHERE r.agent_name = ?1 AND r.read_ts IS NULL AND m.id > ?2",
+            params![agent, after_message_id],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )?;
-        let rows = stmt.query_map(params![agent, after_message_id, scan_cap], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut count = 0u64;
-        let mut newest = 0i64;
-        let mut highest = Importance::Low;
-        for (id, importance) in rows.flatten() {
-            count += 1;
-            newest = newest.max(id);
-            let parsed = Importance::parse(&importance);
-            if importance_rank(parsed) > importance_rank(highest) {
-                highest = parsed;
-            }
-        }
+        let (count, newest_message_id, rank) = row;
+        let highest_importance = match rank {
+            3 => "urgent",
+            2 => "high",
+            1 => "normal",
+            _ => "low",
+        };
         Ok((count > 0).then(|| UnreadSummary {
             count,
-            highest_importance: highest.as_str().to_string(),
-            newest_message_id: newest,
+            highest_importance: highest_importance.to_string(),
+            newest_message_id,
         }))
     }
 
@@ -1453,19 +1466,19 @@ mod tests {
                 "2026-07-24T00:00:02Z",
             )
             .unwrap();
-        let summary = s.unread_summary("Z", 0, 100).unwrap().unwrap();
+        let summary = s.unread_summary("Z", 0).unwrap().unwrap();
         assert_eq!(summary.count, 2);
         assert_eq!(summary.highest_importance, "urgent");
         assert_eq!(summary.newest_message_id, two.message_id);
         // Watermark dedup: nothing newer than the newest surfaced id.
         assert!(s
-            .unread_summary("Z", summary.newest_message_id, 100)
+            .unread_summary("Z", summary.newest_message_id)
             .unwrap()
             .is_none());
         // Marking the first read leaves only the second in a fresh summary.
         s.mark_read("Z", one.message_id, "2026-07-24T01:00:00Z")
             .unwrap();
-        let remaining = s.unread_summary("Z", 0, 100).unwrap().unwrap();
+        let remaining = s.unread_summary("Z", 0).unwrap().unwrap();
         assert_eq!(remaining.count, 1);
         assert_eq!(remaining.newest_message_id, two.message_id);
     }

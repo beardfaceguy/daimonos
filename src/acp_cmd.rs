@@ -1865,19 +1865,30 @@ async fn build_session_handle(
         && cfg.coordination.notifications.ui_notice
     {
         let weak = Arc::downgrade(&handle);
-        let interval = std::time::Duration::from_millis(
-            cfg.coordination.notifications.poll_interval_ms.max(250),
-        );
+        let notification_tool_session = {
+            let session = handle.session.lock().await;
+            session.coordination_tool_session()
+        };
+        let base_ms = cfg.coordination.notifications.effective_poll_interval_ms();
+        // Stable per-session jitter (up to 20%) prevents many sessions from
+        // opening SQLite connections in lockstep while keeping deterministic
+        // behavior and no RNG dependency.
+        let jitter = session_id
+            .to_string()
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64))
+            % (base_ms / 5 + 1);
+        let interval = std::time::Duration::from_millis(base_ms + jitter);
         let poll_session_id = session_id.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(handle) = weak.upgrade() else { break };
-                let notice = {
-                    let session = handle.session.lock().await;
-                    session.poll_coordination_ui_notice().await
-                };
-                if let Some(text) = notice {
+                // AgentSession lock serializes polling with prompt execution;
+                // the method itself releases its tool-session lock before DB I/O.
+                let notice =
+                    AgentSession::poll_coordination_ui_notice(&notification_tool_session).await;
+                if let Some((text, newest_message_id)) = notice {
                     if let Some(cx) = current_cx(&handle.connection) {
                         send_notification(
                             &cx,
@@ -1886,6 +1897,13 @@ async fn build_session_handle(
                                 AcpContentBlock::Text(TextContent::new(text)),
                             )),
                         );
+                        // Advance only after a live connection accepted the
+                        // notification attempt; no connection means retry later.
+                        AgentSession::acknowledge_coordination_ui_notice(
+                            &notification_tool_session,
+                            newest_message_id,
+                        )
+                        .await;
                     }
                 }
             }

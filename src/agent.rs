@@ -333,21 +333,45 @@ fn log_compaction_event(cfg: &TokenLogConfig, event: &CompactionEvent) {
 async fn coordination_model_notice(
     session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
 ) -> Option<String> {
+    // Snapshot only immutable routing state under the mutex; never hold it
+    // across synchronous SQLite I/O.
+    let (agent, watermark, db_path, busy_timeout) = {
+        let s = session.lock().await;
+        let cfg = &s.cfg.coordination;
+        if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.model_notice {
+            return None;
+        }
+        (
+            s.coordination_agent_name.clone()?,
+            s.coordination_model_watermark,
+            crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace),
+            cfg.effective_busy_timeout_ms(),
+        )
+    };
+    let agent_for_query = agent.clone();
+    let summary = match tokio::task::spawn_blocking(move || {
+        crate::coordination::CoordinationStore::open_with(&db_path, busy_timeout)
+            .and_then(|store| store.unread_summary(&agent_for_query, watermark))
+    })
+    .await
+    {
+        Ok(Ok(summary)) => summary?,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "daimonos::coordination", event="notification_check_failed", error=%error);
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(target: "daimonos::coordination", event="notification_task_failed", error=%error);
+            return None;
+        }
+    };
+    // Advance only if this is still the same binding/watermark snapshot.
     let mut s = session.lock().await;
-    let cfg = &s.cfg.coordination;
-    if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.model_notice {
+    if s.coordination_agent_name.as_deref() != Some(agent.as_str())
+        || s.coordination_model_watermark != watermark
+    {
         return None;
     }
-    let agent = s.coordination_agent_name.clone()?;
-    let db_path = crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace);
-    let store = crate::coordination::CoordinationStore::open_with(
-        &db_path,
-        cfg.effective_busy_timeout_ms(),
-    )
-    .ok()?;
-    let summary = store
-        .unread_summary(&agent, s.coordination_model_watermark, 1_000)
-        .ok()??;
     s.coordination_model_watermark = summary.newest_message_id;
     Some(format!(
         "[DAIMONOS COORDINATION NOTICE]\nYou have {} new unread agent-mail message(s) for {}. Highest importance: {}. Call fetch_inbox(agent=\"{}\", unread_only=true) before continuing if the messages may affect your current work.",
@@ -939,27 +963,60 @@ impl AgentSession {
     /// ACP background task only; acquiring the AgentSession lock means this
     /// cannot run during a provider stream or tool execution. Deduplicated by
     /// a UI-specific newest-message watermark. Metadata only, fail-open.
-    pub async fn poll_coordination_ui_notice(&self) -> Option<String> {
-        let mut s = self.tool_session.lock().await;
-        let cfg = &s.cfg.coordination;
-        if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.ui_notice {
-            return None;
-        }
-        let agent = s.coordination_agent_name.clone()?;
-        let db_path = crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace);
-        let store = crate::coordination::CoordinationStore::open_with(
-            &db_path,
-            cfg.effective_busy_timeout_ms(),
-        )
-        .ok()?;
-        let summary = store
-            .unread_summary(&agent, s.coordination_ui_watermark, 1_000)
-            .ok()??;
-        s.coordination_ui_watermark = summary.newest_message_id;
-        Some(format!(
-            "Agent mail: {} new unread message(s) for {} (highest importance: {}). The agent will be notified at its next safe action boundary.",
-            summary.count, agent, summary.highest_importance
+    pub fn coordination_tool_session(&self) -> std::sync::Arc<tokio::sync::Mutex<Session>> {
+        std::sync::Arc::clone(&self.tool_session)
+    }
+
+    pub async fn poll_coordination_ui_notice(
+        tool_session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    ) -> Option<(String, i64)> {
+        let (agent, watermark, db_path, busy_timeout) = {
+            let s = tool_session.lock().await;
+            let cfg = &s.cfg.coordination;
+            if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.ui_notice {
+                return None;
+            }
+            (
+                s.coordination_agent_name.clone()?,
+                s.coordination_ui_watermark,
+                crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace),
+                cfg.effective_busy_timeout_ms(),
+            )
+        };
+        let agent_for_query = agent.clone();
+        let summary = match tokio::task::spawn_blocking(move || {
+            crate::coordination::CoordinationStore::open_with(&db_path, busy_timeout)
+                .and_then(|store| store.unread_summary(&agent_for_query, watermark))
+        })
+        .await
+        {
+            Ok(Ok(summary)) => summary?,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "daimonos::coordination", event="ui_notification_check_failed", error=%error);
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(target: "daimonos::coordination", event="ui_notification_task_failed", error=%error);
+                return None;
+            }
+        };
+        Some((
+            format!(
+                "Agent mail: {} new unread message(s) for {} (highest importance: {}). The agent will be notified at its next safe action boundary.",
+                summary.count, agent, summary.highest_importance
+            ),
+            summary.newest_message_id,
         ))
+    }
+
+    /// Advance UI dedup only after ACP delivery was attempted with a live
+    /// connection. A stale/lost candidate cannot suppress a later notice.
+    pub async fn acknowledge_coordination_ui_notice(
+        tool_session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+        newest_message_id: i64,
+    ) {
+        let mut s = tool_session.lock().await;
+        s.coordination_ui_watermark = s.coordination_ui_watermark.max(newest_message_id);
     }
 
     pub fn user_turn_count(&self) -> usize {
@@ -1478,11 +1535,55 @@ mod tests {
             tool_session,
             AgentConfig::default(),
         );
-        let notice = sess.poll_coordination_ui_notice().await.unwrap();
+        let tool_session = sess.coordination_tool_session();
+        let (notice, newest) = AgentSession::poll_coordination_ui_notice(&tool_session)
+            .await
+            .unwrap();
         assert!(notice.contains("highest importance: urgent"));
         assert!(!notice.contains("SECRET_SUBJECT"));
         assert!(!notice.contains("SECRET_BODY"));
-        assert!(sess.poll_coordination_ui_notice().await.is_none());
+        // Candidate repeats until delivery is acknowledged.
+        assert!(AgentSession::poll_coordination_ui_notice(&tool_session)
+            .await
+            .is_some());
+        AgentSession::acknowledge_coordination_ui_notice(&tool_session, newest).await;
+        assert!(AgentSession::poll_coordination_ui_notice(&tool_session)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_session_prompt_delivers_model_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut tool_session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        tool_session.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let store = crate::coordination::CoordinationStore::open_with(&db, 5_000).unwrap();
+        store
+            .send_message(
+                "RedStone",
+                &["BlueLake".into()],
+                &[],
+                "secret",
+                "secret body",
+                crate::coordination::Importance::Normal,
+                false,
+                None,
+                "2026-07-25T00:00:00Z",
+            )
+            .unwrap();
+        let provider = RecordingProvider::new(vec![end_turn_resp()]);
+        let calls = provider.calls_handle();
+        let mut sess = AgentSession::new(Box::new(provider), tool_session, AgentConfig::default());
+        sess.prompt("work").await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let system = calls[0].2.as_deref().unwrap_or_default();
+        assert!(system.contains("DAIMONOS COORDINATION NOTICE"));
+        assert!(!system.contains("secret body"));
     }
 
     #[tokio::test]

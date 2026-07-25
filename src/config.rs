@@ -528,6 +528,12 @@ pub struct CoordinationNotificationsConfig {
     pub poll_interval_ms: u64,
 }
 
+impl CoordinationNotificationsConfig {
+    pub fn effective_poll_interval_ms(&self) -> u64 {
+        self.poll_interval_ms.max(250)
+    }
+}
+
 impl Default for CoordinationNotificationsConfig {
     fn default() -> Self {
         Self {
