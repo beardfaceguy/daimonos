@@ -480,8 +480,8 @@
     "semantic_hash": ""
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1785004188.18653,
-    "ast_hash": "2e04470804d732b5e02441e73cb9ce75",
+    "mtime": 1785005991.1833453,
+    "ast_hash": "44438c82cf308523ebb987b92d27bc7c",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
@@ -990,8 +990,8 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1785004288.0788233,
-    "ast_hash": "f8b1fcb5f2f7f428f009c449c1716c18",
+    "mtime": 1785005935.117645,
+    "ast_hash": "6fde0f8c346f9d8da64e3f5f9723e8e4",
     "semantic_hash": ""
   },
   "tests/test_observability.py": {
@@ -1050,8 +1050,8 @@
     "semantic_hash": ""
   },
   "src/providers/openai.rs": {
-    "mtime": 1785005305.1890147,
-    "ast_hash": "d4de802b2aca8c330be592153d47f014",
+    "mtime": 1785005926.4216917,
+    "ast_hash": "1db43e2745016ad363267eadba7b6550",
     "semantic_hash": ""
   }
 }

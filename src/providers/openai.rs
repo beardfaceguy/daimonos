@@ -140,6 +140,8 @@ impl LlmProvider for OpenAiProvider {
 }
 
 fn is_gpt_56_sol(model: &str) -> bool {
+    // Official model docs specify that the bare `gpt-5.6` alias routes to
+    // GPT-5.6 Sol, so it shares the same limits and pricing.
     model == "gpt-5.6" || model == "gpt-5.6-sol" || model.starts_with("gpt-5.6-sol-")
 }
 
@@ -441,7 +443,7 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
         && cache_rate == 0.0
         && output_rate == 0.0
     {
-        tracing::warn!(
+        tracing::debug!(
             target: "daimonos::providers::openai",
             event = "unknown_model_pricing",
             model,
@@ -503,7 +505,6 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
         || value.contains("context window exceeded")
         || value.contains("exceeds the context window")
         || value.contains("prompt is too long")
-        || value.contains("too many tokens")
         || value.contains("input is too long")
 }
 

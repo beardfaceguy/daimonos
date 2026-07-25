@@ -296,14 +296,14 @@ fn content_block_to_anthropic(
     })
 }
 
-fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMessage {
+fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> Option<AnthropicMessage> {
     let serializable = msg
         .content
         .iter()
         .filter(|block| !matches!(block, ContentBlock::ProviderState { .. }))
         .collect::<Vec<_>>();
     let last = serializable.len().saturating_sub(1);
-    let blocks = serializable
+    let blocks: Vec<AnthropicBlock> = serializable
         .into_iter()
         .enumerate()
         .filter_map(|(i, block)| {
@@ -315,13 +315,13 @@ fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMes
             content_block_to_anthropic(block, cache)
         })
         .collect();
-    AnthropicMessage {
+    (!blocks.is_empty()).then(|| AnthropicMessage {
         role: match msg.role {
             Role::User => "user".to_string(),
             Role::Assistant => "assistant".to_string(),
         },
         content: blocks,
-    }
+    })
 }
 
 fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
@@ -335,15 +335,18 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         })
         .collect();
 
+    let stable_end = ctx.stable_prefix_len.min(ctx.messages.len());
+    let boundary_index = ctx.messages[..stable_end].iter().rposition(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::ProviderState { .. }))
+    });
     let messages = ctx
         .messages
         .iter()
         .enumerate()
-        .map(|(i, msg)| {
-            // Mark the last message of the stable prefix as the cache boundary
-            let is_boundary = ctx.stable_prefix_len > 0 && i + 1 == ctx.stable_prefix_len;
-            message_to_anthropic(msg, is_boundary)
-        })
+        .filter_map(|(i, msg)| message_to_anthropic(msg, boundary_index == Some(i)))
         .collect();
 
     let thinking = if opts.thinking != ThinkingLevel::Off && supports_adaptive_thinking(&opts.model)
@@ -1043,6 +1046,24 @@ mod tests {
         assert!(
             second_block.get("cache_control").is_none() || second_block["cache_control"].is_null()
         );
+    }
+
+    #[test]
+    fn provider_state_only_message_is_dropped() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ProviderState {
+                    provider: "openai".into(),
+                    data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 1,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        assert!(json["messages"].as_array().unwrap().is_empty());
     }
 
     #[test]

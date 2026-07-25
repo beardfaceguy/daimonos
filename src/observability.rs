@@ -132,8 +132,9 @@ impl GenerationSpan {
             "langfuse.observation.usage_details",
             serde_json::json!({
                 "input": usage.input,
+                // reasoning_output is already included in output. Keep it as
+                // a dedicated span attribute, not in this additive map.
                 "output": usage.output,
-                "reasoning_output": usage.reasoning_output,
                 "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write,
             })
