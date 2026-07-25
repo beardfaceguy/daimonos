@@ -1387,6 +1387,14 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("context window was exceeded")
     {
         "Provider rejected the prompt because the context window was exceeded."
+    } else if error_has_http_status(&error, "402")
+        || normalized.contains("insufficient credit")
+        || normalized.contains("payment required")
+    {
+        // Billing/credit is checked before the auth classes: a provider
+        // message can carry both an auth-ish word and a payment signal, and
+        // the billing cause is the more actionable one to surface.
+        "Provider billing/credit issue (HTTP 402). Check the provider account balance."
     } else if error_has_http_status(&error, "401")
         || normalized.contains("authentication")
         || normalized.contains("invalid api key")
@@ -1401,12 +1409,6 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("authorization error")
     {
         "Provider authorization failed (HTTP 403)."
-    } else if error_has_http_status(&error, "402")
-        || normalized.contains("insufficient credit")
-        || normalized.contains("payment required")
-        || normalized.contains("add more using")
-    {
-        "Provider billing/credit issue (HTTP 402). Check the provider account balance."
     } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
     } else if normalized.contains("timeout")
@@ -5970,6 +5972,11 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("HTTP4021 request id")),
             "Provider request failed."
+        );
+        // Billing is surfaced ahead of an incidental auth-ish word.
+        assert_eq!(
+            safe_provider_error_message(false, Some("402 unauthorized: payment required")),
+            "Provider billing/credit issue (HTTP 402). Check the provider account balance."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("unexpected private payload")),

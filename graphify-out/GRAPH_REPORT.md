@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-25)
 
 ## Corpus Check
-- 204 files · ~242,690 words
+- 204 files · ~242,747 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4882 nodes · 11242 edges · 224 communities (202 shown, 22 thin omitted)
+- 4882 nodes · 11242 edges · 223 communities (201 shown, 22 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `5b701482`
+- Built from commit: `3d57676b`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -217,7 +217,6 @@
 - [[_COMMUNITY_Community 209|Community 209]]
 - [[_COMMUNITY_Community 210|Community 210]]
 - [[_COMMUNITY_Community 211|Community 211]]
-- [[_COMMUNITY_Community 212|Community 212]]
 - [[_COMMUNITY_Community 213|Community 213]]
 - [[_COMMUNITY_Community 214|Community 214]]
 - [[_COMMUNITY_Community 215|Community 215]]
@@ -277,7 +276,7 @@
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 - 1-file cycle: `src/snapshot.rs -> src/snapshot.rs`
 
-## Communities (224 total, 22 thin omitted)
+## Communities (223 total, 22 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.19
@@ -968,8 +967,8 @@ Cohesion: 0.20
 Nodes (23): Globals, Handle, build_globals(), execute_with_op_count(), llm_query_batched_rejects_oversized_batch(), llm_query_batched_reports_per_item_outcomes(), llm_query_returns_text_and_accumulates_usage(), llm_query_treats_refusal_as_error() (+15 more)
 
 ### Community 203 - "Community 203"
-Cohesion: 0.50
-Nodes (3): cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, Drop
+Cohesion: 0.21
+Nodes (7): OnceLock, Semaphore, cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, configure_max_concurrent(), init_semaphore(), Drop
 
 ### Community 204 - "Community 204"
 Cohesion: 0.08
@@ -1002,10 +1001,6 @@ Nodes (4): mint(), mint_always_valid_format(), mint_covers_many_distinct_names()
 ### Community 211 - "Community 211"
 Cohesion: 0.20
 Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
-
-### Community 212 - "Community 212"
-Cohesion: 0.50
-Nodes (4): OnceLock, Semaphore, configure_max_concurrent(), init_semaphore()
 
 ### Community 213 - "Community 213"
 Cohesion: 0.29
