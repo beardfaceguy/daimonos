@@ -2085,7 +2085,7 @@ async fn build_session_handle(
                 let Some(handle) = weak.upgrade() else { break };
                 // Non-blocking idle gate: run_prompt_turn/retry holds this lock
                 // for the entire provider stream + tool loop. If busy, skip this
-                // tick so no AgentThoughtChunk can appear mid-stream/tool call.
+                // tick so no UI notification can appear mid-stream/tool call.
                 let notice = poll_coordination_ui_notice_if_idle(
                     &handle.session,
                     &notification_tool_session,
