@@ -298,6 +298,31 @@ Implementation of each feature is incomplete until it has:
 6. reachability tests proving the tools dispatch through `tool_facade::invoke`
    (internal loop), not only via MCP.
 
+## Amendment — Cooperative unread-mail notifications (#1063)
+
+**Status:** Accepted, 2026-07-25.
+
+Unread mail is surfaced without mutating an active provider stream or tool-call
+sequence. Daimonos binds a successfully registered agent name to the live tool
+session and checks a bounded metadata-only unread summary at safe generation
+boundaries: before the initial provider request and after a complete assistant
+`tool_use` + user `tool_result` batch, immediately before the next request.
+
+The model-visible notice is enabled by default and is appended to the ephemeral
+system context for that generation, not persisted as a fake user turn. It
+contains only unread count, highest importance, agent name, and an instruction
+to call `fetch_inbox`; subjects and bodies are never injected automatically.
+
+ACP sessions also run a 1500ms idle poll by default. The poller acquires the
+`AgentSession` lock, so it naturally waits through active provider streams and
+tool execution, then emits a metadata-only `AgentThoughtChunk` to Zed. Model
+and UI delivery use independent newest-message-id watermarks to prevent repeat
+spam. Missing identity or store/query failure disables that check fail-open.
+
+Urgent mail does **not** cancel or interject into an active stream. That more
+hazardous behavior is deferred to Vikunja #1064 and remains disabled until a
+separate ADR/prototype proves history and tool-result ordering remain valid.
+
 ## Consequences
 
 ### Positive

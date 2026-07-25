@@ -59,6 +59,12 @@ pub struct Session {
     /// Threaded onto every `ToolCallRecord` so the analytics DB can be
     /// joined post-hoc with the agent's own usage logs (vikunja #43).
     pub external_session_id: Option<String>,
+    /// Agent-mail identity bound by a successful `register_agent` call. `None`
+    /// means notifications are inactive; daimonos never silently mints one.
+    pub coordination_agent_name: Option<String>,
+    /// Newest message id already surfaced to the model/UI respectively.
+    pub coordination_model_watermark: i64,
+    pub coordination_ui_watermark: i64,
     /// Out-of-band metadata produced by the most recent `ops::dispatch` call.
     /// Populated by the MCP layer right before it converts the `Response`
     /// into a `CallToolResult` and consumed by the analytics layer in the
@@ -102,6 +108,9 @@ impl Session {
             used_tools: HashSet::new(),
             analytics: None,
             external_session_id: None,
+            coordination_agent_name: None,
+            coordination_model_watermark: 0,
+            coordination_ui_watermark: 0,
             last_response_meta: ResponseMeta::default(),
             verbosity,
         }
