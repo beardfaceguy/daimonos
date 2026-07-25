@@ -327,6 +327,34 @@ fn log_compaction_event(cfg: &TokenLogConfig, event: &CompactionEvent) {
 
 // --- Main loop ---
 
+/// Check unread agent mail at a safe generation boundary. Returns a
+/// metadata-only system notice and advances the model watermark exactly once.
+/// Fail-open: any store/path error yields None and never fails the turn.
+async fn coordination_model_notice(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+) -> Option<String> {
+    let mut s = session.lock().await;
+    let cfg = &s.cfg.coordination;
+    if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.model_notice {
+        return None;
+    }
+    let agent = s.coordination_agent_name.clone()?;
+    let db_path = crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace);
+    let store = crate::coordination::CoordinationStore::open_with(
+        &db_path,
+        cfg.effective_busy_timeout_ms(),
+    )
+    .ok()?;
+    let summary = store
+        .unread_summary(&agent, s.coordination_model_watermark, 1_000)
+        .ok()??;
+    s.coordination_model_watermark = summary.newest_message_id;
+    Some(format!(
+        "[DAIMONOS COORDINATION NOTICE]\nYou have {} new unread agent-mail message(s) for {}. Highest importance: {}. Call fetch_inbox(agent=\"{}\", unread_only=true) before continuing if the messages may affect your current work.",
+        summary.count, agent, summary.highest_importance, agent
+    ))
+}
+
 pub async fn run(
     provider: &dyn LlmProvider,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -337,9 +365,19 @@ pub async fn run(
     let mut total_usage = Usage::default();
 
     loop {
+        // Safe boundary: no provider stream or tool call is active here. This
+        // runs before the initial generation and after complete tool-result
+        // batches; the notice is ephemeral system context, not fake history.
+        let coordination_notice = coordination_model_notice(&session).await;
+        let system = match (config.system.as_deref(), coordination_notice.as_deref()) {
+            (Some(base), Some(notice)) => Some(format!("{base}\n\n{notice}")),
+            (None, Some(notice)) => Some(notice.to_string()),
+            (Some(base), None) => Some(base.to_string()),
+            (None, None) => None,
+        };
         let ctx = Context {
             messages: messages.clone(),
-            system: config.system.clone(),
+            system,
             tools: config.tools.clone(),
             stable_prefix_len: 0,
         };
@@ -897,6 +935,33 @@ impl AgentSession {
         Ok(self.commit(result))
     }
 
+    /// Poll unread agent mail for a human-visible ACP notice. Called by the
+    /// ACP background task only; acquiring the AgentSession lock means this
+    /// cannot run during a provider stream or tool execution. Deduplicated by
+    /// a UI-specific newest-message watermark. Metadata only, fail-open.
+    pub async fn poll_coordination_ui_notice(&self) -> Option<String> {
+        let mut s = self.tool_session.lock().await;
+        let cfg = &s.cfg.coordination;
+        if !cfg.enabled || !cfg.notifications.enabled || !cfg.notifications.ui_notice {
+            return None;
+        }
+        let agent = s.coordination_agent_name.clone()?;
+        let db_path = crate::coordination::workspace_db_path(&cfg.resolved_db_dir(), &s.workspace);
+        let store = crate::coordination::CoordinationStore::open_with(
+            &db_path,
+            cfg.effective_busy_timeout_ms(),
+        )
+        .ok()?;
+        let summary = store
+            .unread_summary(&agent, s.coordination_ui_watermark, 1_000)
+            .ok()??;
+        s.coordination_ui_watermark = summary.newest_message_id;
+        Some(format!(
+            "Agent mail: {} new unread message(s) for {} (highest importance: {}). The agent will be notified at its next safe action boundary.",
+            summary.count, agent, summary.highest_importance
+        ))
+    }
+
     pub fn user_turn_count(&self) -> usize {
         self.messages
             .iter()
@@ -1286,6 +1351,145 @@ mod tests {
     /// sandbox thread via `Arc<Mutex<Session>>` (vikunja #1050).
     fn shared(session: Session) -> Arc<tokio::sync::Mutex<Session>> {
         Arc::new(tokio::sync::Mutex::new(session))
+    }
+
+    #[tokio::test]
+    async fn coordination_model_notice_is_metadata_only_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        session.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let store = crate::coordination::CoordinationStore::open_with(&db, 5_000).unwrap();
+        store
+            .send_message(
+                "RedStone",
+                &["BlueLake".into()],
+                &[],
+                "SUBJECT_SECRET",
+                "BODY_SECRET",
+                crate::coordination::Importance::High,
+                false,
+                None,
+                "2026-07-25T00:00:00Z",
+            )
+            .unwrap();
+        let shared = shared(session);
+        let notice = coordination_model_notice(&shared).await.unwrap();
+        assert!(notice.contains("1 new unread"));
+        assert!(notice.contains("Highest importance: high"));
+        assert!(notice.contains("fetch_inbox"));
+        assert!(!notice.contains("SUBJECT_SECRET"));
+        assert!(!notice.contains("BODY_SECRET"));
+        assert!(coordination_model_notice(&shared).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mail_arriving_during_tool_call_is_visible_only_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        session.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_hook = Arc::clone(&sent);
+        let db_hook = db.clone();
+        let config = AgentConfig {
+            after_tool_call: Some(Box::new(move |_, _, _| {
+                let store =
+                    crate::coordination::CoordinationStore::open_with(&db_hook, 5_000).unwrap();
+                store
+                    .send_message(
+                        "RedStone",
+                        &["BlueLake".into()],
+                        &[],
+                        "SECRET_SUBJECT",
+                        "SECRET_BODY",
+                        crate::coordination::Importance::High,
+                        false,
+                        None,
+                        "2026-07-25T00:00:00Z",
+                    )
+                    .unwrap();
+                sent_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                AfterHookResult::Continue
+            })),
+            ..AgentConfig::default()
+        };
+        let provider = RecordingProvider::new(vec![
+            tool_call_resp("t1", "session_stats", json!({})),
+            end_turn_resp(),
+        ]);
+        let calls = provider.calls_handle();
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("go")],
+            &config,
+        )
+        .await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0]
+            .2
+            .as_deref()
+            .unwrap_or_default()
+            .contains("COORDINATION NOTICE"));
+        let second_system = calls[1].2.as_deref().unwrap_or_default();
+        assert!(second_system.contains("DAIMONOS COORDINATION NOTICE"));
+        assert!(!second_system.contains("SECRET_SUBJECT"));
+        assert!(!second_system.contains("SECRET_BODY"));
+        // Ephemeral notice is not persisted as a fake user message.
+        assert!(!result.messages.iter().any(|m| m.content.iter().any(|b| {
+            matches!(b, ContentBlock::Text(t) if t.contains("DAIMONOS COORDINATION NOTICE"))
+        })));
+    }
+
+    #[tokio::test]
+    async fn ui_notice_is_metadata_only_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut tool_session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        tool_session.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let store = crate::coordination::CoordinationStore::open_with(&db, 5_000).unwrap();
+        store
+            .send_message(
+                "RedStone",
+                &["BlueLake".into()],
+                &[],
+                "SECRET_SUBJECT",
+                "SECRET_BODY",
+                crate::coordination::Importance::Urgent,
+                false,
+                None,
+                "2026-07-25T00:00:00Z",
+            )
+            .unwrap();
+        let sess = AgentSession::new(
+            Box::new(MockProvider::new(vec![])),
+            tool_session,
+            AgentConfig::default(),
+        );
+        let notice = sess.poll_coordination_ui_notice().await.unwrap();
+        assert!(notice.contains("highest importance: urgent"));
+        assert!(!notice.contains("SECRET_SUBJECT"));
+        assert!(!notice.contains("SECRET_BODY"));
+        assert!(sess.poll_coordination_ui_notice().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn coordination_notices_require_registered_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(session_in(dir.path()));
+        assert!(coordination_model_notice(&shared).await.is_none());
     }
 
     // --- AgentSession (multi-turn, project #183) ---

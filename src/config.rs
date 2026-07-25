@@ -512,6 +512,31 @@ pub struct CoordinationConfig {
     /// read so a long/adversarial reply chain cannot blow up a response
     /// (ADR-009 D3/D7; no recursion).
     pub thread_max_messages: i64,
+    /// Cooperative unread-mail notifications (ADR-009 amendment, #1063).
+    pub notifications: CoordinationNotificationsConfig,
+}
+
+/// Safe-boundary coordination notification policy. Model and UI notices are
+/// independently deduplicated by per-session newest-message watermarks.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CoordinationNotificationsConfig {
+    pub enabled: bool,
+    pub model_notice: bool,
+    pub ui_notice: bool,
+    /// Idle ACP poll interval. Clamped to >= 250ms.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for CoordinationNotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_notice: true,
+            ui_notice: true,
+            poll_interval_ms: 1_500,
+        }
+    }
 }
 
 impl Default for CoordinationConfig {
@@ -525,6 +550,7 @@ impl Default for CoordinationConfig {
             inbox_default_limit: 20,
             inbox_max_limit: 500,
             thread_max_messages: 500,
+            notifications: CoordinationNotificationsConfig::default(),
         }
     }
 }

@@ -189,7 +189,7 @@ fn coordination_outcome(verb: &str, body: &Value, response: &Response) -> Coordi
 fn register_agent(
     store: &CoordinationStore,
     body: &Value,
-    session: &Session,
+    session: &mut Session,
     now: &str,
 ) -> Response {
     // Name: caller-supplied (validated) or minted. Fall back to the session's
@@ -226,7 +226,10 @@ fn register_agent(
     let task = body.get("task").and_then(|v| v.as_str());
 
     match store.register_agent(&name, session_id.as_deref(), program, model, task, now) {
-        Ok(rec) => Response::ok(json!({ "agent": agent_json(&rec) })),
+        Ok(rec) => {
+            session.coordination_agent_name = Some(rec.name.clone());
+            Response::ok(json!({ "agent": agent_json(&rec) }))
+        }
         Err(e) => Response::err(
             ERR_STORE_UNAVAILABLE,
             &format!("coord: register failed: {e}"),

@@ -99,6 +99,15 @@ pub struct InboxFilter {
     pub since: Option<String>,
 }
 
+/// Bounded unread-mail summary used by cooperative notifications (#1063).
+/// Carries metadata only — never subject/body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadSummary {
+    pub count: u64,
+    pub highest_importance: String,
+    pub newest_message_id: i64,
+}
+
 /// One advisory file reservation (ADR-009 D4/D6). A soft "I'm working here"
 /// signal, NOT a lock: it never blocks a write. `pattern` is an opaque glob
 /// (never resolved against the filesystem). A reservation is *active* while it
@@ -192,6 +201,7 @@ impl CoordinationStore {
                     inception_ts  TEXT NOT NULL,
                     last_seen_ts  TEXT NOT NULL
                  );
+                 CREATE INDEX IF NOT EXISTS agent_session_id ON agent(session_id, last_seen_ts);
                  CREATE TABLE IF NOT EXISTS message (
                     id           INTEGER PRIMARY KEY,
                     thread_id    INTEGER,
@@ -314,6 +324,21 @@ impl CoordinationStore {
             )
             .ok();
         Ok(rec)
+    }
+
+    /// Find the most-recent agent registered to a runtime session id. Used to
+    /// restore notification identity after ACP session reload; bounded to one
+    /// indexed-style lookup and panic-free.
+    pub fn agent_name_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        match self.conn.query_row(
+            "SELECT name FROM agent WHERE session_id = ?1 ORDER BY last_seen_ts DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        ) {
+            Ok(name) => Ok(Some(name)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("lookup coordination identity by session"),
+        }
     }
 
     /// All agents, most-recently-seen first, bounded by `limit` (ADR-009: reads
@@ -538,6 +563,43 @@ impl CoordinationStore {
             }
         }
         Ok(out)
+    }
+
+    /// Metadata-only unread summary newer than `after_message_id`. The query is
+    /// bounded to `scan_cap` rows and returns None when no new unread mail
+    /// exists. No subjects/bodies are selected.
+    pub fn unread_summary(
+        &self,
+        agent: &str,
+        after_message_id: i64,
+        scan_cap: i64,
+    ) -> Result<Option<UnreadSummary>> {
+        let scan_cap = scan_cap.clamp(1, 1_000);
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.importance
+             FROM recipient r JOIN message m ON m.id = r.message_id
+             WHERE r.agent_name = ?1 AND r.read_ts IS NULL AND m.id > ?2
+             ORDER BY m.id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![agent, after_message_id, scan_cap], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut count = 0u64;
+        let mut newest = 0i64;
+        let mut highest = Importance::Low;
+        for (id, importance) in rows.flatten() {
+            count += 1;
+            newest = newest.max(id);
+            let parsed = Importance::parse(&importance);
+            if importance_rank(parsed) > importance_rank(highest) {
+                highest = parsed;
+            }
+        }
+        Ok((count > 0).then(|| UnreadSummary {
+            count,
+            highest_importance: highest.as_str().to_string(),
+            newest_message_id: newest,
+        }))
     }
 
     /// Mark one message read for `agent`. Idempotent: a second call keeps the
@@ -1360,6 +1422,73 @@ mod tests {
         let unread = s.fetch_inbox("Z", &f, 100).unwrap();
         assert_eq!(unread.len(), 2);
         assert!(unread.iter().all(|e| e.message.subject != "high"));
+    }
+
+    #[test]
+    fn unread_summary_is_metadata_only_bounded_and_watermarked() {
+        let s = store();
+        let one = s
+            .send_message(
+                "A",
+                &["Z".into()],
+                &[],
+                "SUBJECT_SECRET",
+                "BODY_SECRET",
+                Importance::Normal,
+                false,
+                None,
+                "2026-07-24T00:00:01Z",
+            )
+            .unwrap();
+        let two = s
+            .send_message(
+                "A",
+                &["Z".into()],
+                &[],
+                "ANOTHER_SECRET",
+                "MORE_SECRET",
+                Importance::Urgent,
+                false,
+                None,
+                "2026-07-24T00:00:02Z",
+            )
+            .unwrap();
+        let summary = s.unread_summary("Z", 0, 100).unwrap().unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.highest_importance, "urgent");
+        assert_eq!(summary.newest_message_id, two.message_id);
+        // Watermark dedup: nothing newer than the newest surfaced id.
+        assert!(s
+            .unread_summary("Z", summary.newest_message_id, 100)
+            .unwrap()
+            .is_none());
+        // Marking the first read leaves only the second in a fresh summary.
+        s.mark_read("Z", one.message_id, "2026-07-24T01:00:00Z")
+            .unwrap();
+        let remaining = s.unread_summary("Z", 0, 100).unwrap().unwrap();
+        assert_eq!(remaining.count, 1);
+        assert_eq!(remaining.newest_message_id, two.message_id);
+    }
+
+    #[test]
+    fn coordination_identity_recovers_by_session_id() {
+        let s = store();
+        s.register_agent(
+            "BlueLake",
+            Some("acp-session-1"),
+            Some("daimonos"),
+            None,
+            None,
+            "2026-07-24T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            s.agent_name_for_session("acp-session-1")
+                .unwrap()
+                .as_deref(),
+            Some("BlueLake")
+        );
+        assert!(s.agent_name_for_session("missing").unwrap().is_none());
     }
 
     #[test]

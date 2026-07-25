@@ -1816,14 +1816,33 @@ async fn build_session_handle(
         Arc::clone(&bridge),
         Arc::clone(&bridge_slot),
     );
-    let tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
+    let mut tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
+    let acp_session_key = session_id.to_string();
+    tool_session.external_session_id = Some(acp_session_key.clone());
+    // Recover a previously registered identity for this persisted ACP session.
+    // Fail-open: missing/corrupt coordination storage leaves notifications off.
+    if cfg.coordination.enabled {
+        let db_path = crate::coordination::workspace_db_path(
+            &cfg.coordination.resolved_db_dir(),
+            &session_workspace,
+        );
+        if let Ok(store) = crate::coordination::CoordinationStore::open_with(
+            &db_path,
+            cfg.coordination.effective_busy_timeout_ms(),
+        ) {
+            tool_session.coordination_agent_name = store
+                .agent_name_for_session(&acp_session_key)
+                .ok()
+                .flatten();
+        }
+    }
     let mut context_windows = HashMap::new();
     if state.compaction.follows_model_window {
         if let Some(policy) = &state.compaction.policy {
             context_windows.insert(state.default_model.clone(), policy.context_window);
         }
     }
-    Ok(Arc::new(SessionHandle {
+    let handle = Arc::new(SessionHandle {
         lifecycle: tokio::sync::Mutex::new(()),
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
@@ -1835,7 +1854,44 @@ async fn build_session_handle(
         client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
         compaction: state.compaction.clone(),
         context_windows: tokio::sync::Mutex::new(context_windows),
-    }))
+    });
+
+    // Idle human-visible agent-mail notification poller (#1063). A Weak handle
+    // prevents a task cycle; when the session is deleted/dropped the task exits.
+    // Locking AgentSession means polling waits through active prompts/tools and
+    // can never mutate or notify mid-stream.
+    if cfg.coordination.enabled
+        && cfg.coordination.notifications.enabled
+        && cfg.coordination.notifications.ui_notice
+    {
+        let weak = Arc::downgrade(&handle);
+        let interval = std::time::Duration::from_millis(
+            cfg.coordination.notifications.poll_interval_ms.max(250),
+        );
+        let poll_session_id = session_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(handle) = weak.upgrade() else { break };
+                let notice = {
+                    let session = handle.session.lock().await;
+                    session.poll_coordination_ui_notice().await
+                };
+                if let Some(text) = notice {
+                    if let Some(cx) = current_cx(&handle.connection) {
+                        send_notification(
+                            &cx,
+                            &poll_session_id,
+                            SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                AcpContentBlock::Text(TextContent::new(text)),
+                            )),
+                        );
+                    }
+                }
+            }
+        });
+    }
+    Ok(handle)
 }
 
 /// Refresh a live session's forwarded MCP bridge without replacing its agent

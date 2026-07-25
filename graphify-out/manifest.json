@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1784927773.5518,
-    "ast_hash": "76d6cdaeb4856d613970fb43904713b4",
+    "mtime": 1784955825.6384683,
+    "ast_hash": "fd5954d56583e76e04e327eed25df857",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1784833584.7611542,
-    "ast_hash": "0b7f5e212bdd9581c54435dff7ff3112",
+    "mtime": 1784956161.6399977,
+    "ast_hash": "4685b242c50737e66c6faefde2ec4787",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -290,8 +290,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1784922539.5674584,
-    "ast_hash": "b5f74080aa858968be492d85be8cc359",
+    "mtime": 1784955565.7883787,
+    "ast_hash": "598a70aba6c9a08583d40cb35d228ad4",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -505,8 +505,8 @@
     "semantic_hash": ""
   },
   "src/session.rs": {
-    "mtime": 1784402264.433214,
-    "ast_hash": "752147af4b80c2f926cfd55db2ba2b33",
+    "mtime": 1784955583.577248,
+    "ast_hash": "18dfa60a2905ba0228c82a66052cc793",
     "semantic_hash": ""
   },
   "src/session_store.rs": {
@@ -745,7 +745,7 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1784928062.2446964,
+    "mtime": 1784929151.8509088,
     "ast_hash": "bab6d7c940018611ddd96bbc0134db85",
     "semantic_hash": ""
   },
@@ -990,7 +990,7 @@
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1784928785.9924877,
+    "mtime": 1784929151.8659089,
     "ast_hash": "7046914a2b64ccf56e4d3d3e721185d9",
     "semantic_hash": ""
   },
@@ -1025,7 +1025,7 @@
     "semantic_hash": ""
   },
   "src/coordination/mod.rs": {
-    "mtime": 1784924987.966949,
+    "mtime": 1784955754.1629937,
     "ast_hash": "13004918ce8d8dd6b1efb9a0834931dd",
     "semantic_hash": ""
   },
@@ -1035,18 +1035,18 @@
     "semantic_hash": ""
   },
   "src/coordination/store.rs": {
-    "mtime": 1784924987.966949,
-    "ast_hash": "c35a0995426eea2fdc7f555b55991083",
+    "mtime": 1784956122.3422866,
+    "ast_hash": "e5d9de9bc6f2258f9668e7dbc6efa9dd",
     "semantic_hash": ""
   },
   "src/ops/coord.rs": {
-    "mtime": 1784928748.486752,
-    "ast_hash": "f2be2f7eaa26eafbc549a1a7e8839bdf",
+    "mtime": 1784955713.9472895,
+    "ast_hash": "db134a8e649eb2faec1d1a493718844a",
     "semantic_hash": ""
   },
   "docs/adr/009-agent-coordination.md": {
-    "mtime": 1784916516.3227966,
-    "ast_hash": "3d933ca101cb263b07b810c087eaa4a9",
+    "mtime": 1784955865.8871722,
+    "ast_hash": "61f34e740bcec26cb025b58fa899f20b",
     "semantic_hash": ""
   }
 }
