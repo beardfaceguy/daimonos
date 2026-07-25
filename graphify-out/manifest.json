@@ -255,12 +255,12 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785002288.9372835,
-    "ast_hash": "7cffae0fd373ca59c890f6b9054e95b0",
+    "mtime": 1785021876.3580096,
+    "ast_hash": "ea53fd8c6484af854d9e927625658bfb",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1785004065.7993963,
+    "mtime": 1785006332.0710568,
     "ast_hash": "4aac31a19064294ea574f048444a829e",
     "semantic_hash": ""
   },
@@ -270,7 +270,7 @@
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
-    "mtime": 1785002804.7584198,
+    "mtime": 1785006332.0710568,
     "ast_hash": "46e9414f3044cdaac71c2e8afda76c3d",
     "semantic_hash": ""
   },
@@ -280,12 +280,12 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1785002307.6661432,
+    "mtime": 1785006332.0710568,
     "ast_hash": "ce45f293f08d1a3cc4b4974970348a2d",
     "semantic_hash": ""
   },
   "src/compaction.rs": {
-    "mtime": 1785002894.5237472,
+    "mtime": 1785006332.0710568,
     "ast_hash": "bfffda90127f784fafaeea3a7b76c35d",
     "semantic_hash": ""
   },
@@ -480,17 +480,17 @@
     "semantic_hash": ""
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1785005991.1833453,
+    "mtime": 1785006332.0720568,
     "ast_hash": "44438c82cf308523ebb987b92d27bc7c",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1785004086.583249,
+    "mtime": 1785006332.0720568,
     "ast_hash": "79c68710dfa9739407d2b774a64b5802",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1785003942.5061634,
+    "mtime": 1785006332.0720568,
     "ast_hash": "480a0479f99fb7dbee38d001d747ef8b",
     "semantic_hash": ""
   },
@@ -805,7 +805,7 @@
     "semantic_hash": ""
   },
   "docs/adr/001-provider-boundary-invariant.md": {
-    "mtime": 1785004324.3225667,
+    "mtime": 1785006332.057057,
     "ast_hash": "37b883db859c1932fe6a04fed0fd9878",
     "semantic_hash": ""
   },
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785002686.4683058,
+    "mtime": 1785006332.057057,
     "ast_hash": "d1d1c4bc0602644d3564af3d2287ebc7",
     "semantic_hash": ""
   },
@@ -875,7 +875,7 @@
     "semantic_hash": ""
   },
   "docs/zed-acp-setup.md": {
-    "mtime": 1785002696.6062298,
+    "mtime": 1785006332.0580568,
     "ast_hash": "d5c9fda0be21e953d9dbe9d65d97b2fb",
     "semantic_hash": ""
   },
@@ -985,12 +985,12 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785002804.7594197,
+    "mtime": 1785006332.0710568,
     "ast_hash": "44b73436668af00b76ba8406b7b6ae8c",
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1785005935.117645,
+    "mtime": 1785006332.0720568,
     "ast_hash": "6fde0f8c346f9d8da64e3f5f9723e8e4",
     "semantic_hash": ""
   },
@@ -1050,7 +1050,7 @@
     "semantic_hash": ""
   },
   "src/providers/openai.rs": {
-    "mtime": 1785005926.4216917,
+    "mtime": 1785006332.0720568,
     "ast_hash": "1db43e2745016ad363267eadba7b6550",
     "semantic_hash": ""
   }

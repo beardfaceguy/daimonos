@@ -1401,6 +1401,12 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("authorization error")
     {
         "Provider authorization failed (HTTP 403)."
+    } else if error_has_http_status(&error, "402")
+        || normalized.contains("insufficient credit")
+        || normalized.contains("payment required")
+        || normalized.contains("add more using")
+    {
+        "Provider billing/credit issue (HTTP 402). Check the provider account balance."
     } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
     } else if normalized.contains("timeout")
@@ -5943,6 +5949,27 @@ mod tests {
         assert_eq!(
             safe_provider_error_message(false, Some("openrouter 429: slow down")),
             "Provider rate limit exceeded (HTTP 429)."
+        );
+        assert_eq!(
+            safe_provider_error_message(
+                false,
+                Some(
+                    "openrouter 402 Payment Required: {\"error\":{\"message\":\"Insufficient credits. Add more using https://openrouter.ai/settings/credits\",\"code\":402}}"
+                )
+            ),
+            "Provider billing/credit issue (HTTP 402). Check the provider account balance."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("Insufficient credits")),
+            "Provider billing/credit issue (HTTP 402). Check the provider account balance."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("payment_required")),
+            "Provider billing/credit issue (HTTP 402). Check the provider account balance."
+        );
+        assert_eq!(
+            safe_provider_error_message(false, Some("HTTP4021 request id")),
+            "Provider request failed."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("unexpected private payload")),
