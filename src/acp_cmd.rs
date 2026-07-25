@@ -181,6 +181,15 @@ impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
         let mut attempts = 0u64;
         loop {
             match self.inner.write(buffer) {
+                // Empty writes are required to succeed immediately.
+                Ok(0) if buffer.is_empty() => return Ok(0),
+                // A zero-length write for a nonempty buffer is transient
+                // backpressure for this pipe transport. Letting it escape makes
+                // write_all convert it to fatal WriteZero.
+                Ok(0) => {
+                    attempts = attempts.saturating_add(1);
+                    self.note_would_block("write_zero", attempts)?;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     attempts = attempts.saturating_add(1);
@@ -3181,6 +3190,7 @@ mod tests {
     #[derive(Default)]
     struct TransientWriter {
         write_interrupted_remaining: usize,
+        write_zero_remaining: usize,
         write_would_block_remaining: usize,
         flush_interrupted_remaining: usize,
         flush_would_block_remaining: usize,
@@ -3197,6 +3207,10 @@ mod tests {
             if self.write_would_block_remaining > 0 {
                 self.write_would_block_remaining -= 1;
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if self.write_zero_remaining > 0 {
+                self.write_zero_remaining -= 1;
+                return Ok(0);
             }
             self.bytes.extend_from_slice(buffer);
             Ok(buffer.len())
@@ -3247,6 +3261,7 @@ mod tests {
     fn resilient_writer_retries_transient_write_and_flush_would_block() {
         let inner = TransientWriter {
             write_interrupted_remaining: 1,
+            write_zero_remaining: 1,
             write_would_block_remaining: 2,
             flush_interrupted_remaining: 1,
             flush_would_block_remaining: 1,
