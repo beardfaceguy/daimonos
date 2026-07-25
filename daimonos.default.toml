@@ -319,7 +319,7 @@ thread_max_messages = 500
 enabled = true
 model_notice = true
 ui_notice = true
-# Idle ACP polling cadence for human-visible Zed thought notifications.
+# Idle ACP polling cadence for clearly labeled, visible Zed agent-message notifications.
 poll_interval_ms = 1500
 
 [prompts]
