@@ -43,6 +43,8 @@ pub struct Usage {
     pub cache_write: u64,
     pub input: u64,
     pub output: u64,
+    // Detail already included in output; never add it again to totals.
+    pub reasoning_output: u64,
     pub cost: Cost,
 }
 
@@ -56,6 +58,8 @@ pub struct Cost {
 ```
 
 Cost is **provider-computed and passed through** — core never calculates it.
+`reasoning_output` is a provider-reported detail inside `output`, exposed for
+benchmark/observability analysis without double counting token totals.
 
 ## Why
 

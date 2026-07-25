@@ -83,6 +83,9 @@ pub struct ToolSchema {
 pub struct Usage {
     pub input: u64,
     pub output: u64,
+    /// Reasoning-token detail already included in `output`; informational only
+    /// and never added again when computing totals/cost.
+    pub reasoning_output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost: Cost,
@@ -357,6 +360,7 @@ mod tests {
         let u = Usage {
             input: 100,
             output: 9,
+            reasoning_output: 4,
             cache_read: 30,
             cache_write: 20,
             cost: Cost::default(),

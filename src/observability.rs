@@ -79,6 +79,7 @@ impl GenerationSpan {
             "langfuse.observation.completion_start_time" = tracing::field::Empty,
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
+            "daimonos.usage.reasoning_output" = tracing::field::Empty,
             "daimonos.usage.cache_read" = tracing::field::Empty,
             "daimonos.usage.cache_write" = tracing::field::Empty,
             "langfuse.observation.usage_details" = tracing::field::Empty,
@@ -122,6 +123,8 @@ impl GenerationSpan {
         self.span.record("gen_ai.usage.input_tokens", usage.input);
         self.span.record("gen_ai.usage.output_tokens", usage.output);
         self.span
+            .record("daimonos.usage.reasoning_output", usage.reasoning_output);
+        self.span
             .record("daimonos.usage.cache_read", usage.cache_read);
         self.span
             .record("daimonos.usage.cache_write", usage.cache_write);
@@ -130,6 +133,7 @@ impl GenerationSpan {
             serde_json::json!({
                 "input": usage.input,
                 "output": usage.output,
+                "reasoning_output": usage.reasoning_output,
                 "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write,
             })
@@ -1381,6 +1385,7 @@ mod tests {
                     usage: Usage {
                         input: 100,
                         output: 20,
+                        reasoning_output: 0,
                         cache_read: 30,
                         cache_write: 10,
                         cost: Cost {
@@ -1840,6 +1845,7 @@ mod tests {
                         usage: Usage {
                             input: 10,
                             output: 5,
+                            reasoning_output: 0,
                             cache_read: 0,
                             cache_write: 0,
                             cost: Cost::default(),
@@ -2025,6 +2031,7 @@ mod tests {
             usage: Usage {
                 input: 100,
                 output: 20,
+                reasoning_output: 0,
                 cache_read: 0,
                 cache_write: 0,
                 cost: Cost {

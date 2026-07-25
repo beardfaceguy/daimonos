@@ -124,9 +124,12 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+fn is_gpt_56_sol(model: &str) -> bool {
+    model == "gpt-5.6" || model == "gpt-5.6-sol" || model.starts_with("gpt-5.6-sol-")
+}
+
 pub(crate) fn known_context_window(model: &str) -> Option<u64> {
-    (model == "gpt-5.6" || model == "gpt-5.6-sol" || model.starts_with("gpt-5.6-sol-"))
-        .then_some(GPT_56_CONTEXT_WINDOW)
+    is_gpt_56_sol(model).then_some(GPT_56_CONTEXT_WINDOW)
 }
 
 pub(crate) fn build_request(ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
@@ -164,7 +167,9 @@ fn reasoning_effort(level: &ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::XHigh => "xhigh",
-        ThinkingLevel::Max => "max",
+        // OpenAI's broadly deployed Responses contract tops out at xhigh;
+        // map Daimonos's provider-neutral Max conservatively for compatibility.
+        ThinkingLevel::Max => "xhigh",
     }
 }
 
@@ -224,8 +229,13 @@ pub(crate) fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                     flush_text(&mut input, role, &mut text);
                     input.push(data.clone());
                 }
-                // Provider state belongs only to its owning adapter. Blocks
-                // in the wrong role are invalid neutral history and are
+                ContentBlock::ProviderState { provider, .. } => tracing::debug!(
+                    target: "daimonos::providers::openai",
+                    event = "provider_state_skipped",
+                    owner = provider,
+                    role,
+                ),
+                // Blocks in the wrong role are invalid neutral history and are
                 // deliberately ignored rather than sent on an invalid wire.
                 _ => {}
             }
@@ -327,11 +337,20 @@ fn output_to_content(output: Option<&Vec<Value>>) -> Vec<ContentBlock> {
                 });
             }
             Some("reasoning") => {
-                let mut state = item.clone();
-                // Status is response-local and rejected when replayed by some
-                // API versions; retain only continuation-relevant fields.
-                if let Some(object) = state.as_object_mut() {
-                    object.remove("status");
+                // Whitelist the fields accepted by Responses input items;
+                // discard response-local status/metadata before replay.
+                let mut state = json!({
+                    "type": "reasoning",
+                    "summary": item["summary"].clone(),
+                    "encrypted_content": item["encrypted_content"].clone()
+                });
+                if let Some(id) = item.get("id").filter(|value| !value.is_null()) {
+                    state["id"] = id.clone();
+                }
+                if let Some(reasoning_content) =
+                    item.get("content").filter(|value| !value.is_null())
+                {
+                    state["content"] = reasoning_content.clone();
                 }
                 content.push(ContentBlock::ProviderState {
                     provider: PROVIDER_STATE.to_string(),
@@ -355,6 +374,9 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
         .as_u64()
         .unwrap_or(0);
     let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    let reasoning_output = usage["output_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     let input = total_input.saturating_sub(cache_read);
     let (input_rate, cache_rate, output_rate) = pricing(model);
     let input_usd = input as f64 / 1_000_000.0 * input_rate;
@@ -363,6 +385,7 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
     Usage {
         input,
         output,
+        reasoning_output,
         cache_read,
         cache_write: 0,
         cost: Cost {
@@ -376,7 +399,7 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
 }
 
 fn pricing(model: &str) -> (f64, f64, f64) {
-    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+    if is_gpt_56_sol(model) {
         (5.0, 0.5, 30.0)
     } else {
         (0.0, 0.0, 0.0)
@@ -410,7 +433,8 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
     value.contains("maximum context length")
         || value.contains("context length exceeded")
         || value.contains("context_length_exceeded")
-        || value.contains("context window")
+        || value.contains("context window exceeded")
+        || value.contains("exceeds the context window")
         || value.contains("prompt is too long")
         || value.contains("too many tokens")
         || value.contains("input is too long")
@@ -488,6 +512,7 @@ impl StreamState {
                 let message = event["message"]
                     .as_str()
                     .or_else(|| event["error"]["message"].as_str())
+                    .or_else(|| event["response"]["error"]["message"].as_str())
                     .unwrap_or("unknown error");
                 let full = format!("openai stream error: {}", bounded(message, 500));
                 self.terminal = Some(if is_context_overflow_error(message) {
@@ -713,6 +738,19 @@ mod tests {
     }
 
     #[test]
+    fn max_thinking_maps_to_compatible_xhigh() {
+        assert_eq!(reasoning_effort(&ThinkingLevel::Max), "xhigh");
+    }
+
+    #[test]
+    fn model_metadata_and_pricing_use_same_predicate() {
+        assert_eq!(known_context_window("gpt-5.6-sol"), Some(1_050_000));
+        assert_eq!(pricing("gpt-5.6-sol"), (5.0, 0.5, 30.0));
+        assert_eq!(known_context_window("gpt-5.6-mini"), None);
+        assert_eq!(pricing("gpt-5.6-mini"), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
     fn request_omits_temperature_for_reasoning_models() {
         let ctx = Context {
             messages: vec![Message::user("summarize")],
@@ -731,7 +769,7 @@ mod tests {
         let response_body = json!({
             "status":"completed",
             "output":[
-                {"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[]},
+                {"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[],"status":"completed","unexpected":"drop-me"},
                 {"type":"function_call","id":"fc1","call_id":"c1","name":"read_file","arguments":"{\"path\":\"a\"}"}
             ],
             "usage":{}
@@ -755,6 +793,8 @@ mod tests {
         ]);
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["encrypted_content"], "opaque");
+        assert!(input[1].get("status").is_none());
+        assert!(input[1].get("unexpected").is_none());
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[2]["call_id"], "c1");
         assert_eq!(input[3]["type"], "function_call_output");
@@ -819,6 +859,7 @@ mod tests {
         assert_eq!(response.usage.input, 60);
         assert_eq!(response.usage.cache_read, 40);
         assert_eq!(response.usage.output, 30);
+        assert_eq!(response.usage.reasoning_output, 20);
         assert!(response.content.iter().any(
             |b| matches!(b, ContentBlock::ProviderState { provider, .. } if provider == "openai")
         ));

@@ -208,6 +208,7 @@ fn map_usage(raw: AnthropicUsage, model: &str) -> Usage {
     Usage {
         input: raw.input_tokens,
         output: raw.output_tokens,
+        reasoning_output: 0,
         cache_read: raw.cache_read_input_tokens,
         cache_write: raw.cache_creation_input_tokens,
         cost: Cost {
@@ -296,10 +297,14 @@ fn content_block_to_anthropic(
 }
 
 fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMessage {
-    let last = msg.content.len().saturating_sub(1);
-    let blocks = msg
+    let serializable = msg
         .content
         .iter()
+        .filter(|block| !matches!(block, ContentBlock::ProviderState { .. }))
+        .collect::<Vec<_>>();
+    let last = serializable.len().saturating_sub(1);
+    let blocks = serializable
+        .into_iter()
         .enumerate()
         .filter_map(|(i, block)| {
             let cache = if is_prefix_boundary && i == last {
@@ -1038,6 +1043,29 @@ mod tests {
         assert!(
             second_block.get("cache_control").is_none() || second_block["cache_control"].is_null()
         );
+    }
+
+    #[test]
+    fn skipped_provider_state_does_not_steal_cache_boundary() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("visible".into()),
+                    ContentBlock::ProviderState {
+                        provider: "openai".into(),
+                        data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+                    },
+                ],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 1,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        let content = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
