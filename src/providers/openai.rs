@@ -47,7 +47,7 @@ impl OpenAiProvider {
             .iter()
             .flat_map(|message| &message.content)
             .any(|block| matches!(block, ContentBlock::Image { .. }))
-            .then(|| LlmResponse::error("openai gpt-5.6-sol does not support image input"))
+            .then(|| LlmResponse::error("native OpenAI provider does not support image input"))
     }
 }
 
@@ -279,7 +279,7 @@ fn sanitize_reasoning_state(data: &Value) -> Option<Value> {
         return None;
     }
     let encrypted = data["encrypted_content"].as_str()?;
-    let summary = data["summary"].as_array()?;
+    let summary = data["summary"].as_array().cloned().unwrap_or_default();
     let mut state = json!({
         "type": "reasoning",
         "summary": summary,
@@ -310,7 +310,13 @@ pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
 }
 
 pub(crate) fn parse_response(body: &Value, model: &str) -> LlmResponse {
-    let status = body["status"].as_str().unwrap_or("failed");
+    let status = body["status"].as_str().unwrap_or_else(|| {
+        if body["output"].is_array() && body["error"].is_null() {
+            "completed"
+        } else {
+            "failed"
+        }
+    });
     let content = output_to_content(body["output"].as_array());
     let has_tools = content
         .iter()
@@ -388,23 +394,25 @@ fn output_to_content(output: Option<&Vec<Value>>) -> Vec<ContentBlock> {
             Some("reasoning") => {
                 // Whitelist the fields accepted by Responses input items;
                 // discard response-local status/metadata before replay.
-                let mut state = json!({
-                    "type": "reasoning",
-                    "summary": item["summary"].clone(),
-                    "encrypted_content": item["encrypted_content"].clone()
-                });
-                if let Some(id) = item.get("id").filter(|value| !value.is_null()) {
-                    state["id"] = id.clone();
+                if let Some(encrypted) = item["encrypted_content"].as_str() {
+                    let mut state = json!({
+                        "type": "reasoning",
+                        "summary": item["summary"].as_array().cloned().unwrap_or_default(),
+                        "encrypted_content": encrypted
+                    });
+                    if let Some(id) = item.get("id").filter(|value| !value.is_null()) {
+                        state["id"] = id.clone();
+                    }
+                    if let Some(reasoning_content) =
+                        item.get("content").filter(|value| !value.is_null())
+                    {
+                        state["content"] = reasoning_content.clone();
+                    }
+                    content.push(ContentBlock::ProviderState {
+                        provider: PROVIDER_STATE.to_string(),
+                        data: state,
+                    });
                 }
-                if let Some(reasoning_content) =
-                    item.get("content").filter(|value| !value.is_null())
-                {
-                    state["content"] = reasoning_content.clone();
-                }
-                content.push(ContentBlock::ProviderState {
-                    provider: PROVIDER_STATE.to_string(),
-                    data: state,
-                });
                 for summary in item["summary"].as_array().into_iter().flatten() {
                     if let Some(text) = summary["text"].as_str().filter(|t| !t.is_empty()) {
                         content.push(ContentBlock::Thinking(text.to_string()));
@@ -491,7 +499,6 @@ fn bounded(value: &str, cap: usize) -> String {
 pub(crate) fn is_context_overflow_error(message: &str) -> bool {
     let value = message.to_ascii_lowercase().replace(['_', '-'], " ");
     value.contains("maximum context length")
-        || value.contains("context length exceeded")
         || value.contains("context length exceeded")
         || value.contains("context window exceeded")
         || value.contains("exceeds the context window")
@@ -982,6 +989,51 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["c1", "c2"]);
+    }
+
+    #[test]
+    fn missing_status_with_output_is_treated_as_completed() {
+        let response = parse_response(
+            &json!({
+                "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                "usage":{}
+            }),
+            "gpt-5.6-sol",
+        );
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn reasoning_without_summary_replays_with_empty_summary() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ProviderState {
+                provider: "openai".into(),
+                data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+            }],
+        }];
+        let input = messages_to_input(&messages);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["summary"], json!([]));
+    }
+
+    #[test]
+    fn reasoning_without_encrypted_content_is_not_persisted() {
+        let response = parse_response(
+            &json!({
+                "status":"completed",
+                "output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"visible summary"}]}],
+                "usage":{}
+            }),
+            "gpt-5.6-sol",
+        );
+        assert!(!response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ProviderState { .. })));
+        assert!(response.content.iter().any(
+            |block| matches!(block, ContentBlock::Thinking(text) if text == "visible summary")
+        ));
     }
 
     #[test]
