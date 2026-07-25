@@ -252,8 +252,11 @@ fn supports_adaptive_thinking(model: &str) -> bool {
         || model.starts_with("claude-fable")
 }
 
-fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>) -> AnthropicBlock {
-    match block {
+fn content_block_to_anthropic(
+    block: &ContentBlock,
+    cache: Option<CacheControl>,
+) -> Option<AnthropicBlock> {
+    Some(match block {
         ContentBlock::Text(t) => AnthropicBlock::Text {
             text: t.clone(),
             cache_control: cache,
@@ -278,6 +281,7 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
             input: input.clone(),
             cache_control: cache,
         },
+        ContentBlock::ProviderState { .. } => return None,
         ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -288,7 +292,7 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
             is_error: if *is_error { Some(true) } else { None },
             cache_control: cache,
         },
-    }
+    })
 }
 
 fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMessage {
@@ -297,7 +301,7 @@ fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMes
         .content
         .iter()
         .enumerate()
-        .map(|(i, block)| {
+        .filter_map(|(i, block)| {
             let cache = if is_prefix_boundary && i == last {
                 Some(CacheControl::ephemeral())
             } else {

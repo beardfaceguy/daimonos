@@ -1319,7 +1319,8 @@ fn is_user_turn_message(message: &Message) -> bool {
         ContentBlock::Image { .. } => true,
         ContentBlock::ToolResult { .. }
         | ContentBlock::ToolCall { .. }
-        | ContentBlock::Thinking(_) => false,
+        | ContentBlock::Thinking(_)
+        | ContentBlock::ProviderState { .. } => false,
     })
 }
 

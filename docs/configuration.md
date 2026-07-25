@@ -66,6 +66,22 @@ come from either the file or the process environment; startup fails clearly
 when it is absent from both. All existing provider, approval-mode, and
 compaction validation applies after the override merge.
 
+Supported providers are `anthropic`, `openrouter`, and native `openai`.
+Native OpenAI uses the Responses API (not Chat Completions); a direct
+GPT-5.6 Sol configuration is:
+
+```dotenv
+DAIMONOS_AGENT_PROVIDER=openai
+DAIMONOS_AGENT_MODEL=gpt-5.6-sol
+DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
+DAIMONOS_AGENT_API_KEY=sk-...
+```
+
+For `gpt-5.6-sol`, daimonos reports the documented 1,050,000-token context
+window and 128,000-token maximum output capability. The model is text-only;
+ACP image prompts are rejected before provider dispatch. OpenAI tool loops
+retain encrypted reasoning continuation state locally with `store=false`.
+
 This makes one-off headless overrides possible without rewriting a complete
 temporary file:
 

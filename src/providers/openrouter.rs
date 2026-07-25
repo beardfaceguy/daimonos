@@ -365,8 +365,8 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                                 }
                             }));
                         }
-                        // Thinking blocks are Anthropic-specific; skip for OpenRouter
-                        ContentBlock::Thinking(_) => {}
+                        // Thinking/provider state are provider-specific; skip.
+                        ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => {}
                         // Images are only valid in user prompts.
                         ContentBlock::Image { .. } => {}
                         // Tool results belong on user messages, not assistant

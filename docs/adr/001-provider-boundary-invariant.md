@@ -12,9 +12,14 @@ No model/provider-specific code in core, ever.
 - **`core`** — defines the `LlmProvider` trait + neutral types (`Message`, `ToolSchema`,
   `LlmResponse`, `Usage`) + the agent loop. Core knows nothing about Anthropic, OpenAI,
   `/v1/messages`, `cache_control`, `x-api-key`, model-ID strings, or adaptive-thinking quirks.
-- **`providers/anthropic`** — the ONLY place Anthropic-specific code lives (module in v1, own
-  crate in phase A). Future providers (`providers/openai`, `providers/openrouter`) drop in behind
-  the trait with zero core changes.
+- **`providers/anthropic`** — the ONLY place Anthropic-specific wire/API/cache
+  behavior lives.
+- **`providers/openai`** — native OpenAI Responses API behavior: response
+  items/SSE events, encrypted reasoning continuation state, reasoning effort,
+  tool wire shapes, pricing, and usage semantics.
+- **`providers/openrouter`** — OpenAI-compatible Chat Completions behavior for
+  OpenRouter and compatible endpoints; it is deliberately separate from the
+  native OpenAI Responses path.
 - **`providers/*`** — same pattern for any future provider.
 
 ## Design rule: "Core expresses intent, provider translates to mechanism"
