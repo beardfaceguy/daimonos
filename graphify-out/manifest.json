@@ -1050,8 +1050,8 @@
     "semantic_hash": ""
   },
   "src/providers/openai.rs": {
-    "mtime": 1785004208.4713867,
-    "ast_hash": "03cafbe41996fe4c4fb4d52245c98592",
+    "mtime": 1785004878.3726459,
+    "ast_hash": "b3e9e73b63c584e1188be853ea5d0f53",
     "semantic_hash": ""
   }
 }

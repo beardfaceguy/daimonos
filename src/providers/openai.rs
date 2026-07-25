@@ -9,6 +9,7 @@ use crate::providers::{
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const PROVIDER_STATE: &str = "openai";
 const GPT_56_CONTEXT_WINDOW: u64 = 1_050_000;
+const GPT_56_MAX_OUTPUT: u32 = 128_000;
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -40,11 +41,22 @@ impl OpenAiProvider {
     fn request_body(&self, ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
         build_request(ctx, opts, stream)
     }
+
+    fn reject_images(ctx: &Context) -> Option<LlmResponse> {
+        ctx.messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+            .then(|| LlmResponse::error("openai gpt-5.6-sol does not support image input"))
+    }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+        if let Some(error) = Self::reject_images(ctx) {
+            return error;
+        }
         let response = match self
             .client
             .post(self.endpoint())
@@ -76,6 +88,9 @@ impl LlmProvider for OpenAiProvider {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
+        if let Some(error) = Self::reject_images(ctx) {
+            return error;
+        }
         let response = match self
             .client
             .post(self.endpoint())
@@ -133,18 +148,25 @@ pub(crate) fn known_context_window(model: &str) -> Option<u64> {
 }
 
 pub(crate) fn build_request(ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
+    let max_output_tokens = if is_gpt_56_sol(&opts.model) {
+        opts.max_tokens.min(GPT_56_MAX_OUTPUT)
+    } else {
+        opts.max_tokens
+    };
     let mut body = json!({
         "model": opts.model,
         "input": messages_to_input(&ctx.messages),
-        "max_output_tokens": opts.max_tokens,
+        "max_output_tokens": max_output_tokens,
         "stream": stream,
         "store": false,
         "include": ["reasoning.encrypted_content"],
         "reasoning": {
-            "effort": reasoning_effort(&opts.thinking),
-            "summary": "auto"
+            "effort": reasoning_effort(&opts.thinking)
         }
     });
+    if opts.thinking != ThinkingLevel::Off {
+        body["reasoning"]["summary"] = json!("auto");
+    }
     if let Some(system) = &ctx.system {
         body["instructions"] = json!(system);
     }
@@ -227,7 +249,14 @@ pub(crate) fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                     if message.role == Role::Assistant && provider == PROVIDER_STATE =>
                 {
                     flush_text(&mut input, role, &mut text);
-                    input.push(data.clone());
+                    if let Some(reasoning) = sanitize_reasoning_state(data) {
+                        input.push(reasoning);
+                    } else {
+                        tracing::warn!(
+                            target: "daimonos::providers::openai",
+                            event = "invalid_provider_state_skipped",
+                        );
+                    }
                 }
                 ContentBlock::ProviderState { provider, .. } => tracing::debug!(
                     target: "daimonos::providers::openai",
@@ -243,6 +272,26 @@ pub(crate) fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         flush_text(&mut input, role, &mut text);
     }
     input
+}
+
+fn sanitize_reasoning_state(data: &Value) -> Option<Value> {
+    if data["type"].as_str() != Some("reasoning") {
+        return None;
+    }
+    let encrypted = data["encrypted_content"].as_str()?;
+    let summary = data["summary"].as_array()?;
+    let mut state = json!({
+        "type": "reasoning",
+        "summary": summary,
+        "encrypted_content": encrypted,
+    });
+    if let Some(id) = data["id"].as_str() {
+        state["id"] = json!(id);
+    }
+    if let Some(content) = data["content"].as_array() {
+        state["content"] = json!(content);
+    }
+    Some(state)
 }
 
 pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
@@ -379,6 +428,17 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
         .unwrap_or(0);
     let input = total_input.saturating_sub(cache_read);
     let (input_rate, cache_rate, output_rate) = pricing(model);
+    if (input > 0 || cache_read > 0 || output > 0)
+        && input_rate == 0.0
+        && cache_rate == 0.0
+        && output_rate == 0.0
+    {
+        tracing::warn!(
+            target: "daimonos::providers::openai",
+            event = "unknown_model_pricing",
+            model,
+        );
+    }
     let input_usd = input as f64 / 1_000_000.0 * input_rate;
     let cache_read_usd = cache_read as f64 / 1_000_000.0 * cache_rate;
     let output_usd = output as f64 / 1_000_000.0 * output_rate;
@@ -429,15 +489,37 @@ fn bounded(value: &str, cap: usize) -> String {
 }
 
 pub(crate) fn is_context_overflow_error(message: &str) -> bool {
-    let value = message.to_ascii_lowercase();
+    let value = message.to_ascii_lowercase().replace(['_', '-'], " ");
     value.contains("maximum context length")
         || value.contains("context length exceeded")
-        || value.contains("context_length_exceeded")
+        || value.contains("context length exceeded")
         || value.contains("context window exceeded")
         || value.contains("exceeds the context window")
         || value.contains("prompt is too long")
         || value.contains("too many tokens")
         || value.contains("input is too long")
+}
+
+fn stream_error_message(event: &Value) -> String {
+    for value in [
+        &event["message"],
+        &event["error"]["message"],
+        &event["response"]["error"]["message"],
+    ] {
+        if let Some(message) = value.as_str() {
+            return message.to_string();
+        }
+    }
+    for value in [
+        &event["code"],
+        &event["error"]["code"],
+        &event["response"]["error"]["code"],
+    ] {
+        if !value.is_null() {
+            return format!("provider error code {value}");
+        }
+    }
+    "unknown error".to_string()
 }
 
 struct StreamState {
@@ -470,8 +552,7 @@ impl StreamState {
                     deltas.push(StreamEvent::TextDelta(delta.to_string()));
                 }
             }
-            Some("response.reasoning_summary_text.delta")
-            | Some("response.reasoning_text.delta") => {
+            Some("response.reasoning_summary_text.delta") => {
                 if let Some(delta) = event["delta"].as_str() {
                     self.thinking.push_str(delta);
                     deltas.push(StreamEvent::ThinkingDelta(delta.to_string()));
@@ -509,13 +590,9 @@ impl StreamState {
                 self.finished = true;
             }
             Some("error") | Some("response.error") => {
-                let message = event["message"]
-                    .as_str()
-                    .or_else(|| event["error"]["message"].as_str())
-                    .or_else(|| event["response"]["error"]["message"].as_str())
-                    .unwrap_or("unknown error");
-                let full = format!("openai stream error: {}", bounded(message, 500));
-                self.terminal = Some(if is_context_overflow_error(message) {
+                let message = stream_error_message(event);
+                let full = format!("openai stream error: {}", bounded(&message, 500));
+                self.terminal = Some(if is_context_overflow_error(&message) {
                     LlmResponse::context_overflow_error(full)
                 } else {
                     LlmResponse::error(full)
@@ -738,6 +815,70 @@ mod tests {
     }
 
     #[test]
+    fn gpt_56_output_is_clamped_to_documented_limit() {
+        let ctx = Context {
+            messages: vec![],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let mut options = opts();
+        options.max_tokens = u32::MAX;
+        let body = build_request(&ctx, &options, false);
+        assert_eq!(body["max_output_tokens"], GPT_56_MAX_OUTPUT);
+    }
+
+    #[test]
+    fn reasoning_off_omits_summary() {
+        let ctx = Context {
+            messages: vec![],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let mut options = opts();
+        options.thinking = ThinkingLevel::Off;
+        let body = build_request(&ctx, &options, false);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn images_are_rejected_not_silently_dropped() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Image {
+                    data: "x".into(),
+                    media_type: "image/png".into(),
+                    uri: None,
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let response = OpenAiProvider::reject_images(&ctx).unwrap();
+        assert_eq!(response.stop_reason, StopReason::Error);
+        assert!(response
+            .error_message
+            .unwrap()
+            .contains("does not support image"));
+    }
+
+    #[test]
+    fn invalid_persisted_provider_state_cannot_inject_wire_items() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ProviderState {
+                provider: "openai".into(),
+                data: json!({"type":"function_call","call_id":"injected","name":"exec","arguments":"{}"}),
+            }],
+        }];
+        assert!(messages_to_input(&messages).is_empty());
+    }
+
+    #[test]
     fn max_thinking_maps_to_compatible_xhigh() {
         assert_eq!(reasoning_effort(&ThinkingLevel::Max), "xhigh");
     }
@@ -870,6 +1011,23 @@ mod tests {
         assert!(response.content.iter().any(
             |b| matches!(b, ContentBlock::ToolCall { id, name, .. } if id == "c1" && name == "exec")
         ));
+    }
+
+    #[test]
+    fn raw_reasoning_text_is_not_exposed() {
+        let mut state = StreamState::new("gpt-5.6-sol".into());
+        let events = state.on_event(&json!({
+            "type":"response.reasoning_text.delta",
+            "delta":"private chain of thought"
+        }));
+        assert!(events.is_empty());
+        assert!(state.thinking.is_empty());
+    }
+
+    #[test]
+    fn numeric_stream_error_code_is_preserved() {
+        let event = json!({"type":"response.error","error":{"code":429}});
+        assert_eq!(stream_error_message(&event), "provider error code 429");
     }
 
     #[test]
