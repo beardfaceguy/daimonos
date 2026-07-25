@@ -101,8 +101,8 @@ type CurrentModel = Arc<StdMutex<String>>;
 struct ResilientWriter<T> {
     inner: T,
     direction: &'static str,
-    /// At 1ms backoff this defaults to about five seconds. Prevents a
-    /// permanently misconfigured nonblocking fd from hanging ACP forever.
+    /// With capped exponential backoff, 100 attempts is roughly five seconds.
+    /// Prevents a permanently blocked fd from hanging ACP forever.
     max_would_block_attempts: u64,
 }
 
@@ -111,7 +111,7 @@ impl<T> ResilientWriter<T> {
         Self {
             inner,
             direction,
-            max_would_block_attempts: 5_000,
+            max_would_block_attempts: 100,
         }
     }
 
@@ -132,18 +132,33 @@ impl<T> ResilientWriter<T> {
     }
 
     fn note_would_block(&self, operation: &str, attempts: u64) -> std::io::Result<()> {
-        if attempts == 1
-            || (attempts.is_multiple_of(1_000) && attempts < self.max_would_block_attempts)
-        {
-            tracing::warn!(
+        if attempts == 1 {
+            // A single pipe-backpressure retry is expected under bursts; keep
+            // it out of warn-level logs.
+            tracing::debug!(
                 target: "daimonos::acp",
                 event = "stdio_would_block_retry",
                 direction = self.direction,
                 operation,
                 attempts,
             );
+        } else if attempts.is_multiple_of(25) && attempts < self.max_would_block_attempts {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_sustained",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
         }
         if attempts >= self.max_would_block_attempts {
+            tracing::error!(
+                target: "daimonos::acp",
+                event = "stdio_would_block_timeout",
+                direction = self.direction,
+                operation,
+                attempts,
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
@@ -152,7 +167,11 @@ impl<T> ResilientWriter<T> {
                 ),
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Exponential backoff (1,2,4,…), capped at 50ms. This absorbs short
+        // bursts cheaply without tight polling during sustained backpressure.
+        let shift = attempts.saturating_sub(1).min(6) as u32;
+        let delay_ms = (1u64 << shift).min(50);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         Ok(())
     }
 }
@@ -162,6 +181,7 @@ impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
         let mut attempts = 0u64;
         loop {
             match self.inner.write(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     attempts = attempts.saturating_add(1);
                     self.note_would_block("write", attempts)?;
@@ -176,6 +196,7 @@ impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
         let mut attempts = 0u64;
         loop {
             match self.inner.flush() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     attempts = attempts.saturating_add(1);
                     self.note_would_block("flush", attempts)?;
@@ -3159,7 +3180,9 @@ mod tests {
 
     #[derive(Default)]
     struct TransientWriter {
+        write_interrupted_remaining: usize,
         write_would_block_remaining: usize,
+        flush_interrupted_remaining: usize,
         flush_would_block_remaining: usize,
         bytes: Vec<u8>,
         flushes: usize,
@@ -3167,6 +3190,10 @@ mod tests {
 
     impl std::io::Write for TransientWriter {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.write_interrupted_remaining > 0 {
+                self.write_interrupted_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
             if self.write_would_block_remaining > 0 {
                 self.write_would_block_remaining -= 1;
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -3176,6 +3203,10 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_interrupted_remaining > 0 {
+                self.flush_interrupted_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
             if self.flush_would_block_remaining > 0 {
                 self.flush_would_block_remaining -= 1;
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -3215,7 +3246,9 @@ mod tests {
     #[test]
     fn resilient_writer_retries_transient_write_and_flush_would_block() {
         let inner = TransientWriter {
+            write_interrupted_remaining: 1,
             write_would_block_remaining: 2,
+            flush_interrupted_remaining: 1,
             flush_would_block_remaining: 1,
             ..Default::default()
         };
