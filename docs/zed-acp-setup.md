@@ -107,7 +107,8 @@ DAIMONOS_AGENT_SUMMARY_PROMPT=...                        # unset → built-in te
 The budget is `CONTEXT_WINDOW − OUTPUT_RESERVATION`; watermarks must satisfy
 `0 < LOW < HIGH < 1`. `CONTEXT_WINDOW` is optional (#965): when omitted,
 daimonos queries the provider for the effective model's window (OpenRouter
-`context_length` / Anthropic `max_input_tokens`) and errors out if it can't be
+`context_length` / Anthropic `max_input_tokens` / native OpenAI known-model
+metadata) and errors out if it can't be
 determined. If you use the model picker across models with different windows,
 either leave `CONTEXT_WINDOW` unset (each model resolves its own) or set it for
 the smallest one. The simplest
@@ -138,7 +139,8 @@ the equivalent notice.
   (persisted under `~/.daimonos/acp-sessions`).
 - Embedded file context and pasted images are preserved in the model prompt.
   Image capability is advertised only when the configured provider adapter
-  supports multimodal requests (the Anthropic and OpenRouter adapters do).
+  supports multimodal requests (the Anthropic and OpenRouter adapters do;
+  native OpenAI GPT-5.6 Sol is text-only).
   Audio prompts are not advertised.
 - Provider thinking streams as collapsible thought chunks and is restored when
   a saved session is loaded.

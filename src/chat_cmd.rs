@@ -190,7 +190,9 @@ fn render_transcript(messages: &[Message]) -> String {
                         .unwrap_or_default()
                 )),
                 ContentBlock::ToolCall { name, .. } => out.push_str(&format!("[tool: {name}]\n")),
-                ContentBlock::Thinking(_) | ContentBlock::ToolResult { .. } => {}
+                ContentBlock::Thinking(_)
+                | ContentBlock::ProviderState { .. }
+                | ContentBlock::ToolResult { .. } => {}
             }
         }
     }

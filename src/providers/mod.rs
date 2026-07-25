@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod anthropic;
+pub mod openai;
 pub mod openrouter;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,6 +23,14 @@ pub enum ContentBlock {
         uri: Option<String>,
     },
     Thinking(String),
+    /// Provider-owned opaque continuation state required to preserve a
+    /// stateless tool loop (for example OpenAI encrypted reasoning items).
+    /// Persisted in history, never rendered, and replayed only by the matching
+    /// provider adapter.
+    ProviderState {
+        provider: String,
+        data: Value,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -74,6 +83,9 @@ pub struct ToolSchema {
 pub struct Usage {
     pub input: u64,
     pub output: u64,
+    /// Reasoning-token detail already included in `output`; informational only
+    /// and never added again when computing totals/cost.
+    pub reasoning_output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost: Cost,
@@ -348,6 +360,7 @@ mod tests {
         let u = Usage {
             input: 100,
             output: 9,
+            reasoning_output: 4,
             cache_read: 30,
             cache_write: 20,
             cost: Cost::default(),
@@ -388,6 +401,28 @@ mod tests {
         let m = Message::user("hello");
         assert_eq!(m.role, Role::User);
         assert!(matches!(&m.content[0], ContentBlock::Text(t) if t == "hello"));
+    }
+
+    #[test]
+    fn provider_state_round_trips_through_session_serialization() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ProviderState {
+                provider: "openai".into(),
+                data: serde_json::json!({
+                    "type": "reasoning",
+                    "id": "r1",
+                    "encrypted_content": "opaque"
+                }),
+            }],
+        };
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded: Message = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            &decoded.content[0],
+            ContentBlock::ProviderState { provider, data }
+                if provider == "openai" && data["encrypted_content"] == "opaque"
+        ));
     }
 
     #[test]

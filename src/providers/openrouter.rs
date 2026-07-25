@@ -365,8 +365,8 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                                 }
                             }));
                         }
-                        // Thinking blocks are Anthropic-specific; skip for OpenRouter
-                        ContentBlock::Thinking(_) => {}
+                        // Thinking/provider state are provider-specific; skip.
+                        ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => {}
                         // Images are only valid in user prompts.
                         ContentBlock::Image { .. } => {}
                         // Tool results belong on user messages, not assistant
@@ -479,6 +479,9 @@ fn parse_usage(usage: &Value) -> Usage {
             .saturating_sub(cache_read)
             .saturating_sub(cache_write),
         output: usage["completion_tokens"].as_u64().unwrap_or(0),
+        reasoning_output: usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0),
         cache_read,
         cache_write,
         // OpenRouter does not return cost in the usage object; left at zero.

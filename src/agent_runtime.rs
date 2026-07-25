@@ -23,8 +23,12 @@ fn try_build_provider(
             providers::anthropic::AnthropicProvider::new(api_key.to_string())
                 .with_base_url(base_url.to_string()),
         )),
+        "openai" => {
+            providers::openai::OpenAiProvider::new(api_key.to_string(), base_url.to_string())
+                .map(|provider| Box::new(provider) as Box<dyn providers::LlmProvider>)
+        }
         other => Err(format!(
-            "unsupported provider: {other} (valid: openrouter, anthropic)"
+            "unsupported provider: {other} (valid: openrouter, anthropic, openai)"
         )),
     }
 }
@@ -245,6 +249,25 @@ fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_openai_provider_builds_and_reports_known_window() {
+        let provider = try_build_provider("openai", "key", "https://api.openai.com/v1")
+            .expect("native OpenAI provider");
+        assert_eq!(
+            provider.context_window("gpt-5.6-sol").await,
+            Some(1_050_000)
+        );
+        assert!(!provider.supports_images());
+    }
+
+    #[test]
+    fn unsupported_provider_names_openai_in_valid_set() {
+        let error = try_build_provider("ollama", "key", "http://localhost")
+            .err()
+            .expect("unsupported provider error");
+        assert!(error.contains("openai"));
+    }
 
     #[test]
     fn agent_provider_error_returns_to_caller_for_ordered_shutdown() {

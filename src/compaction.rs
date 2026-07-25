@@ -110,6 +110,9 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .iter()
         .map(|b| match b {
             ContentBlock::Text(t) | ContentBlock::Thinking(t) => t.len(),
+            ContentBlock::ProviderState { provider, data } => {
+                provider.len() + data.to_string().len()
+            }
             ContentBlock::Image {
                 data,
                 media_type,
@@ -248,9 +251,9 @@ pub fn transcript_for_summary(messages: &[Message]) -> String {
                     };
                     out.push_str(&format!("[{tag}: {capped}{ellipsis}]\n"));
                 }
-                // Thinking is internal reasoning; the assistant's visible text
-                // restates anything that mattered.
-                ContentBlock::Thinking(_) => {}
+                // Thinking/provider continuation state is internal; visible
+                // assistant text restates anything that mattered.
+                ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => {}
             }
         }
     }
@@ -480,6 +483,19 @@ mod tests {
         assert!(t.contains('…'), "long tool result must be capped: {t}");
         // Capped at 500 chars of x's, not 2000.
         assert!(!t.contains(&text_of_len(501)), "tool result exceeded cap");
+    }
+
+    #[test]
+    fn transcript_omits_provider_state_but_estimates_its_size() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ProviderState {
+                provider: "openai".into(),
+                data: serde_json::json!({"type":"reasoning","encrypted_content":"SECRET_OPAQUE_STATE"}),
+            }],
+        }];
+        assert!(!transcript_for_summary(&messages).contains("SECRET_OPAQUE_STATE"));
+        assert!(estimate_tokens(&messages) > 0);
     }
 
     #[test]

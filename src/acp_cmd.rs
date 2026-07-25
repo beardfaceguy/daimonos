@@ -2223,7 +2223,7 @@ fn replay_history(
                         ContentChunk::new(AcpContentBlock::Text(TextContent::new(text.clone())));
                     send_notification(cx, session_id, SessionUpdate::AgentThoughtChunk(chunk));
                 }
-                CoreBlock::Thinking(_) => {}
+                CoreBlock::Thinking(_) | CoreBlock::ProviderState { .. } => {}
             }
         }
     }

@@ -167,9 +167,9 @@ impl AgentEnv {
         let provider = present("DAIMONOS_AGENT_PROVIDER").unwrap();
         let approval_mode = present("DAIMONOS_AGENT_APPROVAL_MODE").unwrap();
 
-        if !matches!(provider.as_str(), "openrouter" | "anthropic") {
+        if !matches!(provider.as_str(), "openrouter" | "anthropic" | "openai") {
             return Err(format!(
-                "agent configuration for {}: DAIMONOS_AGENT_PROVIDER '{}' unsupported (valid: openrouter, anthropic)",
+                "agent configuration for {}: DAIMONOS_AGENT_PROVIDER '{}' unsupported (valid: openrouter, anthropic, openai)",
                 path.display(),
                 provider
             ));
@@ -701,6 +701,21 @@ mod tests {
         );
         let err = load_str(&s).unwrap_err();
         assert!(err.contains("DAIMONOS_AGENT_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn accepts_native_openai_provider() {
+        let s = base()
+            .replace(
+                "DAIMONOS_AGENT_PROVIDER=openrouter",
+                "DAIMONOS_AGENT_PROVIDER=openai",
+            )
+            .replace("anthropic/claude-sonnet-4.6", "gpt-5.6-sol")
+            .replace("https://openrouter.ai/api/v1", "https://api.openai.com/v1");
+        let env = load_str(&s).unwrap();
+        assert_eq!(env.provider, "openai");
+        assert_eq!(env.model, "gpt-5.6-sol");
+        assert_eq!(env.base_url, "https://api.openai.com/v1");
     }
 
     #[test]

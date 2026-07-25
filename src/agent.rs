@@ -198,6 +198,7 @@ pub fn accumulate_usage(acc: Usage, turn: Usage) -> Usage {
     Usage {
         input: acc.input + turn.input,
         output: acc.output + turn.output,
+        reasoning_output: acc.reasoning_output + turn.reasoning_output,
         cache_read: acc.cache_read + turn.cache_read,
         cache_write: acc.cache_write + turn.cache_write,
         cost: Cost {
@@ -269,6 +270,7 @@ fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
         "model": model,
         "input": usage.input,
         "output": usage.output,
+        "reasoning_output": usage.reasoning_output,
         "cache_read": usage.cache_read,
         "cache_write": usage.cache_write,
         // Fixed-decimal string, not a bare f64: serde_json renders small floats
@@ -1319,7 +1321,8 @@ fn is_user_turn_message(message: &Message) -> bool {
         ContentBlock::Image { .. } => true,
         ContentBlock::ToolResult { .. }
         | ContentBlock::ToolCall { .. }
-        | ContentBlock::Thinking(_) => false,
+        | ContentBlock::Thinking(_)
+        | ContentBlock::ProviderState { .. } => false,
     })
 }
 
@@ -2037,6 +2040,7 @@ mod tests {
         let usage = Usage {
             input: 120,
             output: 45,
+            reasoning_output: 11,
             cache_read: 3,
             cache_write: 7,
             cost: Cost {
@@ -2050,6 +2054,7 @@ mod tests {
         assert_eq!(parsed["model"], "claude-haiku-4-5");
         assert_eq!(parsed["input"], 120);
         assert_eq!(parsed["output"], 45);
+        assert_eq!(parsed["reasoning_output"], 11);
         assert_eq!(parsed["cache_read"], 3);
         assert_eq!(parsed["cache_write"], 7);
         assert_eq!(parsed["cost_usd"], "0.001200");

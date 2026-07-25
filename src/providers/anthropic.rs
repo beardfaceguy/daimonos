@@ -208,6 +208,7 @@ fn map_usage(raw: AnthropicUsage, model: &str) -> Usage {
     Usage {
         input: raw.input_tokens,
         output: raw.output_tokens,
+        reasoning_output: 0,
         cache_read: raw.cache_read_input_tokens,
         cache_write: raw.cache_creation_input_tokens,
         cost: Cost {
@@ -252,8 +253,11 @@ fn supports_adaptive_thinking(model: &str) -> bool {
         || model.starts_with("claude-fable")
 }
 
-fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>) -> AnthropicBlock {
-    match block {
+fn content_block_to_anthropic(
+    block: &ContentBlock,
+    cache: Option<CacheControl>,
+) -> Option<AnthropicBlock> {
+    Some(match block {
         ContentBlock::Text(t) => AnthropicBlock::Text {
             text: t.clone(),
             cache_control: cache,
@@ -278,6 +282,7 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
             input: input.clone(),
             cache_control: cache,
         },
+        ContentBlock::ProviderState { .. } => return None,
         ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -288,16 +293,20 @@ fn content_block_to_anthropic(block: &ContentBlock, cache: Option<CacheControl>)
             is_error: if *is_error { Some(true) } else { None },
             cache_control: cache,
         },
-    }
+    })
 }
 
-fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMessage {
-    let last = msg.content.len().saturating_sub(1);
-    let blocks = msg
+fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> Option<AnthropicMessage> {
+    let serializable = msg
         .content
         .iter()
+        .filter(|block| !matches!(block, ContentBlock::ProviderState { .. }))
+        .collect::<Vec<_>>();
+    let last = serializable.len().saturating_sub(1);
+    let blocks: Vec<AnthropicBlock> = serializable
+        .into_iter()
         .enumerate()
-        .map(|(i, block)| {
+        .filter_map(|(i, block)| {
             let cache = if is_prefix_boundary && i == last {
                 Some(CacheControl::ephemeral())
             } else {
@@ -306,13 +315,13 @@ fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> AnthropicMes
             content_block_to_anthropic(block, cache)
         })
         .collect();
-    AnthropicMessage {
+    (!blocks.is_empty()).then(|| AnthropicMessage {
         role: match msg.role {
             Role::User => "user".to_string(),
             Role::Assistant => "assistant".to_string(),
         },
         content: blocks,
-    }
+    })
 }
 
 fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
@@ -326,15 +335,18 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         })
         .collect();
 
+    let stable_end = ctx.stable_prefix_len.min(ctx.messages.len());
+    let boundary_index = ctx.messages[..stable_end].iter().rposition(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::ProviderState { .. }))
+    });
     let messages = ctx
         .messages
         .iter()
         .enumerate()
-        .map(|(i, msg)| {
-            // Mark the last message of the stable prefix as the cache boundary
-            let is_boundary = ctx.stable_prefix_len > 0 && i + 1 == ctx.stable_prefix_len;
-            message_to_anthropic(msg, is_boundary)
-        })
+        .filter_map(|(i, msg)| message_to_anthropic(msg, boundary_index == Some(i)))
         .collect();
 
     let thinking = if opts.thinking != ThinkingLevel::Off && supports_adaptive_thinking(&opts.model)
@@ -1034,6 +1046,47 @@ mod tests {
         assert!(
             second_block.get("cache_control").is_none() || second_block["cache_control"].is_null()
         );
+    }
+
+    #[test]
+    fn provider_state_only_message_is_dropped() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ProviderState {
+                    provider: "openai".into(),
+                    data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 1,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        assert!(json["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn skipped_provider_state_does_not_steal_cache_boundary() {
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("visible".into()),
+                    ContentBlock::ProviderState {
+                        provider: "openai".into(),
+                        data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+                    },
+                ],
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 1,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        let content = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
