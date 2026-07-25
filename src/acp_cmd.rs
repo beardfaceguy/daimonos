@@ -1763,6 +1763,17 @@ async fn truncate_session(
     Ok(())
 }
 
+/// Poll a human-visible coordination notice only while the AgentSession is
+/// idle. `run_prompt_turn`/retry holds this mutex across provider streaming and
+/// tool execution; `try_lock` therefore skips (never queues) a mid-turn tick.
+async fn poll_coordination_ui_notice_if_idle(
+    agent_session: &tokio::sync::Mutex<AgentSession>,
+    tool_session: &Arc<tokio::sync::Mutex<Session>>,
+) -> Option<(String, i64)> {
+    let _idle_guard = agent_session.try_lock().ok()?;
+    AgentSession::poll_coordination_ui_notice(tool_session).await
+}
+
 /// Build a fresh session handle (provider + agent session + per-session
 /// cells) without inserting it into the map. Shared by `session/new` and the
 /// unknown-id branch of `session/load` (a respawned process has no in-memory
@@ -1870,9 +1881,9 @@ async fn build_session_handle(
             session.coordination_tool_session()
         };
         let base_ms = cfg.coordination.notifications.effective_poll_interval_ms();
-        // Stable per-session jitter (up to 20%) prevents many sessions from
-        // opening SQLite connections in lockstep while keeping deterministic
-        // behavior and no RNG dependency.
+        // Stable per-session jitter (up to 20% of the already-clamped effective
+        // interval) prevents many sessions from opening SQLite connections in
+        // lockstep while keeping deterministic behavior and no RNG dependency.
         let jitter = session_id
             .to_string()
             .bytes()
@@ -1884,26 +1895,45 @@ async fn build_session_handle(
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(handle) = weak.upgrade() else { break };
-                // AgentSession lock serializes polling with prompt execution;
-                // the method itself releases its tool-session lock before DB I/O.
-                let notice =
-                    AgentSession::poll_coordination_ui_notice(&notification_tool_session).await;
+                // Non-blocking idle gate: run_prompt_turn/retry holds this lock
+                // for the entire provider stream + tool loop. If busy, skip this
+                // tick so no AgentThoughtChunk can appear mid-stream/tool call.
+                let notice = poll_coordination_ui_notice_if_idle(
+                    &handle.session,
+                    &notification_tool_session,
+                )
+                .await;
                 if let Some((text, newest_message_id)) = notice {
-                    if let Some(cx) = current_cx(&handle.connection) {
-                        send_notification(
-                            &cx,
-                            &poll_session_id,
-                            SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                AcpContentBlock::Text(TextContent::new(text)),
-                            )),
-                        );
-                        // Advance only after a live connection accepted the
-                        // notification attempt; no connection means retry later.
-                        AgentSession::acknowledge_coordination_ui_notice(
-                            &notification_tool_session,
-                            newest_message_id,
-                        )
-                        .await;
+                    match current_cx(&handle.connection) {
+                        Some(cx) => {
+                            let delivery = cx.send_notification(SessionNotification::new(
+                                poll_session_id.clone(),
+                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                    AcpContentBlock::Text(TextContent::new(text)),
+                                )),
+                            ));
+                            match delivery {
+                                Ok(()) => {
+                                    // Advance only after successful delivery.
+                                    AgentSession::acknowledge_coordination_ui_notice(
+                                        &notification_tool_session,
+                                        newest_message_id,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => tracing::warn!(
+                                    target: "daimonos::coordination",
+                                    event = "ui_notification_delivery_failed",
+                                    session_id = %poll_session_id,
+                                    error = %error,
+                                ),
+                            }
+                        }
+                        None => tracing::debug!(
+                            target: "daimonos::coordination",
+                            event = "ui_notification_no_connection",
+                            session_id = %poll_session_id,
+                        ),
                     }
                 }
             }
@@ -3028,6 +3058,65 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::io::AsyncReadExt;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn coordination_ui_poll_skips_while_agent_session_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let cfg = Arc::new(cfg);
+        let mut tool_state = Session::new(dir.path().to_path_buf(), Arc::clone(&cfg));
+        tool_state.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let store = crate::coordination::CoordinationStore::open_with(&db, 5_000).unwrap();
+        store
+            .send_message(
+                "RedStone",
+                &["BlueLake".into()],
+                &[],
+                "secret subject",
+                "secret body",
+                crate::coordination::Importance::High,
+                false,
+                None,
+                "2026-07-25T00:00:00Z",
+            )
+            .unwrap();
+        let agent_session = tokio::sync::Mutex::new(AgentSession::new(
+            Box::new(MockProvider::new(vec![])),
+            tool_state,
+            AgentConfig::default(),
+        ));
+        let notification_tool_session = {
+            let guard = agent_session.lock().await;
+            guard.coordination_tool_session()
+        };
+
+        // Simulate an active prompt/tool loop holding AgentSession. The poll is
+        // non-blocking and must skip without advancing the UI watermark.
+        let busy_guard = agent_session.lock().await;
+        assert!(
+            poll_coordination_ui_notice_if_idle(&agent_session, &notification_tool_session)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            notification_tool_session
+                .lock()
+                .await
+                .coordination_ui_watermark,
+            0
+        );
+        drop(busy_guard);
+
+        // Once idle, the same pending message is surfaced.
+        assert!(
+            poll_coordination_ui_notice_if_idle(&agent_session, &notification_tool_session)
+                .await
+                .is_some()
+        );
+    }
 
     #[test]
     fn resolve_mcp_specs_fallback_gating() {

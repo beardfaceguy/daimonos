@@ -327,12 +327,14 @@ fn log_compaction_event(cfg: &TokenLogConfig, event: &CompactionEvent) {
 
 // --- Main loop ---
 
-/// Check unread agent mail at a safe generation boundary. Returns a
-/// metadata-only system notice and advances the model watermark exactly once.
-/// Fail-open: any store/path error yields None and never fails the turn.
+/// Prepare unread agent mail at a safe generation boundary. Returns a
+/// metadata-only system notice plus the newest-message watermark it represents.
+/// This does NOT advance the watermark: the caller acknowledges it only after
+/// a provider response successfully consumes the notice. Fail-open: any
+/// store/path error yields None and never fails the turn.
 async fn coordination_model_notice(
     session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
-) -> Option<String> {
+) -> Option<(String, i64)> {
     // Snapshot only immutable routing state under the mutex; never hold it
     // across synchronous SQLite I/O.
     let (agent, watermark, db_path, busy_timeout) = {
@@ -365,18 +367,32 @@ async fn coordination_model_notice(
             return None;
         }
     };
-    // Advance only if this is still the same binding/watermark snapshot.
-    let mut s = session.lock().await;
+    // Re-check the binding/watermark snapshot before returning a candidate,
+    // but do not advance yet — a provider error/abort must leave it retryable.
+    let s = session.lock().await;
     if s.coordination_agent_name.as_deref() != Some(agent.as_str())
         || s.coordination_model_watermark != watermark
     {
         return None;
     }
-    s.coordination_model_watermark = summary.newest_message_id;
-    Some(format!(
-        "[DAIMONOS COORDINATION NOTICE]\nYou have {} new unread agent-mail message(s) for {}. Highest importance: {}. Call fetch_inbox(agent=\"{}\", unread_only=true) before continuing if the messages may affect your current work.",
-        summary.count, agent, summary.highest_importance, agent
+    Some((
+        format!(
+            "[DAIMONOS COORDINATION NOTICE]\nYou have {} new unread agent-mail message(s) for {}. Highest importance: {}. Call fetch_inbox(agent=\"{}\", unread_only=true) before continuing if the messages may affect your current work.",
+            summary.count, agent, summary.highest_importance, agent
+        ),
+        summary.newest_message_id,
     ))
+}
+
+/// Commit a prepared model notice after the provider successfully consumed it.
+/// Monotonic max keeps concurrent/newer candidates safe; an error/abort caller
+/// simply does not call this, so the notice is retried on the next turn.
+async fn acknowledge_coordination_model_notice(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    newest_message_id: i64,
+) {
+    let mut s = session.lock().await;
+    s.coordination_model_watermark = s.coordination_model_watermark.max(newest_message_id);
 }
 
 pub async fn run(
@@ -393,7 +409,8 @@ pub async fn run(
         // runs before the initial generation and after complete tool-result
         // batches; the notice is ephemeral system context, not fake history.
         let coordination_notice = coordination_model_notice(&session).await;
-        let system = match (config.system.as_deref(), coordination_notice.as_deref()) {
+        let notice_text = coordination_notice.as_ref().map(|(text, _)| text.as_str());
+        let system = match (config.system.as_deref(), notice_text) {
             (Some(base), Some(notice)) => Some(format!("{base}\n\n{notice}")),
             (None, Some(notice)) => Some(notice.to_string()),
             (Some(base), None) => Some(base.to_string()),
@@ -440,6 +457,14 @@ pub async fn run(
             }
         };
         generation.finish(&resp);
+        // Two-phase notice delivery: only advance the watermark after a real
+        // provider response consumed the notice. Provider Error/Aborted leaves
+        // it pending so the next generation retries it (#1063/codeJung).
+        if !matches!(resp.stop_reason, StopReason::Error | StopReason::Aborted) {
+            if let Some((_, newest_message_id)) = coordination_notice.as_ref() {
+                acknowledge_coordination_model_notice(&session, *newest_message_id).await;
+            }
+        }
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
         if let Some(log_cfg) = &config.token_log {
             log_token_usage(log_cfg, &config.opts.model, &resp.usage);
@@ -1434,12 +1459,15 @@ mod tests {
             )
             .unwrap();
         let shared = shared(session);
-        let notice = coordination_model_notice(&shared).await.unwrap();
+        let (notice, newest) = coordination_model_notice(&shared).await.unwrap();
         assert!(notice.contains("1 new unread"));
         assert!(notice.contains("Highest importance: high"));
         assert!(notice.contains("fetch_inbox"));
         assert!(!notice.contains("SUBJECT_SECRET"));
         assert!(!notice.contains("BODY_SECRET"));
+        // Candidate repeats until a provider response successfully consumes it.
+        assert!(coordination_model_notice(&shared).await.is_some());
+        acknowledge_coordination_model_notice(&shared, newest).await;
         assert!(coordination_model_notice(&shared).await.is_none());
     }
 
@@ -1584,6 +1612,49 @@ mod tests {
         let system = calls[0].2.as_deref().unwrap_or_default();
         assert!(system.contains("DAIMONOS COORDINATION NOTICE"));
         assert!(!system.contains("secret body"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_does_not_suppress_coordination_notice_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("coord-db");
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(db_dir.to_string_lossy().to_string());
+        let mut tool_session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        tool_session.coordination_agent_name = Some("BlueLake".to_string());
+        let db = crate::coordination::workspace_db_path(&db_dir, dir.path());
+        let store = crate::coordination::CoordinationStore::open_with(&db, 5_000).unwrap();
+        store
+            .send_message(
+                "RedStone",
+                &["BlueLake".into()],
+                &[],
+                "secret",
+                "secret body",
+                crate::coordination::Importance::High,
+                false,
+                None,
+                "2026-07-25T00:00:00Z",
+            )
+            .unwrap();
+        let provider = RecordingProvider::new(vec![
+            LlmResponse::error("transient provider failure"),
+            end_turn_resp(),
+        ]);
+        let calls = provider.calls_handle();
+        let mut sess = AgentSession::new(Box::new(provider), tool_session, AgentConfig::default());
+        let failed = sess.prompt("first").await;
+        assert_eq!(failed.stop_reason, StopReason::Error);
+        let succeeded = sess.prompt("retry").await;
+        assert_eq!(succeeded.stop_reason, StopReason::EndTurn);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (_, _, system) in calls.iter() {
+            assert!(system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("DAIMONOS COORDINATION NOTICE"));
+        }
     }
 
     #[tokio::test]

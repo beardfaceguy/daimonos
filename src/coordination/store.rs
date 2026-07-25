@@ -574,9 +574,10 @@ impl CoordinationStore {
         Ok(out)
     }
 
-    /// Metadata-only unread summary newer than `after_message_id`. The query is
-    /// bounded to `scan_cap` rows and returns None when no new unread mail
-    /// exists. No subjects/bodies are selected.
+    /// Metadata-only unread summary newer than `after_message_id`. The indexed
+    /// aggregate returns None when no new unread mail exists and selects no
+    /// subjects/bodies. It is one bounded-result SQL aggregate (one row), not a
+    /// materialized message scan.
     pub fn unread_summary(
         &self,
         agent: &str,
@@ -606,7 +607,11 @@ impl CoordinationStore {
             3 => "urgent",
             2 => "high",
             1 => "normal",
-            _ => "low",
+            0 => "low",
+            // SQL normalizes unknown stored values to rank 1; keep defensive
+            // decode consistent with that default if corruption produces an
+            // unexpected integer.
+            _ => "normal",
         };
         Ok((count > 0).then(|| UnreadSummary {
             count,
