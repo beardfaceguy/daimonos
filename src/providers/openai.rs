@@ -125,7 +125,8 @@ impl LlmProvider for OpenAiProvider {
 }
 
 pub(crate) fn known_context_window(model: &str) -> Option<u64> {
-    (model == "gpt-5.6" || model.starts_with("gpt-5.6-")).then_some(GPT_56_CONTEXT_WINDOW)
+    (model == "gpt-5.6" || model == "gpt-5.6-sol" || model.starts_with("gpt-5.6-sol-"))
+        .then_some(GPT_56_CONTEXT_WINDOW)
 }
 
 pub(crate) fn build_request(ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
@@ -223,6 +224,9 @@ pub(crate) fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                     flush_text(&mut input, role, &mut text);
                     input.push(data.clone());
                 }
+                // Provider state belongs only to its owning adapter. Blocks
+                // in the wrong role are invalid neutral history and are
+                // deliberately ignored rather than sent on an invalid wire.
                 _ => {}
             }
         }
@@ -405,6 +409,9 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
     let value = message.to_ascii_lowercase();
     value.contains("maximum context length")
         || value.contains("context length exceeded")
+        || value.contains("context_length_exceeded")
+        || value.contains("context window")
+        || value.contains("prompt is too long")
         || value.contains("too many tokens")
         || value.contains("input is too long")
 }
@@ -452,11 +459,9 @@ impl StreamState {
             }
             Some("response.completed") | Some("response.incomplete") | Some("response.failed") => {
                 let mut parsed = parse_response(&event["response"], &self.model);
-                // Completed response is authoritative and contains all items;
-                // replace accumulated item content to avoid duplicates.
-                if !parsed.content.is_empty() {
-                    self.content = std::mem::take(&mut parsed.content);
-                }
+                // Terminal response is authoritative even when output is empty;
+                // replace accumulated output-item events to avoid stale items.
+                self.content = std::mem::take(&mut parsed.content);
                 if !self.text.is_empty()
                     && !self
                         .content
@@ -466,15 +471,30 @@ impl StreamState {
                     self.content
                         .insert(0, ContentBlock::Text(std::mem::take(&mut self.text)));
                 }
+                if !self.thinking.is_empty()
+                    && !self
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Thinking(_)))
+                {
+                    self.content
+                        .push(ContentBlock::Thinking(std::mem::take(&mut self.thinking)));
+                }
                 parsed.content = std::mem::take(&mut self.content);
                 self.terminal = Some(parsed);
                 self.finished = true;
             }
             Some("error") | Some("response.error") => {
-                self.terminal = Some(LlmResponse::error(format!(
-                    "openai stream error: {}",
-                    bounded(event["message"].as_str().unwrap_or("unknown error"), 500)
-                )));
+                let message = event["message"]
+                    .as_str()
+                    .or_else(|| event["error"]["message"].as_str())
+                    .unwrap_or("unknown error");
+                let full = format!("openai stream error: {}", bounded(message, 500));
+                self.terminal = Some(if is_context_overflow_error(message) {
+                    LlmResponse::context_overflow_error(full)
+                } else {
+                    LlmResponse::error(full)
+                });
                 self.finished = true;
             }
             _ => {}
@@ -812,6 +832,51 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_classifies_context_overflow() {
+        let mut state = StreamState::new("gpt-5.6-sol".into());
+        state.on_event(&json!({
+            "type":"response.error",
+            "error":{"message":"context_length_exceeded"}
+        }));
+        let response = state.finish();
+        assert_eq!(response.stop_reason, StopReason::Error);
+        assert!(response.context_overflow);
+    }
+
+    #[test]
+    fn stream_preserves_reasoning_delta_when_terminal_omits_summary() {
+        let mut state = StreamState::new("gpt-5.6-sol".into());
+        state.on_event(&json!({"type":"response.reasoning_summary_text.delta","delta":"why"}));
+        state.on_event(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","output":[],"usage":{}}
+        }));
+        let response = state.finish();
+        assert!(response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Thinking(text) if text == "why")));
+    }
+
+    #[test]
+    fn terminal_empty_output_drops_stale_completed_items() {
+        let mut state = StreamState::new("gpt-5.6-sol".into());
+        state.on_event(&json!({
+            "type":"response.output_item.done",
+            "item":{"type":"function_call","call_id":"stale","name":"exec","arguments":"{}"}
+        }));
+        state.on_event(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","output":[],"usage":{}}
+        }));
+        let response = state.finish();
+        assert!(!response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+    }
+
+    #[test]
     fn stream_state_emits_deltas_and_finishes_from_completed_response() {
         let mut state = StreamState::new("gpt-5.6-sol".into());
         assert_eq!(
@@ -862,6 +927,7 @@ mod tests {
             Some(1_050_000)
         );
         assert_eq!(provider.context_window("unknown").await, None);
+        assert_eq!(provider.context_window("gpt-5.6-mini").await, None);
         assert!(!provider.supports_images());
     }
 }
