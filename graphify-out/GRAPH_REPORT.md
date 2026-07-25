@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-25)
 
 ## Corpus Check
-- 204 files · ~242,599 words
+- 204 files · ~242,747 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4882 nodes · 11242 edges · 226 communities (206 shown, 20 thin omitted)
+- 4882 nodes · 11242 edges · 223 communities (201 shown, 22 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `6bf6d883`
+- Built from commit: `3d57676b`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -73,7 +73,6 @@
 - [[_COMMUNITY_Community 55|Community 55]]
 - [[_COMMUNITY_Community 56|Community 56]]
 - [[_COMMUNITY_Community 57|Community 57]]
-- [[_COMMUNITY_Community 58|Community 58]]
 - [[_COMMUNITY_Community 59|Community 59]]
 - [[_COMMUNITY_Community 60|Community 60]]
 - [[_COMMUNITY_Community 61|Community 61]]
@@ -218,7 +217,6 @@
 - [[_COMMUNITY_Community 209|Community 209]]
 - [[_COMMUNITY_Community 210|Community 210]]
 - [[_COMMUNITY_Community 211|Community 211]]
-- [[_COMMUNITY_Community 212|Community 212]]
 - [[_COMMUNITY_Community 213|Community 213]]
 - [[_COMMUNITY_Community 214|Community 214]]
 - [[_COMMUNITY_Community 215|Community 215]]
@@ -227,7 +225,6 @@
 - [[_COMMUNITY_Community 218|Community 218]]
 - [[_COMMUNITY_Community 219|Community 219]]
 - [[_COMMUNITY_Community 220|Community 220]]
-- [[_COMMUNITY_Community 221|Community 221]]
 - [[_COMMUNITY_Community 222|Community 222]]
 - [[_COMMUNITY_Community 223|Community 223]]
 - [[_COMMUNITY_Community 224|Community 224]]
@@ -279,7 +276,7 @@
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 - 1-file cycle: `src/snapshot.rs -> src/snapshot.rs`
 
-## Communities (226 total, 20 thin omitted)
+## Communities (223 total, 22 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.19
@@ -473,10 +470,6 @@ Nodes (25): acp_client_user_message_ids_round_trip(), atomic_write_leaves_no_tmp
 Cohesion: 0.17
 Nodes (21): McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content., tools/call write_file creates a file on disk. (+13 more)
 
-### Community 48 - "Community 48"
-Cohesion: 0.18
-Nodes (17): AcpDiff, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content(), acp_omits_terminal_metadata_without_client_capability(), acp_plain_text_tool_result_becomes_json_string_raw_output(), acp_tool_call_advertises_location() (+9 more)
-
 ### Community 49 - "Community 49"
 Cohesion: 0.07
 Nodes (27): Tests for token analytics and session_stats tool (CLA-297)., Per-tool breakdown should show individual tool stats., session_stats should appear in the default tool list (Terse tier)., After a few tool calls, session_stats should report non-zero totals., Spawn a fresh daimonos subprocess with custom env and complete the     MCP hands, When DAIMONOS_AGENT_SESSION_ID is set in the launch environment,     session_sta, Without the env var (default conftest fixture), session_stats     should report, The set_external_session_id MCP tool must mutate the live session     field; sub (+19 more)
@@ -512,10 +505,6 @@ Nodes (21): _expected_version(), _instructions(), Tests for MCP initialize hands
 ### Community 57 - "Community 57"
 Cohesion: 0.16
 Nodes (14): Debug, AnthropicImageSource, AnthropicProvider, AnthropicThinking, complete_returns_error_on_api_401(), context_window_returns_none_on_http_error(), from_env_errors_when_key_not_set(), Client (+6 more)
-
-### Community 58 - "Community 58"
-Cohesion: 0.14
-Nodes (17): Event, S, end_turn_resp(), ImageCapableProvider, MockProvider, RawErrorCapture, CompleteOpts, Context (+9 more)
 
 ### Community 59 - "Community 59"
 Cohesion: 0.16
@@ -610,8 +599,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.07
-Nodes (54): AcpContentBlock, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability() (+46 more)
+Cohesion: 0.09
+Nodes (46): InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_commands_execute_without_llm_and_clear_persisted_history() (+38 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -842,8 +831,8 @@ Cohesion: 0.29
 Nodes (7): 1. Open Zed settings, 2. Add daimonos as an MCP server, 3. Verify, Prerequisites, Setup, Troubleshooting, Zed Editor Setup
 
 ### Community 158 - "Community 158"
-Cohesion: 0.14
-Nodes (21): SessionInfo, encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), locations_for_read_file_include_offset_as_line(), locations_for_read_file_without_offset_have_no_line(), locations_for_write_and_edit_carry_path_only(), paginate_session_summaries(), pagination_summary() (+13 more)
+Cohesion: 0.04
+Nodes (68): AcpContentBlock, AcpDiff, CoreMessage, SessionInfo, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content() (+60 more)
 
 ### Community 161 - "Community 161"
 Cohesion: 0.50
@@ -855,7 +844,7 @@ Nodes (14): AgentResult, AgentSession, is_user_turn_message(), last_assistant_te
 
 ### Community 168 - "Community 168"
 Cohesion: 0.10
-Nodes (52): AgentSession, CancelSlot, ConnectTo, CurrentModel, McpClientPool, AcpCommand, AcpCompaction, AcpState (+44 more)
+Nodes (49): AgentSession, CancelSlot, ConnectTo, CurrentModel, McpClientPool, AcpCompaction, AcpState, align_client_user_message_ids() (+41 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.24
@@ -938,8 +927,8 @@ Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.15
-Nodes (31): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, CoreMessage, SessionId, acp_stop_reason_name(), available_commands() (+23 more)
+Cohesion: 0.18
+Nodes (28): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, SessionId, acp_stop_reason_name(), available_commands(), emit_usage_update() (+20 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -978,8 +967,8 @@ Cohesion: 0.20
 Nodes (23): Globals, Handle, build_globals(), execute_with_op_count(), llm_query_batched_rejects_oversized_batch(), llm_query_batched_reports_per_item_outcomes(), llm_query_returns_text_and_accumulates_usage(), llm_query_treats_refusal_as_error() (+15 more)
 
 ### Community 203 - "Community 203"
-Cohesion: 0.50
-Nodes (3): cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, Drop
+Cohesion: 0.21
+Nodes (7): OnceLock, Semaphore, cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, configure_max_concurrent(), init_semaphore(), Drop
 
 ### Community 204 - "Community 204"
 Cohesion: 0.08
@@ -1013,10 +1002,6 @@ Nodes (4): mint(), mint_always_valid_format(), mint_covers_many_distinct_names()
 Cohesion: 0.20
 Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
 
-### Community 212 - "Community 212"
-Cohesion: 0.50
-Nodes (4): OnceLock, Semaphore, configure_max_concurrent(), init_semaphore()
-
 ### Community 213 - "Community 213"
 Cohesion: 0.29
 Nodes (6): MockScriptToolPlugin, HashMap, Path, ToolDescriptor, ToolPlugin, ToolResult
@@ -1030,8 +1015,8 @@ Cohesion: 0.21
 Nodes (8): CoordinationOutcome, GenerationMetadata, record_bridge_lifecycle(), remote_server_alias(), Option, ThinkingLevel, ToolOutcome, ToolStatus
 
 ### Community 216 - "Community 216"
-Cohesion: 0.29
-Nodes (6): LevelFilter, capture_raw_error_logging(), log_raw_provider_error(), raw_provider_error_logged_when_debug_enabled(), raw_provider_error_not_logged_at_default_level(), Display
+Cohesion: 0.18
+Nodes (10): Event, LevelFilter, S, capture_raw_error_logging(), log_raw_provider_error(), raw_provider_error_logged_when_debug_enabled(), raw_provider_error_not_logged_at_default_level(), RawErrorCapture (+2 more)
 
 ### Community 217 - "Community 217"
 Cohesion: 0.18
@@ -1049,10 +1034,6 @@ Nodes (10): daimonos.default.toml (reference config), Discord Integration Setup 
 Cohesion: 0.25
 Nodes (8): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom Instructions (optional), Prerequisites, Setup, Troubleshooting
 
-### Community 221 - "Community 221"
-Cohesion: 1.00
-Nodes (3): error_has_http_status(), error_has_token(), safe_provider_error_message()
-
 ### Community 222 - "Community 222"
 Cohesion: 0.57
 Nodes (8): agent_system.md (Agent System Prompt), Claude Code Setup Guide, Cursor IDE Setup Guide, execute_script Tool, mcp_instructions.md (MCP Instructions Prompt), Other MCP-Compatible Tools Guide, Daimonos Prompts README, Embedded Starlark Interpreter
@@ -1065,10 +1046,6 @@ Nodes (8): Context compaction (required config), Model picker, Prerequisites, Sc
 Cohesion: 0.33
 Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
 
-### Community 225 - "Community 225"
-Cohesion: 0.33
-Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
-
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
   AGENTS.md · relation: references
@@ -1080,7 +1057,7 @@ Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock
 ## Knowledge Gaps
 - **797 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+792 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **22 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1095,7 +1072,7 @@ _Questions this graph is uniquely positioned to answer:_
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 34`, `Community 167`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
-- **Why does `RawErrorCapture` connect `Community 58` to `Community 216`, `Community 82`, `Community 168`?**
+- **Why does `RawErrorCapture` connect `Community 216` to `Community 168`, `Community 158`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **What connects `Load all task summaries from one run directory.`, `All run dirs belonging to (arm, tag), including -rN repetitions.`, `Per-task cross-run statistics: mean/min/max per metric, success rate,     contam` to the rest of the system?**
   _1000 weakly-connected nodes found - possible documentation gaps or missing edges._
