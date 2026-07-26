@@ -33,6 +33,11 @@ starlark = "0.13"
 # succeeded. Semver says 0.3.6 should be compatible with 0.3.4; upstream broke
 # that, so the bound stays until we move to starlark 0.14, which builds against
 # current allocative.
+#
+# On the range: 0.3.4 is what Cargo.lock pins and what everything here is built
+# and tested against. 0.3.5 is allowed but untested — kept in range so a genuine
+# patch fix can be picked up without a Cargo.toml edit. 0.3.6 is the known-broken
+# one. Narrow this to an exact 0.3.4 if an untested patch bump is unwelcome.
 allocative = ">=0.3.4, <0.3.6"
 # Pinned to our fork (branch fix/stateless-sse-stream-close): the #215 stderr
 # busy-loop fix plus two streamable-HTTP client fixes needed for stateless,
