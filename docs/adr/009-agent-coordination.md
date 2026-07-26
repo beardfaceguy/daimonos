@@ -313,11 +313,14 @@ system context for that generation, not persisted as a fake user turn. It
 contains only unread count, highest importance, agent name, and an instruction
 to call `fetch_inbox`; subjects and bodies are never injected automatically.
 
-ACP sessions also run a 1500ms idle poll by default. The poller acquires the
-`AgentSession` lock, so it naturally waits through active provider streams and
-tool execution, then emits a metadata-only `AgentThoughtChunk` to Zed. Model
-and UI delivery use independent newest-message-id watermarks to prevent repeat
-spam. Missing identity or store/query failure disables that check fail-open.
+ACP sessions also run a 1500ms idle poll by default. The poller uses a
+non-blocking `AgentSession` lock gate, so ticks during active provider streams
+or tool execution are skipped and retried only when idle. It then emits a
+clearly labeled, metadata-only `AgentMessageChunk` to Zed so the notice is
+immediately visible rather than hidden in collapsed reasoning. The update is
+UI-only and is never persisted into provider history. Model and UI delivery use
+independent newest-message-id watermarks to prevent repeat spam. Missing
+identity or store/query failure disables that check fail-open.
 
 Urgent mail does **not** cancel or interject into an active stream. That more
 hazardous behavior is deferred to Vikunja #1064 and remains disabled until a

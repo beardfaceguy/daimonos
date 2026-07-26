@@ -1029,7 +1029,7 @@ impl AgentSession {
         };
         Some((
             format!(
-                "Agent mail: {} new unread message(s) for {} (highest importance: {}). The agent will be notified at its next safe action boundary.",
+                "Daimonos agent mail: {} new unread message(s) for {} (highest importance: {}). The agent will be notified at its next safe action boundary.",
                 summary.count, agent, summary.highest_importance
             ),
             summary.newest_message_id,

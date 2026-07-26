@@ -1941,6 +1941,16 @@ async fn truncate_session(
     Ok(())
 }
 
+/// Render the human-facing idle notification as a normal visible agent message
+/// block. The explicit "Daimonos agent mail" label distinguishes this
+/// daemon-authored UI event from model-authored prose; it is not persisted into
+/// provider history.
+fn coordination_ui_update(text: String) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(TextContent::new(
+        text,
+    ))))
+}
+
 /// Poll a human-visible coordination notice only while the AgentSession is
 /// idle. `run_prompt_turn`/retry holds this mutex across provider streaming and
 /// tool execution; `try_lock` therefore skips (never queues) a mid-turn tick.
@@ -2075,7 +2085,7 @@ async fn build_session_handle(
                 let Some(handle) = weak.upgrade() else { break };
                 // Non-blocking idle gate: run_prompt_turn/retry holds this lock
                 // for the entire provider stream + tool loop. If busy, skip this
-                // tick so no AgentThoughtChunk can appear mid-stream/tool call.
+                // tick so no UI notification can appear mid-stream/tool call.
                 let notice = poll_coordination_ui_notice_if_idle(
                     &handle.session,
                     &notification_tool_session,
@@ -2086,9 +2096,7 @@ async fn build_session_handle(
                         Some(cx) => {
                             let delivery = cx.send_notification(SessionNotification::new(
                                 poll_session_id.clone(),
-                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                    AcpContentBlock::Text(TextContent::new(text)),
-                                )),
+                                coordination_ui_update(text),
                             ));
                             match delivery {
                                 Ok(()) => {
@@ -3351,6 +3359,24 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("ACP stdout write failed"));
         assert!(error.to_string().contains("denied"));
+    }
+
+    #[test]
+    fn coordination_ui_update_is_visible_agent_message_and_metadata_only() {
+        let text = "Daimonos agent mail: 1 new unread message(s) for NotifyB (highest importance: high). The agent will be notified at its next safe action boundary.";
+        let update = coordination_ui_update(text.to_string());
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
+                AcpContentBlock::Text(content) => {
+                    assert_eq!(content.text, text);
+                    assert!(content.text.starts_with("Daimonos agent mail:"));
+                    assert!(!content.text.contains("SUBJECT_SECRET"));
+                    assert!(!content.text.contains("BODY_SECRET"));
+                }
+                other => panic!("expected text content, got {other:?}"),
+            },
+            other => panic!("expected visible AgentMessageChunk, got {other:?}"),
+        }
     }
 
     #[tokio::test]
