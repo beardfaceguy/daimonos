@@ -323,11 +323,23 @@ impl RuntimeOption {
             }
             (RuntimeOptionSpec::Boolean, RuntimeValue::Bool(_)) => true,
             (RuntimeOptionSpec::Integer { min, max, step }, RuntimeValue::Integer(value)) => {
-                value >= min && value <= max && (value - min) % step == 0
+                *step > 0
+                    && min <= max
+                    && value >= min
+                    && value <= max
+                    && value
+                        .checked_sub(*min)
+                        .is_some_and(|offset| offset % step == 0)
             }
             _ => false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBudgetError {
+    OutputReservationNotBelowWindow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +350,7 @@ pub struct ContextUsage {
     pub effective_input_budget: Option<u64>,
     pub utilization_basis_points: Option<u16>,
     pub compaction_high_water_tokens: Option<u64>,
+    pub budget_error: Option<ContextBudgetError>,
 }
 
 impl ContextUsage {
@@ -347,6 +360,9 @@ impl ContextUsage {
         output_reservation: u64,
         compaction_high_water_tokens: Option<u64>,
     ) -> Self {
+        let budget_error = model_context_window
+            .filter(|window| output_reservation >= *window)
+            .map(|_| ContextBudgetError::OutputReservationNotBelowWindow);
         let effective_input_budget = model_context_window
             .and_then(|window| window.checked_sub(output_reservation))
             .filter(|budget| *budget > 0);
@@ -361,6 +377,7 @@ impl ContextUsage {
             effective_input_budget,
             utilization_basis_points,
             compaction_high_water_tokens,
+            budget_error,
         }
     }
 }
@@ -381,14 +398,25 @@ pub fn validate_next_sequence(previous: Option<u64>, next: u64) -> Result<(), Se
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolLimits {
+    /// UTF-8 byte cap. Validation rejects; it never truncates at this boundary.
     pub max_prompt_bytes: usize,
+    /// UTF-8 byte cap. Validation rejects; it never truncates at this boundary.
     pub max_label_bytes: usize,
+    pub max_identifier_bytes: usize,
+    pub max_ticket_bytes: usize,
+    pub max_runtime_value_bytes: usize,
+    pub max_capabilities: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolValidationError {
-    PromptTooLarge { max_bytes: usize },
-    ClientLabelTooLarge { max_bytes: usize },
+    FieldTooLarge {
+        field: &'static str,
+        max_bytes: usize,
+    },
+    TooManyCapabilities {
+        max: usize,
+    },
 }
 
 impl ProtocolLimits {
@@ -396,19 +424,54 @@ impl ProtocolLimits {
         &self,
         message: &ClientMessage,
     ) -> Result<(), ProtocolValidationError> {
-        match message {
-            ClientMessage::Prompt { text, .. } if text.len() > self.max_prompt_bytes => {
-                Err(ProtocolValidationError::PromptTooLarge {
-                    max_bytes: self.max_prompt_bytes,
+        let check = |field: &'static str, value: &str, max_bytes: usize| {
+            (value.len() > max_bytes)
+                .then_some(ProtocolValidationError::FieldTooLarge { field, max_bytes })
+        };
+        let error = match message {
+            ClientMessage::Attach {
+                ticket,
+                client,
+                requested_capabilities,
+                ..
+            } => check("attach.client.id", &client.id, self.max_identifier_bytes)
+                .or_else(|| check("attach.client.label", &client.label, self.max_label_bytes))
+                .or_else(|| {
+                    ticket
+                        .as_deref()
+                        .and_then(|ticket| check("attach.ticket", ticket, self.max_ticket_bytes))
+                })
+                .or_else(|| {
+                    (requested_capabilities.len() > self.max_capabilities).then_some(
+                        ProtocolValidationError::TooManyCapabilities {
+                            max: self.max_capabilities,
+                        },
+                    )
+                }),
+            ClientMessage::Prompt { request_id, text } => {
+                check("prompt.request_id", request_id, self.max_identifier_bytes)
+                    .or_else(|| check("prompt.text", text, self.max_prompt_bytes))
+            }
+            ClientMessage::ApprovalResponse { approval_id, .. } => check(
+                "approval_response.approval_id",
+                approval_id,
+                self.max_identifier_bytes,
+            ),
+            ClientMessage::Interrupt { request_id } => request_id
+                .as_deref()
+                .and_then(|id| check("interrupt.request_id", id, self.max_identifier_bytes)),
+            ClientMessage::SetConfig { config_id, value } => {
+                check("set_config.config_id", config_id, self.max_identifier_bytes).or_else(|| {
+                    if let RuntimeValue::String(value) = value {
+                        check("set_config.value", value, self.max_runtime_value_bytes)
+                    } else {
+                        None
+                    }
                 })
             }
-            ClientMessage::Attach { client, .. } if client.label.len() > self.max_label_bytes => {
-                Err(ProtocolValidationError::ClientLabelTooLarge {
-                    max_bytes: self.max_label_bytes,
-                })
-            }
-            _ => Ok(()),
-        }
+            ClientMessage::SyncRequest { .. } | ClientMessage::Ping | ClientMessage::Detach => None,
+        };
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -507,6 +570,14 @@ mod tests {
         let unknown = ContextUsage::new(100, None, 20, None);
         assert_eq!(unknown.effective_input_budget, None);
         assert_eq!(unknown.utilization_basis_points, None);
+        assert_eq!(unknown.budget_error, None);
+
+        let invalid = ContextUsage::new(100, Some(20), 20, None);
+        assert_eq!(invalid.effective_input_budget, None);
+        assert_eq!(
+            invalid.budget_error,
+            Some(ContextBudgetError::OutputReservationNotBelowWindow)
+        );
     }
 
     #[test]
@@ -540,6 +611,33 @@ mod tests {
         assert!(budget.accepts(&RuntimeValue::Integer(200_000)));
         assert!(!budget.accepts(&RuntimeValue::Integer(200_001)));
         assert!(!budget.accepts(&RuntimeValue::Integer(16_500)));
+    }
+
+    #[test]
+    fn malformed_integer_option_never_panics_or_overflows() {
+        let zero_step: RuntimeOption = serde_json::from_value(json!({
+            "id": "budget",
+            "label": "Budget",
+            "value": 0,
+            "default_value": 0,
+            "spec": { "type": "integer", "min": -9223372036854775808_i64, "max": 9223372036854775807_i64, "step": 0 },
+            "mutable_while_running": false,
+            "help": null
+        }))
+        .unwrap();
+        assert!(!zero_step.accepts(&RuntimeValue::Integer(0)));
+
+        let huge_step: RuntimeOption = serde_json::from_value(json!({
+            "id": "budget",
+            "label": "Budget",
+            "value": -9223372036854775808_i64,
+            "default_value": -9223372036854775808_i64,
+            "spec": { "type": "integer", "min": -9223372036854775808_i64, "max": 9223372036854775807_i64, "step": 2 },
+            "mutable_while_running": false,
+            "help": null
+        }))
+        .unwrap();
+        assert!(!huge_step.accepts(&RuntimeValue::Integer(9223372036854775807_i64)));
     }
 
     #[test]
@@ -623,6 +721,10 @@ mod tests {
         let limits = ProtocolLimits {
             max_prompt_bytes: 8,
             max_label_bytes: 6,
+            max_identifier_bytes: 4,
+            max_ticket_bytes: 6,
+            max_runtime_value_bytes: 5,
+            max_capabilities: 3,
         };
         assert!(limits
             .validate_client_message(&ClientMessage::Prompt {
@@ -635,7 +737,10 @@ mod tests {
                 request_id: "p1".to_string(),
                 text: "123456789".to_string(),
             }),
-            Err(ProtocolValidationError::PromptTooLarge { max_bytes: 8 })
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "prompt.text",
+                max_bytes: 8,
+            })
         );
         assert_eq!(
             limits.validate_client_message(&ClientMessage::Attach {
@@ -648,7 +753,110 @@ mod tests {
                 },
                 requested_capabilities: vec![ClientCapability::Observe],
             }),
-            Err(ProtocolValidationError::ClientLabelTooLarge { max_bytes: 6 })
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "attach.client.label",
+                max_bytes: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_limits_cover_all_untrusted_identifiers_tickets_and_values() {
+        let limits = ProtocolLimits {
+            max_prompt_bytes: 64,
+            max_label_bytes: 64,
+            max_identifier_bytes: 4,
+            max_ticket_bytes: 6,
+            max_runtime_value_bytes: 5,
+            max_capabilities: 2,
+        };
+        let too_large = |field| ProtocolValidationError::FieldTooLarge {
+            field,
+            max_bytes: 4,
+        };
+
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Prompt {
+                request_id: "12345".to_string(),
+                text: "ok".to_string(),
+            }),
+            Err(too_large("prompt.request_id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::ApprovalResponse {
+                approval_id: "12345".to_string(),
+                decision: ApprovalDecision::Deny,
+            }),
+            Err(too_large("approval_response.approval_id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Interrupt {
+                request_id: Some("12345".to_string()),
+            }),
+            Err(too_large("interrupt.request_id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::SetConfig {
+                config_id: "12345".to_string(),
+                value: RuntimeValue::Bool(true),
+            }),
+            Err(too_large("set_config.config_id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::SetConfig {
+                config_id: "mode".to_string(),
+                value: RuntimeValue::String("123456".to_string()),
+            }),
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "set_config.value",
+                max_bytes: 5,
+            })
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Attach {
+                protocol_version: PROTOCOL_VERSION,
+                ticket: Some("1234567".to_string()),
+                client: ClientInfo {
+                    id: "id".to_string(),
+                    kind: ClientKind::Android,
+                    label: "phone".to_string(),
+                },
+                requested_capabilities: vec![ClientCapability::Observe],
+            }),
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "attach.ticket",
+                max_bytes: 6,
+            })
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Attach {
+                protocol_version: PROTOCOL_VERSION,
+                ticket: None,
+                client: ClientInfo {
+                    id: "12345".to_string(),
+                    kind: ClientKind::Android,
+                    label: "phone".to_string(),
+                },
+                requested_capabilities: vec![ClientCapability::Observe],
+            }),
+            Err(too_large("attach.client.id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Attach {
+                protocol_version: PROTOCOL_VERSION,
+                ticket: None,
+                client: ClientInfo {
+                    id: "id".to_string(),
+                    kind: ClientKind::Android,
+                    label: "phone".to_string(),
+                },
+                requested_capabilities: vec![
+                    ClientCapability::Observe,
+                    ClientCapability::Prompt,
+                    ClientCapability::Interrupt,
+                ],
+            }),
+            Err(ProtocolValidationError::TooManyCapabilities { max: 2 })
         );
     }
 }
