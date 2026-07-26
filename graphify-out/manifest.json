@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785030079.7119281,
-    "ast_hash": "77164aa9619d476fe2658a0368373dd1",
+    "mtime": 1785033132.6954584,
+    "ast_hash": "a6305b59227d2c1b5b524c38991db8f8",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1785030144.8994453,
-    "ast_hash": "6b51f5ecd293602ee465f8d7b74f9287",
+    "mtime": 1785033132.6954584,
+    "ast_hash": "91e6ef94ccbb929f827bf2099e0054a0",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -270,7 +270,7 @@
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
-    "mtime": 1785029982.3286493,
+    "mtime": 1785032639.5240543,
     "ast_hash": "13f1e924f19258023a5047abb7ea2da9",
     "semantic_hash": ""
   },
@@ -280,12 +280,12 @@
     "semantic_hash": "84576370f5a7519c86d15b46e5280f28"
   },
   "src/chat_cmd.rs": {
-    "mtime": 1785006332.0710568,
+    "mtime": 1785032639.5240543,
     "ast_hash": "ce45f293f08d1a3cc4b4974970348a2d",
     "semantic_hash": ""
   },
   "src/compaction.rs": {
-    "mtime": 1785006332.0710568,
+    "mtime": 1785032639.5250542,
     "ast_hash": "bfffda90127f784fafaeea3a7b76c35d",
     "semantic_hash": ""
   },
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1784692241.1792347,
-    "ast_hash": "bf527bba28793178be442733a99d07ae",
+    "mtime": 1785039213.7629724,
+    "ast_hash": "f14720097e8bdac28ad63a7296dd631b",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -480,17 +480,17 @@
     "semantic_hash": ""
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1785006332.0720568,
+    "mtime": 1785032639.5250542,
     "ast_hash": "44438c82cf308523ebb987b92d27bc7c",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1785006332.0720568,
+    "mtime": 1785032639.5260541,
     "ast_hash": "79c68710dfa9739407d2b774a64b5802",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
-    "mtime": 1785006332.0720568,
+    "mtime": 1785032639.5260541,
     "ast_hash": "480a0479f99fb7dbee38d001d747ef8b",
     "semantic_hash": ""
   },
@@ -625,9 +625,9 @@
     "semantic_hash": "20fc74f37d2378473da5693c9840e6ac"
   },
   "tests/test_lifecycle.py": {
-    "mtime": 1779353632.692966,
-    "ast_hash": "38bfa5209e0a8ba7cd32686324c29e21",
-    "semantic_hash": "38bfa5209e0a8ba7cd32686324c29e21"
+    "mtime": 1785039162.7203195,
+    "ast_hash": "641908b6c8dcb0d9455388967bac1dc5",
+    "semantic_hash": ""
   },
   "tests/test_ls.py": {
     "mtime": 1782101848.115677,
@@ -745,8 +745,8 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1784929151.8509088,
-    "ast_hash": "bab6d7c940018611ddd96bbc0134db85",
+    "mtime": 1785032639.5070543,
+    "ast_hash": "3f8af16e9ae590227d449289723ce507",
     "semantic_hash": ""
   },
   "CHANGELOG.md": {
@@ -805,7 +805,7 @@
     "semantic_hash": ""
   },
   "docs/adr/001-provider-boundary-invariant.md": {
-    "mtime": 1785006332.057057,
+    "mtime": 1785032639.5070543,
     "ast_hash": "37b883db859c1932fe6a04fed0fd9878",
     "semantic_hash": ""
   },
@@ -830,7 +830,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785006332.057057,
+    "mtime": 1785032639.5080543,
     "ast_hash": "d1d1c4bc0602644d3564af3d2287ebc7",
     "semantic_hash": ""
   },
@@ -875,7 +875,7 @@
     "semantic_hash": ""
   },
   "docs/zed-acp-setup.md": {
-    "mtime": 1785006332.0580568,
+    "mtime": 1785032639.5080543,
     "ast_hash": "d5c9fda0be21e953d9dbe9d65d97b2fb",
     "semantic_hash": ""
   },
@@ -985,12 +985,12 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785024242.1372821,
+    "mtime": 1785032639.5240543,
     "ast_hash": "ef22e75241007800f0bd76e3f94228f9",
     "semantic_hash": ""
   },
   "src/observability.rs": {
-    "mtime": 1785006332.0720568,
+    "mtime": 1785032639.5250542,
     "ast_hash": "6fde0f8c346f9d8da64e3f5f9723e8e4",
     "semantic_hash": ""
   },
@@ -1045,12 +1045,12 @@
     "semantic_hash": ""
   },
   "docs/adr/009-agent-coordination.md": {
-    "mtime": 1784961825.549354,
-    "ast_hash": "61f34e740bcec26cb025b58fa899f20b",
+    "mtime": 1785033132.6944585,
+    "ast_hash": "c8cfd95c8f984dbd933ac2f8dc75fd31",
     "semantic_hash": ""
   },
   "src/providers/openai.rs": {
-    "mtime": 1785006332.0720568,
+    "mtime": 1785032639.5260541,
     "ast_hash": "1db43e2745016ad363267eadba7b6550",
     "semantic_hash": ""
   }

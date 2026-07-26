@@ -10,7 +10,7 @@ use rust_mcp_sdk::schema::{
 use rust_mcp_sdk::{McpServer, StdioTransport, TransportOptions};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -39,12 +39,125 @@ fn mcp_identity_meta() -> serde_json::Map<String, Value> {
     )])
 }
 
+/// Liveness signal shared by the request handlers and the idle watchdog.
+///
+/// Tracks two things, and the watchdog needs both:
+///
+/// * `last_activity` — unix-seconds of the most recent request boundary. Kept
+///   in an atomic so the watchdog never blocks on the session mutex.
+/// * `in_flight` — how many requests are currently executing.
+///
+/// `in_flight` exists because a timestamp alone cannot distinguish an
+/// abandoned server from a busy one. A single `exec` running a long build, or
+/// a command that hangs outright, produces no new requests, so a
+/// timestamp-only watchdog counted it as idle and killed the process
+/// mid-request. The client then saw an opaque transport error and lost the
+/// call's result.
+pub struct ActivityTracker {
+    last_activity: AtomicU64,
+    in_flight: AtomicUsize,
+}
+
+impl ActivityTracker {
+    pub fn new() -> Self {
+        Self {
+            last_activity: AtomicU64::new(now_unix_secs()),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    /// Stamp the clock without claiming an in-flight slot.
+    fn poke(&self) {
+        self.last_activity.store(now_unix_secs(), Ordering::Relaxed);
+    }
+
+    /// Mark a request as executing. The returned guard releases the slot and
+    /// re-stamps the clock on drop, so the idle window is measured from when a
+    /// request *finished* rather than when it arrived. Drop runs on early
+    /// return and on unwind, so a failing handler cannot leak a slot and wedge
+    /// the watchdog off forever.
+    fn begin_request(self: &Arc<Self>) -> RequestGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.poke();
+        RequestGuard(Arc::clone(self))
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn idle_secs(&self) -> u64 {
+        now_unix_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
+    }
+
+    /// Sample `(in_flight, idle_secs)` in the one order that is sound.
+    ///
+    /// The two values live in separate atomics, so any pair of reads is not a
+    /// consistent snapshot, and the order is load-bearing. Reading the clock
+    /// first admits this interleaving: read a stale timestamp, a long call then
+    /// completes (refreshing the clock and releasing its slot), read
+    /// `in_flight` as 0, and act on the stale reading — which defeats the
+    /// poke-before-release order in [`RequestGuard::drop`] entirely.
+    ///
+    /// Reading `in_flight` first inverts that. The guard stores the timestamp
+    /// and *then* releases the slot with a SeqCst read-modify-write, so a
+    /// SeqCst load that observes the released count synchronizes-with that
+    /// release and the timestamp read afterwards is guaranteed to be the
+    /// refreshed one.
+    ///
+    /// Encapsulated here rather than done at the call site so the ordering
+    /// cannot be silently reversed by a later edit.
+    fn liveness_snapshot(&self) -> (usize, u64) {
+        let in_flight = self.in_flight();
+        let idle_secs = self.idle_secs();
+        (in_flight, idle_secs)
+    }
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Releases an in-flight slot when a request handler returns.
+struct RequestGuard(Arc<ActivityTracker>);
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        // Order matters. Stamp the clock BEFORE releasing the slot.
+        //
+        // The watchdog vetoes on `in_flight > 0`, so the instant the count
+        // reaches zero the timestamp must already be fresh. Releasing first
+        // leaves a window where the watchdog sees an unoccupied server whose
+        // clock is still stale by the entire duration of the call that just
+        // finished — and for any call longer than the timeout that means it
+        // exits immediately, reintroducing the very bug this guard exists to
+        // prevent, just on completion instead of mid-call.
+        //
+        // The SeqCst read-modify-write below also publishes the store above,
+        // but only for a reader that loads `in_flight` *before* the timestamp:
+        // observing the released count then synchronizes-with this release. That
+        // read order is why [`ActivityTracker::liveness_snapshot`] exists; a
+        // reader that samples the clock first gets no such guarantee.
+        self.0.poke();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether the watchdog should terminate the process.
+///
+/// Split out from the timer loop so the policy is unit-testable. A non-zero
+/// `in_flight` vetoes the exit no matter how stale the clock is: work in
+/// progress is the strongest possible evidence the server is not abandoned.
+fn should_exit_for_idle(idle_secs: u64, timeout_secs: u64, in_flight: usize) -> bool {
+    timeout_secs != 0 && in_flight == 0 && idle_secs >= timeout_secs
+}
+
 pub struct DaimonosHandler {
     session: Arc<Mutex<Session>>,
-    /// Updated on every incoming request so the idle watchdog can detect
-    /// abandonment. Storing unix-seconds in an `AtomicU64` lets the
-    /// watchdog read it without ever blocking on the session mutex.
-    last_activity: Arc<AtomicU64>,
+    /// Request liveness shared with the idle watchdog.
+    activity: Arc<ActivityTracker>,
     /// When true, re-root diagnostics are written to stderr. Mirrors the
     /// server's startup-log gate so MCP-quiet mode stays silent (Cursor
     /// surfaces subprocess stderr as `[error]`).
@@ -52,16 +165,19 @@ pub struct DaimonosHandler {
 }
 
 impl DaimonosHandler {
-    pub fn new(session: Session, last_activity: Arc<AtomicU64>, startup_logs: bool) -> Self {
+    pub fn new(session: Session, activity: Arc<ActivityTracker>, startup_logs: bool) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
-            last_activity,
+            activity,
             startup_logs,
         }
     }
 
-    fn poke_activity(&self) {
-        self.last_activity.store(now_unix_secs(), Ordering::Relaxed);
+    /// Claim an in-flight slot for the duration of a request. Hold the guard
+    /// for the whole handler body; dropping it early re-opens the idle window
+    /// while the request is still running.
+    fn begin_request(&self) -> RequestGuard {
+        self.activity.begin_request()
     }
 }
 
@@ -932,7 +1048,7 @@ impl ServerHandler for DaimonosHandler {
         _request: Option<PaginatedRequestParams>,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<ListToolsResult, RpcError> {
-        self.poke_activity();
+        let _activity = self.begin_request();
         let session = self.session.lock().await;
         let descriptions = &session.cfg.prompts.resolved_tool_descriptions;
         let all = tools::tool_definitions(descriptions);
@@ -961,7 +1077,8 @@ impl ServerHandler for DaimonosHandler {
         params: CallToolRequestParams,
         runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
-        self.poke_activity();
+        // Held for the whole call: a long or hung tool must not read as idle.
+        let _activity = self.begin_request();
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
 
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
@@ -1267,7 +1384,7 @@ fn effective_idle_timeout(cfg: &Config) -> u64 {
 /// daimonos process holding inotify watches, fds and memory.
 fn spawn_idle_watchdog(
     timeout_secs: u64,
-    last_activity: Arc<AtomicU64>,
+    activity: Arc<ActivityTracker>,
     analytics: Option<Arc<AnalyticsStore>>,
     startup_logs: bool,
 ) {
@@ -1289,10 +1406,17 @@ fn spawn_idle_watchdog(
         let interval = Duration::from_millis(500);
         loop {
             tokio::time::sleep(interval).await;
-            let last = last_activity.load(Ordering::Relaxed);
-            let now = now_unix_secs();
-            let idle = now.saturating_sub(last);
-            if idle >= timeout_secs {
+            let (in_flight, idle) = activity.liveness_snapshot();
+            if should_exit_for_idle(idle, timeout_secs, in_flight) {
+                // Logged at WARN, not just stderr-under-a-flag: this exit can
+                // discard a session's remaining work, and when it was only an
+                // `eprintln!` the shutdown left no trace in the JSON log at all.
+                tracing::warn!(
+                    event = "idle_shutdown",
+                    idle_secs = idle,
+                    timeout_secs,
+                    "idle watchdog exiting to release resources"
+                );
                 if startup_logs {
                     eprintln!(
                         "daimonos: idle for {idle}s (>= {timeout_secs}s timeout) — exiting to release resources"
@@ -1337,10 +1461,10 @@ pub async fn run_mcp_server(
     startup_logs: bool,
 ) -> anyhow::Result<()> {
     let idle_timeout_secs = effective_idle_timeout(&cfg);
-    let last_activity = Arc::new(AtomicU64::new(now_unix_secs()));
+    let activity = Arc::new(ActivityTracker::new());
     spawn_idle_watchdog(
         idle_timeout_secs,
-        last_activity.clone(),
+        activity.clone(),
         analytics.clone(),
         startup_logs,
     );
@@ -1361,7 +1485,7 @@ pub async fn run_mcp_server(
     session.verbosity = config::effective_verbosity(&session.cfg);
 
     let instructions = build_instructions(&workspace, &session.cfg).await;
-    let handler = DaimonosHandler::new(session, last_activity, startup_logs);
+    let handler = DaimonosHandler::new(session, activity, startup_logs);
 
     let server_details = InitializeResult {
         server_info: Implementation {
@@ -1627,6 +1751,135 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Idle watchdog: an in-flight request is not idleness (vikunja #1078) ---
+
+    #[test]
+    fn idle_exit_fires_once_the_window_passes_with_nothing_in_flight() {
+        assert!(should_exit_for_idle(600, 600, 0));
+        assert!(should_exit_for_idle(601, 600, 0));
+    }
+
+    #[test]
+    fn idle_exit_is_vetoed_while_a_request_is_in_flight() {
+        // The regression. A single long or hung tool call sends no new
+        // requests, so the clock goes stale while the server is genuinely
+        // busy. Killing it there loses the call's result and surfaces to the
+        // client as an opaque transport error.
+        assert!(!should_exit_for_idle(600, 600, 1));
+        assert!(!should_exit_for_idle(86_400, 600, 1));
+        assert!(!should_exit_for_idle(86_400, 600, 4));
+    }
+
+    #[test]
+    fn idle_exit_does_not_fire_before_the_window() {
+        assert!(!should_exit_for_idle(599, 600, 0));
+        assert!(!should_exit_for_idle(0, 600, 0));
+    }
+
+    #[test]
+    fn idle_exit_is_disabled_by_a_zero_timeout() {
+        assert!(!should_exit_for_idle(u64::MAX, 0, 0));
+    }
+
+    #[test]
+    fn request_guard_tracks_and_releases_in_flight_slots() {
+        let activity = Arc::new(ActivityTracker::new());
+        assert_eq!(activity.in_flight(), 0);
+
+        let first = activity.begin_request();
+        assert_eq!(activity.in_flight(), 1);
+
+        let second = activity.begin_request();
+        assert_eq!(activity.in_flight(), 2);
+
+        drop(second);
+        assert_eq!(activity.in_flight(), 1);
+
+        drop(first);
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    #[test]
+    fn request_guard_releases_its_slot_on_unwind() {
+        // A handler that panics must not leave the slot claimed forever, which
+        // would disable the watchdog for the life of the process.
+        let activity = Arc::new(ActivityTracker::new());
+        let panicking = Arc::clone(&activity);
+
+        let result = std::panic::catch_unwind(move || {
+            let _guard = panicking.begin_request();
+            assert_eq!(panicking.in_flight(), 1);
+            panic!("handler blew up");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    #[test]
+    fn releasing_the_last_slot_leaves_a_fresh_idle_window() {
+        // A long call ends with a clock that is stale by its whole duration.
+        // Releasing the slot must refresh the clock, or the watchdog exits the
+        // instant the veto lifts — the same kill, moved to completion time.
+        let activity = Arc::new(ActivityTracker::new());
+        let guard = activity.begin_request();
+
+        // Simulate a call that ran far longer than any timeout.
+        activity
+            .last_activity
+            .store(now_unix_secs().saturating_sub(10_000), Ordering::Relaxed);
+        assert!(
+            !should_exit_for_idle(activity.idle_secs(), 600, activity.in_flight()),
+            "in-flight work must veto the exit even with a very stale clock"
+        );
+
+        drop(guard);
+
+        assert_eq!(activity.in_flight(), 0);
+        assert!(
+            !should_exit_for_idle(activity.idle_secs(), 600, activity.in_flight()),
+            "releasing the last in-flight slot must restart the idle window \
+             from completion time, not leave the pre-call timestamp in place"
+        );
+    }
+
+    #[test]
+    fn liveness_snapshot_never_reports_a_stale_clock_as_unoccupied() {
+        // The sampling order is what makes the pair usable. With the clock read
+        // first, a call completing between the two loads yields (stale idle,
+        // in_flight 0) and the watchdog exits on a server that just finished
+        // work. The snapshot must never hand back that combination.
+        let activity = Arc::new(ActivityTracker::new());
+        let guard = activity.begin_request();
+        activity
+            .last_activity
+            .store(now_unix_secs().saturating_sub(10_000), Ordering::Relaxed);
+
+        let (in_flight, idle) = activity.liveness_snapshot();
+        assert_eq!(in_flight, 1);
+        assert!(idle >= 10_000);
+        assert!(!should_exit_for_idle(idle, 600, in_flight));
+
+        drop(guard);
+
+        let (in_flight, idle) = activity.liveness_snapshot();
+        assert_eq!(in_flight, 0);
+        assert!(
+            idle <= 1,
+            "observing an unoccupied tracker must come with the refreshed \
+             timestamp, got idle={idle}s"
+        );
+        assert!(!should_exit_for_idle(idle, 600, in_flight));
+    }
+
+    #[test]
+    fn a_fresh_tracker_starts_idle_and_unoccupied() {
+        let activity = ActivityTracker::new();
+        assert_eq!(activity.in_flight(), 0);
+        // Freshly stamped, so within the same second.
+        assert!(activity.idle_secs() <= 1);
+    }
 
     #[test]
     fn response_to_result_ok() {
