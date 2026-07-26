@@ -1663,6 +1663,7 @@ async fn run_prompt_turn(
     user_message: CoreMessage,
     client_user_message_id: Option<String>,
     store: Option<&SessionStore>,
+    assistant_prefix: Option<String>,
 ) -> AcpStopReason {
     // Acquire exclusive access to this session *before* publishing the
     // turn's connection/cancel handles — otherwise a second overlapping
@@ -1729,6 +1730,20 @@ async fn run_prompt_turn(
         return AcpStopReason::EndTurn;
     }
 
+    // Stream the prefix at the start of the turn, but do not put it in the
+    // provider's input context. On successful completion below, it becomes a
+    // real leading assistant history message for persistence and replay.
+    // Direct commands returned above intentionally do not receive a prefix.
+    if let Some(prefix) = assistant_prefix.as_ref() {
+        send_notification(
+            cx,
+            session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                TextContent::new(prefix.clone()),
+            ))),
+        );
+    }
+
     let notify = Arc::new(tokio::sync::Notify::new());
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
@@ -1736,6 +1751,18 @@ async fn run_prompt_turn(
         turn = agent_session.prompt_message(user_message) => Some(turn),
         _ = notify.notified() => None,
     };
+    if outcome.is_some() {
+        if let Some(prefix) = assistant_prefix {
+            if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
+                tracing::error!(
+                    target: "daimonos::acp",
+                    event = "assistant_turn_prefix_insert_failed",
+                    session_id = %session_id,
+                    error = %error,
+                );
+            }
+        }
+    }
 
     // Snapshot the updated history while we still hold the session lock, so we
     // can persist it after releasing the lock (cross-process session/load
@@ -2955,19 +2982,9 @@ fn build_agent_with_state(
                                         );
                                         AcpStopReason::EndTurn
                                     } else {
-                                        if state.timestamp_turns {
-                                            send_notification(
-                                                &spawn_cx,
-                                                &session_id,
-                                                SessionUpdate::AgentMessageChunk(
-                                                    ContentChunk::new(AcpContentBlock::Text(
-                                                        TextContent::new(turn_timestamp_line(
-                                                            chrono::Local::now(),
-                                                        )),
-                                                    )),
-                                                ),
-                                            );
-                                        }
+                                        let assistant_prefix = state
+                                            .timestamp_turns
+                                            .then(|| turn_timestamp_line(chrono::Local::now()));
                                         run_prompt_turn(
                                             &handle,
                                             &spawn_cx,
@@ -2975,6 +2992,7 @@ fn build_agent_with_state(
                                             user_message,
                                             client_user_message_id,
                                             state.store.as_ref(),
+                                            assistant_prefix,
                                         )
                                         .instrument(prompt_span.span().clone())
                                         .await
@@ -3811,8 +3829,21 @@ mod tests {
         assert!(line.ends_with("]\n"));
     }
 
-    async fn first_turn_assistant_texts(timestamp_turns: bool) -> Vec<String> {
+    fn assistant_texts(history: &[crate::providers::Message]) -> Vec<String> {
+        history
+            .iter()
+            .filter(|m| m.role == CoreRole::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                CoreBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn first_turn_assistant_texts(timestamp_turns: bool) -> (Vec<String>, Vec<String>) {
         let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
         let mut state_out = None;
         let agent = build_agent_with_state(
             mock_factory(vec![end_turn_resp("hello from daimonos")]),
@@ -3822,7 +3853,7 @@ mod tests {
             vec!["test-model".to_string()],
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
-            None,
+            Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
             timestamp_turns,
@@ -3861,37 +3892,43 @@ mod tests {
             .cloned()
             .expect("live session");
         let history = handle.session.lock().await.history().to_vec();
-        history
-            .iter()
-            .filter(|m| m.role == CoreRole::Assistant)
-            .flat_map(|m| m.content.iter())
-            .filter_map(|b| match b {
-                CoreBlock::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect()
+        let persisted = state
+            .store
+            .as_ref()
+            .expect("session store")
+            .load(&session_id.to_string())
+            .expect("persisted session");
+        (
+            assistant_texts(&history),
+            assistant_texts(&persisted.messages),
+        )
     }
 
     #[tokio::test]
     async fn timestamp_turn_on_prefixes_assistant_history() {
-        let texts = first_turn_assistant_texts(true).await;
+        let (texts, persisted_texts) = first_turn_assistant_texts(true).await;
         let re = regex::Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .+\]\n$").unwrap();
         let stamps = texts.iter().filter(|t| re.is_match(t)).count();
-        assert_eq!(stamps, 1, "expected exactly one timestamp line, got {texts:?}");
+        assert_eq!(
+            stamps, 1,
+            "expected exactly one timestamp line, got {texts:?}"
+        );
         assert!(
             texts.iter().any(|t| t.contains("hello from daimonos")),
             "model text still present: {texts:?}"
         );
+        assert_eq!(persisted_texts, texts, "timestamp must survive persistence");
     }
 
     #[tokio::test]
     async fn timestamp_turn_off_by_default_emits_no_timestamp() {
-        let texts = first_turn_assistant_texts(false).await;
+        let (texts, persisted_texts) = first_turn_assistant_texts(false).await;
         let re = regex::Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .+\]\n$").unwrap();
         assert!(
             !texts.iter().any(|t| re.is_match(t)),
             "no timestamp line expected: {texts:?}"
         );
+        assert_eq!(persisted_texts, texts);
     }
 
     #[tokio::test]

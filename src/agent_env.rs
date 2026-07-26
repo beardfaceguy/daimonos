@@ -751,11 +751,17 @@ mod tests {
         assert!(!load_str(&base()).unwrap().timestamp_turns);
         for on in ["true", "1", "on", "yes", "YES", "On"] {
             let s = base() + &format!("DAIMONOS_AGENT_TIMESTAMP_TURNS={on}\n");
-            assert!(load_str(&s).unwrap().timestamp_turns, "expected on for {on}");
+            assert!(
+                load_str(&s).unwrap().timestamp_turns,
+                "expected on for {on}"
+            );
         }
         for off in ["false", "0", "off", "no", "  "] {
             let s = base() + &format!("DAIMONOS_AGENT_TIMESTAMP_TURNS={off}\n");
-            assert!(!load_str(&s).unwrap().timestamp_turns, "expected off for '{off}'");
+            assert!(
+                !load_str(&s).unwrap().timestamp_turns,
+                "expected off for '{off}'"
+            );
         }
     }
 
