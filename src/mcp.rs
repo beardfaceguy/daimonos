@@ -89,6 +89,29 @@ impl ActivityTracker {
     fn idle_secs(&self) -> u64 {
         now_unix_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
     }
+
+    /// Sample `(in_flight, idle_secs)` in the one order that is sound.
+    ///
+    /// The two values live in separate atomics, so any pair of reads is not a
+    /// consistent snapshot, and the order is load-bearing. Reading the clock
+    /// first admits this interleaving: read a stale timestamp, a long call then
+    /// completes (refreshing the clock and releasing its slot), read
+    /// `in_flight` as 0, and act on the stale reading — which defeats the
+    /// poke-before-release order in [`RequestGuard::drop`] entirely.
+    ///
+    /// Reading `in_flight` first inverts that. The guard stores the timestamp
+    /// and *then* releases the slot with a SeqCst read-modify-write, so a
+    /// SeqCst load that observes the released count synchronizes-with that
+    /// release and the timestamp read afterwards is guaranteed to be the
+    /// refreshed one.
+    ///
+    /// Encapsulated here rather than done at the call site so the ordering
+    /// cannot be silently reversed by a later edit.
+    fn liveness_snapshot(&self) -> (usize, u64) {
+        let in_flight = self.in_flight();
+        let idle_secs = self.idle_secs();
+        (in_flight, idle_secs)
+    }
 }
 
 impl Default for ActivityTracker {
@@ -112,9 +135,11 @@ impl Drop for RequestGuard {
         // exits immediately, reintroducing the very bug this guard exists to
         // prevent, just on completion instead of mid-call.
         //
-        // The SeqCst read-modify-write below also publishes the store above: a
-        // watchdog that observes the decremented count is guaranteed to observe
-        // the refreshed timestamp with it.
+        // The SeqCst read-modify-write below also publishes the store above,
+        // but only for a reader that loads `in_flight` *before* the timestamp:
+        // observing the released count then synchronizes-with this release. That
+        // read order is why [`ActivityTracker::liveness_snapshot`] exists; a
+        // reader that samples the clock first gets no such guarantee.
         self.0.poke();
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1381,8 +1406,7 @@ fn spawn_idle_watchdog(
         let interval = Duration::from_millis(500);
         loop {
             tokio::time::sleep(interval).await;
-            let idle = activity.idle_secs();
-            let in_flight = activity.in_flight();
+            let (in_flight, idle) = activity.liveness_snapshot();
             if should_exit_for_idle(idle, timeout_secs, in_flight) {
                 // Logged at WARN, not just stderr-under-a-flag: this exit can
                 // discard a session's remaining work, and when it was only an
@@ -1818,6 +1842,35 @@ mod tests {
             "releasing the last in-flight slot must restart the idle window \
              from completion time, not leave the pre-call timestamp in place"
         );
+    }
+
+    #[test]
+    fn liveness_snapshot_never_reports_a_stale_clock_as_unoccupied() {
+        // The sampling order is what makes the pair usable. With the clock read
+        // first, a call completing between the two loads yields (stale idle,
+        // in_flight 0) and the watchdog exits on a server that just finished
+        // work. The snapshot must never hand back that combination.
+        let activity = Arc::new(ActivityTracker::new());
+        let guard = activity.begin_request();
+        activity
+            .last_activity
+            .store(now_unix_secs().saturating_sub(10_000), Ordering::Relaxed);
+
+        let (in_flight, idle) = activity.liveness_snapshot();
+        assert_eq!(in_flight, 1);
+        assert!(idle >= 10_000);
+        assert!(!should_exit_for_idle(idle, 600, in_flight));
+
+        drop(guard);
+
+        let (in_flight, idle) = activity.liveness_snapshot();
+        assert_eq!(in_flight, 0);
+        assert!(
+            idle <= 1,
+            "observing an unoccupied tracker must come with the refreshed \
+             timestamp, got idle={idle}s"
+        );
+        assert!(!should_exit_for_idle(idle, 600, in_flight));
     }
 
     #[test]
