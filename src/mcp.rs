@@ -102,8 +102,21 @@ struct RequestGuard(Arc<ActivityTracker>);
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // Order matters. Stamp the clock BEFORE releasing the slot.
+        //
+        // The watchdog vetoes on `in_flight > 0`, so the instant the count
+        // reaches zero the timestamp must already be fresh. Releasing first
+        // leaves a window where the watchdog sees an unoccupied server whose
+        // clock is still stale by the entire duration of the call that just
+        // finished — and for any call longer than the timeout that means it
+        // exits immediately, reintroducing the very bug this guard exists to
+        // prevent, just on completion instead of mid-call.
+        //
+        // The SeqCst read-modify-write below also publishes the store above: a
+        // watchdog that observes the decremented count is guaranteed to observe
+        // the refreshed timestamp with it.
         self.0.poke();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1778,6 +1791,33 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(activity.in_flight(), 0);
+    }
+
+    #[test]
+    fn releasing_the_last_slot_leaves_a_fresh_idle_window() {
+        // A long call ends with a clock that is stale by its whole duration.
+        // Releasing the slot must refresh the clock, or the watchdog exits the
+        // instant the veto lifts — the same kill, moved to completion time.
+        let activity = Arc::new(ActivityTracker::new());
+        let guard = activity.begin_request();
+
+        // Simulate a call that ran far longer than any timeout.
+        activity
+            .last_activity
+            .store(now_unix_secs().saturating_sub(10_000), Ordering::Relaxed);
+        assert!(
+            !should_exit_for_idle(activity.idle_secs(), 600, activity.in_flight()),
+            "in-flight work must veto the exit even with a very stale clock"
+        );
+
+        drop(guard);
+
+        assert_eq!(activity.in_flight(), 0);
+        assert!(
+            !should_exit_for_idle(activity.idle_secs(), 600, activity.in_flight()),
+            "releasing the last in-flight slot must restart the idle window \
+             from completion time, not leave the pre-call timestamp in place"
+        );
     }
 
     #[test]
