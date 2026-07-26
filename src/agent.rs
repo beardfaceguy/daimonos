@@ -1258,6 +1258,22 @@ impl AgentSession {
         &self.messages
     }
 
+    /// Insert a synthetic assistant message at the start of the most recent
+    /// user turn. Frontends can use this for turn metadata after the provider
+    /// has completed, so it cannot alter that turn's request. The inserted
+    /// message is part of normal persisted history.
+    pub fn insert_assistant_turn_prefix(
+        &mut self,
+        prefix: impl Into<String>,
+    ) -> Result<(), String> {
+        let Some(user_index) = self.messages.iter().rposition(is_user_turn_message) else {
+            return Err("cannot prefix assistant turn: session has no user turn".to_string());
+        };
+        self.messages
+            .insert(user_index + 1, Message::assistant(prefix));
+        Ok(())
+    }
+
     /// Replace the conversation history, e.g. restoring a persisted ACP
     /// session on `session/load` after a process restart. Cumulative usage is
     /// left untouched (it's a fresh process, so there's none to preserve).

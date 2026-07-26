@@ -230,6 +230,7 @@ pub async fn run_acp(
         sessions_dir,
         acp_cmd::AcpCompaction::new(compaction, compaction_follows_model),
         analytics_store,
+        agent.timestamp_turns,
     )
     .await
 }

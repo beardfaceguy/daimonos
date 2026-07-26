@@ -87,6 +87,10 @@ pub struct AgentEnv {
     /// effective `Option<CompactionPolicy>` by [`Self::resolve_compaction`]
     /// once the provider and effective model are known.
     pub compaction: CompactionConfig,
+    /// Opt-in: prefix each ACP agent turn with a real system-clock timestamp
+    /// line so a stalled vs. active agent is visible in the thread (#1070).
+    /// From `DAIMONOS_AGENT_TIMESTAMP_TURNS`; default false.
+    pub timestamp_turns: bool,
 }
 
 impl AgentEnv {
@@ -185,6 +189,11 @@ impl AgentEnv {
         let model = present("DAIMONOS_AGENT_MODEL").unwrap();
         let models = candidate_models(&model, parse_list(vars.get("DAIMONOS_AGENT_MODELS")));
         let compaction = parse_compaction(vars, path)?;
+        let timestamp_turns = parse_bool_flag(
+            vars.get("DAIMONOS_AGENT_TIMESTAMP_TURNS"),
+            "DAIMONOS_AGENT_TIMESTAMP_TURNS",
+            path,
+        )?;
 
         Ok(AgentEnv {
             provider,
@@ -196,6 +205,7 @@ impl AgentEnv {
             denied_commands: parse_list(vars.get("DAIMONOS_AGENT_DENIED_COMMANDS")),
             models,
             compaction,
+            timestamp_turns,
         })
     }
 
@@ -474,6 +484,24 @@ fn parse_list(raw: Option<&String>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Parse an optional boolean env flag. Absent/empty => false. Accepts
+/// `true/1/on/yes` and `false/0/off/no` (case-insensitive); any other
+/// non-empty value is a hard error naming the key and path (no silent
+/// fallback, matching the rest of agent-env validation).
+fn parse_bool_flag(raw: Option<&String>, key: &str, path: &Path) -> Result<bool, String> {
+    match raw.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        None => Ok(false),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Ok(true),
+            "false" | "0" | "off" | "no" => Ok(false),
+            other => Err(format!(
+                "agent configuration for {}: {key} '{other}' invalid (valid: true, false)",
+                path.display()
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +744,33 @@ mod tests {
         assert_eq!(env.provider, "openai");
         assert_eq!(env.model, "gpt-5.6-sol");
         assert_eq!(env.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn timestamp_turns_defaults_off_and_parses_truthy_values() {
+        assert!(!load_str(&base()).unwrap().timestamp_turns);
+        for on in ["true", "1", "on", "yes", "YES", "On"] {
+            let s = base() + &format!("DAIMONOS_AGENT_TIMESTAMP_TURNS={on}\n");
+            assert!(
+                load_str(&s).unwrap().timestamp_turns,
+                "expected on for {on}"
+            );
+        }
+        for off in ["false", "0", "off", "no", "  "] {
+            let s = base() + &format!("DAIMONOS_AGENT_TIMESTAMP_TURNS={off}\n");
+            assert!(
+                !load_str(&s).unwrap().timestamp_turns,
+                "expected off for '{off}'"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_turns_rejects_garbage_value() {
+        let s = base() + "DAIMONOS_AGENT_TIMESTAMP_TURNS=maybe\n";
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("DAIMONOS_AGENT_TIMESTAMP_TURNS"), "{err}");
+        assert!(err.contains("invalid"), "{err}");
     }
 
     #[test]

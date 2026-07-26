@@ -369,6 +369,9 @@ struct AcpState {
     /// Analytics store for attributing remote MCP tool calls (ADR-003).
     /// `None` when analytics is disabled.
     analytics: Option<Arc<AnalyticsStore>>,
+    /// When true, each prompt turn is prefixed with a real system-clock
+    /// timestamp line in the thread (#1070, `DAIMONOS_AGENT_TIMESTAMP_TURNS`).
+    timestamp_turns: bool,
     /// Process-wide pool for deduplicating identical forwarded MCP server
     /// configs across ACP sessions (#1008). Bridges retain explicit leases.
     mcp_pool: McpClientPool,
@@ -1433,6 +1436,18 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
     }
 }
 
+/// Format the per-turn timestamp line shown at the top of an agent turn when
+/// `DAIMONOS_AGENT_TIMESTAMP_TURNS` is on (#1070). Sourced from the OS clock
+/// by the caller (never the model). Generic over the timezone so tests can
+/// pin a fixed instant. Kept as its own line so it renders distinctly and
+/// persists/replays like any other assistant text.
+fn turn_timestamp_line<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!("[{}]\n", now.format("%Y-%m-%d %H:%M:%S %Z"))
+}
+
 fn send_provider_error_diagnostic(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
@@ -1648,6 +1663,7 @@ async fn run_prompt_turn(
     user_message: CoreMessage,
     client_user_message_id: Option<String>,
     store: Option<&SessionStore>,
+    assistant_prefix: Option<String>,
 ) -> AcpStopReason {
     // Acquire exclusive access to this session *before* publishing the
     // turn's connection/cancel handles — otherwise a second overlapping
@@ -1714,6 +1730,20 @@ async fn run_prompt_turn(
         return AcpStopReason::EndTurn;
     }
 
+    // Stream the prefix at the start of the turn, but do not put it in the
+    // provider's input context. On successful completion below, it becomes a
+    // real leading assistant history message for persistence and replay.
+    // Direct commands returned above intentionally do not receive a prefix.
+    if let Some(prefix) = assistant_prefix.as_ref() {
+        send_notification(
+            cx,
+            session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                TextContent::new(prefix.clone()),
+            ))),
+        );
+    }
+
     let notify = Arc::new(tokio::sync::Notify::new());
     *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
 
@@ -1721,6 +1751,18 @@ async fn run_prompt_turn(
         turn = agent_session.prompt_message(user_message) => Some(turn),
         _ = notify.notified() => None,
     };
+    if outcome.is_some() {
+        if let Some(prefix) = assistant_prefix {
+            if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
+                tracing::error!(
+                    target: "daimonos::acp",
+                    event = "assistant_turn_prefix_insert_failed",
+                    session_id = %session_id,
+                    error = %error,
+                );
+            }
+        }
+    }
 
     // Snapshot the updated history while we still hold the session lock, so we
     // can persist it after releasing the lock (cross-process session/load
@@ -2268,6 +2310,7 @@ fn build_agent(
         sessions_dir,
         AcpCompaction::new(compaction, false),
         analytics,
+        false,
         &mut None,
     )
 }
@@ -2289,6 +2332,7 @@ fn build_agent_with_state(
     sessions_dir: Option<PathBuf>,
     compaction: AcpCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
+    timestamp_turns: bool,
     state_out: &mut Option<Arc<AcpState>>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
@@ -2311,6 +2355,7 @@ fn build_agent_with_state(
         session_list_page_size: cfg.acp.session_list_page_size,
         compaction,
         analytics,
+        timestamp_turns,
         mcp_pool: McpClientPool::new(),
     });
     *state_out = Some(Arc::clone(&state));
@@ -2937,6 +2982,9 @@ fn build_agent_with_state(
                                         );
                                         AcpStopReason::EndTurn
                                     } else {
+                                        let assistant_prefix = state
+                                            .timestamp_turns
+                                            .then(|| turn_timestamp_line(chrono::Local::now()));
                                         run_prompt_turn(
                                             &handle,
                                             &spawn_cx,
@@ -2944,6 +2992,7 @@ fn build_agent_with_state(
                                             user_message,
                                             client_user_message_id,
                                             state.store.as_ref(),
+                                            assistant_prefix,
                                         )
                                         .instrument(prompt_span.span().clone())
                                         .await
@@ -3096,6 +3145,7 @@ pub async fn run_acp(
     sessions_dir: Option<PathBuf>,
     compaction: AcpCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
+    timestamp_turns: bool,
 ) -> anyhow::Result<()> {
     tracing::info!(
         target: "daimonos::acp",
@@ -3121,6 +3171,7 @@ pub async fn run_acp(
         sessions_dir,
         compaction,
         analytics,
+        timestamp_turns,
         &mut state_out,
     );
     // The upstream ACP stdio transport waits for both its incoming and
@@ -3661,6 +3712,7 @@ mod tests {
             Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
+            false,
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -3765,6 +3817,120 @@ mod tests {
         assert_eq!(persisted.client_user_message_ids, vec!["", "user-1"]);
     }
 
+    #[test]
+    fn turn_timestamp_line_is_a_bracketed_dated_line() {
+        use chrono::TimeZone;
+        let fixed = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 25, 16, 45, 3)
+            .unwrap();
+        let line = turn_timestamp_line(fixed);
+        assert_eq!(line, "[2026-07-25 16:45:03 UTC]\n");
+        assert!(line.starts_with('['));
+        assert!(line.ends_with("]\n"));
+    }
+
+    fn assistant_texts(history: &[crate::providers::Message]) -> Vec<String> {
+        history
+            .iter()
+            .filter(|m| m.role == CoreRole::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                CoreBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn first_turn_assistant_texts(timestamp_turns: bool) -> (Vec<String>, Vec<String>) {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![end_turn_resp("hello from daimonos")]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            AcpCompaction::new(None, false),
+            None,
+            timestamp_turns,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let workspace_path = workspace.path().to_path_buf();
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(&workspace_path))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(session_id)
+            })
+            .await
+            .unwrap();
+        let handle = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live session");
+        let history = handle.session.lock().await.history().to_vec();
+        let persisted = state
+            .store
+            .as_ref()
+            .expect("session store")
+            .load(&session_id.to_string())
+            .expect("persisted session");
+        (
+            assistant_texts(&history),
+            assistant_texts(&persisted.messages),
+        )
+    }
+
+    #[tokio::test]
+    async fn timestamp_turn_on_prefixes_assistant_history() {
+        let (texts, persisted_texts) = first_turn_assistant_texts(true).await;
+        let re = regex::Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .+\]\n$").unwrap();
+        let stamps = texts.iter().filter(|t| re.is_match(t)).count();
+        assert_eq!(
+            stamps, 1,
+            "expected exactly one timestamp line, got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("hello from daimonos")),
+            "model text still present: {texts:?}"
+        );
+        assert_eq!(persisted_texts, texts, "timestamp must survive persistence");
+    }
+
+    #[tokio::test]
+    async fn timestamp_turn_off_by_default_emits_no_timestamp() {
+        let (texts, persisted_texts) = first_turn_assistant_texts(false).await;
+        let re = regex::Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .+\]\n$").unwrap();
+        assert!(
+            !texts.iter().any(|t| re.is_match(t)),
+            "no timestamp line expected: {texts:?}"
+        );
+        assert_eq!(persisted_texts, texts);
+    }
+
     #[tokio::test]
     async fn session_delete_waits_for_live_load_lifecycle() {
         let workspace = tempfile::tempdir().unwrap();
@@ -3782,6 +3948,7 @@ mod tests {
             Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
+            false,
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -3867,6 +4034,7 @@ mod tests {
             Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
+            false,
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -3922,6 +4090,7 @@ mod tests {
             Some(sessions.path().to_path_buf()),
             AcpCompaction::new(None, false),
             None,
+            false,
             &mut state_out,
         );
         let _state = state_out.expect("ACP state");
