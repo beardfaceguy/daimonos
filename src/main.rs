@@ -6,6 +6,7 @@ mod agent_runtime;
 mod analytics;
 mod chat_cmd;
 mod cli;
+mod client_transport;
 mod compaction;
 mod config;
 mod coordination;
