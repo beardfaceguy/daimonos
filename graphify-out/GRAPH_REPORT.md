@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-26)
 
 ## Corpus Check
-- 207 files · ~252,868 words
+- 207 files · ~253,045 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5075 nodes · 11687 edges · 232 communities (212 shown, 20 thin omitted)
+- 5081 nodes · 11707 edges · 232 communities (212 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `547a0291`
+- Built from commit: `dbd0eb16`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -997,7 +997,7 @@ Nodes (13): classify_subcall_failure(), MockProvider, AtomicU64, CompleteOpts, C
 
 ### Community 206 - "Community 206"
 Cohesion: 0.09
-Nodes (32): ClientMessage, OwnedReadHalf, OwnedWriteHalf, Sender, ServerMessage, ClientTransport, in_memory_disconnect_returns_none(), in_memory_transport_applies_bounded_backpressure() (+24 more)
+Nodes (36): ClientMessage, OwnedReadHalf, OwnedWriteHalf, Sender, ServerMessage, ClientTransport, in_memory_disconnect_returns_none(), in_memory_transport_applies_bounded_backpressure() (+28 more)
 
 ### Community 207 - "Community 207"
 Cohesion: 0.18
@@ -1020,8 +1020,8 @@ Cohesion: 0.20
 Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
 
 ### Community 212 - "Community 212"
-Cohesion: 0.18
-Nodes (13): RequestGuard, ActivityTracker, liveness_snapshot_never_reports_a_stale_clock_as_unoccupied(), now_unix_secs(), releasing_the_last_slot_leaves_a_fresh_idle_window(), request_guard_releases_its_slot_on_unwind(), request_guard_tracks_and_releases_in_flight_slots(), RequestGuard (+5 more)
+Cohesion: 0.17
+Nodes (14): RequestGuard, ActivityTracker, liveness_snapshot_never_reports_a_stale_clock_as_unoccupied(), now_unix_secs(), releasing_the_last_slot_leaves_a_fresh_idle_window(), request_guard_releases_its_slot_on_unwind(), request_guard_tracks_and_releases_in_flight_slots(), RequestGuard (+6 more)
 
 ### Community 213 - "Community 213"
 Cohesion: 0.29
@@ -1060,8 +1060,8 @@ Cohesion: 0.12
 Nodes (22): AcpDiff, Meta, diff_for_completed_edit(), diff_for_edit_file_falls_back_without_applied_diffs(), diff_for_edit_file_falls_back_without_pre_edit_capture(), diff_for_edit_file_replays_applied_pairs(), diff_for_write_file_new_file_has_no_old_text(), diff_for_write_file_uses_input_content() (+14 more)
 
 ### Community 222 - "Community 222"
-Cohesion: 0.40
-Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
+Cohesion: 0.50
+Nodes (4): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), Path, session_with_analytics()
 
 ### Community 223 - "Community 223"
 Cohesion: 0.24
@@ -1108,7 +1108,7 @@ Nodes (9): ListToolsResult, PaginatedRequestParams, RpcError, ServerHandler, Dai
   README.md · relation: references
 
 ## Knowledge Gaps
-- **843 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+838 more)
+- **842 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+837 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -1122,10 +1122,10 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
-  _High betweenness centrality (0.008) - this node is a cross-community bridge._
+  _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **Why does `RawErrorCapture` connect `Community 168` to `Community 34`, `Community 158`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 136`, `Community 167`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **What connects `Load all task summaries from one run directory.`, `All run dirs belonging to (arm, tag), including -rN repetitions.`, `Per-task cross-run statistics: mean/min/max per metric, success rate,     contam` to the rest of the system?**
-  _1048 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _1047 weakly-connected nodes found - possible documentation gaps or missing edges._

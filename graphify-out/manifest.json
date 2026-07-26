@@ -1060,8 +1060,8 @@
     "semantic_hash": ""
   },
   "src/client_transport.rs": {
-    "mtime": 1785088223.6592581,
-    "ast_hash": "bbc788eeede1adac1e5caeb14bd6a438",
+    "mtime": 1785088694.2280838,
+    "ast_hash": "b116fa7558b8ca7518dd995222e59b18",
     "semantic_hash": ""
   },
   "docs/adr/010-session-daemon-remote-control.md": {
