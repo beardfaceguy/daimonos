@@ -25,6 +25,7 @@ mod providers;
 mod safety;
 mod script;
 mod session;
+mod session_protocol;
 mod session_store;
 mod snapshot;
 mod tool_descriptions;
