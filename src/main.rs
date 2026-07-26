@@ -26,6 +26,8 @@ mod providers;
 mod safety;
 mod script;
 mod session;
+#[allow(dead_code)] // ApprovalBroker is wired into ACP/daemon in the next slice.
+mod session_core;
 mod session_protocol;
 mod session_store;
 mod snapshot;
