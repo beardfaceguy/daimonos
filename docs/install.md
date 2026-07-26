@@ -75,6 +75,22 @@ cargo build --release
 ./target/release/daimonos --help
 ```
 
+To put it on `PATH` instead of referencing `target/release` from your editor
+config:
+
+```bash
+cargo install --path . --force
+# installs to ~/.cargo/bin/daimonos
+```
+
+Note that `cargo install` re-resolves dependencies from scratch and ignores
+`Cargo.lock`. Pass `--locked` if you want the exact dependency set this repo was
+tested against:
+
+```bash
+cargo install --path . --force --locked
+```
+
 You should see:
 
 ```
