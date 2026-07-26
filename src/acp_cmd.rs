@@ -73,7 +73,7 @@ type CancelSlot = Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>;
 /// `ToolCallUpdate` path consults this set so cancellation, replay anomalies,
 /// or a late progress callback cannot update an id the client does not know
 /// (or resurrect a call that already reached a terminal state).
-type ActiveToolCalls = Arc<StdMutex<HashSet<String>>>;
+type ActiveToolCalls = Arc<StdMutex<HashMap<String, bool>>>;
 
 /// The tool-call hooks (baked into `AgentConfig` once, at `session/new`
 /// time) need a `ConnectionTo<Client>` to send notifications/requests on.
@@ -847,9 +847,43 @@ fn tool_call_update_is_live(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if terminal {
-        active.remove(tool_call_id)
+        active.remove(tool_call_id).is_some()
     } else {
-        active.contains(tool_call_id)
+        active.contains_key(tool_call_id)
+    }
+}
+
+fn cancel_active_tool_calls(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    active_tool_calls: &ActiveToolCalls,
+) {
+    let active = {
+        let mut calls = active_tool_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        calls.drain().collect::<Vec<_>>()
+    };
+    for (tool_call_id, terminal_output) in active {
+        let fields = ToolCallUpdateFields::new()
+            .status(Some(ToolCallStatus::Failed))
+            .content(Some(vec![AcpContentBlock::Text(TextContent::new(
+                "cancelled".to_string(),
+            ))
+            .into()]))
+            .raw_output(Some(serde_json::json!({ "cancelled": true })));
+        let mut update = ToolCallUpdate::new(tool_call_id.clone(), fields);
+        if terminal_output {
+            update = update.meta(Meta::from_iter([(
+                "terminal_exit".to_string(),
+                serde_json::json!({
+                    "terminal_id": tool_call_id,
+                    "exit_code": null,
+                    "signal": "cancelled",
+                }),
+            )]));
+        }
+        send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
     }
 }
 
@@ -1004,7 +1038,7 @@ fn build_before_tool_call_hook(
             active_tool_calls
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(info.id.clone());
+                .insert(info.id.clone(), terminal_output && info.name == "exec");
 
             // Denylist/allowlist/approval-mode gating first (same policy
             // `daimonos agent`/`daimonos chat` enforce) — only tools that
@@ -1846,14 +1880,11 @@ async fn run_prompt_turn(
         _ = notify.notified() => None,
     };
     if outcome.is_none() {
-        // Dropping the prompt future cancels any in-flight permission request
-        // or tool execution. Retire its announcements at the same boundary so
-        // a late callback cannot target a call from the cancelled turn.
-        handle
-            .active_tool_calls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        // Dropping the prompt future skips the normal before/after completion
+        // path. Close every already-announced call before retiring its id so
+        // the client does not retain Pending/InProgress chrome; draining first
+        // also makes any racing late callback observe the call as closed.
+        cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
     }
     if outcome.is_some() {
         if let Some(prefix) = assistant_prefix {
@@ -2105,7 +2136,7 @@ async fn build_session_handle(
         .await,
     );
     let bridge_slot = Arc::new(tokio::sync::RwLock::new(Arc::clone(&bridge)));
-    let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashSet::new()));
+    let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
@@ -2376,7 +2407,7 @@ fn replay_history(
                     if !announced_tool_ids.remove(tool_use_id) {
                         tracing::warn!(
                             target: "daimonos::acp",
-                            event = "orphan_tool_result_dropped_during_replay",
+                            event = "unmatched_tool_result_dropped_during_replay",
                             tool_call_id = %tool_use_id,
                         );
                         continue;
@@ -4813,6 +4844,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_cancel_closes_announced_tool_call() {
+        use agent_client_protocol::schema::v1::ClientCapabilities;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![tool_call_resp(
+                "t1",
+                "exec",
+                serde_json::json!({"command": "sleep 30"}),
+            )]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let permission_seen = Arc::new(tokio::sync::Notify::new());
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let option_id = request.options.first().unwrap().option_id.clone();
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
+                                    option_id,
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().meta(Meta::from_iter([(
+                                "terminal_output".to_string(),
+                                serde_json::json!(true),
+                            )])),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task();
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    permission_seen.notified(),
+                )
+                .await
+                .expect("permission request should arrive");
+                connection.send_notification(CancelNotification::new(session_id))?;
+                let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+                    .await
+                    .expect("cancelled prompt should resolve")?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::Cancelled);
+        let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        let cancelled = updates.iter().find_map(|update| match update {
+            SessionUpdate::ToolCallUpdate(call)
+                if call.fields.status == Some(ToolCallStatus::Failed) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        });
+        let cancelled = cancelled.expect("cancel must close the announced call");
+        assert_eq!(cancelled.tool_call_id.to_string(), "t1");
+        assert_eq!(
+            cancelled.fields.raw_output,
+            Some(serde_json::json!({"cancelled": true}))
+        );
+        assert_eq!(
+            cancelled
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_exit"))
+                .and_then(|exit| exit.get("signal")),
+            Some(&serde_json::json!("cancelled"))
+        );
+    }
+
+    #[tokio::test]
     async fn acp_session_delete_cancels_inflight_prompt() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
@@ -7057,11 +7212,11 @@ mod tests {
 
     #[test]
     fn tool_call_liveness_rejects_orphans_and_post_completion_updates() {
-        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashSet::new()));
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
         assert!(!tool_call_update_is_live(&active, "t1", false));
         assert!(!tool_call_update_is_live(&active, "t1", true));
 
-        active.lock().unwrap().insert("t1".to_string());
+        active.lock().unwrap().insert("t1".to_string(), false);
         assert!(tool_call_update_is_live(&active, "t1", false));
         assert!(tool_call_update_is_live(&active, "t1", true));
         assert!(!tool_call_update_is_live(&active, "t1", false));
