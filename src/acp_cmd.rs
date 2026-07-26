@@ -69,6 +69,12 @@ use crate::tool_facade;
 /// lock the long-running prompt holds.
 type CancelSlot = Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>;
 
+/// Tool-call ids announced to the ACP client and not yet completed. Every
+/// `ToolCallUpdate` path consults this set so cancellation, replay anomalies,
+/// or a late progress callback cannot update an id the client does not know
+/// (or resurrect a call that already reached a terminal state).
+type ActiveToolCalls = Arc<StdMutex<HashMap<String, bool>>>;
+
 /// The tool-call hooks (baked into `AgentConfig` once, at `session/new`
 /// time) need a `ConnectionTo<Client>` to send notifications/requests on.
 /// Requests specifically (`session/request_permission`) only get their
@@ -323,6 +329,7 @@ struct SessionHandle {
     lifecycle: tokio::sync::Mutex<()>,
     session: tokio::sync::Mutex<AgentSession>,
     cancel: CancelSlot,
+    active_tool_calls: ActiveToolCalls,
     connection: CurrentConnection,
     current_model: CurrentModel,
     cwd: PathBuf,
@@ -706,12 +713,21 @@ fn current_cx(connection: &CurrentConnection) -> Option<ConnectionTo<AcpClientRo
     connection.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
+fn try_send_notification(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    update: SessionUpdate,
+) -> bool {
+    cx.send_notification(SessionNotification::new(session_id.clone(), update))
+        .is_ok()
+}
+
 fn send_notification(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     update: SessionUpdate,
 ) {
-    let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+    let _ = try_send_notification(cx, session_id, update);
 }
 
 fn to_acp_plan(entries: &[AgentPlanEntry]) -> AcpPlan {
@@ -803,9 +819,78 @@ fn terminal_exit_meta(info: &ToolCallInfo, code: Option<i32>, signal: Option<Str
     )])
 }
 
+/// Send an update only while its tool call is live. For terminal updates,
+/// removal happens atomically before enqueueing the final update, so any
+/// concurrently arriving progress callback observes the call as closed and
+/// cannot emit terminal output after completion.
+fn send_active_tool_call_update(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    active_tool_calls: &ActiveToolCalls,
+    tool_call_id: &str,
+    update: ToolCallUpdate,
+    terminal: bool,
+) -> bool {
+    let should_send = tool_call_update_is_live(active_tool_calls, tool_call_id, terminal);
+    if should_send {
+        send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+    }
+    should_send
+}
+
+fn tool_call_update_is_live(
+    active_tool_calls: &ActiveToolCalls,
+    tool_call_id: &str,
+    terminal: bool,
+) -> bool {
+    let mut active = active_tool_calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if terminal {
+        active.remove(tool_call_id).is_some()
+    } else {
+        active.contains_key(tool_call_id)
+    }
+}
+
+fn cancel_active_tool_calls(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    active_tool_calls: &ActiveToolCalls,
+) {
+    let active = {
+        let mut calls = active_tool_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        calls.drain().collect::<Vec<_>>()
+    };
+    for (tool_call_id, terminal_output) in active {
+        let fields = ToolCallUpdateFields::new()
+            .status(Some(ToolCallStatus::Failed))
+            .content(Some(vec![AcpContentBlock::Text(TextContent::new(
+                "cancelled".to_string(),
+            ))
+            .into()]))
+            .raw_output(Some(serde_json::json!({ "cancelled": true })));
+        let mut update = ToolCallUpdate::new(tool_call_id.clone(), fields);
+        if terminal_output {
+            update = update.meta(Meta::from_iter([(
+                "terminal_exit".to_string(),
+                serde_json::json!({
+                    "terminal_id": tool_call_id,
+                    "exit_code": null,
+                    "signal": "cancelled",
+                }),
+            )]));
+        }
+        send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+    }
+}
+
 fn build_tool_progress_hook(
     connection: CurrentConnection,
     session_id: SessionId,
+    active_tool_calls: ActiveToolCalls,
     enabled: bool,
 ) -> Option<ToolProgressHook> {
     enabled.then(|| {
@@ -829,13 +914,27 @@ fn build_tool_progress_hook(
                         let update =
                             ToolCallUpdate::new(info.id.clone(), ToolCallUpdateFields::new())
                                 .meta(terminal_exit_meta(info, code, signal));
-                        send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+                        send_active_tool_call_update(
+                            &cx,
+                            &session_id,
+                            &active_tool_calls,
+                            &info.id,
+                            update,
+                            false,
+                        );
                         return;
                     }
                 };
                 let update = ToolCallUpdate::new(info.id.clone(), ToolCallUpdateFields::new())
                     .meta(Meta::from_iter([(key.to_string(), value)]));
-                send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+                send_active_tool_call_update(
+                    &cx,
+                    &session_id,
+                    &active_tool_calls,
+                    &info.id,
+                    update,
+                    false,
+                );
             },
         ) as ToolProgressHook
     })
@@ -892,6 +991,7 @@ async fn request_permission(
 fn build_before_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
+    active_tool_calls: ActiveToolCalls,
     safety: Arc<crate::safety::SafetyPolicy>,
     diff_stash: DiffStash,
     workspace: PathBuf,
@@ -901,6 +1001,7 @@ fn build_before_tool_call_hook(
         let connection = Arc::clone(&connection);
         let session_id = session_id.clone();
         let safety = Arc::clone(&safety);
+        let active_tool_calls = Arc::clone(&active_tool_calls);
         let diff_stash = Arc::clone(&diff_stash);
         let workspace = workspace.clone();
         Box::pin(async move {
@@ -926,7 +1027,18 @@ fn build_before_tool_call_hook(
             if terminal_output {
                 tool_call = tool_call.meta(terminal_info_meta(&workspace, info));
             }
-            send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
+            // Only ids whose announcement reached the connection become live.
+            // Progress cannot start until this hook returns, so recording after
+            // the synchronous enqueue cannot race the first callback.
+            let announced =
+                try_send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
+            if !announced {
+                return BeforeHookResult::Block("failed to announce ACP tool call".to_string());
+            }
+            active_tool_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(info.id.clone(), terminal_output && info.name == "exec");
 
             // Denylist/allowlist/approval-mode gating first (same policy
             // `daimonos agent`/`daimonos chat` enforce) — only tools that
@@ -975,7 +1087,14 @@ fn build_before_tool_call_hook(
             {
                 update = update.meta(terminal_exit_meta(info, None, Some("blocked".to_string())));
             }
-            send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+            send_active_tool_call_update(
+                &cx,
+                &session_id,
+                &active_tool_calls,
+                &info.id,
+                update,
+                matches!(decision, BeforeHookResult::Block(_)),
+            );
 
             decision
         })
@@ -985,6 +1104,7 @@ fn build_before_tool_call_hook(
 fn build_after_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
+    active_tool_calls: ActiveToolCalls,
     diff_stash: DiffStash,
     workspace: PathBuf,
 ) -> AfterHook {
@@ -1000,6 +1120,10 @@ fn build_after_tool_call_hook(
             .remove(&info.id)
             .flatten();
         let Some(cx) = current_cx(&connection) else {
+            active_tool_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&info.id);
             return AfterHookResult::Continue;
         };
         let status = if is_error {
@@ -1026,7 +1150,7 @@ fn build_after_tool_call_hook(
                 .content(Some(vec![block]))
                 .raw_output(Some(raw_output)),
         );
-        send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
+        send_active_tool_call_update(&cx, &session_id, &active_tool_calls, &info.id, update, true);
         AfterHookResult::Continue
     })
 }
@@ -1161,6 +1285,7 @@ fn build_agent_config(
     model: String,
     connection: CurrentConnection,
     session_id: SessionId,
+    active_tool_calls: ActiveToolCalls,
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
@@ -1182,6 +1307,7 @@ fn build_agent_config(
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
+            Arc::clone(&active_tool_calls),
             safety,
             Arc::clone(&diff_stash),
             workspace.to_path_buf(),
@@ -1190,6 +1316,7 @@ fn build_agent_config(
         after_tool_call: Some(build_after_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
+            Arc::clone(&active_tool_calls),
             diff_stash,
             workspace.to_path_buf(),
         )),
@@ -1204,6 +1331,7 @@ fn build_agent_config(
         on_tool_progress: build_tool_progress_hook(
             Arc::clone(&connection),
             session_id.clone(),
+            active_tool_calls,
             terminal_output,
         ),
         on_plan_update: Some(build_plan_hook(Arc::clone(&connection), session_id.clone())),
@@ -1751,6 +1879,13 @@ async fn run_prompt_turn(
         turn = agent_session.prompt_message(user_message) => Some(turn),
         _ = notify.notified() => None,
     };
+    if outcome.is_none() {
+        // Dropping the prompt future skips the normal before/after completion
+        // path. Close every already-announced call before retiring its id so
+        // the client does not retain Pending/InProgress chrome; draining first
+        // also makes any racing late callback observe the call as closed.
+        cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
+    }
     if outcome.is_some() {
         if let Some(prefix) = assistant_prefix {
             if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
@@ -2001,11 +2136,13 @@ async fn build_session_handle(
         .await,
     );
     let bridge_slot = Arc::new(tokio::sync::RwLock::new(Arc::clone(&bridge)));
+    let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
         Arc::clone(&connection),
         session_id.clone(),
+        Arc::clone(&active_tool_calls),
         safety,
         token_log,
         state.compaction.policy.clone(),
@@ -2045,6 +2182,7 @@ async fn build_session_handle(
         lifecycle: tokio::sync::Mutex::new(()),
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
+        active_tool_calls,
         connection,
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
@@ -2195,6 +2333,7 @@ fn replay_history(
 ) {
     use crate::providers::{ContentBlock as CoreBlock, Role};
     let mut plan_tool_ids = HashSet::new();
+    let mut announced_tool_ids = HashSet::new();
     for message in history {
         for block in &message.content {
             match block {
@@ -2237,11 +2376,13 @@ fn replay_history(
                                     .kind(tool_kind_for(name))
                                     .status(ToolCallStatus::InProgress)
                                     .raw_input(Some(input.clone()));
-                                send_notification(
+                                if try_send_notification(
                                     cx,
                                     session_id,
                                     SessionUpdate::ToolCall(tool_call),
-                                );
+                                ) {
+                                    announced_tool_ids.insert(id.clone());
+                                }
                             }
                         }
                     } else {
@@ -2249,7 +2390,10 @@ fn replay_history(
                             .kind(tool_kind_for(name))
                             .status(ToolCallStatus::InProgress)
                             .raw_input(Some(input.clone()));
-                        send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call));
+                        if try_send_notification(cx, session_id, SessionUpdate::ToolCall(tool_call))
+                        {
+                            announced_tool_ids.insert(id.clone());
+                        }
                     }
                 }
                 CoreBlock::ToolResult {
@@ -2258,6 +2402,14 @@ fn replay_history(
                     is_error,
                 } => {
                     if plan_tool_ids.contains(tool_use_id) {
+                        continue;
+                    }
+                    if !announced_tool_ids.remove(tool_use_id) {
+                        tracing::warn!(
+                            target: "daimonos::acp",
+                            event = "unmatched_tool_result_dropped_during_replay",
+                            tool_call_id = %tool_use_id,
+                        );
                         continue;
                     }
                     let status = if *is_error {
@@ -4692,6 +4844,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_cancel_closes_announced_tool_call() {
+        use agent_client_protocol::schema::v1::ClientCapabilities;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![tool_call_resp(
+                "t1",
+                "exec",
+                serde_json::json!({"command": "sleep 30"}),
+            )]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let permission_seen = Arc::new(tokio::sync::Notify::new());
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let option_id = request.options.first().unwrap().option_id.clone();
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
+                                    option_id,
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().meta(Meta::from_iter([(
+                                "terminal_output".to_string(),
+                                serde_json::json!(true),
+                            )])),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task();
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    permission_seen.notified(),
+                )
+                .await
+                .expect("permission request should arrive");
+                connection.send_notification(CancelNotification::new(session_id))?;
+                let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+                    .await
+                    .expect("cancelled prompt should resolve")?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::Cancelled);
+        let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        let cancelled = updates.iter().find_map(|update| match update {
+            SessionUpdate::ToolCallUpdate(call)
+                if call.fields.status == Some(ToolCallStatus::Failed) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        });
+        let cancelled = cancelled.expect("cancel must close the announced call");
+        assert_eq!(cancelled.tool_call_id.to_string(), "t1");
+        assert_eq!(
+            cancelled.fields.raw_output,
+            Some(serde_json::json!({"cancelled": true}))
+        );
+        assert_eq!(
+            cancelled
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("terminal_exit"))
+                .and_then(|exit| exit.get("signal")),
+            Some(&serde_json::json!("cancelled"))
+        );
+    }
+
+    #[tokio::test]
     async fn acp_session_delete_cancels_inflight_prompt() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
@@ -4838,6 +5114,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_cancelled_permission_finishes_the_announced_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![
+                tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
+                end_turn_resp("done"),
+            ]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |_request: RequestPermissionRequest, responder, _cx| {
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCallUpdate(call)
+                if call.tool_call_id.to_string() == "t1"
+                    && call.fields.status == Some(ToolCallStatus::Failed)
+        )));
+        assert!(!updates.iter().any(|update| matches!(
+            update,
+            SessionUpdate::ToolCallUpdate(call)
+                if call.fields.status == Some(ToolCallStatus::Completed)
+        )));
+    }
+
+    #[tokio::test]
     async fn acp_denied_tool_blocks_without_asking_permission() {
         let dir = tempfile::tempdir().unwrap();
         let make_provider = mock_factory(vec![
@@ -4927,6 +5285,7 @@ mod tests {
             "a denylisted tool must not even ask for permission"
         );
         let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
         let failed_updates: Vec<&ToolCallUpdate> = updates
             .iter()
             .filter_map(|update| match update {
@@ -5823,6 +6182,78 @@ mod tests {
                     if commands.available_commands.len() == 3
             )),
             "session/load must re-advertise slash commands: {replayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_replay_drops_tool_result_without_announcement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let session_id = "orphan-result-session";
+        SessionStore::new(sessions.path().to_path_buf()).save_acp(
+            session_id,
+            "test-model",
+            &[crate::providers::Message {
+                role: crate::providers::Role::User,
+                content: vec![crate::providers::ContentBlock::ToolResult {
+                    tool_use_id: "never-announced".to_string(),
+                    content: "late result".to_string(),
+                    is_error: false,
+                }],
+            }],
+            workspace.path(),
+            &[],
+        );
+        let agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        SessionId::new(session_id),
+                        workspace.path(),
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let updates = updates.lock().unwrap();
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update, SessionUpdate::ToolCallUpdate(_))),
+            "orphan replay result must be dropped: {updates:?}"
         );
     }
 
@@ -6750,6 +7181,48 @@ mod tests {
         );
     }
 
+    fn assert_no_orphan_tool_updates(updates: &[SessionUpdate]) {
+        let mut active = HashSet::new();
+        for (index, update) in updates.iter().enumerate() {
+            match update {
+                SessionUpdate::ToolCall(call) => {
+                    active.insert(call.tool_call_id.to_string());
+                }
+                SessionUpdate::ToolCallUpdate(call) => {
+                    let id = call.tool_call_id.to_string();
+                    assert!(
+                        active.contains(&id),
+                        "orphan or post-completion update for {id} at index {index}: {updates:?}"
+                    );
+                    if matches!(
+                        call.fields.status,
+                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    ) {
+                        active.remove(&id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            active.is_empty(),
+            "tool calls did not reach a terminal state: {active:?}; updates: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn tool_call_liveness_rejects_orphans_and_post_completion_updates() {
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        assert!(!tool_call_update_is_live(&active, "t1", false));
+        assert!(!tool_call_update_is_live(&active, "t1", true));
+
+        active.lock().unwrap().insert("t1".to_string(), false);
+        assert!(tool_call_update_is_live(&active, "t1", false));
+        assert!(tool_call_update_is_live(&active, "t1", true));
+        assert!(!tool_call_update_is_live(&active, "t1", false));
+        assert!(!tool_call_update_is_live(&active, "t1", true));
+    }
+
     /// Run one scripted tool call through the full ACP flow and return the
     /// collected session updates.
     async fn run_tool_call_flow(
@@ -6803,7 +7276,9 @@ mod tests {
             })
             .await
             .unwrap();
-        Arc::try_unwrap(updates).unwrap().into_inner().unwrap()
+        let updates = Arc::try_unwrap(updates).unwrap().into_inner().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        updates
     }
 
     #[tokio::test]
@@ -6913,6 +7388,36 @@ mod tests {
             .unwrap();
 
         let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        let announcement_index = updates
+            .iter()
+            .position(|update| matches!(update, SessionUpdate::ToolCall(call) if call.tool_call_id.to_string() == "t1"))
+            .expect("exec tool-call announcement");
+        let completion_index = updates
+            .iter()
+            .position(|update| {
+                matches!(
+                    update,
+                    SessionUpdate::ToolCallUpdate(call)
+                        if call.tool_call_id.to_string() == "t1"
+                            && call.fields.status == Some(ToolCallStatus::Completed)
+                )
+            })
+            .expect("exec tool-call completion");
+        for (index, update) in updates.iter().enumerate() {
+            if let SessionUpdate::ToolCallUpdate(call) = update {
+                assert_eq!(call.tool_call_id.to_string(), "t1");
+                let is_terminal_frame = call.meta.as_ref().is_some_and(|meta| {
+                    meta.contains_key("terminal_output") || meta.contains_key("terminal_exit")
+                });
+                if is_terminal_frame {
+                    assert!(
+                        announcement_index < index && index < completion_index,
+                        "terminal frame must be after announcement and before completion: {updates:?}"
+                    );
+                }
+            }
+        }
         let terminal_info = updates.iter().find_map(|update| match update {
             SessionUpdate::ToolCall(call) => call
                 .meta

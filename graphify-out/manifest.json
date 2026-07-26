@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785033132.6954584,
-    "ast_hash": "a6305b59227d2c1b5b524c38991db8f8",
+    "mtime": 1785050397.7732267,
+    "ast_hash": "16e318f9a119ddd045ca0e5950940aec",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1785039213.7629724,
-    "ast_hash": "f14720097e8bdac28ad63a7296dd631b",
+    "mtime": 1785040982.1870549,
+    "ast_hash": "ac52e7b77bef0cb4a300a54398e97035",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -625,7 +625,7 @@
     "semantic_hash": "20fc74f37d2378473da5693c9840e6ac"
   },
   "tests/test_lifecycle.py": {
-    "mtime": 1785039162.7203195,
+    "mtime": 1785040982.1880548,
     "ast_hash": "641908b6c8dcb0d9455388967bac1dc5",
     "semantic_hash": ""
   },
@@ -855,8 +855,8 @@
     "semantic_hash": ""
   },
   "docs/install.md": {
-    "mtime": 1784656761.6125412,
-    "ast_hash": "3fa14a97383c3ee06332c109375a6f81",
+    "mtime": 1785043147.9161332,
+    "ast_hash": "5f021dc9288ffc8d0cc2a1e54aa9da0a",
     "semantic_hash": ""
   },
   "docs/other-tools-setup.md": {
