@@ -24,7 +24,16 @@ hex = "0.4"
 async-trait = "0.1"
 blocking = "1"
 starlark = "0.13"
-allocative = "0.3"
+# Upper bound is deliberate. allocative 0.3.6 changed the trait bound on
+# `Visitor::visit_field` in a way that starlark_map 0.13 does not satisfy, so a
+# plain caret requirement lets dependency resolution pick a combination that
+# cannot compile. Cargo.lock hides this locally, but `cargo install --path .`
+# re-resolves from scratch and ignores the lockfile, so an install would fail
+# with a trait-bound error inside starlark_map while a normal `cargo build`
+# succeeded. Semver says 0.3.6 should be compatible with 0.3.4; upstream broke
+# that, so the bound stays until we move to starlark 0.14, which builds against
+# current allocative.
+allocative = ">=0.3.4, <0.3.6"
 # Pinned to our fork (branch fix/stateless-sse-stream-close): the #215 stderr
 # busy-loop fix plus two streamable-HTTP client fixes needed for stateless,
 # POST-only servers like Linear MCP — (1) a graceful POST-stream close is
