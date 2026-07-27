@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
@@ -188,6 +189,22 @@ impl SessionCore {
         })
     }
 
+    /// Cancel the active turn, emitting `Cancelling` before the notification
+    /// that unwinds it. Returns false when no turn is active.
+    ///
+    /// Emitting from here rather than from the caller is what makes the sequence
+    /// deterministic: the terminal event comes from `SessionTurn::drop` on the
+    /// turn's own task, which the notification triggers, so a `Cancelling`
+    /// emitted afterwards could arrive *after* the turn had already ended and
+    /// leave the stream resting on `Cancelling` for good.
+    pub fn cancel_turn(&self) -> bool {
+        self.turn.cancel_with(|| {
+            let _ = self.events.emit(SessionEvent::TurnStatusChanged {
+                status: crate::session_protocol::TurnStatus::Cancelling,
+            });
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: AgentSession,
@@ -298,9 +315,20 @@ impl SessionTurn<'_> {
 
 impl Drop for SessionTurn<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.events.emit(SessionEvent::TurnStatusChanged {
-            status: crate::session_protocol::TurnStatus::Idle,
-        }) {
+        // Drop is the single terminal emitter for a turn, mirroring the
+        // single-terminal claim the tool-call lifecycle already uses: it is the
+        // one place guaranteed to run on every exit path — normal return, `?`,
+        // panic, or a dropped future on cancellation.
+        //
+        // Which terminal event depends on how the turn ended. Emitting `Idle`
+        // unconditionally left a cancelled turn indistinguishable from a
+        // completed one in the canonical stream.
+        let status = if self.active.is_cancelled() {
+            crate::session_protocol::TurnStatus::Cancelled
+        } else {
+            crate::session_protocol::TurnStatus::Idle
+        };
+        if let Err(error) = self.events.emit(SessionEvent::TurnStatusChanged { status }) {
             tracing::error!(
                 target: "daimonos::session_core",
                 event = "turn_idle_event_failed",
@@ -310,6 +338,19 @@ impl Drop for SessionTurn<'_> {
     }
 }
 
+/// The cancellation route for one turn, shared between the task running the turn
+/// and whoever cancels it.
+///
+/// `cancelled` is separate from the notification because `SessionTurn::drop`
+/// decides the turn's terminal event and cannot `await`: a `Notify` carries no
+/// readable "was this signalled" state, so the fact has to be recorded on its
+/// own.
+#[derive(Default)]
+struct TurnSignal {
+    notify: tokio::sync::Notify,
+    cancelled: AtomicBool,
+}
+
 /// Transport-independent ownership for one session's active turn.
 ///
 /// The controller prevents a second prompt from replacing the first turn's
@@ -317,12 +358,12 @@ impl Drop for SessionTurn<'_> {
 /// including early returns and unwinding.
 #[derive(Default)]
 pub struct TurnController {
-    active: StdMutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+    active: StdMutex<Option<std::sync::Arc<TurnSignal>>>,
 }
 
 pub struct ActiveTurn<'a> {
     controller: &'a TurnController,
-    signal: std::sync::Arc<tokio::sync::Notify>,
+    signal: std::sync::Arc<TurnSignal>,
 }
 
 impl TurnController {
@@ -334,7 +375,7 @@ impl TurnController {
         if active.is_some() {
             return Err(TurnError::Busy);
         }
-        let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = std::sync::Arc::new(TurnSignal::default());
         *active = Some(std::sync::Arc::clone(&signal));
         Ok(ActiveTurn {
             controller: self,
@@ -343,6 +384,19 @@ impl TurnController {
     }
 
     pub fn cancel(&self) -> bool {
+        self.cancel_with(|| {})
+    }
+
+    /// Cancel the active turn, running `before_signal` after the turn is marked
+    /// cancelled but *before* the notification that unwinds it.
+    ///
+    /// The ordering is the point. The terminal event comes from
+    /// `SessionTurn::drop` on the task running the turn, which the notification
+    /// triggers. Anything the canceller wants recorded ahead of that terminal
+    /// event — a `Cancelling` status, say — has to be emitted before the notify,
+    /// or it can land after the turn has already ended and leave the stream
+    /// resting on a non-terminal status.
+    pub fn cancel_with<F: FnOnce()>(&self, before_signal: F) -> bool {
         let signal = self
             .active
             .lock()
@@ -351,7 +405,9 @@ impl TurnController {
         let Some(signal) = signal else {
             return false;
         };
-        signal.notify_one();
+        signal.cancelled.store(true, Ordering::SeqCst);
+        before_signal();
+        signal.notify.notify_one();
         true
     }
 
@@ -365,7 +421,13 @@ impl TurnController {
 
 impl ActiveTurn<'_> {
     pub async fn cancelled(&self) {
-        self.signal.notified().await;
+        self.signal.notify.notified().await;
+    }
+
+    /// Whether this turn has been cancelled. Readable synchronously so `Drop`
+    /// can pick the terminal event.
+    fn is_cancelled(&self) -> bool {
+        self.signal.cancelled.load(Ordering::SeqCst)
     }
 }
 
@@ -758,6 +820,93 @@ mod tests {
         let resolution = registered.receiver.await.unwrap();
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
         assert_eq!(resolution.resolved_by, "broker_drop");
+    }
+
+    /// Collect every `TurnStatusChanged` status a router sees, in order.
+    fn turn_status_recorder() -> (
+        SessionEventRouter,
+        std::sync::Arc<std::sync::Mutex<Vec<TurnStatus>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_hook = std::sync::Arc::clone(&seen);
+        let router = SessionEventRouter::new(Some(std::sync::Arc::new(move |_seq, event| {
+            if let SessionEvent::TurnStatusChanged { status } = event {
+                seen_for_hook
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(status);
+            }
+        })));
+        (router, seen)
+    }
+
+    /// A cancelled turn must be distinguishable from a completed one in the
+    /// canonical stream, and the terminal event must come last.
+    ///
+    /// Asserting the *ordered sequence* matters. "a terminal event was emitted"
+    /// or "the stream contains Cancelling" both held before this fix, when every
+    /// turn ended on `Idle` and `Cancelling` could arrive after it.
+    #[tokio::test]
+    async fn cancelled_turn_ends_on_cancelled_after_cancelling() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let turn = SessionTurn {
+                active,
+                events: &router,
+            };
+            // Mirrors SessionCore::cancel_turn: mark cancelled, emit Cancelling,
+            // then signal — so Cancelling precedes the unwind it causes.
+            assert!(controller.cancel_with(|| {
+                let _ = router.emit(SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Cancelling,
+                });
+            }));
+            tokio::time::timeout(std::time::Duration::from_millis(100), turn.cancelled())
+                .await
+                .expect("turn observes cancellation");
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            statuses,
+            vec![
+                TurnStatus::Running,
+                TurnStatus::Cancelling,
+                TurnStatus::Cancelled
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_ends_on_idle() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let _turn = SessionTurn {
+                active,
+                events: &router,
+            };
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(statuses, vec![TurnStatus::Running, TurnStatus::Idle]);
     }
 
     #[test]

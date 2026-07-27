@@ -112,6 +112,10 @@ pub enum TurnStatus {
     Running,
     WaitingForApproval,
     Cancelling,
+    /// Terminal state for a turn that was cancelled, as distinct from `Idle`
+    /// for one that ran to completion. Without it both outcomes end the stream
+    /// on `Idle` and a replaying consumer cannot tell them apart.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

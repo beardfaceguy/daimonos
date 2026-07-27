@@ -446,7 +446,9 @@ async fn session_operation_lock(
 }
 
 fn request_session_cancel(handle: &SessionHandle) {
-    let _ = handle.core.turn.cancel();
+    // `cancel_turn` emits `Cancelling` before signalling, so it is ordered ahead
+    // of the terminal event the unwinding turn's `Drop` produces.
+    let _ = handle.core.cancel_turn();
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -2046,12 +2048,11 @@ async fn run_prompt_turn(
         // path. Close every already-announced call before retiring its id so
         // the client does not retain Pending/InProgress chrome; draining first
         // also makes any racing late callback observe the call as closed.
-        let _ = handle
-            .core
-            .events
-            .emit(CoreSessionEvent::TurnStatusChanged {
-                status: crate::session_protocol::TurnStatus::Cancelling,
-            });
+        //
+        // `Cancelling` is emitted by `SessionCore::cancel_turn` before the
+        // cancellation signal, not here. Emitted at this point it could land
+        // after the turn's own `Drop` had already written the terminal event,
+        // leaving the canonical stream resting on `Cancelling` permanently.
         for tool_call_id in cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls) {
             let _ = handle.core.events.emit(CoreSessionEvent::ToolCallFinished {
                 id: tool_call_id,
