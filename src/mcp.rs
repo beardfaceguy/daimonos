@@ -21,7 +21,7 @@ use crate::config::{self, Config};
 use crate::index::WorkspaceIndex;
 use crate::ops;
 use crate::pipeline_cache::PipelineCache;
-use crate::protocol::Response;
+use crate::protocol::{Response, ResponseMeta};
 use crate::script;
 use crate::session::Session;
 use crate::snapshot::SnapshotStore;
@@ -296,6 +296,46 @@ async fn dispatch_tool(
     }
 
     result
+}
+
+/// Dispatch a plugin or meta tool that has no opcode mapping, returning
+/// `(content, is_error, meta)`. `None` means `name` does not belong to this
+/// registry at all, so the caller should fall through to remote MCP dispatch.
+///
+/// These tools are implemented once, here, and both frontends route through this
+/// entry point. Previously only the MCP adapter did, and the agent loop fell
+/// through to "not available in agent mode" for all 19 of them (vikunja 1112).
+pub(crate) async fn dispatch_local_tool(
+    session: &mut Session,
+    name: &str,
+    args: &Value,
+) -> Option<(String, bool, ResponseMeta)> {
+    // Decide ownership of the name *before* dispatching. `dispatch_tool_inner`
+    // calls `activate_tool` and records `used_tools` on entry, so probing it
+    // speculatively would mutate session exposure state for remote bridge tools
+    // and misspellings this registry never owned.
+    if !tools::is_registry_tool(name) {
+        return None;
+    }
+
+    // Drain stale meta first so a handler that sets none cannot inherit flags
+    // from the previous call — the same guard `dispatch_tool` applies.
+    let _ = std::mem::take(&mut session.last_response_meta);
+    let result = dispatch_tool_inner(session, name, args).await;
+    let meta = std::mem::take(&mut session.last_response_meta);
+
+    match result {
+        Ok(result) => Some((
+            extract_result_text(&result),
+            result.is_error.unwrap_or(false),
+            meta,
+        )),
+        // The name is ours, so an error is a real failure. Returning `None` here
+        // would misroute it to remote dispatch and surface as "not available".
+        // `Display`, not `Debug`: this string is surfaced to the model, and the
+        // Debug form of a boxed error is noisy and unstable across versions.
+        Err(error) => Some((format!("tool '{name}' failed: {error}"), true, meta)),
+    }
 }
 
 async fn dispatch_tool_inner(
@@ -1751,6 +1791,44 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dispatch_tool_inner` calls `activate_tool` and records `used_tools` on
+    /// entry, so `dispatch_local_tool` has to establish that a name belongs to
+    /// this registry *before* dispatching. The agent loop calls it for every
+    /// non-opcode name on the way to remote dispatch, so probing speculatively
+    /// would leave exposure and usage state polluted with remote bridge tools and
+    /// typos that were never local (vikunja 1112, codeJung review of PR #110).
+    #[tokio::test]
+    async fn dispatch_local_tool_declines_foreign_names_without_touching_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(crate::config::Config::default()),
+        );
+        let exposed_before = session.exposed_tools.clone();
+        let used_before = session.used_tools.clone();
+
+        // A remote MCP bridge name, and a misspelling of a real local tool.
+        for name in ["mcp__other_server__do_thing", "shelcheck"] {
+            assert!(
+                dispatch_local_tool(&mut session, name, &json!({}))
+                    .await
+                    .is_none(),
+                "{name} is not in this registry and must be declined"
+            );
+            assert!(
+                !session.used_tools.contains(name),
+                "{name} leaked into used_tools"
+            );
+            assert!(
+                !session.exposed_tools.contains(name),
+                "{name} leaked into exposed_tools"
+            );
+        }
+
+        assert_eq!(session.exposed_tools, exposed_before);
+        assert_eq!(session.used_tools, used_before);
+    }
 
     // --- Idle watchdog: an in-flight request is not idleness (vikunja #1078) ---
 
