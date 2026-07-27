@@ -59,20 +59,13 @@ use crate::providers::{
     StreamEvent, ToolSchema, Usage,
 };
 use crate::session::Session;
-use crate::session_core::{ApprovalBroker, ApprovalError};
+use crate::session_core::{ApprovalBroker, ApprovalError, TurnController, TurnError};
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
     ClientCapability,
 };
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
-
-/// One in-flight prompt's cancellation switch. Stored outside the
-/// session-holding lock (in its own quickly-acquired-and-released
-/// `std::sync::Mutex`) so a `session/cancel` notification — dispatched
-/// concurrently while a prompt is in flight — never has to wait on the same
-/// lock the long-running prompt holds.
-type CancelSlot = Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>;
 
 /// Tool-call ids announced to the ACP client and not yet completed. Every
 /// `ToolCallUpdate` path consults this set so cancellation, replay anomalies,
@@ -333,7 +326,7 @@ struct SessionHandle {
     /// cannot be refreshed or replayed after its handle is removed.
     lifecycle: tokio::sync::Mutex<()>,
     session: tokio::sync::Mutex<AgentSession>,
-    cancel: CancelSlot,
+    turn: TurnController,
     active_tool_calls: ActiveToolCalls,
     approvals: Arc<ApprovalBroker>,
     connection: CurrentConnection,
@@ -408,14 +401,7 @@ async fn session_operation_lock(
 }
 
 fn request_session_cancel(handle: &SessionHandle) {
-    let notify = handle
-        .cancel
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    if let Some(notify) = notify {
-        notify.notify_one();
-    }
+    let _ = handle.turn.cancel();
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -1872,11 +1858,15 @@ async fn run_prompt_turn(
     client_user_message_id: Option<String>,
     store: Option<&SessionStore>,
     assistant_prefix: Option<String>,
-) -> AcpStopReason {
-    // Acquire exclusive access to this session *before* publishing the
-    // turn's connection/cancel handles — otherwise a second overlapping
-    // session/prompt for the *same* session could overwrite the in-flight
-    // turn's routing/cancellation handle while both wait on this lock.
+) -> Result<AcpStopReason, TurnError> {
+    // Claim the transport-independent turn slot before waiting on session
+    // state. A second prompt for this session is rejected immediately instead
+    // of queueing behind the active provider/tool loop and running later with
+    // stale user intent.
+    let active_turn = match handle.turn.begin() {
+        Ok(active_turn) => active_turn,
+        Err(error) => return Err(error),
+    };
     let mut agent_session = handle.session.lock().await;
     {
         let mut client_ids = handle.client_user_message_ids.lock().await;
@@ -1891,7 +1881,7 @@ async fn run_prompt_turn(
                         TextContent::new(message),
                     ))),
                 );
-                return AcpStopReason::EndTurn;
+                return Ok(AcpStopReason::EndTurn);
             }
         }
     }
@@ -1917,7 +1907,7 @@ async fn run_prompt_turn(
                     TextContent::new(error),
                 ))),
             );
-            return AcpStopReason::EndTurn;
+            return Ok(AcpStopReason::EndTurn);
         }
     };
 
@@ -1935,7 +1925,7 @@ async fn run_prompt_turn(
         }
         let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
         send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
-        return AcpStopReason::EndTurn;
+        return Ok(AcpStopReason::EndTurn);
     }
 
     // Stream the prefix at the start of the turn, but do not put it in the
@@ -1952,12 +1942,9 @@ async fn run_prompt_turn(
         );
     }
 
-    let notify = Arc::new(tokio::sync::Notify::new());
-    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
-
     let outcome = tokio::select! {
         turn = agent_session.prompt_message(user_message) => Some(turn),
-        _ = notify.notified() => None,
+        _ = active_turn.cancelled() => None,
     };
     if outcome.is_none() {
         // Resolve every reliable approval waiter before retiring the turn.
@@ -1999,7 +1986,7 @@ async fn run_prompt_turn(
         None
     };
     drop(agent_session);
-    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    drop(active_turn);
 
     if let (Some(store), Some(messages), Some(client_ids)) =
         (store, history_snapshot, client_ids_snapshot)
@@ -2013,7 +2000,7 @@ async fn run_prompt_turn(
         );
     }
 
-    match outcome {
+    Ok(match outcome {
         Some(turn) => {
             emit_usage_update(
                 cx,
@@ -2048,7 +2035,7 @@ async fn run_prompt_turn(
             tracing::Span::current().record("daimonos.cancel.reason", "client");
             AcpStopReason::Cancelled
         }
-    }
+    })
 }
 
 async fn run_retry_turn(
@@ -2057,6 +2044,10 @@ async fn run_retry_turn(
     session_id: &SessionId,
     store: Option<&SessionStore>,
 ) -> Result<AcpStopReason, String> {
+    let active_turn = handle
+        .turn
+        .begin()
+        .map_err(|_| "session is busy".to_string())?;
     let mut agent_session = handle.session.lock().await;
     *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
     let model = handle
@@ -2066,11 +2057,9 @@ async fn run_retry_turn(
         .clone();
     let context_window = prepare_model(handle, &mut agent_session, &model).await?;
 
-    let notify = Arc::new(tokio::sync::Notify::new());
-    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify.clone());
     let outcome = tokio::select! {
         turn = agent_session.retry_last_turn() => Some(turn),
-        _ = notify.notified() => None,
+        _ = active_turn.cancelled() => None,
     };
     let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
 
@@ -2100,15 +2089,12 @@ async fn run_retry_turn(
                 Some(agent_session.history().to_vec()),
             )
         }
-        Some(Err(error)) => {
-            *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return Err(error);
-        }
+        Some(Err(error)) => return Err(error),
         None => (AcpStopReason::Cancelled, None),
     };
     let client_ids = handle.client_user_message_ids.lock().await.clone();
     drop(agent_session);
-    *handle.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    drop(active_turn);
 
     if let (Some(store), Some(messages)) = (store, history_snapshot) {
         store.save_acp(
@@ -2269,7 +2255,7 @@ async fn build_session_handle(
     let handle = Arc::new(SessionHandle {
         lifecycle: tokio::sync::Mutex::new(()),
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
-        cancel: Arc::new(StdMutex::new(None)),
+        turn: TurnController::default(),
         active_tool_calls,
         approvals,
         connection,
@@ -3196,7 +3182,7 @@ fn build_agent_with_state(
                                 session_id = %session_id,
                             );
                             let handle = state.sessions.lock().await.get(&session_id).cloned();
-                            let stop_reason = match handle {
+                            let turn_result = match handle {
                                 Some(handle) => {
                                     let model = handle
                                         .current_model
@@ -3217,7 +3203,7 @@ fn build_agent_with_state(
                                         tools_exposed,
                                     });
                                     let user_message = prompt_message(req.prompt);
-                                    let stop_reason = if message_has_images(&user_message)
+                                    let turn_result = if message_has_images(&user_message)
                                         && !state.supports_images
                                     {
                                         send_notification(
@@ -3229,7 +3215,7 @@ fn build_agent_with_state(
                                                 )),
                                             )),
                                         );
-                                        AcpStopReason::EndTurn
+                                        Ok(AcpStopReason::EndTurn)
                                     } else {
                                         let assistant_prefix = state
                                             .timestamp_turns
@@ -3246,16 +3232,26 @@ fn build_agent_with_state(
                                         .instrument(prompt_span.span().clone())
                                         .await
                                     };
-                                    let error_type = match stop_reason {
-                                        AcpStopReason::Refusal => Some("refusal"),
-                                        AcpStopReason::Cancelled => Some("client_cancelled"),
-                                        _ => None,
-                                    };
-                                    prompt_span.finish(
-                                        acp_stop_reason_name(&stop_reason),
-                                        error_type,
-                                    );
-                                    stop_reason
+                                    match turn_result {
+                                        Ok(stop_reason) => {
+                                            let error_type = match stop_reason {
+                                                AcpStopReason::Refusal => Some("refusal"),
+                                                AcpStopReason::Cancelled => {
+                                                    Some("client_cancelled")
+                                                }
+                                                _ => None,
+                                            };
+                                            prompt_span.finish(
+                                                acp_stop_reason_name(&stop_reason),
+                                                error_type,
+                                            );
+                                            Ok(stop_reason)
+                                        }
+                                        Err(error) => {
+                                            prompt_span.finish("error", Some("busy"));
+                                            Err(error)
+                                        }
+                                    }
                                 }
                                 None => {
                                     send_notification(
@@ -3267,17 +3263,35 @@ fn build_agent_with_state(
                                             )),
                                         )),
                                     );
-                                    AcpStopReason::EndTurn
+                                    Ok(AcpStopReason::EndTurn)
                                 }
                             };
-                            tracing::info!(
-                                target: "daimonos::acp",
-                                event = "prompt_completed",
-                                session_id = %session_id,
-                                stop_reason = ?stop_reason,
-                                duration_ms = started.elapsed().as_millis() as u64,
-                            );
-                            let _ = responder.respond(PromptResponse::new(stop_reason));
+                            match turn_result {
+                                Ok(stop_reason) => {
+                                    tracing::info!(
+                                        target: "daimonos::acp",
+                                        event = "prompt_completed",
+                                        session_id = %session_id,
+                                        stop_reason = ?stop_reason,
+                                        duration_ms = started.elapsed().as_millis() as u64,
+                                    );
+                                    let _ = responder.respond(PromptResponse::new(stop_reason));
+                                }
+                                Err(error) => {
+                                    tracing::info!(
+                                        target: "daimonos::acp",
+                                        event = "prompt_rejected",
+                                        session_id = %session_id,
+                                        error = %error,
+                                        duration_ms = started.elapsed().as_millis() as u64,
+                                    );
+                                    let _ = responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(
+                                            error.to_string(),
+                                        ),
+                                    );
+                                }
+                            }
                             Ok(())
                         });
                         Ok(())
@@ -3339,14 +3353,7 @@ fn build_agent_with_state(
                     async move {
                         let handle = state.sessions.lock().await.get(&notif.session_id).cloned();
                         if let Some(handle) = handle {
-                            if let Some(notify) = handle
-                                .cancel
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .as_ref()
-                            {
-                                notify.notify_one();
-                            }
+                            request_session_cancel(&handle);
                         }
                         Ok(())
                     }
