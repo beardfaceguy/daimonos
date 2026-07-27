@@ -764,6 +764,7 @@ dependencies = [
  "ignore",
  "json-patch",
  "keyring",
+ "libc",
  "notify",
  "opentelemetry",
  "opentelemetry-otlp",
