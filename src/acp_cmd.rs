@@ -2044,10 +2044,7 @@ async fn run_retry_turn(
     session_id: &SessionId,
     store: Option<&SessionStore>,
 ) -> Result<AcpStopReason, String> {
-    let active_turn = handle
-        .turn
-        .begin()
-        .map_err(|_| "session is busy".to_string())?;
+    let active_turn = handle.turn.begin().map_err(|error| error.to_string())?;
     let mut agent_session = handle.session.lock().await;
     *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
     let model = handle
