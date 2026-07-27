@@ -80,6 +80,62 @@ mod tests {
 
     // --- active_schemas ---
 
+    /// The defect behind vikunja 1112: `active_schemas` is the catalog handed to
+    /// the model, but the agent loop could only dispatch opcode-backed tools plus
+    /// two special cases. Nineteen advertised tools therefore failed every call
+    /// with "not available in agent mode".
+    ///
+    /// Advertising a capability and then refusing it is worse than not
+    /// advertising it: the model cannot plan around it and burns a turn per
+    /// discovery. This asserts every advertised tool is reachable by *some*
+    /// agent-loop path, so the catalog and the dispatcher cannot drift apart
+    /// again.
+    #[tokio::test]
+    async fn every_advertised_tool_is_dispatchable_by_the_agent_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut undispatchable = Vec::new();
+
+        for schema in default_schemas(dir.path()) {
+            let name = schema.name.as_str();
+
+            // Path 1: opcode-backed, handled by this facade.
+            if tools::has_opcode_mapping(name) {
+                continue;
+            }
+            // Path 2: special-cased directly in the agent loop.
+            if name == "execute_script" || name == crate::agent::UPDATE_PLAN_TOOL {
+                continue;
+            }
+            // Path 3: plugin/meta tool shared with the MCP adapter. Arguments are
+            // deliberately empty — a tool that rejects them still proves it is
+            // wired, and `Some` vs `None` is exactly the reachability question.
+            let mut session = session_in(dir.path());
+            if crate::mcp::dispatch_local_tool(&mut session, name, &json!({}))
+                .await
+                .is_some()
+            {
+                continue;
+            }
+
+            undispatchable.push(schema.name.clone());
+        }
+
+        // `batch` is a known, tracked exception (vikunja 1112). It lives in the
+        // MCP request handler rather than the shared dispatcher because its KGL
+        // observe path deliberately drops the session lock before doing sync
+        // SQLite I/O — something a function taking `&mut Session` cannot do.
+        // Extracting it requires reworking that lock handling.
+        //
+        // Asserted as an exact set rather than skipped: if another tool ever
+        // becomes undispatchable this fails, and when `batch` is fixed this also
+        // fails, prompting removal of the exception.
+        assert_eq!(
+            undispatchable,
+            vec!["batch".to_string()],
+            "agent-loop dispatch coverage changed; expected only the tracked `batch` gap"
+        );
+    }
+
     #[test]
     fn active_schemas_is_non_empty() {
         let dir = tempfile::tempdir().unwrap();

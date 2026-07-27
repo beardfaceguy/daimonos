@@ -298,6 +298,28 @@ async fn dispatch_tool(
     result
 }
 
+/// Dispatch a plugin or meta tool that has no opcode mapping, returning
+/// `(content, is_error)`. `None` means `name` is not a local tool at all, so the
+/// caller should fall through to remote MCP dispatch.
+///
+/// These tools are implemented once, here, and both frontends route through this
+/// entry point. Previously only the MCP adapter did, and the agent loop fell
+/// through to "not available in agent mode" for all 19 of them (vikunja 1112).
+pub(crate) async fn dispatch_local_tool(
+    session: &mut Session,
+    name: &str,
+    args: &Value,
+) -> Option<(String, bool)> {
+    match dispatch_tool_inner(session, name, args).await {
+        Ok(result) => Some((
+            extract_result_text(&result),
+            result.is_error.unwrap_or(false),
+        )),
+        // The only error `dispatch_tool_inner` produces is `unknown_tool`.
+        Err(_) => None,
+    }
+}
+
 async fn dispatch_tool_inner(
     session: &mut Session,
     name: &str,

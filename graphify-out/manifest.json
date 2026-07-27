@@ -255,13 +255,13 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785168077.5877662,
+    "mtime": 1785179077.9961069,
     "ast_hash": "46911a43e393cc46e818082954c875c6",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1785115574.9317095,
-    "ast_hash": "9446ff85aef65b960d95451abde1309d",
+    "mtime": 1785179805.1849318,
+    "ast_hash": "09ca5b908d2d7885f43cebc316438103",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1785040982.1870549,
-    "ast_hash": "ac52e7b77bef0cb4a300a54398e97035",
+    "mtime": 1785179816.3058522,
+    "ast_hash": "76ddac7a4fa02ac1fc57ed93c98d7cd0",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -375,7 +375,7 @@
     "semantic_hash": "87419cbcf60a37e69e4ba01b8a642fde"
   },
   "src/ops/exec_ops.rs": {
-    "mtime": 1785169989.7208316,
+    "mtime": 1785179077.9961069,
     "ast_hash": "a9d8fdf5679ca9775d56f4d6da594974",
     "semantic_hash": ""
   },
@@ -410,12 +410,12 @@
     "semantic_hash": "6b727d2a9a620fcc0b59ffaeaa82f1e0"
   },
   "src/plugins/cargo.rs": {
-    "mtime": 1785170079.6335568,
+    "mtime": 1785179077.9961069,
     "ast_hash": "4b926f737783a6d87f710e2cda108d2f",
     "semantic_hash": ""
   },
   "src/plugins/curl.rs": {
-    "mtime": 1785170079.6347163,
+    "mtime": 1785179077.997107,
     "ast_hash": "835ca6dd2ca21e7c059c7d57d52dceee",
     "semantic_hash": ""
   },
@@ -425,7 +425,7 @@
     "semantic_hash": "d2324e0e7f1b31b0ebde2d8d1f797900"
   },
   "src/plugins/docker.rs": {
-    "mtime": 1785170079.634998,
+    "mtime": 1785179077.997107,
     "ast_hash": "51b5997eaea4c151eb64fc1861bc653c",
     "semantic_hash": ""
   },
@@ -435,12 +435,12 @@
     "semantic_hash": "dd34ac80a8789099851a024ad1abc03a"
   },
   "src/plugins/gh.rs": {
-    "mtime": 1785170079.6356575,
+    "mtime": 1785179077.997107,
     "ast_hash": "fd56a7a1fc843c7dcb87723be504668e",
     "semantic_hash": ""
   },
   "src/plugins/git.rs": {
-    "mtime": 1785170079.6345618,
+    "mtime": 1785179077.997107,
     "ast_hash": "a15e731a29d3908e27082e0a2150b8f9",
     "semantic_hash": ""
   },
@@ -450,17 +450,17 @@
     "semantic_hash": "5d4302833a5528a5764e1c5a4a2b8f15"
   },
   "src/plugins/npm.rs": {
-    "mtime": 1785170079.6351242,
+    "mtime": 1785179077.997107,
     "ast_hash": "743326a5894a25ec7ae1ea3f85869843",
     "semantic_hash": ""
   },
   "src/plugins/pytest.rs": {
-    "mtime": 1785170079.6348612,
+    "mtime": 1785179077.997107,
     "ast_hash": "f542051b9c95efa47886ef899291b562",
     "semantic_hash": ""
   },
   "src/plugins/shellcheck.rs": {
-    "mtime": 1785170079.6353614,
+    "mtime": 1785179077.997107,
     "ast_hash": "387b7702ad64f92058d54e5ae58e0e29",
     "semantic_hash": ""
   },
@@ -520,12 +520,12 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1784916516.3385727,
-    "ast_hash": "7413b9f116ed665dadfae1f597085892",
+    "mtime": 1785179674.1758687,
+    "ast_hash": "7a776e3acebf15ea12b8169c22f9c071",
     "semantic_hash": ""
   },
   "src/tool_runner.rs": {
-    "mtime": 1785167885.1811159,
+    "mtime": 1785179077.998107,
     "ast_hash": "72a74b4ff1d7ccdac58e3880e1eac9f5",
     "semantic_hash": ""
   },
