@@ -332,7 +332,9 @@ pub(crate) async fn dispatch_local_tool(
         )),
         // The name is ours, so an error is a real failure. Returning `None` here
         // would misroute it to remote dispatch and surface as "not available".
-        Err(error) => Some((format!("tool '{name}' failed: {error:?}"), true, meta)),
+        // `Display`, not `Debug`: this string is surfaced to the model, and the
+        // Debug form of a boxed error is noisy and unstable across versions.
+        Err(error) => Some((format!("tool '{name}' failed: {error}"), true, meta)),
     }
 }
 

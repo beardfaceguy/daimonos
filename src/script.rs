@@ -1461,36 +1461,21 @@ pub fn tool_signatures() -> String {
         // `name` argument of their own that would collide with it.
         "def tool(tool_name: str, /, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
     ];
-    let named: std::collections::HashSet<&str> = [
-        "read_file",
-        "write_file",
-        "edit_file",
-        "search",
-        "exec",
-        "ls",
-        "snapshot",
-        "git",
-        "gh",
-        "cargo",
-        "pytest",
-        "docker",
-        "discord",
-        "session_stats",
-    ]
-    .into_iter()
-    .collect();
-    // Everything else reachable through `tool(name, **kwargs)`. Derived from the
-    // registry rather than hand-listed, so tools added later show up here without
-    // anyone remembering to update this string (vikunja 1112).
+    // Every opcode-backed tool, derived from the registry. An earlier version
+    // subtracted the named bindings above to avoid listing them twice, but that
+    // needed a hand-maintained set of those names — reintroducing exactly the
+    // drift this whole change removes. Listing all of them is redundant rather
+    // than wrong: the named bindings are callable through `tool()` too, since
+    // both route through `build_request`.
     let mut via_generic: Vec<&str> = tools::all_tools()
         .into_iter()
-        .filter(|t| t.to_request.is_some() && !named.contains(t.name))
+        .filter(|t| t.to_request.is_some())
         .map(|t| t.name)
         .collect();
     via_generic.sort_unstable();
     let mut out = sigs.join("\n");
     if !via_generic.is_empty() {
-        out.push_str("\n# Also callable as tool(\"<name>\", ...): ");
+        out.push_str("\n# Callable as tool(\"<name>\", ...): ");
         out.push_str(&via_generic.join(", "));
     }
     out

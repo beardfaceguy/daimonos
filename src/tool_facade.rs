@@ -126,6 +126,55 @@ mod tests {
         );
     }
 
+    /// The agent catalog must withhold `McpOnly` tools. Asserted explicitly
+    /// because the invariant lives in a filter in this file while the tier is set
+    /// in `tools.rs` — reviewers reading only the `tools.rs` side of a diff have
+    /// twice flagged this as possibly broken, and nothing stated it outright.
+    #[test]
+    fn active_schemas_withholds_mcp_only_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let advertised: Vec<String> = default_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        let mcp_only: Vec<&str> = tools::all_tools()
+            .into_iter()
+            .filter(|t| t.tier == ToolTier::McpOnly)
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !mcp_only.is_empty(),
+            "no McpOnly tools left; this test is now vacuous and should be removed"
+        );
+
+        for name in mcp_only {
+            assert!(
+                !advertised.contains(&name.to_string()),
+                "{name} is McpOnly but was advertised to the agent"
+            );
+        }
+    }
+
+    /// The MCP side of the same tier: `McpOnly` must stay exposed there. Moving
+    /// `batch` to the new tier initially dropped it out of `initial_exposed_tools`
+    /// and so out of MCP `list_tools` entirely, which the Rust suite did not
+    /// catch — only the Python MCP integration suite did.
+    #[test]
+    fn mcp_only_tools_remain_exposed_over_mcp() {
+        let exposed = tools::initial_exposed_tools();
+        for tool in tools::all_tools()
+            .into_iter()
+            .filter(|t| t.tier == ToolTier::McpOnly)
+        {
+            assert!(
+                exposed.contains(tool.name),
+                "{} is McpOnly but missing from the default MCP-exposed set",
+                tool.name
+            );
+        }
+    }
+
     #[test]
     fn active_schemas_is_non_empty() {
         let dir = tempfile::tempdir().unwrap();

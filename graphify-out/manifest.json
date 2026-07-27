@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1785181499.484064,
-    "ast_hash": "71c7395df31c44c834a4e727ee2d89ce",
+    "mtime": 1785182396.2050545,
+    "ast_hash": "75195a8f4a1d3c81da3c8883b689b4c3",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -500,8 +500,8 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1785181390.33052,
-    "ast_hash": "c139f2230e4c0112689fec8c94209404",
+    "mtime": 1785182418.0818903,
+    "ast_hash": "223c902cf4178008f78b158cccaa4ae5",
     "semantic_hash": ""
   },
   "src/session.rs": {
@@ -520,8 +520,8 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1785180359.2219684,
-    "ast_hash": "78a204bbe9e9a5cb6dee87f5b1fedfc6",
+    "mtime": 1785182430.7437954,
+    "ast_hash": "fdac22479ca6c18b59000cf2a9e2d583",
     "semantic_hash": ""
   },
   "src/tool_runner.rs": {

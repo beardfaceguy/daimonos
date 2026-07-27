@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-27)
 
 ## Corpus Check
-- 208 files · ~259,027 words
+- 208 files · ~259,263 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5182 nodes · 11960 edges · 231 communities (212 shown, 19 thin omitted)
+- 5184 nodes · 11963 edges · 230 communities (211 shown, 19 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `c11e38a0`
+- Built from commit: `08ca8fce`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -183,7 +183,6 @@
 - [[_COMMUNITY_Community 172|Community 172]]
 - [[_COMMUNITY_Community 173|Community 173]]
 - [[_COMMUNITY_Community 174|Community 174]]
-- [[_COMMUNITY_Community 175|Community 175]]
 - [[_COMMUNITY_Community 176|Community 176]]
 - [[_COMMUNITY_Community 177|Community 177]]
 - [[_COMMUNITY_Community 178|Community 178]]
@@ -284,7 +283,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (231 total, 19 thin omitted)
+## Communities (230 total, 19 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -435,8 +434,8 @@ Cohesion: 0.18
 Nodes (29): build_tool_args(), build_tool_args_empty(), build_tool_args_with_fields(), build_tool_args_with_kv(), test_session_no_registry(), test_session_with_registry(), tool_list(), tool_list_no_registry() (+21 more)
 
 ### Community 37 - "Community 37"
-Cohesion: 0.13
-Nodes (33): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+25 more)
+Cohesion: 0.12
+Nodes (34): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+26 more)
 
 ### Community 38 - "Community 38"
 Cohesion: 0.26
@@ -479,8 +478,8 @@ Cohesion: 0.17
 Nodes (21): McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content., tools/call write_file creates a file on disk. (+13 more)
 
 ### Community 48 - "Community 48"
-Cohesion: 0.25
-Nodes (7): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting
+Cohesion: 0.33
+Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
 
 ### Community 49 - "Community 49"
 Cohesion: 0.07
@@ -783,23 +782,23 @@ Cohesion: 0.13
 Nodes (14): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Manual testing, Prerequisites, Quick start (new agents), Repo layout (+6 more)
 
 ### Community 140 - "Community 140"
-Cohesion: 0.09
-Nodes (14): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines, 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended) (+6 more)
+Cohesion: 0.08
+Nodes (16): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting, Runtime Modes (+8 more)
 
 ### Community 141 - "Community 141"
 Cohesion: 0.12
 Nodes (15): 1. Create the MCP config file, 2. Start the server, 3. Use in Copilot Chat, Context-aware tools missing, GitHub Copilot Setup, JetBrains IDEs Setup, "MCP servers in Copilot" policy error, Prerequisites (+7 more)
 
 ### Community 142 - "Community 142"
-Cohesion: 0.29
-Nodes (7): Agent still uses built-in tools, "daimonos" doesn't appear in MCP panel, MCP disconnects after ~10 minutes idle, MCP log lines marked `[error]` for benign text (`auto-registered…`, `index: …`), "Permission denied" errors, Tools like `cargo` or `git` don't appear, Troubleshooting
+Cohesion: 0.12
+Nodes (15): 1. Create the MCP config file, 2. Verify in Cursor, 3. Add the system prompt directive (recommended), Agent still uses built-in tools, Cursor IDE Setup, "daimonos" doesn't appear in MCP panel, MCP disconnects after ~10 minutes idle, MCP log lines marked `[error]` for benign text (`auto-registered…`, `index: …`) (+7 more)
 
 ### Community 143 - "Community 143"
 Cohesion: 0.14
 Nodes (13): 1) Create Discord Bot Credentials, 2) Set the Bot Token in Environment, 3) Configure Daimonos Discord Section, 429 / rate limit issues, 4) Find Guild/Channel IDs, 5) Verify in MCP, "discord integration disabled", Discord Integration Setup (+5 more)
 
 ### Community 144 - "Community 144"
-Cohesion: 0.15
+Cohesion: 0.14
 Nodes (13): Android Studio (Gemini Agent), AnythingLLM, BoltAI, ChatGPT Desktop, Claude Desktop, Continue.dev (VS Code / JetBrains), General Pattern, LibreChat (+5 more)
 
 ### Community 145 - "Community 145"
@@ -889,10 +888,6 @@ Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(
 ### Community 174 - "Community 174"
 Cohesion: 0.14
 Nodes (18): RecordedCall, agent_session_prompt_delivers_model_notice(), MockProvider, orphan_ids(), provider_error_does_not_suppress_coordination_notice_retry(), RecordingProvider, Box, CompleteOpts (+10 more)
-
-### Community 175 - "Community 175"
-Cohesion: 0.22
-Nodes (8): 1. Open MCP configuration, 2. Add daimonos as an MCP server, 3. Verify, Adding a Rules Directive (optional), Prerequisites, Setup, Troubleshooting, Windsurf Setup
 
 ### Community 176 - "Community 176"
 Cohesion: 0.09
