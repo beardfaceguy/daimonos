@@ -1,8 +1,14 @@
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
-use crate::session_protocol::{ApprovalDecision, ApprovalRequest, ClientCapability};
+use crate::agent::AgentSession;
+use crate::compaction::CompactionPolicy;
+use crate::providers::Message;
+use crate::session_protocol::{ApprovalDecision, ApprovalRequest, ClientCapability, SessionEvent};
+use crate::session_store::SessionStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnError {
@@ -19,6 +25,332 @@ impl std::fmt::Display for TurnError {
 
 impl std::error::Error for TurnError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEventError {
+    SequenceExhausted,
+    HandlerPanicked,
+}
+
+pub type SessionEventHandler = std::sync::Arc<dyn Fn(u64, SessionEvent) + Send + Sync + 'static>;
+
+/// Transport-independent projection of canonical session events.
+///
+/// The router assigns session-local monotonic sequence numbers before handing
+/// events to the configured adapter. Reliable replay/ring retention is layered
+/// on this sequence in Vikunja #1100; this layer owns only canonical ordering.
+pub struct SessionEventRouter {
+    sequence: StdMutex<u64>,
+    handler: Option<SessionEventHandler>,
+}
+
+impl SessionEventRouter {
+    pub fn new(handler: Option<SessionEventHandler>) -> Self {
+        Self {
+            sequence: StdMutex::new(0),
+            handler,
+        }
+    }
+
+    pub fn emit(&self, event: SessionEvent) -> Result<u64, SessionEventError> {
+        let sequence = {
+            let mut current = self
+                .sequence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *current = current
+                .checked_add(1)
+                .ok_or(SessionEventError::SequenceExhausted)?;
+            *current
+        };
+        if let Some(handler) = &self.handler {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(sequence, event);
+            }))
+            .map_err(|_| SessionEventError::HandlerPanicked)?;
+        }
+        Ok(sequence)
+    }
+
+    pub fn latest_sequence(&self) -> u64 {
+        *self
+            .sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for SessionEventRouter {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+/// Compaction policy plus whether its context window follows the active model.
+#[derive(Clone)]
+pub struct SessionCompaction {
+    pub(crate) policy: Option<CompactionPolicy>,
+    pub(crate) follows_model_window: bool,
+}
+
+impl SessionCompaction {
+    pub fn new(policy: Option<CompactionPolicy>, follows_model_window: bool) -> Self {
+        Self {
+            policy,
+            follows_model_window,
+        }
+    }
+
+    pub fn policy_for(
+        &self,
+        model: &str,
+        context_window: Option<u64>,
+    ) -> Result<Option<CompactionPolicy>, String> {
+        let Some(mut policy) = self.policy.clone() else {
+            return Ok(None);
+        };
+        if self.follows_model_window {
+            let context_window = context_window.ok_or_else(|| {
+                format!(
+                    "could not determine the context window for model '{model}' from the provider"
+                )
+            })?;
+            if policy.output_reservation >= context_window {
+                return Err(format!(
+                    "DAIMONOS_AGENT_OUTPUT_RESERVATION ({}) must be smaller than the \
+                     provider-reported context window ({context_window}) for model '{model}'",
+                    policy.output_reservation
+                ));
+            }
+            policy.context_window = context_window;
+        }
+        Ok(Some(policy))
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionPersistence {
+    session_id: String,
+    store: SessionStore,
+}
+
+impl SessionPersistence {
+    pub fn new(session_id: impl Into<String>, store: SessionStore) -> Self {
+        Self {
+            session_id: session_id.into(),
+            store,
+        }
+    }
+
+    fn save(
+        &self,
+        model: &str,
+        messages: &[Message],
+        cwd: &Path,
+        client_user_message_ids: &[String],
+    ) {
+        self.store.save_acp(
+            &self.session_id,
+            model,
+            messages,
+            cwd,
+            client_user_message_ids,
+        );
+    }
+}
+
+/// Daemon-owned, transport-independent state for one live agent session.
+///
+/// Provider, tools, safety hooks, history, usage, and runtime config live inside
+/// `AgentSession`; this core adds lifecycle serialization, active-turn routing,
+/// approvals, persistence identity, model/window state, and canonical events.
+pub struct SessionCore {
+    pub(crate) lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) session: tokio::sync::Mutex<AgentSession>,
+    pub(crate) turn: TurnController,
+    pub(crate) approvals: Arc<ApprovalBroker>,
+    pub(crate) current_model: StdMutex<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
+    pub(crate) compaction: SessionCompaction,
+    pub(crate) context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
+    pub(crate) events: Arc<SessionEventRouter>,
+    persistence: Option<SessionPersistence>,
+}
+
+impl SessionCore {
+    pub fn begin_turn(&self) -> Result<SessionTurn<'_>, TurnError> {
+        let active = self.turn.begin()?;
+        let _ = self.events.emit(SessionEvent::TurnStatusChanged {
+            status: crate::session_protocol::TurnStatus::Running,
+        });
+        Ok(SessionTurn {
+            active,
+            events: &self.events,
+        })
+    }
+
+    /// Cancel the active turn, emitting `Cancelling` before the notification
+    /// that unwinds it. Returns false when no turn is active.
+    ///
+    /// Emitting from here rather than from the caller is what makes the sequence
+    /// deterministic: the terminal event comes from `SessionTurn::drop` on the
+    /// turn's own task, which the notification triggers, so a `Cancelling`
+    /// emitted afterwards could arrive *after* the turn had already ended and
+    /// leave the stream resting on `Cancelling` for good.
+    pub fn cancel_turn(&self) -> bool {
+        self.turn.cancel_with(|| {
+            let _ = self.events.emit(SessionEvent::TurnStatusChanged {
+                status: crate::session_protocol::TurnStatus::Cancelling,
+            });
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: AgentSession,
+        current_model: String,
+        cwd: PathBuf,
+        compaction: SessionCompaction,
+        context_windows: HashMap<String, u64>,
+        approvals: Arc<ApprovalBroker>,
+        persistence: Option<SessionPersistence>,
+        events: Arc<SessionEventRouter>,
+    ) -> Self {
+        Self {
+            lifecycle: tokio::sync::Mutex::new(()),
+            session: tokio::sync::Mutex::new(session),
+            turn: TurnController::default(),
+            approvals,
+            current_model: StdMutex::new(current_model),
+            cwd,
+            client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
+            compaction,
+            context_windows: tokio::sync::Mutex::new(context_windows),
+            events,
+            persistence,
+        }
+    }
+
+    pub async fn prepare_model(
+        &self,
+        session: &mut AgentSession,
+        model: &str,
+    ) -> Result<Option<u64>, String> {
+        let cached = self.context_windows.lock().await.get(model).copied();
+        let context_window = match cached {
+            Some(window) => Some(window),
+            None => {
+                let resolved = session
+                    .context_window(model)
+                    .await
+                    .filter(|&window| window > 0);
+                if let Some(window) = resolved {
+                    self.context_windows
+                        .lock()
+                        .await
+                        .insert(model.to_string(), window);
+                }
+                resolved
+            }
+        };
+        let policy = self.compaction.policy_for(model, context_window)?;
+        session.set_model(model);
+        session.set_compaction(policy);
+        Ok(context_window.or_else(|| {
+            (!self.compaction.follows_model_window)
+                .then(|| {
+                    self.compaction
+                        .policy
+                        .as_ref()
+                        .map(|policy| policy.context_window)
+                })
+                .flatten()
+        }))
+    }
+
+    pub fn context_usage(
+        &self,
+        used_tokens: u64,
+        context_window: Option<u64>,
+    ) -> crate::session_protocol::ContextUsage {
+        let (reservation, high_water) = self
+            .compaction
+            .policy
+            .as_ref()
+            .map(|policy| {
+                let budget = policy.budget();
+                let valid_fraction = policy.high_water.is_finite()
+                    && (0.0..=1.0).contains(&policy.high_water)
+                    && budget > 0;
+                let high_water =
+                    valid_fraction.then(|| (policy.high_water * budget as f64).round() as u64);
+                (policy.output_reservation, high_water)
+            })
+            .unwrap_or((0, None));
+        crate::session_protocol::ContextUsage::new(
+            used_tokens,
+            context_window,
+            reservation,
+            high_water,
+        )
+    }
+
+    pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
+        if let Some(persistence) = &self.persistence {
+            persistence.save(model, messages, &self.cwd, client_user_message_ids);
+        }
+    }
+}
+
+pub struct SessionTurn<'a> {
+    active: ActiveTurn<'a>,
+    events: &'a SessionEventRouter,
+}
+
+impl SessionTurn<'_> {
+    pub async fn cancelled(&self) {
+        self.active.cancelled().await;
+    }
+}
+
+impl Drop for SessionTurn<'_> {
+    fn drop(&mut self) {
+        // Drop is the single terminal emitter for a turn, mirroring the
+        // single-terminal claim the tool-call lifecycle already uses: it is the
+        // one place guaranteed to run on every exit path — normal return, `?`,
+        // panic, or a dropped future on cancellation.
+        //
+        // Which terminal event depends on how the turn ended. Emitting `Idle`
+        // unconditionally left a cancelled turn indistinguishable from a
+        // completed one in the canonical stream.
+        let status = if self.active.is_cancelled() {
+            crate::session_protocol::TurnStatus::Cancelled
+        } else {
+            crate::session_protocol::TurnStatus::Idle
+        };
+        if let Err(error) = self.events.emit(SessionEvent::TurnStatusChanged { status }) {
+            tracing::error!(
+                target: "daimonos::session_core",
+                event = "turn_idle_event_failed",
+                error = ?error,
+            );
+        }
+    }
+}
+
+/// The cancellation route for one turn, shared between the task running the turn
+/// and whoever cancels it.
+///
+/// `cancelled` is separate from the notification because `SessionTurn::drop`
+/// decides the turn's terminal event and cannot `await`: a `Notify` carries no
+/// readable "was this signalled" state, so the fact has to be recorded on its
+/// own.
+#[derive(Default)]
+struct TurnSignal {
+    notify: tokio::sync::Notify,
+    cancelled: AtomicBool,
+}
+
 /// Transport-independent ownership for one session's active turn.
 ///
 /// The controller prevents a second prompt from replacing the first turn's
@@ -26,12 +358,12 @@ impl std::error::Error for TurnError {}
 /// including early returns and unwinding.
 #[derive(Default)]
 pub struct TurnController {
-    active: StdMutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+    active: StdMutex<Option<std::sync::Arc<TurnSignal>>>,
 }
 
 pub struct ActiveTurn<'a> {
     controller: &'a TurnController,
-    signal: std::sync::Arc<tokio::sync::Notify>,
+    signal: std::sync::Arc<TurnSignal>,
 }
 
 impl TurnController {
@@ -43,7 +375,7 @@ impl TurnController {
         if active.is_some() {
             return Err(TurnError::Busy);
         }
-        let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = std::sync::Arc::new(TurnSignal::default());
         *active = Some(std::sync::Arc::clone(&signal));
         Ok(ActiveTurn {
             controller: self,
@@ -52,6 +384,19 @@ impl TurnController {
     }
 
     pub fn cancel(&self) -> bool {
+        self.cancel_with(|| {})
+    }
+
+    /// Cancel the active turn, running `before_signal` after the turn is marked
+    /// cancelled but *before* the notification that unwinds it.
+    ///
+    /// The ordering is the point. The terminal event comes from
+    /// `SessionTurn::drop` on the task running the turn, which the notification
+    /// triggers. Anything the canceller wants recorded ahead of that terminal
+    /// event — a `Cancelling` status, say — has to be emitted before the notify,
+    /// or it can land after the turn has already ended and leave the stream
+    /// resting on a non-terminal status.
+    pub fn cancel_with<F: FnOnce()>(&self, before_signal: F) -> bool {
         let signal = self
             .active
             .lock()
@@ -60,7 +405,9 @@ impl TurnController {
         let Some(signal) = signal else {
             return false;
         };
-        signal.notify_one();
+        signal.cancelled.store(true, Ordering::SeqCst);
+        before_signal();
+        signal.notify.notify_one();
         true
     }
 
@@ -74,7 +421,13 @@ impl TurnController {
 
 impl ActiveTurn<'_> {
     pub async fn cancelled(&self) {
-        self.signal.notified().await;
+        self.signal.notify.notified().await;
+    }
+
+    /// Whether this turn has been cancelled. Readable synchronously so `Drop`
+    /// can pick the terminal event.
+    fn is_cancelled(&self) -> bool {
+        self.signal.cancelled.load(Ordering::SeqCst)
     }
 }
 
@@ -249,6 +602,7 @@ impl Drop for ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_protocol::TurnStatus;
 
     fn request() -> ApprovalRequest {
         ApprovalRequest {
@@ -466,5 +820,161 @@ mod tests {
         let resolution = registered.receiver.await.unwrap();
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
         assert_eq!(resolution.resolved_by, "broker_drop");
+    }
+
+    /// Collect every `TurnStatusChanged` status a router sees, in order.
+    fn turn_status_recorder() -> (
+        SessionEventRouter,
+        std::sync::Arc<std::sync::Mutex<Vec<TurnStatus>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_hook = std::sync::Arc::clone(&seen);
+        let router = SessionEventRouter::new(Some(std::sync::Arc::new(move |_seq, event| {
+            if let SessionEvent::TurnStatusChanged { status } = event {
+                seen_for_hook
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(status);
+            }
+        })));
+        (router, seen)
+    }
+
+    /// A cancelled turn must be distinguishable from a completed one in the
+    /// canonical stream, and the terminal event must come last.
+    ///
+    /// Asserting the *ordered sequence* matters. "a terminal event was emitted"
+    /// or "the stream contains Cancelling" both held before this fix, when every
+    /// turn ended on `Idle` and `Cancelling` could arrive after it.
+    #[tokio::test]
+    async fn cancelled_turn_ends_on_cancelled_after_cancelling() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let turn = SessionTurn {
+                active,
+                events: &router,
+            };
+            // Mirrors SessionCore::cancel_turn: mark cancelled, emit Cancelling,
+            // then signal — so Cancelling precedes the unwind it causes.
+            assert!(controller.cancel_with(|| {
+                let _ = router.emit(SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Cancelling,
+                });
+            }));
+            tokio::time::timeout(std::time::Duration::from_millis(100), turn.cancelled())
+                .await
+                .expect("turn observes cancellation");
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            statuses,
+            vec![
+                TurnStatus::Running,
+                TurnStatus::Cancelling,
+                TurnStatus::Cancelled
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_ends_on_idle() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let _turn = SessionTurn {
+                active,
+                events: &router,
+            };
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(statuses, vec![TurnStatus::Running, TurnStatus::Idle]);
+    }
+
+    #[test]
+    fn event_router_assigns_monotonic_sequences_and_forwards_events() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_hook = std::sync::Arc::clone(&seen);
+        let router = SessionEventRouter::new(Some(std::sync::Arc::new(move |seq, event| {
+            seen_for_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((seq, event));
+        })));
+
+        assert_eq!(
+            router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            }),
+            Ok(1)
+        );
+        assert_eq!(
+            router.emit(SessionEvent::AssistantDelta {
+                text: "hello".to_string(),
+            }),
+            Ok(2)
+        );
+        assert_eq!(router.latest_sequence(), 2);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn event_router_contains_adapter_panics() {
+        let router = SessionEventRouter::new(Some(std::sync::Arc::new(|_, _| {
+            panic!("adapter failed");
+        })));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            router.emit(SessionEvent::AssistantDone)
+        }));
+        assert_eq!(result.unwrap(), Err(SessionEventError::HandlerPanicked));
+        assert_eq!(router.latest_sequence(), 1);
+    }
+
+    #[test]
+    fn session_compaction_updates_only_provider_following_windows() {
+        let policy = CompactionPolicy {
+            high_water: 0.8,
+            low_water: 0.5,
+            context_window: 100,
+            output_reservation: 10,
+            summary_model: None,
+            summary_prompt: None,
+        };
+        let dynamic = SessionCompaction::new(Some(policy.clone()), true);
+        assert_eq!(
+            dynamic
+                .policy_for("model", Some(200))
+                .unwrap()
+                .unwrap()
+                .context_window,
+            200
+        );
+        let fixed = SessionCompaction::new(Some(policy), false);
+        assert_eq!(
+            fixed
+                .policy_for("model", Some(200))
+                .unwrap()
+                .unwrap()
+                .context_window,
+            100
+        );
     }
 }

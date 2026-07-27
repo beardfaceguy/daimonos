@@ -255,12 +255,12 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785179077.9961069,
-    "ast_hash": "46911a43e393cc46e818082954c875c6",
+    "mtime": 1785187961.872019,
+    "ast_hash": "5cabaacb9ce54ab0871549da7b65b773",
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1785181379.564598,
+    "mtime": 1785184910.486647,
     "ast_hash": "50fb3c3bd314031f1574e7a08232410d",
     "semantic_hash": ""
   },
@@ -360,7 +360,7 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1785182396.2050545,
+    "mtime": 1785184910.486647,
     "ast_hash": "75195a8f4a1d3c81da3c8883b689b4c3",
     "semantic_hash": ""
   },
@@ -375,7 +375,7 @@
     "semantic_hash": "87419cbcf60a37e69e4ba01b8a642fde"
   },
   "src/ops/exec_ops.rs": {
-    "mtime": 1785179077.9961069,
+    "mtime": 1785184910.4876468,
     "ast_hash": "a9d8fdf5679ca9775d56f4d6da594974",
     "semantic_hash": ""
   },
@@ -410,12 +410,12 @@
     "semantic_hash": "6b727d2a9a620fcc0b59ffaeaa82f1e0"
   },
   "src/plugins/cargo.rs": {
-    "mtime": 1785179077.9961069,
+    "mtime": 1785184910.4876468,
     "ast_hash": "4b926f737783a6d87f710e2cda108d2f",
     "semantic_hash": ""
   },
   "src/plugins/curl.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.4876468,
     "ast_hash": "835ca6dd2ca21e7c059c7d57d52dceee",
     "semantic_hash": ""
   },
@@ -425,7 +425,7 @@
     "semantic_hash": "d2324e0e7f1b31b0ebde2d8d1f797900"
   },
   "src/plugins/docker.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.4876468,
     "ast_hash": "51b5997eaea4c151eb64fc1861bc653c",
     "semantic_hash": ""
   },
@@ -435,12 +435,12 @@
     "semantic_hash": "dd34ac80a8789099851a024ad1abc03a"
   },
   "src/plugins/gh.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.4876468,
     "ast_hash": "fd56a7a1fc843c7dcb87723be504668e",
     "semantic_hash": ""
   },
   "src/plugins/git.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.4876468,
     "ast_hash": "a15e731a29d3908e27082e0a2150b8f9",
     "semantic_hash": ""
   },
@@ -450,17 +450,17 @@
     "semantic_hash": "5d4302833a5528a5764e1c5a4a2b8f15"
   },
   "src/plugins/npm.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.4876468,
     "ast_hash": "743326a5894a25ec7ae1ea3f85869843",
     "semantic_hash": ""
   },
   "src/plugins/pytest.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.488647,
     "ast_hash": "f542051b9c95efa47886ef899291b562",
     "semantic_hash": ""
   },
   "src/plugins/shellcheck.rs": {
-    "mtime": 1785179077.997107,
+    "mtime": 1785184910.488647,
     "ast_hash": "387b7702ad64f92058d54e5ae58e0e29",
     "semantic_hash": ""
   },
@@ -470,7 +470,7 @@
     "semantic_hash": "17bd493a4f351e18a645d99c18e7612b"
   },
   "src/prompts.rs": {
-    "mtime": 1785167752.0990539,
+    "mtime": 1785184910.488647,
     "ast_hash": "2dc910e14c1b6f225932db4448ddf3a8",
     "semantic_hash": ""
   },
@@ -500,7 +500,7 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1785182418.0818903,
+    "mtime": 1785184910.488647,
     "ast_hash": "223c902cf4178008f78b158cccaa4ae5",
     "semantic_hash": ""
   },
@@ -520,17 +520,17 @@
     "semantic_hash": "a733fe108931b46235d6a07f09928870"
   },
   "src/tool_facade.rs": {
-    "mtime": 1785182430.7437954,
+    "mtime": 1785184910.489647,
     "ast_hash": "fdac22479ca6c18b59000cf2a9e2d583",
     "semantic_hash": ""
   },
   "src/tool_runner.rs": {
-    "mtime": 1785179077.998107,
+    "mtime": 1785184910.489647,
     "ast_hash": "72a74b4ff1d7ccdac58e3880e1eac9f5",
     "semantic_hash": ""
   },
   "src/tools.rs": {
-    "mtime": 1785181341.1988764,
+    "mtime": 1785184910.489647,
     "ast_hash": "8ed38fbce06adf986d1a1396bfaf8aef",
     "semantic_hash": ""
   },
@@ -900,7 +900,7 @@
     "semantic_hash": ""
   },
   "prompts/mcp_instructions.md": {
-    "mtime": 1785167752.0990539,
+    "mtime": 1785184910.4836469,
     "ast_hash": "1f95c773599f4cc77ff9cc82231b610b",
     "semantic_hash": ""
   },
@@ -985,8 +985,8 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785032639.5240543,
-    "ast_hash": "ef22e75241007800f0bd76e3f94228f9",
+    "mtime": 1785184910.315648,
+    "ast_hash": "865bc34a94daba737b01973cdd1f6a8f",
     "semantic_hash": ""
   },
   "src/observability.rs": {
@@ -1055,8 +1055,8 @@
     "semantic_hash": ""
   },
   "src/session_protocol.rs": {
-    "mtime": 1785119023.4663594,
-    "ast_hash": "da9eee802550b5cb76e4b5079c6c9b9c",
+    "mtime": 1785187876.151627,
+    "ast_hash": "97c7b36fbc898d8a924cccadba06fa8f",
     "semantic_hash": ""
   },
   "src/client_transport.rs": {
@@ -1070,8 +1070,8 @@
     "semantic_hash": ""
   },
   "src/session_core.rs": {
-    "mtime": 1785167752.0270543,
-    "ast_hash": "b0234897d8ffccff6997b4224b7a64c0",
+    "mtime": 1785188078.4259152,
+    "ast_hash": "ff64ddb9cfcde1267edaeee76b8a28ca",
     "semantic_hash": ""
   }
 }
