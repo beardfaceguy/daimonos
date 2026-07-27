@@ -158,6 +158,24 @@ pub struct ApprovalRequest {
     pub allow_always_available: bool,
 }
 
+impl ApprovalRequest {
+    /// Build a request whose wire id will be assigned by `ApprovalBroker`.
+    pub fn unassigned(
+        tool_call_id: impl Into<String>,
+        tool: impl Into<String>,
+        detail: impl Into<String>,
+        allow_always_available: bool,
+    ) -> Self {
+        Self {
+            id: String::new(),
+            tool_call_id: tool_call_id.into(),
+            tool: tool.into(),
+            detail: detail.into(),
+            allow_always_available,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -671,6 +689,15 @@ mod tests {
             serde_json::from_str::<ServerMessage>(&encoded).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn unassigned_approval_request_makes_broker_owned_id_explicit() {
+        let request = ApprovalRequest::unassigned("tool-1", "exec", "run tests", true);
+        assert!(request.id.is_empty());
+        assert_eq!(request.tool_call_id, "tool-1");
+        assert_eq!(request.tool, "exec");
+        assert!(request.allow_always_available);
     }
 
     #[test]

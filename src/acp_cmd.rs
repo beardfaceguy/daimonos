@@ -59,6 +59,11 @@ use crate::providers::{
     StreamEvent, ToolSchema, Usage,
 };
 use crate::session::Session;
+use crate::session_core::{ApprovalBroker, ApprovalError};
+use crate::session_protocol::{
+    ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
+    ClientCapability,
+};
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
 
@@ -330,6 +335,7 @@ struct SessionHandle {
     session: tokio::sync::Mutex<AgentSession>,
     cancel: CancelSlot,
     active_tool_calls: ActiveToolCalls,
+    approvals: Arc<ApprovalBroker>,
     connection: CurrentConnection,
     current_model: CurrentModel,
     cwd: PathBuf,
@@ -951,7 +957,23 @@ async fn request_permission(
     session_id: &SessionId,
     info: &ToolCallInfo,
     safety: &crate::safety::SafetyPolicy,
+    approvals: &ApprovalBroker,
 ) -> BeforeHookResult {
+    let registered = match approvals.register(CoreApprovalRequest::unassigned(
+        info.id.clone(),
+        info.name.clone(),
+        tool_call_title(info),
+        true,
+    )) {
+        Ok(registered) => registered,
+        Err(_) => {
+            return BeforeHookResult::Block(format!(
+                "permission broker unavailable for '{}'",
+                info.name
+            ))
+        }
+    };
+
     let update = ToolCallUpdate::new(
         info.id.clone(),
         ToolCallUpdateFields::new().raw_input(Some(info.input.clone())),
@@ -966,32 +988,87 @@ async fn request_permission(
         PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), update, options);
-    match cx.send_request(request).block_task().await {
+    let approval_id = registered.request.id.clone();
+    let broker_receiver = registered.receiver;
+
+    // ACP v1 has no server-to-client cancellation for an outstanding
+    // session/request_permission. Keep that request as the selected local
+    // approval target until it completes; dropping it after a peer answer would
+    // leave stale permission chrome in the ACP client. A future multi-client
+    // router selects exactly one approval-capable controller before this point.
+    let (decision, denied_reason) = match cx.send_request(request).block_task().await {
         Ok(response) => match response.outcome {
             RequestPermissionOutcome::Selected(sel) => match sel.option_id.to_string().as_str() {
-                "allow_once" => BeforeHookResult::Allow,
-                "allow_always" => {
-                    safety.remember_always(&info.name);
-                    BeforeHookResult::Allow
-                }
-                _ => BeforeHookResult::Block(format!("permission denied for '{}'", info.name)),
+                "allow_once" => (CoreApprovalDecision::AllowOnce, None),
+                "allow_always" => (CoreApprovalDecision::AllowAlways, None),
+                _ => (
+                    CoreApprovalDecision::Deny,
+                    Some(format!("permission denied for '{}'", info.name)),
+                ),
             },
-            RequestPermissionOutcome::Cancelled => {
-                BeforeHookResult::Block(format!("permission request cancelled for '{}'", info.name))
-            }
-            _ => BeforeHookResult::Block(format!(
-                "unrecognized permission outcome for '{}'",
-                info.name
-            )),
+            RequestPermissionOutcome::Cancelled => (
+                CoreApprovalDecision::Deny,
+                Some(format!("permission request cancelled for '{}'", info.name)),
+            ),
+            _ => (
+                CoreApprovalDecision::Deny,
+                Some(format!(
+                    "unrecognized permission outcome for '{}'",
+                    info.name
+                )),
+            ),
         },
-        Err(_) => BeforeHookResult::Block(format!("permission request failed for '{}'", info.name)),
+        Err(_) => (
+            CoreApprovalDecision::Deny,
+            Some(format!("permission request failed for '{}'", info.name)),
+        ),
+    };
+
+    let local_capabilities = [
+        ClientCapability::ApproveOnce,
+        ClientCapability::ApproveAlways,
+    ];
+    match approvals.resolve(&approval_id, "acp_local", &local_capabilities, decision) {
+        Ok(_) | Err(ApprovalError::NotPending) => {}
+        Err(_) => {
+            return BeforeHookResult::Block(format!(
+                "permission resolution failed for '{}'",
+                info.name
+            ));
+        }
+    }
+    let resolution = match broker_receiver.await {
+        Ok(resolution) => resolution,
+        Err(_) => {
+            return BeforeHookResult::Block(format!(
+                "permission broker closed for '{}'",
+                info.name
+            ));
+        }
+    };
+    match resolution.decision {
+        CoreApprovalDecision::AllowOnce => BeforeHookResult::Allow,
+        CoreApprovalDecision::AllowAlways => {
+            safety.remember_always(&info.name);
+            BeforeHookResult::Allow
+        }
+        CoreApprovalDecision::Deny => {
+            let reason = if resolution.resolved_by == "acp_local" {
+                denied_reason.unwrap_or_else(|| format!("permission denied for '{}'", info.name))
+            } else {
+                format!("permission denied for '{}'", info.name)
+            };
+            BeforeHookResult::Block(reason)
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_before_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
+    approvals: Arc<ApprovalBroker>,
     safety: Arc<crate::safety::SafetyPolicy>,
     diff_stash: DiffStash,
     workspace: PathBuf,
@@ -1002,6 +1079,7 @@ fn build_before_tool_call_hook(
         let session_id = session_id.clone();
         let safety = Arc::clone(&safety);
         let active_tool_calls = Arc::clone(&active_tool_calls);
+        let approvals = Arc::clone(&approvals);
         let diff_stash = Arc::clone(&diff_stash);
         let workspace = workspace.clone();
         Box::pin(async move {
@@ -1047,7 +1125,7 @@ fn build_before_tool_call_hook(
                 crate::safety::Gate::Block(reason) => BeforeHookResult::Block(reason),
                 crate::safety::Gate::Allow => BeforeHookResult::Allow,
                 crate::safety::Gate::NeedsApproval => {
-                    request_permission(&cx, &session_id, info, &safety).await
+                    request_permission(&cx, &session_id, info, &safety, &approvals).await
                 }
             };
 
@@ -1286,6 +1364,7 @@ fn build_agent_config(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
+    approvals: Arc<ApprovalBroker>,
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
@@ -1308,6 +1387,7 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             Arc::clone(&active_tool_calls),
+            approvals,
             safety,
             Arc::clone(&diff_stash),
             workspace.to_path_buf(),
@@ -1880,6 +1960,10 @@ async fn run_prompt_turn(
         _ = notify.notified() => None,
     };
     if outcome.is_none() {
+        // Resolve every reliable approval waiter before retiring the turn.
+        // The ACP request future is dropped by cancellation, but the broker is
+        // session-owned and would otherwise retain a permanently pending entry.
+        handle.approvals.cancel_all("session_cancelled");
         // Dropping the prompt future skips the normal before/after completion
         // path. Close every already-announced call before retiring its id so
         // the client does not retain Pending/InProgress chrome; draining first
@@ -2137,12 +2221,16 @@ async fn build_session_handle(
     );
     let bridge_slot = Arc::new(tokio::sync::RwLock::new(Arc::clone(&bridge)));
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+    // ACP local clients may retain the existing AllowAlways behavior. Remote
+    // clients are capability-gated independently when they are attached.
+    let approvals = Arc::new(ApprovalBroker::new(true));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
         Arc::clone(&connection),
         session_id.clone(),
         Arc::clone(&active_tool_calls),
+        Arc::clone(&approvals),
         safety,
         token_log,
         state.compaction.policy.clone(),
@@ -2183,6 +2271,7 @@ async fn build_session_handle(
         session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
         cancel: Arc::new(StdMutex::new(None)),
         active_tool_calls,
+        approvals,
         connection,
         current_model: Arc::new(StdMutex::new(state.default_model.clone())),
         cwd: session_workspace,
@@ -4848,7 +4937,8 @@ mod tests {
         use agent_client_protocol::schema::v1::ClientCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
-        let agent = build_agent(
+        let mut state_out = None;
+        let agent = build_agent_with_state(
             mock_factory(vec![tool_call_resp(
                 "t1",
                 "exec",
@@ -4864,9 +4954,12 @@ mod tests {
             }),
             None,
             None,
+            AcpCompaction::new(None, false),
             None,
-            None,
+            false,
+            &mut state_out,
         );
+        let state = state_out.expect("ACP state");
         let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_for_handler = Arc::clone(&updates);
         let permission_seen = Arc::new(tokio::sync::Notify::new());
@@ -4931,10 +5024,20 @@ mod tests {
                 )
                 .await
                 .expect("permission request should arrive");
+                let handle = state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .expect("live session handle");
+                assert_eq!(handle.approvals.pending().len(), 1);
+
                 connection.send_notification(CancelNotification::new(session_id))?;
                 let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
                     .await
                     .expect("cancelled prompt should resolve")?;
+                assert!(handle.approvals.pending().is_empty());
                 Ok(response.stop_reason)
             })
             .await
@@ -5111,6 +5214,110 @@ mod tests {
             vec![ToolCallStatus::InProgress, ToolCallStatus::Completed],
             "got: {updates:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn earlier_broker_resolution_survives_later_acp_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![
+                tool_call_resp("t1", "exec", serde_json::json!({"command": "echo hi"})),
+                end_turn_resp("done"),
+            ]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            AcpCompaction::new(None, false),
+            None,
+            false,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let permission_seen = Arc::new(tokio::sync::Notify::new());
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_request(
+                async move |_request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.notify_one();
+                    // Keep the client dispatch loop free while its local answer
+                    // is delayed, so an independent broker response can win.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let _ = responder.respond(
+                            agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Cancelled,
+                            ),
+                        );
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    permission_seen.notified(),
+                )
+                .await
+                .expect("ACP permission request should be pending");
+
+                let handle = state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .expect("live session handle");
+                let approval = handle
+                    .approvals
+                    .pending()
+                    .into_iter()
+                    .next()
+                    .expect("broker approval");
+                handle
+                    .approvals
+                    .resolve(
+                        &approval.id,
+                        "remote-test",
+                        &[ClientCapability::ApproveOnce],
+                        CoreApprovalDecision::AllowOnce,
+                    )
+                    .expect("remote approval should win");
+
+                let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+                    .await
+                    .expect("winning broker resolution should survive the later ACP response")?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
     }
 
     #[tokio::test]
