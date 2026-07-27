@@ -1112,7 +1112,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 
     fn exec<'v>(
         command: &str,
-        #[starlark(require = named)] args: Option<UnpackList<String>>,
+        args: Option<UnpackList<String>>,
         #[starlark(require = named)] cwd: Option<&str>,
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
@@ -1131,9 +1131,16 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
     fn ls<'v>(
         path: Option<&str>,
         depth: Option<i32>,
+        #[starlark(require = named)] glob: Option<&str>,
+        #[starlark(require = named)] r#type: Option<&str>,
         heap: &'v Heap,
     ) -> anyhow::Result<StarlarkValue<'v>> {
-        let args = serde_json::json!({"path": path, "depth": depth});
+        let args = serde_json::json!({
+            "path": path,
+            "depth": depth,
+            "glob": glob,
+            "type": r#type,
+        });
         let resp = dispatch_tool_by_name("ls", &args)?;
         response_to_starlark_val(resp, heap)
     }
@@ -1409,20 +1416,20 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 /// Generate Python-style function signatures for all available tool bindings.
 pub fn tool_signatures() -> String {
     let sigs = [
-        "def read_file(path: str, offset: int = None, limit: int = None) -> dict: ...",
+        "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
         "def edit_file(path: str, edits: list[str]) -> dict: ...",
-        "def search(pattern: str, mode: str = \"content\", path: str = None, glob: str = None, max_results: int = None) -> dict: ...",
-        "def exec(command: str, args: list[str] = [], cwd: str = None) -> dict: ...",
-        "def ls(path: str = None, depth: int = None) -> dict: ...",
-        "def snapshot(action: str, id: str = None, tag: str = None) -> dict: ...",
-        "def git(command: str, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
-        "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
-        "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
-        "def pytest(command: str, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
-        "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
-        "def discord(command: str, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
-        "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",
+        "def search(pattern: str, *, mode: str = \"content\", path: str = None, glob: str = None, max_results: int = None) -> dict: ...",
+        "def exec(command: str, args: list[str] = [], *, cwd: str = None) -> dict: ...",
+        "def ls(path: str = None, depth: int = None, *, glob: str = None, type: str = None) -> dict: ...",
+        "def snapshot(action: str, *, id: str = None, tag: str = None) -> dict: ...",
+        "def git(command: str, *, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
+        "def gh(command: str, *, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
+        "def cargo(command: str, *, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
+        "def pytest(command: str, *, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
+        "def docker(command: str, *, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
+        "def discord(command: str, *, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
+        "def session_stats(*, scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
     ];
     sigs.join("\n")
@@ -1841,6 +1848,55 @@ result = data["content"]
     }
 
     #[tokio::test]
+    async fn execute_ls_accepts_documented_glob_and_type_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "ignore\n").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/also.rs"), "nested\n").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+
+        let result = execute(
+            r#"result = ls(path=".", depth=1, glob="*.rs", type="f")"#,
+            session,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let names = result.value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["n"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn execute_exec_accepts_positional_and_keyword_args() {
+        let session = test_session();
+        let result = execute(
+            r#"
+result = {
+    "positional": exec("printf", ["%s", "hello"])["out"],
+    "keyword": exec("printf", args=["%s", "world"])["out"],
+}
+"#,
+            session,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.value,
+            serde_json::json!({"positional": "hello", "keyword": "world"})
+        );
+    }
+
+    #[tokio::test]
     async fn execute_exec_command() {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
@@ -1875,6 +1931,27 @@ result = {"lines": lines, "status": "ok"}
         let val = result.value;
         assert_eq!(val["lines"], 3);
         assert_eq!(val["status"], "ok");
+    }
+
+    #[test]
+    fn tool_signatures_match_positional_and_keyword_only_bindings() {
+        let sigs = tool_signatures();
+        assert!(
+            sigs.contains("def exec(command: str, args: list[str] = [], *, cwd: str = None)"),
+            "exec args must be documented as positional and cwd as keyword-only"
+        );
+        assert!(
+            sigs.contains("def ls(path: str = None, depth: int = None, *, glob: str = None, type: str = None)"),
+            "ls must document its glob/type filters"
+        );
+        assert!(
+            sigs.contains("def read_file(path: str, *, offset: int = None, limit: int = None)"),
+            "named-only binding parameters must be marked with *"
+        );
+        assert!(
+            sigs.contains("def session_stats(*, scope: str = \"session\", days: int = None)"),
+            "fully named-only bindings must be documented as such"
+        );
     }
 
     #[test]

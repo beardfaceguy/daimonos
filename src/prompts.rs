@@ -317,6 +317,19 @@ mod tests {
     }
 
     #[test]
+    fn mcp_instructions_explain_starlark_top_level_loop_restriction() {
+        let instructions = MCP_INSTRUCTIONS_DEFAULT.to_lowercase();
+        assert!(
+            instructions.contains("top-level") && instructions.contains("for"),
+            "must explain that Starlark rejects top-level for loops"
+        );
+        assert!(
+            instructions.contains("wrap loops") && instructions.contains("result = main()"),
+            "must show the function-wrapper pattern for loops"
+        );
+    }
+
+    #[test]
     fn prompts_guide_context_offload_into_execute_script() {
         // vikunja #1047 (RLM LID): keep large outputs in-sandbox and return a
         // compact `result` rather than flooding the root context.
