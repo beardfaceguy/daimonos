@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -1277,8 +1278,10 @@ impl AgentSession {
     /// Replace the conversation history, e.g. restoring a persisted ACP
     /// session on `session/load` after a process restart. Cumulative usage is
     /// left untouched (it's a fresh process, so there's none to preserve).
+    ///
+    /// History is repaired on the way in — see [`close_orphan_tool_calls`].
     pub fn set_history(&mut self, messages: Vec<Message>) {
-        self.messages = messages;
+        self.messages = close_orphan_tool_calls(messages);
     }
 
     /// Usage accumulated across every turn this session.
@@ -1323,6 +1326,83 @@ impl AgentSession {
     pub fn tool_count(&self) -> usize {
         self.config.tools.len()
     }
+}
+
+/// Text recorded as the result of a tool call that never produced one.
+pub(crate) const INTERRUPTED_TOOL_RESULT: &str =
+    "Tool call interrupted: the assistant turn ended before this tool ran, so it produced \
+     no result and changed nothing. Re-issue it if it is still needed.";
+
+/// Give every assistant `ToolCall` a matching `ToolResult`.
+///
+/// A turn killed mid-tool-call (cancel, crash, dropped stream) persists the
+/// call without its result. Providers reject that shape outright — OpenAI's
+/// Responses API 400s on a `function_call` with no `function_call_output` —
+/// and since the gap is persisted, *every* later prompt in that session fails
+/// the same way, wedging the thread permanently. Repairing on load turns a
+/// dead session into one that just sees a failed tool call and moves on.
+///
+/// Synthetic results are inserted directly after the message that made the
+/// call, so ordering stays valid for providers that require the pairing to be
+/// adjacent. `ToolResult`-only messages are not user turns
+/// ([`is_user_turn_message`]), so turn indexing is unaffected.
+fn close_orphan_tool_calls(messages: Vec<Message>) -> Vec<Message> {
+    let answered: HashSet<&str> = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let orphans: Vec<Vec<String>> = messages
+        .iter()
+        .map(|message| {
+            if message.role != Role::Assistant {
+                return Vec::new();
+            }
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall { id, .. } if !answered.contains(id.as_str()) => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    if orphans.iter().all(Vec::is_empty) {
+        return messages;
+    }
+
+    let mut repaired = Vec::with_capacity(messages.len() + 1);
+    for (message, ids) in messages.into_iter().zip(orphans) {
+        repaired.push(message);
+        if ids.is_empty() {
+            continue;
+        }
+        tracing::warn!(
+            target: "daimonos::agent",
+            event = "orphan_tool_calls_closed",
+            tool_call_ids = ?ids,
+        );
+        repaired.push(Message {
+            role: Role::User,
+            content: ids
+                .into_iter()
+                .map(|tool_use_id| ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: INTERRUPTED_TOOL_RESULT.to_string(),
+                    is_error: true,
+                })
+                .collect(),
+        });
+    }
+    repaired
 }
 
 fn is_user_turn_message(message: &Message) -> bool {
@@ -2917,5 +2997,164 @@ mod tests {
             940,
             "summary call tokens must be counted"
         );
+    }
+
+    // --- orphan tool-call repair ---
+
+    fn tool_call(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                id: id.to_string(),
+                name: "edit_file".to_string(),
+                input: json!({}),
+            }],
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    fn orphan_ids(messages: &[Message]) -> Vec<&str> {
+        let answered: HashSet<&str> = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, .. } if !answered.contains(id.as_str()) => {
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn close_orphan_tool_calls_leaves_paired_history_untouched() {
+        let history = vec![
+            Message::user("go"),
+            tool_call("c1"),
+            tool_result("c1"),
+            Message::assistant("done"),
+        ];
+        assert_eq!(
+            close_orphan_tool_calls(history.clone()).len(),
+            history.len()
+        );
+        assert!(orphan_ids(&close_orphan_tool_calls(history)).is_empty());
+    }
+
+    #[test]
+    fn close_orphan_tool_calls_pairs_a_turn_cut_off_mid_call() {
+        // The wedged-session shape: a call persisted with no result, then the
+        // user prompting again. Every later prompt 400s until this is closed.
+        let repaired = close_orphan_tool_calls(vec![
+            Message::user("go"),
+            tool_call("c1"),
+            Message::user("pick up where you left off"),
+        ]);
+
+        assert!(orphan_ids(&repaired).is_empty());
+        // Inserted directly after the call, before the next user text.
+        assert!(matches!(
+            repaired[2].content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, is_error: true, .. }] if tool_use_id == "c1"
+        ));
+        assert!(
+            matches!(repaired[3].content.as_slice(), [ContentBlock::Text(t)] if t == "pick up where you left off")
+        );
+    }
+
+    #[test]
+    fn close_orphan_tool_calls_closes_only_the_unanswered_parallel_call() {
+        let repaired = close_orphan_tool_calls(vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolCall {
+                        id: "c1".to_string(),
+                        name: "exec".to_string(),
+                        input: json!({}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "c2".to_string(),
+                        name: "exec".to_string(),
+                        input: json!({}),
+                    },
+                ],
+            },
+            tool_result("c1"),
+        ]);
+
+        assert!(orphan_ids(&repaired).is_empty());
+        assert!(matches!(
+            repaired[2].content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "c2"
+        ));
+    }
+
+    #[test]
+    fn set_history_repairs_orphans_without_shifting_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sess = AgentSession::new(
+            Box::new(MockProvider::new(vec![])),
+            session_in(dir.path()),
+            AgentConfig::default(),
+        );
+        sess.set_history(vec![
+            Message::user("go"),
+            tool_call("c1"),
+            Message::user("pick up where you left off"),
+        ]);
+
+        assert!(orphan_ids(sess.history()).is_empty());
+        // Synthetic ToolResult messages are not user turns, so the
+        // client_user_message_ids alignment in acp_cmd stays correct.
+        assert_eq!(sess.user_turn_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn repaired_history_is_accepted_by_the_next_prompt_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = AgentSession::new(
+            Box::new(CaptureProvider {
+                seen: Arc::clone(&seen),
+            }),
+            session_in(dir.path()),
+            AgentConfig::default(),
+        );
+        sess.set_history(vec![Message::user("go"), tool_call("c1")]);
+
+        let turn = sess.prompt("continue").await;
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        let provider_context = seen.lock().unwrap().clone();
+        assert!(orphan_ids(&provider_context).is_empty());
+        assert!(provider_context.iter().any(|message| {
+            matches!(
+                message.content.as_slice(),
+                [ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: true,
+                }] if tool_use_id == "c1" && content == INTERRUPTED_TOOL_RESULT
+            )
+        }));
     }
 }
