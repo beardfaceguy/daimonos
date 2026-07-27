@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-26)
 
 ## Corpus Check
-- 208 files · ~255,005 words
+- 208 files · ~255,100 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5127 nodes · 11830 edges · 234 communities (214 shown, 20 thin omitted)
+- 5128 nodes · 11832 edges · 235 communities (215 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `fd1ca59f`
+- Built from commit: `83e25bdd`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -240,6 +240,7 @@
 - [[_COMMUNITY_Community 231|Community 231]]
 - [[_COMMUNITY_Community 232|Community 232]]
 - [[_COMMUNITY_Community 233|Community 233]]
+- [[_COMMUNITY_Community 234|Community 234]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 56 edges
@@ -287,7 +288,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (234 total, 20 thin omitted)
+## Communities (235 total, 20 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.18
@@ -618,8 +619,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.11
-Nodes (44): InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_cancelled_permission_finishes_the_announced_call() (+36 more)
+Cohesion: 0.06
+Nodes (70): AcpContentBlock, AcpDiff, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled() (+62 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -850,8 +851,8 @@ Cohesion: 0.29
 Nodes (7): 1. Open Zed settings, 2. Add daimonos as an MCP server, 3. Verify, Prerequisites, Setup, Troubleshooting, Zed Editor Setup
 
 ### Community 158 - "Community 158"
-Cohesion: 0.10
-Nodes (23): AcpContentBlock, AvailableCommand, LevelFilter, agent_tools(), assistant_texts(), available_commands(), capture_raw_error_logging(), log_raw_provider_error() (+15 more)
+Cohesion: 0.12
+Nodes (19): AvailableCommand, LevelFilter, agent_tools(), assistant_texts(), available_commands(), capture_raw_error_logging(), log_raw_provider_error(), raw_provider_error_logged_when_debug_enabled() (+11 more)
 
 ### Community 161 - "Community 161"
 Cohesion: 0.50
@@ -911,7 +912,7 @@ Nodes (36): CompactionEvent, accumulate_sums_tokens(), accumulate_zero_is_identi
 
 ### Community 182 - "Community 182"
 Cohesion: 0.07
-Nodes (63): bounded(), build_request(), complete_posts_authenticated_responses_request(), error_response(), gpt_56_output_is_clamped_to_documented_limit(), images_are_rejected_not_silently_dropped(), incomplete_refusal_and_errors_map_safely(), is_context_overflow_error() (+55 more)
+Nodes (64): bounded(), build_request(), complete_posts_authenticated_responses_request(), error_response(), gpt_56_output_is_clamped_to_documented_limit(), images_are_rejected_not_silently_dropped(), incomplete_refusal_and_errors_map_safely(), incomplete_response_drops_truncated_function_call_arguments() (+56 more)
 
 ### Community 183 - "Community 183"
 Cohesion: 0.33
@@ -934,8 +935,8 @@ Cohesion: 0.23
 Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
 ### Community 188 - "Community 188"
-Cohesion: 0.18
-Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
+Cohesion: 0.50
+Nodes (4): DateTime, turn_timestamp_line(), turn_timestamp_line_is_a_bracketed_dated_line(), Tz
 
 ### Community 189 - "Community 189"
 Cohesion: 0.12
@@ -1002,8 +1003,8 @@ Cohesion: 0.09
 Nodes (36): ClientMessage, OwnedReadHalf, OwnedWriteHalf, ServerMessage, ClientTransport, in_memory_disconnect_returns_none(), in_memory_transport_applies_bounded_backpressure(), in_memory_transport_pair() (+28 more)
 
 ### Community 207 - "Community 207"
-Cohesion: 0.08
-Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
+Cohesion: 0.06
+Nodes (69): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+61 more)
 
 ### Community 208 - "Community 208"
 Cohesion: 0.09
@@ -1022,8 +1023,8 @@ Cohesion: 0.20
 Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
 
 ### Community 212 - "Community 212"
-Cohesion: 0.18
-Nodes (13): RequestGuard, ActivityTracker, liveness_snapshot_never_reports_a_stale_clock_as_unoccupied(), now_unix_secs(), releasing_the_last_slot_leaves_a_fresh_idle_window(), request_guard_releases_its_slot_on_unwind(), request_guard_tracks_and_releases_in_flight_slots(), RequestGuard (+5 more)
+Cohesion: 0.17
+Nodes (14): RequestGuard, ActivityTracker, liveness_snapshot_never_reports_a_stale_clock_as_unoccupied(), now_unix_secs(), releasing_the_last_slot_leaves_a_fresh_idle_window(), request_guard_releases_its_slot_on_unwind(), request_guard_tracks_and_releases_in_flight_slots(), RequestGuard (+6 more)
 
 ### Community 213 - "Community 213"
 Cohesion: 0.29
@@ -1062,8 +1063,8 @@ Cohesion: 0.57
 Nodes (8): agent_system.md (Agent System Prompt), Claude Code Setup Guide, Cursor IDE Setup Guide, execute_script Tool, mcp_instructions.md (MCP Instructions Prompt), Other MCP-Compatible Tools Guide, Daimonos Prompts README, Embedded Starlark Interpreter
 
 ### Community 222 - "Community 222"
-Cohesion: 0.40
-Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
+Cohesion: 0.50
+Nodes (4): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), Path, session_with_analytics()
 
 ### Community 223 - "Community 223"
 Cohesion: 0.24
@@ -1106,8 +1107,12 @@ Cohesion: 0.21
 Nodes (8): CoordinationOutcome, GenerationMetadata, record_bridge_lifecycle(), remote_server_alias(), Option, ThinkingLevel, ToolOutcome, ToolStatus
 
 ### Community 233 - "Community 233"
-Cohesion: 0.05
-Nodes (54): AcpDiff, DateTime, SessionInfo, concurrent_cold_load_builds_persisted_session_once(), coordination_ui_poll_skips_while_agent_session_is_busy(), coordination_ui_update(), coordination_ui_update_is_visible_agent_message_and_metadata_only(), decode_session_list_cursor() (+46 more)
+Cohesion: 0.11
+Nodes (25): SessionInfo, decode_session_list_cursor(), encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), locations_for_read_file_include_offset_as_line(), locations_for_read_file_without_offset_have_no_line(), locations_for_write_and_edit_carry_path_only(), paginate_session_summaries() (+17 more)
+
+### Community 234 - "Community 234"
+Cohesion: 1.00
+Nodes (3): error_has_http_status(), error_has_token(), safe_provider_error_message()
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -1133,7 +1138,7 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
-- **Why does `RawErrorCapture` connect `Community 34` to `Community 168`, `Community 233`, `Community 158`?**
+- **Why does `RawErrorCapture` connect `Community 34` to `Community 168`, `Community 82`, `Community 158`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 225`, `Community 136`, `Community 0`?**
   _High betweenness centrality (0.005) - this node is a cross-community bridge._
