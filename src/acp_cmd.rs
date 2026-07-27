@@ -50,7 +50,6 @@ use crate::agent::{
     UPDATE_PLAN_TOOL,
 };
 use crate::analytics::AnalyticsStore;
-use crate::compaction::CompactionPolicy;
 use crate::config::Config;
 use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
 use crate::observability::{PromptMetadata, PromptSpan};
@@ -59,10 +58,13 @@ use crate::providers::{
     StreamEvent, ToolSchema, Usage,
 };
 use crate::session::Session;
-use crate::session_core::{ApprovalBroker, ApprovalError, TurnController, TurnError};
+use crate::session_core::{
+    ApprovalBroker, ApprovalError, SessionCompaction, SessionCore, SessionEventHandler,
+    SessionEventRouter, SessionPersistence, TurnError,
+};
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
-    ClientCapability,
+    ClientCapability, SessionEvent as CoreSessionEvent, ToolCallStateStatus,
 };
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
@@ -84,14 +86,6 @@ type ActiveToolCalls = Arc<StdMutex<HashMap<String, bool>>>;
 /// `request_permission`. Updated at the top of every `session/prompt` call
 /// with that call's fresh handle; read fresh by the hooks on each use.
 type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
-
-/// The model the user has selected via the ACP model picker (vikunja #960).
-/// A cheap `std::sync::Mutex` separate from the session lock so
-/// `session/set_config_option` can update it instantly without stalling the
-/// dispatch loop or waiting on an in-flight prompt's session lock. Applied
-/// to the session at the top of each `run_prompt_turn`, so a switch takes
-/// effect on the next prompt (you can't change model mid-turn anyway).
-type CurrentModel = Arc<StdMutex<String>>;
 
 /// Blocking stdout adapter for ACP that treats `WouldBlock`/EAGAIN as
 /// transient pipe backpressure instead of a fatal transport error. Zed tears
@@ -272,75 +266,20 @@ impl<R: AsyncRead + Unpin> AsyncRead for EofAwareReader<R> {
 /// session — each `session/new` constructs its own.
 pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn LlmProvider>, String> + Send + Sync>;
 
-/// ACP compaction policy plus whether its context window follows the model
-/// picker. An explicitly configured `DAIMONOS_AGENT_CONTEXT_WINDOW` remains
-/// fixed; a provider-resolved window is refreshed for each selected model.
-#[derive(Clone)]
-pub struct AcpCompaction {
-    policy: Option<CompactionPolicy>,
-    follows_model_window: bool,
-}
-
-impl AcpCompaction {
-    pub fn new(policy: Option<CompactionPolicy>, follows_model_window: bool) -> Self {
-        Self {
-            policy,
-            follows_model_window,
-        }
-    }
-
-    fn policy_for(
-        &self,
-        model: &str,
-        context_window: Option<u64>,
-    ) -> Result<Option<CompactionPolicy>, String> {
-        let Some(mut policy) = self.policy.clone() else {
-            return Ok(None);
-        };
-        if self.follows_model_window {
-            let context_window = context_window.ok_or_else(|| {
-                format!(
-                    "could not determine the context window for model '{model}' from the provider"
-                )
-            })?;
-            if policy.output_reservation >= context_window {
-                return Err(format!(
-                    "DAIMONOS_AGENT_OUTPUT_RESERVATION ({}) must be smaller than the \
-                     provider-reported context window ({context_window}) for model '{model}'",
-                    policy.output_reservation
-                ));
-            }
-            policy.context_window = context_window;
-        }
-        Ok(Some(policy))
-    }
-}
-
 /// Per-session state. Each session gets its own session lock, cancel slot,
 /// connection cell, and current-model cell, so concurrent sessions (Zed can
 /// run several chat threads against one process) never block or cross-talk
 /// with each other. Shared via `Arc` so a long prompt turn holds only this
 /// handle — not the sessions-map lock.
 struct SessionHandle {
-    /// Serializes session/load lifecycle work with session/delete so a bridge
-    /// cannot be refreshed or replayed after its handle is removed.
-    lifecycle: tokio::sync::Mutex<()>,
-    session: tokio::sync::Mutex<AgentSession>,
-    turn: TurnController,
+    core: SessionCore,
     active_tool_calls: ActiveToolCalls,
-    approvals: Arc<ApprovalBroker>,
     connection: CurrentConnection,
-    current_model: CurrentModel,
-    cwd: PathBuf,
     /// Per-session bridge to Zed-forwarded MCP servers (ADR-003). Empty when
     /// the bridge is disabled or no servers were forwarded. Shut down on
     /// session/delete.
     bridge: BridgeSlot,
     mcp_specs: tokio::sync::Mutex<Vec<ServerSpec>>,
-    client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
-    compaction: AcpCompaction,
-    /// Provider-reported windows already resolved for this session's models.
-    context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
 }
 
 type BridgeSlot = Arc<tokio::sync::RwLock<Arc<McpBridge>>>;
@@ -371,7 +310,7 @@ struct AcpState {
     /// Maximum sessions returned by one session/list response.
     session_list_page_size: usize,
     /// Context/window compaction configuration cloned into each session.
-    compaction: AcpCompaction,
+    compaction: SessionCompaction,
     /// Analytics store for attributing remote MCP tool calls (ADR-003).
     /// `None` when analytics is disabled.
     analytics: Option<Arc<AnalyticsStore>>,
@@ -401,7 +340,7 @@ async fn session_operation_lock(
 }
 
 fn request_session_cancel(handle: &SessionHandle) {
-    let _ = handle.turn.cancel();
+    let _ = handle.core.turn.cancel();
 }
 
 /// The `SessionConfigId` for the model picker option.
@@ -944,6 +883,7 @@ async fn request_permission(
     info: &ToolCallInfo,
     safety: &crate::safety::SafetyPolicy,
     approvals: &ApprovalBroker,
+    events: &SessionEventRouter,
 ) -> BeforeHookResult {
     let registered = match approvals.register(CoreApprovalRequest::unassigned(
         info.id.clone(),
@@ -959,6 +899,10 @@ async fn request_permission(
             ))
         }
     };
+
+    let _ = events.emit(CoreSessionEvent::ApprovalRequested {
+        request: registered.request.clone(),
+    });
 
     let update = ToolCallUpdate::new(
         info.id.clone(),
@@ -1032,6 +976,11 @@ async fn request_permission(
             ));
         }
     };
+    let _ = events.emit(CoreSessionEvent::ApprovalResolved {
+        approval_id: resolution.approval_id.clone(),
+        decision: resolution.decision,
+        resolved_by: resolution.resolved_by.clone(),
+    });
     match resolution.decision {
         CoreApprovalDecision::AllowOnce => BeforeHookResult::Allow,
         CoreApprovalDecision::AllowAlways => {
@@ -1054,6 +1003,7 @@ fn build_before_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
+    events: Arc<SessionEventRouter>,
     approvals: Arc<ApprovalBroker>,
     safety: Arc<crate::safety::SafetyPolicy>,
     diff_stash: DiffStash,
@@ -1066,6 +1016,7 @@ fn build_before_tool_call_hook(
         let safety = Arc::clone(&safety);
         let active_tool_calls = Arc::clone(&active_tool_calls);
         let approvals = Arc::clone(&approvals);
+        let events = Arc::clone(&events);
         let diff_stash = Arc::clone(&diff_stash);
         let workspace = workspace.clone();
         Box::pin(async move {
@@ -1083,7 +1034,7 @@ fn build_before_tool_call_hook(
             } else {
                 info.name.clone()
             };
-            let mut tool_call = ToolCall::new(info.id.clone(), title)
+            let mut tool_call = ToolCall::new(info.id.clone(), title.clone())
                 .kind(tool_kind_for(&info.name))
                 .status(ToolCallStatus::Pending)
                 .locations(tool_call_locations(&workspace, &info.name, &info.input))
@@ -1103,6 +1054,12 @@ fn build_before_tool_call_hook(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(info.id.clone(), terminal_output && info.name == "exec");
+            let _ = events.emit(CoreSessionEvent::ToolCallStarted {
+                id: info.id.clone(),
+                name: info.name.clone(),
+                title,
+                input_summary: None,
+            });
 
             // Denylist/allowlist/approval-mode gating first (same policy
             // `daimonos agent`/`daimonos chat` enforce) — only tools that
@@ -1111,7 +1068,7 @@ fn build_before_tool_call_hook(
                 crate::safety::Gate::Block(reason) => BeforeHookResult::Block(reason),
                 crate::safety::Gate::Allow => BeforeHookResult::Allow,
                 crate::safety::Gate::NeedsApproval => {
-                    request_permission(&cx, &session_id, info, &safety, &approvals).await
+                    request_permission(&cx, &session_id, info, &safety, &approvals, &events).await
                 }
             };
 
@@ -1127,6 +1084,14 @@ fn build_before_tool_call_hook(
                 }
             }
 
+            let canonical_status = match &decision {
+                BeforeHookResult::Allow => ToolCallStateStatus::InProgress,
+                BeforeHookResult::Block(_) => ToolCallStateStatus::Failed,
+            };
+            let _ = events.emit(CoreSessionEvent::ToolCallUpdated {
+                id: info.id.clone(),
+                status: canonical_status,
+            });
             let fields = match &decision {
                 BeforeHookResult::Allow => {
                     ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress))
@@ -1169,6 +1134,7 @@ fn build_after_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
+    events: Arc<SessionEventRouter>,
     diff_stash: DiffStash,
     workspace: PathBuf,
 ) -> AfterHook {
@@ -1183,6 +1149,11 @@ fn build_after_tool_call_hook(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&info.id)
             .flatten();
+        let _ = events.emit(CoreSessionEvent::ToolCallFinished {
+            id: info.id.clone(),
+            ok: !is_error,
+            output: content.to_string(),
+        });
         let Some(cx) = current_cx(&connection) else {
             active_tool_calls
                 .lock()
@@ -1219,65 +1190,39 @@ fn build_after_tool_call_hook(
     })
 }
 
-fn build_stream_hook(
-    connection: CurrentConnection,
-    session_id: SessionId,
-) -> crate::agent::StreamHook {
-    Box::new(move |ev: StreamEvent| {
-        let Some(cx) = current_cx(&connection) else {
-            return;
+fn build_stream_hook(events: Arc<SessionEventRouter>) -> crate::agent::StreamHook {
+    Box::new(move |event: StreamEvent| {
+        let event = match event {
+            StreamEvent::TextDelta(text) => CoreSessionEvent::AssistantDelta { text },
+            StreamEvent::ThinkingDelta(text) => CoreSessionEvent::ThoughtDelta { text },
         };
-        let (text, thought) = match ev {
-            StreamEvent::TextDelta(text) => (text, false),
-            StreamEvent::ThinkingDelta(text) => (text, true),
-        };
-        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(text)));
-        let update = if thought {
-            SessionUpdate::AgentThoughtChunk(chunk)
-        } else {
-            SessionUpdate::AgentMessageChunk(chunk)
-        };
-        send_notification(&cx, &session_id, update);
+        let _ = events.emit(event);
     })
 }
 
-async fn prepare_model(
-    handle: &SessionHandle,
-    session: &mut AgentSession,
-    model: &str,
-) -> Result<Option<u64>, String> {
-    let cached = handle.context_windows.lock().await.get(model).copied();
-    let context_window = match cached {
-        Some(window) => Some(window),
-        None => {
-            let resolved = session
-                .context_window(model)
-                .await
-                .filter(|&window| window > 0);
-            if let Some(window) = resolved {
-                handle
-                    .context_windows
-                    .lock()
-                    .await
-                    .insert(model.to_string(), window);
-            }
-            resolved
+fn build_acp_event_handler(
+    connection: CurrentConnection,
+    session_id: SessionId,
+) -> SessionEventHandler {
+    Arc::new(move |_sequence, event| {
+        let Some(cx) = current_cx(&connection) else {
+            return;
+        };
+        let update = match event {
+            CoreSessionEvent::AssistantDelta { text } => Some(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(AcpContentBlock::Text(TextContent::new(text))),
+            )),
+            CoreSessionEvent::ThoughtDelta { text } => Some(SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(AcpContentBlock::Text(TextContent::new(text))),
+            )),
+            // Rich ACP tool/diff/terminal projections remain adapter-specific;
+            // the canonical events still feed daemon snapshots/replay.
+            _ => None,
+        };
+        if let Some(update) = update {
+            send_notification(&cx, &session_id, update);
         }
-    };
-    let policy = handle.compaction.policy_for(model, context_window)?;
-    session.set_model(model);
-    session.set_compaction(policy);
-    Ok(context_window.or_else(|| {
-        (!handle.compaction.follows_model_window)
-            .then(|| {
-                handle
-                    .compaction
-                    .policy
-                    .as_ref()
-                    .map(|policy| policy.context_window)
-            })
-            .flatten()
-    }))
+    })
 }
 
 fn emit_usage_update(
@@ -1324,19 +1269,14 @@ fn model_config_options(models: &[String], current: &str) -> Vec<SessionConfigOp
 /// (ADR-002 Q6): no dedicated compaction SessionUpdate exists in schema
 /// 1.4.0, and a thought renders collapsed/greyed — honest without faking
 /// agent output.
-fn build_compaction_hook(
-    connection: CurrentConnection,
-    session_id: SessionId,
-) -> crate::agent::CompactionHook {
+fn build_compaction_hook(events: Arc<SessionEventRouter>) -> crate::agent::CompactionHook {
     Box::new(move |event: &crate::compaction::CompactionEvent| {
-        let Some(cx) = current_cx(&connection) else {
-            return;
-        };
-        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(format!(
-            "[context compacted: {} older turn(s) summarized]",
-            event.evicted_turns
-        ))));
-        send_notification(&cx, &session_id, SessionUpdate::AgentThoughtChunk(chunk));
+        let _ = events.emit(CoreSessionEvent::ThoughtDelta {
+            text: format!(
+                "[context compacted: {} older turn(s) summarized]",
+                event.evicted_turns
+            ),
+        });
     })
 }
 
@@ -1350,6 +1290,7 @@ fn build_agent_config(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
+    events: Arc<SessionEventRouter>,
     approvals: Arc<ApprovalBroker>,
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
@@ -1373,6 +1314,7 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             Arc::clone(&active_tool_calls),
+            Arc::clone(&events),
             approvals,
             safety,
             Arc::clone(&diff_stash),
@@ -1383,17 +1325,12 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             Arc::clone(&active_tool_calls),
+            Arc::clone(&events),
             diff_stash,
             workspace.to_path_buf(),
         )),
-        on_compaction: Some(build_compaction_hook(
-            Arc::clone(&connection),
-            session_id.clone(),
-        )),
-        on_stream_event: Some(build_stream_hook(
-            Arc::clone(&connection),
-            session_id.clone(),
-        )),
+        on_compaction: Some(build_compaction_hook(Arc::clone(&events))),
+        on_stream_event: Some(build_stream_hook(Arc::clone(&events))),
         on_tool_progress: build_tool_progress_hook(
             Arc::clone(&connection),
             session_id.clone(),
@@ -1856,20 +1793,19 @@ async fn run_prompt_turn(
     session_id: &SessionId,
     user_message: CoreMessage,
     client_user_message_id: Option<String>,
-    store: Option<&SessionStore>,
     assistant_prefix: Option<String>,
 ) -> Result<AcpStopReason, TurnError> {
     // Claim the transport-independent turn slot before waiting on session
     // state. A second prompt for this session is rejected immediately instead
     // of queueing behind the active provider/tool loop and running later with
     // stale user intent.
-    let active_turn = match handle.turn.begin() {
+    let active_turn = match handle.core.begin_turn() {
         Ok(active_turn) => active_turn,
         Err(error) => return Err(error),
     };
-    let mut agent_session = handle.session.lock().await;
+    let mut agent_session = handle.core.session.lock().await;
     {
-        let mut client_ids = handle.client_user_message_ids.lock().await;
+        let mut client_ids = handle.core.client_user_message_ids.lock().await;
         align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
         if let Some(id) = client_user_message_id.as_deref() {
             if client_ids.iter().any(|existing| existing == id) {
@@ -1885,6 +1821,13 @@ async fn run_prompt_turn(
             }
         }
     }
+    let user_text = direct_command_text(&user_message)
+        .unwrap_or("[multimodal user message]")
+        .to_string();
+    let _ = handle
+        .core
+        .events
+        .emit(CoreSessionEvent::UserMessage { text: user_text });
 
     // Now that we hold the lock, refresh the connection handle with *this*
     // dispatch's cx — see `CurrentConnection`'s doc comment for why.
@@ -1893,11 +1836,12 @@ async fn run_prompt_turn(
     // Apply the picker's current model selection before the turn — a switch
     // made via session/set_config_option takes effect on the next prompt.
     let model = handle
+        .core
         .current_model
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let context_window = match prepare_model(handle, &mut agent_session, &model).await {
+    let context_window = match handle.core.prepare_model(&mut agent_session, &model).await {
         Ok(window) => window,
         Err(error) => {
             send_notification(
@@ -1916,12 +1860,12 @@ async fn run_prompt_turn(
         let cleared_history =
             (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
         if command == AcpCommand::Clear {
-            handle.client_user_message_ids.lock().await.clear();
+            handle.core.client_user_message_ids.lock().await.clear();
         }
         drop(agent_session);
 
-        if let (Some(store), Some(messages)) = (store, cleared_history) {
-            store.save_acp(&session_id.to_string(), &model, &messages, &handle.cwd, &[]);
+        if let Some(messages) = cleared_history {
+            handle.core.persist(&model, &messages, &[]);
         }
         let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
         send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
@@ -1950,7 +1894,13 @@ async fn run_prompt_turn(
         // Resolve every reliable approval waiter before retiring the turn.
         // The ACP request future is dropped by cancellation, but the broker is
         // session-owned and would otherwise retain a permanently pending entry.
-        handle.approvals.cancel_all("session_cancelled");
+        for resolution in handle.core.approvals.cancel_all("session_cancelled") {
+            let _ = handle.core.events.emit(CoreSessionEvent::ApprovalResolved {
+                approval_id: resolution.approval_id,
+                decision: resolution.decision,
+                resolved_by: resolution.resolved_by,
+            });
+        }
         // Dropping the prompt future skips the normal before/after completion
         // path. Close every already-announced call before retiring its id so
         // the client does not retain Pending/InProgress chrome; draining first
@@ -1958,6 +1908,7 @@ async fn run_prompt_turn(
         cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
     }
     if outcome.is_some() {
+        let _ = handle.core.events.emit(CoreSessionEvent::AssistantDone);
         if let Some(prefix) = assistant_prefix {
             if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
                 tracing::error!(
@@ -1977,7 +1928,7 @@ async fn run_prompt_turn(
     let history_snapshot = outcome.as_ref().map(|_| agent_session.history().to_vec());
     let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
     let client_ids_snapshot = if outcome.is_some() {
-        let mut client_ids = handle.client_user_message_ids.lock().await;
+        let mut client_ids = handle.core.client_user_message_ids.lock().await;
         client_ids.push(client_user_message_id.unwrap_or_default());
         let user_turn_count = agent_session.user_turn_count();
         align_client_user_message_ids(&mut client_ids, user_turn_count);
@@ -1988,20 +1939,22 @@ async fn run_prompt_turn(
     drop(agent_session);
     drop(active_turn);
 
-    if let (Some(store), Some(messages), Some(client_ids)) =
-        (store, history_snapshot, client_ids_snapshot)
-    {
-        store.save_acp(
-            &session_id.to_string(),
-            &model,
-            &messages,
-            &handle.cwd,
-            &client_ids,
-        );
+    if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
+        handle.core.persist(&model, &messages, &client_ids);
     }
 
     Ok(match outcome {
         Some(turn) => {
+            let used_tokens = turn
+                .last_call_usage
+                .prompt_tokens()
+                .saturating_add(turn.last_call_usage.output);
+            let _ = handle
+                .core
+                .events
+                .emit(CoreSessionEvent::ContextUsageChanged {
+                    usage: handle.core.context_usage(used_tokens, context_window),
+                });
             emit_usage_update(
                 cx,
                 session_id,
@@ -2042,17 +1995,23 @@ async fn run_retry_turn(
     handle: &Arc<SessionHandle>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    store: Option<&SessionStore>,
 ) -> Result<AcpStopReason, String> {
-    let active_turn = handle.turn.begin().map_err(|error| error.to_string())?;
-    let mut agent_session = handle.session.lock().await;
+    let active_turn = handle
+        .core
+        .begin_turn()
+        .map_err(|error| error.to_string())?;
+    let mut agent_session = handle.core.session.lock().await;
     *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
     let model = handle
+        .core
         .current_model
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let context_window = prepare_model(handle, &mut agent_session, &model).await?;
+    let context_window = handle
+        .core
+        .prepare_model(&mut agent_session, &model)
+        .await?;
 
     let outcome = tokio::select! {
         turn = agent_session.retry_last_turn() => Some(turn),
@@ -2062,6 +2021,16 @@ async fn run_retry_turn(
 
     let (stop_reason, history_snapshot) = match outcome {
         Some(Ok(turn)) => {
+            let used_tokens = turn
+                .last_call_usage
+                .prompt_tokens()
+                .saturating_add(turn.last_call_usage.output);
+            let _ = handle
+                .core
+                .events
+                .emit(CoreSessionEvent::ContextUsageChanged {
+                    usage: handle.core.context_usage(used_tokens, context_window),
+                });
             emit_usage_update(
                 cx,
                 session_id,
@@ -2089,18 +2058,12 @@ async fn run_retry_turn(
         Some(Err(error)) => return Err(error),
         None => (AcpStopReason::Cancelled, None),
     };
-    let client_ids = handle.client_user_message_ids.lock().await.clone();
+    let client_ids = handle.core.client_user_message_ids.lock().await.clone();
     drop(agent_session);
     drop(active_turn);
 
-    if let (Some(store), Some(messages)) = (store, history_snapshot) {
-        store.save_acp(
-            &session_id.to_string(),
-            &model,
-            &messages,
-            &handle.cwd,
-            &client_ids,
-        );
+    if let Some(messages) = history_snapshot {
+        handle.core.persist(&model, &messages, &client_ids);
     }
     Ok(stop_reason)
 }
@@ -2111,8 +2074,8 @@ async fn truncate_session(
     client_user_message_id: &str,
     store: Option<&SessionStore>,
 ) -> Result<(), String> {
-    let mut agent_session = handle.session.lock().await;
-    let mut client_ids = handle.client_user_message_ids.lock().await;
+    let mut agent_session = handle.core.session.lock().await;
+    let mut client_ids = handle.core.client_user_message_ids.lock().await;
     let user_turn_count = agent_session.user_turn_count();
     align_client_user_message_ids(&mut client_ids, user_turn_count);
     let Some(turn_index) = client_ids
@@ -2128,6 +2091,7 @@ async fn truncate_session(
 
     if let Some(store) = store {
         let model = handle
+            .core
             .current_model
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2136,7 +2100,7 @@ async fn truncate_session(
             &session_id.to_string(),
             &model,
             agent_session.history(),
-            &handle.cwd,
+            &handle.core.cwd,
             &client_ids,
         );
     }
@@ -2207,12 +2171,17 @@ async fn build_session_handle(
     // ACP local clients may retain the existing AllowAlways behavior. Remote
     // clients are capability-gated independently when they are attached.
     let approvals = Arc::new(ApprovalBroker::new(true));
+    let events = Arc::new(SessionEventRouter::new(Some(build_acp_event_handler(
+        Arc::clone(&connection),
+        session_id.clone(),
+    ))));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
         Arc::clone(&connection),
         session_id.clone(),
         Arc::clone(&active_tool_calls),
+        Arc::clone(&events),
         Arc::clone(&approvals),
         safety,
         token_log,
@@ -2249,20 +2218,26 @@ async fn build_session_handle(
             context_windows.insert(state.default_model.clone(), policy.context_window);
         }
     }
-    let handle = Arc::new(SessionHandle {
-        lifecycle: tokio::sync::Mutex::new(()),
-        session: tokio::sync::Mutex::new(AgentSession::new(provider, tool_session, config)),
-        turn: TurnController::default(),
-        active_tool_calls,
+    let persistence = state
+        .store
+        .clone()
+        .map(|store| SessionPersistence::new(session_id.to_string(), store));
+    let core = SessionCore::new(
+        AgentSession::new(provider, tool_session, config),
+        state.default_model.clone(),
+        session_workspace,
+        state.compaction.clone(),
+        context_windows,
         approvals,
+        persistence,
+        events,
+    );
+    let handle = Arc::new(SessionHandle {
+        core,
+        active_tool_calls,
         connection,
-        current_model: Arc::new(StdMutex::new(state.default_model.clone())),
-        cwd: session_workspace,
         bridge: bridge_slot,
         mcp_specs: tokio::sync::Mutex::new(mcp_specs),
-        client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
-        compaction: state.compaction.clone(),
-        context_windows: tokio::sync::Mutex::new(context_windows),
     });
 
     // Idle human-visible agent-mail notification poller (#1063). A Weak handle
@@ -2275,7 +2250,7 @@ async fn build_session_handle(
     {
         let weak = Arc::downgrade(&handle);
         let notification_tool_session = {
-            let session = handle.session.lock().await;
+            let session = handle.core.session.lock().await;
             session.coordination_tool_session()
         };
         let base_ms = cfg.coordination.notifications.effective_poll_interval_ms();
@@ -2297,7 +2272,7 @@ async fn build_session_handle(
                 // for the entire provider stream + tool loop. If busy, skip this
                 // tick so no UI notification can appear mid-stream/tool call.
                 let notice = poll_coordination_ui_notice_if_idle(
-                    &handle.session,
+                    &handle.core.session,
                     &notification_tool_session,
                 )
                 .await;
@@ -2347,10 +2322,10 @@ async fn refresh_live_mcp_bridge(
     cfg: &Config,
     mcp_specs: Vec<ServerSpec>,
 ) {
-    let mut agent_session = handle.session.lock().await;
+    let mut agent_session = handle.core.session.lock().await;
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
-        tool_facade::active_schemas(&handle.cwd, descriptions)
+        tool_facade::active_schemas(&handle.core.cwd, descriptions)
             .into_iter()
             .map(|schema| schema.name)
             .collect();
@@ -2365,7 +2340,7 @@ async fn refresh_live_mcp_bridge(
         )
         .await,
     );
-    agent_session.set_tools(agent_tools(&handle.cwd, descriptions, &new_bridge));
+    agent_session.set_tools(agent_tools(&handle.core.cwd, descriptions, &new_bridge));
     let old_bridge = {
         let mut bridge = handle.bridge.write().await;
         std::mem::replace(&mut *bridge, new_bridge)
@@ -2540,7 +2515,7 @@ fn build_agent(
         safety,
         token_log,
         sessions_dir,
-        AcpCompaction::new(compaction, false),
+        SessionCompaction::new(compaction, false),
         analytics,
         false,
         &mut None,
@@ -2562,7 +2537,7 @@ fn build_agent_with_state(
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
-    compaction: AcpCompaction,
+    compaction: SessionCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     timestamp_turns: bool,
     state_out: &mut Option<Arc<AcpState>>,
@@ -2661,7 +2636,6 @@ fn build_agent_with_state(
                                     &handle,
                                     &spawn_cx,
                                     &req.session_id,
-                                    state.store.as_ref(),
                                 )
                                 .await
                                 {
@@ -2809,7 +2783,7 @@ fn build_agent_with_state(
                             request_session_cancel(handle);
                         }
                         let _lifecycle = match &existing_handle {
-                            Some(handle) => Some(handle.lifecycle.lock().await),
+                            Some(handle) => Some(handle.core.lifecycle.lock().await),
                             None => None,
                         };
                         let removed_handle = state.sessions.lock().await.remove(&req.session_id);
@@ -2817,7 +2791,7 @@ fn build_agent_with_state(
                             // Wait for a cancelled turn (or short direct command)
                             // to release the session before removing its file, so
                             // it cannot save itself again after deletion.
-                            let session = handle.session.lock().await;
+                            let session = handle.core.session.lock().await;
                             drop(session);
                         }
                         if let Err(error) = store.delete(&req.session_id.to_string()) {
@@ -2931,7 +2905,7 @@ fn build_agent_with_state(
                                 &session_id.to_string(),
                                 &state.default_model,
                                 &[],
-                                &handle.cwd,
+                                &handle.core.cwd,
                                 &[],
                             );
                         }
@@ -3010,7 +2984,7 @@ fn build_agent_with_state(
                         // session/delete takes the same guard before removing
                         // the handle, giving load/delete a single linear order.
                         let _lifecycle = match &existing {
-                            Some(handle) => Some(handle.lifecycle.lock().await),
+                            Some(handle) => Some(handle.core.lifecycle.lock().await),
                             None => None,
                         };
                         if let Some(handle) = &existing {
@@ -3052,10 +3026,11 @@ fn build_agent_with_state(
                             }
                             // Live sessions always preserve provider, history,
                             // usage, compaction cache, and tool-session state.
-                            let agent_session = handle.session.lock().await;
+                            let agent_session = handle.core.session.lock().await;
                             replay_history(&cx, &session_id, agent_session.history());
                             drop(agent_session);
                             let model = handle
+                                .core
                                 .current_model
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -3092,7 +3067,7 @@ fn build_agent_with_state(
                             };
                             let model = record.model.clone();
                             {
-                                let mut agent_session = handle.session.lock().await;
+                                let mut agent_session = handle.core.session.lock().await;
                                 agent_session.set_history(record.messages);
                                 agent_session.set_model(model.clone());
                                 let mut client_ids = record.client_user_message_ids;
@@ -3100,10 +3075,11 @@ fn build_agent_with_state(
                                     &mut client_ids,
                                     agent_session.user_turn_count(),
                                 );
-                                *handle.client_user_message_ids.lock().await = client_ids;
+                                *handle.core.client_user_message_ids.lock().await = client_ids;
                                 replay_history(&cx, &session_id, agent_session.history());
                             }
                             *handle
+                                .core
                                 .current_model
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner()) = model.clone();
@@ -3182,12 +3158,13 @@ fn build_agent_with_state(
                             let turn_result = match handle {
                                 Some(handle) => {
                                     let model = handle
+                                        .core
                                         .current_model
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clone();
                                     let (turn_index, tools_exposed) = {
-                                        let session = handle.session.lock().await;
+                                        let session = handle.core.session.lock().await;
                                         (session.user_turn_count(), session.tool_count())
                                     };
                                     let session_key = session_id.to_string();
@@ -3195,7 +3172,7 @@ fn build_agent_with_state(
                                         mode: "acp",
                                         session_id: Some(&session_key),
                                         model: &model,
-                                        workspace: &handle.cwd,
+                                        workspace: &handle.core.cwd,
                                         turn_index,
                                         tools_exposed,
                                     });
@@ -3223,7 +3200,6 @@ fn build_agent_with_state(
                                             &session_id,
                                             user_message,
                                             client_user_message_id,
-                                            state.store.as_ref(),
                                             assistant_prefix,
                                         )
                                         .instrument(prompt_span.span().clone())
@@ -3323,6 +3299,7 @@ fn build_agent_with_state(
                                     // Only honor a value we actually advertised.
                                     if state.models.iter().any(|m| m == &picked) {
                                         *handle
+                                            .core
                                             .current_model
                                             .lock()
                                             .unwrap_or_else(|p| p.into_inner()) = picked;
@@ -3330,6 +3307,7 @@ fn build_agent_with_state(
                                 }
                             }
                             current = handle
+                                .core
                                 .current_model
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -3396,7 +3374,7 @@ pub async fn run_acp(
     safety: crate::safety::SafetyPolicy,
     token_log: Option<PathBuf>,
     sessions_dir: Option<PathBuf>,
-    compaction: AcpCompaction,
+    compaction: SessionCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     timestamp_turns: bool,
 ) -> anyhow::Result<()> {
@@ -3494,6 +3472,7 @@ async fn shutdown_all_bridges(state: &AcpState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::CompactionPolicy;
     use agent_client_protocol::schema::ProtocolVersion;
     use async_trait::async_trait;
     use futures_util::io::AsyncReadExt;
@@ -3981,7 +3960,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -4077,9 +4056,9 @@ mod tests {
             .get(&session_id)
             .cloned()
             .expect("live session");
-        assert_eq!(handle.session.lock().await.user_turn_count(), 2);
+        assert_eq!(handle.core.session.lock().await.user_turn_count(), 2);
         assert_eq!(
-            *handle.client_user_message_ids.lock().await,
+            *handle.core.client_user_message_ids.lock().await,
             vec!["", "user-1"]
         );
         let persisted = SessionStore::new(sessions.path().to_path_buf())
@@ -4125,7 +4104,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             timestamp_turns,
             &mut state_out,
@@ -4162,7 +4141,7 @@ mod tests {
             .get(&session_id)
             .cloned()
             .expect("live session");
-        let history = handle.session.lock().await.history().to_vec();
+        let history = handle.core.session.lock().await.history().to_vec();
         let persisted = state
             .store
             .as_ref()
@@ -4217,7 +4196,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -4247,7 +4226,7 @@ mod tests {
                         .get(&session_id)
                         .cloned()
                         .expect("new session handle");
-                    let lifecycle = handle.lifecycle.lock().await;
+                    let lifecycle = handle.core.lifecycle.lock().await;
                     let delete = connection
                         .send_request(DeleteSessionRequest::new(session_id.clone()))
                         .block_task();
@@ -4303,7 +4282,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -4359,7 +4338,7 @@ mod tests {
             Arc::new(crate::safety::SafetyPolicy::default()),
             None,
             Some(sessions.path().to_path_buf()),
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -4958,7 +4937,7 @@ mod tests {
             }),
             None,
             None,
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -5035,13 +5014,13 @@ mod tests {
                     .get(&session_id)
                     .cloned()
                     .expect("live session handle");
-                assert_eq!(handle.approvals.pending().len(), 1);
+                assert_eq!(handle.core.approvals.pending().len(), 1);
 
                 connection.send_notification(CancelNotification::new(session_id))?;
                 let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
                     .await
                     .expect("cancelled prompt should resolve")?;
-                assert!(handle.approvals.pending().is_empty());
+                assert!(handle.core.approvals.pending().is_empty());
                 Ok(response.stop_reason)
             })
             .await
@@ -5239,7 +5218,7 @@ mod tests {
             }),
             None,
             None,
-            AcpCompaction::new(None, false),
+            SessionCompaction::new(None, false),
             None,
             false,
             &mut state_out,
@@ -5298,12 +5277,14 @@ mod tests {
                     .cloned()
                     .expect("live session handle");
                 let approval = handle
+                    .core
                     .approvals
                     .pending()
                     .into_iter()
                     .next()
                     .expect("broker approval");
                 handle
+                    .core
                     .approvals
                     .resolve(
                         &approval.id,
@@ -6721,7 +6702,7 @@ mod tests {
             summary_model: None,
             summary_prompt: None,
         };
-        let dynamic = AcpCompaction::new(Some(base.clone()), true);
+        let dynamic = SessionCompaction::new(Some(base.clone()), true);
         assert_eq!(
             dynamic
                 .policy_for("anthropic/claude-opus-4.8", Some(1_000_000))
@@ -6731,7 +6712,7 @@ mod tests {
             1_000_000
         );
 
-        let explicit = AcpCompaction::new(Some(base), false);
+        let explicit = SessionCompaction::new(Some(base), false);
         assert_eq!(
             explicit
                 .policy_for("anthropic/claude-opus-4.8", Some(1_000_000))
