@@ -261,10 +261,13 @@ impl SessionCore {
             .policy
             .as_ref()
             .map(|policy| {
-                (
-                    policy.output_reservation,
-                    Some((policy.high_water * policy.budget() as f64) as u64),
-                )
+                let budget = policy.budget();
+                let valid_fraction = policy.high_water.is_finite()
+                    && (0.0..=1.0).contains(&policy.high_water)
+                    && budget > 0;
+                let high_water =
+                    valid_fraction.then(|| (policy.high_water * budget as f64).round() as u64);
+                (policy.output_reservation, high_water)
             })
             .unwrap_or((0, None));
         crate::session_protocol::ContextUsage::new(
@@ -295,9 +298,15 @@ impl SessionTurn<'_> {
 
 impl Drop for SessionTurn<'_> {
     fn drop(&mut self) {
-        let _ = self.events.emit(SessionEvent::TurnStatusChanged {
+        if let Err(error) = self.events.emit(SessionEvent::TurnStatusChanged {
             status: crate::session_protocol::TurnStatus::Idle,
-        });
+        }) {
+            tracing::error!(
+                target: "daimonos::session_core",
+                event = "turn_idle_event_failed",
+                error = ?error,
+            );
+        }
     }
 }
 

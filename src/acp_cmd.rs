@@ -788,13 +788,17 @@ fn cancel_active_tool_calls(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     active_tool_calls: &ActiveToolCalls,
-) {
+) -> Vec<String> {
     let active = {
         let mut calls = active_tool_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         calls.drain().collect::<Vec<_>>()
     };
+    let cancelled_ids = active
+        .iter()
+        .map(|(tool_call_id, _)| tool_call_id.clone())
+        .collect::<Vec<_>>();
     for (tool_call_id, terminal_output) in active {
         let fields = ToolCallUpdateFields::new()
             .status(Some(ToolCallStatus::Failed))
@@ -816,6 +820,7 @@ fn cancel_active_tool_calls(
         }
         send_notification(cx, session_id, SessionUpdate::ToolCallUpdate(update));
     }
+    cancelled_ids
 }
 
 fn build_tool_progress_hook(
@@ -970,6 +975,11 @@ async fn request_permission(
     let resolution = match broker_receiver.await {
         Ok(resolution) => resolution,
         Err(_) => {
+            let _ = events.emit(CoreSessionEvent::ApprovalResolved {
+                approval_id: approval_id.clone(),
+                decision: CoreApprovalDecision::Deny,
+                resolved_by: "broker_closed".to_string(),
+            });
             return BeforeHookResult::Block(format!(
                 "permission broker closed for '{}'",
                 info.name
@@ -1821,14 +1831,6 @@ async fn run_prompt_turn(
             }
         }
     }
-    let user_text = direct_command_text(&user_message)
-        .unwrap_or("[multimodal user message]")
-        .to_string();
-    let _ = handle
-        .core
-        .events
-        .emit(CoreSessionEvent::UserMessage { text: user_text });
-
     // Now that we hold the lock, refresh the connection handle with *this*
     // dispatch's cx — see `CurrentConnection`'s doc comment for why.
     *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
@@ -1872,6 +1874,14 @@ async fn run_prompt_turn(
         return Ok(AcpStopReason::EndTurn);
     }
 
+    let user_text = direct_command_text(&user_message)
+        .unwrap_or("[multimodal user message]")
+        .to_string();
+    let _ = handle
+        .core
+        .events
+        .emit(CoreSessionEvent::UserMessage { text: user_text });
+
     // Stream the prefix at the start of the turn, but do not put it in the
     // provider's input context. On successful completion below, it becomes a
     // real leading assistant history message for persistence and replay.
@@ -1905,7 +1915,19 @@ async fn run_prompt_turn(
         // path. Close every already-announced call before retiring its id so
         // the client does not retain Pending/InProgress chrome; draining first
         // also makes any racing late callback observe the call as closed.
-        cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
+        let _ = handle
+            .core
+            .events
+            .emit(CoreSessionEvent::TurnStatusChanged {
+                status: crate::session_protocol::TurnStatus::Cancelling,
+            });
+        for tool_call_id in cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls) {
+            let _ = handle.core.events.emit(CoreSessionEvent::ToolCallFinished {
+                id: tool_call_id,
+                ok: false,
+                output: "cancelled".to_string(),
+            });
+        }
     }
     if outcome.is_some() {
         let _ = handle.core.events.emit(CoreSessionEvent::AssistantDone);
@@ -2031,6 +2053,7 @@ async fn run_retry_turn(
                 .emit(CoreSessionEvent::ContextUsageChanged {
                     usage: handle.core.context_usage(used_tokens, context_window),
                 });
+            let _ = handle.core.events.emit(CoreSessionEvent::AssistantDone);
             emit_usage_update(
                 cx,
                 session_id,
