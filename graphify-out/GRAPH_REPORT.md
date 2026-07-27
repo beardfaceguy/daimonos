@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-27)
 
 ## Corpus Check
-- 208 files · ~258,564 words
+- 208 files · ~258,598 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5179 nodes · 11954 edges · 234 communities (214 shown, 20 thin omitted)
+- 5179 nodes · 11954 edges · 235 communities (215 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `f182326b`
+- Built from commit: `14c3fd5b`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -240,6 +240,7 @@
 - [[_COMMUNITY_Community 231|Community 231]]
 - [[_COMMUNITY_Community 232|Community 232]]
 - [[_COMMUNITY_Community 233|Community 233]]
+- [[_COMMUNITY_Community 234|Community 234]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 56 edges
@@ -287,7 +288,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (234 total, 20 thin omitted)
+## Communities (235 total, 20 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -478,8 +479,8 @@ Cohesion: 0.17
 Nodes (25): acp_client_user_message_ids_round_trip(), atomic_write_leaves_no_tmp_file(), delete_is_idempotent_and_rejects_unsafe_ids(), first_user_line(), legacy_record_without_cwd_remains_readable(), list_breaks_equal_mtime_ties_by_session_id(), list_returns_saved_sessions_with_labels(), load_unknown_id_is_none() (+17 more)
 
 ### Community 47 - "Community 47"
-Cohesion: 0.14
-Nodes (25): mcp_socket_server(), McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file. (+17 more)
+Cohesion: 0.17
+Nodes (21): McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content., tools/call write_file creates a file on disk. (+13 more)
 
 ### Community 48 - "Community 48"
 Cohesion: 0.29
@@ -1108,6 +1109,10 @@ Nodes (3): AcpPlan, AgentPlanEntry, to_acp_plan()
 ### Community 233 - "Community 233"
 Cohesion: 0.05
 Nodes (44): AcpContentBlock, CoreMessage, InitializeRequest, SessionInfo, client_supports_terminal_output(), concurrent_cold_load_builds_persisted_session_once(), coordination_ui_poll_skips_while_agent_session_is_busy(), diff_for_completed_edit() (+36 more)
+
+### Community 234 - "Community 234"
+Cohesion: 0.33
+Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]

@@ -957,10 +957,13 @@ pub fn all_tools() -> Vec<ToolDef> {
 // --- Derived queries ---
 
 /// Build the initial set of exposed tool names (Tier 0 + Tier 1).
+///
+/// `McpOnly` belongs here too: it is withheld from the *agent* catalog, not from
+/// MCP, so for MCP exposure it behaves exactly like `Terse`.
 pub fn initial_exposed_tools() -> HashSet<String> {
     all_tools()
         .iter()
-        .filter(|t| t.tier == ToolTier::Full || t.tier == ToolTier::Terse)
+        .filter(|t| matches!(t.tier, ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly))
         .map(|t| t.name.to_string())
         .collect()
 }
@@ -984,9 +987,14 @@ pub fn has_full_schema(name: &str) -> bool {
 /// Whether `list_tools` should include the full inputSchema for this tool.
 pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_used: bool) -> bool {
     if full_tool_schemas {
-        return all_tools()
-            .iter()
-            .any(|t| t.name == name && (t.tier == ToolTier::Full || t.tier == ToolTier::Terse));
+        return all_tools().iter().any(|t| {
+            t.name == name
+                && matches!(
+                    t.tier,
+                    // `McpOnly` is Terse-equivalent for MCP schema exposure.
+                    ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly
+                )
+        });
     }
     has_full_schema(name) && !already_used
 }
