@@ -4,6 +4,96 @@ use tokio::sync::oneshot;
 
 use crate::session_protocol::{ApprovalDecision, ApprovalRequest, ClientCapability};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnError {
+    Busy,
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("session is busy"),
+        }
+    }
+}
+
+impl std::error::Error for TurnError {}
+
+/// Transport-independent ownership for one session's active turn.
+///
+/// The controller prevents a second prompt from replacing the first turn's
+/// cancellation route. The active permit clears the route on every exit path,
+/// including early returns and unwinding.
+#[derive(Default)]
+pub struct TurnController {
+    active: StdMutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+}
+
+pub struct ActiveTurn<'a> {
+    controller: &'a TurnController,
+    signal: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl TurnController {
+    pub fn begin(&self) -> Result<ActiveTurn<'_>, TurnError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.is_some() {
+            return Err(TurnError::Busy);
+        }
+        let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        *active = Some(std::sync::Arc::clone(&signal));
+        Ok(ActiveTurn {
+            controller: self,
+            signal,
+        })
+    }
+
+    pub fn cancel(&self) -> bool {
+        let signal = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(signal) = signal else {
+            return false;
+        };
+        signal.notify_one();
+        true
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+}
+
+impl ActiveTurn<'_> {
+    pub async fn cancelled(&self) {
+        self.signal.notified().await;
+    }
+}
+
+impl Drop for ActiveTurn<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .controller
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|signal| std::sync::Arc::ptr_eq(signal, &self.signal))
+        {
+            *active = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalResolution {
     pub approval_id: String,
@@ -168,6 +258,47 @@ mod tests {
             detail: "run tests".to_string(),
             allow_always_available: true,
         }
+    }
+
+    #[tokio::test]
+    async fn turn_controller_rejects_overlap_and_routes_cancellation() {
+        let controller = TurnController::default();
+        let active = controller.begin().expect("first turn starts");
+        assert!(controller.is_active());
+        assert!(matches!(controller.begin(), Err(TurnError::Busy)));
+        assert!(controller.cancel());
+        tokio::time::timeout(std::time::Duration::from_millis(100), active.cancelled())
+            .await
+            .expect("active turn receives cancellation");
+        drop(active);
+        assert!(!controller.is_active());
+    }
+
+    #[tokio::test]
+    async fn cancellation_signal_does_not_leak_into_the_next_turn() {
+        let controller = TurnController::default();
+        let first = controller.begin().expect("first turn starts");
+        let first_signal = std::sync::Arc::clone(&first.signal);
+        assert!(controller.cancel());
+        first.cancelled().await;
+        drop(first);
+
+        let second = controller.begin().expect("second turn starts");
+        assert!(!std::sync::Arc::ptr_eq(&first_signal, &second.signal));
+        assert!(controller.cancel());
+        second.cancelled().await;
+    }
+
+    #[test]
+    fn dropping_active_turn_clears_slot_and_idle_cancel_is_safe() {
+        let controller = TurnController::default();
+        assert!(!controller.cancel());
+        {
+            let _active = controller.begin().expect("turn starts");
+            assert!(controller.is_active());
+        }
+        assert!(!controller.is_active());
+        assert!(controller.begin().is_ok());
     }
 
     #[tokio::test]
