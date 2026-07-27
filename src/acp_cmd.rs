@@ -59,7 +59,7 @@ use crate::providers::{
     StreamEvent, ToolSchema, Usage,
 };
 use crate::session::Session;
-use crate::session_core::ApprovalBroker;
+use crate::session_core::{ApprovalBroker, ApprovalError};
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
     ClientCapability,
@@ -959,13 +959,12 @@ async fn request_permission(
     safety: &crate::safety::SafetyPolicy,
     approvals: &ApprovalBroker,
 ) -> BeforeHookResult {
-    let registered = match approvals.register(CoreApprovalRequest {
-        id: String::new(),
-        tool_call_id: info.id.clone(),
-        tool: info.name.clone(),
-        detail: tool_call_title(info),
-        allow_always_available: true,
-    }) {
+    let registered = match approvals.register(CoreApprovalRequest::unassigned(
+        info.id.clone(),
+        info.name.clone(),
+        tool_call_title(info),
+        true,
+    )) {
         Ok(registered) => registered,
         Err(_) => {
             return BeforeHookResult::Block(format!(
@@ -990,91 +989,61 @@ async fn request_permission(
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), update, options);
     let approval_id = registered.request.id.clone();
-    let mut broker_receiver = registered.receiver;
-    let local_request = cx.send_request(request).block_task();
-    tokio::pin!(local_request);
-    let mut denied_reason = None;
+    let broker_receiver = registered.receiver;
 
-    // The broker and the ACP client are peer approval sources. Whichever
-    // returns a valid terminal decision first wins; late answers are harmless
-    // because ApprovalBroker::resolve rejects non-pending ids.
-    let resolution = tokio::select! {
-        broker = &mut broker_receiver => match broker {
-            Ok(resolution) => resolution,
-            Err(_) => {
-                return BeforeHookResult::Block(format!(
-                    "permission broker closed for '{}'",
+    // ACP v1 has no server-to-client cancellation for an outstanding
+    // session/request_permission. Keep that request as the selected local
+    // approval target until it completes; dropping it after a peer answer would
+    // leave stale permission chrome in the ACP client. A future multi-client
+    // router selects exactly one approval-capable controller before this point.
+    let (decision, denied_reason) = match cx.send_request(request).block_task().await {
+        Ok(response) => match response.outcome {
+            RequestPermissionOutcome::Selected(sel) => match sel.option_id.to_string().as_str() {
+                "allow_once" => (CoreApprovalDecision::AllowOnce, None),
+                "allow_always" => (CoreApprovalDecision::AllowAlways, None),
+                _ => (
+                    CoreApprovalDecision::Deny,
+                    Some(format!("permission denied for '{}'", info.name)),
+                ),
+            },
+            RequestPermissionOutcome::Cancelled => (
+                CoreApprovalDecision::Deny,
+                Some(format!("permission request cancelled for '{}'", info.name)),
+            ),
+            _ => (
+                CoreApprovalDecision::Deny,
+                Some(format!(
+                    "unrecognized permission outcome for '{}'",
                     info.name
-                ));
-            }
+                )),
+            ),
         },
-        response = &mut local_request => {
-            let decision = match response {
-                Ok(response) => match response.outcome {
-                    RequestPermissionOutcome::Selected(sel) => {
-                        match sel.option_id.to_string().as_str() {
-                            "allow_once" => CoreApprovalDecision::AllowOnce,
-                            "allow_always" => CoreApprovalDecision::AllowAlways,
-                            _ => {
-                                denied_reason = Some(format!(
-                                    "permission denied for '{}'",
-                                    info.name
-                                ));
-                                CoreApprovalDecision::Deny
-                            }
-                        }
-                    }
-                    RequestPermissionOutcome::Cancelled => {
-                        denied_reason = Some(format!(
-                            "permission request cancelled for '{}'",
-                            info.name
-                        ));
-                        CoreApprovalDecision::Deny
-                    }
-                    _ => {
-                        denied_reason = Some(format!(
-                            "unrecognized permission outcome for '{}'",
-                            info.name
-                        ));
-                        CoreApprovalDecision::Deny
-                    }
-                },
-                Err(_) => {
-                    denied_reason = Some(format!(
-                        "permission request failed for '{}'",
-                        info.name
-                    ));
-                    CoreApprovalDecision::Deny
-                }
-            };
+        Err(_) => (
+            CoreApprovalDecision::Deny,
+            Some(format!("permission request failed for '{}'", info.name)),
+        ),
+    };
 
-            let local_capabilities = [
-                ClientCapability::ApproveOnce,
-                ClientCapability::ApproveAlways,
-            ];
-            if approvals
-                .resolve(
-                    &approval_id,
-                    "acp_local",
-                    &local_capabilities,
-                    decision,
-                )
-                .is_err()
-            {
-                return BeforeHookResult::Block(format!(
-                    "permission resolution failed for '{}'",
-                    info.name
-                ));
-            }
-            match broker_receiver.await {
-                Ok(resolution) => resolution,
-                Err(_) => {
-                    return BeforeHookResult::Block(format!(
-                        "permission broker closed for '{}'",
-                        info.name
-                    ));
-                }
-            }
+    let local_capabilities = [
+        ClientCapability::ApproveOnce,
+        ClientCapability::ApproveAlways,
+    ];
+    match approvals.resolve(&approval_id, "acp_local", &local_capabilities, decision) {
+        Ok(_) | Err(ApprovalError::NotPending) => {}
+        Err(_) => {
+            return BeforeHookResult::Block(format!(
+                "permission resolution failed for '{}'",
+                info.name
+            ));
+        }
+    }
+    let resolution = match broker_receiver.await {
+        Ok(resolution) => resolution,
+        Err(_) => {
+            return BeforeHookResult::Block(format!(
+                "permission broker closed for '{}'",
+                info.name
+            ));
         }
     };
     match resolution.decision {
@@ -1083,9 +1052,14 @@ async fn request_permission(
             safety.remember_always(&info.name);
             BeforeHookResult::Allow
         }
-        CoreApprovalDecision::Deny => BeforeHookResult::Block(
-            denied_reason.unwrap_or_else(|| format!("permission denied for '{}'", info.name)),
-        ),
+        CoreApprovalDecision::Deny => {
+            let reason = if resolution.resolved_by == "acp_local" {
+                denied_reason.unwrap_or_else(|| format!("permission denied for '{}'", info.name))
+            } else {
+                format!("permission denied for '{}'", info.name)
+            };
+            BeforeHookResult::Block(reason)
+        }
     }
 }
 
@@ -5243,7 +5217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broker_resolution_can_win_while_acp_permission_request_is_pending() {
+    async fn earlier_broker_resolution_survives_later_acp_denial() {
         let dir = tempfile::tempdir().unwrap();
         let mut state_out = None;
         let agent = build_agent_with_state(
@@ -5335,9 +5309,9 @@ mod tests {
                     )
                     .expect("remote approval should win");
 
-                let response = tokio::time::timeout(std::time::Duration::from_millis(300), prompt)
+                let response = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
                     .await
-                    .expect("broker resolution should not wait for ACP response")?;
+                    .expect("winning broker resolution should survive the later ACP response")?;
                 Ok(response.stop_reason)
             })
             .await
