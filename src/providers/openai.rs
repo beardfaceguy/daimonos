@@ -386,11 +386,35 @@ fn output_to_content(output: Option<&Vec<Value>>) -> Vec<ContentBlock> {
                 }
             }
             Some("function_call") => {
-                let args = item["arguments"].as_str().unwrap_or("{}");
+                let call_id = item["call_id"].as_str().unwrap_or("");
+                let tool_name = item["name"].as_str().unwrap_or("");
+                let Some(args) = item["arguments"].as_str() else {
+                    tracing::warn!(
+                        target: "daimonos::providers::openai",
+                        event = "invalid_function_call_arguments_skipped",
+                        call_id,
+                        tool_name,
+                        error = "missing arguments string",
+                    );
+                    continue;
+                };
+                let input = match serde_json::from_str(args) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "daimonos::providers::openai",
+                            event = "invalid_function_call_arguments_skipped",
+                            call_id,
+                            tool_name,
+                            %error,
+                        );
+                        continue;
+                    }
+                };
                 content.push(ContentBlock::ToolCall {
-                    id: item["call_id"].as_str().unwrap_or("").to_string(),
-                    name: item["name"].as_str().unwrap_or("").to_string(),
-                    input: serde_json::from_str(args).unwrap_or_else(|_| json!({})),
+                    id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    input,
                 });
             }
             Some("reasoning") => {
@@ -1143,6 +1167,33 @@ mod tests {
         let response = state.finish();
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(matches!(&response.content[0], ContentBlock::Text(t) if t == "hi"));
+    }
+
+    #[test]
+    fn incomplete_response_drops_truncated_function_call_arguments() {
+        let response = parse_response(
+            &json!({
+                "status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "output":[
+                    {"type":"function_call","call_id":"complete","name":"read_file","arguments":"{\"path\":\"a\"}"},
+                    {"type":"function_call","call_id":"truncated","name":"edit_file","arguments":"{\"path\":\"src/lib.rs\",\"edits\":["}
+                ],
+                "usage":{}
+            }),
+            "gpt-5.6-sol",
+        );
+
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        let tool_call_ids = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_call_ids, vec!["complete"]);
     }
 
     #[test]
