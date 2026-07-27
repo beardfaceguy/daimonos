@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-27)
 
 ## Corpus Check
-- 208 files · ~260,850 words
+- 208 files · ~261,455 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5234 nodes · 12111 edges · 231 communities (211 shown, 20 thin omitted)
+- 5240 nodes · 12131 edges · 245 communities (224 shown, 21 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `1bb65264`
+- Built from commit: `c363250b`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -202,6 +202,7 @@
 - [[_COMMUNITY_Community 192|Community 192]]
 - [[_COMMUNITY_Community 193|Community 193]]
 - [[_COMMUNITY_Community 194|Community 194]]
+- [[_COMMUNITY_Community 195|Community 195]]
 - [[_COMMUNITY_Community 196|Community 196]]
 - [[_COMMUNITY_Community 198|Community 198]]
 - [[_COMMUNITY_Community 199|Community 199]]
@@ -227,16 +228,29 @@
 - [[_COMMUNITY_Community 219|Community 219]]
 - [[_COMMUNITY_Community 220|Community 220]]
 - [[_COMMUNITY_Community 221|Community 221]]
+- [[_COMMUNITY_Community 222|Community 222]]
 - [[_COMMUNITY_Community 223|Community 223]]
 - [[_COMMUNITY_Community 224|Community 224]]
+- [[_COMMUNITY_Community 225|Community 225]]
 - [[_COMMUNITY_Community 226|Community 226]]
 - [[_COMMUNITY_Community 227|Community 227]]
 - [[_COMMUNITY_Community 228|Community 228]]
 - [[_COMMUNITY_Community 229|Community 229]]
 - [[_COMMUNITY_Community 230|Community 230]]
 - [[_COMMUNITY_Community 231|Community 231]]
+- [[_COMMUNITY_Community 232|Community 232]]
 - [[_COMMUNITY_Community 233|Community 233]]
 - [[_COMMUNITY_Community 234|Community 234]]
+- [[_COMMUNITY_Community 235|Community 235]]
+- [[_COMMUNITY_Community 236|Community 236]]
+- [[_COMMUNITY_Community 237|Community 237]]
+- [[_COMMUNITY_Community 238|Community 238]]
+- [[_COMMUNITY_Community 239|Community 239]]
+- [[_COMMUNITY_Community 240|Community 240]]
+- [[_COMMUNITY_Community 241|Community 241]]
+- [[_COMMUNITY_Community 242|Community 242]]
+- [[_COMMUNITY_Community 243|Community 243]]
+- [[_COMMUNITY_Community 244|Community 244]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 56 edges
@@ -284,7 +298,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (231 total, 20 thin omitted)
+## Communities (245 total, 21 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -347,8 +361,8 @@ Cohesion: 0.12
 Nodes (41): AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider(), dry_run_prints_task_in_output() (+33 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.10
-Nodes (49): IndexState, concurrent_reindexes_serialize_correctly(), eager_index_small_root_regardless_of_marker(), extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), gate_allows_large_marked_root() (+41 more)
+Cohesion: 0.32
+Nodes (15): concurrent_reindexes_serialize_correctly(), gated_root_skips_indexing(), incremental_adds_new_files(), incremental_combined_add_delete_modify(), incremental_removes_deleted_files(), incremental_skips_unchanged_files(), incremental_updates_modified_files(), index_and_search_fixture_dir() (+7 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.11
@@ -479,8 +493,8 @@ Cohesion: 0.17
 Nodes (21): McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file., tools/call read_file returns the file's content., tools/call write_file creates a file on disk. (+13 more)
 
 ### Community 48 - "Community 48"
-Cohesion: 0.08
-Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
+Cohesion: 0.14
+Nodes (19): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+11 more)
 
 ### Community 49 - "Community 49"
 Cohesion: 0.07
@@ -491,8 +505,8 @@ Cohesion: 0.13
 Nodes (18): Path, CallSample, Client, find_binary(), load_task(), main(), proc_resource_snapshot(), Locate the release daimonos binary, building it if necessary.      Falls back to (+10 more)
 
 ### Community 51 - "Community 51"
-Cohesion: 0.13
-Nodes (32): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+24 more)
+Cohesion: 0.22
+Nodes (14): AGENTS.md (repo agent conventions), Cline Setup Guide, GitHub Copilot Setup Guide, Daimonos MCP Server (daimonos --mcp), Build Notes, Installing Daimonos, Next Steps, Option A: Download Pre-Built Binary (+6 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.09
@@ -663,8 +677,8 @@ Cohesion: 0.05
 Nodes (90): ClientHandler, ClientRuntime, InitializeRequestParams, Metadata, OsStr, PoolSlot, PoolSlotState, BridgeClientHandler (+82 more)
 
 ### Community 94 - "Community 94"
-Cohesion: 0.06
-Nodes (34): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, [Unreleased], Contributing Guide, Installation & Setup Guide, README — Daimonos Project Overview (+26 more)
+Cohesion: 0.09
+Nodes (21): Avoid: Conditional environment inheritance, Avoid: Insert-only maps without remove, Avoid: Testing only the happy path, Rust Collection Patterns, Use: AtomicBool for dirty flags, Use: Bounded insert wrapper, Use: Remove-on-terminal-state, 1. HashMap/Vec in long-lived structs (+13 more)
 
 ### Community 95 - "Community 95"
 Cohesion: 0.08
@@ -759,8 +773,8 @@ Cohesion: 0.60
 Nodes (4): main(), parse_iso(), to_int(), DateTime
 
 ### Community 121 - "Community 121"
-Cohesion: 0.10
-Nodes (21): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+13 more)
+Cohesion: 0.17
+Nodes (13): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, LlmProvider Trait (+5 more)
 
 ### Community 122 - "Community 122"
 Cohesion: 0.11
@@ -847,8 +861,8 @@ Cohesion: 0.29
 Nodes (7): 1. Open Zed settings, 2. Add daimonos as an MCP server, 3. Verify, Prerequisites, Setup, Troubleshooting, Zed Editor Setup
 
 ### Community 158 - "Community 158"
-Cohesion: 0.07
-Nodes (57): BridgeSlot, ConnectTo, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled() (+49 more)
+Cohesion: 0.08
+Nodes (54): ConnectTo, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_cancelled_permission_finishes_the_announced_call() (+46 more)
 
 ### Community 161 - "Community 161"
 Cohesion: 0.50
@@ -859,8 +873,8 @@ Cohesion: 0.14
 Nodes (15): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, retry_error_type(), Into, Message (+7 more)
 
 ### Community 168 - "Community 168"
-Cohesion: 0.11
-Nodes (48): McpBridge, McpClientPool, SessionCompaction, SessionCore, AcpState, agent_tools(), align_client_user_message_ids(), assistant_texts() (+40 more)
+Cohesion: 0.13
+Nodes (44): McpBridge, McpClientPool, SessionCompaction, SessionCore, AcpState, agent_tools(), align_client_user_message_ids(), assistant_texts() (+36 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.24
@@ -943,8 +957,8 @@ Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.09
-Nodes (61): AcpClientRole, AcpPlan, AcpStopReason, ActiveToolCalls, AgentPlanEntry, ConnectionTo, CurrentConnection, DiffStash (+53 more)
+Cohesion: 0.08
+Nodes (68): AcpClientRole, AcpPlan, AcpStopReason, ActiveToolCalls, AgentPlanEntry, BridgeSlot, ConnectionTo, CurrentConnection (+60 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -953,6 +967,10 @@ Nodes (22): ADR-006: Privacy-first LLM observability over OpenTelemetry, Compact
 ### Community 194 - "Community 194"
 Cohesion: 0.36
 Nodes (9): arr(), has_name(), names(), orient_from_graph_alone(), write_module(), Path, String, Value (+1 more)
+
+### Community 195 - "Community 195"
+Cohesion: 0.15
+Nodes (9): ActiveTurn, AtomicU8, ActiveTurn, Drop, F, Notify, SessionTurn, TurnController (+1 more)
 
 ### Community 196 - "Community 196"
 Cohesion: 0.19
@@ -1003,8 +1021,8 @@ Cohesion: 0.09
 Nodes (21): ADR-009: Native agent-to-agent coordination (agent mail), Alternatives considered, Amendment — Cooperative unread-mail notifications (#1063), Consequences, Context, D10 — Verification gates, D1 — One dedicated coordination SQLite DB per workspace, opened directly by every process (no broker), D2 — Identity: stable, memorable, per-workspace names (+13 more)
 
 ### Community 209 - "Community 209"
-Cohesion: 0.05
-Nodes (70): ActiveTurn, ApprovalDecision, ApprovalRequest, ClientCapability, SessionEvent, SessionTurn, ActiveTurn, allow_always_requires_host_policy_request_option_and_capability() (+62 more)
+Cohesion: 0.22
+Nodes (20): ApprovalDecision, ApprovalRequest, ClientCapability, allow_always_requires_host_policy_request_option_and_capability(), ApprovalError, ApprovalResolution, broker_assigns_monotonic_ids_that_are_never_reused(), cancel_all_denies_every_pending_waiter() (+12 more)
 
 ### Community 210 - "Community 210"
 Cohesion: 0.28
@@ -1054,6 +1072,10 @@ Nodes (8): 1. Open MCP settings, 2. Add daimonos, 3. Verify, Cline Setup, Custom
 Cohesion: 0.40
 Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
 
+### Community 222 - "Community 222"
+Cohesion: 0.19
+Nodes (15): ApprovalState, AgentSession, ApprovalBroker, Arc, HashMap, Into, Message, Mutex (+7 more)
+
 ### Community 223 - "Community 223"
 Cohesion: 0.24
 Nodes (10): _err_text(), Regression tests for set_cwd (vikunja #249, fix #7).  The bug: `set_cwd` checked, Non-existent path must produce a canonicalize/resolve error,     not a 'not a di, When set_cwd is given a path to a regular file, the error must     reference the, When set_cwd is given a symlink pointing at a file, the error must     reference, Sanity check: setting cwd to a real subdirectory should succeed     and report t, test_set_cwd_missing_path_returns_canonicalize_error(), test_set_cwd_on_directory_succeeds() (+2 more)
@@ -1061,6 +1083,10 @@ Nodes (10): _err_text(), Regression tests for set_cwd (vikunja #249, fix #7).  T
 ### Community 224 - "Community 224"
 Cohesion: 0.13
 Nodes (17): E, Span, build_provider(), CompactionSpan, CoordinationSpan, generation_span_is_child_and_exports_usage_without_content(), GenerationSpan, prompt_root_omits_absent_session_id() (+9 more)
+
+### Community 225 - "Community 225"
+Cohesion: 0.18
+Nodes (14): canonical_json(), content_hash(), filtered_walk_builder(), IndexResult, Substrate, DefNode, Edge, EffectFacts (+6 more)
 
 ### Community 226 - "Community 226"
 Cohesion: 0.40
@@ -1086,13 +1112,53 @@ Nodes (3): cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, Drop
 Cohesion: 0.25
 Nodes (9): ListToolsResult, PaginatedRequestParams, RpcError, ServerHandler, DaimonosHandler, Arc, McpServer, Mutex (+1 more)
 
+### Community 232 - "Community 232"
+Cohesion: 0.14
+Nodes (16): extract_trigrams(), extract_trigrams_deduplicates_per_file(), extract_trigrams_from_content(), extract_trigrams_short_content(), IndexState, IndexStats, query_to_trigrams(), query_to_trigrams_normal() (+8 more)
+
 ### Community 233 - "Community 233"
 Cohesion: 0.04
-Nodes (65): AcpContentBlock, AcpDiff, AvailableCommand, CoreMessage, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+57 more)
+Nodes (65): AcpContentBlock, AcpDiff, AvailableCommand, CoreMessage, InitializeRequest, LevelFilter, SessionInfo, AcpCommand (+57 more)
 
 ### Community 234 - "Community 234"
 Cohesion: 0.33
 Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Two concurrent sessions must not share read-cache or cwd state., test_mcp_socket_parallel_sessions_isolated()
+
+### Community 235 - "Community 235"
+Cohesion: 0.26
+Nodes (11): SessionEvent, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe(), repeated_cancel_emits_cancelling_once(), SessionEventError (+3 more)
+
+### Community 236 - "Community 236"
+Cohesion: 0.20
+Nodes (10): CompactionPolicy, ContextUsage, Default, Option, Result, Self, SessionEventHandler, StdMutex (+2 more)
+
+### Community 237 - "Community 237"
+Cohesion: 0.18
+Nodes (13): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, [Unreleased], Contributing Guide, Installation & Setup Guide, README — Daimonos Project Overview (+5 more)
+
+### Community 238 - "Community 238"
+Cohesion: 0.30
+Nodes (11): eager_index_small_root_regardless_of_marker(), gate_allows_large_marked_root(), gate_allows_large_root_with_git_dir(), gate_blocks_large_unmarked_root(), gate_disabled_always_eager(), has_project_marker(), preflight_within_budget(), IndexConfig (+3 more)
+
+### Community 239 - "Community 239"
+Cohesion: 0.22
+Nodes (10): daimonos.default.toml (reference config), Discord Integration Setup Guide, Agent Environment File, Config File Location, Configuration Reference, Environment Variables, Performance Tuning Tips, Which config file is in use? (+2 more)
+
+### Community 240 - "Community 240"
+Cohesion: 0.57
+Nodes (8): agent_system.md (Agent System Prompt), Claude Code Setup Guide, Cursor IDE Setup Guide, execute_script Tool, mcp_instructions.md (MCP Instructions Prompt), Other MCP-Compatible Tools Guide, Daimonos Prompts README, Embedded Starlark Interpreter
+
+### Community 241 - "Community 241"
+Cohesion: 0.25
+Nodes (8): Context compaction (required config), Model picker, Prerequisites, Scope, Setup, Troubleshooting, Verify, Zed Editor Setup (native ACP agent)
+
+### Community 242 - "Community 242"
+Cohesion: 0.29
+Nodes (7): IndexState, Arc, HashSet, Mutex, PathBuf, RwLock, WorkspaceIndex
+
+### Community 243 - "Community 243"
+Cohesion: 0.29
+Nodes (5): SessionTurn, Display, Error, Formatter, TurnError
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -1105,7 +1171,7 @@ Nodes (4): mcp_socket_server(), Start daimonos in --mcp-socket mode; yield (sock
 ## Knowledge Gaps
 - **859 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+854 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **21 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1119,7 +1185,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 174`, `Community 167`?**
-  _High betweenness centrality (0.007) - this node is a cross-community bridge._
+  _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
   _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **What connects `Load all task summaries from one run directory.`, `All run dirs belonging to (arm, tag), including -rN repetitions.`, `Per-task cross-run statistics: mean/min/max per metric, success rate,     contam` to the rest of the system?**

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
@@ -311,6 +311,13 @@ impl SessionTurn<'_> {
     pub async fn cancelled(&self) {
         self.active.cancelled().await;
     }
+
+    /// Claim completion, so a cancel arriving during post-turn bookkeeping
+    /// (persistence snapshots, id alignment) cannot relabel a finished turn as
+    /// cancelled. Call as soon as the turn's work has completed.
+    pub fn mark_completed(&self) {
+        self.active.complete();
+    }
 }
 
 impl Drop for SessionTurn<'_> {
@@ -341,14 +348,43 @@ impl Drop for SessionTurn<'_> {
 /// The cancellation route for one turn, shared between the task running the turn
 /// and whoever cancels it.
 ///
-/// `cancelled` is separate from the notification because `SessionTurn::drop`
+/// `outcome` is separate from the notification because `SessionTurn::drop`
 /// decides the turn's terminal event and cannot `await`: a `Notify` carries no
 /// readable "was this signalled" state, so the fact has to be recorded on its
 /// own.
+///
+/// It is a claim, not a flag: exactly one of completion and cancellation wins
+/// the `Live -> {Completed, Cancelled}` transition. Without the claim, a cancel
+/// arriving between the prompt finishing and `SessionTurn` dropping marked a
+/// *completed* turn cancelled — the canonical stream said `Cancelled` while the
+/// ACP response said `EndTurn`.
 #[derive(Default)]
 struct TurnSignal {
     notify: tokio::sync::Notify,
-    cancelled: AtomicBool,
+    outcome: AtomicU8,
+}
+
+impl TurnSignal {
+    const LIVE: u8 = 0;
+    const COMPLETED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    /// Claim `outcome` for this turn. Returns true if this call won the claim;
+    /// false if the other outcome already holds it. Claiming the same outcome
+    /// twice reports true (idempotent from the claimant's side).
+    fn claim(&self, outcome: u8) -> bool {
+        match self
+            .outcome
+            .compare_exchange(Self::LIVE, outcome, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => true,
+            Err(current) => current == outcome,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.outcome.load(Ordering::SeqCst) == Self::CANCELLED
+    }
 }
 
 /// Transport-independent ownership for one session's active turn.
@@ -405,8 +441,19 @@ impl TurnController {
         let Some(signal) = signal else {
             return false;
         };
-        signal.cancelled.store(true, Ordering::SeqCst);
-        before_signal();
+        // Claim the outcome first. A turn that already completed refuses the
+        // cancel outright: marking it cancelled after the fact would put a
+        // `Cancelled` terminal event on a turn whose ACP response was `EndTurn`.
+        // A repeat cancel is accepted (and re-notifies) but must not win a
+        // second `Cancelling` emission, so the callback runs only on the state
+        // transition itself.
+        let already_cancelled = signal.is_cancelled();
+        if !signal.claim(TurnSignal::CANCELLED) {
+            return false;
+        }
+        if !already_cancelled {
+            before_signal();
+        }
         signal.notify.notify_one();
         true
     }
@@ -427,7 +474,14 @@ impl ActiveTurn<'_> {
     /// Whether this turn has been cancelled. Readable synchronously so `Drop`
     /// can pick the terminal event.
     fn is_cancelled(&self) -> bool {
-        self.signal.cancelled.load(Ordering::SeqCst)
+        self.signal.is_cancelled()
+    }
+
+    /// Claim completion for this turn, so a later cancel cannot relabel it.
+    /// Loses gracefully: if cancellation claimed first, the turn stays
+    /// cancelled — the claim decides, whichever side gets there first.
+    fn complete(&self) {
+        let _ = self.signal.claim(TurnSignal::COMPLETED);
     }
 }
 
@@ -883,6 +937,77 @@ mod tests {
                 TurnStatus::Cancelling,
                 TurnStatus::Cancelled
             ],
+        );
+    }
+
+    /// A cancel that loses the outcome claim must not relabel a finished turn.
+    /// Before the claim existed, a cancel landing between prompt completion and
+    /// `SessionTurn` drop produced a canonical `Cancelled` for a turn whose ACP
+    /// response was `EndTurn`.
+    #[tokio::test]
+    async fn cancel_after_completion_is_refused_and_turn_ends_idle() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let turn = SessionTurn {
+                active,
+                events: &router,
+            };
+            turn.mark_completed();
+            // The cancel arrives during post-completion bookkeeping: it must be
+            // refused, and must not emit Cancelling.
+            assert!(!controller.cancel_with(|| {
+                let _ = router.emit(SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Cancelling,
+                });
+            }));
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(statuses, vec![TurnStatus::Running, TurnStatus::Idle]);
+    }
+
+    /// A repeated cancel re-notifies but must not win a second `Cancelling`
+    /// emission — the callback runs only on the Live -> Cancelled transition.
+    #[tokio::test]
+    async fn repeated_cancel_emits_cancelling_once() {
+        let (router, seen) = turn_status_recorder();
+        let controller = TurnController::default();
+
+        {
+            let active = controller.begin().expect("turn starts");
+            let turn = SessionTurn {
+                active,
+                events: &router,
+            };
+            let cancelling = || {
+                let _ = router.emit(SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Cancelling,
+                });
+            };
+            assert!(controller.cancel_with(cancelling));
+            assert!(controller.cancel_with(cancelling));
+            tokio::time::timeout(std::time::Duration::from_millis(100), turn.cancelled())
+                .await
+                .expect("turn observes cancellation");
+        }
+
+        let statuses = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            statuses,
+            vec![TurnStatus::Cancelling, TurnStatus::Cancelled],
+            "exactly one Cancelling for two cancel calls"
         );
     }
 
