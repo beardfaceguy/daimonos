@@ -470,8 +470,8 @@
     "semantic_hash": "17bd493a4f351e18a645d99c18e7612b"
   },
   "src/prompts.rs": {
-    "mtime": 1784762617.5780985,
-    "ast_hash": "282c72b24d681df8421ffe9e7c199e90",
+    "mtime": 1785129756.2917683,
+    "ast_hash": "2dc910e14c1b6f225932db4448ddf3a8",
     "semantic_hash": ""
   },
   "src/protocol.rs": {
@@ -500,8 +500,8 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1784833584.762154,
-    "ast_hash": "9ea1d88606fb85825e11fd813739fcbd",
+    "mtime": 1785129750.9398081,
+    "ast_hash": "a3e6080965187f5b9b1cb73ee4400655",
     "semantic_hash": ""
   },
   "src/session.rs": {
@@ -900,8 +900,8 @@
     "semantic_hash": ""
   },
   "prompts/mcp_instructions.md": {
-    "mtime": 1784762617.5770984,
-    "ast_hash": "5cf82d675ea2bad18f09add0798a5009",
+    "mtime": 1785129389.4114928,
+    "ast_hash": "1f95c773599f4cc77ff9cc82231b610b",
     "semantic_hash": ""
   },
   "prompts/summary.md": {
@@ -1050,7 +1050,7 @@
     "semantic_hash": ""
   },
   "src/providers/openai.rs": {
-    "mtime": 1785124989.2365959,
+    "mtime": 1785129204.626865,
     "ast_hash": "df6a2372fa7a09fe86aa0f55a052227d",
     "semantic_hash": ""
   },
