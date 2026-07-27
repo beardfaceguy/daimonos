@@ -120,19 +120,9 @@ mod tests {
             undispatchable.push(schema.name.clone());
         }
 
-        // `batch` is a known, tracked exception (vikunja 1112). It lives in the
-        // MCP request handler rather than the shared dispatcher because its KGL
-        // observe path deliberately drops the session lock before doing sync
-        // SQLite I/O — something a function taking `&mut Session` cannot do.
-        // Extracting it requires reworking that lock handling.
-        //
-        // Asserted as an exact set rather than skipped: if another tool ever
-        // becomes undispatchable this fails, and when `batch` is fixed this also
-        // fails, prompting removal of the exception.
-        assert_eq!(
-            undispatchable,
-            vec!["batch".to_string()],
-            "agent-loop dispatch coverage changed; expected only the tracked `batch` gap"
+        assert!(
+            undispatchable.is_empty(),
+            "tools advertised to the model that the agent loop cannot dispatch: {undispatchable:?}"
         );
     }
 

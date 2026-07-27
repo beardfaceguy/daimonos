@@ -68,6 +68,10 @@ pub enum ToolTier {
     /// Available to the built-in agent/chat/ACP loop, but not exposed when
     /// daimonos itself is serving tools over MCP.
     AgentOnly,
+    /// The mirror of `AgentOnly`: exposed over MCP but withheld from the
+    /// agent/chat/ACP loop, so the catalog the model sees stays truthful about
+    /// what it can actually call (vikunja 1112).
+    McpOnly,
 }
 
 pub const LIST_ALL_TOOLS_TOOL: &str = "list_all_tools";
@@ -226,9 +230,14 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             context_check: None,
         },
+        // MCP-only: `batch` is implemented in the MCP request handler, and the
+        // agent loop has `execute_script`, which is strictly more capable and is
+        // what prompts/mcp_instructions.md already tells the model to prefer for
+        // multi-op work. Advertising `batch` to the agent as well meant offering a
+        // redundant tool that then failed on every call (vikunja 1112).
         ToolDef {
             name: "batch",
-            tier: ToolTier::Terse,
+            tier: ToolTier::McpOnly,
             schema: json!({
                 "type": "object",
                 "properties": {

@@ -1067,6 +1067,31 @@ fn subcall_functions(builder: &mut GlobalsBuilder) {
 #[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn tool_functions(builder: &mut GlobalsBuilder) {
+    /// Call any opcode-backed tool by name with keyword arguments.
+    ///
+    /// The named bindings below cover a hand-picked subset, and that subset drifts
+    /// from the tool registry as tools are added — the coordination family
+    /// (`register_agent`, `send_message`, `fetch_inbox`, …) was documented in the
+    /// MCP instructions while being absent here, so scripts calling it failed with
+    /// `Variable register_agent not found` (vikunja 1112).
+    ///
+    /// This is the escape hatch that closes the class rather than one more entry
+    /// in a list that has to be maintained by hand: any tool with an opcode
+    /// mapping is reachable through it, including tools added later.
+    ///
+    /// The tool name is positional-only: several tools take a `name` argument of
+    /// their own (`register_agent(name=...)` above all), and a nameable positional
+    /// would collide with it as "Argument `name` occurs more than once".
+    fn tool<'v>(
+        #[starlark(require = pos)] tool_name: &str,
+        #[starlark(kwargs)] kwargs: StarlarkValue<'v>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        let args = starlark_to_json(kwargs, heap);
+        let resp = dispatch_tool_by_name(tool_name, &args)?;
+        response_to_starlark_dict(resp, heap)
+    }
+
     fn read_file<'v>(
         path: &str,
         #[starlark(require = named)] offset: Option<i32>,
@@ -1431,8 +1456,41 @@ pub fn tool_signatures() -> String {
         "def discord(command: str, *, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
         "def session_stats(*, scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
+        "def tool(name: str, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
     ];
-    sigs.join("\n")
+    let named: std::collections::HashSet<&str> = [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search",
+        "exec",
+        "ls",
+        "snapshot",
+        "git",
+        "gh",
+        "cargo",
+        "pytest",
+        "docker",
+        "discord",
+        "session_stats",
+    ]
+    .into_iter()
+    .collect();
+    // Everything else reachable through `tool(name, **kwargs)`. Derived from the
+    // registry rather than hand-listed, so tools added later show up here without
+    // anyone remembering to update this string (vikunja 1112).
+    let mut via_generic: Vec<&str> = tools::all_tools()
+        .into_iter()
+        .filter(|t| t.to_request.is_some() && !named.contains(t.name))
+        .map(|t| t.name)
+        .collect();
+    via_generic.sort_unstable();
+    let mut out = sigs.join("\n");
+    if !via_generic.is_empty() {
+        out.push_str("\n# Also callable as tool(\"<name>\", ...): ");
+        out.push_str(&via_generic.join(", "));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1448,6 +1506,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(dir.keep(), Arc::new(Config::default()));
         Arc::new(Mutex::new(session))
+    }
+
+    /// vikunja 1112: the coordination tools were documented in the MCP
+    /// instructions but never bound in the sandbox, so scripts calling them died
+    /// with `Variable register_agent not found`. `tool(name, **kwargs)` reaches any
+    /// opcode-backed tool, which closes the class rather than adding one more
+    /// hand-maintained binding that can drift from the registry.
+    #[tokio::test]
+    async fn generic_tool_binding_reaches_the_coordination_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(dir.path().join("coord-db").to_string_lossy().to_string());
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(cfg),
+        )));
+
+        let code = concat!(
+            "registered = tool(\"register_agent\", name=\"ScriptProbe\", program=\"test\")\n",
+            "agents = tool(\"list_agents\")\n",
+            "result = registered",
+        );
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .expect("coordination tools should be callable through tool()");
+
+        // The registration receipt echoes the handle back.
+        let text = serde_json::to_string(&result.value).unwrap();
+        assert!(
+            text.contains("ScriptProbe"),
+            "expected the registration receipt to name the agent, got {text}"
+        );
+    }
+
+    /// The failure mode this replaces: an unbound name is a Starlark resolution
+    /// error, not a tool error, so it cannot be caught or worked around in-script.
+    #[tokio::test]
+    async fn unknown_tool_name_is_a_tool_error_not_a_missing_variable() {
+        let session = test_session();
+        let error = execute(
+            "result = tool(\"no_such_tool\")",
+            session,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an unknown tool name should fail");
+        assert!(
+            error.contains("no_such_tool"),
+            "error should name the tool, got {error}"
+        );
+        assert!(
+            !error.contains("not found") || error.contains("opcode"),
+            "should be a dispatch error, not a Starlark variable-resolution error: {error}"
+        );
     }
 
     #[tokio::test]
