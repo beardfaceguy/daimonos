@@ -741,34 +741,89 @@ pub async fn run(
                                 (content, !ok, Some(outcome))
                             }
                             None => {
-                                let served = match &config.remote_tool_dispatch {
-                                    Some(hook) => hook(&name, &input).await,
-                                    None => None,
+                                // Plugin tools (git, cargo, shellcheck, …) and meta
+                                // tools (list_all_tools, kgl_query, workspace_info,
+                                // …) carry no opcode mapping, so the facade declines
+                                // them. They are implemented once in the MCP
+                                // dispatcher; route there rather than reimplementing,
+                                // so the two frontends cannot drift (vikunja 1112).
+                                let local = {
+                                    let mut session_guard = session.lock().await;
+                                    crate::mcp::dispatch_local_tool(
+                                        &mut session_guard,
+                                        &name,
+                                        &input,
+                                    )
+                                    .await
                                 };
-                                match served {
-                                    // Remote MCP: the bridge emits the
-                                    // `mcp.remote_tool` span with its server alias.
-                                    Some(r) => (r.content, r.is_error, None),
-                                    None => {
-                                        // Emit a standalone span only when no
-                                        // `tool_span` is open for this call
-                                        // (i.e. a non-native tool). Guarding on
-                                        // `tool_span` avoids double-spanning
-                                        // should an opcode tool ever reach here.
-                                        if tool_span.is_none() {
-                                            crate::observability::ToolSpan::new(
-                                                &name,
-                                                dispatch_tool_kind(&name),
-                                            )
-                                            .finish_status(
-                                                crate::observability::ToolStatus::Unavailable,
-                                            );
-                                        }
-                                        (
-                                            format!("tool '{name}' not available in agent mode"),
-                                            true,
-                                            None,
+                                if let Some((content, is_error, meta)) = local {
+                                    let response_chars = content.len();
+                                    let (saved_tokens, _) = crate::analytics::compute_savings(
+                                        meta.unfiltered_chars,
+                                        response_chars,
+                                    );
+                                    let outcome = ToolOutcome {
+                                        request_tokens_est: crate::analytics::estimate_tokens(
+                                            request_chars,
+                                        ),
+                                        response_tokens_est: crate::analytics::estimate_tokens(
+                                            response_chars,
+                                        ),
+                                        saved_tokens_est: saved_tokens,
+                                        redirect: meta.redirect_via_plugin,
+                                        filtered: meta.filter_applied,
+                                        read_dedup: meta.read_dedup,
+                                        batch_size: 1,
+                                    };
+                                    // These tools carry no opcode mapping, so no
+                                    // `tool_span` was opened for them upstream.
+                                    // Without this they would be the only tools
+                                    // the agent can call that emit no span.
+                                    if tool_span.is_none() {
+                                        let status = if is_error {
+                                            crate::observability::ToolStatus::Error
+                                        } else {
+                                            crate::observability::ToolStatus::Success
+                                        };
+                                        crate::observability::ToolSpan::new(
+                                            &name,
+                                            dispatch_tool_kind(&name),
                                         )
+                                        .finish(status, outcome);
+                                    }
+                                    (content, is_error, Some(outcome))
+                                } else {
+                                    let served = match &config.remote_tool_dispatch {
+                                        Some(hook) => hook(&name, &input).await,
+                                        None => None,
+                                    };
+                                    match served {
+                                        // Remote MCP: the bridge emits the
+                                        // `mcp.remote_tool` span with its server alias.
+                                        Some(r) => (r.content, r.is_error, None),
+                                        None => {
+                                            // Emit a standalone span only when no
+                                            // `tool_span` is open for this call
+                                            // (i.e. a non-native tool). Guarding on
+                                            // `tool_span` avoids double-spanning
+                                            // should an opcode tool ever reach here.
+                                            if tool_span.is_none() {
+                                                crate::observability::ToolSpan::new(
+                                                    &name,
+                                                    dispatch_tool_kind(&name),
+                                                )
+                                                .finish_status(
+                                                    crate::observability::ToolStatus::Unavailable,
+                                                );
+                                            }
+                                            (
+                                                format!(
+                                                    "tool '{name}' not available in agent mode"
+                                                ),
+                                                true,
+                                                None,
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -2203,6 +2258,47 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(content.lines().count(), 1);
         assert!(content.contains("\"cmd\":\"agent\""));
+    }
+
+    /// vikunja 1112. The catalog handed to the model advertised 19 tools the
+    /// agent loop could not dispatch, so each one failed with "not available in
+    /// agent mode". This drives `run` end-to-end — asserting on the dispatcher in
+    /// isolation is not enough, because the defect was the loop not *calling* it.
+    #[tokio::test]
+    async fn agent_loop_dispatches_plugin_and_meta_tools() {
+        // One plugin tool and one meta tool: the two families that were dead.
+        for tool in ["shellcheck", "list_all_tools"] {
+            let dir = tempfile::tempdir().unwrap();
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let hook_seen = Arc::clone(&seen);
+            let config = AgentConfig {
+                after_tool_call: Some(Box::new(move |_info, content, _is_error| {
+                    hook_seen.lock().unwrap().push(content.to_string());
+                    AfterHookResult::Continue
+                })),
+                ..AgentConfig::default()
+            };
+            let provider = MockProvider::new(vec![
+                tool_call_resp("call-1", tool, json!({})),
+                end_turn_resp(),
+            ]);
+
+            run(
+                &provider,
+                shared(session_in(dir.path())),
+                vec![Message::user("go")],
+                &config,
+            )
+            .await;
+
+            let results = seen.lock().unwrap().clone();
+            assert_eq!(results.len(), 1, "{tool}: expected exactly one tool result");
+            assert!(
+                !results[0].contains("not available in agent mode"),
+                "{tool} was advertised but not dispatchable by the agent loop: {}",
+                results[0]
+            );
+        }
     }
 
     #[tokio::test]

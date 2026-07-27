@@ -80,6 +80,101 @@ mod tests {
 
     // --- active_schemas ---
 
+    /// The defect behind vikunja 1112: `active_schemas` is the catalog handed to
+    /// the model, but the agent loop could only dispatch opcode-backed tools plus
+    /// two special cases. Nineteen advertised tools therefore failed every call
+    /// with "not available in agent mode".
+    ///
+    /// Advertising a capability and then refusing it is worse than not
+    /// advertising it: the model cannot plan around it and burns a turn per
+    /// discovery. This asserts every advertised tool is reachable by *some*
+    /// agent-loop path, so the catalog and the dispatcher cannot drift apart
+    /// again.
+    #[tokio::test]
+    async fn every_advertised_tool_is_dispatchable_by_the_agent_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut undispatchable = Vec::new();
+
+        for schema in default_schemas(dir.path()) {
+            let name = schema.name.as_str();
+
+            // Path 1: opcode-backed, handled by this facade.
+            if tools::has_opcode_mapping(name) {
+                continue;
+            }
+            // Path 2: special-cased directly in the agent loop.
+            if name == "execute_script" || name == crate::agent::UPDATE_PLAN_TOOL {
+                continue;
+            }
+            // Path 3: plugin/meta tool shared with the MCP adapter. Arguments are
+            // deliberately empty — a tool that rejects them still proves it is
+            // wired, and `Some` vs `None` is exactly the reachability question.
+            let mut session = session_in(dir.path());
+            if crate::mcp::dispatch_local_tool(&mut session, name, &json!({}))
+                .await
+                .is_some()
+            {
+                continue;
+            }
+
+            undispatchable.push(schema.name.clone());
+        }
+
+        assert!(
+            undispatchable.is_empty(),
+            "tools advertised to the model that the agent loop cannot dispatch: {undispatchable:?}"
+        );
+    }
+
+    /// The agent catalog must withhold `McpOnly` tools. Asserted explicitly
+    /// because the invariant lives in a filter in this file while the tier is set
+    /// in `tools.rs` — reviewers reading only the `tools.rs` side of a diff have
+    /// twice flagged this as possibly broken, and nothing stated it outright.
+    #[test]
+    fn active_schemas_withholds_mcp_only_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let advertised: Vec<String> = default_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        let mcp_only: Vec<&str> = tools::all_tools()
+            .into_iter()
+            .filter(|t| t.tier == ToolTier::McpOnly)
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !mcp_only.is_empty(),
+            "no McpOnly tools left; this test is now vacuous and should be removed"
+        );
+
+        for name in mcp_only {
+            assert!(
+                !advertised.contains(&name.to_string()),
+                "{name} is McpOnly but was advertised to the agent"
+            );
+        }
+    }
+
+    /// The MCP side of the same tier: `McpOnly` must stay exposed there. Moving
+    /// `batch` to the new tier initially dropped it out of `initial_exposed_tools`
+    /// and so out of MCP `list_tools` entirely, which the Rust suite did not
+    /// catch — only the Python MCP integration suite did.
+    #[test]
+    fn mcp_only_tools_remain_exposed_over_mcp() {
+        let exposed = tools::initial_exposed_tools();
+        for tool in tools::all_tools()
+            .into_iter()
+            .filter(|t| t.tier == ToolTier::McpOnly)
+        {
+            assert!(
+                exposed.contains(tool.name),
+                "{} is McpOnly but missing from the default MCP-exposed set",
+                tool.name
+            );
+        }
+    }
+
     #[test]
     fn active_schemas_is_non_empty() {
         let dir = tempfile::tempdir().unwrap();

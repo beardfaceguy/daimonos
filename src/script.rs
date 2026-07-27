@@ -1067,6 +1067,31 @@ fn subcall_functions(builder: &mut GlobalsBuilder) {
 #[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn tool_functions(builder: &mut GlobalsBuilder) {
+    /// Call any opcode-backed tool by name with keyword arguments.
+    ///
+    /// The named bindings below cover a hand-picked subset, and that subset drifts
+    /// from the tool registry as tools are added — the coordination family
+    /// (`register_agent`, `send_message`, `fetch_inbox`, …) was documented in the
+    /// MCP instructions while being absent here, so scripts calling it failed with
+    /// `Variable register_agent not found` (vikunja 1112).
+    ///
+    /// This is the escape hatch that closes the class rather than one more entry
+    /// in a list that has to be maintained by hand: any tool with an opcode
+    /// mapping is reachable through it, including tools added later.
+    ///
+    /// The tool name is positional-only: several tools take a `name` argument of
+    /// their own (`register_agent(name=...)` above all), and a nameable positional
+    /// would collide with it as "Argument `name` occurs more than once".
+    fn tool<'v>(
+        #[starlark(require = pos)] tool_name: &str,
+        #[starlark(kwargs)] kwargs: StarlarkValue<'v>,
+        heap: &'v Heap,
+    ) -> anyhow::Result<Dict<'v>> {
+        let args = starlark_to_json(kwargs, heap);
+        let resp = dispatch_tool_by_name(tool_name, &args)?;
+        response_to_starlark_dict(resp, heap)
+    }
+
     fn read_file<'v>(
         path: &str,
         #[starlark(require = named)] offset: Option<i32>,
@@ -1112,7 +1137,7 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 
     fn exec<'v>(
         command: &str,
-        #[starlark(require = named)] args: Option<UnpackList<String>>,
+        args: Option<UnpackList<String>>,
         #[starlark(require = named)] cwd: Option<&str>,
         heap: &'v Heap,
     ) -> anyhow::Result<Dict<'v>> {
@@ -1131,9 +1156,16 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
     fn ls<'v>(
         path: Option<&str>,
         depth: Option<i32>,
+        #[starlark(require = named)] glob: Option<&str>,
+        #[starlark(require = named)] r#type: Option<&str>,
         heap: &'v Heap,
     ) -> anyhow::Result<StarlarkValue<'v>> {
-        let args = serde_json::json!({"path": path, "depth": depth});
+        let args = serde_json::json!({
+            "path": path,
+            "depth": depth,
+            "glob": glob,
+            "type": r#type,
+        });
         let resp = dispatch_tool_by_name("ls", &args)?;
         response_to_starlark_val(resp, heap)
     }
@@ -1409,23 +1441,44 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 /// Generate Python-style function signatures for all available tool bindings.
 pub fn tool_signatures() -> String {
     let sigs = [
-        "def read_file(path: str, offset: int = None, limit: int = None) -> dict: ...",
+        "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
         "def edit_file(path: str, edits: list[str]) -> dict: ...",
-        "def search(pattern: str, mode: str = \"content\", path: str = None, glob: str = None, max_results: int = None) -> dict: ...",
-        "def exec(command: str, args: list[str] = [], cwd: str = None) -> dict: ...",
-        "def ls(path: str = None, depth: int = None) -> dict: ...",
-        "def snapshot(action: str, id: str = None, tag: str = None) -> dict: ...",
-        "def git(command: str, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
-        "def gh(command: str, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
-        "def cargo(command: str, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
-        "def pytest(command: str, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
-        "def docker(command: str, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
-        "def discord(command: str, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
-        "def session_stats(scope: str = \"session\", days: int = None) -> dict: ...",
+        "def search(pattern: str, *, mode: str = \"content\", path: str = None, glob: str = None, max_results: int = None) -> dict: ...",
+        "def exec(command: str, args: list[str] = [], *, cwd: str = None) -> dict: ...",
+        "def ls(path: str = None, depth: int = None, *, glob: str = None, type: str = None) -> dict: ...",
+        "def snapshot(action: str, *, id: str = None, tag: str = None) -> dict: ...",
+        "def git(command: str, *, limit: int = None, oneline: bool = None, path: str = None, message: str = None, all: bool = None, branch: str = None, create: bool = None, mode: str = None) -> dict: ...",
+        "def gh(command: str, *, number: int = None, state: str = None, limit: int = None, author: str = None, title: str = None, body: str = None, base: str = None, draft: bool = None, endpoint: str = None, method: str = None) -> dict: ...",
+        "def cargo(command: str, *, package: str = None, filter: str = None, lib: bool = None, release: bool = None, dev: bool = None) -> dict: ...",
+        "def pytest(command: str, *, path: str = None, filter: str = None, markers: str = None, verbose: bool = None, failfast: bool = None) -> dict: ...",
+        "def docker(command: str, *, container: str = None, tail: int = None, file: str = None, detach: bool = None) -> dict: ...",
+        "def discord(command: str, *, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
+        "def session_stats(*, scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
+        // The tool name is positional-only, so it must not be documented as a
+        // keyword: `tool(name="register_agent")` fails, and several tools take a
+        // `name` argument of their own that would collide with it.
+        "def tool(tool_name: str, /, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
     ];
-    sigs.join("\n")
+    // Every opcode-backed tool, derived from the registry. An earlier version
+    // subtracted the named bindings above to avoid listing them twice, but that
+    // needed a hand-maintained set of those names — reintroducing exactly the
+    // drift this whole change removes. Listing all of them is redundant rather
+    // than wrong: the named bindings are callable through `tool()` too, since
+    // both route through `build_request`.
+    let mut via_generic: Vec<&str> = tools::all_tools()
+        .into_iter()
+        .filter(|t| t.to_request.is_some())
+        .map(|t| t.name)
+        .collect();
+    via_generic.sort_unstable();
+    let mut out = sigs.join("\n");
+    if !via_generic.is_empty() {
+        out.push_str("\n# Callable as tool(\"<name>\", ...): ");
+        out.push_str(&via_generic.join(", "));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1441,6 +1494,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(dir.keep(), Arc::new(Config::default()));
         Arc::new(Mutex::new(session))
+    }
+
+    /// vikunja 1112: the coordination tools were documented in the MCP
+    /// instructions but never bound in the sandbox, so scripts calling them died
+    /// with `Variable register_agent not found`. `tool(name, **kwargs)` reaches any
+    /// opcode-backed tool, which closes the class rather than adding one more
+    /// hand-maintained binding that can drift from the registry.
+    #[tokio::test]
+    async fn generic_tool_binding_reaches_the_coordination_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.coordination.db_dir = Some(dir.path().join("coord-db").to_string_lossy().to_string());
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(cfg),
+        )));
+
+        let code = concat!(
+            "registered = tool(\"register_agent\", name=\"ScriptProbe\", program=\"test\")\n",
+            "agents = tool(\"list_agents\")\n",
+            "result = registered",
+        );
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .expect("coordination tools should be callable through tool()");
+
+        // The registration receipt echoes the handle back.
+        let text = serde_json::to_string(&result.value).unwrap();
+        assert!(
+            text.contains("ScriptProbe"),
+            "expected the registration receipt to name the agent, got {text}"
+        );
+    }
+
+    /// The failure mode this replaces: an unbound name is a Starlark resolution
+    /// error, not a tool error, so it cannot be caught or worked around in-script.
+    #[tokio::test]
+    async fn unknown_tool_name_is_a_tool_error_not_a_missing_variable() {
+        let session = test_session();
+        let error = execute(
+            "result = tool(\"no_such_tool\")",
+            session,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an unknown tool name should fail");
+        assert!(
+            error.contains("no_such_tool"),
+            "error should name the tool, got {error}"
+        );
+        assert!(
+            !error.contains("not found") || error.contains("opcode"),
+            "should be a dispatch error, not a Starlark variable-resolution error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1841,6 +1948,55 @@ result = data["content"]
     }
 
     #[tokio::test]
+    async fn execute_ls_accepts_documented_glob_and_type_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "ignore\n").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/also.rs"), "nested\n").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+
+        let result = execute(
+            r#"result = ls(path=".", depth=1, glob="*.rs", type="f")"#,
+            session,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let names = result.value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["n"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn execute_exec_accepts_positional_and_keyword_args() {
+        let session = test_session();
+        let result = execute(
+            r#"
+result = {
+    "positional": exec("printf", ["%s", "hello"])["out"],
+    "keyword": exec("printf", args=["%s", "world"])["out"],
+}
+"#,
+            session,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.value,
+            serde_json::json!({"positional": "hello", "keyword": "world"})
+        );
+    }
+
+    #[tokio::test]
     async fn execute_exec_command() {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
@@ -1875,6 +2031,27 @@ result = {"lines": lines, "status": "ok"}
         let val = result.value;
         assert_eq!(val["lines"], 3);
         assert_eq!(val["status"], "ok");
+    }
+
+    #[test]
+    fn tool_signatures_match_positional_and_keyword_only_bindings() {
+        let sigs = tool_signatures();
+        assert!(
+            sigs.contains("def exec(command: str, args: list[str] = [], *, cwd: str = None)"),
+            "exec args must be documented as positional and cwd as keyword-only"
+        );
+        assert!(
+            sigs.contains("def ls(path: str = None, depth: int = None, *, glob: str = None, type: str = None)"),
+            "ls must document its glob/type filters"
+        );
+        assert!(
+            sigs.contains("def read_file(path: str, *, offset: int = None, limit: int = None)"),
+            "named-only binding parameters must be marked with *"
+        );
+        assert!(
+            sigs.contains("def session_stats(*, scope: str = \"session\", days: int = None)"),
+            "fully named-only bindings must be documented as such"
+        );
     }
 
     #[test]

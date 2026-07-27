@@ -68,6 +68,10 @@ pub enum ToolTier {
     /// Available to the built-in agent/chat/ACP loop, but not exposed when
     /// daimonos itself is serving tools over MCP.
     AgentOnly,
+    /// The mirror of `AgentOnly`: exposed over MCP but withheld from the
+    /// agent/chat/ACP loop, so the catalog the model sees stays truthful about
+    /// what it can actually call (vikunja 1112).
+    McpOnly,
 }
 
 pub const LIST_ALL_TOOLS_TOOL: &str = "list_all_tools";
@@ -226,9 +230,14 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             context_check: None,
         },
+        // MCP-only: `batch` is implemented in the MCP request handler, and the
+        // agent loop has `execute_script`, which is strictly more capable and is
+        // what prompts/mcp_instructions.md already tells the model to prefer for
+        // multi-op work. Advertising `batch` to the agent as well meant offering a
+        // redundant tool that then failed on every call (vikunja 1112).
         ToolDef {
             name: "batch",
-            tier: ToolTier::Terse,
+            tier: ToolTier::McpOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -948,10 +957,13 @@ pub fn all_tools() -> Vec<ToolDef> {
 // --- Derived queries ---
 
 /// Build the initial set of exposed tool names (Tier 0 + Tier 1).
+///
+/// `McpOnly` belongs here too: it is withheld from the *agent* catalog, not from
+/// MCP, so for MCP exposure it behaves exactly like `Terse`.
 pub fn initial_exposed_tools() -> HashSet<String> {
     all_tools()
         .iter()
-        .filter(|t| t.tier == ToolTier::Full || t.tier == ToolTier::Terse)
+        .filter(|t| matches!(t.tier, ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly))
         .map(|t| t.name.to_string())
         .collect()
 }
@@ -975,9 +987,14 @@ pub fn has_full_schema(name: &str) -> bool {
 /// Whether `list_tools` should include the full inputSchema for this tool.
 pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_used: bool) -> bool {
     if full_tool_schemas {
-        return all_tools()
-            .iter()
-            .any(|t| t.name == name && (t.tier == ToolTier::Full || t.tier == ToolTier::Terse));
+        return all_tools().iter().any(|t| {
+            t.name == name
+                && matches!(
+                    t.tier,
+                    // `McpOnly` is Terse-equivalent for MCP schema exposure.
+                    ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly
+                )
+        });
     }
     has_full_schema(name) && !already_used
 }
@@ -1025,6 +1042,13 @@ pub fn build_request(name: &str, args: &Value) -> Option<Result<Request, String>
     let tool = tools.iter().find(|t| t.name == name)?;
     let to_request = tool.to_request?;
     Some(to_request(args))
+}
+
+/// Whether `name` is defined in this registry at all, as opposed to a remote MCP
+/// bridge tool or a misspelling. Callers use this to decide whether a name is
+/// theirs to dispatch *before* doing anything with side effects.
+pub fn is_registry_tool(name: &str) -> bool {
+    all_tools().iter().any(|tool| tool.name == name)
 }
 
 /// Whether `name` maps to an opcode `Request` served by `tool_facade`/`ops`
