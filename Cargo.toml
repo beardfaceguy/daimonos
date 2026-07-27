@@ -67,6 +67,11 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 base64 = "0.22.1"
 
+# Only for fcntl(F_GETFL/F_SETFL) on the ACP stdin descriptor, to clear an
+# O_NONBLOCK flag a child process left behind on the shared file description.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 keyring = ["dep:keyring"]
 

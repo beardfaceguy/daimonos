@@ -109,8 +109,14 @@ pub trait ToolPlugin: Send + Sync {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Explicit either way: never inherit our stdin. Under `daimonos acp`
+        // fd 0 is the JSON-RPC pipe from the client, and an inheriting child can
+        // both steal protocol bytes and leave O_NONBLOCK set on the shared open
+        // file description.
         if stdin_data.is_some() {
             proc.stdin(Stdio::piped());
+        } else {
+            proc.stdin(Stdio::null());
         }
 
         for (k, v) in env {

@@ -622,6 +622,8 @@ async fn gh_issue_comment(
 pub fn is_available() -> bool {
     std::process::Command::new("gh")
         .arg("--version")
+        // Never inherit our stdin; see build_command in ops/exec_ops.rs.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

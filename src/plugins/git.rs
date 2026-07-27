@@ -610,6 +610,8 @@ async fn git_checkout(
 pub fn is_available() -> bool {
     std::process::Command::new("git")
         .arg("--version")
+        // Never inherit our stdin; see build_command in ops/exec_ops.rs.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

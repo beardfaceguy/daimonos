@@ -397,6 +397,8 @@ async fn cargo_add(
 pub fn is_available() -> bool {
     std::process::Command::new("cargo")
         .arg("--version")
+        // Never inherit our stdin; see build_command in ops/exec_ops.rs.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

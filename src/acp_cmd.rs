@@ -93,15 +93,20 @@ type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 /// effect on the next prompt (you can't change model mid-turn anyway).
 type CurrentModel = Arc<StdMutex<String>>;
 
+/// The ACP JSON-RPC input descriptor. Named rather than inlined because it is
+/// both read from and repaired (see `clear_fd_nonblocking`).
+const ACP_STDIN_FD: i32 = 0;
+
 /// Blocking stdout adapter for ACP that treats `WouldBlock`/EAGAIN as
 /// transient pipe backpressure instead of a fatal transport error. Zed tears
 /// down the entire agent when an output transport error escapes. Retry on the
 /// blocking worker (never the async executor), with a small sleep to avoid
 /// spinning. Other errors retain their kind and gain directional context.
 ///
-/// This deliberately wraps stdout only. Stdin must remain an indefinite
-/// blocking read while the agent is idle; a bounded WouldBlock retry there
-/// would incorrectly time out a healthy idle session.
+/// The stdin counterpart is `ResilientReader`, which shares this backoff but
+/// retries without a bound. Stdin must remain an indefinite blocking read while
+/// the agent is idle, so a *bounded* retry there would incorrectly time out a
+/// healthy idle session — which is why stdin was originally left unprotected.
 struct ResilientWriter<T> {
     inner: T,
     direction: &'static str,
@@ -136,48 +141,62 @@ impl<T> ResilientWriter<T> {
     }
 
     fn note_would_block(&self, operation: &str, attempts: u64) -> std::io::Result<()> {
-        if attempts == 1 {
-            // A single pipe-backpressure retry is expected under bursts; keep
-            // it out of warn-level logs.
-            tracing::debug!(
-                target: "daimonos::acp",
-                event = "stdio_would_block_retry",
-                direction = self.direction,
-                operation,
-                attempts,
-            );
-        } else if attempts.is_multiple_of(25) && attempts < self.max_would_block_attempts {
-            tracing::warn!(
-                target: "daimonos::acp",
-                event = "stdio_would_block_sustained",
-                direction = self.direction,
-                operation,
-                attempts,
-            );
-        }
-        if attempts >= self.max_would_block_attempts {
-            tracing::error!(
-                target: "daimonos::acp",
-                event = "stdio_would_block_timeout",
-                direction = self.direction,
-                operation,
-                attempts,
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "ACP {} {operation} remained blocked after {attempts} attempts",
-                    self.direction
-                ),
-            ));
-        }
-        // Exponential backoff (1,2,4,…), capped at 50ms. This absorbs short
-        // bursts cheaply without tight polling during sustained backpressure.
-        let shift = attempts.saturating_sub(1).min(6) as u32;
-        let delay_ms = (1u64 << shift).min(50);
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        Ok(())
+        note_stdio_would_block(
+            self.direction,
+            operation,
+            attempts,
+            Some(self.max_would_block_attempts),
+        )
     }
+}
+
+/// Shared `WouldBlock` backoff for the blocking ACP stdio adapters. Sleeps on
+/// the calling thread, which is always a `blocking::Unblock` worker and never
+/// the async executor. `max_attempts: None` retries indefinitely.
+fn note_stdio_would_block(
+    direction: &'static str,
+    operation: &str,
+    attempts: u64,
+    max_attempts: Option<u64>,
+) -> std::io::Result<()> {
+    if attempts == 1 {
+        // A single pipe-backpressure retry is expected under bursts; keep
+        // it out of warn-level logs.
+        tracing::debug!(
+            target: "daimonos::acp",
+            event = "stdio_would_block_retry",
+            direction,
+            operation,
+            attempts,
+        );
+    } else if attempts.is_multiple_of(25) && max_attempts.is_none_or(|max| attempts < max) {
+        tracing::warn!(
+            target: "daimonos::acp",
+            event = "stdio_would_block_sustained",
+            direction,
+            operation,
+            attempts,
+        );
+    }
+    if max_attempts.is_some_and(|max| attempts >= max) {
+        tracing::error!(
+            target: "daimonos::acp",
+            event = "stdio_would_block_timeout",
+            direction,
+            operation,
+            attempts,
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("ACP {direction} {operation} remained blocked after {attempts} attempts"),
+        ));
+    }
+    // Exponential backoff (1,2,4,…), capped at 50ms. This absorbs short
+    // bursts cheaply without tight polling during sustained backpressure.
+    let shift = attempts.saturating_sub(1).min(6) as u32;
+    let delay_ms = (1u64 << shift).min(50);
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    Ok(())
 }
 
 impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
@@ -219,6 +238,93 @@ impl<T: std::io::Write> std::io::Write for ResilientWriter<T> {
             }
         }
     }
+}
+
+/// Blocking stdin adapter for ACP. Mirrors `ResilientWriter` with two
+/// deliberate differences: retries are unbounded, because an idle session
+/// legitimately has nothing to read and any bound would kill healthy sessions;
+/// and every `WouldBlock` first tries to clear `O_NONBLOCK` from the underlying
+/// descriptor.
+///
+/// A blocking read only reports EAGAIN when fd 0 is in non-blocking mode, which
+/// happens when a child process inherits it and flips the flag on the shared
+/// open file description without restoring it. Child stdin is now nulled at
+/// every spawn site, so that should no longer occur; recovering here keeps one
+/// stray child from taking down the transport anyway.
+struct ResilientReader<T> {
+    inner: T,
+    direction: &'static str,
+    /// Descriptor to un-poison on `WouldBlock`. `None` disables recovery, which
+    /// is what tests over in-memory readers want.
+    recover_fd: Option<i32>,
+}
+
+impl<T> ResilientReader<T> {
+    fn new(inner: T, direction: &'static str, recover_fd: Option<i32>) -> Self {
+        Self {
+            inner,
+            direction,
+            recover_fd,
+        }
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for ResilientReader<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut attempts = 0u64;
+        loop {
+            match self.inner.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts = attempts.saturating_add(1);
+                    if let Some(fd) = self.recover_fd {
+                        if clear_fd_nonblocking(fd).unwrap_or(false) {
+                            tracing::warn!(
+                                target: "daimonos::acp",
+                                event = "stdio_nonblocking_cleared",
+                                direction = self.direction,
+                                fd,
+                                attempts,
+                            );
+                        }
+                    }
+                    note_stdio_would_block(self.direction, "read", attempts, None)?;
+                }
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("ACP {} read failed: {error}", self.direction),
+                    ));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// Clear `O_NONBLOCK` from `fd`, reporting whether the flag had been set.
+/// Blocking reads on a non-blocking descriptor fail with EAGAIN, so a child that
+/// poisoned an inherited descriptor would otherwise break the ACP transport.
+#[cfg(unix)]
+fn clear_fd_nonblocking(fd: i32) -> std::io::Result<bool> {
+    // SAFETY: F_GETFL/F_SETFL take an int argument and touch no memory we own;
+    // `fd` is a descriptor this process already holds open.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        return Ok(false);
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn clear_fd_nonblocking(_fd: i32) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 struct EofAwareReader<R> {
@@ -3444,8 +3550,26 @@ pub async fn run_acp(
                 .take()
         }
     };
+    // A child spawned before this build may have inherited fd 0 and left it
+    // non-blocking, which would make every blocking read fail with EAGAIN.
+    match clear_fd_nonblocking(ACP_STDIN_FD) {
+        Ok(true) => tracing::warn!(
+            target: "daimonos::acp",
+            event = "stdin_nonblocking_cleared_at_startup",
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            target: "daimonos::acp",
+            event = "stdin_flag_probe_failed",
+            error = %error,
+        ),
+    }
     let stdin = EofAwareReader::new(
-        blocking::Unblock::new(std::io::stdin()),
+        blocking::Unblock::new(ResilientReader::new(
+            std::io::stdin(),
+            "stdin",
+            Some(ACP_STDIN_FD),
+        )),
         Arc::clone(&eof),
         input_error,
     );
@@ -3604,6 +3728,167 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("ACP stdout write failed"));
         assert!(error.to_string().contains("denied"));
+    }
+
+    #[derive(Default)]
+    struct TransientReader {
+        interrupted_remaining: usize,
+        would_block_remaining: usize,
+        payload: Vec<u8>,
+    }
+
+    impl std::io::Read for TransientReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupted_remaining > 0 {
+                self.interrupted_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            if self.would_block_remaining > 0 {
+                self.would_block_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let count = self.payload.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.payload[..count]);
+            self.payload.drain(..count);
+            Ok(count)
+        }
+    }
+
+    struct FatalReader;
+
+    impl std::io::Read for FatalReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+    }
+
+    #[test]
+    fn resilient_reader_retries_transient_interrupted_and_would_block() {
+        let inner = TransientReader {
+            interrupted_remaining: 1,
+            would_block_remaining: 3,
+            payload: b"hello".to_vec(),
+        };
+        let mut reader = ResilientReader::new(inner, "stdin", None);
+        let mut buffer = [0u8; 8];
+        let read = std::io::Read::read(&mut reader, &mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"hello");
+    }
+
+    #[test]
+    fn resilient_reader_reports_eof_without_retrying() {
+        // Ok(0) is a closed peer, not backpressure. Retrying it would hang the
+        // shutdown path that waits on stdin EOF.
+        let mut reader = ResilientReader::new(TransientReader::default(), "stdin", None);
+        let mut buffer = [0u8; 8];
+        assert_eq!(std::io::Read::read(&mut reader, &mut buffer).unwrap(), 0);
+    }
+
+    #[test]
+    fn resilient_reader_preserves_real_error_kind_and_adds_direction() {
+        let mut reader = ResilientReader::new(FatalReader, "stdin", None);
+        let mut buffer = [0u8; 8];
+        let error = std::io::Read::read(&mut reader, &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("ACP stdin read failed"));
+        assert!(error.to_string().contains("denied"));
+    }
+
+    #[test]
+    fn stdio_would_block_backoff_is_bounded_for_writes_and_unbounded_for_reads() {
+        // The write side must eventually give up so a permanently blocked pipe
+        // cannot hang ACP forever.
+        let error = note_stdio_would_block("stdout", "write", 3, Some(3)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error
+            .to_string()
+            .contains("ACP stdout write remained blocked"));
+        // The read side must not: an idle session has nothing to read, and any
+        // bound would eventually kill a perfectly healthy connection.
+        note_stdio_would_block("stdin", "read", 10_000, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_fd_nonblocking_reports_and_clears_the_flag() {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is the two-element array pipe(2) writes its ends into.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // A fresh pipe is blocking, so there is nothing to clear.
+        assert!(!clear_fd_nonblocking(read_fd).unwrap());
+
+        // SAFETY: `read_fd` is the live read end of the pipe above.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        assert!(clear_fd_nonblocking(read_fd).unwrap());
+        assert_eq!(
+            unsafe { libc::fcntl(read_fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        // Idempotent: a second call has nothing left to do.
+        assert!(!clear_fd_nonblocking(read_fd).unwrap());
+
+        // SAFETY: both ends are still open and owned by this test.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resilient_reader_recovers_a_child_poisoned_descriptor() {
+        // The regression this whole change exists for: a child process left
+        // O_NONBLOCK on an inherited descriptor, so a blocking read returns
+        // EAGAIN. The reader must repair the flag and keep reading instead of
+        // failing the transport.
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is the two-element array pipe(2) writes its ends into.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: `read_fd` is the live read end of the pipe above.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        // Nothing is buffered yet, so the first attempt sees EAGAIN. The write
+        // lands well after the flag has been repaired, so the retry blocks
+        // normally and returns data.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // SAFETY: `write_fd` is the live write end of the pipe above.
+            unsafe {
+                assert_eq!(libc::write(write_fd, b"ok".as_ptr().cast(), 2), 2);
+                libc::close(write_fd);
+            }
+        });
+
+        // SAFETY: takes ownership of the read end, closed when `file` drops.
+        let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut reader = ResilientReader::new(file, "stdin", Some(read_fd));
+        let mut buffer = [0u8; 8];
+        let read = std::io::Read::read(&mut reader, &mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"ok");
+        // SAFETY: `reader` still owns the descriptor at this point.
+        assert_eq!(
+            unsafe { libc::fcntl(read_fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "the retry path should have cleared O_NONBLOCK"
+        );
+        writer.join().unwrap();
     }
 
     #[test]

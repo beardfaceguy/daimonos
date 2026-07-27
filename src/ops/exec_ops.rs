@@ -29,7 +29,7 @@ fn merge_env(
 /// When args is empty and command contains whitespace, shell-wrap via `sh -c`
 /// so models can send `command: "cargo test"` without splitting into args.
 fn build_command(cmd: &str, args: &[String]) -> Command {
-    if args.is_empty() && cmd.contains(' ') {
+    let mut command = if args.is_empty() && cmd.contains(' ') {
         let mut c = Command::new("sh");
         c.args(["-c", cmd]);
         c
@@ -37,7 +37,14 @@ fn build_command(cmd: &str, args: &[String]) -> Command {
         let mut c = Command::new(cmd);
         c.args(args);
         c
-    }
+    };
+    // Never hand a child our stdin. Under `daimonos acp` fd 0 is the JSON-RPC
+    // pipe from the client: an inheriting child can consume protocol bytes, and
+    // a child that reads stdin asynchronously (node/libuv, python asyncio) sets
+    // O_NONBLOCK on the shared open file description without restoring it, which
+    // makes our own transport reads fail with EAGAIN.
+    command.stdin(Stdio::null());
+    command
 }
 
 /// Truncate output that exceeds `max_chars` by keeping first and last lines
@@ -757,6 +764,103 @@ mod tests {
 
     fn session_in(dir: &std::path::Path) -> Session {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
+    }
+
+    /// Installs a pipe carrying `payload` as fd 0 for the duration of a test,
+    /// restoring the original descriptor on drop.
+    ///
+    /// Without this, asserting "the child did not inherit our stdin" is vacuous
+    /// whenever the test harness's own stdin is already `/dev/null` — which is
+    /// the common case in CI and under backgrounded runs. Giving the parent a
+    /// distinctive stdin makes the assertion discriminating in every environment.
+    #[cfg(unix)]
+    struct StdinOverride {
+        saved: i32,
+    }
+
+    #[cfg(unix)]
+    impl StdinOverride {
+        fn with_payload(payload: &[u8]) -> Self {
+            let mut fds = [0i32; 2];
+            // SAFETY: `fds` is the two-element array pipe(2) writes its ends into.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let (read_fd, write_fd) = (fds[0], fds[1]);
+            // SAFETY: both ends are live; `payload` is far below the pipe buffer
+            // so the write completes without blocking.
+            unsafe {
+                assert_eq!(
+                    libc::write(write_fd, payload.as_ptr().cast(), payload.len()),
+                    payload.len() as isize
+                );
+                libc::close(write_fd);
+            }
+            // SAFETY: fd 0 is open; `dup`/`dup2` only manipulate descriptors.
+            let saved = unsafe { libc::dup(0) };
+            assert!(saved >= 0);
+            // SAFETY: `read_fd` is live and fd 0 is a valid target.
+            unsafe {
+                assert_eq!(libc::dup2(read_fd, 0), 0);
+                libc::close(read_fd);
+            }
+            Self { saved }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StdinOverride {
+        fn drop(&mut self) {
+            // SAFETY: `saved` is the descriptor duplicated from fd 0 in `new`.
+            unsafe {
+                libc::dup2(self.saved, 0);
+                libc::close(self.saved);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_does_not_give_children_our_stdin() {
+        // Under `daimonos acp` fd 0 is the JSON-RPC pipe from the client. A child
+        // that inherits it can consume protocol bytes, and an async-stdin child
+        // leaves O_NONBLOCK set on the shared open file description, which makes
+        // our own transport reads fail with EAGAIN.
+        let _stdin = StdinOverride::with_payload(b"parent-protocol-bytes");
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+
+        // `wc -c` drains stdin to EOF, so a zero byte count proves the child was
+        // handed no input — the parent's stdin has 21 bytes waiting.
+        let r = exec(
+            &s,
+            &Op {
+                c: 8,
+                s: Some("wc -c".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["exit"], 0);
+        assert_eq!(d["out"].as_str().unwrap().trim(), "0");
+
+        // Where procfs is available, also assert descriptor identity: an
+        // inheriting child would report the parent's pipe, not /dev/null.
+        if Path::new("/proc/self/fd/0").exists() {
+            let r = exec(
+                &s,
+                &Op {
+                    c: 8,
+                    s: Some("readlink /proc/self/fd/0".into()),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(r.ok);
+            let d = r.d.unwrap();
+            assert_eq!(d["exit"], 0);
+            assert_eq!(d["out"].as_str().unwrap().trim(), "/dev/null");
+        }
     }
 
     #[tokio::test]
