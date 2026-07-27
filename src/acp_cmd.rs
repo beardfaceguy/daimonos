@@ -1126,14 +1126,22 @@ fn build_before_tool_call_hook(
             {
                 update = update.meta(terminal_exit_meta(info, None, Some("blocked".to_string())));
             }
-            send_active_tool_call_update(
+            let blocked = matches!(decision, BeforeHookResult::Block(_));
+            let sent = send_active_tool_call_update(
                 &cx,
                 &session_id,
                 &active_tool_calls,
                 &info.id,
                 update,
-                matches!(decision, BeforeHookResult::Block(_)),
+                blocked,
             );
+            if blocked && sent {
+                let _ = events.emit(CoreSessionEvent::ToolCallFinished {
+                    id: info.id.clone(),
+                    ok: false,
+                    output: "blocked".to_string(),
+                });
+            }
 
             decision
         })
@@ -1159,16 +1167,18 @@ fn build_after_tool_call_hook(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&info.id)
             .flatten();
+        // Claim terminal ownership before emitting either canonical or ACP
+        // completion. Cancellation drains the same live-id map, so exactly one
+        // path can finish a tool call.
+        if !tool_call_update_is_live(&active_tool_calls, &info.id, true) {
+            return AfterHookResult::Continue;
+        }
         let _ = events.emit(CoreSessionEvent::ToolCallFinished {
             id: info.id.clone(),
             ok: !is_error,
             output: content.to_string(),
         });
         let Some(cx) = current_cx(&connection) else {
-            active_tool_calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&info.id);
             return AfterHookResult::Continue;
         };
         let status = if is_error {
@@ -1195,7 +1205,7 @@ fn build_after_tool_call_hook(
                 .content(Some(vec![block]))
                 .raw_output(Some(raw_output)),
         );
-        send_active_tool_call_update(&cx, &session_id, &active_tool_calls, &info.id, update, true);
+        send_notification(&cx, &session_id, SessionUpdate::ToolCallUpdate(update));
         AfterHookResult::Continue
     })
 }
@@ -1776,6 +1786,23 @@ fn direct_command_text(message: &CoreMessage) -> Option<&str> {
     }
 }
 
+fn canonical_user_message_text(message: &CoreMessage) -> String {
+    let mut parts = Vec::new();
+    for block in &message.content {
+        match block {
+            CoreBlock::Text(text) => parts.push(text.clone()),
+            CoreBlock::Image {
+                data, media_type, ..
+            } => parts.push(format!(
+                "[image: media_type={media_type}, encoded_bytes={}]",
+                data.len()
+            )),
+            _ => parts.push("[unsupported user content]".to_string()),
+        }
+    }
+    parts.join("\n")
+}
+
 fn message_has_images(message: &CoreMessage) -> bool {
     message
         .content
@@ -1874,9 +1901,7 @@ async fn run_prompt_turn(
         return Ok(AcpStopReason::EndTurn);
     }
 
-    let user_text = direct_command_text(&user_message)
-        .unwrap_or("[multimodal user message]")
-        .to_string();
+    let user_text = canonical_user_message_text(&user_message);
     let _ = handle
         .core
         .events
