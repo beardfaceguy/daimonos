@@ -756,17 +756,41 @@ pub async fn run(
                                     )
                                     .await
                                 };
-                                if let Some((content, is_error)) = local {
+                                if let Some((content, is_error, meta)) = local {
+                                    let response_chars = content.len();
+                                    let (saved_tokens, _) = crate::analytics::compute_savings(
+                                        meta.unfiltered_chars,
+                                        response_chars,
+                                    );
                                     let outcome = ToolOutcome {
                                         request_tokens_est: crate::analytics::estimate_tokens(
                                             request_chars,
                                         ),
                                         response_tokens_est: crate::analytics::estimate_tokens(
-                                            content.len(),
+                                            response_chars,
                                         ),
+                                        saved_tokens_est: saved_tokens,
+                                        redirect: meta.redirect_via_plugin,
+                                        filtered: meta.filter_applied,
+                                        read_dedup: meta.read_dedup,
                                         batch_size: 1,
-                                        ..ToolOutcome::default()
                                     };
+                                    // These tools carry no opcode mapping, so no
+                                    // `tool_span` was opened for them upstream.
+                                    // Without this they would be the only tools
+                                    // the agent can call that emit no span.
+                                    if tool_span.is_none() {
+                                        let status = if is_error {
+                                            crate::observability::ToolStatus::Error
+                                        } else {
+                                            crate::observability::ToolStatus::Success
+                                        };
+                                        crate::observability::ToolSpan::new(
+                                            &name,
+                                            dispatch_tool_kind(&name),
+                                        )
+                                        .finish(status, outcome);
+                                    }
                                     (content, is_error, Some(outcome))
                                 } else {
                                     let served = match &config.remote_tool_dispatch {

@@ -1456,7 +1456,10 @@ pub fn tool_signatures() -> String {
         "def discord(command: str, *, guild_id: str = None, channel_id: str = None, query: str = None, limit: int = None, analytics_tag: str = None) -> dict: ...",
         "def session_stats(*, scope: str = \"session\", days: int = None) -> dict: ...",
         "def print(*args) -> None:  # captured in logs",
-        "def tool(name: str, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
+        // The tool name is positional-only, so it must not be documented as a
+        // keyword: `tool(name="register_agent")` fails, and several tools take a
+        // `name` argument of their own that would collide with it.
+        "def tool(tool_name: str, /, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
     ];
     let named: std::collections::HashSet<&str> = [
         "read_file",

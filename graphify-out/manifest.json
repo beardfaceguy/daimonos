@@ -260,8 +260,8 @@
     "semantic_hash": ""
   },
   "src/agent.rs": {
-    "mtime": 1785179805.1849318,
-    "ast_hash": "09ca5b908d2d7885f43cebc316438103",
+    "mtime": 1785181379.564598,
+    "ast_hash": "50fb3c3bd314031f1574e7a08232410d",
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "src/mcp.rs": {
-    "mtime": 1785179816.3058522,
-    "ast_hash": "76ddac7a4fa02ac1fc57ed93c98d7cd0",
+    "mtime": 1785181499.484064,
+    "ast_hash": "71c7395df31c44c834a4e727ee2d89ce",
     "semantic_hash": ""
   },
   "src/ops/diff_ops.rs": {
@@ -500,8 +500,8 @@
     "semantic_hash": ""
   },
   "src/script.rs": {
-    "mtime": 1785180365.405924,
-    "ast_hash": "ea709820c7176a07b6f787c99ef2cdfa",
+    "mtime": 1785181390.33052,
+    "ast_hash": "c139f2230e4c0112689fec8c94209404",
     "semantic_hash": ""
   },
   "src/session.rs": {
@@ -530,8 +530,8 @@
     "semantic_hash": ""
   },
   "src/tools.rs": {
-    "mtime": 1785180700.0325277,
-    "ast_hash": "923afd5c7dedaac18809db652f1842e6",
+    "mtime": 1785181341.1988764,
+    "ast_hash": "8ed38fbce06adf986d1a1396bfaf8aef",
     "semantic_hash": ""
   },
   "src/verbosity.rs": {

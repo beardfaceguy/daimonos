@@ -1044,6 +1044,13 @@ pub fn build_request(name: &str, args: &Value) -> Option<Result<Request, String>
     Some(to_request(args))
 }
 
+/// Whether `name` is defined in this registry at all, as opposed to a remote MCP
+/// bridge tool or a misspelling. Callers use this to decide whether a name is
+/// theirs to dispatch *before* doing anything with side effects.
+pub fn is_registry_tool(name: &str) -> bool {
+    all_tools().iter().any(|tool| tool.name == name)
+}
+
 /// Whether `name` maps to an opcode `Request` served by `tool_facade`/`ops`
 /// (as opposed to a plugin/meta tool handled in `mcp.rs` or a remote MCP tool).
 /// Name-only so callers can classify a tool before dispatching it.
