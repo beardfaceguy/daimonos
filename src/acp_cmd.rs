@@ -2033,6 +2033,12 @@ async fn run_prompt_turn(
         turn = agent_session.prompt_message(user_message) => Some(turn),
         _ = active_turn.cancelled() => None,
     };
+    if outcome.is_some() {
+        // Claim completion immediately: a cancel arriving during the
+        // bookkeeping below must not relabel a finished turn as cancelled
+        // (canonical `Cancelled` against an ACP `EndTurn`).
+        active_turn.mark_completed();
+    }
     if outcome.is_none() {
         // Resolve every reliable approval waiter before retiring the turn.
         // The ACP request future is dropped by cancellation, but the broker is
@@ -2091,6 +2097,21 @@ async fn run_prompt_turn(
         None
     };
     drop(agent_session);
+    // Emit usage before dropping the turn: `SessionTurn::drop` writes the
+    // terminal status, and an event landing after it detaches from the turn for
+    // any consumer that frames turns by terminal status.
+    if let Some(turn) = outcome.as_ref() {
+        let used_tokens = turn
+            .last_call_usage
+            .prompt_tokens()
+            .saturating_add(turn.last_call_usage.output);
+        let _ = handle
+            .core
+            .events
+            .emit(CoreSessionEvent::ContextUsageChanged {
+                usage: handle.core.context_usage(used_tokens, context_window),
+            });
+    }
     drop(active_turn);
 
     if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
@@ -2099,16 +2120,6 @@ async fn run_prompt_turn(
 
     Ok(match outcome {
         Some(turn) => {
-            let used_tokens = turn
-                .last_call_usage
-                .prompt_tokens()
-                .saturating_add(turn.last_call_usage.output);
-            let _ = handle
-                .core
-                .events
-                .emit(CoreSessionEvent::ContextUsageChanged {
-                    usage: handle.core.context_usage(used_tokens, context_window),
-                });
             emit_usage_update(
                 cx,
                 session_id,
@@ -2171,6 +2182,10 @@ async fn run_retry_turn(
         turn = agent_session.retry_last_turn() => Some(turn),
         _ = active_turn.cancelled() => None,
     };
+    if outcome.is_some() {
+        // Claim completion immediately; see run_prompt_turn for why.
+        active_turn.mark_completed();
+    }
     let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
 
     let (stop_reason, history_snapshot) = match outcome {
