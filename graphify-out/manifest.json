@@ -255,8 +255,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785190035.3112695,
-    "ast_hash": "8455d105371db005362e6ae95ce2ce22",
+    "mtime": 1785251943.2024107,
+    "ast_hash": "33a2f558d056f1948de36f49966470cd",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -1055,8 +1055,8 @@
     "semantic_hash": ""
   },
   "src/session_protocol.rs": {
-    "mtime": 1785188785.572175,
-    "ast_hash": "97c7b36fbc898d8a924cccadba06fa8f",
+    "mtime": 1785193957.3058717,
+    "ast_hash": "666980b69fcb3b9d01706fad632f3ed2",
     "semantic_hash": ""
   },
   "src/client_transport.rs": {
@@ -1065,13 +1065,13 @@
     "semantic_hash": ""
   },
   "docs/adr/010-session-daemon-remote-control.md": {
-    "mtime": 1785088004.3569734,
-    "ast_hash": "8008cd7d6fb49350ee4b32688d5a67d2",
+    "mtime": 1785194064.7621012,
+    "ast_hash": "60fa66640f7244e3ade8c64eef93a0de",
     "semantic_hash": ""
   },
   "src/session_core.rs": {
-    "mtime": 1785190153.5535657,
-    "ast_hash": "81cce6d34256a808a60e52bd39db4cd1",
+    "mtime": 1785194000.0855649,
+    "ast_hash": "3bc9a5695803d59dd9e78b1e0a3677b3",
     "semantic_hash": ""
   }
 }
