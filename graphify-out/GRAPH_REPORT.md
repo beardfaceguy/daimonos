@@ -1,16 +1,16 @@
-# Graph Report - daimonos  (2026-07-27)
+# Graph Report - daimonos  (2026-07-28)
 
 ## Corpus Check
-- 208 files · ~262,563 words
+- 208 files · ~263,574 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5256 nodes · 12180 edges · 236 communities (216 shown, 20 thin omitted)
+- 5264 nodes · 12206 edges · 236 communities (216 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `dc6c62db`
+- Built from commit: `c04adb57`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -665,7 +665,7 @@ Nodes (7): Tests for search MCP tool (content grep and file name search)., works
 
 ### Community 93 - "Community 93"
 Cohesion: 0.05
-Nodes (90): ClientHandler, ClientRuntime, InitializeRequestParams, Metadata, OsStr, PoolSlot, PoolSlotState, BridgeClientHandler (+82 more)
+Nodes (95): ClientHandler, ClientRuntime, InitializeRequestParams, Metadata, OsStr, PoolSlot, PoolSlotState, BridgeClientHandler (+87 more)
 
 ### Community 94 - "Community 94"
 Cohesion: 0.06
@@ -908,8 +908,8 @@ Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.16
-Nodes (10): basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), disabled_runtime_does_not_resolve_credentials(), LoggingExporter, missing_credentials_fail_open_without_secret_material(), record_truncation(), HashMap (+2 more)
+Cohesion: 0.10
+Nodes (21): ExporterBuildError, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CompactionMetadata, CompactionOutcome (+13 more)
 
 ### Community 181 - "Community 181"
 Cohesion: 0.10
@@ -936,12 +936,12 @@ Cohesion: 0.25
 Nodes (22): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), coordination_span_error_status_records_bounded_class(), coordination_span_never_records_message_content(), coordination_span_records_metadata_only() (+14 more)
 
 ### Community 187 - "Community 187"
-Cohesion: 0.13
-Nodes (16): ExporterBuildError, OTelSdkResult, Resource, SpanData, SpanExporter, basic_authorization_header(), build_exporter(), CoordinationOutcome (+8 more)
+Cohesion: 0.23
+Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
 ### Community 188 - "Community 188"
-Cohesion: 0.15
-Nodes (11): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, CoordinationSpan, GenerationSpan, RetrySpan, AtomicBool (+3 more)
+Cohesion: 0.21
+Nodes (8): CoordinationOutcome, GenerationMetadata, record_bridge_lifecycle(), remote_server_alias(), Option, ThinkingLevel, ToolOutcome, ToolStatus
 
 ### Community 189 - "Community 189"
 Cohesion: 0.13
@@ -1024,8 +1024,8 @@ Cohesion: 0.28
 Nodes (4): mint(), mint_always_valid_format(), mint_covers_many_distinct_names(), String
 
 ### Community 211 - "Community 211"
-Cohesion: 0.15
-Nodes (15): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus (+7 more)
+Cohesion: 0.20
+Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
 
 ### Community 212 - "Community 212"
 Cohesion: 0.16
@@ -1076,8 +1076,8 @@ Cohesion: 0.24
 Nodes (10): _err_text(), Regression tests for set_cwd (vikunja #249, fix #7).  The bug: `set_cwd` checked, Non-existent path must produce a canonicalize/resolve error,     not a 'not a di, When set_cwd is given a path to a regular file, the error must     reference the, When set_cwd is given a symlink pointing at a file, the error must     reference, Sanity check: setting cwd to a real subdirectory should succeed     and report t, test_set_cwd_missing_path_returns_canonicalize_error(), test_set_cwd_on_directory_succeeds() (+2 more)
 
 ### Community 224 - "Community 224"
-Cohesion: 0.17
-Nodes (13): E, build_provider(), generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptMetadata, PromptSpan, RemoteToolSpan (+5 more)
+Cohesion: 0.13
+Nodes (17): E, Span, build_provider(), CompactionSpan, CoordinationSpan, generation_span_is_child_and_exports_usage_without_content(), GenerationSpan, prompt_root_omits_absent_session_id() (+9 more)
 
 ### Community 225 - "Community 225"
 Cohesion: 0.25
@@ -1142,7 +1142,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
-  _High betweenness centrality (0.008) - this node is a cross-community bridge._
+  _High betweenness centrality (0.009) - this node is a cross-community bridge._
 - **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 174`, `Community 28`?**
