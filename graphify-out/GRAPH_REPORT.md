@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-28)
 
 ## Corpus Check
-- 194 files · ~256,314 words
+- 194 files · ~256,360 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5187 nodes · 12137 edges · 219 communities (204 shown, 15 thin omitted)
+- 5187 nodes · 12137 edges · 218 communities (203 shown, 15 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `27ad196d`
+- Built from commit: `0c958844`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -111,7 +111,6 @@
 - [[_COMMUNITY_Community 93|Community 93]]
 - [[_COMMUNITY_Community 94|Community 94]]
 - [[_COMMUNITY_Community 95|Community 95]]
-- [[_COMMUNITY_Community 96|Community 96]]
 - [[_COMMUNITY_Community 97|Community 97]]
 - [[_COMMUNITY_Community 98|Community 98]]
 - [[_COMMUNITY_Community 99|Community 99]]
@@ -272,7 +271,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (219 total, 15 thin omitted)
+## Communities (218 total, 15 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -657,10 +656,6 @@ Nodes (34): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, 
 ### Community 95 - "Community 95"
 Cohesion: 0.08
 Nodes (26): 60-second demo, Additional capabilities, Architecture, Benchmark results, Configuration, Configure your IDE, Contributing, Core tools (always available) (+18 more)
-
-### Community 96 - "Community 96"
-Cohesion: 0.29
-Nodes (6): SessionTurn, Display, Error, Formatter, Result, TurnError
 
 ### Community 97 - "Community 97"
 Cohesion: 0.20
@@ -1051,8 +1046,8 @@ Cohesion: 0.04
 Nodes (52): AcpContentBlock, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+44 more)
 
 ### Community 235 - "Community 235"
-Cohesion: 0.26
-Nodes (12): SessionEvent, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe(), repeated_cancel_emits_cancelling_once() (+4 more)
+Cohesion: 0.16
+Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe() (+10 more)
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]

@@ -420,8 +420,8 @@
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1785266829.6389377,
-    "ast_hash": "3d46c172b84ce75fc4d27c28a85407b5",
+    "mtime": 1785267459.4921265,
+    "ast_hash": "c43d96148dbf2ab9e74af5ab1685d2e5",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
@@ -755,8 +755,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785267057.0817058,
-    "ast_hash": "584d3933b1064ee877169c263138fcec",
+    "mtime": 1785267466.9050422,
+    "ast_hash": "0c9835de0b499ca5be73824c588b1759",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {

@@ -177,7 +177,8 @@ impl ThinkingLevel {
     /// Returns a message listing the valid levels on an unknown value — no
     /// silent fallback (matches agent-env validation).
     pub fn from_input(raw: &str) -> Result<Self, String> {
-        let normalized = raw.trim().to_ascii_lowercase();
+        let trimmed = raw.trim();
+        let normalized = trimmed.to_ascii_lowercase();
         Self::ALL
             .iter()
             .find(|level| level.as_str() == normalized)
@@ -188,7 +189,7 @@ impl ThinkingLevel {
                     .map(|l| l.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("'{raw}' invalid (valid: {valid})")
+                format!("'{trimmed}' invalid (valid: {valid})")
             })
     }
 }

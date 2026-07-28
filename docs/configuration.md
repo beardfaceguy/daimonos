@@ -104,10 +104,13 @@ message naming the key and listing the valid levels.
 DAIMONOS_AGENT_THINKING=high
 ```
 
-How the level maps onto the wire request is provider-specific (for example,
-native OpenAI sends it as `reasoning.effort`, with `max` mapped to the
-provider-compatible `xhigh`). Provider defaults and the Anthropic adaptive
-thinking behavior are unchanged by this key.
+How the level maps onto the wire request is provider-specific. On native
+OpenAI the level is sent as `reasoning.effort`; note that its Responses
+contract tops out at `xhigh`, so `max` is mapped conservatively onto the
+same `xhigh` wire value — the two are therefore indistinguishable at that
+provider (pick `xhigh` unless you specifically want `max` to mean the
+maximum on a provider that exposes a distinct level). Provider defaults and
+the Anthropic adaptive thinking behavior are unchanged by this key.
 
 ## Settings
 
