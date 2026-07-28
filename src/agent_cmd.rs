@@ -26,6 +26,9 @@ pub struct AgentCmdArgs {
     pub analytics: Option<Arc<AnalyticsStore>>,
     /// `--debug-tokens` log file path. `None` = no per-call token logging.
     pub token_log: Option<std::path::PathBuf>,
+    /// Reasoning effort for the model (#1122), from `DAIMONOS_AGENT_THINKING`
+    /// (default `medium`). Forwarded into `CompleteOpts.thinking`.
+    pub thinking: crate::providers::ThinkingLevel,
 }
 
 // NOTE: no compaction policy here — ADR-002 compaction operates BETWEEN
@@ -79,6 +82,7 @@ pub async fn run_agent(
         tools,
         opts: CompleteOpts {
             model,
+            thinking: args.thinking,
             ..CompleteOpts::default()
         },
         before_tool_call,
@@ -215,6 +219,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         }
     }
 
@@ -234,6 +239,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -251,6 +257,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -270,6 +277,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -380,6 +388,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::Medium,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -387,6 +396,39 @@ mod tests {
             .unwrap();
         let calls = provider.call_opts();
         assert_eq!(calls[0].model, "claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn thinking_defaults_to_medium_in_complete_opts() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![end_turn_with_text("ok")]);
+        let mut out = Vec::new();
+        run_agent(&provider, dir.path(), default_cfg(), args("go"), &mut out)
+            .await
+            .unwrap();
+        let calls = provider.call_opts();
+        assert_eq!(calls[0].thinking, crate::providers::ThinkingLevel::Medium);
+    }
+
+    #[tokio::test]
+    async fn thinking_level_is_threaded_into_complete_opts() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![end_turn_with_text("ok")]);
+        let a = AgentCmdArgs {
+            task: "go".into(),
+            model: None,
+            dry_run: false,
+            safety: None,
+            analytics: None,
+            token_log: None,
+            thinking: crate::providers::ThinkingLevel::High,
+        };
+        let mut out = Vec::new();
+        run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
+            .await
+            .unwrap();
+        let calls = provider.call_opts();
+        assert_eq!(calls[0].thinking, crate::providers::ThinkingLevel::High);
     }
 
     // --- tool schemas ---
@@ -436,6 +478,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: Some(log_path.clone()),
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -493,6 +536,7 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -519,6 +563,7 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
+            thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)

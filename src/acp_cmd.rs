@@ -425,6 +425,10 @@ struct AcpState {
     /// When true, each prompt turn is prefixed with a real system-clock
     /// timestamp line in the thread (#1070, `DAIMONOS_AGENT_TIMESTAMP_TURNS`).
     timestamp_turns: bool,
+    /// Reasoning effort for every prompt turn (#1122,
+    /// `DAIMONOS_AGENT_THINKING`; default Medium). Cloned into each session's
+    /// `CompleteOpts.thinking` via `build_agent_config`.
+    thinking: crate::providers::ThinkingLevel,
     /// Process-wide pool for deduplicating identical forwarded MCP server
     /// configs across ACP sessions (#1008). Bridges retain explicit leases.
     mcp_pool: McpClientPool,
@@ -1479,6 +1483,7 @@ fn build_compaction_hook(events: Arc<SessionEventRouter>) -> crate::agent::Compa
 fn build_agent_config(
     workspace: &Path,
     model: String,
+    thinking: crate::providers::ThinkingLevel,
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
@@ -1500,6 +1505,7 @@ fn build_agent_config(
         tools,
         opts: CompleteOpts {
             model,
+            thinking,
             ..CompleteOpts::default()
         },
         before_tool_call: Some(build_before_tool_call_hook(
@@ -2400,6 +2406,7 @@ async fn build_session_handle(
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
+        state.thinking.clone(),
         Arc::clone(&connection),
         session_id.clone(),
         Arc::clone(&active_tool_calls),
@@ -2740,6 +2747,7 @@ fn build_agent(
         SessionCompaction::new(compaction, false),
         analytics,
         false,
+        crate::providers::ThinkingLevel::default(),
         &mut None,
     )
 }
@@ -2762,6 +2770,7 @@ fn build_agent_with_state(
     compaction: SessionCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     timestamp_turns: bool,
+    thinking: crate::providers::ThinkingLevel,
     state_out: &mut Option<Arc<AcpState>>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
@@ -2785,6 +2794,7 @@ fn build_agent_with_state(
         compaction,
         analytics,
         timestamp_turns,
+        thinking,
         mcp_pool: McpClientPool::new(),
     });
     *state_out = Some(Arc::clone(&state));
@@ -3616,6 +3626,7 @@ pub async fn run_acp(
     compaction: SessionCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     timestamp_turns: bool,
+    thinking: crate::providers::ThinkingLevel,
 ) -> anyhow::Result<()> {
     tracing::info!(
         target: "daimonos::acp",
@@ -3642,6 +3653,7 @@ pub async fn run_acp(
         compaction,
         analytics,
         timestamp_turns,
+        thinking,
         &mut state_out,
     );
     // The upstream ACP stdio transport waits for both its incoming and
@@ -4384,6 +4396,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -4528,6 +4541,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             timestamp_turns,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -4640,6 +4654,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -4726,6 +4741,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -4782,6 +4798,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let _state = state_out.expect("ACP state");
@@ -5381,6 +5398,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -5522,6 +5540,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -5813,6 +5832,7 @@ mod tests {
             SessionCompaction::new(None, false),
             None,
             false,
+            crate::providers::ThinkingLevel::default(),
             &mut state_out,
         );
         let state = state_out.expect("ACP state");
@@ -6220,6 +6240,85 @@ mod tests {
                 200_000
             })
         }
+    }
+
+    /// Captures the reasoning effort each turn was sent with (from
+    /// `CompleteOpts.thinking`). Used to prove the agent-env thinking level is
+    /// threaded into the ACP prompt path (vikunja #1122).
+    struct ThinkingCaptureProvider {
+        seen: Arc<StdMutex<Vec<crate::providers::ThinkingLevel>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ThinkingCaptureProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            self.seen.lock().unwrap().push(opts.thinking.clone());
+            end_turn_resp("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_prompt_turn_uses_agent_env_thinking_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let make_provider: ProviderFactory = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move || {
+                Ok(Box::new(ThinkingCaptureProvider {
+                    seen: Arc::clone(&seen),
+                }))
+            })
+        };
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            make_provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "model-a".to_string(),
+            vec!["model-a".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            SessionCompaction::new(None, false),
+            None,
+            false,
+            crate::providers::ThinkingLevel::High,
+            &mut state_out,
+        );
+        let _state = state_out.expect("ACP state");
+
+        AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        new_session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![crate::providers::ThinkingLevel::High],
+            "the prompt turn must run at the agent-env reasoning effort"
+        );
     }
 
     /// Pull the single model `SessionConfigOption` out of a config_options list.

@@ -75,6 +75,9 @@ pub async fn run_agent(
             safety: None,
             analytics: None,
             token_log,
+            // Dry-run never calls the provider and does not load the agent env,
+            // so effort is immaterial here; use the default.
+            thinking: providers::ThinkingLevel::default(),
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -112,6 +115,7 @@ pub async fn run_agent(
         safety: Some(agent.to_safety_policy(approve_fn)),
         analytics: analytics_store,
         token_log,
+        thinking: agent.thinking.clone(),
     };
     let result =
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
@@ -231,6 +235,7 @@ pub async fn run_acp(
         crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
         analytics_store,
         agent.timestamp_turns,
+        agent.thinking.clone(),
     )
     .await
 }

@@ -91,6 +91,27 @@ DAIMONOS_AGENT_APPROVAL_MODE=auto \
 daimonos agent "review this change"
 ```
 
+### Reasoning effort (`DAIMONOS_AGENT_THINKING`)
+
+Optional. Sets the model's reasoning effort for both the one-shot
+`daimonos agent` path and the `daimonos acp` prompt path. Valid values, in
+ascending order: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
+(case-insensitive). Defaults to `medium` when the key is absent, so existing
+`agent.env` files are unaffected. An unrecognized value fails startup with a
+message naming the key and listing the valid levels.
+
+```dotenv
+DAIMONOS_AGENT_THINKING=high
+```
+
+How the level maps onto the wire request is provider-specific. On native
+OpenAI the level is sent as `reasoning.effort`; note that its Responses
+contract tops out at `xhigh`, so `max` is mapped conservatively onto the
+same `xhigh` wire value — the two are therefore indistinguishable at that
+provider (pick `xhigh` unless you specifically want `max` to mean the
+maximum on a provider that exposes a distinct level). Provider defaults and
+the Anthropic adaptive thinking behavior are unchanged by this key.
+
 ## Settings
 
 ### `[index]` — Workspace Indexing

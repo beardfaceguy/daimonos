@@ -157,6 +157,41 @@ impl ThinkingLevel {
             Self::Max => "max",
         }
     }
+
+    /// Every level as its canonical string, in ascending-effort order. This is
+    /// the single source of the string<->enum mapping (paired with [`as_str`]),
+    /// so parsers and error messages stay consistent as levels are added.
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    /// Parse a reasoning-effort level from a user-supplied string
+    /// (case-insensitive, surrounding whitespace ignored). Reuses [`as_str`]
+    /// as the canonical mapping so there is exactly one place levels are named.
+    /// Returns a message listing the valid levels on an unknown value — no
+    /// silent fallback (matches agent-env validation).
+    pub fn from_input(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let normalized = trimmed.to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .find(|level| level.as_str() == normalized)
+            .cloned()
+            .ok_or_else(|| {
+                let valid = Self::ALL
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("'{trimmed}' invalid (valid: {valid})")
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +309,36 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_level_parses_every_known_level_case_insensitively() {
+        let cases = [
+            ("off", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("xhigh", ThinkingLevel::XHigh),
+            ("max", ThinkingLevel::Max),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(ThinkingLevel::from_input(input), Ok(expected.clone()));
+            // Case- and whitespace-insensitive, and round-trips through as_str.
+            assert_eq!(
+                ThinkingLevel::from_input(&format!("  {}  ", input.to_uppercase())),
+                Ok(expected.clone())
+            );
+            assert_eq!(ThinkingLevel::from_input(expected.as_str()), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn thinking_level_rejects_unknown_value() {
+        let err = ThinkingLevel::from_input("turbo").unwrap_err();
+        assert!(err.contains("turbo"), "{err}");
+        // Error should list the valid levels so the message is actionable.
+        assert!(err.contains("high"), "{err}");
+    }
 
     struct StaticProvider(LlmResponse);
 
