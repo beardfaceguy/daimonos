@@ -1638,6 +1638,18 @@ fn build_remote_dispatch_hook(bridge_slot: BridgeSlot) -> RemoteToolHook {
         let input = input.clone();
         Box::pin(async move {
             let bridge = Arc::clone(&*bridge_slot.read().await);
+            // Provenance guard (task #1116): a name under a refused self /
+            // nested-daimonos server never reached `routes`, so `call` would
+            // return `None` and the agent loop would surface a generic "not
+            // available." Answer with an explicit prohibition instead, so a
+            // self-server tool that leaks in (stale catalog, replayed history,
+            // hand-built call) fails legibly rather than silently missing.
+            if let Some(reason) = bridge.self_dispatch_refused(&name).await {
+                return Some(RemoteToolResult {
+                    content: reason,
+                    is_error: true,
+                });
+            }
             bridge
                 .call(&name, &input)
                 .await

@@ -38,6 +38,35 @@ use crate::providers::ToolSchema;
 
 pub const REMOTE_TOOL_PREFIX: &str = "mcp__";
 
+/// Whether a bridge, when forwarding MCP servers, is allowed to attach to a
+/// server that is itself a daimonos instance (by executable path or by the
+/// `_daimonos` identity marker in its `serverInfo`). Every bridge built inside
+/// a running daimonos — ACP agent or `mcp` server — selects `Reject`: a
+/// daimonos must never become a client of another daimonos, which would nest
+/// the tool surface and let the model reach its own control plane. `Allow`
+/// exists only for tests that need the un-guarded path.
+///
+/// This is a typed policy rather than a bare `bool` so a new call site cannot
+/// silently omit the guard (the dead-parameter failure mode this repo has been
+/// bitten by): every builder takes a `SelfConnectPolicy` by value and must
+/// name its choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfConnectPolicy {
+    /// Refuse and loudly record any self / nested-daimonos server.
+    Reject,
+    /// Permit self-connection. Only the test-only `build()` entry point selects
+    /// this; every production builder uses `Reject`.
+    #[allow(dead_code)]
+    Allow,
+}
+
+impl SelfConnectPolicy {
+    /// True when this policy rejects self / nested-daimonos servers.
+    fn rejects(self) -> bool {
+        matches!(self, SelfConnectPolicy::Reject)
+    }
+}
+
 /// Canonical transport identity for pooling. Display names are deliberately
 /// excluded: two sessions may alias the same server differently while sharing
 /// one transport/client. Map fields are sorted so insertion order cannot
@@ -406,6 +435,12 @@ pub struct McpBridge {
     tools: Vec<ToolSchema>,
     diagnostics: Vec<String>,
     had_connection_failures: bool,
+    /// Number of forwarded specs refused for being self / nested daimonos.
+    refused_self_connections: usize,
+    /// Namespace prefixes (`mcp__<server>__`) of servers refused as self /
+    /// nested daimonos. A dispatch under one of these is a prohibited
+    /// self-dispatch even though the server contributed no routes.
+    refused_self_prefixes: Vec<String>,
     analytics: Option<Arc<AnalyticsStore>>,
     external_session_id: Option<String>,
     call_timeout: Duration,
@@ -423,6 +458,8 @@ impl McpBridge {
             tools: Vec::new(),
             diagnostics: Vec::new(),
             had_connection_failures: false,
+            refused_self_connections: 0,
+            refused_self_prefixes: Vec::new(),
             analytics: None,
             external_session_id: None,
             call_timeout: Duration::from_secs(0),
@@ -449,13 +486,14 @@ impl McpBridge {
             analytics,
             external_session_id,
             McpClientPool::new(),
-            false,
+            SelfConnectPolicy::Allow,
         )
         .await
     }
 
     /// Build using a process-shared client pool. When pooling is disabled in
     /// config, a private pool preserves the original per-session isolation.
+    /// Production entry point: always refuses self / nested-daimonos servers.
     pub async fn build_with_pool(
         specs: Vec<ServerSpec>,
         cfg: &AcpMcpConfig,
@@ -471,7 +509,7 @@ impl McpBridge {
             analytics,
             external_session_id,
             shared_pool,
-            true,
+            SelfConnectPolicy::Reject,
         )
         .await
     }
@@ -483,7 +521,7 @@ impl McpBridge {
         analytics: Option<Arc<AnalyticsStore>>,
         external_session_id: Option<String>,
         shared_pool: McpClientPool,
-        reject_daimonos: bool,
+        self_connect: SelfConnectPolicy,
     ) -> Self {
         let requested_servers = specs.len();
         let build_started = Instant::now();
@@ -506,6 +544,8 @@ impl McpBridge {
             tools: Vec::new(),
             diagnostics: Vec::new(),
             had_connection_failures: false,
+            refused_self_connections: 0,
+            refused_self_prefixes: Vec::new(),
             analytics,
             external_session_id,
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
@@ -515,7 +555,7 @@ impl McpBridge {
         }
 
         let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
-        let current_executable = if reject_daimonos {
+        let current_executable = if self_connect.rejects() {
             match std::env::current_exe() {
                 Ok(path) => tokio::fs::canonicalize(path).await.ok(),
                 Err(_) => None,
@@ -544,7 +584,7 @@ impl McpBridge {
         let mut connect_specs = Vec::with_capacity(checked_specs.len());
         for (spec, points_to_current) in checked_specs {
             if points_to_current {
-                record_self_skip(&mut bridge, spec.name(), "matching ACP executable");
+                record_self_skip(&mut bridge, spec.name(), "matching daimonos executable");
             } else {
                 connect_specs.push(spec);
             }
@@ -569,7 +609,7 @@ impl McpBridge {
                 async move {
                     let server_name = spec.name().to_string();
                     let outcome = pool
-                        .acquire(&spec, cfg, init_timeout, reject_daimonos)
+                        .acquire(&spec, cfg, init_timeout, self_connect.rejects())
                         .await;
                     (index, server_name, outcome)
                 }
@@ -638,7 +678,7 @@ impl McpBridge {
                     }
                 }
                 Ok(None) => {
-                    record_self_skip(&mut bridge, &server_name, "MCP identity marker");
+                    record_self_skip(&mut bridge, &server_name, "daimonos MCP identity marker");
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -654,6 +694,7 @@ impl McpBridge {
                 }
             }
         }
+        let refused_self_connections = bridge.refused_self_connections();
         tracing::info!(
             target: "daimonos::mcp_bridge",
             event = "bridge_build_completed",
@@ -661,6 +702,7 @@ impl McpBridge {
             connected_servers = bridge.runtime.get_mut().leases.len(),
             exposed_tools = bridge.tools.len(),
             diagnostics = bridge.diagnostics.len(),
+            refused_self_connections,
         );
         // Session-lifecycle span (ADR-006 D4): built outside any prompt, so it
         // roots its own trace. Counts and duration only — no URIs/headers (D6).
@@ -691,6 +733,50 @@ impl McpBridge {
     /// when Zed reloads a live session.
     pub fn had_connection_failures(&self) -> bool {
         self.had_connection_failures
+    }
+
+    /// How many forwarded specs were refused for being a self / nested
+    /// daimonos server. A queryable signal so the refusal is not merely a log
+    /// line: callers surface it to the model (task #1116).
+    pub fn refused_self_connections(&self) -> usize {
+        self.refused_self_connections
+    }
+
+    /// If `name` is a tool under a refused self / nested-daimonos server's
+    /// namespace, returns a prohibition reason; otherwise `None`. This keys on
+    /// PROVENANCE, not on the bare tool name — a native daimonos tool served
+    /// by a legitimate leaf `mcp` server is never refused here. The dispatch
+    /// path calls this before falling through to "not available" so a
+    /// self-server tool that leaks into a call (stale catalog, replayed
+    /// history, hand-built request) fails with an explicit error rather than a
+    /// generic miss.
+    ///
+    /// A refused self-server contributes NO routes, so a name that IS a live
+    /// route is always a legitimately-served tool and is never refused. This
+    /// check comes first so a legitimate forwarded server whose sanitized
+    /// namespace prefix happens to collide with a refused self-server's prefix
+    /// (sanitization is many-to-one, e.g. `self.srv` and `self_srv` both map to
+    /// `mcp__self_srv__`) keeps working: the guard only fires for a name that
+    /// matches a refused prefix AND is not actually served here.
+    pub async fn self_dispatch_refused(&self, name: &str) -> Option<String> {
+        if self.refused_self_prefixes.is_empty() {
+            return None;
+        }
+        // A live route is a legitimately-served tool: never refuse it, even if
+        // its sanitized prefix collides with a refused self-server's.
+        if self.runtime.read().await.routes.contains_key(name) {
+            return None;
+        }
+        self.refused_self_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+            .then(|| {
+                format!(
+                    "tool '{name}' is refused: it belongs to a daimonos MCP server, and a \
+                     daimonos agent must not connect to or dispatch tools from its own \
+                     tool server"
+                )
+            })
     }
 
     /// Number of connected servers (clients that contributed ≥1 tool).
@@ -838,16 +924,42 @@ impl McpBridge {
 }
 
 fn record_self_skip(bridge: &mut McpBridge, server_name: &str, detected_by: &str) {
-    tracing::info!(
+    tracing::warn!(
         target: "daimonos::mcp_bridge",
-        event = "self_server_skipped",
+        event = "self_server_refused",
         server = %server_name,
         detected_by,
     );
+    bridge.refused_self_connections += 1;
+    // Record the namespace prefix its tools *would* have used so a later
+    // dispatch of one is recognized as a prohibited self-dispatch even though
+    // the server contributed no routes. Kept consistent with `namespaced_name`
+    // (which sanitizes the whole `mcp__server__tool`): sanitize the prefix the
+    // same way and strip any trailing partial-tool truncation is irrelevant
+    // because we match by `starts_with`.
+    bridge
+        .refused_self_prefixes
+        .push(self_namespace_prefix(server_name));
     bridge.diagnostics.push(format!(
-        "MCP server '{server_name}' was skipped because it is a Daimonos MCP \
-         server and this ACP session already exposes Daimonos native tools"
+        "MCP server '{server_name}' was refused ({detected_by}): it is a daimonos MCP \
+         server, and a daimonos agent must not connect to its own tool server"
     ));
+}
+
+/// The sanitized namespace prefix (`mcp__<server>__`) that a server's tools
+/// would carry, computed the same way as [`namespaced_name`] so a refused
+/// server's tools can be recognized by provenance at dispatch time.
+fn self_namespace_prefix(server: &str) -> String {
+    let raw = format!("{REMOTE_TOOL_PREFIX}{server}__");
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn has_daimonos_identity(client: &ClientRuntime) -> bool {
@@ -1683,7 +1795,8 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|message| message.contains("renamed-global-server")
-                && message.contains("Daimonos MCP")));
+                && message.to_lowercase().contains("refused")
+                && message.to_lowercase().contains("daimonos mcp")));
         assert_eq!(pool.entry_count().await, 0);
     }
 
@@ -1714,6 +1827,147 @@ mod tests {
             .iter()
             .any(|message| message.contains("local-daimonos")));
         assert_eq!(pool.slot_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn refused_self_connection_is_counted_and_surfaced_as_a_prohibition() {
+        // A forwarded spec that resolves to the daimonos binary itself must be
+        // refused *loudly*: a queryable count plus a diagnostic that names the
+        // prohibition, not a silent absence. (task #1116, scope item 1.)
+        let current = std::env::current_exe().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "sneaky-self".to_string(),
+            command: current.to_string_lossy().into_owned(),
+            args: vec!["would-run-the-harness".to_string()],
+            env: HashMap::new(),
+        };
+        let pool = McpClientPool::new();
+        let bridge = McpBridge::build_with_pool(
+            vec![spec],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+            pool.clone(),
+        )
+        .await;
+
+        assert_eq!(bridge.server_count(), 0);
+        assert!(bridge.tools().is_empty());
+        assert!(!bridge.had_connection_failures());
+        // Queryable, not just a log line.
+        assert_eq!(bridge.refused_self_connections(), 1);
+        assert!(
+            bridge
+                .diagnostics()
+                .iter()
+                .any(|m| m.contains("sneaky-self")
+                    && m.to_lowercase().contains("refused")
+                    && m.to_lowercase().contains("self")),
+            "refusal must be surfaced as an explicit prohibition, got: {:?}",
+            bridge.diagnostics()
+        );
+    }
+
+    #[tokio::test]
+    async fn self_dispatch_is_refused_by_provenance_not_by_name() {
+        // The dispatch guard keys on PROVENANCE (a tool name under a rejected
+        // self-server's namespace prefix), never on a bare native tool name —
+        // so a leaf `mcp` server dispatching its own native tools is untouched.
+        // (task #1116, scope item 2.)
+        let current = std::env::current_exe().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "selfsrv".to_string(),
+            command: current.to_string_lossy().into_owned(),
+            args: vec!["would-run-the-harness".to_string()],
+            env: HashMap::new(),
+        };
+        let bridge = McpBridge::build_with_pool(
+            vec![spec],
+            &AcpMcpConfig::default(),
+            &native_set(&["exec"]),
+            None,
+            None,
+            McpClientPool::new(),
+        )
+        .await;
+
+        // A name under the rejected self-server's namespace is a prohibited
+        // self-dispatch.
+        let namespaced = namespaced_name("selfsrv", "exec");
+        let refusal = bridge.self_dispatch_refused(&namespaced).await;
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|r| r.to_lowercase().contains("self")),
+            "expected a prohibition reason for {namespaced}, got {refusal:?}"
+        );
+        // A native tool name is NOT refused by provenance (leaf mcp server must
+        // keep dispatching its own tools).
+        assert_eq!(bridge.self_dispatch_refused("exec").await, None);
+        // An unrelated unknown name is not this bridge's concern.
+        assert_eq!(bridge.self_dispatch_refused("totally_unknown").await, None);
+    }
+
+    #[tokio::test]
+    async fn self_dispatch_refusal_does_not_false_positive_on_a_live_route() {
+        // Regression (codeJung PR #113): namespace-prefix sanitization is
+        // many-to-one, so a legitimate forwarded server can share a refused
+        // self-server's prefix. A name that IS a live route must never be
+        // refused — a refused self-server contributes no routes, so a live
+        // route is always legitimately served. (task #1116.)
+        let mut bridge = McpBridge::empty();
+        // Simulate a refused self-server whose sanitized prefix is `mcp__s_v__`.
+        bridge
+            .refused_self_prefixes
+            .push(self_namespace_prefix("s.v"));
+        let colliding = namespaced_name("s.v", "do_it"); // sanitizes into the same prefix
+                                                         // With no live route, a name under the refused prefix is refused.
+        assert!(
+            bridge.self_dispatch_refused(&colliding).await.is_some(),
+            "a non-route name under a refused prefix should be refused"
+        );
+        // Register that exact name as a live route (a legitimate colliding
+        // server): it must now be allowed through.
+        bridge.runtime.get_mut().routes.insert(
+            colliding.clone(),
+            Route {
+                lease: 0,
+                original: "do_it".to_string(),
+            },
+        );
+        assert_eq!(
+            bridge.self_dispatch_refused(&colliding).await,
+            None,
+            "a live route must never be refused, even under a colliding prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_connect_policy_reject_is_the_production_default() {
+        // Every production bridge builder derives `SelfConnectPolicy::Reject`,
+        // so the guard cannot be silently dropped by a new caller and `mcp`
+        // mode is covered the instant it ever forwards. (task #1116, items 3/4.)
+        let current = std::env::current_exe().unwrap();
+        let spec = ServerSpec::Stdio {
+            name: "nested-daimonos".to_string(),
+            command: current.to_string_lossy().into_owned(),
+            args: vec!["would-run-the-harness".to_string()],
+            env: HashMap::new(),
+        };
+        // `build_with_pool_policy` with the production policy must reject.
+        let bridge = McpBridge::build_with_pool_policy(
+            vec![spec],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+            McpClientPool::new(),
+            SelfConnectPolicy::Reject,
+        )
+        .await;
+        assert_eq!(bridge.server_count(), 0);
+        assert_eq!(bridge.refused_self_connections(), 1);
     }
 
     #[tokio::test]
@@ -1792,7 +2046,7 @@ mod tests {
                 None,
                 Some("session-first".to_string()),
                 pool.clone(),
-                false,
+                SelfConnectPolicy::Allow,
             ),
             McpBridge::build_with_pool_policy(
                 vec![spec("second")],
@@ -1801,7 +2055,7 @@ mod tests {
                 None,
                 Some("session-second".to_string()),
                 pool.clone(),
-                false,
+                SelfConnectPolicy::Allow,
             )
         );
 
@@ -1912,7 +2166,7 @@ mod tests {
             None,
             None,
             process_pool.clone(),
-            false,
+            SelfConnectPolicy::Allow,
         )
         .await;
 
