@@ -129,6 +129,13 @@ Protocol version 1 uses:
 Unknown object fields are tolerated for additive compatibility. Unknown message
 variants are rejected until a version/capability negotiation allows them.
 
+Before remote consumers ship, `AssistantDone` carries the canonical terminal
+outcome (`completed`, `errored`, `refused`, `aborted`, or `max_tokens`) so replay
+cannot turn a provider failure into a clean completion. Approval waits and
+session teardown are likewise explicit status/lifecycle events; frontend
+adapters derive their diagnostics from these events instead of maintaining a
+parallel transport-only outcome path.
+
 ### D4 — `SessionCore` is extracted from ACP, not rewritten
 
 The first core refactor extracts `AcpState`/`SessionHandle` behavior into a

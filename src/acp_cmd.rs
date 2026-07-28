@@ -46,7 +46,7 @@ use tracing::Instrument;
 use crate::agent::{
     parse_plan_entries, AfterHook, AfterHookResult, AgentConfig, AgentSession, BeforeHook,
     BeforeHookResult, PlanEntry as AgentPlanEntry, PlanHook, PlanPriority, PlanStatus,
-    RemoteToolHook, RemoteToolResult, TokenLogConfig, ToolCallInfo, ToolProgressHook,
+    RemoteToolHook, RemoteToolResult, TokenLogConfig, ToolCallInfo, ToolProgressHook, TurnResult,
     UPDATE_PLAN_TOOL,
 };
 use crate::analytics::AnalyticsStore;
@@ -64,7 +64,9 @@ use crate::session_core::{
 };
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
-    ClientCapability, SessionEvent as CoreSessionEvent, ToolCallStateStatus,
+    AssistantOutcome as CoreAssistantOutcome, ClientCapability, RuntimeChoice as CoreRuntimeChoice,
+    RuntimeOption as CoreRuntimeOption, RuntimeValue as CoreRuntimeValue,
+    SessionEvent as CoreSessionEvent, ToolCallStateStatus, TurnStatus as CoreTurnStatus,
 };
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
@@ -453,6 +455,9 @@ fn request_session_cancel(handle: &SessionHandle) {
 
 /// The `SessionConfigId` for the model picker option.
 const MODEL_CONFIG_ID: &str = "model";
+const SESSION_END_REASON_DELETED: &str = "deleted";
+const SESSION_END_REASON_ENGINE_SHUTDOWN: &str = "engine_shutdown";
+const REFUSAL_DIAGNOSTIC: &str = "Provider refused the request based on content policy.";
 const CLIENT_USER_MESSAGE_IDS_META_KEY: &str = "zed.dev/clientUserMessageIds";
 const SESSION_RETRY_META_KEY: &str = "zed.dev/sessionRetry";
 const SESSION_TRUNCATE_META_KEY: &str = "zed.dev/sessionTruncate";
@@ -931,6 +936,29 @@ fn cancel_active_tool_calls(
     cancelled_ids
 }
 
+/// Resolve reliable approval waiters and close every ACP/canonical tool call
+/// whose normal completion path was dropped with a cancelled turn.
+fn cleanup_cancelled_turn(
+    handle: &SessionHandle,
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+) {
+    for resolution in handle.core.approvals.cancel_all("session_cancelled") {
+        let _ = handle.core.events.emit(CoreSessionEvent::ApprovalResolved {
+            approval_id: resolution.approval_id,
+            decision: resolution.decision,
+            resolved_by: resolution.resolved_by,
+        });
+    }
+    for tool_call_id in cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls) {
+        let _ = handle.core.events.emit(CoreSessionEvent::ToolCallFinished {
+            id: tool_call_id,
+            ok: false,
+            output: "cancelled".to_string(),
+        });
+    }
+}
+
 fn build_tool_progress_hook(
     connection: CurrentConnection,
     session_id: SessionId,
@@ -1013,6 +1041,9 @@ async fn request_permission(
         }
     };
 
+    let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
+        status: CoreTurnStatus::WaitingForApproval,
+    });
     let _ = events.emit(CoreSessionEvent::ApprovalRequested {
         request: registered.request.clone(),
     });
@@ -1074,6 +1105,9 @@ async fn request_permission(
     match approvals.resolve(&approval_id, "acp_local", &local_capabilities, decision) {
         Ok(_) | Err(ApprovalError::NotPending) => {}
         Err(_) => {
+            let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
+                status: CoreTurnStatus::Running,
+            });
             return BeforeHookResult::Block(format!(
                 "permission resolution failed for '{}'",
                 info.name
@@ -1088,6 +1122,9 @@ async fn request_permission(
                 decision: CoreApprovalDecision::Deny,
                 resolved_by: "broker_closed".to_string(),
             });
+            let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
+                status: CoreTurnStatus::Running,
+            });
             return BeforeHookResult::Block(format!(
                 "permission broker closed for '{}'",
                 info.name
@@ -1098,6 +1135,9 @@ async fn request_permission(
         approval_id: resolution.approval_id.clone(),
         decision: resolution.decision,
         resolved_by: resolution.resolved_by.clone(),
+    });
+    let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
+        status: CoreTurnStatus::Running,
     });
     match resolution.decision {
         CoreApprovalDecision::AllowOnce => BeforeHookResult::Allow,
@@ -1343,6 +1383,18 @@ fn build_acp_event_handler(
             CoreSessionEvent::ThoughtDelta { text } => Some(SessionUpdate::AgentThoughtChunk(
                 ContentChunk::new(AcpContentBlock::Text(TextContent::new(text))),
             )),
+            CoreSessionEvent::AssistantDone {
+                outcome: CoreAssistantOutcome::Errored { message, .. },
+            } => {
+                send_provider_error_diagnostic(&cx, &session_id, &message);
+                None
+            }
+            CoreSessionEvent::AssistantDone {
+                outcome: CoreAssistantOutcome::Refused,
+            } => {
+                send_refusal_diagnostic(&cx, &session_id);
+                None
+            }
             // Rich ACP tool/diff/terminal projections remain adapter-specific;
             // the canonical events still feed daemon snapshots/replay.
             _ => None,
@@ -1391,6 +1443,18 @@ fn model_config_options(models: &[String], current: &str) -> Vec<SessionConfigOp
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
             .category(Some(SessionConfigOptionCategory::Model));
     vec![option]
+}
+
+fn canonical_model_options(models: &[String], current: &str) -> Vec<CoreRuntimeOption> {
+    vec![CoreRuntimeOption::select(
+        MODEL_CONFIG_ID,
+        "Model",
+        CoreRuntimeValue::String(current.to_string()),
+        models
+            .iter()
+            .map(|model| CoreRuntimeChoice::new(model, model))
+            .collect(),
+    )]
 }
 
 /// Surface a compaction as a subtle thought chunk in Zed's thread view
@@ -1710,11 +1774,8 @@ where
 fn send_provider_error_diagnostic(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    context_overflow: bool,
-    error: Option<&str>,
+    message: &str,
 ) {
-    let message = safe_provider_error_message(context_overflow, error);
-    tracing::Span::current().record("error.type", "provider_error");
     send_notification(
         cx,
         session_id,
@@ -1722,17 +1783,6 @@ fn send_provider_error_diagnostic(
             TextContent::new(message),
         ))),
     );
-    tracing::warn!(
-        target: "daimonos::acp",
-        event = "provider_request_failed",
-        session_id = %session_id,
-        class = message,
-    );
-    // The `warn` above is privacy-safe: it carries only the friendly `class`,
-    // never the provider's raw error. The raw text is the only way to diagnose
-    // the catch-all "Provider request failed." bucket, so log it separately at
-    // DEBUG (see `log_raw_provider_error`).
-    log_raw_provider_error(session_id, message, error);
 }
 
 /// Max characters of the raw provider error we ever emit. Bounds accidental
@@ -1792,7 +1842,7 @@ fn sanitize_provider_error(raw: &str) -> String {
 /// sees the friendly `class`) and never recorded on an OTel span (ADR-006
 /// privacy-first). The body is passed through [`sanitize_provider_error`]
 /// (secret-shape scrub + length cap) before logging. No-op when there is no
-/// raw error. Factored out of `send_provider_error_diagnostic` so it can be
+/// raw error. Factored out of canonical outcome emission so it can be
 /// unit-tested without a live ACP connection (#1062).
 fn log_raw_provider_error(session_id: impl std::fmt::Display, class: &str, error: Option<&str>) {
     if let Some(raw) = error {
@@ -1806,12 +1856,48 @@ fn log_raw_provider_error(session_id: impl std::fmt::Display, class: &str, error
     }
 }
 
+fn canonical_assistant_outcome(turn: &TurnResult) -> CoreAssistantOutcome {
+    match turn.stop_reason {
+        crate::providers::StopReason::Error => CoreAssistantOutcome::Errored {
+            context_overflow: turn.context_overflow,
+            message: safe_provider_error_message(
+                turn.context_overflow,
+                turn.error_message.as_deref(),
+            )
+            .to_string(),
+        },
+        crate::providers::StopReason::Refusal => CoreAssistantOutcome::Refused,
+        crate::providers::StopReason::Aborted => CoreAssistantOutcome::Aborted,
+        crate::providers::StopReason::MaxTokens => CoreAssistantOutcome::MaxTokens,
+        crate::providers::StopReason::EndTurn | crate::providers::StopReason::ToolUse => {
+            CoreAssistantOutcome::Completed
+        }
+    }
+}
+
+fn emit_assistant_done(events: &SessionEventRouter, session_id: &SessionId, turn: &TurnResult) {
+    let outcome = canonical_assistant_outcome(turn);
+    if let CoreAssistantOutcome::Errored { message, .. } = &outcome {
+        tracing::Span::current().record("error.type", "provider_error");
+        tracing::warn!(
+            target: "daimonos::acp",
+            event = "provider_request_failed",
+            session_id = %session_id,
+            class = message,
+        );
+        // The warning is privacy-safe. Raw provider text remains DEBUG-only,
+        // scrubbed, and is never included in the canonical event.
+        log_raw_provider_error(session_id, message, turn.error_message.as_deref());
+    }
+    let _ = events.emit(CoreSessionEvent::AssistantDone { outcome });
+}
+
 fn send_refusal_diagnostic(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
     send_notification(
         cx,
         session_id,
         SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
-            TextContent::new("Provider refused the request based on content policy."),
+            TextContent::new(REFUSAL_DIAGNOSTIC),
         ))),
     );
 }
@@ -2020,13 +2106,9 @@ async fn run_prompt_turn(
     // real leading assistant history message for persistence and replay.
     // Direct commands returned above intentionally do not receive a prefix.
     if let Some(prefix) = assistant_prefix.as_ref() {
-        send_notification(
-            cx,
-            session_id,
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
-                TextContent::new(prefix.clone()),
-            ))),
-        );
+        let _ = handle.core.events.emit(CoreSessionEvent::AssistantDelta {
+            text: prefix.clone(),
+        });
     }
 
     let outcome = tokio::select! {
@@ -2040,35 +2122,11 @@ async fn run_prompt_turn(
         active_turn.mark_completed();
     }
     if outcome.is_none() {
-        // Resolve every reliable approval waiter before retiring the turn.
-        // The ACP request future is dropped by cancellation, but the broker is
-        // session-owned and would otherwise retain a permanently pending entry.
-        for resolution in handle.core.approvals.cancel_all("session_cancelled") {
-            let _ = handle.core.events.emit(CoreSessionEvent::ApprovalResolved {
-                approval_id: resolution.approval_id,
-                decision: resolution.decision,
-                resolved_by: resolution.resolved_by,
-            });
-        }
-        // Dropping the prompt future skips the normal before/after completion
-        // path. Close every already-announced call before retiring its id so
-        // the client does not retain Pending/InProgress chrome; draining first
-        // also makes any racing late callback observe the call as closed.
-        //
-        // `Cancelling` is emitted by `SessionCore::cancel_turn` before the
-        // cancellation signal, not here. Emitted at this point it could land
-        // after the turn's own `Drop` had already written the terminal event,
-        // leaving the canonical stream resting on `Cancelling` permanently.
-        for tool_call_id in cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls) {
-            let _ = handle.core.events.emit(CoreSessionEvent::ToolCallFinished {
-                id: tool_call_id,
-                ok: false,
-                output: "cancelled".to_string(),
-            });
-        }
+        // Dropping the prompt future skips normal approval/tool completion.
+        // Cleanup must precede `SessionTurn::drop`, the single terminal emitter.
+        cleanup_cancelled_turn(handle, cx, session_id);
     }
     if outcome.is_some() {
-        let _ = handle.core.events.emit(CoreSessionEvent::AssistantDone);
         if let Some(prefix) = assistant_prefix {
             if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
                 tracing::error!(
@@ -2111,6 +2169,7 @@ async fn run_prompt_turn(
             .emit(CoreSessionEvent::ContextUsageChanged {
                 usage: handle.core.context_usage(used_tokens, context_window),
             });
+        emit_assistant_done(&handle.core.events, session_id, turn);
     }
     drop(active_turn);
 
@@ -2127,18 +2186,6 @@ async fn run_prompt_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
-            match turn.stop_reason {
-                crate::providers::StopReason::Error => send_provider_error_diagnostic(
-                    cx,
-                    session_id,
-                    turn.context_overflow,
-                    turn.error_message.as_deref(),
-                ),
-                crate::providers::StopReason::Refusal => {
-                    send_refusal_diagnostic(cx, session_id);
-                }
-                _ => {}
-            }
             // A turn that completes with `Aborted` was terminated by the
             // after-tool-call policy hook, not the client (ADR-006 D5).
             if matches!(turn.stop_reason, crate::providers::StopReason::Aborted) {
@@ -2187,6 +2234,11 @@ async fn run_retry_turn(
         active_turn.mark_completed();
     }
     let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
+    if outcome.is_none() {
+        // The retry path runs the same provider/tool loop as a prompt and must
+        // perform the same pre-terminal cleanup when that future is dropped.
+        cleanup_cancelled_turn(handle, cx, session_id);
+    }
 
     let (stop_reason, history_snapshot) = match outcome {
         Some(Ok(turn)) => {
@@ -2200,7 +2252,7 @@ async fn run_retry_turn(
                 .emit(CoreSessionEvent::ContextUsageChanged {
                     usage: handle.core.context_usage(used_tokens, context_window),
                 });
-            let _ = handle.core.events.emit(CoreSessionEvent::AssistantDone);
+            emit_assistant_done(&handle.core.events, session_id, &turn);
             emit_usage_update(
                 cx,
                 session_id,
@@ -2208,18 +2260,6 @@ async fn run_retry_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
-            match turn.stop_reason {
-                crate::providers::StopReason::Error => send_provider_error_diagnostic(
-                    cx,
-                    session_id,
-                    turn.context_overflow,
-                    turn.error_message.as_deref(),
-                ),
-                crate::providers::StopReason::Refusal => {
-                    send_refusal_diagnostic(cx, session_id);
-                }
-                _ => {}
-            }
             (
                 map_stop_reason(turn.stop_reason),
                 Some(agent_session.history().to_vec()),
@@ -2978,6 +3018,11 @@ fn build_agent_with_state(
                                 )),
                             );
                         }
+                        if let Some(handle) = &removed_handle {
+                            let _ = handle.core.events.emit(CoreSessionEvent::SessionEnding {
+                                reason: SESSION_END_REASON_DELETED.to_string(),
+                            });
+                        }
                         // Session file is gone; tear down its MCP clients so
                         // Zed-spawned stdio servers don't linger (ADR-003, D7).
                         if let Some(handle) = removed_handle {
@@ -3463,16 +3508,21 @@ fn build_agent_with_state(
                         // client, but keep the echo sensible).
                         let mut current = state.default_model.clone();
                         if let Some(handle) = handle {
+                            let mut changed = false;
                             if req.config_id.to_string() == MODEL_CONFIG_ID {
                                 if let Some(value) = req.value.as_value_id() {
                                     let picked = value.to_string();
                                     // Only honor a value we actually advertised.
                                     if state.models.iter().any(|m| m == &picked) {
-                                        *handle
+                                        let mut selected = handle
                                             .core
                                             .current_model
                                             .lock()
-                                            .unwrap_or_else(|p| p.into_inner()) = picked;
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        if *selected != picked {
+                                            *selected = picked;
+                                            changed = true;
+                                        }
                                     }
                                 }
                             }
@@ -3482,6 +3532,13 @@ fn build_agent_with_state(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .clone();
+                            if changed {
+                                let _ = handle.core.events.emit(
+                                    CoreSessionEvent::RuntimeOptionsChanged {
+                                        options: canonical_model_options(&state.models, &current),
+                                    },
+                                );
+                            }
                         }
                         let options = model_config_options(&state.models, &current);
                         responder.respond(SetSessionConfigOptionResponse::new(options))
@@ -3653,6 +3710,9 @@ async fn shutdown_all_bridges(state: &AcpState) {
         map.drain().map(|(_, handle)| handle).collect()
     };
     for handle in handles {
+        let _ = handle.core.events.emit(CoreSessionEvent::SessionEnding {
+            reason: SESSION_END_REASON_ENGINE_SHUTDOWN.to_string(),
+        });
         shutdown_session_bridge(&handle).await;
     }
 }
@@ -4501,6 +4561,26 @@ mod tests {
             assistant_texts(&history),
             assistant_texts(&persisted.messages),
         )
+    }
+
+    #[test]
+    fn assistant_prefix_flows_only_through_canonical_delta_event() {
+        let source = include_str!("acp_cmd.rs");
+        let prefix_path = source
+            .split("// Stream the prefix at the start of the turn")
+            .nth(1)
+            .expect("assistant prefix production path")
+            .split("let outcome = tokio::select!")
+            .next()
+            .expect("assistant prefix block");
+        assert!(
+            prefix_path.contains("emit(CoreSessionEvent::AssistantDelta"),
+            "assistant prefix must enter the canonical stream"
+        );
+        assert!(
+            !prefix_path.contains("send_notification"),
+            "assistant prefix must not bypass the canonical event adapter"
+        );
     }
 
     #[tokio::test]
@@ -5403,6 +5483,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_cancel_cleans_up_retry_approval_and_tool_call() {
+        use agent_client_protocol::schema::v1::ClientCapabilities;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![
+                end_turn_resp("first"),
+                tool_call_resp(
+                    "retry-tool",
+                    "exec",
+                    serde_json::json!({"command": "sleep 30"}),
+                ),
+            ]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            SessionCompaction::new(None, false),
+            None,
+            false,
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+        let permission_seen = Arc::new(tokio::sync::Notify::new());
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let option_id = request.options.first().unwrap().option_id.clone();
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
+                                    option_id,
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().meta(Meta::from_iter([(
+                                "terminal_output".to_string(),
+                                serde_json::json!(true),
+                            )])),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("first"))],
+                    ))
+                    .block_task()
+                    .await?;
+                let retry = connection
+                    .send_request(RetrySessionRequest {
+                        session_id: session_id.clone(),
+                    })
+                    .block_task();
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    permission_seen.notified(),
+                )
+                .await
+                .expect("retry permission request should arrive");
+                let handle = state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .expect("live session handle");
+                assert_eq!(handle.core.approvals.pending().len(), 1);
+
+                connection.send_notification(CancelNotification::new(session_id))?;
+                let response = tokio::time::timeout(std::time::Duration::from_secs(2), retry)
+                    .await
+                    .expect("cancelled retry should resolve")?;
+                assert!(
+                    handle.core.approvals.pending().is_empty(),
+                    "retry cancellation must resolve every approval"
+                );
+                assert!(
+                    handle
+                        .active_tool_calls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty(),
+                    "retry cancellation must drain every announced tool id"
+                );
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::Cancelled);
+        let updates = updates.lock().unwrap();
+        assert_no_orphan_tool_updates(&updates);
+        let terminal_updates = updates
+            .iter()
+            .filter(|update| {
+                matches!(
+                    update,
+                    SessionUpdate::ToolCallUpdate(call)
+                        if call.tool_call_id.to_string() == "retry-tool"
+                            && call.fields.status == Some(ToolCallStatus::Failed)
+                )
+            })
+            .count();
+        assert_eq!(
+            terminal_updates, 1,
+            "every announced retry tool call must receive exactly one terminal update"
+        );
+    }
+
+    #[tokio::test]
     async fn acp_session_delete_cancels_inflight_prompt() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
@@ -5994,6 +6225,19 @@ mod tests {
             agent_client_protocol::schema::v1::SessionConfigKind::Select(s) => s,
             _ => panic!("model option should be a Select"),
         }
+    }
+
+    #[test]
+    fn canonical_model_options_match_the_acp_model_selection() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let options = canonical_model_options(&models, "model-b");
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, MODEL_CONFIG_ID);
+        assert_eq!(
+            options[0].value,
+            CoreRuntimeValue::String("model-b".to_string())
+        );
+        assert!(options[0].accepts(&CoreRuntimeValue::String("model-a".to_string())));
     }
 
     #[tokio::test]
@@ -7106,6 +7350,51 @@ mod tests {
         assert_eq!(
             map_stop_reason(StopReason::MaxTokens),
             AcpStopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn canonical_assistant_outcome_preserves_every_terminal_reason() {
+        let turn = |stop_reason| TurnResult {
+            text: String::new(),
+            usage: Usage::default(),
+            last_call_usage: Usage::default(),
+            stop_reason,
+            error_message: None,
+            context_overflow: false,
+        };
+        assert_eq!(
+            canonical_assistant_outcome(&turn(crate::providers::StopReason::EndTurn)),
+            CoreAssistantOutcome::Completed
+        );
+        assert_eq!(
+            canonical_assistant_outcome(&turn(crate::providers::StopReason::ToolUse)),
+            CoreAssistantOutcome::Completed
+        );
+        assert_eq!(
+            canonical_assistant_outcome(&turn(crate::providers::StopReason::Refusal)),
+            CoreAssistantOutcome::Refused
+        );
+        assert_eq!(
+            canonical_assistant_outcome(&turn(crate::providers::StopReason::Aborted)),
+            CoreAssistantOutcome::Aborted
+        );
+        assert_eq!(
+            canonical_assistant_outcome(&turn(crate::providers::StopReason::MaxTokens)),
+            CoreAssistantOutcome::MaxTokens
+        );
+        let errored = TurnResult {
+            error_message: Some("maximum context length exceeded".to_string()),
+            context_overflow: true,
+            ..turn(crate::providers::StopReason::Error)
+        };
+        assert_eq!(
+            canonical_assistant_outcome(&errored),
+            CoreAssistantOutcome::Errored {
+                context_overflow: true,
+                message: "Provider rejected the prompt because the context window was exceeded."
+                    .to_string(),
+            }
         );
     }
 

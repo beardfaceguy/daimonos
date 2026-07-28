@@ -1035,6 +1035,191 @@ mod tests {
     }
 
     #[test]
+    fn completed_error_turn_has_one_fully_ordered_canonical_sequence() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_hook = std::sync::Arc::clone(&seen);
+        let router = SessionEventRouter::new(Some(std::sync::Arc::new(move |_seq, event| {
+            seen_for_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        })));
+        let controller = TurnController::default();
+        {
+            let active = controller.begin().expect("turn starts");
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            let turn = SessionTurn {
+                active,
+                events: &router,
+            };
+            let _ = router.emit(SessionEvent::AssistantDelta {
+                text: "partial".to_string(),
+            });
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::WaitingForApproval,
+            });
+            let _ = router.emit(SessionEvent::ApprovalRequested { request: request() });
+            let _ = router.emit(SessionEvent::ApprovalResolved {
+                approval_id: "approval-1".to_string(),
+                decision: ApprovalDecision::Deny,
+                resolved_by: "acp_local".to_string(),
+            });
+            let _ = router.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Running,
+            });
+            turn.mark_completed();
+            let _ = router.emit(SessionEvent::ContextUsageChanged {
+                usage: crate::session_protocol::ContextUsage::new(10, Some(100), 10, Some(72)),
+            });
+            let _ = router.emit(SessionEvent::AssistantDone {
+                outcome: crate::session_protocol::AssistantOutcome::Errored {
+                    context_overflow: true,
+                    message: "context exceeded".to_string(),
+                },
+            });
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Running,
+                },
+                SessionEvent::AssistantDelta {
+                    text: "partial".to_string(),
+                },
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::WaitingForApproval,
+                },
+                SessionEvent::ApprovalRequested { request: request() },
+                SessionEvent::ApprovalResolved {
+                    approval_id: "approval-1".to_string(),
+                    decision: ApprovalDecision::Deny,
+                    resolved_by: "acp_local".to_string(),
+                },
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Running,
+                },
+                SessionEvent::ContextUsageChanged {
+                    usage: crate::session_protocol::ContextUsage::new(10, Some(100), 10, Some(72),),
+                },
+                SessionEvent::AssistantDone {
+                    outcome: crate::session_protocol::AssistantOutcome::Errored {
+                        context_overflow: true,
+                        message: "context exceeded".to_string(),
+                    },
+                },
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Idle,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_session_event_variant_has_a_production_emission_site() {
+        let core = include_str!("session_core.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let acp = include_str!("acp_cmd.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let production: String = format!("{core}\n{acp}")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        for (variant, marker) in [
+            ("UserMessage", "emit(CoreSessionEvent::UserMessage"),
+            ("AssistantDelta", "emit(CoreSessionEvent::AssistantDelta"),
+            ("AssistantDone", "emit(CoreSessionEvent::AssistantDone"),
+            ("ThoughtDelta", "emit(CoreSessionEvent::ThoughtDelta"),
+            ("ToolCallStarted", "emit(CoreSessionEvent::ToolCallStarted"),
+            ("ToolCallUpdated", "emit(CoreSessionEvent::ToolCallUpdated"),
+            (
+                "ToolCallFinished",
+                "emit(CoreSessionEvent::ToolCallFinished",
+            ),
+            (
+                "ApprovalRequested",
+                "emit(CoreSessionEvent::ApprovalRequested",
+            ),
+            (
+                "ApprovalResolved",
+                "emit(CoreSessionEvent::ApprovalResolved",
+            ),
+            (
+                "RuntimeOptionsChanged",
+                "emit(CoreSessionEvent::RuntimeOptionsChanged",
+            ),
+            (
+                "ContextUsageChanged",
+                "emit(CoreSessionEvent::ContextUsageChanged",
+            ),
+            ("TurnStatusChanged", "emit(SessionEvent::TurnStatusChanged"),
+            ("SessionEnding", "emit(CoreSessionEvent::SessionEnding"),
+        ] {
+            assert!(
+                production.contains(marker),
+                "SessionEvent::{variant} has no production emission site ({marker})"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_event_sites_cover_both_turn_and_session_lifecycle_paths() {
+        let source = include_str!("acp_cmd.rs");
+        let prompt = source
+            .split("async fn run_prompt_turn")
+            .nth(1)
+            .unwrap()
+            .split("async fn run_retry_turn")
+            .next()
+            .unwrap();
+        let retry = source
+            .split("async fn run_retry_turn")
+            .nth(1)
+            .unwrap()
+            .split("async fn truncate_session")
+            .next()
+            .unwrap();
+        assert!(prompt.contains("emit_assistant_done"));
+        assert!(retry.contains("emit_assistant_done"));
+        assert!(prompt.contains("cleanup_cancelled_turn"));
+        assert!(retry.contains("cleanup_cancelled_turn"));
+
+        let permission = source
+            .split("async fn request_permission")
+            .nth(1)
+            .unwrap()
+            .split("fn build_before_tool_call_hook")
+            .next()
+            .unwrap();
+        assert!(permission.contains("CoreTurnStatus::WaitingForApproval"));
+        assert!(permission.contains("CoreTurnStatus::Running"));
+
+        let delete = source
+            .split("move |req: DeleteSessionRequest")
+            .nth(1)
+            .unwrap()
+            .split("move |req: NewSessionRequest")
+            .next()
+            .unwrap();
+        assert!(delete.contains("SESSION_END_REASON_DELETED"));
+        let shutdown = source
+            .split("async fn shutdown_all_bridges")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(shutdown.contains("SESSION_END_REASON_ENGINE_SHUTDOWN"));
+    }
+
+    #[test]
     fn event_router_assigns_monotonic_sequences_and_forwards_events() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_for_hook = std::sync::Arc::clone(&seen);
@@ -1067,7 +1252,9 @@ mod tests {
             panic!("adapter failed");
         })));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            router.emit(SessionEvent::AssistantDone)
+            router.emit(SessionEvent::AssistantDone {
+                outcome: crate::session_protocol::AssistantOutcome::Completed,
+            })
         }));
         assert_eq!(result.unwrap(), Err(SessionEventError::HandlerPanicked));
         assert_eq!(router.latest_sequence(), 1);

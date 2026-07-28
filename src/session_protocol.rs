@@ -182,6 +182,20 @@ impl ApprovalRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum AssistantOutcome {
+    Completed,
+    Errored {
+        context_overflow: bool,
+        /// Privacy-safe diagnostic text suitable for every client projection.
+        message: String,
+    },
+    Refused,
+    Aborted,
+    MaxTokens,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     UserMessage {
         text: String,
@@ -189,7 +203,9 @@ pub enum SessionEvent {
     AssistantDelta {
         text: String,
     },
-    AssistantDone,
+    AssistantDone {
+        outcome: AssistantOutcome,
+    },
     ThoughtDelta {
         text: String,
     },
@@ -567,6 +583,50 @@ mod tests {
             serde_json::from_str::<ServerMessage>(&encoded).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn assistant_done_wire_shape_carries_faithful_outcome() {
+        let cases = [
+            (
+                AssistantOutcome::Completed,
+                json!({"type": "assistant_done", "outcome": {"type": "completed"}}),
+            ),
+            (
+                AssistantOutcome::Errored {
+                    context_overflow: true,
+                    message: "context exceeded".to_string(),
+                },
+                json!({
+                    "type": "assistant_done",
+                    "outcome": {
+                        "type": "errored",
+                        "context_overflow": true,
+                        "message": "context exceeded"
+                    }
+                }),
+            ),
+            (
+                AssistantOutcome::Refused,
+                json!({"type": "assistant_done", "outcome": {"type": "refused"}}),
+            ),
+            (
+                AssistantOutcome::Aborted,
+                json!({"type": "assistant_done", "outcome": {"type": "aborted"}}),
+            ),
+            (
+                AssistantOutcome::MaxTokens,
+                json!({"type": "assistant_done", "outcome": {"type": "max_tokens"}}),
+            ),
+        ];
+        for (outcome, expected) in cases {
+            let event = SessionEvent::AssistantDone { outcome };
+            assert_eq!(serde_json::to_value(&event).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<SessionEvent>(expected).unwrap(),
+                event
+            );
+        }
     }
 
     #[test]
