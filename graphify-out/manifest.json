@@ -190,7 +190,7 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785266770.7743704,
+    "mtime": 1785270102.391973,
     "ast_hash": "718766b0c2b53564de117ef4714eb7e6",
     "semantic_hash": ""
   },
@@ -200,12 +200,12 @@
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
-    "mtime": 1785266743.7275677,
+    "mtime": 1785270102.391973,
     "ast_hash": "5a45514b03aa296af1198e92c73025b4",
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
-    "mtime": 1785266841.0761638,
+    "mtime": 1785270102.391973,
     "ast_hash": "2eee05384e7d37ca7ea6f97255e3442a",
     "semantic_hash": ""
   },
@@ -420,7 +420,7 @@
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1785267459.4921265,
+    "mtime": 1785270102.391973,
     "ast_hash": "c43d96148dbf2ab9e74af5ab1685d2e5",
     "semantic_hash": ""
   },
@@ -755,7 +755,7 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785267466.9050422,
+    "mtime": 1785270102.3679733,
     "ast_hash": "0c9835de0b499ca5be73824c588b1759",
     "semantic_hash": ""
   },
@@ -905,7 +905,7 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785266611.700771,
+    "mtime": 1785270102.391973,
     "ast_hash": "69d7c84fb6122056f6fc111b83e74f3e",
     "semantic_hash": ""
   },
@@ -1002,6 +1002,11 @@
   "benchmarks/bench-agent.sh": {
     "mtime": 1785264659.857962,
     "ast_hash": "d66e738df3bcd76b2d26a8dbad5742df",
+    "semantic_hash": ""
+  },
+  "benchmarks/bench-cursor.sh": {
+    "mtime": 1785270957.7931993,
+    "ast_hash": "89806df404f7ccc759ea985dd1a7d566",
     "semantic_hash": ""
   }
 }

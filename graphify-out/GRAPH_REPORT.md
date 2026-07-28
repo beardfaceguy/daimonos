@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-28)
 
 ## Corpus Check
-- 194 files · ~256,360 words
+- 195 files · ~257,428 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5187 nodes · 12137 edges · 218 communities (203 shown, 15 thin omitted)
+- 5192 nodes · 12144 edges · 221 communities (205 shown, 16 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `0c958844`
+- Built from commit: `b8744538`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -111,6 +111,7 @@
 - [[_COMMUNITY_Community 93|Community 93]]
 - [[_COMMUNITY_Community 94|Community 94]]
 - [[_COMMUNITY_Community 95|Community 95]]
+- [[_COMMUNITY_Community 96|Community 96]]
 - [[_COMMUNITY_Community 97|Community 97]]
 - [[_COMMUNITY_Community 98|Community 98]]
 - [[_COMMUNITY_Community 99|Community 99]]
@@ -123,6 +124,7 @@
 - [[_COMMUNITY_Community 106|Community 106]]
 - [[_COMMUNITY_Community 107|Community 107]]
 - [[_COMMUNITY_Community 108|Community 108]]
+- [[_COMMUNITY_Community 109|Community 109]]
 - [[_COMMUNITY_Community 110|Community 110]]
 - [[_COMMUNITY_Community 111|Community 111]]
 - [[_COMMUNITY_Community 112|Community 112]]
@@ -131,6 +133,7 @@
 - [[_COMMUNITY_Community 115|Community 115]]
 - [[_COMMUNITY_Community 116|Community 116]]
 - [[_COMMUNITY_Community 118|Community 118]]
+- [[_COMMUNITY_Community 119|Community 119]]
 - [[_COMMUNITY_Community 120|Community 120]]
 - [[_COMMUNITY_Community 121|Community 121]]
 - [[_COMMUNITY_Community 122|Community 122]]
@@ -271,7 +274,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (218 total, 15 thin omitted)
+## Communities (221 total, 16 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -479,7 +482,7 @@ Nodes (18): Path, CallSample, Client, find_binary(), load_task(), main(), proc_r
 
 ### Community 51 - "Community 51"
 Cohesion: 0.12
-Nodes (34): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+26 more)
+Nodes (33): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+25 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.09
@@ -657,6 +660,10 @@ Nodes (34): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, 
 Cohesion: 0.08
 Nodes (26): 60-second demo, Additional capabilities, Architecture, Benchmark results, Configuration, Configure your IDE, Contributing, Core tools (always available) (+18 more)
 
+### Community 96 - "Community 96"
+Cohesion: 0.29
+Nodes (6): SessionTurn, Display, Error, Formatter, Result, TurnError
+
 ### Community 97 - "Community 97"
 Cohesion: 0.20
 Nodes (5): Tests for edit_file MCP tool., edit_file should return a diffs array confirming each applied change., When no edits match, diffs should be absent., test_edit_no_diffs_when_nothing_matches(), test_edit_returns_diffs()
@@ -705,6 +712,10 @@ Nodes (19): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig,
 Cohesion: 0.40
 Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
 
+### Community 109 - "Community 109"
+Cohesion: 0.33
+Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
+
 ### Community 110 - "Community 110"
 Cohesion: 0.70
 Nodes (3): reset_workspace(), run_task(), bench-agent.sh script
@@ -733,9 +744,13 @@ Nodes (4): E2e: KGL observed-provenance capture for script-driven file ops.  Wit
 Cohesion: 0.50
 Nodes (4): AnthropicMessage, AnthropicThinking, AnthropicTool, AnthropicRequest
 
+### Community 119 - "Community 119"
+Cohesion: 0.70
+Nodes (3): reset_workspace(), run_task(), bench-cursor.sh script
+
 ### Community 121 - "Community 121"
-Cohesion: 0.11
-Nodes (20): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+12 more)
+Cohesion: 0.10
+Nodes (21): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+13 more)
 
 ### Community 122 - "Community 122"
 Cohesion: 0.29
@@ -756,10 +771,6 @@ Nodes (14): ADR-002: Context/window compaction for AgentSession, Amendment (2026
 ### Community 139 - "Community 139"
 Cohesion: 0.12
 Nodes (14): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Manual testing, Prerequisites, Quick start (new agents), Repo layout (+6 more)
-
-### Community 140 - "Community 140"
-Cohesion: 0.15
-Nodes (6): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines, Runtime Modes
 
 ### Community 141 - "Community 141"
 Cohesion: 0.13
@@ -1046,8 +1057,8 @@ Cohesion: 0.04
 Nodes (52): AcpContentBlock, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+44 more)
 
 ### Community 235 - "Community 235"
-Cohesion: 0.16
-Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe() (+10 more)
+Cohesion: 0.26
+Nodes (12): SessionEvent, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe(), repeated_cancel_emits_cancelling_once() (+4 more)
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -1060,7 +1071,7 @@ Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_tu
 ## Knowledge Gaps
 - **849 isolated node(s):** `fs`, `{ execSync }`, `[taskFile, rawFile, workspace, summaryFile, format]`, `task`, `text` (+844 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **15 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1073,9 +1084,9 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 174`, `Community 28`?**
   _High betweenness centrality (0.007) - this node is a cross-community bridge._
+- **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
+  _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
-- **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
-  _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `fs` to the rest of the system?**
   _1046 weakly-connected nodes found - possible documentation gaps or missing edges._
