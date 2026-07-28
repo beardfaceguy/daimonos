@@ -1005,8 +1005,8 @@
     "semantic_hash": ""
   },
   "benchmarks/bench-cursor.sh": {
-    "mtime": 1785270255.1502283,
-    "ast_hash": "1384f52e03acfe89d2f46c4e09da6c7f",
+    "mtime": 1785270957.7931993,
+    "ast_hash": "89806df404f7ccc759ea985dd1a7d566",
     "semantic_hash": ""
   }
 }

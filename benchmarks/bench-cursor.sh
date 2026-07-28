@@ -25,17 +25,23 @@
 #                    (e.g. "01" for a single-task smoke test). Omit to run all.
 #
 # Environment variables:
-#   CURSOR_MODEL   cursor-agent model slug (default: gpt-5.6-sol-high — the
-#                  match point for daimonos gpt-5.6-sol at DAIMONOS_AGENT_THINKING=high;
-#                  cursor only offers sol at -high/-xhigh, so high is the A/B).
+#   CURSOR_MODEL   cursor-agent model slug (default: see DEFAULT_CURSOR_MODEL
+#                  below). The default is the match point for daimonos
+#                  gpt-5.6-sol at DAIMONOS_AGENT_THINKING=high; cursor only
+#                  offers sol at -high/-xhigh, so high is the A/B.
 #   BENCH_TAG      Extra label folded into the results dir name (e.g. sol-high-r1).
 #   CURSOR_BIN     Path to the cursor-agent binary (default: from PATH, else
 #                  ~/.local/bin/cursor-agent).
 #   BENCH_TASK_TIMEOUT  Per-task wall-clock cap in seconds (default: 600), same
 #                  guardrail as bench-agent.sh: a stuck task must not run away.
 #
-# POSIX sh compatible (works with BusyBox ash).
+# Portability: POSIX sh syntax, but requires GNU coreutils `timeout` (for the
+# `--kill-after` per-task cap) and `node` on PATH — same host assumptions as
+# bench-agent.sh. Intended to run on the Linux benchmark host, not BusyBox.
 set -eu
+
+# Single source of the default cursor model slug (referenced in the header).
+DEFAULT_CURSOR_MODEL="gpt-5.6-sol-high"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/workspace"
@@ -52,12 +58,13 @@ else
   CURSOR_BIN="$HOME/.local/bin/cursor-agent"
 fi
 
-MODEL="${CURSOR_MODEL:-gpt-5.6-sol-high}"
+MODEL="${CURSOR_MODEL:-$DEFAULT_CURSOR_MODEL}"
 TASK_FILTER="${1:-}"
 RUN_TAG="${BENCH_TAG:-}"
 
 [ -x "$CURSOR_BIN" ] || { echo "Error: cursor-agent not found/executable at $CURSOR_BIN"; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "Error: node is required (token extraction + correctness checks)"; exit 1; }
+command -v timeout >/dev/null 2>&1 || { echo "Error: GNU coreutils 'timeout' is required for the per-task wall-clock cap"; exit 1; }
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-cursor${RUN_TAG:+-$RUN_TAG}"
 RUN_DIR="$RESULTS_DIR/$RUN_ID"
