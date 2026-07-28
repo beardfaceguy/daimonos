@@ -190,8 +190,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785256442.9280264,
-    "ast_hash": "634535c688172300c3539f3a004119f6",
+    "mtime": 1785266770.7743704,
+    "ast_hash": "718766b0c2b53564de117ef4714eb7e6",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -200,13 +200,13 @@
     "semantic_hash": ""
   },
   "src/agent_cmd.rs": {
-    "mtime": 1784819800.4416826,
-    "ast_hash": "d90787ddba2860708dbf0945815ad0e0",
+    "mtime": 1785266743.7275677,
+    "ast_hash": "5a45514b03aa296af1198e92c73025b4",
     "semantic_hash": ""
   },
   "src/agent_env.rs": {
-    "mtime": 1785032639.5240543,
-    "ast_hash": "13f1e924f19258023a5047abb7ea2da9",
+    "mtime": 1785266841.0761638,
+    "ast_hash": "2eee05384e7d37ca7ea6f97255e3442a",
     "semantic_hash": ""
   },
   "src/analytics.rs": {
@@ -420,8 +420,8 @@
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
-    "mtime": 1785032639.5260541,
-    "ast_hash": "79c68710dfa9739407d2b774a64b5802",
+    "mtime": 1785266829.6389377,
+    "ast_hash": "3d46c172b84ce75fc4d27c28a85407b5",
     "semantic_hash": ""
   },
   "src/providers/openrouter.rs": {
@@ -700,7 +700,7 @@
     "semantic_hash": ""
   },
   "benchmarks/README.md": {
-    "mtime": 1785260667.2542384,
+    "mtime": 1785264659.857962,
     "ast_hash": "e3eaab79c9a0537517abd0aa1620d8b2",
     "semantic_hash": ""
   },
@@ -755,8 +755,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785032639.5080543,
-    "ast_hash": "d1d1c4bc0602644d3564af3d2287ebc7",
+    "mtime": 1785267057.0817058,
+    "ast_hash": "584d3933b1064ee877169c263138fcec",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -905,8 +905,8 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785188785.568175,
-    "ast_hash": "865bc34a94daba737b01973cdd1f6a8f",
+    "mtime": 1785266611.700771,
+    "ast_hash": "69d7c84fb6122056f6fc111b83e74f3e",
     "semantic_hash": ""
   },
   "src/observability.rs": {
@@ -995,12 +995,12 @@
     "semantic_hash": ""
   },
   "benchmarks/analyze.py": {
-    "mtime": 1785260578.7581823,
+    "mtime": 1785264659.857962,
     "ast_hash": "5dfb54dc7de79b23d93d5f858b7af87c",
     "semantic_hash": ""
   },
   "benchmarks/bench-agent.sh": {
-    "mtime": 1785260680.7330947,
+    "mtime": 1785264659.857962,
     "ast_hash": "d66e738df3bcd76b2d26a8dbad5742df",
     "semantic_hash": ""
   }

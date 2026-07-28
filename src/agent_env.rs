@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::compaction::CompactionPolicy;
-use crate::providers::LlmProvider;
+use crate::providers::{LlmProvider, ThinkingLevel};
 
 /// Compaction settings parsed from the env file when `DAIMONOS_AGENT_CONTEXT_WINDOW`
 /// is omitted (vikunja #965): everything a [`CompactionPolicy`] needs except
@@ -91,6 +91,12 @@ pub struct AgentEnv {
     /// line so a stalled vs. active agent is visible in the thread (#1070).
     /// From `DAIMONOS_AGENT_TIMESTAMP_TURNS`; default false.
     pub timestamp_turns: bool,
+    /// Reasoning effort for the model on both the one-shot `agent` and the
+    /// ACP prompt paths (#1122). From the optional `DAIMONOS_AGENT_THINKING`
+    /// key; default `medium` so configs without the key are unaffected (the
+    /// prior hardwired value). Both command paths forward this into the
+    /// per-turn `CompleteOpts.thinking`.
+    pub thinking: ThinkingLevel,
 }
 
 impl AgentEnv {
@@ -194,6 +200,11 @@ impl AgentEnv {
             "DAIMONOS_AGENT_TIMESTAMP_TURNS",
             path,
         )?;
+        let thinking = parse_thinking(
+            vars.get("DAIMONOS_AGENT_THINKING"),
+            "DAIMONOS_AGENT_THINKING",
+            path,
+        )?;
 
         Ok(AgentEnv {
             provider,
@@ -206,6 +217,7 @@ impl AgentEnv {
             models,
             compaction,
             timestamp_turns,
+            thinking,
         })
     }
 
@@ -502,6 +514,19 @@ fn parse_bool_flag(raw: Option<&String>, key: &str, path: &Path) -> Result<bool,
     }
 }
 
+/// Parse an optional reasoning-effort level (#1122). Absent/empty =>
+/// [`ThinkingLevel::Medium`] (the prior hardwired default, so existing configs
+/// are unaffected). Delegates parsing to [`ThinkingLevel::from_input`] — the
+/// single string<->enum mapping — and prefixes the key + path on error, matching
+/// the rest of agent-env validation (no silent fallback).
+fn parse_thinking(raw: Option<&String>, key: &str, path: &Path) -> Result<ThinkingLevel, String> {
+    match raw.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        None => Ok(ThinkingLevel::default()),
+        Some(value) => ThinkingLevel::from_input(value)
+            .map_err(|msg| format!("agent configuration for {}: {key} {msg}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +796,47 @@ mod tests {
         let err = load_str(&s).unwrap_err();
         assert!(err.contains("DAIMONOS_AGENT_TIMESTAMP_TURNS"), "{err}");
         assert!(err.contains("invalid"), "{err}");
+    }
+
+    #[test]
+    fn thinking_defaults_to_medium_when_absent() {
+        // An existing config with no DAIMONOS_AGENT_THINKING key must be
+        // unaffected: reasoning effort stays Medium (the prior hardwired value).
+        assert_eq!(
+            load_str(&base()).unwrap().thinking,
+            crate::providers::ThinkingLevel::Medium
+        );
+    }
+
+    #[test]
+    fn thinking_parses_each_level() {
+        use crate::providers::ThinkingLevel;
+        let cases = [
+            ("off", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("xhigh", ThinkingLevel::XHigh),
+            ("max", ThinkingLevel::Max),
+            ("HIGH", ThinkingLevel::High),
+        ];
+        for (raw, expected) in cases {
+            let s = base() + &format!("DAIMONOS_AGENT_THINKING={raw}\n");
+            assert_eq!(
+                load_str(&s).unwrap().thinking,
+                expected,
+                "expected {raw} -> {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_rejects_garbage_value() {
+        let s = base() + "DAIMONOS_AGENT_THINKING=turbo\n";
+        let err = load_str(&s).unwrap_err();
+        assert!(err.contains("DAIMONOS_AGENT_THINKING"), "{err}");
+        assert!(err.contains("turbo"), "{err}");
     }
 
     #[test]
