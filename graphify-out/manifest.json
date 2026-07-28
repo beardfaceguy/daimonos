@@ -24,70 +24,10 @@
     "ast_hash": "a9399d70a31d576f0435e776cae4934e",
     "semantic_hash": "a9399d70a31d576f0435e776cae4934e"
   },
-  "benchmarks/analyze-results.py": {
-    "mtime": 1783453010.079877,
-    "ast_hash": "7dc72b0c3cd8b641bb2a34ba70a3a497",
-    "semantic_hash": "7dc72b0c3cd8b641bb2a34ba70a3a497"
-  },
-  "benchmarks/analyze-runtimes.py": {
-    "mtime": 1783978125.1801138,
-    "ast_hash": "989fb41e0f36ce4fa8dfd8b29680fbfe",
-    "semantic_hash": "989fb41e0f36ce4fa8dfd8b29680fbfe"
-  },
   "benchmarks/check-task.js": {
     "mtime": 1783978125.1801138,
     "ast_hash": "3db05286027b42c208f343dcbb9c26fe",
     "semantic_hash": "3db05286027b42c208f343dcbb9c26fe"
-  },
-  "benchmarks/compare-models.py": {
-    "mtime": 1779353632.6927505,
-    "ast_hash": "2679b6f15953c84ef2c752439aca8601",
-    "semantic_hash": "2679b6f15953c84ef2c752439aca8601"
-  },
-  "benchmarks/cursor-attribute.py": {
-    "mtime": 1784352158.960194,
-    "ast_hash": "02f7b334fd516c1dee2f4ef0fcff091a",
-    "semantic_hash": ""
-  },
-  "benchmarks/models.json": {
-    "mtime": 1783978125.1811137,
-    "ast_hash": "d426043d62c445f7c68b1b4afeb9b6c5",
-    "semantic_hash": "d426043d62c445f7c68b1b4afeb9b6c5"
-  },
-  "benchmarks/remote/collect-results.sh": {
-    "mtime": 1779353632.689789,
-    "ast_hash": "f5fe5aeb5681f4b14e392232f456c653",
-    "semantic_hash": "f5fe5aeb5681f4b14e392232f456c653"
-  },
-  "benchmarks/remote/provision-daimonos.sh": {
-    "mtime": 1779353632.692024,
-    "ast_hash": "192de39c3d51f88ecdfd96fda62afb5f",
-    "semantic_hash": "192de39c3d51f88ecdfd96fda62afb5f"
-  },
-  "benchmarks/remote/provision-ubuntu.sh": {
-    "mtime": 1781856636.9807894,
-    "ast_hash": "26259fd9e93199204b339e7d54c5ff8b",
-    "semantic_hash": "26259fd9e93199204b339e7d54c5ff8b"
-  },
-  "benchmarks/remote/run-remote-benchmark.sh": {
-    "mtime": 1779353632.6914613,
-    "ast_hash": "533ab2b337fe77623105c4c79bfdc772",
-    "semantic_hash": "533ab2b337fe77623105c4c79bfdc772"
-  },
-  "benchmarks/run-all-arms.sh": {
-    "mtime": 1783457050.5059052,
-    "ast_hash": "16902142e85ed0b776972ce8d29c76f2",
-    "semantic_hash": "16902142e85ed0b776972ce8d29c76f2"
-  },
-  "benchmarks/run-benchmark.sh": {
-    "mtime": 1783453010.079877,
-    "ast_hash": "a63e9a171f76d9076a9d3080eb99e38f",
-    "semantic_hash": "a63e9a171f76d9076a9d3080eb99e38f"
-  },
-  "benchmarks/run-runtime-benchmark.sh": {
-    "mtime": 1783978125.1811137,
-    "ast_hash": "c87d21ff17ab291d3c4446a9eb1c89f5",
-    "semantic_hash": "c87d21ff17ab291d3c4446a9eb1c89f5"
   },
   "benchmarks/server-bench/bench.py": {
     "mtime": 1781856636.9807894,
@@ -123,11 +63,6 @@
     "mtime": 1779353632.6928592,
     "ast_hash": "5175ea01919f988d6fa1c19c24fab01e",
     "semantic_hash": "5175ea01919f988d6fa1c19c24fab01e"
-  },
-  "benchmarks/setup-mcp.sh": {
-    "mtime": 1779353632.6908514,
-    "ast_hash": "a488d468fa058ddf24fc30c3b2300943",
-    "semantic_hash": "a488d468fa058ddf24fc30c3b2300943"
   },
   "benchmarks/tasks/01-read-understand.json": {
     "mtime": 1783364996.0131116,
@@ -255,7 +190,7 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785255296.7492938,
+    "mtime": 1785256442.9280264,
     "ast_hash": "634535c688172300c3539f3a004119f6",
     "semantic_hash": ""
   },
@@ -554,20 +489,10 @@
     "ast_hash": "b88cd6c303b9c58a5b0740bbd2587754",
     "semantic_hash": "b88cd6c303b9c58a5b0740bbd2587754"
   },
-  "tests/test_bench_analyze.py": {
-    "mtime": 1783364814.3702247,
-    "ast_hash": "5b8b0019171bd2a830868b1843c3343c",
-    "semantic_hash": "5b8b0019171bd2a830868b1843c3343c"
-  },
   "tests/test_bench_checks.py": {
     "mtime": 1783365294.6878138,
     "ast_hash": "1c02c99a450610a7a3cd2325676d9bdd",
     "semantic_hash": "1c02c99a450610a7a3cd2325676d9bdd"
-  },
-  "tests/test_bench_pipeline.py": {
-    "mtime": 1783382707.7094991,
-    "ast_hash": "15622ca635350bbea6c50ce52e0e85a8",
-    "semantic_hash": "15622ca635350bbea6c50ce52e0e85a8"
   },
   "tests/test_cli_prompts.py": {
     "mtime": 1784352158.972194,
@@ -775,8 +700,8 @@
     "semantic_hash": ""
   },
   "benchmarks/README.md": {
-    "mtime": 1784352158.960194,
-    "ast_hash": "cd1f5ee0bf83e1e4b0a978916a541cd3",
+    "mtime": 1785260667.2542384,
+    "ast_hash": "e3eaab79c9a0537517abd0aa1620d8b2",
     "semantic_hash": ""
   },
   "benchmarks/results/2026-07-06-gated-three-arm.md": {
@@ -924,13 +849,8 @@
     "ast_hash": "cf9592ec1876a653cb021ae21e4b0e0e",
     "semantic_hash": ""
   },
-  "tests/test_benchmark_scripts.py": {
-    "mtime": 1784352158.972194,
-    "ast_hash": "3dc8c4adee21dbb0ef4854d257c691c2",
-    "semantic_hash": ""
-  },
   "src/mcp_bridge.rs": {
-    "mtime": 1785255401.067176,
+    "mtime": 1785256442.9280264,
     "ast_hash": "a77d5b43d4152de561acc875ebd57c4c",
     "semantic_hash": ""
   },
@@ -1072,6 +992,16 @@
   "src/session_core.rs": {
     "mtime": 1785253213.5898077,
     "ast_hash": "3bc9a5695803d59dd9e78b1e0a3677b3",
+    "semantic_hash": ""
+  },
+  "benchmarks/analyze.py": {
+    "mtime": 1785260578.7581823,
+    "ast_hash": "5dfb54dc7de79b23d93d5f858b7af87c",
+    "semantic_hash": ""
+  },
+  "benchmarks/bench-agent.sh": {
+    "mtime": 1785260680.7330947,
+    "ast_hash": "d66e738df3bcd76b2d26a8dbad5742df",
     "semantic_hash": ""
   }
 }
