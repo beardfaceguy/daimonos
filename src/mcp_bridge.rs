@@ -750,7 +750,23 @@ impl McpBridge {
     /// self-server tool that leaks into a call (stale catalog, replayed
     /// history, hand-built request) fails with an explicit error rather than a
     /// generic miss.
-    pub fn self_dispatch_refused(&self, name: &str) -> Option<String> {
+    ///
+    /// A refused self-server contributes NO routes, so a name that IS a live
+    /// route is always a legitimately-served tool and is never refused. This
+    /// check comes first so a legitimate forwarded server whose sanitized
+    /// namespace prefix happens to collide with a refused self-server's prefix
+    /// (sanitization is many-to-one, e.g. `self.srv` and `self_srv` both map to
+    /// `mcp__self_srv__`) keeps working: the guard only fires for a name that
+    /// matches a refused prefix AND is not actually served here.
+    pub async fn self_dispatch_refused(&self, name: &str) -> Option<String> {
+        if self.refused_self_prefixes.is_empty() {
+            return None;
+        }
+        // A live route is a legitimately-served tool: never refuse it, even if
+        // its sanitized prefix collides with a refused self-server's.
+        if self.runtime.read().await.routes.contains_key(name) {
+            return None;
+        }
         self.refused_self_prefixes
             .iter()
             .any(|prefix| name.starts_with(prefix.as_str()))
@@ -1879,7 +1895,7 @@ mod tests {
         // A name under the rejected self-server's namespace is a prohibited
         // self-dispatch.
         let namespaced = namespaced_name("selfsrv", "exec");
-        let refusal = bridge.self_dispatch_refused(&namespaced);
+        let refusal = bridge.self_dispatch_refused(&namespaced).await;
         assert!(
             refusal
                 .as_deref()
@@ -1888,9 +1904,43 @@ mod tests {
         );
         // A native tool name is NOT refused by provenance (leaf mcp server must
         // keep dispatching its own tools).
-        assert_eq!(bridge.self_dispatch_refused("exec"), None);
+        assert_eq!(bridge.self_dispatch_refused("exec").await, None);
         // An unrelated unknown name is not this bridge's concern.
-        assert_eq!(bridge.self_dispatch_refused("totally_unknown"), None);
+        assert_eq!(bridge.self_dispatch_refused("totally_unknown").await, None);
+    }
+
+    #[tokio::test]
+    async fn self_dispatch_refusal_does_not_false_positive_on_a_live_route() {
+        // Regression (codeJung PR #113): namespace-prefix sanitization is
+        // many-to-one, so a legitimate forwarded server can share a refused
+        // self-server's prefix. A name that IS a live route must never be
+        // refused — a refused self-server contributes no routes, so a live
+        // route is always legitimately served. (task #1116.)
+        let mut bridge = McpBridge::empty();
+        // Simulate a refused self-server whose sanitized prefix is `mcp__s_v__`.
+        bridge
+            .refused_self_prefixes
+            .push(self_namespace_prefix("s.v"));
+        let colliding = namespaced_name("s.v", "do_it"); // sanitizes into the same prefix
+                                                         // With no live route, a name under the refused prefix is refused.
+        assert!(
+            bridge.self_dispatch_refused(&colliding).await.is_some(),
+            "a non-route name under a refused prefix should be refused"
+        );
+        // Register that exact name as a live route (a legitimate colliding
+        // server): it must now be allowed through.
+        bridge.runtime.get_mut().routes.insert(
+            colliding.clone(),
+            Route {
+                lease: 0,
+                original: "do_it".to_string(),
+            },
+        );
+        assert_eq!(
+            bridge.self_dispatch_refused(&colliding).await,
+            None,
+            "a live route must never be refused, even under a colliding prefix"
+        );
     }
 
     #[tokio::test]

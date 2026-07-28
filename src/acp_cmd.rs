@@ -1644,7 +1644,7 @@ fn build_remote_dispatch_hook(bridge_slot: BridgeSlot) -> RemoteToolHook {
             // available." Answer with an explicit prohibition instead, so a
             // self-server tool that leaks in (stale catalog, replayed history,
             // hand-built call) fails legibly rather than silently missing.
-            if let Some(reason) = bridge.self_dispatch_refused(&name) {
+            if let Some(reason) = bridge.self_dispatch_refused(&name).await {
                 return Some(RemoteToolResult {
                     content: reason,
                     is_error: true,
