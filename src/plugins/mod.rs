@@ -109,7 +109,7 @@ mod tests {
     async fn every_builtin_cli_module_is_in_the_canonical_registry() {
         let source_modules: BTreeSet<_> = include_str!("mod.rs")
             .lines()
-            .filter_map(|line| line.strip_prefix("pub mod "))
+            .filter_map(|line| line.trim().strip_prefix("pub mod "))
             .filter_map(|line| line.strip_suffix(';'))
             .filter(|module| !matches!(*module, "discord" | "generic_cli" | "x07"))
             .collect();

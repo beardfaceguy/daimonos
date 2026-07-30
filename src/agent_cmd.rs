@@ -655,8 +655,10 @@ mod tests {
             !tool_result_text.contains("plugin not available"),
             "agent execute_script must use the canonical built-in registry: {tool_result_text}"
         );
-        assert!(
-            tool_result_text.contains("\"clean\":true"),
+        let tool_result: serde_json::Value = serde_json::from_str(tool_result_text)
+            .expect("execute_script ToolResult should be JSON");
+        assert_eq!(
+            tool_result["result"]["clean"], true,
             "git status should execute through the plugin: {tool_result_text}"
         );
     }
