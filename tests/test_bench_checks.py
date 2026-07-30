@@ -1,22 +1,24 @@
-"""Tests for benchmarks/check-task.js — the per-task correctness gate (#929).
+"""Tests for benchmarks/check_task.py — the per-task correctness gate (#929).
 
 Invokes the checker with synthetic task/raw/summary files and asserts the
-summary is stamped with checks_passed / checks_total / correct.
+summary is stamped with checks_passed / checks_total / correct. (Ported from
+the check-task.js version when the harness moved off JavaScript, vikunja #1126.)
 """
 
 import json
 import os
 import subprocess
+import sys
 
 
 CHECKER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "benchmarks", "check-task.js",
+    "benchmarks", "check_task.py",
 )
 
 
-def run_checker(tmp_path, checks, final_text, workspace_files=None):
-    """Write synthetic inputs, run check-task.js, return the updated summary."""
+def run_checker(tmp_path, checks, final_text, workspace_files=None, raw_format=None):
+    """Write synthetic inputs, run check_task.py, return the updated summary."""
     task_file = tmp_path / "task.json"
     task_file.write_text(json.dumps({"id": "t", "name": "t", "checks": checks}))
 
@@ -31,10 +33,10 @@ def run_checker(tmp_path, checks, final_text, workspace_files=None):
     summary_file = tmp_path / "t.json"
     summary_file.write_text(json.dumps({"task_id": "t", "success": True}))
 
-    proc = subprocess.run(
-        ["node", CHECKER, str(task_file), str(raw_file), str(workspace), str(summary_file)],
-        capture_output=True, text=True, timeout=120,
-    )
+    cmd = [sys.executable, CHECKER, str(task_file), str(raw_file), str(workspace), str(summary_file)]
+    if raw_format is not None:
+        cmd.append(raw_format)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, f"checker failed: {proc.stderr}"
     return json.loads(summary_file.read_text())
 
@@ -127,9 +129,28 @@ def test_missing_result_event_fails_response_checks(tmp_path):
     summary_file = tmp_path / "t.json"
     summary_file.write_text(json.dumps({"task_id": "t"}))
     proc = subprocess.run(
-        ["node", CHECKER, str(task_file), str(raw_file), str(ws), str(summary_file)],
+        [sys.executable, CHECKER, str(task_file), str(raw_file), str(ws), str(summary_file)],
         capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode == 0
     s = json.loads(summary_file.read_text())
     assert s["correct"] is False
+
+
+def test_text_format_uses_whole_stdout_as_response(tmp_path):
+    """daimonos writes plain assistant text (not events); the `text` format
+    treats the whole raw file as the response."""
+    task_file = tmp_path / "task.json"
+    task_file.write_text(json.dumps({"id": "t", "checks": [{"type": "response", "all": ["hello"]}]}))
+    raw_file = tmp_path / "t.raw.txt"
+    raw_file.write_text("plain hello world, no json here")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    summary_file = tmp_path / "t.json"
+    summary_file.write_text(json.dumps({"task_id": "t"}))
+    proc = subprocess.run(
+        [sys.executable, CHECKER, str(task_file), str(raw_file), str(ws), str(summary_file), "text"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0
+    assert json.loads(summary_file.read_text())["correct"] is True
