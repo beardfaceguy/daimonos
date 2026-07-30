@@ -1010,8 +1010,8 @@
     "semantic_hash": ""
   },
   "benchmarks/summarize.py": {
-    "mtime": 1785299233.7592049,
-    "ast_hash": "0141d5d3a99c795a5d2adec109f25bc5",
+    "mtime": 1785373457.6865423,
+    "ast_hash": "cd26aec0e5d724ce4cfe870dbd022368",
     "semantic_hash": ""
   }
 }

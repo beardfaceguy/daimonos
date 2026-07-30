@@ -7,7 +7,7 @@ given run dir and prints a fixed-width table + totals.
 
 Usage: summarize.py <run-dir>
 
-`cost_usd` may be null (cursor/codex emit no per-run cost) — such rows show
+`cost_usd` may be null (some runtimes emit no per-run cost) — such rows show
 "n/a" and are excluded from the cost total, which then prints "n/a" if no row
 carried a cost.
 """
@@ -24,7 +24,10 @@ def load_rows(run_dir):
         try:
             with open(path, encoding="utf-8") as handle:
                 rows.append(json.load(handle))
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            # Don't silently drop a malformed summary — that would under-report
+            # results with no indication. Warn and skip so the table still prints.
+            sys.stderr.write(f"warning: skipping unreadable summary {path}: {exc}\n")
             continue
     rows.sort(key=lambda r: str(r.get("task_id", "")))
     return rows

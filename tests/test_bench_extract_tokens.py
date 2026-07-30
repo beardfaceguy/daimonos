@@ -36,7 +36,9 @@ def run_extractor(tmp_path, runtime, raw_text, tokenlog_text=None,
         started, ended, wall_ms, exit_code, str(out_file),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    assert proc.returncode == 0, f"extractor failed: {proc.stderr}"
+    assert proc.returncode == 0, (
+        f"extractor failed (rc={proc.returncode})\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
     return json.loads(out_file.read_text())
 
 
