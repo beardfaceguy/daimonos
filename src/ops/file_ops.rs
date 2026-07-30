@@ -137,19 +137,28 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
         }
     }
 
+    let mut resp = json!({"applied": applied});
+    if !diffs.is_empty() {
+        resp["diffs"] = json!(diffs);
+    }
+    // Additive (vikunja #1127): report per-edit failures so the model can react
+    // precisely (fix the one bad `old`) instead of re-reading the whole file.
+    // Absent entirely on full success.
+    if !failures.is_empty() {
+        resp["failures"] = json!(failures);
+    }
+
+    // Only touch the file when something actually changed. On a total miss
+    // (applied == 0) the content is byte-identical to what we read, so skip the
+    // write and the read-cache invalidation entirely — no pointless churn, and
+    // the `failures` array already tells the model what to fix.
+    if applied == 0 {
+        return Response::ok(resp);
+    }
+
     match tokio::fs::write(&path, &content).await {
         Ok(()) => {
             session.invalidate_read_cache(&path);
-            let mut resp = json!({"applied": applied});
-            if !diffs.is_empty() {
-                resp["diffs"] = json!(diffs);
-            }
-            // Additive (vikunja #1127): report per-edit failures so the model
-            // can react precisely (fix the one bad `old`) instead of re-reading
-            // the whole file. Absent entirely on full success.
-            if !failures.is_empty() {
-                resp["failures"] = json!(failures);
-            }
             Response::ok(resp)
         }
         Err(e) => Response::err(4, &format!("write: {e}")),
@@ -187,75 +196,76 @@ fn apply_one_edit(content: &str, old: &str, new: &str) -> EditOutcome {
         ));
     }
 
-    // 2. Leading-whitespace-tolerant, line-wise match.
-    if let Some(updated) = replace_ignoring_leading_ws(content, old, new) {
-        return updated;
+    // 2. Leading-whitespace-tolerant match (single-line edits only).
+    if let Some(outcome) = replace_single_line_ignoring_leading_ws(content, old, new) {
+        return outcome;
     }
 
     EditOutcome::Failed("not found: `old` did not match the file".to_string())
 }
 
-/// Try to match `old` against a run of `content` lines ignoring each line's
-/// leading whitespace, and if it matches uniquely, splice in `new` re-indented
-/// to the file's actual leading whitespace at the match site. Returns `None`
-/// when there is no whitespace-tolerant match; returns `Some(Failed(..))` when
-/// the match is ambiguous (>1 site) so the caller surfaces that too.
-fn replace_ignoring_leading_ws(content: &str, old: &str, new: &str) -> Option<EditOutcome> {
-    let content_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old.lines().collect();
-    if old_lines.is_empty() {
+/// Whitespace-tolerant match for a SINGLE-LINE `old` (the common case where
+/// the model reproduces one line but mangles its indentation). Scoped to one
+/// line deliberately: re-indenting a multi-line `new` whose line count differs
+/// from `old` is ambiguous (which file indent applies to inserted lines?), so
+/// multi-line `old`/`new` are left to the exact-match rung and otherwise fail
+/// loudly rather than risk mis-indenting an inserted block.
+///
+/// Matches a content line whose `trim_start()` equals the trimmed `old`, and
+/// rewrites it as the file line's actual leading whitespace + the trimmed
+/// `new`. Returns `None` when there's no such match; `Some(Failed(..))` when
+/// the trimmed `old` matches more than one line (ambiguous).
+///
+/// Note: matching keys on leading whitespace only (`trim_start`), so lines
+/// differing solely in TRAILING whitespace are treated as distinct.
+fn replace_single_line_ignoring_leading_ws(
+    content: &str,
+    old: &str,
+    new: &str,
+) -> Option<EditOutcome> {
+    // Single-line only: bail if either side spans multiple lines.
+    if old.contains('\n') || new.contains('\n') {
         return None;
     }
-    let key: Vec<&str> = old_lines.iter().map(|l| l.trim_start()).collect();
-
-    // Find every window of content whose trimmed lines equal the trimmed `old`.
-    let mut matches: Vec<usize> = Vec::new();
-    if content_lines.len() >= old_lines.len() {
-        for start in 0..=content_lines.len() - old_lines.len() {
-            let window = &content_lines[start..start + old_lines.len()];
-            if window.iter().zip(&key).all(|(cl, k)| cl.trim_start() == *k) {
-                matches.push(start);
-            }
-        }
+    let old_key = old.trim_start();
+    if old_key.is_empty() {
+        return None;
     }
+
+    let matches: Vec<usize> = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start() == old_key)
+        .map(|(i, _)| i)
+        .collect();
 
     match matches.len() {
         0 => None,
         1 => {
-            let start = matches[0];
-            // Re-indent `new` to the file's leading whitespace at the match
-            // site (per matched line; new lines beyond the matched run reuse
-            // the first line's indent). This preserves the file's real style.
-            let new_lines: Vec<&str> = new.lines().collect();
-            let indents: Vec<&str> = (0..old_lines.len())
-                .map(|i| leading_ws(content_lines[start + i]))
+            let target = matches[0];
+            let rebuilt: Vec<String> = content
+                .lines()
+                .enumerate()
+                .map(|(i, line)| {
+                    if i == target {
+                        // Keep the file's real indentation; swap the content.
+                        format!("{}{}", leading_ws(line), new.trim_start())
+                    } else {
+                        line.to_string()
+                    }
+                })
                 .collect();
-            let first_indent = indents.first().copied().unwrap_or("");
-            let mut rebuilt: Vec<String> = Vec::new();
-            for (i, nl) in new_lines.iter().enumerate() {
-                let indent = indents.get(i).copied().unwrap_or(first_indent);
-                if nl.trim().is_empty() {
-                    rebuilt.push(String::new());
-                } else {
-                    rebuilt.push(format!("{indent}{}", nl.trim_start()));
-                }
-            }
-            // Reassemble the file: lines before, the rebuilt block, lines after.
-            let mut out: Vec<&str> = Vec::new();
-            out.extend_from_slice(&content_lines[..start]);
-            let rebuilt_refs: Vec<&str> = rebuilt.iter().map(|s| s.as_str()).collect();
-            out.extend_from_slice(&rebuilt_refs);
-            out.extend_from_slice(&content_lines[start + old_lines.len()..]);
-            let mut joined = out.join("\n");
-            // Preserve a trailing newline if the original had one.
+            let mut joined = rebuilt.join("\n");
+            // Preserve a trailing newline iff the original had one (so a file
+            // with no final newline round-trips unchanged in byte terms).
             if content.ends_with('\n') {
                 joined.push('\n');
             }
             Some(EditOutcome::Applied(joined))
         }
         n => Some(EditOutcome::Failed(format!(
-            "ambiguous: `old` matches {n} places (ignoring indentation); \
-             include more surrounding lines so it is unique"
+            "ambiguous: `old` matches {n} lines (ignoring indentation); \
+             include more surrounding context so it is unique"
         ))),
     }
 }
@@ -1012,6 +1022,121 @@ mod tests {
         assert!(
             d.get("failures").is_none(),
             "no failures key on full success"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_total_miss_leaves_file_byte_identical_no_trailing_newline() {
+        // Regression guard (codeJung): a file with no trailing newline must
+        // round-trip byte-identically when nothing matches (we skip the write).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let original = "no newline at eof"; // deliberately no trailing \n
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("nn.txt".into()),
+                s: Some(original.into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("nn.txt".into()),
+                a: Some(vec!["absent".into(), "x".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert_eq!(r.d.unwrap()["applied"], 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nn.txt")).unwrap(),
+            original,
+            "a no-match must not alter the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_whitespace_tolerant_deletion_to_empty() {
+        // new == "" deletes the matched line's content, keeping the file's
+        // indentation slot; guards the single-line ws path's empty-`new` case.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("del.rs".into()),
+                s: Some("fn f() {\n\tlet dead = 1;\n}\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        // Tab-indented file; model uses spaces + empty replacement.
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("del.rs".into()),
+                a: Some(vec!["    let dead = 1;".into(), "".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert_eq!(r.d.unwrap()["applied"], 1);
+        // Line content removed; the tab indentation slot remains (empty line).
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("del.rs")).unwrap(),
+            "fn f() {\n\t\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_multiline_ws_mismatch_fails_loudly_not_misindented() {
+        // A multi-line `old` whose indentation doesn't match exactly is NOT
+        // whitespace-tolerantly applied (that path is single-line only); it
+        // must report a structured failure rather than risk a mis-indented edit.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("ml.rs".into()),
+                s: Some("fn f() {\n\tlet a = 1;\n\tlet b = 2;\n}\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("ml.rs".into()),
+                // 4-space indent, two lines: no exact match (file uses tabs),
+                // and multi-line is out of scope for the ws-tolerant path.
+                a: Some(vec![
+                    "    let a = 1;\n    let b = 2;".into(),
+                    "    let a = 10;\n    let b = 20;".into(),
+                ]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["applied"], 0);
+        assert_eq!(d["failures"].as_array().unwrap().len(), 1);
+        // File unchanged (no mis-indented partial edit).
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ml.rs")).unwrap(),
+            "fn f() {\n\tlet a = 1;\n\tlet b = 2;\n}\n"
         );
     }
 

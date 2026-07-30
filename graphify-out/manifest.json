@@ -310,8 +310,8 @@
     "semantic_hash": ""
   },
   "src/ops/file_ops.rs": {
-    "mtime": 1785382662.6791217,
-    "ast_hash": "924c753133b8ee5e7c0a5374fa67bd75",
+    "mtime": 1785384162.9100852,
+    "ast_hash": "7059a0166b8d8e979b6cdf107334f719",
     "semantic_hash": ""
   },
   "src/ops/mod.rs": {
