@@ -485,7 +485,7 @@
     "semantic_hash": "b88cd6c303b9c58a5b0740bbd2587754"
   },
   "tests/test_bench_checks.py": {
-    "mtime": 1785299123.8004527,
+    "mtime": 1785377691.026783,
     "ast_hash": "6d02fa064741cc78942d2bb959106f09",
     "semantic_hash": ""
   },
@@ -665,7 +665,7 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1785372918.302631,
+    "mtime": 1785377691.0027833,
     "ast_hash": "e63530d0e158276d691554c1bce13322",
     "semantic_hash": ""
   },
@@ -695,8 +695,8 @@
     "semantic_hash": ""
   },
   "benchmarks/README.md": {
-    "mtime": 1785372653.048625,
-    "ast_hash": "83a77e356c8326a078ea7e2b77e9adc2",
+    "mtime": 1785377857.6504607,
+    "ast_hash": "8f91bca15787e57b6dbb8f31142d0e5e",
     "semantic_hash": ""
   },
   "benchmarks/results/2026-07-06-gated-three-arm.md": {
@@ -995,23 +995,28 @@
     "semantic_hash": ""
   },
   "benchmarks/bench-agent.sh": {
-    "mtime": 1785299245.8500676,
+    "mtime": 1785377691.003866,
     "ast_hash": "61ce682ed5044bbc38fc3198f93679f6",
     "semantic_hash": ""
   },
   "benchmarks/bench-cursor.sh": {
-    "mtime": 1785299282.0826645,
+    "mtime": 1785377691.0040007,
     "ast_hash": "42f87d4d30d141cda0684e57af85306c",
     "semantic_hash": ""
   },
   "benchmarks/check_task.py": {
-    "mtime": 1785373057.1620634,
+    "mtime": 1785377691.004109,
     "ast_hash": "91990716057a80388bd052400b6e1dba",
     "semantic_hash": ""
   },
   "benchmarks/summarize.py": {
-    "mtime": 1785373457.6865423,
+    "mtime": 1785377691.0042205,
     "ast_hash": "cd26aec0e5d724ce4cfe870dbd022368",
+    "semantic_hash": ""
+  },
+  "benchmarks/bench-codex.sh": {
+    "mtime": 1785378344.981927,
+    "ast_hash": "949608996cc6b3f6c53e4f1eaae9eff8",
     "semantic_hash": ""
   }
 }

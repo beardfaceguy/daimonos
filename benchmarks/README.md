@@ -14,6 +14,8 @@ keep current.
 | File | Role |
 |---|---|
 | `bench-agent.sh` | The runner. Runs the task suite through `daimonos agent`. |
+| `bench-cursor.sh` | Runs the suite through `cursor-agent` (external-agent comparison). |
+| `bench-codex.sh` | Runs the suite through `codex exec` via OpenRouter (controlled harness A/B). |
 | `analyze.py` | Aggregates one or more result dirs, grouped by model, correctness-gated. |
 | `tasks/*.json` | The task suite (prompt + machine-checkable `checks`). |
 | `workspace/` | A git repo the agent operates in; reset (`git checkout` + `clean`) before each task. |
