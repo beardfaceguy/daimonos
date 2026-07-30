@@ -121,13 +121,19 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
 
     let mut applied = 0;
     let mut diffs: Vec<serde_json::Value> = Vec::new();
+    let mut failures: Vec<serde_json::Value> = Vec::new();
     for pair in edits.chunks(2) {
         let old = &pair[0];
         let new = &pair[1];
-        if content.contains(old.as_str()) {
-            content = content.replacen(old.as_str(), new, 1);
-            applied += 1;
-            diffs.push(json!([old, new]));
+        match apply_one_edit(&content, old, new) {
+            EditOutcome::Applied(updated) => {
+                content = updated;
+                applied += 1;
+                diffs.push(json!([old, new]));
+            }
+            EditOutcome::Failed(reason) => {
+                failures.push(json!({"old": old, "reason": reason}));
+            }
         }
     }
 
@@ -138,10 +144,126 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
             if !diffs.is_empty() {
                 resp["diffs"] = json!(diffs);
             }
+            // Additive (vikunja #1127): report per-edit failures so the model
+            // can react precisely (fix the one bad `old`) instead of re-reading
+            // the whole file. Absent entirely on full success.
+            if !failures.is_empty() {
+                resp["failures"] = json!(failures);
+            }
             Response::ok(resp)
         }
         Err(e) => Response::err(4, &format!("write: {e}")),
     }
+}
+
+/// Outcome of trying to apply a single `old -> new` edit to file content.
+enum EditOutcome {
+    /// Matched (exactly or whitespace-tolerantly); carries the updated content.
+    Applied(String),
+    /// Not applied; carries a human-readable reason for the model to act on.
+    Failed(String),
+}
+
+/// Apply one `old -> new` edit with a resilient match ladder (vikunja #1127,
+/// approach adapted from Aider's editblock matcher). First it tries an exact
+/// substring match, but treats ambiguity (more than one occurrence) as a hard
+/// error rather than a silent first-match, so the model cannot clobber the
+/// wrong site. Failing that, it falls back to a line-wise,
+/// leading-whitespace-tolerant match (the model routinely mangles indentation
+/// uniformly): it matches on `trim_start()`-equal lines and rewrites using the
+/// file's actual indentation, again guarding against a non-unique match.
+/// A miss returns a `Failed` with a reason, so the caller reports it as a
+/// structured failure rather than silently dropping the edit.
+fn apply_one_edit(content: &str, old: &str, new: &str) -> EditOutcome {
+    // 1. Exact substring, with an ambiguity guard.
+    let exact_count = content.matches(old).count();
+    if exact_count == 1 {
+        return EditOutcome::Applied(content.replacen(old, new, 1));
+    }
+    if exact_count > 1 {
+        return EditOutcome::Failed(format!(
+            "ambiguous: `old` matches {exact_count} places exactly; \
+             include more surrounding lines so it is unique"
+        ));
+    }
+
+    // 2. Leading-whitespace-tolerant, line-wise match.
+    if let Some(updated) = replace_ignoring_leading_ws(content, old, new) {
+        return updated;
+    }
+
+    EditOutcome::Failed("not found: `old` did not match the file".to_string())
+}
+
+/// Try to match `old` against a run of `content` lines ignoring each line's
+/// leading whitespace, and if it matches uniquely, splice in `new` re-indented
+/// to the file's actual leading whitespace at the match site. Returns `None`
+/// when there is no whitespace-tolerant match; returns `Some(Failed(..))` when
+/// the match is ambiguous (>1 site) so the caller surfaces that too.
+fn replace_ignoring_leading_ws(content: &str, old: &str, new: &str) -> Option<EditOutcome> {
+    let content_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.is_empty() {
+        return None;
+    }
+    let key: Vec<&str> = old_lines.iter().map(|l| l.trim_start()).collect();
+
+    // Find every window of content whose trimmed lines equal the trimmed `old`.
+    let mut matches: Vec<usize> = Vec::new();
+    if content_lines.len() >= old_lines.len() {
+        for start in 0..=content_lines.len() - old_lines.len() {
+            let window = &content_lines[start..start + old_lines.len()];
+            if window.iter().zip(&key).all(|(cl, k)| cl.trim_start() == *k) {
+                matches.push(start);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => None,
+        1 => {
+            let start = matches[0];
+            // Re-indent `new` to the file's leading whitespace at the match
+            // site (per matched line; new lines beyond the matched run reuse
+            // the first line's indent). This preserves the file's real style.
+            let new_lines: Vec<&str> = new.lines().collect();
+            let indents: Vec<&str> = (0..old_lines.len())
+                .map(|i| leading_ws(content_lines[start + i]))
+                .collect();
+            let first_indent = indents.first().copied().unwrap_or("");
+            let mut rebuilt: Vec<String> = Vec::new();
+            for (i, nl) in new_lines.iter().enumerate() {
+                let indent = indents.get(i).copied().unwrap_or(first_indent);
+                if nl.trim().is_empty() {
+                    rebuilt.push(String::new());
+                } else {
+                    rebuilt.push(format!("{indent}{}", nl.trim_start()));
+                }
+            }
+            // Reassemble the file: lines before, the rebuilt block, lines after.
+            let mut out: Vec<&str> = Vec::new();
+            out.extend_from_slice(&content_lines[..start]);
+            let rebuilt_refs: Vec<&str> = rebuilt.iter().map(|s| s.as_str()).collect();
+            out.extend_from_slice(&rebuilt_refs);
+            out.extend_from_slice(&content_lines[start + old_lines.len()..]);
+            let mut joined = out.join("\n");
+            // Preserve a trailing newline if the original had one.
+            if content.ends_with('\n') {
+                joined.push('\n');
+            }
+            Some(EditOutcome::Applied(joined))
+        }
+        n => Some(EditOutcome::Failed(format!(
+            "ambiguous: `old` matches {n} places (ignoring indentation); \
+             include more surrounding lines so it is unique"
+        ))),
+    }
+}
+
+/// The leading-whitespace prefix of a line (spaces/tabs before the first
+/// non-whitespace char); empty string if the line has no indentation.
+fn leading_ws(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
 }
 
 const SKIP_DIRS: &[&str] = &[
@@ -713,6 +835,184 @@ mod tests {
         let d = r.d.unwrap();
         assert_eq!(d["applied"], 0);
         assert!(d.get("diffs").is_none());
+    }
+
+    // --- resilient matching (#1127) ---
+
+    #[tokio::test]
+    async fn patch_tolerates_wrong_leading_whitespace() {
+        // The model emits `old` with mangled indentation (a common failure);
+        // the applier should still match on non-whitespace content and rewrite
+        // using the file's ACTUAL indentation, so the edit lands correctly.
+        //
+        // Non-vacuity: the file is TAB-indented but the model's `old` uses
+        // spaces, so a naive `content.contains(old)` cannot match (verified) —
+        // only line-wise whitespace-tolerant matching succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let original = "fn main() {\n\tlet x = 1;\n\tprintln!(\"{x}\");\n}\n";
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("ws.rs".into()),
+                s: Some(original.into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        // Guard against a vacuous test: the raw substring must NOT be present,
+        // so a pass proves the whitespace-tolerant path did the work.
+        assert!(!original.contains("    let x = 1;"));
+        // `old` uses 4-space indent; the file uses a tab. Non-whitespace matches.
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("ws.rs".into()),
+                a: Some(vec!["    let x = 1;".into(), "    let x = 42;".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        assert_eq!(r.d.unwrap()["applied"], 1);
+        let content = std::fs::read_to_string(dir.path().join("ws.rs")).unwrap();
+        // Rewritten preserving the file's real TAB indentation, not the model's spaces.
+        assert_eq!(
+            content,
+            "fn main() {\n\tlet x = 42;\n\tprintln!(\"{x}\");\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_reports_ambiguous_old_as_failure_and_skips_it() {
+        // `old` occurs more than once: applying to the first silently is unsafe
+        // (the model may have meant a different site). Report it as a structured
+        // failure and leave the file unchanged for that pair.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("amb.txt".into()),
+                s: Some("x = 1\nx = 1\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("amb.txt".into()),
+                a: Some(vec!["x = 1".into(), "x = 2".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok); // additive contract: still ok:true (option b)
+        let d = r.d.unwrap();
+        assert_eq!(d["applied"], 0, "ambiguous edit must not silently apply");
+        let failures = d["failures"].as_array().expect("failures array present");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["old"], "x = 1");
+        assert!(
+            failures[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("ambiguous"),
+            "reason should say why: {:?}",
+            failures[0]["reason"]
+        );
+        // File unchanged.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("amb.txt")).unwrap(),
+            "x = 1\nx = 1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_miss_returns_structured_failure_and_still_applies_others() {
+        // A missing `old` must be reported (which pair + a reason), not silently
+        // dropped, while other pairs in the same call still apply.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("miss.txt".into()),
+                s: Some("alpha beta".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("miss.txt".into()),
+                a: Some(vec![
+                    "alpha".into(),
+                    "ALPHA".into(),
+                    "nonexistent".into(),
+                    "whatever".into(),
+                ]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["applied"], 1, "the matching pair still applies");
+        let failures = d["failures"].as_array().expect("failures array present");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["old"], "nonexistent");
+        assert!(failures[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("miss.txt")).unwrap(),
+            "ALPHA beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_all_applied_has_no_failures_key() {
+        // When every pair applies, `failures` must be absent (not an empty
+        // array) so the all-success response is unchanged from before.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        write(
+            &mut s,
+            &Op {
+                c: 1,
+                p: Some("clean.txt".into()),
+                s: Some("one two".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let r = patch(
+            &mut s,
+            &Op {
+                c: 2,
+                p: Some("clean.txt".into()),
+                a: Some(vec!["one".into(), "1".into()]),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(r.ok);
+        let d = r.d.unwrap();
+        assert_eq!(d["applied"], 1);
+        assert!(
+            d.get("failures").is_none(),
+            "no failures key on full success"
+        );
     }
 
     #[tokio::test]

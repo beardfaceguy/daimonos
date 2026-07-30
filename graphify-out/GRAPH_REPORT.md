@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-07-29)
 
 ## Corpus Check
-- 197 files · ~258,694 words
+- 197 files · ~259,901 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5199 nodes · 12155 edges · 219 communities (203 shown, 16 thin omitted)
+- 5207 nodes · 12181 edges · 222 communities (205 shown, 17 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `dc2df740`
+- Built from commit: `5434f19c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -118,11 +118,13 @@
 - [[_COMMUNITY_Community 100|Community 100]]
 - [[_COMMUNITY_Community 101|Community 101]]
 - [[_COMMUNITY_Community 102|Community 102]]
+- [[_COMMUNITY_Community 103|Community 103]]
 - [[_COMMUNITY_Community 104|Community 104]]
 - [[_COMMUNITY_Community 105|Community 105]]
 - [[_COMMUNITY_Community 106|Community 106]]
 - [[_COMMUNITY_Community 107|Community 107]]
 - [[_COMMUNITY_Community 108|Community 108]]
+- [[_COMMUNITY_Community 109|Community 109]]
 - [[_COMMUNITY_Community 110|Community 110]]
 - [[_COMMUNITY_Community 111|Community 111]]
 - [[_COMMUNITY_Community 112|Community 112]]
@@ -135,6 +137,7 @@
 - [[_COMMUNITY_Community 120|Community 120]]
 - [[_COMMUNITY_Community 121|Community 121]]
 - [[_COMMUNITY_Community 122|Community 122]]
+- [[_COMMUNITY_Community 123|Community 123]]
 - [[_COMMUNITY_Community 128|Community 128]]
 - [[_COMMUNITY_Community 129|Community 129]]
 - [[_COMMUNITY_Community 130|Community 130]]
@@ -229,8 +232,8 @@
 ## God Nodes (most connected - your core abstractions)
 1. `build_agent()` - 56 edges
 2. `build_agent_with_state()` - 56 edges
-3. `session_in()` - 52 edges
-4. `write()` - 48 edges
+3. `session_in()` - 56 edges
+4. `write()` - 52 edges
 5. `session_in()` - 43 edges
 6. `String` - 38 edges
 7. `run()` - 38 edges
@@ -272,7 +275,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (219 total, 16 thin omitted)
+## Communities (222 total, 17 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -303,8 +306,8 @@ Cohesion: 0.09
 Nodes (51): Intent, Item, Iterator, assert_substrate_isolation(), collect_records(), completeness_flags_missing_purpose_and_effectful_nodes(), completeness_ignores_observed_nodes(), Direction (+43 more)
 
 ### Community 7 - "Community 7"
-Cohesion: 0.10
-Nodes (72): glob(), glob_finds_files(), glob_includes_symlinks(), glob_match_simple(), grep(), grep_blocking(), grep_finds_matches(), grep_through_symlink() (+64 more)
+Cohesion: 0.09
+Nodes (80): apply_one_edit(), EditOutcome, glob(), glob_finds_files(), glob_includes_symlinks(), glob_match_simple(), grep(), grep_blocking() (+72 more)
 
 ### Community 8 - "Community 8"
 Cohesion: 0.05
@@ -467,8 +470,8 @@ Cohesion: 0.06
 Nodes (54): Popen, Pygments, pytest, tests/requirements.txt (Test Dependencies), _handshake(), Process lifecycle tests for daimonos --mcp.  Bug being prevented: a daimonos --m, The veto must be released when the call ends, or the watchdog is dead.      Guar, Tool calls reset the idle clock so an active session is never killed. (+46 more)
 
 ### Community 48 - "Community 48"
-Cohesion: 0.06
-Nodes (69): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+61 more)
+Cohesion: 0.08
+Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
 
 ### Community 49 - "Community 49"
 Cohesion: 0.07
@@ -682,6 +685,10 @@ Nodes (9): CLI smoke tests for the baseline-prompt commands (vikunja #980): `--p
 Cohesion: 0.33
 Nodes (6): _parse(), Tests for the diff_files MCP tool., test_diff_different_files(), test_diff_file_vs_content(), test_diff_hunk_line_ranges(), test_diff_identical_files()
 
+### Community 103 - "Community 103"
+Cohesion: 0.18
+Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
+
 ### Community 104 - "Community 104"
 Cohesion: 0.39
 Nodes (6): check_response(), die(), fail(), mcp_session(), pass(), smoke-test.sh script
@@ -701,6 +708,10 @@ Nodes (19): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig,
 ### Community 108 - "Community 108"
 Cohesion: 0.40
 Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
+
+### Community 109 - "Community 109"
+Cohesion: 0.15
+Nodes (36): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, CoreAssistantOutcome, SessionId, available_commands(), build_acp_event_handler() (+28 more)
 
 ### Community 110 - "Community 110"
 Cohesion: 0.70
@@ -742,6 +753,10 @@ Nodes (20): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compac
 Cohesion: 0.29
 Nodes (7): Cost note, Daimonos agent-mode benchmark, Environment variables, Files, Model, provider, and API key — one source of truth, Quick start, Tasks and correctness
 
+### Community 123 - "Community 123"
+Cohesion: 0.33
+Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
+
 ### Community 136 - "Community 136"
 Cohesion: 0.40
 Nodes (8): acknowledge_coordination_model_notice(), CaptureProvider, coordination_model_notice(), coordination_model_notice_is_metadata_only_and_deduplicated(), Arc, Mutex, Session, ui_notice_is_metadata_only_and_deduplicated()
@@ -757,10 +772,6 @@ Nodes (14): ADR-002: Context/window compaction for AgentSession, Amendment (2026
 ### Community 139 - "Community 139"
 Cohesion: 0.12
 Nodes (14): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Manual testing, Prerequisites, Quick start (new agents), Repo layout (+6 more)
-
-### Community 140 - "Community 140"
-Cohesion: 0.15
-Nodes (6): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines, Runtime Modes
 
 ### Community 141 - "Community 141"
 Cohesion: 0.13
@@ -839,8 +850,8 @@ Cohesion: 0.14
 Nodes (15): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, retry_error_type(), Into, Message (+7 more)
 
 ### Community 168 - "Community 168"
-Cohesion: 0.10
-Nodes (53): BridgeSlot, CoreRuntimeOption, McpBridge, McpClientPool, ProviderFactory, SessionCompaction, SessionCore, AcpState (+45 more)
+Cohesion: 0.11
+Nodes (50): CoreRuntimeOption, McpBridge, McpClientPool, ProviderFactory, SessionCompaction, SessionCore, AcpState, agent_tools() (+42 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.24
@@ -919,8 +930,8 @@ Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.08
-Nodes (69): AcpClientRole, AcpPlan, AcpStopReason, ActiveToolCalls, AgentPlanEntry, ConnectionTo, CurrentConnection, DiffStash (+61 more)
+Cohesion: 0.10
+Nodes (41): AcpPlan, ActiveToolCalls, AgentPlanEntry, BridgeSlot, CurrentConnection, DiffStash, Meta, SessionEventRouter (+33 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -1044,7 +1055,7 @@ Nodes (9): ListToolsResult, PaginatedRequestParams, RpcError, ServerHandler, Dai
 
 ### Community 233 - "Community 233"
 Cohesion: 0.04
-Nodes (57): AcpContentBlock, AvailableCommand, CoreAssistantOutcome, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo (+49 more)
+Nodes (52): AcpContentBlock, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+44 more)
 
 ### Community 235 - "Community 235"
 Cohesion: 0.16
@@ -1061,7 +1072,7 @@ Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_tu
 ## Knowledge Gaps
 - **843 isolated node(s):** `Path`, `build.sh script`, `setup.sh script`, `post-build.sh script`, `post-image.sh script` (+838 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **17 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1074,9 +1085,9 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 174`, `Community 167`?**
+- **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
+  _High betweenness centrality (0.007) - this node is a cross-community bridge._
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 174`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
-- **Why does `SessionHandle` connect `Community 168` to `Community 192`, `Community 233`, `Community 222`?**
-  _High betweenness centrality (0.005) - this node is a cross-community bridge._
 - **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `The final response text lives in the stream's ``result`` event; fall back     to` to the rest of the system?**
   _1042 weakly-connected nodes found - possible documentation gaps or missing edges._
