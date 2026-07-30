@@ -93,10 +93,17 @@ pub async fn run_agent(
         ..AgentConfig::default()
     };
 
-    let session = std::sync::Arc::new(tokio::sync::Mutex::new(Session::new(
-        workspace.to_path_buf(),
-        cfg,
-    )));
+    let services = crate::provisioning::build_tool_services(
+        workspace,
+        &cfg,
+        true,
+        false,
+        args.analytics.clone(),
+    )
+    .await;
+    let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
+    crate::provisioning::provision_session(&mut tool_session, &services);
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));
     let initial = vec![Message::user(&args.task)];
     let external_session_id = crate::analytics::read_agent_session_id_env();
     let prompt_span = PromptSpan::new(PromptMetadata {
@@ -596,6 +603,64 @@ mod tests {
             input: serde_json::json!({}),
         };
         assert!(matches!(hook(&info).await, BeforeHookResult::Block(_)));
+    }
+
+    #[tokio::test]
+    async fn run_agent_execute_script_can_call_builtin_git_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        let provider = MockProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::ToolCall {
+                    id: "t1".into(),
+                    name: "execute_script".into(),
+                    input: serde_json::json!({
+                        "code": "result = git(command=\"status\")"
+                    }),
+                }],
+                stop_reason: crate::providers::StopReason::ToolUse,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage::default(),
+            },
+            end_turn_with_text("done"),
+        ]);
+        let mut out = Vec::new();
+        let result = run_agent(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("check git status"),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let tool_result_text = result
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("expected execute_script ToolResult");
+        assert!(
+            !tool_result_text.contains("plugin not available"),
+            "agent execute_script must use the canonical built-in registry: {tool_result_text}"
+        );
+        let tool_result: serde_json::Value = serde_json::from_str(tool_result_text)
+            .expect("execute_script ToolResult should be JSON");
+        assert_eq!(
+            tool_result["result"]["clean"], true,
+            "git status should execute through the plugin: {tool_result_text}"
+        );
     }
 
     // --- cfg wiring (vikunja #958) ---

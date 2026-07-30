@@ -20,13 +20,11 @@ use crate::analytics::{self, AnalyticsStore, ToolCallRecord};
 use crate::config::{self, Config};
 use crate::index::WorkspaceIndex;
 use crate::ops;
-use crate::pipeline_cache::PipelineCache;
 use crate::protocol::{Response, ResponseMeta};
 use crate::script;
 use crate::session::Session;
 use crate::snapshot::SnapshotStore;
 use crate::tool_facade;
-use crate::tool_runner::ToolRegistry;
 use crate::tools;
 
 pub(crate) const DAIMONOS_MCP_META_KEY: &str = "io.daimonos/server-kind";
@@ -1494,12 +1492,10 @@ fn spawn_idle_watchdog(
 pub async fn run_mcp_server(
     workspace: PathBuf,
     cfg: Arc<Config>,
-    ws_index: Arc<WorkspaceIndex>,
-    tool_reg: Arc<ToolRegistry>,
-    pcache: Arc<PipelineCache>,
-    analytics: Option<Arc<AnalyticsStore>>,
+    services: Arc<crate::provisioning::ToolServices>,
     startup_logs: bool,
 ) -> anyhow::Result<()> {
+    let analytics = services.analytics.clone();
     let idle_timeout_secs = effective_idle_timeout(&cfg);
     let activity = Arc::new(ActivityTracker::new());
     spawn_idle_watchdog(
@@ -1510,19 +1506,7 @@ pub async fn run_mcp_server(
     );
 
     let mut session = Session::new(workspace.clone(), cfg);
-    session.index = Some(ws_index);
-    session.tool_registry = Some(tool_reg);
-    session.pipeline_cache = Some(pcache);
-    session.analytics = analytics;
-    // Bootstrap the agent-runtime session id from the launch environment
-    // so analytics rows can be correlated post-hoc with tools like
-    // `claude --session-id $SID`. The MCP `set_external_session_id` tool
-    // can override this mid-session.
-    session.external_session_id = analytics::read_agent_session_id_env();
-    // Apply the DAIMONOS_MCP_VERBOSITY env override here at the startup edge
-    // rather than inside Session::new, so the constructor stays free of
-    // process-global env reads (vikunja #181).
-    session.verbosity = config::effective_verbosity(&session.cfg);
+    crate::provisioning::provision_session(&mut session, &services);
 
     let instructions = build_instructions(&workspace, &session.cfg).await;
     let handler = DaimonosHandler::new(session, activity, startup_logs);

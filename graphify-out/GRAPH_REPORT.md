@@ -1,16 +1,16 @@
-# Graph Report - daimonos  (2026-07-29)
+# Graph Report - daimonos  (2026-07-30)
 
 ## Corpus Check
-- 197 files · ~260,315 words
+- 198 files · ~260,997 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5210 nodes · 12192 edges · 224 communities (207 shown, 17 thin omitted)
+- 5229 nodes · 12223 edges · 224 communities (208 shown, 16 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `b20bb554`
+- Built from commit: `b3120862`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -277,7 +277,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (224 total, 17 thin omitted)
+## Communities (224 total, 16 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.16
@@ -392,8 +392,8 @@ Cohesion: 0.12
 Nodes (38): build_run_args(), build_run_args_default_is_quiet(), build_run_args_failfast_and_filters(), build_run_args_verbose_drops_quiet(), cap_output(), cap_output_does_not_panic_on_multibyte_char_at_head_cut(), collect_failed_tests(), collect_failed_tests_basic() (+30 more)
 
 ### Community 28 - "Community 28"
-Cohesion: 0.15
-Nodes (11): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, CoordinationSpan, GenerationSpan, RetrySpan, AtomicBool (+3 more)
+Cohesion: 0.21
+Nodes (8): CoordinationOutcome, GenerationMetadata, record_bridge_lifecycle(), remote_server_alias(), Option, ThinkingLevel, ToolOutcome, ToolStatus
 
 ### Community 29 - "Community 29"
 Cohesion: 0.15
@@ -484,8 +484,8 @@ Cohesion: 0.13
 Nodes (18): Path, CallSample, Client, find_binary(), load_task(), main(), proc_resource_snapshot(), Locate the release daimonos binary, building it if necessary.      Falls back to (+10 more)
 
 ### Community 51 - "Community 51"
-Cohesion: 0.12
-Nodes (34): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+26 more)
+Cohesion: 0.09
+Nodes (42): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+34 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.09
@@ -747,9 +747,13 @@ Nodes (4): AnthropicMessage, AnthropicThinking, AnthropicTool, AnthropicRequest
 Cohesion: 0.70
 Nodes (3): reset_workspace(), run_task(), bench-cursor.sh script
 
+### Community 120 - "Community 120"
+Cohesion: 0.27
+Nodes (8): BuiltinPlugin, builtin_cli_plugins(), floor_char_boundary(), floor_char_boundary_never_splits_a_char(), register_builtin_plugins(), Config, ToolRegistry, Vec
+
 ### Community 121 - "Community 121"
-Cohesion: 0.11
-Nodes (20): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+12 more)
+Cohesion: 0.18
+Nodes (12): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, LlmProvider Trait (+4 more)
 
 ### Community 122 - "Community 122"
 Cohesion: 0.29
@@ -761,7 +765,7 @@ Nodes (5): Before opening a pull request, Contributing, Development setup, Proje
 
 ### Community 124 - "Community 124"
 Cohesion: 0.29
-Nodes (6): SessionTurn, Display, Error, Formatter, Result, TurnError
+Nodes (12): build_tool_services(), provision_session(), AnalyticsStore, Arc, Config, Option, Path, PipelineCache (+4 more)
 
 ### Community 125 - "Community 125"
 Cohesion: 0.29
@@ -896,8 +900,8 @@ Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.16
-Nodes (10): basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), disabled_runtime_does_not_resolve_credentials(), LoggingExporter, missing_credentials_fail_open_without_secret_material(), record_truncation(), HashMap (+2 more)
+Cohesion: 0.10
+Nodes (21): ExporterBuildError, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CompactionMetadata, CompactionOutcome (+13 more)
 
 ### Community 181 - "Community 181"
 Cohesion: 0.10
@@ -924,8 +928,8 @@ Cohesion: 0.25
 Nodes (22): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), coordination_span_error_status_records_bounded_class(), coordination_span_never_records_message_content(), coordination_span_records_metadata_only() (+14 more)
 
 ### Community 187 - "Community 187"
-Cohesion: 0.13
-Nodes (16): ExporterBuildError, OTelSdkResult, Resource, SpanData, SpanExporter, basic_authorization_header(), build_exporter(), CoordinationOutcome (+8 more)
+Cohesion: 0.23
+Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
 ### Community 188 - "Community 188"
 Cohesion: 0.18
@@ -1004,8 +1008,8 @@ Cohesion: 0.28
 Nodes (4): mint(), mint_always_valid_format(), mint_covers_many_distinct_names(), String
 
 ### Community 211 - "Community 211"
-Cohesion: 0.15
-Nodes (15): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), GenerationMetadata, mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus (+7 more)
+Cohesion: 0.20
+Nodes (10): SdkTracerProvider, SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), ObservabilityRuntime, ObservabilityStatus, Drop (+2 more)
 
 ### Community 212 - "Community 212"
 Cohesion: 0.16
@@ -1040,8 +1044,8 @@ Cohesion: 0.13
 Nodes (23): ApprovalState, AgentSession, ApprovalBroker, CompactionPolicy, ContextUsage, Default, HashMap, Into (+15 more)
 
 ### Community 224 - "Community 224"
-Cohesion: 0.17
-Nodes (13): E, build_provider(), generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptMetadata, PromptSpan, RemoteToolSpan (+5 more)
+Cohesion: 0.13
+Nodes (17): E, Span, build_provider(), CompactionSpan, CoordinationSpan, generation_span_is_child_and_exports_usage_without_content(), GenerationSpan, prompt_root_omits_absent_session_id() (+9 more)
 
 ### Community 226 - "Community 226"
 Cohesion: 0.40
@@ -1068,8 +1072,8 @@ Cohesion: 0.04
 Nodes (52): AcpContentBlock, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+44 more)
 
 ### Community 235 - "Community 235"
-Cohesion: 0.26
-Nodes (12): SessionEvent, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe(), repeated_cancel_emits_cancelling_once() (+4 more)
+Cohesion: 0.16
+Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_turn_ends_idle(), cancellation_signal_does_not_leak_into_the_next_turn(), cancelled_turn_ends_on_cancelled_after_cancelling(), completed_error_turn_has_one_fully_ordered_canonical_sequence(), completed_turn_ends_on_idle(), dropping_active_turn_clears_slot_and_idle_cancel_is_safe() (+10 more)
 
 ## Ambiguous Edges - Review These
 - `AGENTS.md — Cross-tool Agent Guidance` → `Installation & Setup Guide`  [AMBIGUOUS]
@@ -1080,9 +1084,9 @@ Nodes (12): SessionEvent, cancel_after_completion_is_refused_and_turn_ends_idle(
   README.md · relation: references
 
 ## Knowledge Gaps
-- **843 isolated node(s):** `Path`, `build.sh script`, `setup.sh script`, `post-build.sh script`, `post-image.sh script` (+838 more)
+- **848 isolated node(s):** `Path`, `build.sh script`, `setup.sh script`, `post-build.sh script`, `post-image.sh script` (+843 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **17 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1100,4 +1104,4 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 174`?**
   _High betweenness centrality (0.006) - this node is a cross-community bridge._
 - **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `The final response text lives in the stream's ``result`` event; fall back     to` to the rest of the system?**
-  _1042 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _1047 weakly-connected nodes found - possible documentation gaps or missing edges._

@@ -48,11 +48,11 @@ terse = """Get full inputSchema for tool(s) before use."""
 [get_tool_schema.parameters]
 tools = "Tool name(s)"
 [execute_script]
-full = """Run a Starlark (Python-subset) script with all tools as built-in functions. Intermediate results stay in the sandbox; only `result` variable is returned. Much cheaper than sequential tool calls."""
-terse = """Run a Starlark script; all tools as functions; returns `result`. Cheaper than sequential calls."""
+full = """Run a Starlark script with all tools as built-in functions. Starlark is Python-like, not Python: there is no `import`, and top-level `for`, `while`, `if`, and `try` statements are rejected. Put control flow inside `def main(): ...` and finish with `result = main()`. Use `list_tool_signatures` before unfamiliar calls for the exact built-in signatures. Intermediate results stay in the sandbox; only the `result` variable is returned, making one script much cheaper than sequential tool calls."""
+terse = """Run Starlark (no `import` or top-level `for`/control flow); use `def main()` and `result = main()`. Tools are built-ins; see `list_tool_signatures`."""
 
 [execute_script.parameters]
-code = "Starlark source. Set `result` variable for output."
+code = "Starlark source (not Python): no imports or top-level control flow. Set `result`; wrap loops/conditionals in a function."
 timeout = "Max seconds (default: 60)"
 [update_plan]
 full = """Replace the current execution plan for a multi-step task. Send the complete list each time statuses change. Use an empty list to clear the plan."""
