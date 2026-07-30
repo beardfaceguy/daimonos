@@ -49,7 +49,7 @@
 #   BENCH_TASK_TIMEOUT  Per-task wall-clock cap in seconds (default: 600), same
 #                  guardrail as bench-agent.sh: a stuck task must not run away.
 #
-# Portability: POSIX sh syntax, but requires GNU coreutils `timeout`, `node`,
+# Portability: POSIX sh syntax, but requires GNU coreutils `timeout`, `python3`,
 # and `codex` on PATH. Targets the Linux benchmark host, not BusyBox.
 set -eu
 
@@ -130,8 +130,10 @@ run_task() {
     case "$task_id" in "$TASK_FILTER"*) ;; *) return 0 ;; esac
   fi
 
-  # Reuse the "cursor" applicability flag: these tasks apply to any external
-  # coding-agent CLI. (Tasks tag daimonos + cursor; codex is the same class.)
+  # Run tasks tagged for an external agent CLI. Existing tasks tag `cursor`
+  # (codex is the same class of external coding-agent CLI), and a task may
+  # also tag `codex` explicitly; accept either. Tasks tagged only `daimonos`
+  # are skipped (e.g. snapshot-rollback, a daimonos-specific tool).
   case ",$applies_to," in
     *",cursor,"*|*",codex,"*) ;;
     *) echo "  SKIP $task_id ($task_name) — not applicable to an external agent CLI"; return 0 ;;

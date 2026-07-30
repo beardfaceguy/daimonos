@@ -152,9 +152,11 @@ def main(argv):
         m["input"] = max(0, prompt_tokens - m["cache_write"] - m["cache_read"])
         m["output"] = usage.get("output_tokens") or 0
         cost = None  # codex/OpenRouter exec stream carries no per-run cost here
-        # Count assistant tool calls: codex emits tool activity as its own item
-        # types; the response text item is `agent_message`. There is no claude-style
-        # tool_use block array, so report 0 (parity with the cursor branch).
+        # Known limitation: codex emits tool activity as its own `item.completed`
+        # item types (not the claude-style assistant `tool_use` block array that
+        # count_tool_calls scans), so tool calls are reported as 0 here rather
+        # than counted. Token/correctness metrics are unaffected; only the
+        # informational tool_calls field is left at 0 for the codex runtime.
         tool_calls = 0
         is_error = exit_code != 0 or turn is None
     elif runtime == "daimonos":
