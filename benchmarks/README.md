@@ -17,8 +17,9 @@ keep current.
 | `analyze.py` | Aggregates one or more result dirs, grouped by model, correctness-gated. |
 | `tasks/*.json` | The task suite (prompt + machine-checkable `checks`). |
 | `workspace/` | A git repo the agent operates in; reset (`git checkout` + `clean`) before each task. |
-| `check-task.js` | Correctness gate: runs each task's `checks` against the response + workspace. |
-| `extract-tokens.js` | Normalizes the `--debug-tokens` log delta into a per-task summary JSON. |
+| `check_task.py` | Correctness gate: runs each task's `checks` against the response + workspace. |
+| `extract_tokens.py` | Normalizes the `--debug-tokens` log delta into a per-task summary JSON. |
+| `summarize.py` | Prints the end-of-run per-task summary table (shared by the runners). |
 | `results/` | One dir per run, one JSON per task. |
 | `server-bench/` | Separate deterministic opcode/transport micro-bench. Unrelated to this. |
 
@@ -73,7 +74,7 @@ Each `tasks/NN-*.json` has a `prompt` and a `checks` array. Check shapes:
 - `{"type":"response","any":["pat", ...],"min":2}` — at least `min` of them match.
 - `{"type":"workspace","command":"sh command"}` — command exits 0 in the workspace (filesystem ground truth).
 
-`check-task.js` stamps `checks_passed`, `checks_total`, and `correct`
+`check_task.py` stamps `checks_passed`, `checks_total`, and `correct`
 (true / false / null-if-no-checks) into each task summary. `analyze.py` excludes
 `correct == false` and errored runs from token/cost aggregates so a model can't
 look cheap by failing.

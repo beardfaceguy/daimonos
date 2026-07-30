@@ -153,11 +153,9 @@ daimonos/
 │   └── tool_descriptions.toml     # Top-level tool descriptions
 ├── scripts/cursor-review.sh
 ├── benchmarks/                    # Token/runtime benchmark harness
-│   ├── run-benchmark.sh, run-all-arms.sh, run-runtime-benchmark.sh
-│   ├── analyze-results.py, analyze-runtimes.py, compare-models.py
-│   ├── cursor-attribute.py, extract-tokens.js, check-task.js
-│   ├── models.json, setup-mcp.sh
-│   ├── remote/                    # AWS remote benchmark orchestration
+│   ├── bench-agent.sh, bench-cursor.sh   # per-runtime runners
+│   ├── analyze.py, summarize.py          # cross-run analysis + per-run table
+│   ├── extract_tokens.py, check_task.py  # token normalizer + correctness gate
 │   ├── server-bench/              # Server-side benchmark
 │   ├── tasks/                     # Task definitions (JSON)
 │   └── workspace/                 # Target codebase (Rust inventory app)
