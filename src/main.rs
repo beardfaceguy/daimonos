@@ -23,6 +23,7 @@ mod plugins;
 mod prompts;
 mod protocol;
 mod providers;
+mod provisioning;
 mod safety;
 mod script;
 mod session;
@@ -385,89 +386,10 @@ async fn run_tool_service(
         kgl::autoindex::spawn_watcher(workspace.clone(), mcp_quiet_stderr, cfg.kgl.clone());
     }
 
+    // Canonical tool provisioning (unified across MCP / agent / ACP): one place
+    // builds the full registry so every front-door exposes the same tools.
     let tool_reg = Arc::new(tool_runner::ToolRegistry::new());
-    config::register_tools(&cfg, &tool_reg, mcp_quiet_stderr).await;
-
-    if plugins::git::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::git::GitPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered git tool plugin");
-        }
-    }
-
-    if plugins::docker::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::docker::DockerPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered docker tool plugin");
-        }
-    }
-
-    if plugins::cargo::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::cargo::CargoPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered cargo tool plugin");
-        }
-    }
-
-    if plugins::gh::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::gh::GhPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered gh tool plugin");
-        }
-    }
-
-    if plugins::pytest::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::pytest::PytestPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered pytest tool plugin");
-        }
-    }
-
-    if plugins::curl::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::curl::CurlPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered curl tool plugin");
-        }
-    }
-
-    if plugins::shellcheck::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::shellcheck::ShellcheckPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered shellcheck tool plugin");
-        }
-    }
-
-    if plugins::npm::is_available() {
-        tool_reg
-            .register(Arc::new(plugins::npm::NpmPlugin::new()))
-            .await;
-        if !mcp_quiet_stderr {
-            eprintln!("auto-registered npm tool plugin");
-        }
-    }
-
-    tool_reg
-        .register(Arc::new(plugins::discord::DiscordPlugin::new(
-            cfg.discord.clone(),
-        )))
-        .await;
-    if !mcp_quiet_stderr {
-        eprintln!("auto-registered discord tool plugin");
-    }
+    plugins::register_builtin_plugins(&cfg, &tool_reg, mcp_quiet_stderr).await;
 
     let pcache = Arc::new(pipeline_cache::PipelineCache::with_config_watching(
         &workspace,
