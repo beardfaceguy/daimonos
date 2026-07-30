@@ -77,6 +77,50 @@ def test_cursor_camelcase_usage_cost_null(tmp_path):
     assert s["is_error"] is False
 
 
+def test_codex_turn_completed_usage_and_fresh_input(tmp_path):
+    # Codex reports usage on turn.completed; input_tokens is the prompt TOTAL
+    # (includes cached), so fresh input = total - cache_write - cache_read.
+    raw = "\n".join([
+        json.dumps({"type": "thread.started"}),
+        json.dumps({"type": "item.completed",
+                    "item": {"id": "i0", "type": "agent_message", "text": "done"}}),
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 1000, "cached_input_tokens": 600,
+            "cache_write_input_tokens": 300, "output_tokens": 40,
+        }}),
+    ]) + "\n"
+    s = run_extractor(tmp_path, "codex", raw)
+    assert s["cache_write"] == 300
+    assert s["cache_read"] == 600
+    assert s["input"] == 100      # 1000 - 300 - 600 (fresh remainder)
+    assert s["output"] == 40
+    assert s["total_tokens"] == 1040  # 100+300+600+40 == prompt_total+output
+    assert s["cost_usd"] is None
+    assert s["tool_calls"] == 0
+    assert s["is_error"] is False
+
+
+def test_codex_no_turn_completed_is_error(tmp_path):
+    # A truncated codex stream with no turn.completed event -> error.
+    raw = json.dumps({"type": "thread.started"}) + "\n"
+    s = run_extractor(tmp_path, "codex", raw)
+    assert s["is_error"] is True
+    assert s["total_tokens"] == 0
+
+
+def test_codex_fresh_input_floored_at_zero(tmp_path):
+    # If cached subsets exceed the reported prompt total (double-report),
+    # fresh input floors at 0 rather than going negative.
+    raw = "\n".join([
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 100, "cached_input_tokens": 80,
+            "cache_write_input_tokens": 50, "output_tokens": 5,
+        }}),
+    ]) + "\n"
+    s = run_extractor(tmp_path, "codex", raw)
+    assert s["input"] == 0  # max(0, 100 - 50 - 80)
+
+
 def test_daimonos_sums_tokenlog_within_window(tmp_path):
     # Two in-window call lines + one out-of-window line that must be excluded.
     lines = [

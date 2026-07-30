@@ -11,7 +11,7 @@ Usage:
                     <modelSlug> <canon> <startedAt> <endedAt> <wallMs> \\
                     <exitCode> <outFile>
 
-  runtime  = daimonos | claude | cursor
+  runtime  = daimonos | claude | cursor | codex
   rawFile  = claude/cursor stream-json (.jsonl) or daimonos stdout (.txt)
   tokenlog = daimonos --debug-tokens delta (new lines only), or "-" otherwise
   exitCode = the CLI's exit code (feeds is_error)
@@ -128,6 +128,35 @@ def main(argv):
         is_error = exit_code != 0 or (
             (result.get("is_error", True) if result else True)
         )
+    elif runtime == "codex":
+        # Codex CLI `exec --json` emits an event stream: the final response is an
+        # `item.completed` event whose item.type is "agent_message" (item.text), and
+        # usage is on the `turn.completed` event. Field names differ from cursor's
+        # camelCase and claude's snake_case, so this needs its own branch.
+        #   input_tokens             = total prompt tokens (includes the cached parts)
+        #   cache_write_input_tokens = subset written to cache this turn
+        #   cached_input_tokens      = subset read from cache
+        #   output_tokens            = completion tokens
+        # Map to the shared schema without double-counting: cache_write/cache_read
+        # are the cached subsets, and `input` is the genuinely-fresh remainder, so
+        # total = input + cache_write + cache_read + output stays consistent with
+        # the other runtimes.
+        events = json_events(raw_file)
+        turn = next((e for e in events if e.get("type") == "turn.completed"), None)
+        usage = (turn.get("usage") or {}) if turn else {}
+        prompt_tokens = usage.get("input_tokens") or 0
+        m["cache_write"] = usage.get("cache_write_input_tokens") or 0
+        m["cache_read"] = usage.get("cached_input_tokens") or 0
+        # Fresh (non-cached) input = prompt total minus the cached subsets, floored
+        # at 0 in case a provider double-reports.
+        m["input"] = max(0, prompt_tokens - m["cache_write"] - m["cache_read"])
+        m["output"] = usage.get("output_tokens") or 0
+        cost = None  # codex/OpenRouter exec stream carries no per-run cost here
+        # Count assistant tool calls: codex emits tool activity as its own item
+        # types; the response text item is `agent_message`. There is no claude-style
+        # tool_use block array, so report 0 (parity with the cursor branch).
+        tool_calls = 0
+        is_error = exit_code != 0 or turn is None
     elif runtime == "daimonos":
         # Sum per-LLM-call lines from the --debug-tokens delta; skip non-call
         # event lines (e.g. compaction) which carry no input/output token fields.
