@@ -100,7 +100,39 @@ pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::floor_char_boundary;
+    use super::{builtin_cli_plugins, floor_char_boundary, register_builtin_plugins};
+    use crate::config::Config;
+    use crate::tool_runner::ToolRegistry;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn every_builtin_cli_module_is_in_the_canonical_registry() {
+        let source_modules: BTreeSet<_> = include_str!("mod.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub mod "))
+            .filter_map(|line| line.strip_suffix(';'))
+            .filter(|module| !matches!(*module, "discord" | "generic_cli" | "x07"))
+            .collect();
+        let table_modules: BTreeSet<_> = builtin_cli_plugins()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            table_modules, source_modules,
+            "every built-in CLI plugin module must be added to builtin_cli_plugins()"
+        );
+
+        let registry = ToolRegistry::new();
+        register_builtin_plugins(&Config::default(), &registry, true).await;
+        for (id, available, _) in builtin_cli_plugins() {
+            assert_eq!(
+                registry.get(id).await.is_some(),
+                available(),
+                "canonical registration must follow {id}'s availability probe"
+            );
+        }
+        assert!(registry.get("discord").await.is_some());
+    }
 
     #[test]
     fn floor_char_boundary_never_splits_a_char() {

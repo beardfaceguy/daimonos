@@ -236,6 +236,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execute_script_description_prevents_python_dialect_retries() {
+        let catalog = ToolDescriptions::default();
+        let description = catalog
+            .full("execute_script")
+            .expect("execute_script description");
+        assert!(description.contains("no `import`"));
+        assert!(description.contains("top-level `for`"));
+        assert!(description.contains("def main()"));
+        assert!(description.contains("list_tool_signatures"));
+    }
+
     #[tokio::test]
     async fn partial_override_merges_with_defaults() {
         let dir = tempfile::tempdir().unwrap();

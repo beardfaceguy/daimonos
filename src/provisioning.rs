@@ -22,10 +22,6 @@ use crate::tool_runner::ToolRegistry;
 
 /// The shared per-session services every front-door provisions. `analytics` is
 /// optional (disabled by config or init failure); the rest are always built.
-// WIP (feat/unified-tool-provisioning): defined and compiling; the front-door
-// call sites (agent/ACP/MCP) are wired in a follow-up step, at which point
-// these become used and this allow is removed.
-#[allow(dead_code)]
 pub struct ToolServices {
     pub registry: Arc<ToolRegistry>,
     pub index: Arc<WorkspaceIndex>,
@@ -44,7 +40,6 @@ pub struct ToolServices {
 /// root looks like a real project AND `eager_index` is set.
 ///
 /// `background_work` gates the pipeline-cache config watcher the same way.
-#[allow(dead_code)] // WIP: wired into agent/ACP/MCP in a follow-up step.
 pub async fn build_tool_services(
     workspace: &std::path::Path,
     cfg: &Arc<Config>,
@@ -60,14 +55,15 @@ pub async fn build_tool_services(
         &cfg.index,
         !quiet_stderr,
     ));
-    if eager_index && index::should_eager_index(workspace, &cfg.index) {
+    let background_work = eager_index && index::should_eager_index(workspace, &cfg.index);
+    if background_work {
         index.spawn_reindex();
     }
 
     let pipeline_cache = Arc::new(PipelineCache::with_config_watching(
         workspace,
         &cfg.pipeline_cache,
-        eager_index,
+        background_work,
     ));
 
     ToolServices {
@@ -82,7 +78,6 @@ pub async fn build_tool_services(
 /// (external session id from the launch env, effective verbosity). This is the
 /// one place the service fields are wired, so no front-door can drift by
 /// forgetting one.
-#[allow(dead_code)] // WIP: wired into agent/ACP/MCP in a follow-up step.
 pub fn provision_session(session: &mut Session, services: &ToolServices) {
     session.index = Some(Arc::clone(&services.index));
     session.tool_registry = Some(Arc::clone(&services.registry));

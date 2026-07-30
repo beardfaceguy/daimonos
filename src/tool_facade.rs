@@ -32,10 +32,17 @@ pub fn active_schemas(
             )
         })
         .filter(|t| tools::passes_context_check(t.name, workspace))
-        .map(|t| NeutralToolSchema {
-            name: t.name.to_string(),
-            description: descriptions.full_or_name(t.name).to_string(),
-            input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
+        .map(|t| {
+            let mut description = descriptions.full_or_name(t.name).to_string();
+            if t.name == crate::agent::EXECUTE_SCRIPT_TOOL {
+                description.push_str("\n\nExact Starlark tool signatures:\n");
+                description.push_str(&crate::script::tool_signatures());
+            }
+            NeutralToolSchema {
+                name: t.name.to_string(),
+                description,
+                input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
+            }
         })
         .collect()
 }
@@ -79,6 +86,17 @@ mod tests {
     }
 
     // --- active_schemas ---
+
+    #[test]
+    fn execute_script_schema_includes_generated_tool_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = default_schemas(dir.path())
+            .into_iter()
+            .find(|schema| schema.name == "execute_script")
+            .expect("execute_script schema");
+        assert!(schema.description.contains("def git(command: str"));
+        assert!(schema.description.contains("def cargo(command: str"));
+    }
 
     /// The defect behind vikunja 1112: `active_schemas` is the catalog handed to
     /// the model, but the agent loop could only dispatch opcode-backed tools plus

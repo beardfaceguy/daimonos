@@ -2356,6 +2356,43 @@ async fn poll_coordination_ui_notice_if_idle(
     AgentSession::poll_coordination_ui_notice(tool_session).await
 }
 
+/// Build the native tool session used by an ACP chat thread. The MCP bridge is
+/// deliberately separate: native tools are provisioned from the same canonical
+/// registry as agent and MCP, while forwarded MCP servers retain their
+/// per-session collision and self-connection guards.
+async fn build_acp_tool_session(
+    session_workspace: &Path,
+    cfg: &Arc<Config>,
+    analytics: Option<Arc<AnalyticsStore>>,
+    acp_session_key: &str,
+) -> Session {
+    let services =
+        crate::provisioning::build_tool_services(session_workspace, cfg, true, true, analytics)
+            .await;
+    let mut tool_session = Session::new(session_workspace.to_path_buf(), Arc::clone(cfg));
+    crate::provisioning::provision_session(&mut tool_session, &services);
+    // ACP session ids are stable across process restarts and intentionally
+    // override the launch-process id installed by generic provisioning.
+    tool_session.external_session_id = Some(acp_session_key.to_string());
+
+    // Recover a previously registered identity for this persisted ACP session.
+    // Fail-open: missing/corrupt coordination storage leaves notifications off.
+    if cfg.coordination.enabled {
+        let db_path = crate::coordination::workspace_db_path(
+            &cfg.coordination.resolved_db_dir(),
+            session_workspace,
+        );
+        if let Ok(store) = crate::coordination::CoordinationStore::open_with(
+            &db_path,
+            cfg.coordination.effective_busy_timeout_ms(),
+        ) {
+            tool_session.coordination_agent_name =
+                store.agent_name_for_session(acp_session_key).ok().flatten();
+        }
+    }
+    tool_session
+}
+
 /// Build a fresh session handle (provider + agent session + per-session
 /// cells) without inserting it into the map. Shared by `session/new` and the
 /// unknown-id branch of `session/load` (a respawned process has no in-memory
@@ -2421,26 +2458,14 @@ async fn build_session_handle(
         Arc::clone(&bridge),
         Arc::clone(&bridge_slot),
     );
-    let mut tool_session = Session::new(session_workspace.clone(), Arc::clone(cfg));
     let acp_session_key = session_id.to_string();
-    tool_session.external_session_id = Some(acp_session_key.clone());
-    // Recover a previously registered identity for this persisted ACP session.
-    // Fail-open: missing/corrupt coordination storage leaves notifications off.
-    if cfg.coordination.enabled {
-        let db_path = crate::coordination::workspace_db_path(
-            &cfg.coordination.resolved_db_dir(),
-            &session_workspace,
-        );
-        if let Ok(store) = crate::coordination::CoordinationStore::open_with(
-            &db_path,
-            cfg.coordination.effective_busy_timeout_ms(),
-        ) {
-            tool_session.coordination_agent_name = store
-                .agent_name_for_session(&acp_session_key)
-                .ok()
-                .flatten();
-        }
-    }
+    let tool_session = build_acp_tool_session(
+        &session_workspace,
+        cfg,
+        state.analytics.clone(),
+        &acp_session_key,
+    )
+    .await;
     let mut context_windows = HashMap::new();
     if state.compaction.follows_model_window {
         if let Some(policy) = &state.compaction.policy {
@@ -4016,6 +4041,28 @@ mod tests {
             "the retry path should have cleared O_NONBLOCK"
         );
         writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_tool_session_execute_script_can_call_builtin_git_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        let cfg = Arc::new(Config::default());
+        let tool_session = build_acp_tool_session(dir.path(), &cfg, None, "acp-test-session").await;
+        let result = crate::script::execute(
+            "result = git(command=\"status\")",
+            Arc::new(tokio::sync::Mutex::new(tool_session)),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("ACP execute_script should dispatch the built-in git plugin");
+        assert_eq!(result.value["clean"], true);
     }
 
     #[test]

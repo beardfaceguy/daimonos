@@ -350,13 +350,6 @@ async fn run_tool_service(
         );
     }
 
-    let ws_index = Arc::new(index::WorkspaceIndex::new(
-        workspace.clone(),
-        &cfg.index,
-        !mcp_quiet_stderr,
-    ));
-    ws_index.spawn_reindex();
-
     // KGL startup auto-index (gated, best-effort): mirror the trigram index's
     // one-shot startup build so a fresh agent session gets a current graph
     // without a manual `kgl_query index`. Runs on a blocking task; never blocks
@@ -385,17 +378,6 @@ async fn run_tool_service(
         // A2: keep the graph fresh within the session via a debounced file watcher.
         kgl::autoindex::spawn_watcher(workspace.clone(), mcp_quiet_stderr, cfg.kgl.clone());
     }
-
-    // Canonical tool provisioning (unified across MCP / agent / ACP): one place
-    // builds the full registry so every front-door exposes the same tools.
-    let tool_reg = Arc::new(tool_runner::ToolRegistry::new());
-    plugins::register_builtin_plugins(&cfg, &tool_reg, mcp_quiet_stderr).await;
-
-    let pcache = Arc::new(pipeline_cache::PipelineCache::with_config_watching(
-        &workspace,
-        &cfg.pipeline_cache,
-        !overbroad,
-    ));
 
     // Analytics: --stats prints summary and exits
     if matches!(runtime_mode, RuntimeMode::Stats) {
@@ -436,42 +418,24 @@ async fn run_tool_service(
         None
     };
 
+    let services = Arc::new(
+        provisioning::build_tool_services(
+            &workspace,
+            &cfg,
+            mcp_quiet_stderr,
+            true,
+            analytics_store,
+        )
+        .await,
+    );
+
     match runtime_mode {
-        RuntimeMode::McpStdio => {
-            mcp::run_mcp_server(
-                workspace,
-                cfg,
-                ws_index,
-                tool_reg,
-                pcache,
-                analytics_store,
-                startup_logs,
-            )
-            .await
-        }
+        RuntimeMode::McpStdio => mcp::run_mcp_server(workspace, cfg, services, startup_logs).await,
         RuntimeMode::McpSocket(mcp_sock) => {
-            run_mcp_socket_server(
-                mcp_sock,
-                workspace,
-                cfg,
-                ws_index,
-                tool_reg,
-                pcache,
-                analytics_store,
-            )
-            .await
+            run_mcp_socket_server(mcp_sock, workspace, cfg, services).await
         }
         RuntimeMode::Daemon => {
-            run_socket_server(
-                DaemonOptions { socket, debug },
-                workspace,
-                cfg,
-                ws_index,
-                tool_reg,
-                pcache,
-                analytics_store,
-            )
-            .await
+            run_socket_server(DaemonOptions { socket, debug }, workspace, cfg, services).await
         }
         RuntimeMode::Agent | RuntimeMode::Chat | RuntimeMode::Acp | RuntimeMode::Stats => {
             unreachable!("early-return runtime reached service dispatch")
@@ -479,15 +443,11 @@ async fn run_tool_service(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_mcp_socket_server(
     sock_path: PathBuf,
     workspace: PathBuf,
     cfg: Arc<config::Config>,
-    ws_index: Arc<index::WorkspaceIndex>,
-    tool_reg: Arc<tool_runner::ToolRegistry>,
-    pcache: Arc<pipeline_cache::PipelineCache>,
-    analytics: Option<Arc<analytics::AnalyticsStore>>,
+    services: Arc<provisioning::ToolServices>,
 ) -> anyhow::Result<()> {
     if sock_path.exists() {
         std::fs::remove_file(&sock_path)?;
@@ -503,19 +463,11 @@ async fn run_mcp_socket_server(
         let (stream, _addr) = listener.accept().await?;
         let ws = workspace.clone();
         let cfg_c = cfg.clone();
-        let idx = ws_index.clone();
-        let tr = tool_reg.clone();
-        let pc = pcache.clone();
-        let an = analytics.clone();
+        let services = Arc::clone(&services);
 
         tokio::spawn(async move {
             let mut session = session::Session::new(ws, cfg_c);
-            session.index = Some(idx);
-            session.tool_registry = Some(tr);
-            session.pipeline_cache = Some(pc);
-            session.analytics = an;
-            session.external_session_id = analytics::read_agent_session_id_env();
-            session.verbosity = config::effective_verbosity(&session.cfg);
+            provisioning::provision_session(&mut session, &services);
 
             if let Err(e) = mcp::serve_one_mcp(stream, session).await {
                 eprintln!("mcp socket connection error: {e}");
@@ -528,10 +480,7 @@ async fn run_socket_server(
     options: DaemonOptions,
     workspace: PathBuf,
     cfg: Arc<config::Config>,
-    ws_index: Arc<index::WorkspaceIndex>,
-    tool_reg: Arc<tool_runner::ToolRegistry>,
-    pcache: Arc<pipeline_cache::PipelineCache>,
-    analytics: Option<Arc<analytics::AnalyticsStore>>,
+    services: Arc<provisioning::ToolServices>,
 ) -> anyhow::Result<()> {
     if options.socket.exists() {
         std::fs::remove_file(&options.socket)?;
@@ -549,43 +498,28 @@ async fn run_socket_server(
         let (stream, _addr) = listener.accept().await?;
         let ws = workspace.clone();
         let debug = options.debug;
-        let idx = ws_index.clone();
         let cfg_clone = cfg.clone();
-        let tr = tool_reg.clone();
-        let pc = pcache.clone();
-        let an = analytics.clone();
+        let services = Arc::clone(&services);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ws, debug, idx, cfg_clone, tr, pc, an).await {
+            if let Err(e) = handle_connection(stream, ws, debug, cfg_clone, services).await {
                 eprintln!("connection error: {e}");
             }
         });
     }
 }
 
-// Per-connection handler threads the daemon's shared services (index, config,
-// tool registry, pipeline cache, analytics) into the session; grouping them
-// into a struct would only move the argument list elsewhere.
-#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     workspace: PathBuf,
     debug: bool,
-    ws_index: Arc<index::WorkspaceIndex>,
     cfg: Arc<config::Config>,
-    tool_reg: Arc<tool_runner::ToolRegistry>,
-    pcache: Arc<pipeline_cache::PipelineCache>,
-    analytics: Option<Arc<analytics::AnalyticsStore>>,
+    services: Arc<provisioning::ToolServices>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut session = session::Session::new(workspace, cfg);
-    session.index = Some(ws_index);
-    session.tool_registry = Some(tool_reg);
-    session.pipeline_cache = Some(pcache);
-    session.analytics = analytics;
-    session.external_session_id = analytics::read_agent_session_id_env();
-    session.verbosity = config::effective_verbosity(&session.cfg);
+    provisioning::provision_session(&mut session, &services);
     let mut line = String::new();
 
     loop {
