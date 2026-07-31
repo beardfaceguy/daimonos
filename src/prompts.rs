@@ -310,6 +310,14 @@ mod tests {
     }
 
     #[test]
+    fn agent_system_skips_routine_plans_and_coordination_overhead() {
+        let prompt = AGENT_SYSTEM_DEFAULT.to_lowercase();
+        assert!(prompt.contains("routine single-file edits"));
+        assert!(prompt.contains("one inspect/edit/validate loop"));
+        assert!(prompt.contains("explicitly asks for multi-agent coordination"));
+    }
+
+    #[test]
     fn mcp_instructions_default_has_terse_directive() {
         assert!(MCP_INSTRUCTIONS_DEFAULT.contains("Terse output"));
         assert!(MCP_INSTRUCTIONS_DEFAULT.contains("execute_script"));
