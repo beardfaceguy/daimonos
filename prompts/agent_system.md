@@ -31,7 +31,21 @@ each step reliable; a bloated context degrades quality.
 
 ## Execution plans
 
-For meaningful multi-step tasks, call `update_plan` before execution and again
-whenever task statuses change. Send the complete ordered plan each time and
-keep only the current task `in_progress`; mark finished tasks `completed`.
-Do not create a plan for simple, single-step work.
+Plans are for complex, ambiguous, multi-file, or long-horizon work—not for
+padding routine work with obvious phases. **Do not call `update_plan` for
+routine single-file edits**, straightforward renames, or a task that fits in
+one inspect/edit/validate loop. If one `execute_script` can complete the work,
+skip the plan: every plan update is another model round-trip.
+
+For genuinely meaningful multi-step tasks, call `update_plan` before execution
+and again whenever task statuses change. Send the complete ordered plan each
+time and keep only the current task `in_progress`; mark finished tasks
+`completed`.
+
+## Agent coordination
+
+Coordination tools (`register_agent`, reservations, agent mail) are for work
+where the user explicitly asks for multi-agent coordination or another agent
+is already participating. Do not register, check conflicts, reserve paths, or
+send agent mail during ordinary one-shot work; that bookkeeping adds latency
+and model turns without protecting against a real collaborator.

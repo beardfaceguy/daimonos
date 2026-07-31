@@ -656,12 +656,61 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
     })
 }
 
-/// Dispatch a tool call by name, using the tools registry to map args → Request.
+/// Dispatch any native tool by name. Opcode-backed tools take the compact op
+/// path; plugin and meta tools fall through to the same shared dispatcher used
+/// by MCP and the agent loop. Keeping `tool("…")` universal prevents the model
+/// from spending retry turns learning which names require dedicated bindings.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
     let resp = match tools::build_request(name, args) {
         Some(Ok(request)) => dispatch_request(request, name)?,
         Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
-        None => return Err(anyhow::anyhow!("tool '{name}' has no opcode mapping")),
+        None => with_ctx(|ctx| {
+            let started = std::time::Instant::now();
+            let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
+            ctx.handle.block_on(async {
+                let mut session = ctx.session.lock().await;
+                let Some((content, is_error, meta)) =
+                    crate::mcp::dispatch_local_tool(&mut session, name, args).await
+                else {
+                    return Err(anyhow::anyhow!("unknown tool '{name}'"));
+                };
+
+                if let Some(analytics) = session.analytics.clone() {
+                    let (saved_tokens, savings_pct) =
+                        analytics::compute_savings(meta.unfiltered_chars, content.len());
+                    analytics.record_async(ToolCallRecord {
+                        tool_name: format!("script:{name}"),
+                        command: args
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        request_tokens: analytics::estimate_tokens(request_chars),
+                        response_tokens: analytics::estimate_tokens(content.len()),
+                        saved_tokens,
+                        savings_pct,
+                        exec_time_ms: started.elapsed().as_millis() as u64,
+                        was_redirect: meta.redirect_via_plugin,
+                        was_filtered: meta.filter_applied,
+                        read_dedup: meta.read_dedup,
+                        batch_size: 1,
+                        external_session_id: session.external_session_id.clone(),
+                    });
+                }
+
+                let mut response = if is_error {
+                    Response::err(5, &content)
+                } else {
+                    // Local tools return MCP text content: structured tools encode
+                    // JSON, while intentionally textual meta tools (for example
+                    // list_tool_signatures) remain a string under `data`.
+                    let value = serde_json::from_str(&content)
+                        .unwrap_or_else(|_| serde_json::Value::String(content));
+                    Response::ok(value)
+                };
+                response.meta = meta;
+                Ok(response)
+            })
+        })?,
     };
     // KGL observed-provenance: capture script-driven file ops the same way the
     // MCP-direct path does. Gated off by default; best-effort (never affects the
@@ -1067,7 +1116,7 @@ fn subcall_functions(builder: &mut GlobalsBuilder) {
 #[allow(clippy::too_many_arguments)]
 #[starlark_module]
 fn tool_functions(builder: &mut GlobalsBuilder) {
-    /// Call any opcode-backed tool by name with keyword arguments.
+    /// Call any native tool by name with keyword arguments.
     ///
     /// The named bindings below cover a hand-picked subset, and that subset drifts
     /// from the tool registry as tools are added — the coordination family
@@ -1076,8 +1125,8 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
     /// `Variable register_agent not found` (vikunja 1112).
     ///
     /// This is the escape hatch that closes the class rather than one more entry
-    /// in a list that has to be maintained by hand: any tool with an opcode
-    /// mapping is reachable through it, including tools added later.
+    /// in a list that has to be maintained by hand: opcode, plugin, and meta
+    /// tools are all reachable through it, including tools added later.
     ///
     /// The tool name is positional-only: several tools take a `name` argument of
     /// their own (`register_agent(name=...)` above all), and a nameable positional
@@ -1459,9 +1508,11 @@ pub fn tool_signatures() -> String {
         // The tool name is positional-only, so it must not be documented as a
         // keyword: `tool(name="register_agent")` fails, and several tools take a
         // `name` argument of their own that would collide with it.
-        "def tool(tool_name: str, /, **kwargs) -> dict: ...  # any opcode-backed tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
+        "def tool(tool_name: str, /, **kwargs) -> dict: ...  # any native tool, e.g. tool(\"register_agent\", name=\"BlueLake\")",
     ];
-    // Every opcode-backed tool, derived from the registry. An earlier version
+    // Every opcode-backed tool is listed below from the registry. Plugin/meta
+    // tools also work through `tool()` even when they have a dedicated binding.
+    // An earlier version
     // subtracted the named bindings above to avoid listing them twice, but that
     // needed a hand-maintained set of those names — reintroducing exactly the
     // drift this whole change removes. Listing all of them is redundant rather
@@ -1499,7 +1550,7 @@ mod tests {
     /// vikunja 1112: the coordination tools were documented in the MCP
     /// instructions but never bound in the sandbox, so scripts calling them died
     /// with `Variable register_agent not found`. `tool(name, **kwargs)` reaches any
-    /// opcode-backed tool, which closes the class rather than adding one more
+    /// native tool, which closes the class rather than adding one more
     /// hand-maintained binding that can drift from the registry.
     #[tokio::test]
     async fn generic_tool_binding_reaches_the_coordination_family() {
@@ -1526,6 +1577,20 @@ mod tests {
             text.contains("ScriptProbe"),
             "expected the registration receipt to name the agent, got {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_tool_binding_reaches_commandless_meta_tools() {
+        let result = execute(
+            "result = tool(\"list_tool_signatures\")",
+            test_session(),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("commandless meta tools should use the shared local dispatcher");
+        assert!(result.value["data"]
+            .as_str()
+            .is_some_and(|text| text.contains("def read_file")));
     }
 
     /// The failure mode this replaces: an unbound name is a Starlark resolution
@@ -1731,7 +1796,7 @@ result = True
     }
 
     #[tokio::test]
-    async fn execute_script_records_plugin_shortcuts_in_analytics() {
+    async fn generic_tool_binding_dispatches_plugins_and_records_analytics() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
         let db_path = dir.path().join("script_analytics.db");
@@ -1764,10 +1829,14 @@ result = True
         session.tool_registry = Some(registry);
         let session = Arc::new(Mutex::new(session));
 
-        let result = execute(r#"git("status")"#, session, Duration::from_secs(2))
-            .await
-            .unwrap();
-        assert_eq!(result.value, serde_json::Value::Null);
+        let result = execute(
+            r#"result = tool("git", command="status")"#,
+            session,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.value, serde_json::json!({"ok": true}));
 
         assert!(
             analytics.wait_until_quiet(Duration::from_secs(1)).await,
