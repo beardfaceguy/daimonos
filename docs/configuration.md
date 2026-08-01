@@ -203,6 +203,40 @@ exec_stream_chunk_bytes = 8_192
 extra_path = ["/opt/custom/bin", "/usr/local/go/bin"]
 ```
 
+### `[tool_output]` — Model-visible tool results
+
+Every text result returned to an agent or MCP client is bounded before it
+enters model history. When a result exceeds either limit, Daimonos stores the
+complete text in a private managed file and returns a UTF-8-safe head/tail
+preview containing its path. Storage failures fail open: the successful tool
+result remains unchanged.
+
+Before each provider call, older successful tool results are also pruned
+newest-first against a deterministic token budget. Errors and the configured
+number of recent results are preserved. Large string arguments from old
+`write_file` and `edit_file` calls are truncated without changing paths or
+other metadata.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `directory` | `~/.daimonos/tool-output` | Managed full-output directory; files are mode `0600` under a mode `0700` directory |
+| `max_bytes` | `51200` | Maximum UTF-8 bytes in one model-visible text result |
+| `max_lines` | `2000` | Maximum lines in one model-visible text result |
+| `retention_days` | `7` | Delete older managed files during subsequent writes |
+| `intra_turn_result_budget_tokens` | `40000` | Approximate newest-first budget for prior successful results |
+| `intra_turn_keep_recent_results` | `5` | Most-recent successful results always preserved |
+| `old_argument_max_chars` | `2000` | Threshold for truncating old edit/write string arguments |
+
+```toml
+[tool_output]
+max_bytes = 51_200
+max_lines = 2_000
+retention_days = 7
+intra_turn_result_budget_tokens = 40_000
+intra_turn_keep_recent_results = 5
+old_argument_max_chars = 2_000
+```
+
 ### `[mcp]` — MCP server (`--mcp`)
 
 These settings apply only when running as an MCP server over stdio (Cursor,

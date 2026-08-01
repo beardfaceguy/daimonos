@@ -1,6 +1,8 @@
 """Tests for read_file and write_file MCP tools."""
 
 import json
+import re
+from pathlib import Path
 
 
 def test_write_and_read_roundtrip(daimonos):
@@ -37,6 +39,29 @@ def test_read_with_offset_and_limit(daimonos):
 def test_read_nonexistent_file(daimonos):
     result = daimonos.call_tool("read_file", {"path": "nonexistent.txt"})
     assert result.get("isError") is True
+
+
+def test_large_read_is_bounded_and_full_result_is_recoverable(daimonos):
+    unique_line = "tool-output-boundary-sentinel"
+    original = unique_line + "\n" + ("x" * 60_000)
+    daimonos.call_tool("write_file", {
+        "path": "large-result.txt",
+        "content": original,
+    })
+
+    result = daimonos.call_tool("read_file", {"path": "large-result.txt"})
+    visible = result["content"][0]["text"]
+
+    assert len(visible.encode()) <= 51_200
+    match = re.search(r"full output saved to (.+?) \.\.\.", visible)
+    assert match, visible
+    output_path = Path(match.group(1))
+    try:
+        full_result = output_path.read_text()
+        assert unique_line in full_result
+        assert len(full_result) > len(visible)
+    finally:
+        output_path.unlink(missing_ok=True)
 
 
 def test_write_creates_nested_dirs(daimonos):

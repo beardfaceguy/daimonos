@@ -1,16 +1,16 @@
-# Graph Report - daimonos  (2026-07-30)
+# Graph Report - daimonos  (2026-07-31)
 
 ## Corpus Check
-- 198 files · ~260,997 words
+- 202 files · ~269,328 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5229 nodes · 12223 edges · 224 communities (208 shown, 16 thin omitted)
+- 5346 nodes · 12555 edges · 224 communities (209 shown, 15 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `b3120862`
+- Built from commit: `c3d103a6`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -140,6 +140,8 @@
 - [[_COMMUNITY_Community 123|Community 123]]
 - [[_COMMUNITY_Community 124|Community 124]]
 - [[_COMMUNITY_Community 125|Community 125]]
+- [[_COMMUNITY_Community 126|Community 126]]
+- [[_COMMUNITY_Community 127|Community 127]]
 - [[_COMMUNITY_Community 128|Community 128]]
 - [[_COMMUNITY_Community 129|Community 129]]
 - [[_COMMUNITY_Community 130|Community 130]]
@@ -177,6 +179,7 @@
 - [[_COMMUNITY_Community 168|Community 168]]
 - [[_COMMUNITY_Community 169|Community 169]]
 - [[_COMMUNITY_Community 170|Community 170]]
+- [[_COMMUNITY_Community 171|Community 171]]
 - [[_COMMUNITY_Community 172|Community 172]]
 - [[_COMMUNITY_Community 173|Community 173]]
 - [[_COMMUNITY_Community 174|Community 174]]
@@ -201,7 +204,6 @@
 - [[_COMMUNITY_Community 194|Community 194]]
 - [[_COMMUNITY_Community 195|Community 195]]
 - [[_COMMUNITY_Community 196|Community 196]]
-- [[_COMMUNITY_Community 198|Community 198]]
 - [[_COMMUNITY_Community 199|Community 199]]
 - [[_COMMUNITY_Community 200|Community 200]]
 - [[_COMMUNITY_Community 201|Community 201]]
@@ -225,8 +227,6 @@
 - [[_COMMUNITY_Community 226|Community 226]]
 - [[_COMMUNITY_Community 227|Community 227]]
 - [[_COMMUNITY_Community 229|Community 229]]
-- [[_COMMUNITY_Community 230|Community 230]]
-- [[_COMMUNITY_Community 231|Community 231]]
 - [[_COMMUNITY_Community 233|Community 233]]
 - [[_COMMUNITY_Community 235|Community 235]]
 - [[_COMMUNITY_Community 244|Community 244]]
@@ -236,12 +236,12 @@
 2. `build_agent()` - 56 edges
 3. `build_agent_with_state()` - 56 edges
 4. `write()` - 55 edges
-5. `session_in()` - 43 edges
-6. `String` - 38 edges
-7. `run()` - 38 edges
-8. `AgentSession` - 34 edges
-9. `execute()` - 34 edges
-10. `mock_factory()` - 33 edges
+5. `session_in()` - 44 edges
+6. `run()` - 43 edges
+7. `String` - 38 edges
+8. `execute()` - 35 edges
+9. `AgentSession` - 34 edges
+10. `Option` - 33 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `AWS Nitro Kernel Configuration Guide` --semantically_similar_to--> `Deploy to AWS Workflow`  [INFERRED] [semantically similar]
@@ -277,11 +277,11 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (224 total, 16 thin omitted)
+## Communities (224 total, 15 thin omitted)
 
 ### Community 0 - "Community 0"
-Cohesion: 0.16
-Nodes (33): after_hook_terminate_exits_with_aborted(), agent_loop_dispatches_plugin_and_meta_tools(), assistant_appended_before_tool_results(), before_hook_block_returns_error_result(), coordination_notices_require_registered_identity(), end_turn_stops_loop(), mail_arriving_during_tool_call_is_visible_only_next_generation(), max_tokens_stops_loop_cleanly() (+25 more)
+Cohesion: 0.19
+Nodes (31): after_hook_terminate_exits_with_aborted(), agent_list_all_tools_includes_remote_catalog_entries(), agent_loop_dispatches_plugin_and_meta_tools(), assistant_appended_before_tool_results(), before_hook_block_returns_error_result(), coordination_notices_require_registered_identity(), end_turn_stops_loop(), mail_arriving_during_tool_call_is_visible_only_next_generation() (+23 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.07
@@ -289,15 +289,15 @@ Nodes (74): agent_runs_summary_aggregates_correctly(), agent_runs_summary_empty_
 
 ### Community 2 - "Community 2"
 Cohesion: 0.10
-Nodes (31): execute(), execute_captures_print(), execute_dict_result_variable(), execute_double_colon_in_string_literal_succeeds(), execute_exec_accepts_positional_and_keyword_args(), execute_exec_command(), execute_ls_accepts_documented_glob_and_type_filters(), execute_multi_step_script() (+23 more)
+Nodes (32): execute(), execute_captures_print(), execute_dict_result_variable(), execute_double_colon_in_string_literal_succeeds(), execute_exec_accepts_positional_and_keyword_args(), execute_exec_command(), execute_ls_accepts_documented_glob_and_type_filters(), execute_multi_step_script() (+24 more)
 
 ### Community 3 - "Community 3"
-Cohesion: 0.08
-Nodes (23): a_fresh_tracker_starts_idle_and_unoccupied(), build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs(), effective_idle_timeout(), kgl_hint_is_gated_and_mentions_orient() (+15 more)
+Cohesion: 0.07
+Nodes (32): a_fresh_tracker_starts_idle_and_unoccupied(), bound_call_tool_result(), BoundResultStats, build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs() (+24 more)
 
 ### Community 4 - "Community 4"
-Cohesion: 0.12
-Nodes (16): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+8 more)
+Cohesion: 0.10
+Nodes (20): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+12 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.11
@@ -337,7 +337,7 @@ Nodes (48): Gated Three-Arm Benchmark Report (2026-07-06), distro/build-buildroo
 
 ### Community 14 - "Community 14"
 Cohesion: 0.11
-Nodes (44): AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider(), dry_run_prints_task_in_output() (+36 more)
+Nodes (45): AgentCmdArgs, analytics_not_called_on_dry_run(), analytics_record_agent_run_called_on_success(), args(), default_cfg(), default_model_is_opus_48(), dry_run_does_not_call_provider(), dry_run_prints_task_in_output() (+37 more)
 
 ### Community 15 - "Community 15"
 Cohesion: 0.10
@@ -416,8 +416,8 @@ Cohesion: 0.16
 Nodes (31): compact_audit(), compact_audit_clean_project(), compact_audit_missing_metadata_defaults_clean(), compact_audit_with_vulnerabilities(), is_available(), npm_audit(), npm_audit_in_valid_project(), npm_audit_no_package_json_returns_error() (+23 more)
 
 ### Community 34 - "Community 34"
-Cohesion: 0.11
-Nodes (23): Event, S, end_turn_resp(), EofAwareReader, ImageCapableProvider, MockProvider, ModelCaptureProvider, CompleteOpts (+15 more)
+Cohesion: 0.17
+Nodes (15): Event, S, end_turn_resp(), ImageCapableProvider, MockProvider, CompleteOpts, Context, FnMut (+7 more)
 
 ### Community 35 - "Community 35"
 Cohesion: 0.12
@@ -429,11 +429,11 @@ Nodes (29): build_tool_args(), build_tool_args_empty(), build_tool_args_with_fie
 
 ### Community 37 - "Community 37"
 Cohesion: 0.12
-Nodes (34): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+26 more)
+Nodes (35): active_schemas(), active_schemas_excludes_cargo_without_cargo_toml(), active_schemas_excludes_context_filtered_tools_without_git(), active_schemas_excludes_docker_without_dockerfile(), active_schemas_excludes_on_demand_tools(), active_schemas_fields_populated(), active_schemas_includes_cargo_when_cargo_toml_present(), active_schemas_includes_docker_when_compose_yaml_present() (+27 more)
 
 ### Community 38 - "Community 38"
-Cohesion: 0.26
-Nodes (21): RuntimeMode, DaemonOptions, debug_tokens_log_path(), env_requests_mcp_startup_logs(), handle_connection(), install_parent_death_signal(), main(), AnalyticsStore (+13 more)
+Cohesion: 0.30
+Nodes (18): RuntimeMode, DaemonOptions, debug_tokens_log_path(), env_requests_mcp_startup_logs(), handle_connection(), install_parent_death_signal(), main(), Arc (+10 more)
 
 ### Community 39 - "Community 39"
 Cohesion: 0.14
@@ -445,7 +445,7 @@ Nodes (21): Tests for exec MCP tool., Successful cargo build via exec should ret
 
 ### Community 41 - "Community 41"
 Cohesion: 0.07
-Nodes (21): Tests for read_file and write_file MCP tools., Paginated reads always return content, never 'unchanged'., Full read of a file ending in '\\n' must return content ending in '\\n'., Full read of a file WITHOUT trailing newline must not gain one., The canonical regression for vikunja #246: read then write must be     byte-iden, Offset read that reaches EOF must keep the file's trailing newline., Limited read that does NOT reach EOF must not append a newline., Limited read whose slice happens to end at EOF must keep the newline. (+13 more)
+Nodes (21): Tests for read_file and write_file MCP tools., After write_file, re-read returns full content., After edit_file, re-read returns full content., Paginated reads always return content, never 'unchanged'., Full read of a file ending in '\\n' must return content ending in '\\n'., Full read of a file WITHOUT trailing newline must not gain one., The canonical regression for vikunja #246: read then write must be     byte-iden, Offset read that reaches EOF must keep the file's trailing newline. (+13 more)
 
 ### Community 42 - "Community 42"
 Cohesion: 0.15
@@ -472,8 +472,8 @@ Cohesion: 0.14
 Nodes (25): mcp_socket_server(), McpSocketClient, Phase 1 (#240): MCP-over-socket — handshake, tool calls, parallel session isolat, Start daimonos in --mcp-socket mode; yield (sock_path, workspace)., Raw MCP JSON-RPC client over a Unix domain socket., Client can complete MCP initialize handshake., initialize result contains protocolVersion and serverInfo., tools/list returns at least read_file and write_file. (+17 more)
 
 ### Community 48 - "Community 48"
-Cohesion: 0.08
-Nodes (33): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+25 more)
+Cohesion: 0.05
+Nodes (61): build_watcher(), detect(), graphify_has_code_nodes(), has_x07_sources(), relevant_event(), run_startup(), run_startup_indexes_x07_workspace(), spawn_watcher() (+53 more)
 
 ### Community 49 - "Community 49"
 Cohesion: 0.07
@@ -484,11 +484,11 @@ Cohesion: 0.13
 Nodes (18): Path, CallSample, Client, find_binary(), load_task(), main(), proc_resource_snapshot(), Locate the release daimonos binary, building it if necessary.      Falls back to (+10 more)
 
 ### Community 51 - "Community 51"
-Cohesion: 0.09
-Nodes (42): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+34 more)
+Cohesion: 0.12
+Nodes (34): agent_system.md (Agent System Prompt), AGENTS.md (repo agent conventions), Claude Code Setup Guide, Cline Setup Guide, GitHub Copilot Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Daimonos MCP Server (daimonos --mcp) (+26 more)
 
 ### Community 52 - "Community 52"
-Cohesion: 0.09
+Cohesion: 0.08
 Nodes (21): Tests for the batch MCP tool., Nested batch calls are rejected., Batch without ops field returns error., Batch can run exec commands., Batch can mix different tool types., Batch continues on failure and reports per-op status., Batch with empty ops array returns empty results., Batch reading multiple files returns all results. (+13 more)
 
 ### Community 53 - "Community 53"
@@ -517,7 +517,7 @@ Nodes (40): RuntimeOption, ApprovalDecision, ApprovalRequest, AssistantOutcome, 
 
 ### Community 59 - "Community 59"
 Cohesion: 0.16
-Nodes (16): DescriptionEntry, embedded_catalog_covers_all_tools_and_terse_variants(), malformed_override_falls_back_to_defaults(), merge_value(), parse(), partial_override_merges_with_defaults(), Default, Error (+8 more)
+Nodes (17): DescriptionEntry, embedded_catalog_covers_all_tools_and_terse_variants(), execute_script_description_prevents_python_dialect_retries(), malformed_override_falls_back_to_defaults(), merge_value(), parse(), partial_override_merges_with_defaults(), Default (+9 more)
 
 ### Community 60 - "Community 60"
 Cohesion: 0.22
@@ -532,8 +532,8 @@ Cohesion: 0.53
 Nodes (3): reset_workspace(), run_task(), bench-codex.sh script
 
 ### Community 63 - "Community 63"
-Cohesion: 0.16
-Nodes (14): AnthropicResponseBlock, AnthropicUsage, AnthropicBlock, AnthropicResponse, AnthropicResponseBlock, AnthropicTool, CacheControl, content_block_to_anthropic() (+6 more)
+Cohesion: 0.15
+Nodes (16): AnthropicMessage, AnthropicThinking, AnthropicTool, AnthropicBlock, AnthropicRequest, AnthropicResponseBlock, AnthropicTool, CacheControl (+8 more)
 
 ### Community 64 - "Community 64"
 Cohesion: 0.32
@@ -580,8 +580,8 @@ Cohesion: 0.17
 Nodes (15): _create_pytest_project(), _pytest_available(), Drop a tests/ directory with a single test file in the workspace., pytest run on all-passing tests reports passed count and ok=true., pytest run reports structured failure ids when a test fails., pytest run with -k filter selects a subset., pytest collect returns the list of discovered test ids., pytest tool appears when a tests/ directory exists. (+7 more)
 
 ### Community 75 - "Community 75"
-Cohesion: 0.16
-Nodes (28): call_target_name(), classify_verb(), collect_calls(), collect_io_ops(), effect_facts(), empty_workspace_yields_empty_graph(), find_first_string(), first_string_arg() (+20 more)
+Cohesion: 0.17
+Nodes (18): SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content(), acp_omits_terminal_metadata_without_client_capability(), acp_plain_text_tool_result_becomes_json_string_raw_output(), acp_tool_call_advertises_location(), acp_usage_uses_final_request_not_accumulated_tool_loop() (+10 more)
 
 ### Community 76 - "Community 76"
 Cohesion: 0.24
@@ -608,8 +608,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.15
-Nodes (12): AgentConfig, append_remote_tools_to_catalog(), remote_tools_are_appended_to_list_all_tools_catalog(), AfterHook, AtomicU64, BeforeHook, CompactionHook, PlanHook (+4 more)
+Cohesion: 0.16
+Nodes (20): RecordedCall, acknowledge_coordination_model_notice(), AgentSession, BenchmarkCaptureProvider, CaptureProvider, coordination_model_notice(), coordination_model_notice_is_metadata_only_and_deduplicated(), microcompact_agent_history() (+12 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -624,8 +624,8 @@ Cohesion: 0.27
 Nodes (11): each_op_has_required_fields(), full_registry_returns_all_ops(), known_opcodes_present(), op_schema(), op_schema_helper_required_params(), schema(), specific_op_returns_single(), unknown_specific_op_returns_error() (+3 more)
 
 ### Community 86 - "Community 86"
-Cohesion: 0.26
-Nodes (13): build_request(), build_request_cache_control_on_prefix_boundary(), build_request_drops_temperature_when_thinking_enabled(), build_request_explicit_temperature_is_sent_when_thinking_off(), build_request_includes_adaptive_thinking_for_opus(), build_request_no_cache_control_when_stable_prefix_len_zero(), build_request_no_sampling_params(), build_request_no_thinking_for_haiku() (+5 more)
+Cohesion: 0.22
+Nodes (16): build_request(), build_request_cache_control_on_prefix_boundary(), build_request_disables_default_thinking_for_opus_5(), build_request_drops_temperature_when_thinking_enabled(), build_request_explicit_temperature_is_sent_when_thinking_off(), build_request_includes_adaptive_thinking_for_opus(), build_request_includes_adaptive_thinking_for_opus_5(), build_request_no_cache_control_when_stable_prefix_len_zero() (+8 more)
 
 ### Community 87 - "Community 87"
 Cohesion: 0.38
@@ -640,8 +640,8 @@ Cohesion: 0.24
 Nodes (9): is_context_overflow_error(), map_stop_reason(), CompleteOpts, Context, FnMut, LlmResponse, Send, StopReason (+1 more)
 
 ### Community 90 - "Community 90"
-Cohesion: 0.23
-Nodes (11): AnthropicBlock, AnthropicMessage, PartialBlock, stream_empty_text_block_omitted_from_content(), stream_multiple_blocks_by_index(), stream_text_deltas_accumulate_and_emit(), stream_thinking_deltas_emit_and_accumulate(), stream_tool_use_input_json_accumulates_silently() (+3 more)
+Cohesion: 0.22
+Nodes (12): AnthropicBlock, AnthropicMessage, PartialBlock, stream_empty_text_block_omitted_from_content(), stream_multiple_blocks_by_index(), stream_preserves_thinking_signature_for_tool_loop_replay(), stream_text_deltas_accumulate_and_emit(), stream_thinking_deltas_emit_and_accumulate() (+4 more)
 
 ### Community 91 - "Community 91"
 Cohesion: 0.18
@@ -688,8 +688,8 @@ Cohesion: 0.33
 Nodes (6): _parse(), Tests for the diff_files MCP tool., test_diff_different_files(), test_diff_file_vs_content(), test_diff_hunk_line_ranges(), test_diff_identical_files()
 
 ### Community 103 - "Community 103"
-Cohesion: 0.18
-Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
+Cohesion: 0.11
+Nodes (46): argument_pruning_contributes_to_saved_token_estimate(), bound_text(), BoundText, cfg(), cleanup_expired(), ensure_private_directory(), estimated_tokens(), existing_output_path() (+38 more)
 
 ### Community 104 - "Community 104"
 Cohesion: 0.39
@@ -704,16 +704,16 @@ Cohesion: 0.39
 Nodes (7): fmt(), gated(), load_summaries(), main(), model_of(), Yield per-task summary dicts from run dirs, optionally filtered by tag., Counts toward aggregates unless it errored or its checks failed.
 
 ### Community 107 - "Community 107"
-Cohesion: 0.11
-Nodes (19): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig, SearchConfig, Config, effective_full_tool_schemas() (+11 more)
+Cohesion: 0.10
+Nodes (20): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig, SearchConfig, Config, effective_full_tool_schemas() (+12 more)
 
 ### Community 108 - "Community 108"
-Cohesion: 0.40
-Nodes (5): filtered_exec_records_positive_saved_tokens(), read_dedup_records_positive_saved_tokens(), AnalyticsStore, Path, session_with_analytics()
+Cohesion: 0.18
+Nodes (36): chrono_now(), clean_empty_dirs(), collect_relative_paths(), collect_workspace_paths(), copy_workspace(), create_impl(), create_snapshot(), create_without_tag() (+28 more)
 
 ### Community 109 - "Community 109"
-Cohesion: 0.15
-Nodes (36): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, CoreAssistantOutcome, SessionId, available_commands(), build_acp_event_handler() (+28 more)
+Cohesion: 0.09
+Nodes (50): AcpClientRole, AcpStopReason, AvailableCommand, ConnectionTo, CoreAssistantOutcome, CoreMessage, SessionId, acp_stop_reason_name() (+42 more)
 
 ### Community 110 - "Community 110"
 Cohesion: 0.70
@@ -740,28 +740,28 @@ Cohesion: 0.60
 Nodes (4): E2e: KGL observed-provenance capture for script-driven file ops.  With DAIMONOS_, test_no_capture_when_disabled(), test_script_write_is_observed(), _text()
 
 ### Community 118 - "Community 118"
-Cohesion: 0.50
-Nodes (4): AnthropicMessage, AnthropicThinking, AnthropicTool, AnthropicRequest
+Cohesion: 0.67
+Nodes (3): AnthropicResponseBlock, AnthropicUsage, AnthropicResponse
 
 ### Community 119 - "Community 119"
 Cohesion: 0.70
 Nodes (3): reset_workspace(), run_task(), bench-cursor.sh script
 
 ### Community 120 - "Community 120"
-Cohesion: 0.27
-Nodes (8): BuiltinPlugin, builtin_cli_plugins(), floor_char_boundary(), floor_char_boundary_never_splits_a_char(), register_builtin_plugins(), Config, ToolRegistry, Vec
+Cohesion: 0.29
+Nodes (9): BuiltinPlugin, builtin_cli_plugins(), every_builtin_cli_module_is_in_the_canonical_registry(), floor_char_boundary(), floor_char_boundary_never_splits_a_char(), register_builtin_plugins(), Config, ToolRegistry (+1 more)
 
 ### Community 121 - "Community 121"
-Cohesion: 0.18
-Nodes (12): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, LlmProvider Trait (+4 more)
+Cohesion: 0.11
+Nodes (20): ADR-001: Provider Boundary Invariant, ADR-002: Context/Window Compaction for AgentSession, src/agent_env.rs, src/agent.rs, AgentSession, CompactionPolicy, src/compaction.rs, Context compaction (required config) (+12 more)
 
 ### Community 122 - "Community 122"
-Cohesion: 0.29
-Nodes (7): Cost note, Daimonos agent-mode benchmark, Environment variables, Files, Model, provider, and API key — one source of truth, Quick start, Tasks and correctness
+Cohesion: 0.25
+Nodes (8): Controlled tool-output benchmark, Cost note, Daimonos agent-mode benchmark, Environment variables, Files, Model, provider, and API key — one source of truth, Quick start, Tasks and correctness
 
 ### Community 123 - "Community 123"
-Cohesion: 0.33
-Nodes (5): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines
+Cohesion: 0.29
+Nodes (6): Aggregate result, Artifacts, Interpretation, Method, Per-task total tokens, Vikunja 1193/1194 — Anthropic Opus 4.8 benchmark
 
 ### Community 124 - "Community 124"
 Cohesion: 0.29
@@ -771,9 +771,17 @@ Nodes (12): build_tool_services(), provision_session(), AnalyticsStore, Arc, Con
 Cohesion: 0.29
 Nodes (6): Pygments, pytest, tests/requirements.txt (Test Dependencies), CI smoke test for the deterministic server-bench harness.  Runs a single task at, End-to-end: bench.py spawns daimonos, runs read_100 × 2 replicates,     writes a, test_bench_harness_runs_one_task()
 
+### Community 126 - "Community 126"
+Cohesion: 0.20
+Nodes (9): BENCHMARKING ENV — IMPORTANT (user instruction), Handoff — unified tool provisioning (Vikunja #1127 follow-on) + open threads, Open tickets / backlog (Vikunja project 183 "daimonos-agent"), Operational conventions (bit us repeatedly — don't relearn the hard way), THE 402 (billing) — not a code bug, THE POINT / WHY (root cause we're fixing), WHAT'S LEFT (in order), What the WIP commit already did (DONE, compiles, `clippy -D warnings` clean) (+1 more)
+
+### Community 127 - "Community 127"
+Cohesion: 0.15
+Nodes (13): AgentConfig, append_remote_tools_to_catalog(), controlled_tool_schemas(), remote_tools_are_appended_to_list_all_tools_catalog(), AfterHook, AtomicU64, BeforeHook, CompactionHook (+5 more)
+
 ### Community 136 - "Community 136"
-Cohesion: 0.40
-Nodes (8): acknowledge_coordination_model_notice(), CaptureProvider, coordination_model_notice(), coordination_model_notice_is_metadata_only_and_deduplicated(), Arc, Mutex, Session, ui_notice_is_metadata_only_and_deduplicated()
+Cohesion: 0.25
+Nodes (9): ListToolsResult, PaginatedRequestParams, RpcError, ServerHandler, DaimonosHandler, Arc, McpServer, Mutex (+1 more)
 
 ### Community 137 - "Community 137"
 Cohesion: 0.11
@@ -786,6 +794,10 @@ Nodes (14): ADR-002: Context/window compaction for AgentSession, Amendment (2026
 ### Community 139 - "Community 139"
 Cohesion: 0.12
 Nodes (14): Coding conventions, Daimonos tool usage policy, Layer 1: Rust unit/integration tests, Layer 2: pytest MCP protocol conformance, Manual testing, Prerequisites, Quick start (new agents), Repo layout (+6 more)
+
+### Community 140 - "Community 140"
+Cohesion: 0.15
+Nodes (6): Before opening a pull request, Contributing, Development setup, Project context for coding agents, Pull request guidelines, Runtime Modes
 
 ### Community 141 - "Community 141"
 Cohesion: 0.13
@@ -808,8 +820,8 @@ Cohesion: 0.15
 Nodes (12): Batch Operations, Compact Mode (optional, non-MCP clients), Daimonos Protocol Specification v0.1, Error, Error Codes, MCP Mode (primary), Opcode Registry, Overview (+4 more)
 
 ### Community 146 - "Community 146"
-Cohesion: 0.13
-Nodes (15): `[acp.mcp]` — MCP-server bridge, `[acp]` — Native agent protocol (`acp`), `[analytics]` — Token & Latency Tracking, Correlating with agent-runtime sessions, `[discord]` — Discord Integration Foundation, `[index]` — Workspace Indexing, `[kgl]` — Knowledge-Graph Layer, `[logging]` — Runtime Diagnostics (+7 more)
+Cohesion: 0.12
+Nodes (16): `[acp.mcp]` — MCP-server bridge, `[acp]` — Native agent protocol (`acp`), `[analytics]` — Token & Latency Tracking, Correlating with agent-runtime sessions, `[discord]` — Discord Integration Foundation, `[index]` — Workspace Indexing, `[kgl]` — Knowledge-Graph Layer, `[logging]` — Runtime Diagnostics (+8 more)
 
 ### Community 147 - "Community 147"
 Cohesion: 0.20
@@ -844,48 +856,52 @@ Cohesion: 0.25
 Nodes (7): Adding a task, Output schema, Quick start, server-bench, Tasks, What this doesn't replace, Why
 
 ### Community 156 - "Community 156"
-Cohesion: 0.13
-Nodes (10): AcpConfig, AnalyticsConfig, CoordinationNotificationsConfig, McpConfig, PipelineCacheConfig, ProcessConfig, AcpMcpConfig, Default (+2 more)
+Cohesion: 0.12
+Nodes (11): AcpConfig, AcpMcpConfig, CoordinationNotificationsConfig, McpConfig, PipelineCacheConfig, ProcessConfig, AcpMcpConfig, Default (+3 more)
 
 ### Community 157 - "Community 157"
 Cohesion: 0.29
 Nodes (7): 1. Open Zed settings, 2. Add daimonos as an MCP server, 3. Verify, Prerequisites, Setup, Troubleshooting, Zed Editor Setup
 
 ### Community 158 - "Community 158"
-Cohesion: 0.08
-Nodes (56): ConnectTo, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_cancelled_permission_finishes_the_announced_call(), acp_commands_execute_without_llm_and_clear_persisted_history() (+48 more)
+Cohesion: 0.05
+Nodes (79): AcpContentBlock, AcpDiff, ConnectTo, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images() (+71 more)
 
 ### Community 161 - "Community 161"
-Cohesion: 0.50
-Nodes (3): Execution plans, Keep the context lean (offload large data), Tool efficiency rules
+Cohesion: 0.40
+Nodes (4): Agent coordination, Execution plans, Keep the context lean (offload large data), Tool efficiency rules
 
 ### Community 167 - "Community 167"
-Cohesion: 0.14
-Nodes (15): AgentResult, AgentSession, is_user_turn_message(), last_assistant_text(), RemoteToolResult, retry_error_type(), Into, Message (+7 more)
+Cohesion: 0.11
+Nodes (21): CompactionEvent, AgentResult, compaction_log_line(), is_user_turn_message(), last_assistant_text(), log_compaction_event(), orphan_ids(), RemoteToolResult (+13 more)
 
 ### Community 168 - "Community 168"
-Cohesion: 0.11
-Nodes (50): CoreRuntimeOption, McpBridge, McpClientPool, ProviderFactory, SessionCompaction, SessionCore, AcpState, agent_tools() (+42 more)
+Cohesion: 0.09
+Nodes (56): CoreRuntimeOption, DateTime, LevelFilter, McpBridge, McpClientPool, SessionCompaction, SessionCore, AcpState (+48 more)
 
 ### Community 169 - "Community 169"
-Cohesion: 0.24
-Nodes (9): dirs_next(), load(), load_falls_back_to_defaults(), load_from_explicit_path(), load_from_workspace_file(), Path, PathBuf, search_candidates() (+1 more)
+Cohesion: 0.40
+Nodes (4): close_orphan_tool_calls(), close_orphan_tool_calls_closes_only_the_unanswered_parallel_call(), close_orphan_tool_calls_pairs_a_turn_cut_off_mid_call(), repaired_history_is_accepted_by_the_next_prompt_context()
 
 ### Community 170 - "Community 170"
 Cohesion: 0.50
 Nodes (6): config_dir(), expand_tilde(), home_dir(), Option, PathBuf, tilde_path_uses_shared_home()
+
+### Community 171 - "Community 171"
+Cohesion: 0.50
+Nodes (3): cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, Drop
 
 ### Community 172 - "Community 172"
 Cohesion: 0.10
 Nodes (20): ADR-003: Consume Zed-provided MCP servers in ACP sessions, Amendment: empty-forward fallback for unpatched Zed (2026-07-24), Component map (new + touched), Configuration, Constraints and existing structure, D10 — Analytics attribution, D11 — ACP excludes the Daimonos MCP server itself, D1 — Reuse the in-tree `rust-mcp-sdk` client (no new crate) (+12 more)
 
 ### Community 173 - "Community 173"
-Cohesion: 0.27
-Nodes (15): big_text(), compaction_config(), compaction_disabled_never_compacts(), compaction_hook_and_token_log_report_the_event(), execute_script_runs_in_the_agent_loop(), proactive_compaction_fires_over_high_water(), reactive_overflow_compacts_and_retries_once(), remote_tool_dispatch_none_falls_through_to_not_available() (+7 more)
+Cohesion: 0.20
+Nodes (21): agent_bounds_execute_script_results(), agent_bounds_meta_tool_results(), agent_bounds_native_tool_result_after_full_content_hook(), agent_bounds_remote_tool_results(), big_text(), bounded_session_in(), compaction_config(), compaction_disabled_never_compacts() (+13 more)
 
 ### Community 174 - "Community 174"
-Cohesion: 0.14
-Nodes (18): RecordedCall, agent_session_prompt_delivers_model_notice(), MockProvider, orphan_ids(), provider_error_does_not_suppress_coordination_notice_retry(), RecordingProvider, Box, CompleteOpts (+10 more)
+Cohesion: 0.28
+Nodes (9): end_turn_resp(), end_turn_resp_with_text(), CompleteOpts, Context, FnMut, LlmResponse, Send, StreamEvent (+1 more)
 
 ### Community 175 - "Community 175"
 Cohesion: 0.07
@@ -903,9 +919,13 @@ Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plan
 Cohesion: 0.10
 Nodes (21): ExporterBuildError, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CompactionMetadata, CompactionOutcome (+13 more)
 
+### Community 179 - "Community 179"
+Cohesion: 0.13
+Nodes (12): CoordinationNotificationsConfig, AnalyticsConfig, CoordinationConfig, dirs_next(), LoggingConfig, PromptsConfig, Option, PathBuf (+4 more)
+
 ### Community 181 - "Community 181"
-Cohesion: 0.10
-Nodes (36): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, BeforeHookResult, close_orphan_tool_calls() (+28 more)
+Cohesion: 0.09
+Nodes (36): accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, agent_session_prompt_delivers_model_notice(), BeforeHookResult, controlled_tool_calls() (+28 more)
 
 ### Community 182 - "Community 182"
 Cohesion: 0.07
@@ -931,10 +951,6 @@ Nodes (22): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_sta
 Cohesion: 0.23
 Nodes (9): OTelSdkResult, Resource, SpanData, SpanExporter, LoggingExporter<E>, Arc, AtomicUsize, Vec (+1 more)
 
-### Community 188 - "Community 188"
-Cohesion: 0.18
-Nodes (18): AcpDiff, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_destructive_tool_call_requests_permission_and_allows(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content(), acp_omits_terminal_metadata_without_client_capability(), acp_plain_text_tool_result_becomes_json_string_raw_output() (+10 more)
-
 ### Community 189 - "Community 189"
 Cohesion: 0.12
 Nodes (15): Comparing models & token-saving strategies, Content capture (opt-in), Credential rotation, Disable / rollback, Langfuse Cloud, LLM Observability (OpenTelemetry / Langfuse), Overhead & budgets, Retention (+7 more)
@@ -944,8 +960,8 @@ Cohesion: 0.27
 Nodes (15): assert_intent_is_visible(), declare_edge_creates_edge(), declare_edge_rejects_unknown_source_node(), foo_hash(), run(), str_arg(), str_array(), ws_with_graph() (+7 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.10
-Nodes (41): AcpPlan, ActiveToolCalls, AgentPlanEntry, BridgeSlot, CurrentConnection, DiffStash, Meta, SessionEventRouter (+33 more)
+Cohesion: 0.09
+Nodes (47): AcpPlan, ActiveToolCalls, AgentPlanEntry, BridgeSlot, CurrentConnection, DiffStash, Meta, SessionEventRouter (+39 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.09
@@ -960,12 +976,8 @@ Cohesion: 0.14
 Nodes (10): ActiveTurn, AtomicU8, ActiveTurn, Arc, Drop, F, Notify, SessionTurn (+2 more)
 
 ### Community 196 - "Community 196"
-Cohesion: 0.19
-Nodes (10): AcpMcpConfig, LoggingConfig, ObservabilityConfig, PromptsConfig, resolve_nonempty_env(), Option, Result, String (+2 more)
-
-### Community 198 - "Community 198"
-Cohesion: 0.25
-Nodes (4): discord_redact_sensitive_hides_env_token(), DiscordConfig, redact_secret(), redact_secret_hides_token_value()
+Cohesion: 0.18
+Nodes (9): discord_redact_sensitive_hides_env_token(), DiscordConfig, is_valid_env_var_name(), ObservabilityConfig, redact_secret(), redact_secret_hides_token_value(), resolve_nonempty_env(), Result (+1 more)
 
 ### Community 199 - "Community 199"
 Cohesion: 0.17
@@ -980,16 +992,16 @@ Cohesion: 0.08
 Nodes (70): AgentRecord, workspace_db_path(), workspace_db_path_differs_across_workspaces(), workspace_db_path_is_stable_for_same_workspace(), CoordinationOutcome, CoordinationStore, InboxEntry, MessageRecord (+62 more)
 
 ### Community 202 - "Community 202"
-Cohesion: 0.19
-Nodes (25): Globals, Handle, build_globals(), execute_counts_dispatched_ops_for_batch_size(), execute_with_op_count(), llm_query_batched_rejects_oversized_batch(), llm_query_batched_reports_per_item_outcomes(), llm_query_returns_text_and_accumulates_usage() (+17 more)
+Cohesion: 0.20
+Nodes (24): Globals, Handle, build_globals(), execute_counts_dispatched_ops_for_batch_size(), execute_with_op_count(), llm_query_batched_rejects_oversized_batch(), llm_query_batched_reports_per_item_outcomes(), llm_query_returns_text_and_accumulates_usage() (+16 more)
 
 ### Community 204 - "Community 204"
 Cohesion: 0.08
 Nodes (55): AgentRecord, cc_recipients_get_kind_cc_and_dedupe_with_to(), check_conflicts_is_read_only_and_ignores_own(), coordination_identity_recovers_by_session_id(), CoordinationStore, empty_store_lists_nothing(), expired_reservation_is_inert(), fetch_unknown_agent_is_none_not_error() (+47 more)
 
 ### Community 205 - "Community 205"
-Cohesion: 0.24
-Nodes (12): classify_subcall_failure(), MockProvider, CompleteOpts, ContentBlock, Context, LlmResponse, String, Vec (+4 more)
+Cohesion: 0.22
+Nodes (13): classify_subcall_failure(), MockProvider, CompleteOpts, ContentBlock, Context, LlmProvider, LlmResponse, String (+5 more)
 
 ### Community 206 - "Community 206"
 Cohesion: 0.09
@@ -1020,16 +1032,16 @@ Cohesion: 0.29
 Nodes (6): MockScriptToolPlugin, HashMap, Path, ToolDescriptor, ToolPlugin, ToolResult
 
 ### Community 216 - "Community 216"
-Cohesion: 0.32
-Nodes (15): apply_reroot_repoints_workspace_cwd_and_index(), dispatch_local_tool_declines_foreign_names_without_touching_session(), dispatch_tool_inner(), dispatch_tool_inner_stashes_meta_on_session(), dispatch_tool_threads_meta_through_session_and_resets_after(), extract_result_text(), session_stats_history_scope_filters_by_external_session_id(), session_stats_session_scope_includes_external_session_id() (+7 more)
+Cohesion: 0.28
+Nodes (17): apply_reroot_repoints_workspace_cwd_and_index(), dispatch_local_tool_declines_foreign_names_without_touching_session(), dispatch_tool_bounds_large_text_results_and_offloads_full_content(), dispatch_tool_inner(), dispatch_tool_inner_stashes_meta_on_session(), dispatch_tool_threads_meta_through_session_and_resets_after(), extract_result_text(), mcp_output_boundary_preserves_non_text_blocks_and_error_status() (+9 more)
 
 ### Community 217 - "Community 217"
-Cohesion: 0.17
-Nodes (21): Root, ScriptResult, apply_reroot(), apply_socket_roots_response(), dispatch_local_tool(), percent_decode(), pick_workspace_root(), root_uri_to_path() (+13 more)
+Cohesion: 0.18
+Nodes (21): Root, analytics_command(), apply_reroot(), apply_socket_roots_response(), dispatch_local_tool(), dispatch_tool(), percent_decode(), pick_workspace_root() (+13 more)
 
 ### Community 218 - "Community 218"
-Cohesion: 0.50
-Nodes (11): CallToolError, CallToolRequestParams, dispatch_tool(), err_text(), ok_text(), response_to_result(), CallToolResult, Result (+3 more)
+Cohesion: 0.41
+Nodes (13): CallToolError, CallToolRequestParams, ScriptResult, bounded_text_tool_result(), err_text(), ok_text(), response_to_result(), CallToolResult (+5 more)
 
 ### Community 219 - "Community 219"
 Cohesion: 0.05
@@ -1059,17 +1071,9 @@ Nodes (8): 1. Open MCP configuration, 2. Add daimonos as an MCP server, 3. Verif
 Cohesion: 0.29
 Nodes (7): 1. Edit Gemini CLI settings, 2. Run Gemini CLI, 3. Verify, Gemini CLI Setup, Prerequisites, Setup, Troubleshooting
 
-### Community 230 - "Community 230"
-Cohesion: 0.50
-Nodes (3): cancel_on_drop_sets_flag_when_dropped(), CancelOnDrop, Drop
-
-### Community 231 - "Community 231"
-Cohesion: 0.25
-Nodes (9): ListToolsResult, PaginatedRequestParams, RpcError, ServerHandler, DaimonosHandler, Arc, McpServer, Mutex (+1 more)
-
 ### Community 233 - "Community 233"
-Cohesion: 0.04
-Nodes (52): AcpContentBlock, CoreMessage, DateTime, InitializeRequest, LevelFilter, SessionInfo, acp_stop_reason_name(), AcpCommand (+44 more)
+Cohesion: 0.21
+Nodes (13): SessionInfo, decode_session_list_cursor(), encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), paginate_session_summaries(), pagination_summary(), SessionSummary, session_info() (+5 more)
 
 ### Community 235 - "Community 235"
 Cohesion: 0.16
@@ -1084,9 +1088,9 @@ Nodes (18): SessionEvent, SessionTurn, cancel_after_completion_is_refused_and_tu
   README.md · relation: references
 
 ## Knowledge Gaps
-- **848 isolated node(s):** `Path`, `build.sh script`, `setup.sh script`, `post-build.sh script`, `post-image.sh script` (+843 more)
+- **867 isolated node(s):** `bench-tool-output.sh script`, `Path`, `build.sh script`, `setup.sh script`, `post-build.sh script` (+862 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **15 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -1097,11 +1101,11 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
-- **Why does `RawErrorCapture` connect `Community 168` to `Community 233`, `Community 34`?**
-  _High betweenness centrality (0.009) - this node is a cross-community bridge._
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 82`?**
+  _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
+  _High betweenness centrality (0.008) - this node is a cross-community bridge._
+- **Why does `RawErrorCapture` connect `Community 168` to `Community 34`, `Community 158`?**
   _High betweenness centrality (0.007) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 174`?**
-  _High betweenness centrality (0.006) - this node is a cross-community bridge._
-- **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `The final response text lives in the stream's ``result`` event; fall back     to` to the rest of the system?**
-  _1047 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `bench-tool-output.sh script` to the rest of the system?**
+  _1065 weakly-connected nodes found - possible documentation gaps or missing edges._

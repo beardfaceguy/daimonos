@@ -25,6 +25,9 @@ graphify-out/20*/
 # KGL session state (per-machine SQLite database)
 .kgl/
 
+# Daimonos local session/snapshot state (per-machine, may contain stale lockfiles)
+.daimonos/
+
 # Local Vikunja reconciliation log (per-developer; offline progress tracking)
 VIKUNJA_TRACKING.md
 

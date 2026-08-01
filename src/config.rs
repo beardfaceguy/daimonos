@@ -13,6 +13,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub process: ProcessConfig,
+    pub tool_output: ToolOutputConfig,
     pub logging: LoggingConfig,
     pub observability: ObservabilityConfig,
     pub analytics: AnalyticsConfig,
@@ -151,6 +152,40 @@ pub struct ProcessConfig {
 /// was never called stays in sync with the struct default and the value
 /// in `daimonos.default.toml`.
 pub const DEFAULT_MAX_SCRIPT_THREADS: usize = 32;
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ToolOutputConfig {
+    /// Directory for full outputs replaced by bounded model-visible previews.
+    /// `None` resolves to `~/.daimonos/tool-output`.
+    pub directory: Option<String>,
+    /// Maximum UTF-8 bytes visible to the model for one tool result.
+    pub max_bytes: usize,
+    /// Maximum lines visible to the model for one tool result.
+    pub max_lines: usize,
+    /// Managed output retention period.
+    pub retention_days: u64,
+    /// Newest-first budget for prior successful tool results inside one turn.
+    pub intra_turn_result_budget_tokens: u64,
+    /// Always preserve at least this many most-recent successful results.
+    pub intra_turn_keep_recent_results: usize,
+    /// Maximum retained string argument size for old edit/write tool calls.
+    pub old_argument_max_chars: usize,
+}
+
+impl Default for ToolOutputConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            max_bytes: 50 * 1024,
+            max_lines: 2_000,
+            retention_days: 7,
+            intra_turn_result_budget_tokens: 40_000,
+            intra_turn_keep_recent_results: 5,
+            old_argument_max_chars: 2_000,
+        }
+    }
+}
 
 // LLM/provider connection config lives in the agent env file, loaded by the
 // `agent_env` module (vikunja #949). This TOML section contains only ACP
@@ -952,6 +987,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.acp.validate()?;
         self.process.validate()?;
+        self.tool_output.validate()?;
         self.logging.validate()?;
         self.observability.validate()?;
         self.discord.validate()
@@ -1271,6 +1307,12 @@ mod tests {
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.tool_output.max_bytes, 50 * 1024);
+        assert_eq!(cfg.tool_output.max_lines, 2_000);
+        assert_eq!(cfg.tool_output.retention_days, 7);
+        assert_eq!(cfg.tool_output.intra_turn_result_budget_tokens, 40_000);
+        assert_eq!(cfg.tool_output.intra_turn_keep_recent_results, 5);
+        assert_eq!(cfg.tool_output.old_argument_max_chars, 2_000);
         assert_eq!(cfg.index.max_depth, 20);
         assert!(cfg.logging.enabled);
         assert_eq!(cfg.logging.level, "info");
@@ -1289,6 +1331,38 @@ mod tests {
         assert!(!cfg.mcp.full_tool_schemas);
         assert_eq!(cfg.kgl.busy_timeout_ms, 5_000);
         assert_eq!(cfg.kgl.max_watches, 4_096);
+    }
+
+    #[test]
+    fn tool_output_rejects_unsafe_limits() {
+        for (field, toml) in [
+            ("tool_output.max_bytes", "[tool_output]\nmax_bytes = 255\n"),
+            ("tool_output.max_lines", "[tool_output]\nmax_lines = 2\n"),
+            (
+                "tool_output.retention_days",
+                "[tool_output]\nretention_days = 0\n",
+            ),
+            (
+                "tool_output.intra_turn_result_budget_tokens",
+                "[tool_output]\nintra_turn_result_budget_tokens = 0\n",
+            ),
+            (
+                "tool_output.intra_turn_keep_recent_results",
+                "[tool_output]\nintra_turn_keep_recent_results = 0\n",
+            ),
+            (
+                "tool_output.old_argument_max_chars",
+                "[tool_output]\nold_argument_max_chars = 19\n",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(toml).unwrap();
+            assert!(
+                cfg.validate()
+                    .expect_err("unsafe tool-output limit must be rejected")
+                    .contains(field),
+                "{field} validation error must name the field"
+            );
+        }
     }
 
     #[test]

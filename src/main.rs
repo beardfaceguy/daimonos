@@ -34,6 +34,7 @@ mod session_store;
 mod snapshot;
 mod tool_descriptions;
 mod tool_facade;
+mod tool_output;
 mod tool_runner;
 mod tools;
 mod verbosity;

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{
     CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
@@ -11,6 +11,8 @@ use super::{
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const PROVIDER_STATE: &str = "anthropic";
+const THINKING_SIGNATURE_STATE: &str = "thinking_signature";
 
 // --- Anthropic wire types (request) ---
 
@@ -87,6 +89,8 @@ enum AnthropicBlock {
     Thinking {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
     ToolUse {
@@ -126,6 +130,8 @@ struct AnthropicResponseBlock {
     #[serde(default)]
     thinking: Option<String>,
     #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
@@ -134,18 +140,33 @@ struct AnthropicResponseBlock {
 }
 
 impl AnthropicResponseBlock {
-    fn into_content(self) -> Option<ContentBlock> {
+    fn into_contents(self) -> Vec<ContentBlock> {
         match self.kind.as_str() {
-            "text" => self.text.map(ContentBlock::Text),
-            "thinking" => self.thinking.map(ContentBlock::Thinking),
+            "text" => self.text.map(ContentBlock::Text).into_iter().collect(),
+            "thinking" => {
+                let Some(thinking) = self.thinking else {
+                    return Vec::new();
+                };
+                let mut content = vec![ContentBlock::Thinking(thinking)];
+                if let Some(signature) = self.signature.filter(|value| !value.is_empty()) {
+                    content.push(ContentBlock::ProviderState {
+                        provider: PROVIDER_STATE.to_string(),
+                        data: json!({
+                            "type": THINKING_SIGNATURE_STATE,
+                            "signature": signature,
+                        }),
+                    });
+                }
+                content
+            }
             "tool_use" => {
                 if let (Some(id), Some(name), Some(input)) = (self.id, self.name, self.input) {
-                    Some(ContentBlock::ToolCall { id, name, input })
+                    vec![ContentBlock::ToolCall { id, name, input }]
                 } else {
-                    None
+                    Vec::new()
                 }
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 }
@@ -249,12 +270,14 @@ pub(crate) fn max_input_tokens_from_model(body: &Value) -> Option<u64> {
 
 fn supports_adaptive_thinking(model: &str) -> bool {
     model.starts_with("claude-opus-4")
+        || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-4-6")
         || model.starts_with("claude-fable")
 }
 
 fn content_block_to_anthropic(
     block: &ContentBlock,
+    next_block: Option<&ContentBlock>,
     cache: Option<CacheControl>,
 ) -> Option<AnthropicBlock> {
     Some(match block {
@@ -274,6 +297,7 @@ fn content_block_to_anthropic(
         },
         ContentBlock::Thinking(t) => AnthropicBlock::Thinking {
             thinking: t.clone(),
+            signature: thinking_signature(next_block).map(str::to_owned),
             cache_control: cache,
         },
         ContentBlock::ToolCall { id, name, input } => AnthropicBlock::ToolUse {
@@ -296,23 +320,34 @@ fn content_block_to_anthropic(
     })
 }
 
+fn thinking_signature(block: Option<&ContentBlock>) -> Option<&str> {
+    let ContentBlock::ProviderState { provider, data } = block? else {
+        return None;
+    };
+    if provider != PROVIDER_STATE || data["type"].as_str() != Some(THINKING_SIGNATURE_STATE) {
+        return None;
+    }
+    data["signature"]
+        .as_str()
+        .filter(|signature| !signature.is_empty())
+}
+
 fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> Option<AnthropicMessage> {
-    let serializable = msg
+    let last = msg
         .content
         .iter()
-        .filter(|block| !matches!(block, ContentBlock::ProviderState { .. }))
-        .collect::<Vec<_>>();
-    let last = serializable.len().saturating_sub(1);
-    let blocks: Vec<AnthropicBlock> = serializable
-        .into_iter()
+        .rposition(|block| !matches!(block, ContentBlock::ProviderState { .. }));
+    let blocks: Vec<AnthropicBlock> = msg
+        .content
+        .iter()
         .enumerate()
         .filter_map(|(i, block)| {
-            let cache = if is_prefix_boundary && i == last {
+            let cache = if is_prefix_boundary && Some(i) == last {
                 Some(CacheControl::ephemeral())
             } else {
                 None
             };
-            content_block_to_anthropic(block, cache)
+            content_block_to_anthropic(block, msg.content.get(i + 1), cache)
         })
         .collect();
     (!blocks.is_empty()).then(|| AnthropicMessage {
@@ -349,14 +384,18 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         .filter_map(|(i, msg)| message_to_anthropic(msg, boundary_index == Some(i)))
         .collect();
 
-    let thinking = if opts.thinking != ThinkingLevel::Off && supports_adaptive_thinking(&opts.model)
-    {
-        Some(AnthropicThinking {
-            kind: "adaptive".to_string(),
-        })
+    let thinking_kind = if opts.thinking == ThinkingLevel::Off {
+        // Opus 5 enables adaptive thinking when the field is omitted, so an
+        // explicit disabled value is required to honor the caller's intent.
+        opts.model
+            .starts_with("claude-opus-5")
+            .then_some("disabled")
     } else {
-        None
+        supports_adaptive_thinking(&opts.model).then_some("adaptive")
     };
+    let thinking = thinking_kind.map(|kind| AnthropicThinking {
+        kind: kind.to_string(),
+    });
 
     // Anthropic rejects a custom temperature when thinking is enabled —
     // drop it in that combination (core expresses intent, the provider
@@ -386,7 +425,10 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
 /// `content_block_start` through `content_block_delta`/`_stop`.
 enum PartialBlock {
     Text(String),
-    Thinking(String),
+    Thinking {
+        text: String,
+        signature: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -426,7 +468,10 @@ impl StreamState {
                 let idx = data["index"].as_u64().unwrap_or(0) as usize;
                 let cb = &data["content_block"];
                 let block = match cb["type"].as_str() {
-                    Some("thinking") => PartialBlock::Thinking(String::new()),
+                    Some("thinking") => PartialBlock::Thinking {
+                        text: String::new(),
+                        signature: String::new(),
+                    },
                     Some("tool_use") => PartialBlock::ToolUse {
                         id: cb["id"].as_str().unwrap_or_default().to_string(),
                         name: cb["name"].as_str().unwrap_or_default().to_string(),
@@ -449,10 +494,13 @@ impl StreamState {
                             t.push_str(piece);
                             events.push(StreamEvent::TextDelta(piece.to_string()));
                         }
-                        (PartialBlock::Thinking(t), Some("thinking_delta")) => {
+                        (PartialBlock::Thinking { text, .. }, Some("thinking_delta")) => {
                             let piece = delta["thinking"].as_str().unwrap_or_default();
-                            t.push_str(piece);
+                            text.push_str(piece);
                             events.push(StreamEvent::ThinkingDelta(piece.to_string()));
+                        }
+                        (PartialBlock::Thinking { signature, .. }, Some("signature_delta")) => {
+                            signature.push_str(delta["signature"].as_str().unwrap_or_default());
                         }
                         (PartialBlock::ToolUse { partial_json, .. }, Some("input_json_delta")) => {
                             partial_json
@@ -476,13 +524,23 @@ impl StreamState {
     }
 
     fn finish(self, model: &str) -> LlmResponse {
-        let content = self
-            .blocks
-            .into_iter()
-            .filter_map(|b| match b {
-                PartialBlock::Text(t) if t.is_empty() => None,
-                PartialBlock::Text(t) => Some(ContentBlock::Text(t)),
-                PartialBlock::Thinking(t) => Some(ContentBlock::Thinking(t)),
+        let mut content = Vec::new();
+        for block in self.blocks {
+            match block {
+                PartialBlock::Text(t) if t.is_empty() => {}
+                PartialBlock::Text(t) => content.push(ContentBlock::Text(t)),
+                PartialBlock::Thinking { text, signature } => {
+                    content.push(ContentBlock::Thinking(text));
+                    if !signature.is_empty() {
+                        content.push(ContentBlock::ProviderState {
+                            provider: PROVIDER_STATE.to_string(),
+                            data: json!({
+                                "type": THINKING_SIGNATURE_STATE,
+                                "signature": signature,
+                            }),
+                        });
+                    }
+                }
                 PartialBlock::ToolUse {
                     id,
                     name,
@@ -490,10 +548,10 @@ impl StreamState {
                 } => {
                     let input: Value = serde_json::from_str(&partial_json)
                         .unwrap_or_else(|_| Value::Object(Default::default()));
-                    Some(ContentBlock::ToolCall { id, name, input })
+                    content.push(ContentBlock::ToolCall { id, name, input });
                 }
-            })
-            .collect();
+            }
+        }
         let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         let usage = map_usage(self.usage, model);
         LlmResponse {
@@ -586,7 +644,7 @@ impl LlmProvider for AnthropicProvider {
         let content = raw
             .content
             .into_iter()
-            .filter_map(|b| b.into_content())
+            .flat_map(AnthropicResponseBlock::into_contents)
             .collect();
         let stop_reason = map_stop_reason(raw.stop_reason.as_deref());
         let usage = map_usage(raw.usage, &opts.model);
@@ -998,6 +1056,39 @@ mod tests {
     }
 
     #[test]
+    fn build_request_includes_adaptive_thinking_for_opus_5() {
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-5".to_string(),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn build_request_disables_default_thinking_for_opus_5() {
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-5".to_string(),
+            thinking: ThinkingLevel::Off,
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["thinking"]["type"], "disabled");
+    }
+
+    #[test]
     fn build_request_no_thinking_for_haiku() {
         let ctx = Context {
             messages: vec![Message::user("hello")],
@@ -1173,7 +1264,35 @@ mod tests {
             "text": "hello world"
         }))
         .unwrap();
-        assert!(matches!(block.into_content(), Some(ContentBlock::Text(t)) if t == "hello world"));
+        assert!(
+            matches!(&block.into_contents()[..], [ContentBlock::Text(t)] if t == "hello world")
+        );
+    }
+
+    #[test]
+    fn response_thinking_signature_is_preserved_for_replay() {
+        let block: AnthropicResponseBlock = serde_json::from_value(json!({
+            "type": "thinking",
+            "thinking": "reasoning...",
+            "signature": "signed-thinking"
+        }))
+        .unwrap();
+        let content = block.into_contents();
+        let ctx = Context {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content,
+            }],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let request = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+
+        assert_eq!(
+            request["messages"][0]["content"][0]["signature"],
+            "signed-thinking"
+        );
     }
 
     #[test]
@@ -1186,7 +1305,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            matches!(block.into_content(), Some(ContentBlock::ToolCall { name, .. }) if name == "read_file")
+            matches!(&block.into_contents()[..], [ContentBlock::ToolCall { name, .. }] if name == "read_file")
         );
     }
 
@@ -1197,7 +1316,7 @@ mod tests {
             "data": "opaque"
         }))
         .unwrap();
-        assert!(block.into_content().is_none());
+        assert!(block.into_contents().is_empty());
     }
 
     // --- StreamState (vikunja #957) ---
@@ -1235,6 +1354,66 @@ mod tests {
         );
         let resp = state.finish("claude-haiku-4-5");
         assert!(matches!(&resp.content[0], ContentBlock::Thinking(t) if t == "reasoning..."));
+    }
+
+    #[test]
+    fn stream_preserves_thinking_signature_for_tool_loop_replay() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }));
+        state.on_data(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reasoning..."}
+        }));
+        state.on_data(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "signed-thinking"}
+        }));
+        state.on_data(&json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}
+        }));
+        state.on_data(&json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{}"}
+        }));
+        state.on_data(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}),
+        );
+
+        let response = state.finish("claude-opus-5");
+        let ctx = Context {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: "{}".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let request = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+
+        assert_eq!(
+            request["messages"][0]["content"][0]["signature"],
+            "signed-thinking"
+        );
     }
 
     #[test]

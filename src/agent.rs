@@ -57,12 +57,6 @@ pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 /// sandbox thread shares the live session via `Arc<Mutex<Session>>`.
 pub const EXECUTE_SCRIPT_TOOL: &str = "execute_script";
 
-/// Upper safety ceiling for a model-supplied `execute_script` timeout (1 hour).
-/// Not a user-tunable knob — it only prevents a malformed/oversized value from
-/// tying up a bounded script-thread slot near-indefinitely; it sits well above
-/// any realistic script run (default is 60s).
-const MAX_SCRIPT_TIMEOUT_SECS: i64 = 3600;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPriority {
@@ -398,6 +392,82 @@ async fn acknowledge_coordination_model_notice(
     s.coordination_model_watermark = s.coordination_model_watermark.max(newest_message_id);
 }
 
+async fn microcompact_agent_history(
+    messages: &mut [Message],
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+) {
+    let cfg = {
+        let guard = session.lock().await;
+        guard.cfg.tool_output.clone()
+    };
+    let stats = crate::tool_output::microcompact_history(messages, &cfg).await;
+    if stats.results_pruned == 0 && stats.arguments_pruned == 0 {
+        return;
+    }
+
+    let (analytics, external_session_id) = {
+        let mut guard = session.lock().await;
+        if stats.clear_read_cache {
+            guard.read_cache.clear();
+        } else {
+            for path in &stats.evicted_read_paths {
+                let resolved = guard.resolve_path(path.to_string_lossy().as_ref());
+                guard.invalidate_read_cache(&resolved);
+            }
+        }
+        (guard.analytics.clone(), guard.external_session_id.clone())
+    };
+    if let Some(analytics) = analytics {
+        analytics.record_async(crate::analytics::ToolCallRecord {
+            tool_name: "context:microcompact".to_string(),
+            command: None,
+            request_tokens: 0,
+            response_tokens: 0,
+            saved_tokens: i64::try_from(stats.estimated_tokens_saved).unwrap_or(i64::MAX),
+            savings_pct: 0.0,
+            exec_time_ms: 0,
+            was_redirect: false,
+            was_filtered: true,
+            read_dedup: false,
+            batch_size: u32::try_from(stats.results_pruned.saturating_add(stats.arguments_pruned))
+                .unwrap_or(u32::MAX),
+            external_session_id,
+        });
+    }
+}
+
+async fn record_agent_tool_output_savings(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    tool_name: &str,
+    visible_chars: usize,
+    saved_tokens: i64,
+    savings_pct: f64,
+) {
+    if saved_tokens <= 0 {
+        return;
+    }
+    let (analytics, external_session_id) = {
+        let guard = session.lock().await;
+        (guard.analytics.clone(), guard.external_session_id.clone())
+    };
+    if let Some(analytics) = analytics {
+        analytics.record_async(crate::analytics::ToolCallRecord {
+            tool_name: "context:tool_output".to_string(),
+            command: Some(tool_name.to_string()),
+            request_tokens: 0,
+            response_tokens: crate::analytics::estimate_tokens(visible_chars),
+            saved_tokens,
+            savings_pct,
+            exec_time_ms: 0,
+            was_redirect: false,
+            was_filtered: true,
+            read_dedup: false,
+            batch_size: 1,
+            external_session_id,
+        });
+    }
+}
+
 pub async fn run(
     provider: &dyn LlmProvider,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -408,6 +478,11 @@ pub async fn run(
     let mut total_usage = Usage::default();
 
     loop {
+        // Deterministically shed old successful tool context before every
+        // provider call. This runs inside a single user turn, where ADR-002's
+        // between-turn compaction cannot help.
+        microcompact_agent_history(&mut messages, &session).await;
+
         // Safe boundary: no provider stream or tool call is active here. This
         // runs before the initial generation and after complete tool-result
         // batches; the notice is ephemeral system context, not fake history.
@@ -507,6 +582,10 @@ pub async fn run(
                     })
                     .collect();
 
+                let output_cfg = {
+                    let guard = session.lock().await;
+                    guard.cfg.tool_output.clone()
+                };
                 let mut tool_results = Vec::new();
                 let mut terminate = false;
 
@@ -560,13 +639,13 @@ pub async fn run(
                     let dispatched = name == UPDATE_PLAN_TOOL
                         || name == EXECUTE_SCRIPT_TOOL
                         || crate::tools::has_opcode_mapping(&name);
-                    let tool_span = dispatched.then(|| {
+                    let mut tool_span = dispatched.then(|| {
                         crate::observability::ToolSpan::new(
                             &name,
                             crate::observability::tool_kind(&name),
                         )
                     });
-                    let (content, is_error, outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                    let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
                         // `Arc<Mutex<Session>>` clone rather than a `&mut`.
@@ -575,15 +654,9 @@ pub async fn run(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        let timeout_secs = input
-                            .get("timeout")
-                            .and_then(serde_json::Value::as_i64)
-                            // Non-positive → default (also guards a negative
-                            // value wrapping to a huge u64); clamp the upper
-                            // bound to the safety ceiling.
-                            .filter(|secs| *secs > 0)
-                            .map(|secs| secs.min(MAX_SCRIPT_TIMEOUT_SECS))
-                            .unwrap_or(60) as u64;
+                        let timeout_secs = crate::script::bounded_timeout_secs(
+                            input.get("timeout").and_then(serde_json::Value::as_i64),
+                        );
                         let cfg = {
                             let mut guard = session.lock().await;
                             guard.used_tools.insert(EXECUTE_SCRIPT_TOOL.to_string());
@@ -757,6 +830,11 @@ pub async fn run(
                                     .await
                                 };
                                 if let Some((content, is_error, meta)) = local {
+                                    let content = if name == LIST_ALL_TOOLS_TOOL {
+                                        append_remote_tools_to_catalog(content, &config.tools)
+                                    } else {
+                                        content
+                                    };
                                     let response_chars = content.len();
                                     let (saved_tokens, _) = crate::analytics::compute_savings(
                                         meta.unfiltered_chars,
@@ -775,21 +853,14 @@ pub async fn run(
                                         read_dedup: meta.read_dedup,
                                         batch_size: 1,
                                     };
-                                    // These tools carry no opcode mapping, so no
-                                    // `tool_span` was opened for them upstream.
-                                    // Without this they would be the only tools
-                                    // the agent can call that emit no span.
                                     if tool_span.is_none() {
-                                        let status = if is_error {
-                                            crate::observability::ToolStatus::Error
-                                        } else {
-                                            crate::observability::ToolStatus::Success
-                                        };
-                                        crate::observability::ToolSpan::new(
+                                        // These tools carry no opcode mapping,
+                                        // so open their span here and close it
+                                        // only after the shared output boundary.
+                                        tool_span = Some(crate::observability::ToolSpan::new(
                                             &name,
                                             dispatch_tool_kind(&name),
-                                        )
-                                        .finish(status, outcome);
+                                        ));
                                     }
                                     (content, is_error, Some(outcome))
                                 } else {
@@ -829,6 +900,48 @@ pub async fn run(
                             }
                         }
                     };
+                    // after_tool_call hook
+                    if let Some(hook) = &config.after_tool_call {
+                        if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
+                            terminate = true;
+                        }
+                    }
+
+                    // Every agent-visible text result crosses one shared
+                    // boundary after UI hooks inspect the complete output but
+                    // before model history retains it (vikunja #1193).
+                    let bounded = crate::tool_output::bound_text(&output_cfg, &name, content).await;
+                    let was_offloaded = bounded.output_path.is_some();
+                    if was_offloaded && name == "read_file" {
+                        let mut guard = session.lock().await;
+                        if let Some(path) = input.get("path").and_then(Value::as_str) {
+                            let resolved = guard.resolve_path(path);
+                            guard.invalidate_read_cache(&resolved);
+                        } else {
+                            guard.read_cache.clear();
+                        }
+                    }
+                    let (additional_saved, savings_pct) = crate::analytics::compute_savings(
+                        bounded.original_chars,
+                        bounded.visible_chars,
+                    );
+                    record_agent_tool_output_savings(
+                        &session,
+                        &name,
+                        bounded.visible_chars,
+                        additional_saved,
+                        savings_pct,
+                    )
+                    .await;
+                    if let Some(outcome) = &mut outcome {
+                        outcome.response_tokens_est =
+                            crate::analytics::estimate_tokens(bounded.visible_chars);
+                        outcome.saved_tokens_est =
+                            outcome.saved_tokens_est.saturating_add(additional_saved);
+                        outcome.filtered |= was_offloaded;
+                    }
+                    content = bounded.content;
+
                     if let Some(tool_span) = tool_span {
                         let status = if is_error {
                             crate::observability::ToolStatus::Error
@@ -836,13 +949,6 @@ pub async fn run(
                             crate::observability::ToolStatus::Success
                         };
                         tool_span.finish(status, outcome.unwrap_or_default());
-                    }
-
-                    // after_tool_call hook
-                    if let Some(hook) = &config.after_tool_call {
-                        if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
-                            terminate = true;
-                        }
                     }
 
                     tool_results.push(ContentBlock::ToolResult {
@@ -1503,7 +1609,7 @@ mod tests {
     use crate::providers::LlmResponse;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     // --- MockProvider ---
@@ -1540,6 +1646,36 @@ mod tests {
         async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
             *self.seen.lock().unwrap() = ctx.messages.clone();
             end_turn_resp()
+        }
+    }
+
+    struct BenchmarkCaptureProvider {
+        responses: Mutex<VecDeque<LlmResponse>>,
+        contexts: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl BenchmarkCaptureProvider {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                contexts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn contexts_handle(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            Arc::clone(&self.contexts)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for BenchmarkCaptureProvider {
+        async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            self.contexts.lock().unwrap().push(ctx.messages.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| LlmResponse::error("BenchmarkCaptureProvider exhausted"))
         }
     }
 
@@ -1581,6 +1717,354 @@ mod tests {
 
     fn session_in(dir: &std::path::Path) -> Session {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
+    }
+
+    fn bounded_session_in(dir: &std::path::Path) -> Session {
+        let mut cfg = Config::default();
+        cfg.tool_output.directory = Some(dir.join("tool-output").to_string_lossy().to_string());
+        cfg.tool_output.max_bytes = 256;
+        cfg.tool_output.max_lines = 6;
+        Session::new(dir.to_path_buf(), Arc::new(cfg))
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct ControlledArmMetrics {
+        model_visible_chars: usize,
+        model_visible_tokens: u64,
+        wall_micros: u128,
+        offload_files: usize,
+        pruned_results: usize,
+        truncated_arguments: usize,
+        recoverable_sentinels: usize,
+        read_cache_entries: usize,
+        output_saved_tokens: i64,
+        microcompact_saved_tokens: i64,
+    }
+
+    fn controlled_tool_calls() -> Vec<ContentBlock> {
+        let mut calls = vec![
+            ContentBlock::ToolCall {
+                id: "read-large".into(),
+                name: "read_file".into(),
+                input: json!({"path":"large-read.txt"}),
+            },
+            ContentBlock::ToolCall {
+                id: "meta-large".into(),
+                name: "list_all_tools".into(),
+                input: json!({}),
+            },
+            ContentBlock::ToolCall {
+                id: "script-large".into(),
+                name: "execute_script".into(),
+                input: json!({"code": "result = \"SCRIPT_SENTINEL\" + \"x\" * 60000"}),
+            },
+            ContentBlock::ToolCall {
+                id: "remote-large".into(),
+                name: "mcp__bench__large".into(),
+                input: json!({}),
+            },
+            ContentBlock::ToolCall {
+                id: "write-old".into(),
+                name: "write_file".into(),
+                input: json!({
+                    "path":"written.txt",
+                    "content": format!("WRITE_SENTINEL{}", "w".repeat(10_000)),
+                }),
+            },
+            ContentBlock::ToolCall {
+                id: "edit-old".into(),
+                name: "edit_file".into(),
+                input: json!({
+                    "path":"edit.txt",
+                    "edits":[
+                        format!("EDIT_OLD_SENTINEL{}", "o".repeat(10_000)),
+                        format!("EDIT_NEW_SENTINEL{}", "n".repeat(10_000)),
+                    ],
+                }),
+            },
+        ];
+        calls.extend((0..8).map(|index| ContentBlock::ToolCall {
+            id: format!("medium-{index}"),
+            name: format!("mcp__bench__medium_{index}"),
+            input: json!({}),
+        }));
+        calls.push(ContentBlock::ToolCall {
+            id: "error".into(),
+            name: "does_not_exist".into(),
+            input: json!({}),
+        });
+        calls
+    }
+
+    fn controlled_tool_schemas() -> Vec<ToolSchema> {
+        let mut schemas = (0..160)
+            .map(|index| ToolSchema {
+                name: format!("mcp__bench__schema_{index}"),
+                description: format!("META_SENTINEL_{}{}", index, "d".repeat(600)),
+                input_schema: json!({"type":"object","properties":{}}),
+            })
+            .collect::<Vec<_>>();
+        schemas.push(ToolSchema {
+            name: "mcp__bench__large".into(),
+            description: "controlled large remote tool".into(),
+            input_schema: json!({"type":"object"}),
+        });
+        schemas.extend((0..8).map(|index| ToolSchema {
+            name: format!("mcp__bench__medium_{index}"),
+            description: "controlled medium remote tool".into(),
+            input_schema: json!({"type":"object"}),
+        }));
+        schemas
+    }
+
+    fn count_marker(messages: &[Message], marker: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content.contains(marker),
+                ContentBlock::ToolCall { input, .. } => input.to_string().contains(marker),
+                _ => false,
+            })
+            .count()
+    }
+
+    async fn run_controlled_tool_output_arm(disabled: bool) -> ControlledArmMetrics {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("tool-output");
+        std::fs::write(
+            dir.path().join("large-read.txt"),
+            format!("READ_SENTINEL\n{}", "r".repeat(60_000)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("edit.txt"),
+            format!("EDIT_OLD_SENTINEL{}", "o".repeat(10_000)),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.tool_output.directory = Some(output_dir.to_string_lossy().to_string());
+        if disabled {
+            cfg.tool_output.max_bytes = usize::MAX;
+            cfg.tool_output.max_lines = usize::MAX;
+            cfg.tool_output.intra_turn_result_budget_tokens = u64::MAX;
+            cfg.tool_output.intra_turn_keep_recent_results = usize::MAX;
+            cfg.tool_output.old_argument_max_chars = usize::MAX;
+        }
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        session.analytics = Some(Arc::clone(&analytics));
+        let session = shared(session);
+
+        let first_response = LlmResponse {
+            content: controlled_tool_calls(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage::default(),
+        };
+        let provider =
+            BenchmarkCaptureProvider::new(vec![first_response, end_turn_resp_with_text("done")]);
+        let contexts = provider.contexts_handle();
+        let hook_outputs = Arc::new(Mutex::new(HashMap::new()));
+        let captured_outputs = Arc::clone(&hook_outputs);
+        let config = AgentConfig {
+            tools: controlled_tool_schemas(),
+            after_tool_call: Some(Box::new(move |info, content, _| {
+                captured_outputs
+                    .lock()
+                    .unwrap()
+                    .insert(info.name.clone(), content.to_string());
+                AfterHookResult::Continue
+            })),
+            remote_tool_dispatch: Some(Box::new(|name: &str, _input: &Value| {
+                let name = name.to_string();
+                Box::pin(async move {
+                    if name == "mcp__bench__large" {
+                        return Some(RemoteToolResult {
+                            content: format!("REMOTE_LARGE_SENTINEL\n{}", "l".repeat(60_000)),
+                            is_error: false,
+                        });
+                    }
+                    name.strip_prefix("mcp__bench__medium_")
+                        .map(|index| RemoteToolResult {
+                            content: format!("MEDIUM_SENTINEL_{index}\n{}", "m".repeat(30_000)),
+                            is_error: false,
+                        })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+
+        let started = std::time::Instant::now();
+        let result = run(
+            &provider,
+            Arc::clone(&session),
+            vec![Message::user("controlled benchmark")],
+            &config,
+        )
+        .await;
+        let wall_micros = started.elapsed().as_micros();
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+        let visible = {
+            let contexts = contexts.lock().unwrap();
+            assert_eq!(contexts.len(), 2);
+            contexts[1].clone()
+        };
+        let call_ids = visible
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let result_ids = visible
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(call_ids, result_ids, "tool call/result pairing changed");
+        assert!(visible
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                } if tool_use_id == "error"
+            )));
+
+        assert!(
+            analytics
+                .wait_until_quiet(std::time::Duration::from_secs(2))
+                .await
+        );
+        let stats = analytics.session_summary();
+        let output_saved_tokens = stats
+            .per_tool
+            .get("context:tool_output")
+            .map(|tool| tool.saved_tokens)
+            .unwrap_or(0);
+        let microcompact_saved_tokens = stats
+            .per_tool
+            .get("context:microcompact")
+            .map(|tool| tool.saved_tokens)
+            .unwrap_or(0);
+        let files = std::fs::read_dir(&output_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let recovered_sentinels = [
+            "READ_SENTINEL",
+            "META_SENTINEL",
+            "SCRIPT_SENTINEL",
+            "REMOTE_LARGE_SENTINEL",
+        ]
+        .into_iter()
+        .filter(|sentinel| {
+            files.iter().any(|path| {
+                std::fs::read_to_string(path).is_ok_and(|content| content.contains(sentinel))
+            })
+        })
+        .collect::<Vec<_>>();
+        let recoverable_sentinels = recovered_sentinels.len();
+        let read_cache_entries = session.lock().await.read_cache.len();
+        let model_visible_chars = serde_json::to_string(&visible).unwrap().chars().count();
+        let hook_outputs = hook_outputs.lock().unwrap();
+        let meta_output = hook_outputs
+            .get("list_all_tools")
+            .expect("meta tool result must reach the full-content hook");
+        assert!(
+            meta_output.len() > 50 * 1024 && meta_output.contains("META_SENTINEL"),
+            "controlled meta output was not oversized: {} bytes",
+            meta_output.len()
+        );
+
+        if disabled {
+            assert_eq!(files.len(), 0);
+            assert_eq!(output_saved_tokens, 0);
+            assert_eq!(microcompact_saved_tokens, 0);
+            assert_eq!(count_marker(&visible, "argument truncated"), 0);
+        } else {
+            assert!(files.len() >= 4);
+            assert_eq!(
+                recoverable_sentinels, 4,
+                "missing recoverable outputs: {recovered_sentinels:?}"
+            );
+            assert!(output_saved_tokens > 0);
+            assert!(microcompact_saved_tokens > 0);
+            assert!(count_marker(&visible, "old tool result pruned") > 0);
+            assert!(count_marker(&visible, "argument truncated") >= 2);
+            assert_eq!(read_cache_entries, 0);
+        }
+
+        ControlledArmMetrics {
+            model_visible_chars,
+            model_visible_tokens: crate::analytics::estimate_tokens(model_visible_chars),
+            wall_micros,
+            offload_files: files.len(),
+            pruned_results: count_marker(&visible, "old tool result pruned"),
+            truncated_arguments: count_marker(&visible, "argument truncated"),
+            recoverable_sentinels,
+            read_cache_entries,
+            output_saved_tokens,
+            microcompact_saved_tokens,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled API-free benchmark; run via benchmarks/bench-tool-output.sh"]
+    async fn controlled_tool_output_benchmark() {
+        const REPETITIONS: usize = 3;
+        let mut baseline = Vec::with_capacity(REPETITIONS);
+        let mut candidate = Vec::with_capacity(REPETITIONS);
+        for _ in 0..REPETITIONS {
+            baseline.push(run_controlled_tool_output_arm(true).await);
+            candidate.push(run_controlled_tool_output_arm(false).await);
+        }
+
+        let mean = |values: &[ControlledArmMetrics], select: fn(&ControlledArmMetrics) -> f64| {
+            values.iter().map(select).sum::<f64>() / values.len() as f64
+        };
+        let baseline_tokens = mean(&baseline, |metrics| metrics.model_visible_tokens as f64);
+        let candidate_tokens = mean(&candidate, |metrics| metrics.model_visible_tokens as f64);
+        let reduction_pct = 100.0 * (1.0 - candidate_tokens / baseline_tokens);
+        let baseline_wall_micros = mean(&baseline, |metrics| metrics.wall_micros as f64);
+        let candidate_wall_micros = mean(&candidate, |metrics| metrics.wall_micros as f64);
+        let summary = json!({
+            "benchmark": "controlled-tool-output",
+            "repetitions": REPETITIONS,
+            "baseline": baseline,
+            "candidate": candidate,
+            "mean": {
+                "baseline_model_visible_tokens": baseline_tokens,
+                "candidate_model_visible_tokens": candidate_tokens,
+                "token_reduction_pct": reduction_pct,
+                "baseline_wall_micros": baseline_wall_micros,
+                "candidate_wall_micros": candidate_wall_micros,
+                "wall_delta_pct": 100.0 * (candidate_wall_micros / baseline_wall_micros - 1.0),
+            },
+        });
+        println!("CONTROLLED_TOOL_OUTPUT_BENCH={summary}");
+
+        assert!(
+            candidate_tokens < baseline_tokens * 0.75,
+            "controlled candidate should reduce model-visible tokens by at least 25%: {summary}"
+        );
     }
 
     /// Wrap a session for `run`, which now shares it with execute_script's
@@ -1914,6 +2398,161 @@ mod tests {
             2,
             "tool loop must assign one ordinal per provider generation"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_bounds_native_tool_result_after_full_content_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "large-result-line\n".repeat(200);
+        std::fs::write(dir.path().join("large.txt"), &original).unwrap();
+        let output_dir = dir.path().join("tool-output");
+        let hook_content = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&hook_content);
+        let config = AgentConfig {
+            after_tool_call: Some(Box::new(move |_, content, _| {
+                *captured.lock().unwrap() = content.to_string();
+                AfterHookResult::Continue
+            })),
+            ..AgentConfig::default()
+        };
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "read_file", json!({"path": "large.txt"})),
+            end_turn_resp(),
+        ]));
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = bounded_session_in(dir.path());
+        session.analytics = Some(Arc::clone(&analytics));
+        let mut sess = AgentSession::new(provider, session, config);
+
+        sess.prompt("read the large file").await;
+
+        let ContentBlock::ToolResult { content, .. } = &sess.history()[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(hook_content.lock().unwrap().len() > 256);
+        assert!(content.len() <= 256);
+        assert!(content.contains("full output saved to") || content.contains("full_output_path"));
+        let outputs = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(outputs[0].path()).unwrap(),
+            *hook_content.lock().unwrap()
+        );
+        assert!(
+            !sess
+                .tool_session
+                .lock()
+                .await
+                .read_cache
+                .contains_key(&dir.path().join("large.txt")),
+            "bounded read must not leave a full-visibility cache hit"
+        );
+        assert!(
+            analytics
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        let stats = analytics.session_summary();
+        assert!(
+            stats
+                .per_tool
+                .get("context:tool_output")
+                .is_some_and(|tool| tool.saved_tokens > 0),
+            "agent output offload must record only its additional savings"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_bounds_meta_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "list_all_tools", json!({})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(
+            provider,
+            bounded_session_in(dir.path()),
+            AgentConfig::default(),
+        );
+
+        sess.prompt("list tools").await;
+
+        let ContentBlock::ToolResult { content, .. } = &sess.history()[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() <= 256);
+        assert!(content.contains("full output saved to") || content.contains("full_output_path"));
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tool-output"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_bounds_execute_script_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "c1",
+                "execute_script",
+                json!({"code": "result = \"x\" * 2000"}),
+            ),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(
+            provider,
+            bounded_session_in(dir.path()),
+            AgentConfig::default(),
+        );
+
+        sess.prompt("generate output").await;
+
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &sess.history()[2].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!is_error, "{content}");
+        assert!(content.len() <= 256);
+        assert!(content.contains("full output saved to") || content.contains("full_output_path"));
+    }
+
+    #[tokio::test]
+    async fn agent_bounds_remote_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("c1", "mcp__srv__large", json!({})),
+            end_turn_resp(),
+        ]));
+        let config = AgentConfig {
+            remote_tool_dispatch: Some(Box::new(|name: &str, _input: &Value| {
+                let handled = name == "mcp__srv__large";
+                Box::pin(async move {
+                    handled.then(|| RemoteToolResult {
+                        content: "remote-output\n".repeat(200),
+                        is_error: false,
+                    })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+        let mut sess = AgentSession::new(provider, bounded_session_in(dir.path()), config);
+
+        sess.prompt("call remote").await;
+
+        let ContentBlock::ToolResult { content, .. } = &sess.history()[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() <= 256);
+        assert!(content.contains("full output saved to") || content.contains("full_output_path"));
     }
 
     #[tokio::test]
@@ -2302,6 +2941,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_list_all_tools_includes_remote_catalog_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&seen);
+        let config = AgentConfig {
+            tools: vec![ToolSchema {
+                name: "mcp__linear__get_issue".into(),
+                description: "Get a Linear issue".into(),
+                input_schema: json!({"type":"object"}),
+            }],
+            after_tool_call: Some(Box::new(move |_, content, _| {
+                *captured.lock().unwrap() = content.to_string();
+                AfterHookResult::Continue
+            })),
+            ..AgentConfig::default()
+        };
+        let provider = MockProvider::new(vec![
+            tool_call_resp("call-1", "list_all_tools", json!({})),
+            end_turn_resp(),
+        ]);
+
+        run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("list tools")],
+            &config,
+        )
+        .await;
+
+        let entries: Vec<Value> = serde_json::from_str(&seen.lock().unwrap()).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry["name"] == "mcp__linear__get_issue"));
+    }
+
+    #[tokio::test]
     async fn run_does_not_write_token_log_when_not_configured() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("tokens.log");
@@ -2489,6 +3164,126 @@ mod tests {
     }
 
     // --- run loop ---
+
+    #[tokio::test]
+    async fn microcompaction_invalidates_evicted_read_cache_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached_path = dir.path().join("cached.txt");
+        std::fs::write(&cached_path, "cached").unwrap();
+        let mut cfg = Config::default();
+        cfg.tool_output.directory =
+            Some(dir.path().join("tool-output").to_string_lossy().to_string());
+        cfg.tool_output.intra_turn_result_budget_tokens = 1;
+        cfg.tool_output.intra_turn_keep_recent_results = 1;
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        session.read_cache.insert(
+            cached_path.clone(),
+            crate::session::ReadCacheEntry { hash: 1, lines: 1 },
+        );
+        session.read_cache.insert(
+            dir.path().join("unrelated.txt"),
+            crate::session::ReadCacheEntry { hash: 2, lines: 1 },
+        );
+        let session = shared(session);
+        let mut messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "read".into(),
+                    name: "read_file".into(),
+                    input: json!({"path":"cached.txt"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read".into(),
+                    content: "old read result".repeat(100),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "recent".into(),
+                    name: "search".into(),
+                    input: json!({"pattern":"x"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "recent".into(),
+                    content: "recent".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        microcompact_agent_history(&mut messages, &session).await;
+
+        assert!(
+            session.lock().await.read_cache.is_empty(),
+            "relative historical read paths are cwd-ambiguous, so the cache must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn microcompaction_clears_read_cache_when_evicted_path_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached_path = dir.path().join("other.txt");
+        let mut cfg = Config::default();
+        cfg.tool_output.directory =
+            Some(dir.path().join("tool-output").to_string_lossy().to_string());
+        cfg.tool_output.intra_turn_result_budget_tokens = 1;
+        cfg.tool_output.intra_turn_keep_recent_results = 1;
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        session.read_cache.insert(
+            cached_path,
+            crate::session::ReadCacheEntry { hash: 1, lines: 1 },
+        );
+        let session = shared(session);
+        let mut messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "read".into(),
+                    name: "read_file".into(),
+                    input: json!({}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read".into(),
+                    content: "old read result".repeat(100),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "recent".into(),
+                    name: "search".into(),
+                    input: json!({"pattern":"x"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "recent".into(),
+                    content: "recent".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        microcompact_agent_history(&mut messages, &session).await;
+
+        assert!(session.lock().await.read_cache.is_empty());
+    }
 
     #[tokio::test]
     async fn end_turn_stops_loop() {
