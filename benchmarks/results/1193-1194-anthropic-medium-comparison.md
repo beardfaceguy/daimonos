@@ -61,4 +61,4 @@ token microcompaction budget.
 - Candidate aggregate: `post-1193-1194-anthropic-medium.json`
 - Baseline binary: `8b97ff0e19c626c25125914085500c125994c5b9afd2872f2eba255b08ac6c81`
 - Candidate benchmark binary: `56714a241b7488299c5a6e7c77f1039a0ee26750605989a1d211b5133de5db39`
-- Final reviewed binary: `715a834dbabb64084116c218e2d4984bc0369067a294bb5c7e07f30da3c231e9`
+- Final reviewed binary: `7368c442e121a8fa3ea151126a1ac79189c976239ccc275268b4521733f539db`
