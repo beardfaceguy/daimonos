@@ -57,12 +57,6 @@ pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 /// sandbox thread shares the live session via `Arc<Mutex<Session>>`.
 pub const EXECUTE_SCRIPT_TOOL: &str = "execute_script";
 
-/// Upper safety ceiling for a model-supplied `execute_script` timeout (1 hour).
-/// Not a user-tunable knob — it only prevents a malformed/oversized value from
-/// tying up a bounded script-thread slot near-indefinitely; it sits well above
-/// any realistic script run (default is 60s).
-const MAX_SCRIPT_TIMEOUT_SECS: i64 = 3600;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPriority {
@@ -660,15 +654,9 @@ pub async fn run(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        let timeout_secs = input
-                            .get("timeout")
-                            .and_then(serde_json::Value::as_i64)
-                            // Non-positive → default (also guards a negative
-                            // value wrapping to a huge u64); clamp the upper
-                            // bound to the safety ceiling.
-                            .filter(|secs| *secs > 0)
-                            .map(|secs| secs.min(MAX_SCRIPT_TIMEOUT_SECS))
-                            .unwrap_or(60) as u64;
+                        let timeout_secs = crate::script::bounded_timeout_secs(
+                            input.get("timeout").and_then(serde_json::Value::as_i64),
+                        );
                         let cfg = {
                             let mut guard = session.lock().await;
                             guard.used_tools.insert(EXECUTE_SCRIPT_TOOL.to_string());

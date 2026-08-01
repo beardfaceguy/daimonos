@@ -1364,7 +1364,8 @@ async fn run_execute_script(
         .and_then(Value::as_str)
         .ok_or_else(|| "execute_script requires 'code' argument".to_string())?
         .to_string();
-    let timeout_secs = args.get("timeout").and_then(Value::as_i64).unwrap_or(60) as u64;
+    let timeout_secs =
+        crate::script::bounded_timeout_secs(args.get("timeout").and_then(Value::as_i64));
     script::execute(&code, session, std::time::Duration::from_secs(timeout_secs)).await
 }
 

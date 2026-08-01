@@ -24,6 +24,16 @@ use crate::providers::{
 use crate::session::Session;
 use crate::tools;
 
+pub const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 60;
+/// Internal safety ceiling for model-supplied timeouts; not a tuning knob.
+pub const MAX_SCRIPT_TIMEOUT_SECS: i64 = 3600;
+
+pub fn bounded_timeout_secs(raw: Option<i64>) -> u64 {
+    raw.filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds.min(MAX_SCRIPT_TIMEOUT_SECS) as u64)
+        .unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS)
+}
+
 /// Lazily-initialized global cap on concurrent Starlark script threads.
 ///
 /// Pure-CPU runaway scripts cannot be cancelled by the current
@@ -1545,6 +1555,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(dir.keep(), Arc::new(Config::default()));
         Arc::new(Mutex::new(session))
+    }
+
+    #[test]
+    fn script_timeout_defaults_and_clamps_invalid_values() {
+        assert_eq!(bounded_timeout_secs(None), DEFAULT_SCRIPT_TIMEOUT_SECS);
+        assert_eq!(bounded_timeout_secs(Some(-1)), DEFAULT_SCRIPT_TIMEOUT_SECS);
+        assert_eq!(bounded_timeout_secs(Some(0)), DEFAULT_SCRIPT_TIMEOUT_SECS);
+        assert_eq!(bounded_timeout_secs(Some(30)), 30);
+        assert_eq!(
+            bounded_timeout_secs(Some(MAX_SCRIPT_TIMEOUT_SECS + 1)),
+            MAX_SCRIPT_TIMEOUT_SECS as u64
+        );
     }
 
     /// vikunja 1112: the coordination tools were documented in the MCP
