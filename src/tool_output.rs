@@ -36,7 +36,9 @@ impl ToolOutputConfig {
             .as_deref()
             .map(crate::paths::expand_tilde)
             .or_else(|| crate::paths::home_dir().map(|home| home.join(".daimonos/tool-output")))
-            .unwrap_or_else(|| PathBuf::from("/tmp/daimonos-tool-output"))
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("daimonos-tool-output-{}", std::process::id()))
+            })
     }
 
     pub fn validate(&self) -> Result<(), String> {
