@@ -14,6 +14,7 @@ keep current.
 | File | Role |
 |---|---|
 | `bench-agent.sh` | The runner. Runs the task suite through `daimonos agent`. |
+| `bench-tool-output.sh` | Deterministic API-free A/B for tool-output bounding and microcompaction. |
 | `bench-cursor.sh` | Runs the suite through `cursor-agent` (external-agent comparison). |
 | `bench-codex.sh` | Runs the suite through `codex exec` via OpenRouter (controlled harness A/B). |
 | `analyze.py` | Aggregates one or more result dirs, grouped by model, correctness-gated. |
@@ -56,6 +57,29 @@ To benchmark a different model, change `DAIMONOS_AGENT_MODEL` in `agent.env`
 python3 analyze.py results/
 python3 analyze.py results/ sol
 ```
+
+## Controlled tool-output benchmark
+
+`bench-tool-output.sh` runs the same scripted agent turn twice with the final
+binary:
+
+- **baseline** — output and microcompaction limits set effectively unbounded;
+- **candidate** — default 50 KiB output cap, 40k old-result token budget, five
+  protected recent results, and 2,000-character old argument threshold.
+
+The scenario deterministically drives oversized native `read_file`,
+`list_all_tools` meta, `execute_script`, and remote MCP results; multiple
+medium remote results that exceed the intra-turn budget; old `write_file` and
+`edit_file` arguments; and one preserved error result. It asserts tool
+call/result pairing, recoverability, read-cache invalidation, and analytics
+hits before reporting model-visible tokens and wall time.
+
+```sh
+./bench-tool-output.sh
+```
+
+No provider or API key is used. Results are written under
+`benchmarks/results/*-controlled-tool-output*.json`.
 
 ## Environment variables
 

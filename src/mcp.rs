@@ -214,6 +214,68 @@ fn response_to_result(resp: Response) -> std::result::Result<CallToolResult, Cal
     }
 }
 
+async fn bounded_text_tool_result(
+    cfg: &crate::config::ToolOutputConfig,
+    tool_name: &str,
+    content: String,
+    is_error: bool,
+) -> std::result::Result<CallToolResult, CallToolError> {
+    let bounded = crate::tool_output::bound_text(cfg, tool_name, content).await;
+    if is_error {
+        err_text(bounded.content)
+    } else {
+        ok_text(bounded.content)
+    }
+}
+
+#[derive(Default)]
+struct BoundResultStats {
+    original_bytes: usize,
+    visible_bytes: usize,
+    offloaded: bool,
+}
+
+async fn bound_call_tool_result(
+    cfg: &crate::config::ToolOutputConfig,
+    tool_name: &str,
+    result: &mut CallToolResult,
+) -> BoundResultStats {
+    let mut stats = BoundResultStats::default();
+    for block in &mut result.content {
+        let rust_mcp_sdk::schema::ContentBlock::TextContent(text) = block else {
+            continue;
+        };
+        let original_bytes = text.text.len();
+        let bounded =
+            crate::tool_output::bound_text(cfg, tool_name, std::mem::take(&mut text.text)).await;
+        stats.original_bytes = stats.original_bytes.saturating_add(original_bytes);
+        stats.visible_bytes = stats.visible_bytes.saturating_add(bounded.content.len());
+        stats.offloaded |= bounded.output_path.is_some();
+        text.text = bounded.content;
+    }
+    stats
+}
+
+fn analytics_command(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
+        "kgl_query" => tools::get_str(args, "query"),
+        "kgl_assert" => tools::get_str(args, "action"),
+        "discord" => {
+            let base = tools::get_str(args, "command");
+            let tag = tools::get_str(args, "analytics_tag");
+            match (base, tag) {
+                (Some(command), Some(tag)) if !tag.trim().is_empty() => {
+                    Some(format!("{command}:{}", tag.trim()))
+                }
+                (Some(command), _) => Some(command),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 async fn dispatch_tool(
     session: &mut Session,
     name: &str,
@@ -228,7 +290,38 @@ async fn dispatch_tool(
     // call on the same session.
     let _ = std::mem::take(&mut session.last_response_meta);
 
-    let result = dispatch_tool_inner(session, name, args).await;
+    let mut result = match dispatch_tool_inner(session, name, args).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::mem::take(&mut session.last_response_meta);
+            if let Some(analytics) = &session.analytics {
+                analytics.record_async(ToolCallRecord {
+                    tool_name: name.to_string(),
+                    command: analytics_command(name, args),
+                    request_tokens: analytics::estimate_tokens(request_chars),
+                    response_tokens: 0,
+                    saved_tokens: 0,
+                    savings_pct: 0.0,
+                    exec_time_ms: start.elapsed().as_millis() as u64,
+                    was_redirect: false,
+                    was_filtered: false,
+                    read_dedup: false,
+                    batch_size: 1,
+                    external_session_id: session.external_session_id.clone(),
+                });
+            }
+            return Err(error);
+        }
+    };
+    let bound_stats = bound_call_tool_result(&session.cfg.tool_output, name, &mut result).await;
+    if bound_stats.offloaded && name == "read_file" {
+        if let Some(path) = args.get("path").and_then(Value::as_str) {
+            let resolved = session.resolve_path(path);
+            session.invalidate_read_cache(&resolved);
+        } else {
+            session.read_cache.clear();
+        }
+    }
 
     // Always drain after the inner runs so the slot is reset for the next
     // turn — even when analytics is disabled. Reading the structured meta
@@ -236,52 +329,27 @@ async fn dispatch_tool(
     // match → re-parse JSON → top-level key probe). Both of those approaches
     // were coupled to the response format and prone to drift; this reads
     // exactly what handlers set.
-    let meta = std::mem::take(&mut session.last_response_meta);
+    let mut meta = std::mem::take(&mut session.last_response_meta);
+    meta.filter_applied |= bound_stats.offloaded;
 
     // Record analytics
     if let Some(analytics) = &session.analytics {
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let (response_chars, was_redirect, was_filtered, read_dedup) = match &result {
-            Ok(r) => (
-                extract_result_text(r).len(),
-                meta.redirect_via_plugin,
-                meta.filter_applied,
-                meta.read_dedup,
-            ),
-            Err(_) => (0, false, false, false),
-        };
+        let response_chars = bound_stats.visible_bytes;
 
-        let command = match name {
-            "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
-            "kgl_query" => tools::get_str(args, "query"),
-            "kgl_assert" => tools::get_str(args, "action"),
-            "discord" => {
-                let base = tools::get_str(args, "command");
-                let tag = tools::get_str(args, "analytics_tag");
-                match (base, tag) {
-                    (Some(cmd), Some(t)) if !t.trim().is_empty() => {
-                        Some(format!("{cmd}:{}", t.trim()))
-                    }
-                    (Some(cmd), _) => Some(cmd),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        let (saved_tokens, savings_pct) =
-            analytics::compute_savings(meta.unfiltered_chars, response_chars);
+        let raw_chars = meta.unfiltered_chars.max(bound_stats.original_bytes);
+        let (saved_tokens, savings_pct) = analytics::compute_savings(raw_chars, response_chars);
         let record = ToolCallRecord {
             tool_name: name.to_string(),
-            command,
+            command: analytics_command(name, args),
             request_tokens: analytics::estimate_tokens(request_chars),
             response_tokens: analytics::estimate_tokens(response_chars),
             saved_tokens,
             savings_pct,
             exec_time_ms: elapsed_ms,
-            was_redirect,
-            was_filtered,
-            read_dedup,
+            was_redirect: meta.redirect_via_plugin,
+            was_filtered: meta.filter_applied,
+            read_dedup: meta.read_dedup,
             batch_size: 1,
             external_session_id: session.external_session_id.clone(),
         };
@@ -293,7 +361,7 @@ async fn dispatch_tool(
         analytics.record_async(record);
     }
 
-    result
+    Ok(result)
 }
 
 /// Dispatch a plugin or meta tool that has no opcode mapping, returning
@@ -1126,11 +1194,19 @@ impl ServerHandler for DaimonosHandler {
             // future stays Send.
             let script_res = run_execute_script(self.session.clone(), &args).await;
             // A script may activate on-demand tools via nested dispatch.
-            let changed = self.session.lock().await.take_tools_changed();
+            let (changed, output_cfg) = {
+                let mut session = self.session.lock().await;
+                (
+                    session.take_tools_changed(),
+                    session.cfg.tool_output.clone(),
+                )
+            };
             if changed {
                 spawn_notify_tools_changed(&runtime);
             }
-            return script_result_to_tool_result(script_res);
+            let (content, is_error) = script_result_to_content(script_res);
+            return bounded_text_tool_result(&output_cfg, "execute_script", content, is_error)
+                .await;
         }
 
         let mut session = self.session.lock().await;
@@ -1191,6 +1267,7 @@ impl ServerHandler for DaimonosHandler {
             let payload = serde_json::to_string(&results).unwrap_or_default();
             // Read the dirty flag before the observe path may drop the lock.
             let tools_changed = session.take_tools_changed();
+            let output_cfg = session.cfg.tool_output.clone();
             if observe_on && !observed_ops.is_empty() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let sid = session
@@ -1212,7 +1289,7 @@ impl ServerHandler for DaimonosHandler {
             if tools_changed {
                 spawn_notify_tools_changed(&runtime);
             }
-            return ok_text(payload);
+            return bounded_text_tool_result(&output_cfg, "batch", payload, false).await;
         }
 
         let result = dispatch_tool(&mut session, &params.name, &args).await;
@@ -1293,18 +1370,16 @@ async fn run_execute_script(
 
 /// Convert the Send-safe script outcome only after all handler awaits finish;
 /// `CallToolError` itself is not Send.
-fn script_result_to_tool_result(
-    script_result: Result<script::ScriptResult, String>,
-) -> std::result::Result<CallToolResult, CallToolError> {
+fn script_result_to_content(script_result: Result<script::ScriptResult, String>) -> (String, bool) {
     match script_result {
         Ok(result) => {
             let mut response = json!({"result": result.value});
             if !result.logs.is_empty() {
                 response["logs"] = json!(result.logs);
             }
-            ok_text(serde_json::to_string(&response).unwrap_or_default())
+            (serde_json::to_string(&response).unwrap_or_default(), false)
         }
-        Err(error) => err_text(error),
+        Err(error) => (error, true),
     }
 }
 
@@ -1726,8 +1801,13 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
                     // Keep the Send-safe script outcome across the lock await;
                     // construct CallToolResult only afterwards.
                     let script_result = run_execute_script(Arc::clone(&session), &args).await;
-                    tools_changed = session.lock().await.take_tools_changed();
-                    script_result_to_tool_result(script_result)
+                    let output_cfg = {
+                        let mut session = session.lock().await;
+                        tools_changed = session.take_tools_changed();
+                        session.cfg.tool_output.clone()
+                    };
+                    let (content, is_error) = script_result_to_content(script_result);
+                    bounded_text_tool_result(&output_cfg, "execute_script", content, is_error).await
                 } else {
                     let mut session = session.lock().await;
                     let result = dispatch_tool(&mut session, &name, &args).await;
@@ -2174,6 +2254,232 @@ mod tests {
             session.last_response_meta,
             crate::protocol::ResponseMeta::default(),
             "dispatch_tool must reset last_response_meta after consuming the dedup signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_bounds_large_text_results_and_offloads_full_content() {
+        use crate::config::Config;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("large.txt"), "large-line\n".repeat(300)).unwrap();
+        let output_dir = dir.path().join("tool-output");
+        let mut cfg = Config::default();
+        cfg.tool_output.directory = Some(output_dir.to_string_lossy().to_string());
+        cfg.tool_output.max_bytes = 256;
+        cfg.tool_output.max_lines = 6;
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+
+        let result = dispatch_tool(&mut session, "read_file", &json!({"path": "large.txt"}))
+            .await
+            .unwrap();
+
+        let visible = extract_result_text(&result);
+        assert!(visible.len() <= 256);
+        assert!(visible.contains("full output saved to") || visible.contains("full_output_path"));
+        let outputs = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(std::fs::read_to_string(outputs[0].path())
+            .unwrap()
+            .contains("large-line"));
+        assert!(
+            !session
+                .read_cache
+                .contains_key(&dir.path().join("large.txt")),
+            "bounded MCP read must not leave a full-visibility cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_output_boundary_preserves_non_text_blocks_and_error_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default().tool_output;
+        cfg.directory = Some(dir.path().join("tool-output").to_string_lossy().to_string());
+        cfg.max_bytes = 256;
+        cfg.max_lines = 6;
+        let image = rust_mcp_sdk::schema::ContentBlock::ImageContent(
+            rust_mcp_sdk::schema::ImageContent::new(
+                "aW1hZ2U=".to_string(),
+                "image/png".to_string(),
+                None,
+                None,
+            ),
+        );
+        let image_before = serde_json::to_value(&image).unwrap();
+        let mut result = CallToolResult {
+            content: vec![
+                TextContent::new("large-text\n".repeat(300), None, None).into(),
+                image,
+            ],
+            is_error: Some(true),
+            meta: None,
+            structured_content: Some(serde_json::Map::from_iter([(
+                "kind".to_string(),
+                json!("structured"),
+            )])),
+        };
+
+        let stats = bound_call_tool_result(&cfg, "multimodal", &mut result).await;
+
+        assert!(stats.offloaded);
+        assert!(matches!(
+            &result.content[0],
+            rust_mcp_sdk::schema::ContentBlock::TextContent(text)
+                if text.text.len() <= 256
+                    && (text.text.contains("full output saved to")
+                        || text.text.contains("full_output_path"))
+        ));
+        assert_eq!(
+            serde_json::to_value(&result.content[1]).unwrap(),
+            image_before
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["kind"],
+            "structured"
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    struct ControlledMcpMetrics {
+        model_visible_bytes: usize,
+        wall_micros: u128,
+        offload_files: usize,
+        recoverable_results: usize,
+    }
+
+    async fn run_controlled_mcp_arm(disabled: bool) -> ControlledMcpMetrics {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("tool-output");
+        let mut cfg = Config::default().tool_output;
+        cfg.directory = Some(output_dir.to_string_lossy().to_string());
+        if disabled {
+            cfg.max_bytes = usize::MAX;
+            cfg.max_lines = usize::MAX;
+        }
+
+        let script_payload =
+            json!({"result": format!("MCP_SCRIPT_SENTINEL{}", "s".repeat(120_000))}).to_string();
+        let batch_payload = json!([
+            {"ok":true,"tool":"read_file","data":{"content":format!("MCP_BATCH_A{}", "a".repeat(40_000))}},
+            {"ok":true,"tool":"read_file","data":{"content":format!("MCP_BATCH_B{}", "b".repeat(40_000))}},
+            {"ok":true,"tool":"read_file","data":{"content":format!("MCP_BATCH_C{}", "c".repeat(40_000))}},
+        ])
+        .to_string();
+        let image = rust_mcp_sdk::schema::ContentBlock::ImageContent(
+            rust_mcp_sdk::schema::ImageContent::new(
+                "aW1hZ2U=".to_string(),
+                "image/png".to_string(),
+                None,
+                None,
+            ),
+        );
+        let image_before = serde_json::to_value(&image).unwrap();
+        let mut multimodal = CallToolResult {
+            content: vec![
+                TextContent::new(
+                    format!("MCP_MULTIMODAL_SENTINEL{}", "m".repeat(120_000)),
+                    None,
+                    None,
+                )
+                .into(),
+                image,
+            ],
+            is_error: Some(true),
+            meta: None,
+            structured_content: Some(serde_json::Map::from_iter([(
+                "kind".to_string(),
+                json!("structured"),
+            )])),
+        };
+
+        let started = std::time::Instant::now();
+        let script = bounded_text_tool_result(&cfg, "execute_script", script_payload, false)
+            .await
+            .unwrap();
+        let batch = bounded_text_tool_result(&cfg, "batch", batch_payload, false)
+            .await
+            .unwrap();
+        bound_call_tool_result(&cfg, "multimodal", &mut multimodal).await;
+        let wall_micros = started.elapsed().as_micros();
+
+        assert!(serde_json::from_str::<Value>(&extract_result_text(&script)).is_ok());
+        assert!(serde_json::from_str::<Value>(&extract_result_text(&batch)).is_ok());
+        assert_eq!(
+            serde_json::to_value(&multimodal.content[1]).unwrap(),
+            image_before
+        );
+        assert_eq!(multimodal.is_error, Some(true));
+        assert_eq!(
+            multimodal.structured_content.as_ref().unwrap()["kind"],
+            "structured"
+        );
+
+        let texts = [
+            extract_result_text(&script),
+            extract_result_text(&batch),
+            extract_result_text(&multimodal),
+        ];
+        let recoverable_results = texts
+            .iter()
+            .filter(|text| {
+                text.contains("full output saved to") || text.contains("full_output_path")
+            })
+            .count();
+        let offload_files = std::fs::read_dir(&output_dir)
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        if disabled {
+            assert_eq!(recoverable_results, 0);
+            assert_eq!(offload_files, 0);
+        } else {
+            assert_eq!(recoverable_results, 3);
+            assert_eq!(offload_files, 3);
+        }
+
+        ControlledMcpMetrics {
+            model_visible_bytes: texts.iter().map(String::len).sum(),
+            wall_micros,
+            offload_files,
+            recoverable_results,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled API-free benchmark; run via benchmarks/bench-tool-output.sh"]
+    async fn controlled_mcp_output_benchmark() {
+        const REPETITIONS: usize = 3;
+        let mut baseline = Vec::with_capacity(REPETITIONS);
+        let mut candidate = Vec::with_capacity(REPETITIONS);
+        for _ in 0..REPETITIONS {
+            baseline.push(run_controlled_mcp_arm(true).await);
+            candidate.push(run_controlled_mcp_arm(false).await);
+        }
+        let mean = |values: &[ControlledMcpMetrics], select: fn(&ControlledMcpMetrics) -> f64| {
+            values.iter().map(select).sum::<f64>() / values.len() as f64
+        };
+        let baseline_bytes = mean(&baseline, |metrics| metrics.model_visible_bytes as f64);
+        let candidate_bytes = mean(&candidate, |metrics| metrics.model_visible_bytes as f64);
+        let summary = json!({
+            "benchmark": "controlled-mcp-output",
+            "repetitions": REPETITIONS,
+            "baseline": baseline,
+            "candidate": candidate,
+            "mean": {
+                "baseline_model_visible_bytes": baseline_bytes,
+                "candidate_model_visible_bytes": candidate_bytes,
+                "byte_reduction_pct": 100.0 * (1.0 - candidate_bytes / baseline_bytes),
+                "baseline_wall_micros": mean(&baseline, |metrics| metrics.wall_micros as f64),
+                "candidate_wall_micros": mean(&candidate, |metrics| metrics.wall_micros as f64),
+            },
+        });
+        println!("CONTROLLED_MCP_OUTPUT_BENCH={summary}");
+        assert!(
+            candidate_bytes < baseline_bytes * 0.6,
+            "controlled MCP candidate should reduce visible bytes by at least 40%: {summary}"
         );
     }
 

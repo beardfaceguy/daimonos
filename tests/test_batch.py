@@ -135,3 +135,28 @@ def test_batch_exec(daimonos, tmp_path):
     assert len(content) == 2
     assert content[0]["ok"]
     assert content[1]["ok"]
+
+
+def test_execute_script_large_result_is_bounded(daimonos):
+    result = daimonos.call_tool("execute_script", {
+        "code": 'result = "x" * 60000',
+    })
+    visible = result["content"][0]["text"]
+    assert len(visible.encode()) <= 51_200
+    assert "full output saved to" in visible or "full_output_path" in visible
+
+
+def test_batch_final_aggregate_is_bounded(daimonos, tmp_path):
+    for name in ["large-a.txt", "large-b.txt", "large-c.txt"]:
+        (tmp_path / name).write_text(name + "\n" + ("x" * 20_000))
+
+    result = daimonos.call_tool("batch", {
+        "ops": [
+            {"tool": "read_file", "arguments": {"path": "large-a.txt"}},
+            {"tool": "read_file", "arguments": {"path": "large-b.txt"}},
+            {"tool": "read_file", "arguments": {"path": "large-c.txt"}},
+        ]
+    })
+    visible = result["content"][0]["text"]
+    assert len(visible.encode()) <= 51_200
+    assert "full output saved to" in visible or "full_output_path" in visible

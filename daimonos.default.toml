@@ -86,6 +86,23 @@ max_script_subcalls = 32
 # Max prompts a single llm_query_batched call may take.
 max_script_subcall_batch = 16
 
+[tool_output]
+# Optional directory for complete outputs replaced by bounded previews.
+# Default: ~/.daimonos/tool-output
+# directory = "~/.daimonos/tool-output"
+# Maximum UTF-8 bytes and lines retained in each model-visible text result.
+max_bytes = 51_200
+max_lines = 2_000
+# Delete managed full-output files older than this many days during writes.
+retention_days = 7
+# Within one agent turn, retain old successful results newest-first up to this
+# approximate token budget, while always preserving errors and recent results.
+intra_turn_result_budget_tokens = 40_000
+intra_turn_keep_recent_results = 5
+# Truncate large string arguments in old write_file/edit_file calls above this
+# character count. Paths and other metadata are never truncated.
+old_argument_max_chars = 2_000
+
 [logging]
 # Persist structured JSON diagnostics independently of the ACP/MCP client.
 enabled = true
