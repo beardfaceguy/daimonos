@@ -1719,6 +1719,12 @@ fn error_has_http_status(error: &str, status: &str) -> bool {
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
     let normalized = error.replace(['_', '-'], " ");
+    if normalized.contains("tool use")
+        && normalized.contains("without")
+        && normalized.contains("tool result")
+    {
+        return "Provider rejected invalid tool-call history. Restart/reload the session or use /clear.";
+    }
     // An explicit/strong context-overflow signal takes precedence because the
     // caller can recover through compaction; other classes are informational.
     if context_overflow
@@ -7558,6 +7564,15 @@ mod tests {
 
     #[test]
     fn provider_error_diagnostics_are_bounded_classes() {
+        assert_eq!(
+            safe_provider_error_message(
+                false,
+                Some(
+                    "API 400 Bad Request: tool_use ids were found without tool_result blocks immediately after"
+                )
+            ),
+            "Provider rejected invalid tool-call history. Restart/reload the session or use /clear."
+        );
         assert_eq!(
             safe_provider_error_message(false, Some("API 401: echoed-secret")),
             "Provider authentication failed (HTTP 401)."

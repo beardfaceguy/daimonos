@@ -603,7 +603,7 @@ pub async fn run(
             | StopReason::Aborted
             | StopReason::Error => {
                 return AgentResult {
-                    messages,
+                    messages: close_orphan_tool_calls(messages),
                     usage: total_usage,
                     stop_reason: resp.stop_reason,
                     error_message: resp.error_message,
@@ -1097,6 +1097,11 @@ impl AgentSession {
     /// serialization, history persistence, and retries.
     pub async fn prompt_message(&mut self, user_message: Message) -> TurnResult {
         debug_assert_eq!(user_message.role, Role::User);
+        // Repair live in-memory history as well as loaded history. A terminal
+        // provider response from an older process can leave a ToolCall without
+        // its adjacent ToolResult and wedge every later request in this same
+        // frontend process.
+        self.messages = close_orphan_tool_calls(std::mem::take(&mut self.messages));
         self.config
             .generation_ordinal
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3423,6 +3428,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_tokens_tool_call_is_closed_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![LlmResponse {
+            content: vec![ContentBlock::ToolCall {
+                id: "cut-off-call".into(),
+                name: "write_file".into(),
+                input: json!({
+                    "path": "must-not-exist.txt",
+                    "content": "must not be written"
+                }),
+            }],
+            stop_reason: StopReason::MaxTokens,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage::default(),
+        }]);
+
+        let result = run(
+            &provider,
+            shared(s),
+            vec![Message::user("go")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+        assert!(orphan_ids(&result.messages).is_empty());
+        assert!(matches!(
+            result.messages[2].content.as_slice(),
+            [ContentBlock::ToolResult {
+                tool_use_id,
+                is_error: true,
+                content,
+            }] if tool_use_id == "cut-off-call" && content == INTERRUPTED_TOOL_RESULT
+        ));
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn same_session_continues_after_max_tokens_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = BenchmarkCaptureProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::ToolCall {
+                    id: "cut-off-call".into(),
+                    name: "write_file".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::MaxTokens,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage::default(),
+            },
+            end_turn_resp(),
+        ]);
+        let contexts = provider.contexts_handle();
+        let mut session = AgentSession::new(
+            Box::new(provider),
+            session_in(dir.path()),
+            AgentConfig::default(),
+        );
+
+        let first = session.prompt("start").await;
+        let second = session.prompt("continue").await;
+
+        assert_eq!(first.stop_reason, StopReason::MaxTokens);
+        assert_eq!(second.stop_reason, StopReason::EndTurn);
+        assert!(orphan_ids(session.history()).is_empty());
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert!(orphan_ids(&contexts[1]).is_empty());
+    }
+
+    #[tokio::test]
     async fn usage_accumulates_across_turns() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
@@ -4128,6 +4208,38 @@ mod tests {
                     content,
                     is_error: true,
                 }] if tool_use_id == "c1" && content == INTERRUPTED_TOOL_RESULT
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn prompt_boundary_repairs_live_in_memory_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = AgentSession::new(
+            Box::new(CaptureProvider {
+                seen: Arc::clone(&seen),
+            }),
+            session_in(dir.path()),
+            AgentConfig::default(),
+        );
+        // Simulate a live frontend session that was committed before terminal
+        // response repair existed. No reload/set_history occurs in this path.
+        sess.messages = vec![Message::user("go"), tool_call("c1")];
+
+        let turn = sess.prompt("continue").await;
+
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        let provider_context = seen.lock().unwrap().clone();
+        assert!(orphan_ids(&provider_context).is_empty());
+        assert!(provider_context.iter().any(|message| {
+            matches!(
+                message.content.as_slice(),
+                [ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                }] if tool_use_id == "c1"
             )
         }));
     }
