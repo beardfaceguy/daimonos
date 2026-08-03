@@ -1097,14 +1097,16 @@ impl AgentSession {
     /// serialization, history persistence, and retries.
     pub async fn prompt_message(&mut self, user_message: Message) -> TurnResult {
         debug_assert_eq!(user_message.role, Role::User);
+        self.config
+            .generation_ordinal
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         // Repair live in-memory history as well as loaded history. A terminal
         // provider response from an older process can leave a ToolCall without
         // its adjacent ToolResult and wedge every later request in this same
         // frontend process.
-        self.messages = close_orphan_tool_calls(std::mem::take(&mut self.messages));
-        self.config
-            .generation_ordinal
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if has_orphan_tool_calls(&self.messages) {
+            self.messages = close_orphan_tool_calls(std::mem::take(&mut self.messages));
+        }
 
         // Proactive compaction (ADR-002): compact BEFORE the turn when the
         // last measured occupancy (or, if never measured, an estimate)
@@ -1551,6 +1553,31 @@ impl AgentSession {
 pub(crate) const INTERRUPTED_TOOL_RESULT: &str =
     "Tool call interrupted: the assistant turn ended before this tool ran, so it produced \
      no result and changed nothing. Re-issue it if it is still needed.";
+
+fn has_orphan_tool_calls(messages: &[Message]) -> bool {
+    if !messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
+    {
+        return false;
+    }
+    let answered: HashSet<&str> = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| match block {
+            ContentBlock::ToolCall { id, .. } => !answered.contains(id.as_str()),
+            _ => false,
+        })
+}
 
 /// Give every assistant `ToolCall` a matching `ToolResult`.
 ///
@@ -4106,6 +4133,7 @@ mod tests {
             tool_result("c1"),
             Message::assistant("done"),
         ];
+        assert!(!has_orphan_tool_calls(&history));
         assert_eq!(
             close_orphan_tool_calls(history.clone()).len(),
             history.len()
@@ -4117,11 +4145,13 @@ mod tests {
     fn close_orphan_tool_calls_pairs_a_turn_cut_off_mid_call() {
         // The wedged-session shape: a call persisted with no result, then the
         // user prompting again. Every later prompt 400s until this is closed.
-        let repaired = close_orphan_tool_calls(vec![
+        let history = vec![
             Message::user("go"),
             tool_call("c1"),
             Message::user("pick up where you left off"),
-        ]);
+        ];
+        assert!(has_orphan_tool_calls(&history));
+        let repaired = close_orphan_tool_calls(history);
 
         assert!(orphan_ids(&repaired).is_empty());
         // Inserted directly after the call, before the next user text.

@@ -1723,9 +1723,8 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if normalized.contains("tool use ids were found without tool result blocks") {
-        return "Provider rejected invalid tool-call history. Restart/reload the session or use /clear.";
-    }
+    let invalid_tool_history = error_has_http_status(&error, "400")
+        && normalized.contains("tool use ids were found without tool result blocks");
     // An explicit/strong context-overflow signal takes precedence because the
     // caller can recover through compaction; other classes are informational.
     if context_overflow
@@ -1738,6 +1737,8 @@ fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &
         || normalized.contains("context window was exceeded")
     {
         "Provider rejected the prompt because the context window was exceeded."
+    } else if invalid_tool_history {
+        "Provider rejected invalid tool-call history. Restart/reload the session or use /clear."
     } else if error_has_http_status(&error, "402")
         || normalized.contains("insufficient credit")
         || normalized.contains("payment required")
@@ -7580,6 +7581,22 @@ mod tests {
                 Some("tool use is fine without tool result overhead")
             ),
             "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(
+                false,
+                Some("tool_use ids were found without tool_result blocks")
+            ),
+            "Provider request failed."
+        );
+        assert_eq!(
+            safe_provider_error_message(
+                false,
+                Some(
+                    "API 400: context overflow; tool_use ids were found without tool_result blocks"
+                )
+            ),
+            "Provider rejected the prompt because the context window was exceeded."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("API 401: echoed-secret")),
