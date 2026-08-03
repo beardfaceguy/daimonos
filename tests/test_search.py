@@ -62,32 +62,62 @@ def test_grep_max_results(daimonos):
 
 
 def test_file_search_via_trigram(daimonos):
-    """Search by filename uses the trigram index. Index needs a moment to build."""
+    """Successful writes make filenames searchable immediately."""
     daimonos.call_tool("write_file", {
         "path": "unique_name_xyz.rs",
         "content": "content",
     })
-    # Give the indexer time — it runs in background
-    time.sleep(1)
-
     result = daimonos.call_tool("search", {
         "pattern": "unique_name_xyz",
         "mode": "files",
     })
     content = json.loads(result["content"][0]["text"])
-    if len(content.get("results", [])) > 0:
-        found = [r["file"] for r in content["results"]]
-        assert any("unique_name_xyz" in f for f in found)
+    found = [r["file"] for r in content["results"]]
+    assert any("unique_name_xyz" in f for f in found)
+    assert content["index"]["mode"] == "hybrid"
+    assert content["index"]["coverage"] in {"cold", "complete", "partial"}
+
+
+def test_file_search_honors_path_scope_and_filename_glob(daimonos):
+    daimonos.call_tool(
+        "write_file", {"path": "root_match.rs", "content": "content"}
+    )
+    daimonos.call_tool(
+        "write_file", {"path": "src/scoped_match.rs", "content": "content"}
+    )
+    daimonos.call_tool(
+        "write_file", {"path": "src/scoped_match.txt", "content": "content"}
+    )
+
+    result = daimonos.call_tool(
+        "search",
+        {
+            "pattern": "match",
+            "mode": "files",
+            "path": "src",
+            "glob": "*.rs",
+        },
+    )
+    content = json.loads(result["content"][0]["text"])
+    assert [match["file"] for match in content["results"]] == [
+        "src/scoped_match.rs"
+    ]
+
+
+def test_file_search_rejects_invalid_glob(daimonos):
+    result = daimonos.call_tool(
+        "search", {"pattern": "match", "mode": "files", "glob": "["}
+    )
+    assert result["isError"] is True
+    assert "invalid glob" in result["content"][0]["text"]
 
 
 def test_incremental_index_picks_up_new_files(daimonos):
-    """After writing a new file and waiting for reindex, it should be searchable."""
+    """Content grep remains complete independently from the path index."""
     daimonos.call_tool("write_file", {
         "path": "initial_indexed.rs",
         "content": "fn initial_indexed_function() {}",
     })
-    time.sleep(1.5)
-
     result = daimonos.call_tool("search", {
         "pattern": "initial_indexed_function",
         "mode": "content",
@@ -99,8 +129,6 @@ def test_incremental_index_picks_up_new_files(daimonos):
         "path": "later_added.rs",
         "content": "fn later_added_unique_func() {}",
     })
-    time.sleep(1.5)
-
     result = daimonos.call_tool("search", {
         "pattern": "later_added_unique_func",
         "mode": "content",
@@ -122,3 +150,5 @@ def test_index_stats_in_workspace_info(daimonos):
     index = content.get("index", {})
     assert "files" in index
     assert "trigrams" in index
+    assert index["mode"] == "hybrid"
+    assert index["coverage"] in {"cold", "building", "complete", "partial"}

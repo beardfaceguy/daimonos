@@ -588,6 +588,7 @@ async fn dispatch_tool_inner(
                 session,
                 Request::Single(Op {
                     c: op::LS,
+                    s: Some(crate::ops::SKIP_INDEX_OBSERVATION.to_string()),
                     ..Default::default()
                 }),
             )
@@ -1102,8 +1103,11 @@ fn apply_reroot(session: &mut Session, new_root: PathBuf) {
     session.cwd = new_root.clone();
     session.snapshot_store = SnapshotStore::new(new_root.clone());
     session.read_cache.clear();
+    let should_warm = crate::index::should_warm_index(&new_root, &session.cfg.index, true);
     let idx = Arc::new(WorkspaceIndex::new(new_root, &session.cfg.index, false));
-    idx.spawn_reindex();
+    if should_warm {
+        idx.spawn_reindex();
+    }
     session.index = Some(idx);
 }
 
@@ -2128,7 +2132,7 @@ mod tests {
         let idx = session.index.clone().unwrap();
         let mut found = false;
         for _ in 0..50 {
-            if !idx.search("rerooted_sentinel", 10).await.is_empty() {
+            if !idx.search("rerooted_marker", 10).await.is_empty() {
                 found = true;
                 break;
             }

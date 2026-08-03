@@ -3,6 +3,8 @@ use crate::session::Session;
 use serde_json::json;
 use std::path::Path;
 
+pub const SKIP_INDEX_OBSERVATION: &str = "skip_index_observation";
+
 pub async fn read(session: &mut Session, op: &Op) -> Response {
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
@@ -16,6 +18,9 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         }
         Err(e) => return Response::err(4, &format!("io: {e}")),
     };
+    if let Some(index) = &session.index {
+        index.observe_path(&path).await;
+    }
 
     let total_lines = content.lines().count();
     let offset = op.n.unwrap_or(0).max(0) as usize;
@@ -92,6 +97,9 @@ pub async fn write(session: &mut Session, op: &Op) -> Response {
     match tokio::fs::write(&path, content).await {
         Ok(()) => {
             session.invalidate_read_cache(&path);
+            if let Some(index) = &session.index {
+                index.observe_path(&path).await;
+            }
             Response::ok(json!({"ok": true}))
         }
         Err(e) => Response::err(4, &format!("write: {e}")),
@@ -159,6 +167,9 @@ pub async fn patch(session: &mut Session, op: &Op) -> Response {
     match tokio::fs::write(&path, &content).await {
         Ok(()) => {
             session.invalidate_read_cache(&path);
+            if let Some(index) = &session.index {
+                index.observe_path(&path).await;
+            }
             Response::ok(resp)
         }
         Err(e) => Response::err(4, &format!("write: {e}")),
@@ -320,6 +331,17 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
         let b_name = b["n"].as_str().unwrap_or("");
         a_name.cmp(b_name)
     });
+    if op.s.as_deref() != Some(SKIP_INDEX_OBSERVATION) {
+        if let Some(index) = &session.index {
+            let observed = entries
+                .iter()
+                .filter(|entry| entry["d"].as_bool() == Some(false))
+                .filter_map(|entry| entry["n"].as_str())
+                .map(|relative| path.join(relative))
+                .collect::<Vec<_>>();
+            index.observe_paths(observed).await;
+        }
+    }
 
     Response::ok(json!({"entries": entries}))
 }
@@ -428,6 +450,9 @@ pub async fn stat(session: &Session, op: &Op) -> Response {
         }
         Err(e) => return Response::err(4, &format!("stat: {e}")),
     };
+    if let Some(index) = &session.index {
+        index.observe_path(&path).await;
+    }
 
     if lmeta.is_symlink() {
         let target = tokio::fs::read_link(&path)
@@ -466,19 +491,25 @@ pub async fn glob(session: &Session, op: &Op) -> Response {
 
     let full_pattern = root.join(&pattern).to_string_lossy().to_string();
 
-    let files: Vec<String> = match ::glob::glob(&full_pattern) {
+    let paths: Vec<std::path::PathBuf> = match ::glob::glob(&full_pattern) {
         Ok(paths) => paths
             .filter_map(|p| p.ok())
             .filter(|p| p.is_file())
-            .map(|p| {
-                p.strip_prefix(&session.workspace)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
             .collect(),
         Err(e) => return Response::err(3, &format!("glob: {e}")),
     };
+    if let Some(index) = &session.index {
+        index.observe_paths(paths.iter().cloned()).await;
+    }
+    let files: Vec<String> = paths
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(&session.workspace)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
 
     Response::ok(json!({"files": files}))
 }
@@ -508,7 +539,17 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
     .await;
 
     match result {
-        Ok(Ok(matches)) => Response::ok(json!({"matches": matches})),
+        Ok(Ok(matches)) => {
+            if let Some(index) = &session.index {
+                let observed = matches
+                    .iter()
+                    .filter_map(|matched| matched["f"].as_str())
+                    .map(|relative| session.workspace.join(relative))
+                    .collect::<Vec<_>>();
+                index.observe_paths(observed).await;
+            }
+            Response::ok(json!({"matches": matches}))
+        }
         Ok(Err(e)) => Response::err(4, &format!("grep: {e}")),
         Err(e) => Response::err(4, &format!("grep task: {e}")),
     }

@@ -2,22 +2,22 @@
 # Copy to ~/.config/daimonos/config.toml or place next to the binary to override.
 
 [index]
+# eager = always warm in background; lazy = cold until first file search;
+# hybrid = lazy correctness with heuristic background warming (default)
+mode = "hybrid"
 # Maximum directory traversal depth
 max_depth = 20
-# Skip files larger than this (bytes)
-max_file_size = 1_000_000
-# Bytes to sniff for null bytes when detecting binary files
-binary_sniff_bytes = 512
-# Hard cap on indexed files. The walk stops once this many files are
-# collected, bounding index memory on very large monorepos. Also used as the
-# budget for the over-broad-root preflight below. 0 disables the cap.
+# Hard cap on retained indexed paths. 0 uses an internal 50k safety cap.
 max_files = 50_000
+# Hard cap on all filesystem entries visited by an index/preflight walk.
+# Must be at least max_files.
+max_walk_entries = 100_000
 # Gate eager indexing on a signal instead of a path blocklist. A root larger
 # than the max_files preflight budget is auto-indexed only if it looks like a
 # real project (a project_markers entry is present at the root). This stops
 # daimonos from crawling an over-broad root (e.g. $HOME, a NAS mount) that an
-# editor inherited as cwd. Small roots are always indexed. A gated root gets
-# an empty index; an explicit -w or an MCP roots handshake re-roots normally.
+# editor inherited as cwd. In hybrid mode small/marked roots warm in the
+# background; all roots remain searchable through bounded cold population.
 guard_overbroad_roots = true
 # Filenames that mark a root as a real project for the gate above.
 project_markers = [

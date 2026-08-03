@@ -23,12 +23,12 @@ full = """String-replace edits: `edits` is [old, new, old, new, ...]. Keep each 
 path = "Relative path"
 edits = "[old, new, old, new, ...] pairs. Each `old`: minimal + unique; whitespace-tolerant."
 [search]
-full = """Regex content search or trigram file-name search."""
+full = """Regex content search or trigram relative filename/path search. File mode populates lazily and reports index coverage."""
 
 [search.parameters]
-mode = "Default: content"
-path = "Scope dir"
-glob = "e.g. *.rs"
+mode = "Default: content; files searches relative paths"
+path = "Optional scope dir"
+glob = "Optional filename glob, e.g. *.rs"
 [workspace_info]
 full = """Detailed workspace info (session state, root listing, index stats). Basic info is already in server instructions — only call if you need index stats or full detail."""
 terse = """Workspace info: session, root listing, index stats."""

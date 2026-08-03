@@ -1,12 +1,11 @@
-"""Regression tests for the over-broad root gate (vikunja #47).
+"""Regression tests for hybrid path-index warmup and bounded cold search.
 
 daimonos gates eager indexing on a signal, not a path blocklist: a root
 larger than the `max_files` preflight budget is only crawled if it looks like
 a real project (a project marker such as `.git` / `Cargo.toml` at the root).
-This stops an editor that inherited an over-broad cwd (commonly `$HOME`, but
-equally a NAS mount or downloads dir) from indexing gigabytes of unrelated
-files (observed at ~1.3 GB RSS for a single instance). Small roots are always
-indexed; the filesystem root is always skipped.
+This stops an editor that inherited an over-broad cwd from eagerly indexing
+unrelated paths. Small roots warm in hybrid mode; skipped roots remain
+searchable through capped cold population with explicit partial metadata.
 
 The tests force a tiny budget via a config file so the "large" cases don't
 require creating 50k files.
@@ -55,9 +54,13 @@ def _teardown(proc):
         proc.wait()
 
 
-def _index_files(client):
+def _index_info(client):
     info = json.loads(client.call_tool("workspace_info", {})["content"][0]["text"])
-    return info["index"]["files"]
+    return info["index"]
+
+
+def _index_files(client):
+    return _index_info(client)["files"]
 
 
 def _write_files(d, n):
@@ -73,8 +76,10 @@ def _write_config(tmp_path):
     return cfg
 
 
-def test_large_unmarked_root_is_not_indexed(daimonos_binary, tmp_path):
-    """8 files, budget 3, no project marker -> empty index."""
+def test_large_unmarked_root_starts_cold_then_searches_partially(
+    daimonos_binary, tmp_path
+):
+    """Hybrid skips warmup, then bounded cold search reports partial coverage."""
     proj = str(tmp_path / "proj")
     os.makedirs(proj)
     _write_files(proj, 8)
@@ -84,6 +89,15 @@ def test_large_unmarked_root_is_not_indexed(daimonos_binary, tmp_path):
     try:
         time.sleep(2.0)  # give any (incorrect) reindex time to run
         assert _index_files(client) == 0, "large unmarked root must not be indexed"
+        result = json.loads(
+            client.call_tool(
+                "search", {"pattern": ".rs", "mode": "files"}
+            )["content"][0]["text"]
+        )
+        assert result["results"]
+        assert result["index"]["files"] == 3
+        assert result["index"]["coverage"] == "partial"
+        assert result["index"]["capped"] is True
     finally:
         _teardown(proc)
 
