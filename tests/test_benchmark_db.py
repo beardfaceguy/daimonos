@@ -146,6 +146,16 @@ def test_sync_is_idempotent_and_compare_enforces_scope(tmp_path):
     assert mismatch.returncode != 0
     assert "scope fingerprints differ" in mismatch.stderr
 
+    candidate_summary = results / "candidate-run" / "task.json"
+    original_summary = candidate_summary.read_text()
+    changed_summary = json.loads(original_summary)
+    changed_summary["total_tokens"] = 81
+    candidate_summary.write_text(json.dumps(changed_summary))
+    immutable_run = subprocess.run(sync, capture_output=True, text=True)
+    assert immutable_run.returncode != 0
+    assert "run candidate-run is immutable" in immutable_run.stderr
+    candidate_summary.write_text(original_summary)
+
     changed = json.loads(manifest.read_text())
     changed["stages"][1]["parent"] = None
     manifest.write_text(json.dumps(changed))

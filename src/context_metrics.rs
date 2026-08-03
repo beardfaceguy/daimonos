@@ -20,7 +20,9 @@ pub struct ContextComposition {
     pub tool_result_error_bytes: usize,
     pub image_bytes: usize,
     pub image_count: usize,
+    /// Sum of neutral content categories only; excludes provider wire framing.
     pub payload_bytes: usize,
+    /// Coarse `ceil(payload_bytes / 4)` estimate, not tokenizer occupancy.
     pub payload_tokens_est: u64,
 }
 

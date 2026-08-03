@@ -89,6 +89,9 @@ to provider usage, each native agent generation records numeric-only context
 composition: system bytes, tool names/descriptions/schemas, user/assistant
 text, thinking/provider state, tool-call arguments, successful/error tool
 results, and encoded image bytes. Prompt or tool content is never logged.
+Component token estimates use the documented `ceil(bytes / 4)` heuristic;
+component byte counts are authoritative, while image/base64 token estimates
+are only directional and are not provider tokenizer output.
 
 `extract_tokens.py` aggregates these records into each task summary, including
 actual prompt occupancy, context coverage/growth, component exposure, tool-loop

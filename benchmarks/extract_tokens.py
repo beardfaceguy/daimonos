@@ -122,6 +122,7 @@ def main(argv):
     context_component_tokens = defaultdict(int)
     tool_loop_calls = 0
     final_calls = 0
+    failed_calls = 0
 
     if runtime == "claude":
         events = json_events(raw_file)
@@ -221,6 +222,8 @@ def main(argv):
                 tool_loop_calls += 1
             elif stop_reason in ("end_turn", "max_tokens", "refusal"):
                 final_calls += 1
+            elif stop_reason in ("error", "aborted"):
+                failed_calls += 1
             context = ev.get("context")
             if isinstance(context, dict):
                 estimate = context.get("payload_tokens_est")
@@ -276,6 +279,7 @@ def main(argv):
         "output": m["output"],
         "total_tokens": total,
         "prompt_tokens": prompt_tokens,
+        "fresh_input_tokens": m["input"],
         "mean_prompt_tokens_per_call": mean_prompt_tokens,
         "mean_cache_read_per_call": mean_cache_read,
         "cache_hit_ratio": cache_hit_ratio,
@@ -309,6 +313,7 @@ def main(argv):
         ),
         "tool_loop_calls": tool_loop_calls,
         "final_calls": final_calls,
+        "failed_calls": failed_calls,
         "cost_usd": cost,
         "tool_calls": tool_calls,
         "llm_calls": llm_calls,

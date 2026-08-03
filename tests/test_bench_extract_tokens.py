@@ -200,6 +200,7 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
 
     assert s["llm_calls"] == 3
     assert s["prompt_tokens"] == 42
+    assert s["fresh_input_tokens"] == 35
     assert s["mean_prompt_tokens_per_call"] == 14
     assert s["calls_with_context"] == 2
     assert abs(s["context_coverage_pct"] - (200 / 3)) < 1e-9
@@ -211,6 +212,7 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
     assert s["context_growth_tokens_per_call"] == 50
     assert s["tool_loop_calls"] == 1
     assert s["final_calls"] == 1
+    assert s["failed_calls"] == 0
     assert s["context_component_bytes_total"] == {
         "system_bytes": 80,
         "tool_result_ok_bytes": 120,

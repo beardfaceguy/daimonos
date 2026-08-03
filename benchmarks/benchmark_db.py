@@ -203,7 +203,6 @@ def sync_run(connection, run_id, results_dir):
         else None
     )
     run_values = [
-        str(run_dir.resolve()),
         min((summary.get("started_at") or "" for summary in summaries), default=""),
         max((summary.get("ended_at") or "" for summary in summaries), default=""),
         len(summaries),
@@ -218,21 +217,39 @@ def sync_run(connection, run_id, results_dir):
         sum(numeric(summary, "wall_ms") for summary in summaries),
         sum(summary.get("correct") is True for summary in summaries),
     ]
-    connection.execute(
+    inserted = connection.execute(
         """
-        INSERT OR REPLACE INTO benchmark_runs
+        INSERT OR IGNORE INTO benchmark_runs
             (id, run_dir, started_at, ended_at, task_count, total_tokens,
              prompt_tokens, fresh_input_tokens, cache_write_tokens,
              cache_read_tokens, output_tokens, llm_calls, cost_usd, wall_ms,
              correct_tasks)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [run_id, *run_values],
+        [run_id, str(run_dir.resolve()), *run_values],
     )
+    stored = connection.execute(
+        """
+        SELECT started_at, ended_at, task_count, total_tokens, prompt_tokens,
+               fresh_input_tokens, cache_write_tokens, cache_read_tokens,
+               output_tokens, llm_calls, cost_usd, wall_ms, correct_tasks
+        FROM benchmark_runs
+        WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if list(stored) != run_values:
+        raise ValueError(f"run {run_id} is immutable and differs from the database")
+    if not inserted.rowcount:
+        connection.execute(
+            "UPDATE benchmark_runs SET run_dir = ? WHERE id = ?",
+            (str(run_dir.resolve()), run_id),
+        )
     for summary in summaries:
+        raw_json = json.dumps(summary, separators=(",", ":"), sort_keys=True)
         connection.execute(
             """
-            INSERT OR REPLACE INTO task_results
+            INSERT OR IGNORE INTO task_results
                 (run_id, task_id, task_name, total_tokens, prompt_tokens,
                  fresh_input_tokens, cache_write_tokens, cache_read_tokens,
                  output_tokens, llm_calls, cost_usd, wall_ms, correct,
@@ -259,9 +276,18 @@ def sync_run(connection, run_id, results_dir):
                     summary.get("context_component_tokens_est_total"),
                     separators=(",", ":"),
                 ),
-                json.dumps(summary, separators=(",", ":"), sort_keys=True),
+                raw_json,
             ),
         )
+        stored_raw = connection.execute(
+            "SELECT raw_json FROM task_results WHERE run_id = ? AND task_id = ?",
+            (run_id, summary["task_id"]),
+        ).fetchone()[0]
+        if stored_raw != raw_json:
+            raise ValueError(
+                f"task result {run_id}/{summary['task_id']} is immutable "
+                "and differs from the database"
+            )
 
 
 def sync_manifest(connection, manifest_path, results_dir):
@@ -301,15 +327,27 @@ def sync_manifest(connection, manifest_path, results_dir):
             value, unit = specification
             connection.execute(
                 """
-                INSERT OR REPLACE INTO stage_metrics(stage_id, metric, scope, value, unit)
+                INSERT OR IGNORE INTO stage_metrics(stage_id, metric, scope, value, unit)
                 VALUES (?, ?, 'aggregate', ?, ?)
                 """,
                 (stage["id"], metric, value, unit),
             )
+            stored_metric = connection.execute(
+                """
+                SELECT value, unit FROM stage_metrics
+                WHERE stage_id = ? AND metric = ? AND scope = 'aggregate'
+                """,
+                (stage["id"], metric),
+            ).fetchone()
+            if list(stored_metric) != [value, unit]:
+                raise ValueError(
+                    f"metric {stage['id']}/{metric} is immutable "
+                    "and differs from the database"
+                )
         for artifact in stage.get("artifacts", []):
             connection.execute(
                 """
-                INSERT OR REPLACE INTO benchmark_artifacts(stage_id, path, sha256, kind)
+                INSERT OR IGNORE INTO benchmark_artifacts(stage_id, path, sha256, kind)
                 VALUES (?, ?, ?, ?)
                 """,
                 (
@@ -319,6 +357,21 @@ def sync_manifest(connection, manifest_path, results_dir):
                     artifact.get("kind"),
                 ),
             )
+            stored_artifact = connection.execute(
+                """
+                SELECT sha256, kind FROM benchmark_artifacts
+                WHERE stage_id = ? AND path = ?
+                """,
+                (stage["id"], artifact["path"]),
+            ).fetchone()
+            if list(stored_artifact) != [
+                artifact.get("sha256"),
+                artifact.get("kind"),
+            ]:
+                raise ValueError(
+                    f"artifact {stage['id']}/{artifact['path']} is immutable "
+                    "and differs from the database"
+                )
     connection.commit()
 
 
@@ -379,7 +432,7 @@ def compare_stages(connection, baseline_id, candidate_id):
             "scope fingerprints differ: "
             f"{baseline_id}={baseline_scope}, {candidate_id}={candidate_scope}"
         )
-    if baseline_tasks != candidate_tasks:
+    if set(baseline_tasks) != set(candidate_tasks):
         raise ValueError("task-set fingerprints differ")
     baseline_runs, baseline_by_task = stage_results(
         connection, baseline_id, baseline_tasks
