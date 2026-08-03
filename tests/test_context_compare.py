@@ -106,3 +106,44 @@ def test_context_compare_rejects_unmatched_task_runs(tmp_path):
 
     assert proc.returncode != 0
     assert "matching correctness-gated task runs" in proc.stderr
+
+
+def test_context_compare_rejects_mixed_prompt_token_schemas(tmp_path):
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    write_summary(
+        baseline,
+        "task",
+        calls=2,
+        prompt_tokens=100,
+        components={},
+    )
+    write_summary(
+        candidate,
+        "task",
+        calls=2,
+        prompt_tokens=100,
+        components={},
+    )
+    candidate_path = candidate / "task.json"
+    candidate_summary = json.loads(candidate_path.read_text())
+    candidate_summary.pop("prompt_tokens")
+    candidate_summary["input"] = 50
+    candidate_path.write_text(json.dumps(candidate_summary))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--baseline",
+            str(baseline),
+            "--candidate",
+            str(candidate),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode != 0
+    assert "cannot mix authoritative and reconstructed" in proc.stderr

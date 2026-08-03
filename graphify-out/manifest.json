@@ -1045,8 +1045,8 @@
     "semantic_hash": ""
   },
   "benchmarks/context_compare.py": {
-    "mtime": 1785731943.1331136,
-    "ast_hash": "438e7dd99beabf2ac686bb70ca8f1662",
+    "mtime": 1785732431.550876,
+    "ast_hash": "3bc9c9813be4bf5e892d4b7dd41731c8",
     "semantic_hash": ""
   },
   "src/context_metrics.rs": {
@@ -1055,8 +1055,8 @@
     "semantic_hash": ""
   },
   "tests/test_context_compare.py": {
-    "mtime": 1785638305.406668,
-    "ast_hash": "2e52292b45d12d50174970b8c3b46544",
+    "mtime": 1785732457.6695895,
+    "ast_hash": "1b77b58c68a2f66803f1ddbc7eb53591",
     "semantic_hash": ""
   },
   "benchmarks/results/2026-08-01-native-context-cache.md": {
@@ -1070,8 +1070,8 @@
     "semantic_hash": ""
   },
   "benchmarks/benchmark_db.py": {
-    "mtime": 1785731933.2522194,
-    "ast_hash": "2ed1d6d7b2e34c0fa46672117da89d8c",
+    "mtime": 1785732423.322966,
+    "ast_hash": "b5fb3e6c9279915fdd5e5d339bd5eb87",
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {

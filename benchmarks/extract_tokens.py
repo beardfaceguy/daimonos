@@ -300,7 +300,7 @@ def main(argv):
         "context_estimated_tokens_max": (
             max(context_estimates) if context_estimates else None
         ),
-        "context_growth_tokens_per_call": context_growth,
+        "context_growth_tokens_per_measured_call": context_growth,
         "context_component_bytes_total": (
             dict(sorted(context_component_bytes.items()))
             if context_estimates

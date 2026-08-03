@@ -203,7 +203,7 @@ def sync_run(connection, run_id, results_dir):
         else None
     )
     run_values = [
-        str(run_dir.resolve()),
+        run_id,
         min((summary.get("started_at") or "" for summary in summaries), default=""),
         max((summary.get("ended_at") or "" for summary in summaries), default=""),
         len(summaries),

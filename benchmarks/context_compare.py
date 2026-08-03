@@ -139,6 +139,14 @@ def main(argv=None):
             "both arms need matching correctness-gated task runs; "
             f"baseline={dict(baseline_tasks)}, candidate={dict(candidate_tasks)}"
         )
+    prompt_coverage = [
+        "prompt_tokens" in summary
+        for summary in baseline_summaries + candidate_summaries
+    ]
+    if any(prompt_coverage) and not all(prompt_coverage):
+        parser.error(
+            "cannot mix authoritative and reconstructed prompt-token summaries"
+        )
 
     baseline = aggregate(baseline_summaries)
     candidate = aggregate(candidate_summaries)

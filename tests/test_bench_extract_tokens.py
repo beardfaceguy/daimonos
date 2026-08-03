@@ -209,7 +209,7 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
     assert s["context_estimated_tokens_first"] == 100
     assert s["context_estimated_tokens_last"] == 150
     assert s["context_estimated_tokens_max"] == 150
-    assert s["context_growth_tokens_per_call"] == 50
+    assert s["context_growth_tokens_per_measured_call"] == 50
     assert s["tool_loop_calls"] == 1
     assert s["final_calls"] == 1
     assert s["failed_calls"] == 0
