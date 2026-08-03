@@ -213,8 +213,8 @@ def sync_run(connection, run_id, results_dir):
         if all(value is not None for value in costs)
         else None
     )
+    run_dir_identifier = run_id
     run_values = [
-        run_id,
         min((summary.get("started_at") or "" for summary in summaries), default=""),
         max((summary.get("ended_at") or "" for summary in summaries), default=""),
         len(summaries),
@@ -238,7 +238,7 @@ def sync_run(connection, run_id, results_dir):
              correct_tasks)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [run_id, *run_values],
+        [run_id, run_dir_identifier, *run_values],
     )
     stored = connection.execute(
         """
@@ -251,7 +251,12 @@ def sync_run(connection, run_id, results_dir):
         """,
         (run_id,),
     ).fetchone()
-    if list(stored) != run_values:
+    if stored[0] != run_dir_identifier:
+        raise ValueError(
+            f"run {run_id} directory identifier is immutable: "
+            f"database={stored[0]}, manifest={run_dir_identifier}"
+        )
+    if list(stored[1:]) != run_values:
         raise ValueError(f"run {run_id} is immutable and differs from the database")
     for summary in summaries:
         raw_json = json.dumps(summary, separators=(",", ":"), sort_keys=True)

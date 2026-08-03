@@ -1065,23 +1065,28 @@
     "semantic_hash": ""
   },
   "benchmarks/results/optimization-lineage.md": {
-    "mtime": 1785728244.530631,
-    "ast_hash": "708a8f081bed3a20480d7e7e620a8bae",
+    "mtime": 1785771156.9206705,
+    "ast_hash": "561c592bc55b99e047463b53f17876f4",
     "semantic_hash": ""
   },
   "benchmarks/benchmark_db.py": {
-    "mtime": 1785732923.6144826,
-    "ast_hash": "724330118aaba6686cc831f4782c3460",
+    "mtime": 1785773563.539513,
+    "ast_hash": "5b8a7220b60d634cfe8b3c8a8ce82455",
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {
-    "mtime": 1785728191.6822355,
-    "ast_hash": "25a3582fd35ca752edbf0f93de7dac98",
+    "mtime": 1785771213.6930945,
+    "ast_hash": "e63091d44b9e16cc4cd29b134dc42473",
     "semantic_hash": ""
   },
   "tests/test_benchmark_db.py": {
-    "mtime": 1785731188.3641818,
-    "ast_hash": "a4263072749981fc2ec4b5e28b2c36f6",
+    "mtime": 1785773537.3958015,
+    "ast_hash": "cda99eeb63d2bc4673e4824e65b21d9c",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-03-full-suite-prompt-cache.md": {
+    "mtime": 1785771196.0892732,
+    "ast_hash": "ddc377a21c0d6847f2166c3e4075dce7",
     "semantic_hash": ""
   }
 }

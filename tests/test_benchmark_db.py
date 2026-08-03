@@ -162,3 +162,13 @@ def test_sync_is_idempotent_and_compare_enforces_scope(tmp_path):
     immutable = subprocess.run(sync, capture_output=True, text=True)
     assert immutable.returncode != 0
     assert "parent is immutable" in immutable.stderr
+
+    changed["stages"][1]["parent"] = "B0"
+    manifest.write_text(json.dumps(changed))
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET run_dir = 'relocated' WHERE id = 'baseline-run'"
+        )
+    immutable_path = subprocess.run(sync, capture_output=True, text=True)
+    assert immutable_path.returncode != 0
+    assert "directory identifier is immutable" in immutable_path.stderr
