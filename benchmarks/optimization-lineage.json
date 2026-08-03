@@ -309,6 +309,165 @@
           "kind": "report"
         }
       ]
+    },
+    {
+      "id": "I0",
+      "parent": null,
+      "feature": "Pre-848 legacy content-trigram file search",
+      "scope_fingerprint": "index-lifecycle-v1|small200|large3000|maxfiles500|maxwalk1000|n30|warm20|interleaved",
+      "benchmark_kind": "server_index",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "binary_sha256": "3448d9aea0399edb944b59bef262220c294cc7404c1553b6caec99c009ab02c8",
+      "git_commit": "53339f9dfbe468e5059439bb2b1e3403e3c41bd7",
+      "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+      "created_at": "2026-08-03T19:38:53Z",
+      "run_dirs": [],
+      "metrics": {
+        "correct_profile_runs": [30, "count"],
+        "small_startup_median_ms": [228.399947, "milliseconds"],
+        "small_ready_median_ms": [0.856903, "milliseconds"],
+        "small_warm_median_ms": [0.016871, "milliseconds"],
+        "small_peak_rss_median_kb": [22170, "kibibytes"],
+        "large_unmarked_startup_median_ms": [226.321175, "milliseconds"],
+        "large_unmarked_correct_runs": [0, "count"],
+        "large_unmarked_peak_rss_median_kb": [21698, "kibibytes"],
+        "large_marked_startup_median_ms": [244.522544, "milliseconds"],
+        "large_marked_correct_runs": [0, "count"],
+        "large_marked_peak_rss_median_kb": [22362, "kibibytes"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+          "sha256": "13e7bfb1a8bf8ad3ddbe32f17644396f128b684a864967ccfcf2d67c2638a7bd",
+          "kind": "report"
+        },
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle-r4.json",
+          "sha256": "59134d3f09318c0170785a3f52eb4a0501c93673e6a6c01bde411c86c39e85ee",
+          "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "I1",
+      "parent": "I0",
+      "feature": "Explicit eager relative-path index",
+      "scope_fingerprint": "index-lifecycle-v1|small200|large3000|maxfiles500|maxwalk1000|n30|warm20|interleaved",
+      "benchmark_kind": "server_index",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
+      "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
+      "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+      "created_at": "2026-08-03T19:38:53Z",
+      "run_dirs": [],
+      "metrics": {
+        "correct_profile_runs": [90, "count"],
+        "small_startup_median_ms": [226.493211, "milliseconds"],
+        "small_ready_median_ms": [0.507517, "milliseconds"],
+        "small_warm_median_ms": [0.023985, "milliseconds"],
+        "large_unmarked_ready_median_ms": [0.591658, "milliseconds"],
+        "large_marked_ready_median_ms": [0.680634, "milliseconds"],
+        "max_inotify_watches": [42, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+          "sha256": "13e7bfb1a8bf8ad3ddbe32f17644396f128b684a864967ccfcf2d67c2638a7bd",
+          "kind": "report"
+        },
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle-r4.json",
+          "sha256": "59134d3f09318c0170785a3f52eb4a0501c93673e6a6c01bde411c86c39e85ee",
+          "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "I2",
+      "parent": "I0",
+      "feature": "Explicit lazy relative-path index",
+      "scope_fingerprint": "index-lifecycle-v1|small200|large3000|maxfiles500|maxwalk1000|n30|warm20|interleaved",
+      "benchmark_kind": "server_index",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
+      "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
+      "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+      "created_at": "2026-08-03T19:38:53Z",
+      "run_dirs": [],
+      "metrics": {
+        "correct_profile_runs": [90, "count"],
+        "small_startup_median_ms": [226.071494, "milliseconds"],
+        "small_ready_median_ms": [2.678786, "milliseconds"],
+        "small_warm_median_ms": [0.024521, "milliseconds"],
+        "large_unmarked_ready_median_ms": [8.130284, "milliseconds"],
+        "large_marked_ready_median_ms": [8.623008, "milliseconds"],
+        "max_inotify_watches": [21, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+          "sha256": "13e7bfb1a8bf8ad3ddbe32f17644396f128b684a864967ccfcf2d67c2638a7bd",
+          "kind": "report"
+        },
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle-r4.json",
+          "sha256": "59134d3f09318c0170785a3f52eb4a0501c93673e6a6c01bde411c86c39e85ee",
+          "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "I3",
+      "parent": "I0",
+      "feature": "Default hybrid relative-path index",
+      "scope_fingerprint": "index-lifecycle-v1|small200|large3000|maxfiles500|maxwalk1000|n30|warm20|interleaved",
+      "benchmark_kind": "server_index",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
+      "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
+      "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+      "created_at": "2026-08-03T19:38:53Z",
+      "run_dirs": [],
+      "metrics": {
+        "correct_profile_runs": [90, "count"],
+        "small_startup_median_ms": [229.410201, "milliseconds"],
+        "small_ready_median_ms": [0.447394, "milliseconds"],
+        "small_warm_median_ms": [0.025567, "milliseconds"],
+        "small_peak_rss_median_kb": [22480, "kibibytes"],
+        "large_unmarked_startup_median_ms": [227.355704, "milliseconds"],
+        "large_unmarked_ready_median_ms": [7.780792, "milliseconds"],
+        "large_unmarked_warm_median_ms": [0.115726, "milliseconds"],
+        "large_unmarked_peak_rss_median_kb": [23184, "kibibytes"],
+        "large_marked_startup_median_ms": [244.034173, "milliseconds"],
+        "large_marked_ready_median_ms": [0.651861, "milliseconds"],
+        "large_marked_warm_median_ms": [0.122638, "milliseconds"],
+        "large_marked_peak_rss_median_kb": [23196, "kibibytes"],
+        "max_inotify_watches": [42, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle.md",
+          "sha256": "13e7bfb1a8bf8ad3ddbe32f17644396f128b684a864967ccfcf2d67c2638a7bd",
+          "kind": "report"
+        },
+        {
+          "path": "benchmarks/results/2026-08-03-index-lifecycle-r4.json",
+          "sha256": "59134d3f09318c0170785a3f52eb4a0501c93673e6a6c01bde411c86c39e85ee",
+          "kind": "raw_aggregate"
+        }
+      ]
     }
   ]
 }
