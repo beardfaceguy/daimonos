@@ -1718,11 +1718,12 @@ fn error_has_http_status(error: &str, status: &str) -> bool {
 
 fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
-    let normalized = error.replace(['_', '-'], " ");
-    if normalized.contains("tool use")
-        && normalized.contains("without")
-        && normalized.contains("tool result")
-    {
+    let normalized = error
+        .replace(['_', '-', '`'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.contains("tool use ids were found without tool result blocks") {
         return "Provider rejected invalid tool-call history. Restart/reload the session or use /clear.";
     }
     // An explicit/strong context-overflow signal takes precedence because the
@@ -7572,6 +7573,13 @@ mod tests {
                 )
             ),
             "Provider rejected invalid tool-call history. Restart/reload the session or use /clear."
+        );
+        assert_eq!(
+            safe_provider_error_message(
+                false,
+                Some("tool use is fine without tool result overhead")
+            ),
+            "Provider request failed."
         );
         assert_eq!(
             safe_provider_error_message(false, Some("API 401: echoed-secret")),
