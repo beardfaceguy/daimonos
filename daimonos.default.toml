@@ -7,8 +7,11 @@
 mode = "hybrid"
 # Maximum directory traversal depth
 max_depth = 20
-# Hard cap and cold-search walk budget. 0 uses an internal 50k safety cap.
+# Hard cap on retained indexed paths. 0 uses an internal 50k safety cap.
 max_files = 50_000
+# Hard cap on all filesystem entries visited by an index/preflight walk.
+# Must be at least max_files.
+max_walk_entries = 100_000
 # Gate eager indexing on a signal instead of a path blocklist. A root larger
 # than the max_files preflight budget is auto-indexed only if it looks like a
 # real project (a project_markers entry is present at the root). This stops

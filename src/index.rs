@@ -29,8 +29,10 @@ pub struct WorkspaceIndex {
     reindex_lock: Arc<std::sync::Mutex<()>>,
     max_depth: usize,
     skip_extensions: HashSet<String>,
-    /// Hard cap on indexed files (0 = unbounded). See `IndexConfig::max_files`.
+    /// Effective non-zero hard cap on indexed paths.
     max_files: usize,
+    /// Hard cap on all entries visited during a filesystem walk.
+    max_walk_entries: usize,
     mode: IndexMode,
     /// When true, print one-line indexer stats to stderr after each reindex.
     /// Disabled in MCP quiet mode so hosts like Cursor don't surface benign
@@ -106,7 +108,8 @@ impl WorkspaceIndex {
             reindex_lock: Arc::new(std::sync::Mutex::new(())),
             max_depth: cfg.max_depth,
             skip_extensions: cfg.skip_set(),
-            max_files: cfg.max_files,
+            max_files: cfg.effective_max_files(),
+            max_walk_entries: cfg.max_walk_entries,
             mode: cfg.mode,
             log_progress,
         }
@@ -160,11 +163,8 @@ impl WorkspaceIndex {
         let reindex_lock = Arc::clone(&self.reindex_lock);
         let max_depth = self.max_depth;
         let skip_ext = self.skip_extensions.clone();
-        let max_files = if self.max_files == 0 {
-            DEFAULT_EAGER_PROBE
-        } else {
-            self.max_files
-        };
+        let max_files = self.max_files;
+        let max_walk_entries = self.max_walk_entries;
         let log_progress = self.log_progress;
 
         tokio::task::spawn_blocking(move || {
@@ -184,6 +184,7 @@ impl WorkspaceIndex {
                 event = "index_started",
                 root = %root.display(),
                 max_files,
+                max_walk_entries,
                 max_depth,
             );
 
@@ -221,9 +222,15 @@ impl WorkspaceIndex {
                 .max_depth(Some(max_depth))
                 .build();
 
-            let mut capped = false;
+            let mut cap_reason = None;
             let mut walk_failed = false;
+            let mut visited_entries = 0usize;
             for entry in walker {
+                visited_entries += 1;
+                if visited_entries > max_walk_entries {
+                    cap_reason = Some("walk_entries");
+                    break;
+                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {
@@ -236,7 +243,7 @@ impl WorkspaceIndex {
                     continue;
                 }
                 if current_files.len() >= max_files {
-                    capped = true;
+                    cap_reason = Some("files");
                     break;
                 }
 
@@ -269,18 +276,21 @@ impl WorkspaceIndex {
                 current_files.insert(rel, mtime);
             }
 
-            if capped {
+            let capped = cap_reason.is_some();
+            if let Some(reason) = cap_reason {
                 tracing::warn!(
                     target: "daimonos::index",
-                    event = "index_file_cap_reached",
+                    event = "index_budget_reached",
                     root = %root.display(),
+                    reason,
                     max_files,
+                    max_walk_entries,
                 );
             }
             if capped && log_progress {
                 eprintln!(
-                    "index: file cap reached ({max_files}); indexing first {max_files} files \
-                     only. Tune [index] max_files if your project is larger."
+                    "index: traversal budget reached; coverage is partial \
+                     (max_files={max_files}, max_walk_entries={max_walk_entries})"
                 );
             }
 
@@ -446,28 +456,6 @@ impl WorkspaceIndex {
         })
     }
 
-    fn relative_index_path(&self, path: &Path) -> Option<String> {
-        let relative = path.strip_prefix(&self.root).ok()?;
-        if relative.components().count() > self.max_depth
-            || relative.components().any(|component| match component {
-                Component::Normal(name) => name.to_string_lossy().starts_with('.'),
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => true,
-                Component::CurDir => false,
-            })
-        {
-            return None;
-        }
-        let extension = relative
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if self.skip_extensions.contains(&extension) {
-            return None;
-        }
-        Some(relative.to_string_lossy().to_string())
-    }
-
     pub async fn observe_path(&self, path: &Path) -> bool {
         self.observe_paths(std::iter::once(path.to_path_buf()))
             .await
@@ -475,28 +463,54 @@ impl WorkspaceIndex {
     }
 
     pub async fn observe_paths(&self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
-        let mut relative_paths = Vec::new();
-        for path in paths {
-            if path.is_file() {
-                if let Some(relative) = self.relative_index_path(&path) {
-                    relative_paths.push(relative);
-                }
-            }
-        }
-        relative_paths.sort_unstable();
-        relative_paths.dedup();
-        if relative_paths.is_empty() {
+        let paths: Vec<PathBuf> = paths.into_iter().collect();
+        if paths.is_empty() {
             return 0;
         }
-        let mut state = self.inner.write().await;
-        let max_files = if self.max_files == 0 {
-            DEFAULT_EAGER_PROBE
-        } else {
-            self.max_files
+        let root = self.root.clone();
+        let max_depth = self.max_depth;
+        let skip_extensions = self.skip_extensions.clone();
+        let mut observed = match tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter_map(|path| {
+                    let metadata = std::fs::metadata(&path).ok()?;
+                    if !metadata.is_file() {
+                        return None;
+                    }
+                    let relative = relative_index_path(&root, max_depth, &skip_extensions, &path)?;
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0);
+                    Some((relative, mtime))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                tracing::warn!(
+                    target: "daimonos::index",
+                    event = "path_observation_failed",
+                    error = %error,
+                );
+                return 0;
+            }
         };
+        observed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        observed.dedup_by(|left, right| left.0 == right.0);
+        let mut state = self.inner.write().await;
+        let max_files = self.max_files;
         let mut added = 0usize;
-        for relative in relative_paths {
-            if state.path_to_id.contains_key(&relative) {
+        for (relative, mtime) in observed {
+            if let Some(file_id) = state.path_to_id.get(&relative).copied() {
+                if let Some(stored_mtime) = state.mtimes.get_mut(file_id as usize) {
+                    *stored_mtime = mtime;
+                }
                 continue;
             }
             if state.files.len() >= max_files {
@@ -506,7 +520,7 @@ impl WorkspaceIndex {
             }
             let file_id = state.files.len() as u32;
             state.files.push(relative.clone());
-            state.mtimes.push(0);
+            state.mtimes.push(mtime);
             state.path_to_id.insert(relative.clone(), file_id);
             extract_trigrams(relative.as_bytes(), file_id, &mut state.trigrams);
             added += 1;
@@ -592,6 +606,33 @@ impl WorkspaceIndex {
     }
 }
 
+fn relative_index_path(
+    root: &Path,
+    max_depth: usize,
+    skip_extensions: &HashSet<String>,
+    path: &Path,
+) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.components().count() > max_depth
+        || relative.components().any(|component| match component {
+            Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => true,
+            Component::CurDir => false,
+        })
+    {
+        return None;
+    }
+    let extension = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if skip_extensions.contains(&extension) {
+        return None;
+    }
+    Some(relative.to_string_lossy().to_string())
+}
+
 fn path_matches_filters(
     file: &str,
     scope: Option<&str>,
@@ -660,10 +701,6 @@ fn start_watcher(
     }
 }
 
-/// Internal preflight budget used when `max_files` is 0 (cap disabled) so the
-/// over-broad-root probe still has a bound to early-exit against.
-const DEFAULT_EAGER_PROBE: usize = 50_000;
-
 pub fn should_warm_index(root: &Path, cfg: &IndexConfig, long_lived: bool) -> bool {
     long_lived
         && match cfg.mode {
@@ -685,8 +722,8 @@ pub fn should_warm_index(root: &Path, cfg: &IndexConfig, long_lived: bool) -> bo
 ///
 /// This catches the over-broad case generically — `$HOME`, a NAS mount, a
 /// downloads dir (large, no project marker) all return false — without a
-/// hand-maintained list of paths. The hard `max_files` cap still bounds RSS
-/// for anything that does get indexed.
+/// hand-maintained list of paths. `max_files` bounds retained state while
+/// `max_walk_entries` bounds traversal work.
 pub fn should_eager_index(root: &Path, cfg: &IndexConfig) -> bool {
     if !cfg.guard_overbroad_roots {
         return true;
@@ -702,11 +739,7 @@ pub fn should_eager_index(root: &Path, cfg: &IndexConfig) -> bool {
         return false;
     }
 
-    let budget = if cfg.max_files == 0 {
-        DEFAULT_EAGER_PROBE
-    } else {
-        cfg.max_files
-    };
+    let budget = cfg.effective_max_files();
 
     // Small enough to fully index no matter what it is.
     if preflight_within_budget(&root, cfg, budget) {
@@ -724,10 +757,8 @@ fn has_project_marker(root: &Path, cfg: &IndexConfig) -> bool {
 
 /// Bounded preflight: walk `root` (honoring `.gitignore`, hidden files, and
 /// `max_depth`) counting regular files, and early-exit as soon as the count
-/// exceeds `budget`. Returns true when the whole tree fits within `budget`
-/// (i.e. the root is "small"), false once it provably exceeds it. Touches at
-/// most `budget + 1` file entries, so the probe cost is bounded even on a
-/// pathological root.
+/// exceeds `budget` or total visited entries exceed `max_walk_entries`.
+/// Returns true only when the whole tree fits within both bounds.
 fn preflight_within_budget(root: &Path, cfg: &IndexConfig, budget: usize) -> bool {
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -735,7 +766,15 @@ fn preflight_within_budget(root: &Path, cfg: &IndexConfig, budget: usize) -> boo
         .max_depth(Some(cfg.max_depth))
         .build();
     let mut count = 0usize;
-    for entry in walker.flatten() {
+    let mut visited_entries = 0usize;
+    for entry in walker {
+        visited_entries += 1;
+        if visited_entries > cfg.max_walk_entries {
+            return false;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         if entry.path().is_file() {
             count += 1;
             if count > budget {
@@ -938,6 +977,38 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file, "newly_touched.rs");
         assert_eq!(idx.stats().await.coverage, IndexCoverage::Cold);
+    }
+
+    #[tokio::test]
+    async fn observed_path_records_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mtime.rs");
+        std::fs::write(&path, "content").unwrap();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &IndexConfig::default(), false);
+
+        assert!(idx.observe_path(&path).await);
+
+        let state = idx.inner.read().await;
+        assert_ne!(state.mtimes[0], 0);
+    }
+
+    #[tokio::test]
+    async fn walk_entry_budget_bounds_directory_heavy_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..10 {
+            std::fs::create_dir(dir.path().join(format!("dir-{index}"))).unwrap();
+        }
+        let cfg = IndexConfig {
+            max_files: 3,
+            max_walk_entries: 3,
+            ..Default::default()
+        };
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, false);
+
+        let stats = idx.ensure_populated().await;
+
+        assert_eq!(stats.coverage, IndexCoverage::Partial);
+        assert!(stats.capped);
     }
 
     #[tokio::test]

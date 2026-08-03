@@ -143,7 +143,8 @@ Construction is O(1); population follows the configured rollout mode.
 | `mode` | `"hybrid"` | `eager` always warms long-lived sessions, `lazy` waits for file search, and `hybrid` heuristically warms small or marked projects |
 | `max_depth` | `20` | Maximum directory traversal depth |
 | `skip_extensions` | *(see below)* | File extensions to skip (known binary formats) |
-| `max_files` | `50000` | Hard cap on indexed paths and cold-search traversal. `0` uses an internal 50,000-file safety cap |
+| `max_files` | `50000` | Hard cap on retained indexed paths. `0` uses an internal 50,000-file safety cap |
+| `max_walk_entries` | `100000` | Hard cap on all filesystem entries visited by preflight and index walks; must be at least the effective `max_files` |
 | `guard_overbroad_roots` | `true` | Gate eager indexing on a signal: a root larger than the preflight budget is indexed only if it has a `project_markers` entry |
 | `project_markers` | `.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, `pom.xml`, `build.gradle`, `CMakeLists.txt`, `Makefile` | Filenames marking a root as a real project for the gate |
 
@@ -169,6 +170,8 @@ compiled objects, fonts, databases, and office documents. Directories named
 [index]
 mode = "hybrid"
 max_depth = 20
+max_files = 50_000
+max_walk_entries = 100_000
 skip_extensions = [
   "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg",
   "mp3", "mp4", "avi", "mov", "mkv", "flac", "wav", "ogg", "webm",
@@ -649,9 +652,10 @@ These are not part of the config file but affect daimonos behavior:
 
 ## Performance Tuning Tips
 
-**Large monorepos**: increase `max_depth` or `max_files` if important paths
-fall outside reported coverage. Add project-specific generated/binary
-extensions to `skip_extensions` to spend the path budget on useful files.
+**Large monorepos**: increase `max_depth`, `max_files`, and
+`max_walk_entries` together if important paths fall outside reported
+coverage. Add project-specific generated/binary extensions to
+`skip_extensions` to spend the path budget on useful files.
 
 **Slow first file search**: use `mode = "hybrid"` or `"eager"` to warm
 long-lived sessions, or narrow `path` and `glob` filters. Later searches reuse

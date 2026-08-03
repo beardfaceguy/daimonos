@@ -220,13 +220,13 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1785779178.4661484,
-    "ast_hash": "91544f9df7558656cc7d04a5e8a3b6a2",
+    "mtime": 1785783629.3107767,
+    "ast_hash": "a8542f5a33b02e75d80d2c49e2fa901d",
     "semantic_hash": ""
   },
   "src/index.rs": {
-    "mtime": 1785781493.8009944,
-    "ast_hash": "12f5b6cd4c0459cb03f320a0c2ae5069",
+    "mtime": 1785783629.3237765,
+    "ast_hash": "8a9d2bd06c5c9c3c7eb6736d2efebacd",
     "semantic_hash": ""
   },
   "src/kgl/assert.rs": {
@@ -750,8 +750,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785780309.4758499,
-    "ast_hash": "3f6bcc426f6a6cdb0a45c789c4814eb6",
+    "mtime": 1785783561.7505128,
+    "ast_hash": "b3d432299aa4ac1d9a74b6b4402a4b62",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
