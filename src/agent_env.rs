@@ -76,6 +76,9 @@ pub struct AgentEnv {
     pub base_url: String,
     pub approval_mode: String,
     pub api_key: String,
+    /// Explicit provider prompt caching. Optional and default-off until the
+    /// broader native-agent benchmark establishes the one-call trade-off.
+    pub prompt_cache: bool,
     pub allowed_commands: Vec<String>,
     pub denied_commands: Vec<String>,
     /// Candidate models for the ACP model picker (vikunja #960), from the
@@ -205,6 +208,11 @@ impl AgentEnv {
             "DAIMONOS_AGENT_THINKING",
             path,
         )?;
+        let prompt_cache = parse_bool_flag(
+            vars.get("DAIMONOS_AGENT_PROMPT_CACHE"),
+            "DAIMONOS_AGENT_PROMPT_CACHE",
+            path,
+        )?;
 
         Ok(AgentEnv {
             provider,
@@ -212,6 +220,7 @@ impl AgentEnv {
             base_url: present("DAIMONOS_AGENT_BASE_URL").unwrap(),
             approval_mode,
             api_key: present("DAIMONOS_AGENT_API_KEY").unwrap(),
+            prompt_cache,
             allowed_commands: parse_list(vars.get("DAIMONOS_AGENT_ALLOWED_COMMANDS")),
             denied_commands: parse_list(vars.get("DAIMONOS_AGENT_DENIED_COMMANDS")),
             models,
@@ -577,8 +586,21 @@ mod tests {
         assert_eq!(e.approval_mode, "interactive");
         assert_eq!(e.api_key, "sk-test");
         assert!(e.allowed_commands.is_empty() && e.denied_commands.is_empty());
+        assert!(!e.prompt_cache);
         // No DAIMONOS_AGENT_MODELS → picker list is just the active model.
         assert_eq!(e.models, vec!["anthropic/claude-sonnet-4.6"]);
+    }
+
+    #[test]
+    fn prompt_cache_is_optional_default_off_and_validated() {
+        assert!(!load_str(&base()).unwrap().prompt_cache);
+        assert!(
+            load_str(&(base() + "DAIMONOS_AGENT_PROMPT_CACHE=on\n"))
+                .unwrap()
+                .prompt_cache
+        );
+        let error = load_str(&(base() + "DAIMONOS_AGENT_PROMPT_CACHE=maybe\n")).unwrap_err();
+        assert!(error.contains("DAIMONOS_AGENT_PROMPT_CACHE"));
     }
 
     #[test]

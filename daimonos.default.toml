@@ -396,5 +396,6 @@ poll_interval_ms = 1500
 #   DAIMONOS_AGENT_BASE_URL=https://openrouter.ai/api/v1
 #   DAIMONOS_AGENT_APPROVAL_MODE=interactive    # auto | interactive | paranoid
 #   DAIMONOS_AGENT_API_KEY=sk-...
+#   DAIMONOS_AGENT_PROMPT_CACHE=off             # optional; Anthropic only, default off
 #   DAIMONOS_AGENT_ALLOWED_COMMANDS=            # optional, comma-separated
 #   DAIMONOS_AGENT_DENIED_COMMANDS=exec         # optional, comma-separated
