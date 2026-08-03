@@ -192,10 +192,21 @@ def numeric(summary, field):
 
 
 def sync_run(connection, run_id, results_dir):
+    if Path(run_id).is_absolute() or Path(run_id).name != run_id:
+        raise ValueError(f"run id must be a single directory name: {run_id}")
     run_dir = Path(results_dir) / run_id
     summaries = load_task_summaries(run_dir)
     if not summaries:
         raise ValueError(f"run directory has no task summaries: {run_dir}")
+    unverified = [
+        summary["task_id"]
+        for summary in summaries
+        if summary.get("correct") is not True
+    ]
+    if unverified:
+        raise ValueError(
+            f"run {run_id} has non-passing task summaries: {', '.join(unverified)}"
+        )
     costs = [summary.get("cost_usd") for summary in summaries]
     cost = (
         sum(float(value) for value in costs)

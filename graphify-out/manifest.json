@@ -1045,8 +1045,8 @@
     "semantic_hash": ""
   },
   "benchmarks/context_compare.py": {
-    "mtime": 1785732431.550876,
-    "ast_hash": "3bc9c9813be4bf5e892d4b7dd41731c8",
+    "mtime": 1785732929.1634219,
+    "ast_hash": "6d8aab142fc61174aad5658305a04ceb",
     "semantic_hash": ""
   },
   "src/context_metrics.rs": {
@@ -1070,8 +1070,8 @@
     "semantic_hash": ""
   },
   "benchmarks/benchmark_db.py": {
-    "mtime": 1785732423.322966,
-    "ast_hash": "b5fb3e6c9279915fdd5e5d339bd5eb87",
+    "mtime": 1785732923.6144826,
+    "ast_hash": "724330118aaba6686cc831f4782c3460",
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {

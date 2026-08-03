@@ -19,7 +19,7 @@ def load(paths):
             if (
                 summary.get("task_id")
                 and not summary.get("is_error")
-                and summary.get("correct") is not False
+                and summary.get("correct") is True
             ):
                 summaries.append(summary)
     return summaries

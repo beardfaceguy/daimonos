@@ -1,7 +1,7 @@
 # Graph Report - daimonos  (2026-08-02)
 
 ## Corpus Check
-- 210 files · ~275,209 words
+- 210 files · ~275,251 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `c187eb2e`
+- Built from commit: `e4f71740`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -419,8 +419,8 @@ Cohesion: 0.16
 Nodes (31): compact_audit(), compact_audit_clean_project(), compact_audit_missing_metadata_defaults_clean(), compact_audit_with_vulnerabilities(), is_available(), npm_audit(), npm_audit_in_valid_project(), npm_audit_no_package_json_returns_error() (+23 more)
 
 ### Community 34 - "Community 34"
-Cohesion: 0.13
-Nodes (20): Event, S, end_turn_resp(), EofAwareReader, ImageCapableProvider, MockProvider, ModelCaptureProvider, CompleteOpts (+12 more)
+Cohesion: 0.17
+Nodes (15): Event, S, end_turn_resp(), ImageCapableProvider, MockProvider, CompleteOpts, Context, FnMut (+7 more)
 
 ### Community 35 - "Community 35"
 Cohesion: 0.12
@@ -611,8 +611,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.10
-Nodes (32): acknowledge_coordination_model_notice(), AgentConfig, AgentResult, AgentSession, BenchmarkCaptureProvider, CaptureProvider, controlled_tool_schemas(), coordination_model_notice() (+24 more)
+Cohesion: 0.11
+Nodes (28): acknowledge_coordination_model_notice(), AgentConfig, AgentSession, BenchmarkCaptureProvider, CaptureProvider, controlled_tool_schemas(), coordination_model_notice(), coordination_model_notice_is_metadata_only_and_deduplicated() (+20 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -864,19 +864,19 @@ Nodes (7): 1. Open Zed settings, 2. Add daimonos as an MCP server, 3. Verify, Pr
 
 ### Community 158 - "Community 158"
 Cohesion: 0.04
-Nodes (54): AcpContentBlock, AcpDiff, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content(), acp_omits_terminal_metadata_without_client_capability(), acp_plain_text_tool_result_becomes_json_string_raw_output() (+46 more)
+Nodes (58): AcpContentBlock, AcpDiff, LevelFilter, SessionUpdate, acp_completed_tool_call_carries_structured_raw_output(), acp_edit_file_completion_carries_full_file_diff(), acp_failed_edit_keeps_text_content(), acp_omits_terminal_metadata_without_client_capability() (+50 more)
 
 ### Community 161 - "Community 161"
 Cohesion: 0.40
 Nodes (4): Agent coordination, Execution plans, Keep the context lean (offload large data), Tool efficiency rules
 
 ### Community 167 - "Community 167"
-Cohesion: 0.12
-Nodes (16): append_remote_tools_to_catalog(), is_user_turn_message(), parse_plan_entries(), plan_input_normalizes_and_validates_entries(), PlanEntry, PlanInput, PlanPriority, PlanStatus (+8 more)
+Cohesion: 0.09
+Nodes (27): CompactionEvent, ContextComposition, AgentResult, compaction_log_line(), GenerationLogMetadata, is_user_turn_message(), last_assistant_text(), log_compaction_event() (+19 more)
 
 ### Community 168 - "Community 168"
 Cohesion: 0.09
-Nodes (54): BridgeSlot, CoreRuntimeOption, DateTime, LevelFilter, McpBridge, McpClientPool, SessionCompaction, SessionCore (+46 more)
+Nodes (55): BridgeSlot, CoreRuntimeOption, DateTime, McpBridge, McpClientPool, SessionCompaction, SessionCore, AcpState (+47 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.40
@@ -923,8 +923,8 @@ Cohesion: 0.13
 Nodes (12): CoordinationNotificationsConfig, AnalyticsConfig, CoordinationConfig, dirs_next(), LoggingConfig, PromptsConfig, Option, PathBuf (+4 more)
 
 ### Community 181 - "Community 181"
-Cohesion: 0.08
-Nodes (42): CompactionEvent, ContextComposition, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, BeforeHookResult (+34 more)
+Cohesion: 0.09
+Nodes (35): accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult, close_orphan_tool_calls() (+27 more)
 
 ### Community 182 - "Community 182"
 Cohesion: 0.07
@@ -1112,7 +1112,7 @@ _Questions this graph is uniquely positioned to answer:_
   _High betweenness centrality (0.010) - this node is a cross-community bridge._
 - **Why does `SessionCore` connect `Community 222` to `Community 209`, `Community 195`, `Community 244`, `Community 235`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 167` to `Community 192`, `Community 0`, `Community 109`, `Community 82`, `Community 181`?**
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 82`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
 - **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `bench-tool-output.sh script` to the rest of the system?**
   _1084 weakly-connected nodes found - possible documentation gaps or missing edges._
