@@ -526,11 +526,6 @@ pub async fn run(
             tools: config.tools.clone(),
             stable_prefix_len: 0,
         };
-        let context_composition = config
-            .token_log
-            .as_ref()
-            .map(|_| crate::context_metrics::measure_context(&ctx));
-
         let ordinal = config
             .generation_ordinal
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -575,6 +570,7 @@ pub async fn run(
         }
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
         if let Some(log_cfg) = &config.token_log {
+            let context_composition = crate::context_metrics::measure_context(&ctx);
             let response_tool_calls = resp
                 .content
                 .iter()
@@ -589,9 +585,7 @@ pub async fn run(
                     ordinal,
                     stop_reason: &resp.stop_reason,
                     response_tool_calls,
-                    context: context_composition
-                        .as_ref()
-                        .expect("token logging enables context measurement"),
+                    context: &context_composition,
                 }),
             );
         }
@@ -1363,12 +1357,6 @@ impl AgentSession {
             tools: vec![],
             stable_prefix_len: 0,
         };
-        let context_composition = self
-            .config
-            .token_log
-            .as_ref()
-            .map(|_| crate::context_metrics::measure_context(&ctx));
-
         // One attempt + one retry (ADR-002 Q4); its tokens count toward the
         // session's cumulative usage like any other call. The whole loop is
         // instrumented under the compaction span so each summary
@@ -1403,6 +1391,7 @@ impl AgentSession {
                 self.total_usage =
                     accumulate_usage(std::mem::take(&mut self.total_usage), resp.usage.clone());
                 if let Some(log_cfg) = &self.config.token_log {
+                    let context_composition = crate::context_metrics::measure_context(&ctx);
                     log_token_usage(
                         log_cfg,
                         &summary_model,
@@ -1412,9 +1401,7 @@ impl AgentSession {
                             ordinal,
                             stop_reason: &resp.stop_reason,
                             response_tool_calls: 0,
-                            context: context_composition
-                                .as_ref()
-                                .expect("token logging enables context measurement"),
+                            context: &context_composition,
                         }),
                     );
                 }

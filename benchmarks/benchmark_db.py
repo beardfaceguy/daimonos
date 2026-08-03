@@ -203,7 +203,7 @@ def sync_run(connection, run_id, results_dir):
         else None
     )
     run_values = [
-        run_id,
+        str(run_dir.resolve()),
         min((summary.get("started_at") or "" for summary in summaries), default=""),
         max((summary.get("ended_at") or "" for summary in summaries), default=""),
         len(summaries),
@@ -269,6 +269,9 @@ def sync_manifest(connection, manifest_path, results_dir):
     if manifest.get("schema_version") != 1:
         raise ValueError("unsupported optimization lineage schema")
     stages = manifest.get("stages") or []
+    stage_ids = [stage["id"] for stage in stages]
+    if len(stage_ids) != len(set(stage_ids)):
+        raise ValueError("optimization lineage contains duplicate stage ids")
     inserted_stages = set()
     for stage in stages:
         if sync_stage(connection, stage):
@@ -346,7 +349,7 @@ def stage_results(connection, stage_id, task_ids):
     by_task = defaultdict(list)
     for run_id, task_id, tokens, cost, wall in rows:
         by_run[run_id].append((tokens, cost, wall))
-        by_task[task_id].append(tokens)
+        by_task[task_id].append((tokens, cost, wall))
     run_totals = []
     for values in by_run.values():
         costs = [value[1] for value in values]
@@ -400,12 +403,32 @@ def compare_stages(connection, baseline_id, candidate_id):
 
     per_task = {}
     for task_id in baseline_tasks:
-        baseline_value = mean(baseline_by_task.get(task_id, []))
-        candidate_value = mean(candidate_by_task.get(task_id, []))
+        baseline_values = baseline_by_task.get(task_id, [])
+        candidate_values = candidate_by_task.get(task_id, [])
+        baseline_value = mean([value[0] for value in baseline_values])
+        candidate_value = mean([value[0] for value in candidate_values])
+        baseline_cost = mean(
+            [value[1] for value in baseline_values if value[1] is not None]
+        )
+        candidate_cost = mean(
+            [value[1] for value in candidate_values if value[1] is not None]
+        )
+        baseline_wall = mean([value[2] for value in baseline_values])
+        candidate_wall = mean([value[2] for value in candidate_values])
         per_task[task_id] = {
             "baseline": baseline_value,
             "candidate": candidate_value,
             "delta_pct": delta(baseline_value, candidate_value),
+            "cost_usd": {
+                "baseline": baseline_cost,
+                "candidate": candidate_cost,
+                "delta_pct": delta(baseline_cost, candidate_cost),
+            },
+            "wall_ms": {
+                "baseline": baseline_wall,
+                "candidate": candidate_wall,
+                "delta_pct": delta(baseline_wall, candidate_wall),
+            },
         }
     return {
         "baseline_stage": baseline_id,
@@ -449,14 +472,20 @@ def main(argv=None):
                     json.dump(result, sys.stdout, indent=2)
                     sys.stdout.write("\n")
                 else:
+                    def formatted_delta(metric):
+                        value = result[metric]["delta_pct"]
+                        return "n/a" if value is None else f"{value:+.2f}%"
+
                     print(
                         f"{args.baseline} -> {args.candidate}: "
-                        f"tokens {result['total_tokens']['delta_pct']:+.2f}%, "
-                        f"cost {result['cost_usd']['delta_pct']:+.2f}%, "
-                        f"wall {result['wall_ms']['delta_pct']:+.2f}%"
+                        f"tokens {formatted_delta('total_tokens')}, "
+                        f"cost {formatted_delta('cost_usd')}, "
+                        f"wall {formatted_delta('wall_ms')}"
                     )
                     for task_id, values in result["per_task"].items():
-                        print(f"  {task_id}: {values['delta_pct']:+.2f}% tokens")
+                        token_delta = values["delta_pct"]
+                        rendered = "n/a" if token_delta is None else f"{token_delta:+.2f}%"
+                        print(f"  {task_id}: {rendered} tokens")
             else:
                 for row in connection.execute(
                     """

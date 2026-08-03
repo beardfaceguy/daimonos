@@ -219,7 +219,7 @@ def main(argv):
             stop_reason = ev.get("stop_reason")
             if stop_reason == "tool_use":
                 tool_loop_calls += 1
-            elif isinstance(stop_reason, str):
+            elif stop_reason in ("end_turn", "max_tokens", "refusal"):
                 final_calls += 1
             context = ev.get("context")
             if isinstance(context, dict):

@@ -127,6 +127,8 @@ def test_sync_is_idempotent_and_compare_enforces_scope(tmp_path):
     assert comparison["total_tokens"]["candidate"] == 80
     assert comparison["total_tokens"]["delta_pct"] == -20
     assert comparison["per_task"]["task"]["delta_pct"] == -20
+    assert comparison["per_task"]["task"]["cost_usd"]["delta_pct"] == -30
+    assert comparison["per_task"]["task"]["wall_ms"]["delta_pct"] == 0
 
     mismatch = subprocess.run(
         [

@@ -28,7 +28,10 @@ def load(paths):
 def aggregate(summaries):
     calls = sum(summary.get("llm_calls") or 0 for summary in summaries)
     prompt_tokens = sum(summary.get("prompt_tokens") or 0 for summary in summaries)
-    fresh_input = sum(summary.get("input") or 0 for summary in summaries)
+    fresh_input = sum(
+        summary.get("fresh_input_tokens", summary.get("input")) or 0
+        for summary in summaries
+    )
     cache_write = sum(summary.get("cache_write") or 0 for summary in summaries)
     cache_read = sum(summary.get("cache_read") or 0 for summary in summaries)
     output = sum(summary.get("output") or 0 for summary in summaries)
@@ -130,6 +133,8 @@ def main(argv=None):
 
     baseline = aggregate(baseline_summaries)
     candidate = aggregate(candidate_summaries)
+    if not baseline["calls"] or not candidate["calls"]:
+        parser.error("both arms need at least one LLM call")
     result = {
         "baseline": baseline,
         "candidate": candidate,
