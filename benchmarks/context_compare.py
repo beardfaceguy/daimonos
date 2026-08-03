@@ -27,7 +27,16 @@ def load(paths):
 
 def aggregate(summaries):
     calls = sum(summary.get("llm_calls") or 0 for summary in summaries)
-    prompt_tokens = sum(summary.get("prompt_tokens") or 0 for summary in summaries)
+    prompt_tokens = sum(
+        summary.get("prompt_tokens")
+        if isinstance(summary.get("prompt_tokens"), (int, float))
+        else (
+            (summary.get("fresh_input_tokens", summary.get("input")) or 0)
+            + (summary.get("cache_write") or 0)
+            + (summary.get("cache_read") or 0)
+        )
+        for summary in summaries
+    )
     fresh_input = sum(
         summary.get("fresh_input_tokens", summary.get("input")) or 0
         for summary in summaries

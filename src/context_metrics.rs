@@ -18,6 +18,7 @@ pub struct ContextComposition {
     pub tool_call_argument_bytes: usize,
     pub tool_result_ok_bytes: usize,
     pub tool_result_error_bytes: usize,
+    /// Base64-encoded payload bytes, matching what the provider request carries.
     pub image_bytes: usize,
     pub image_count: usize,
     /// Sum of neutral content categories only; excludes provider wire framing.

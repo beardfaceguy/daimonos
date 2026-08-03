@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-08-02)
 
 ## Corpus Check
-- 210 files · ~275,080 words
+- 210 files · ~275,116 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5408 nodes · 12655 edges · 227 communities (211 shown, 16 thin omitted)
+- 5408 nodes · 12655 edges · 226 communities (210 shown, 16 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 36 edges (avg confidence: 0.76)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `abc82905`
+- Built from commit: `327ac79a`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -221,7 +221,6 @@
 - [[_COMMUNITY_Community 212|Community 212]]
 - [[_COMMUNITY_Community 213|Community 213]]
 - [[_COMMUNITY_Community 214|Community 214]]
-- [[_COMMUNITY_Community 215|Community 215]]
 - [[_COMMUNITY_Community 216|Community 216]]
 - [[_COMMUNITY_Community 217|Community 217]]
 - [[_COMMUNITY_Community 218|Community 218]]
@@ -280,7 +279,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (227 total, 16 thin omitted)
+## Communities (226 total, 16 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.18
@@ -875,8 +874,8 @@ Cohesion: 0.40
 Nodes (4): Agent coordination, Execution plans, Keep the context lean (offload large data), Tool efficiency rules
 
 ### Community 167 - "Community 167"
-Cohesion: 0.13
-Nodes (22): CompactionEvent, ContextComposition, AgentResult, compaction_log_line(), GenerationLogMetadata, last_assistant_text(), log_compaction_event(), log_token_usage() (+14 more)
+Cohesion: 0.09
+Nodes (27): CompactionEvent, ContextComposition, AgentResult, compaction_log_line(), GenerationLogMetadata, is_user_turn_message(), last_assistant_text(), log_compaction_event() (+19 more)
 
 ### Community 168 - "Community 168"
 Cohesion: 0.09
@@ -1046,10 +1045,6 @@ Nodes (15): RequestGuard, ActivityTracker, liveness_snapshot_never_reports_a_sta
 Cohesion: 0.29
 Nodes (6): MockScriptToolPlugin, HashMap, Path, ToolDescriptor, ToolPlugin, ToolResult
 
-### Community 215 - "Community 215"
-Cohesion: 0.22
-Nodes (5): is_user_turn_message(), Into, Result, session_set_model_changes_model_sent_on_next_prompt(), truncate_removes_selected_user_turn_and_everything_after()
-
 ### Community 216 - "Community 216"
 Cohesion: 0.28
 Nodes (17): apply_reroot_repoints_workspace_cwd_and_index(), dispatch_local_tool_declines_foreign_names_without_touching_session(), dispatch_tool_bounds_large_text_results_and_offloads_full_content(), dispatch_tool_inner(), dispatch_tool_inner_stashes_meta_on_session(), dispatch_tool_threads_meta_through_session_and_resets_after(), extract_result_text(), mcp_output_boundary_preserves_non_text_blocks_and_error_status() (+9 more)
@@ -1116,7 +1111,7 @@ _Questions this graph is uniquely positioned to answer:_
   _High betweenness centrality (0.010) - this node is a cross-community bridge._
 - **Why does `SessionCore` connect `Community 222` to `Community 209`, `Community 195`, `Community 244`, `Community 235`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 82`, `Community 215`?**
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 167`, `Community 109`, `Community 82`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
 - **What connects `Yield per-task summary dicts from run dirs, optionally filtered by tag.`, `Counts toward aggregates unless it errored or its checks failed.`, `bench-tool-output.sh script` to the rest of the system?**
   _1084 weakly-connected nodes found - possible documentation gaps or missing edges._

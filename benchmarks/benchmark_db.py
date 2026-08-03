@@ -203,6 +203,7 @@ def sync_run(connection, run_id, results_dir):
         else None
     )
     run_values = [
+        str(run_dir.resolve()),
         min((summary.get("started_at") or "" for summary in summaries), default=""),
         max((summary.get("ended_at") or "" for summary in summaries), default=""),
         len(summaries),
@@ -217,7 +218,7 @@ def sync_run(connection, run_id, results_dir):
         sum(numeric(summary, "wall_ms") for summary in summaries),
         sum(summary.get("correct") is True for summary in summaries),
     ]
-    inserted = connection.execute(
+    connection.execute(
         """
         INSERT OR IGNORE INTO benchmark_runs
             (id, run_dir, started_at, ended_at, task_count, total_tokens,
@@ -226,13 +227,14 @@ def sync_run(connection, run_id, results_dir):
              correct_tasks)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [run_id, str(run_dir.resolve()), *run_values],
+        [run_id, *run_values],
     )
     stored = connection.execute(
         """
-        SELECT started_at, ended_at, task_count, total_tokens, prompt_tokens,
-               fresh_input_tokens, cache_write_tokens, cache_read_tokens,
-               output_tokens, llm_calls, cost_usd, wall_ms, correct_tasks
+        SELECT run_dir, started_at, ended_at, task_count, total_tokens,
+               prompt_tokens, fresh_input_tokens, cache_write_tokens,
+               cache_read_tokens, output_tokens, llm_calls, cost_usd, wall_ms,
+               correct_tasks
         FROM benchmark_runs
         WHERE id = ?
         """,
@@ -240,11 +242,6 @@ def sync_run(connection, run_id, results_dir):
     ).fetchone()
     if list(stored) != run_values:
         raise ValueError(f"run {run_id} is immutable and differs from the database")
-    if not inserted.rowcount:
-        connection.execute(
-            "UPDATE benchmark_runs SET run_dir = ? WHERE id = ?",
-            (str(run_dir.resolve()), run_id),
-        )
     for summary in summaries:
         raw_json = json.dumps(summary, separators=(",", ":"), sort_keys=True)
         connection.execute(
@@ -441,7 +438,16 @@ def compare_stages(connection, baseline_id, candidate_id):
         connection, candidate_id, candidate_tasks
     )
     if not baseline_runs or not candidate_runs:
-        raise ValueError("both stages need imported raw runs")
+        missing = []
+        if not baseline_runs:
+            missing.append(baseline_id)
+        if not candidate_runs:
+            missing.append(candidate_id)
+        raise ValueError(
+            "stage(s) have no imported raw runs: "
+            + ", ".join(missing)
+            + "; inspect stage_metrics directly for aggregate-only stages"
+        )
 
     def metric(index):
         baseline_values = [run[index] for run in baseline_runs if run[index] is not None]
