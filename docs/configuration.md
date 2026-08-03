@@ -134,33 +134,32 @@ DAIMONOS_AGENT_PROMPT_CACHE=on
 
 ### `[index]` — Workspace Indexing
 
-Daimonos builds a trigram index of your workspace in the background for fast
-search. These settings control what gets indexed.
+Daimonos indexes relative file paths for `search` with `mode = "files"`.
+Content search remains a direct filesystem grep and does not use this index.
+Construction is O(1); population follows the configured rollout mode.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `mode` | `"hybrid"` | `eager` always warms long-lived sessions, `lazy` waits for file search, and `hybrid` heuristically warms small or marked projects |
 | `max_depth` | `20` | Maximum directory traversal depth |
-| `max_file_size` | `1000000` (1 MB) | Skip files larger than this (bytes) |
-| `binary_sniff_bytes` | `512` | Bytes to check for null bytes when detecting binary files |
 | `skip_extensions` | *(see below)* | File extensions to skip (known binary formats) |
-| `max_files` | `50000` | Hard cap on indexed files; the walk stops at this count. Also the preflight budget for `guard_overbroad_roots`. `0` disables the cap |
+| `max_files` | `50000` | Hard cap on indexed paths and cold-search traversal. `0` uses an internal 50,000-file safety cap |
 | `guard_overbroad_roots` | `true` | Gate eager indexing on a signal: a root larger than the preflight budget is indexed only if it has a `project_markers` entry |
 | `project_markers` | `.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, `pom.xml`, `build.gradle`, `CMakeLists.txt`, `Makefile` | Filenames marking a root as a real project for the gate |
 
-`guard_overbroad_roots` replaces a brittle path blocklist with a property
-check. daimonos runs a bounded preflight walk of the root:
+Hybrid mode uses `guard_overbroad_roots` as a bounded warm-start heuristic:
 
 - **Within `max_files`** (small) -> index it, whatever it is.
-- **Larger than `max_files`** -> index it only if a `project_markers` entry
-  is present at the root; otherwise serve with an **empty index**.
+- **Larger than `max_files`** -> warm only if a `project_markers` entry is
+  present at the root.
 
 This stops daimonos from crawling an over-broad directory it inherited as cwd
 (commonly `$HOME` — an editor window with no project open — but equally a NAS
 mount or a downloads dir), which has been observed to balloon a single
-instance to ~1.3 GB RSS and exhaust the inotify watch cap. The filesystem
-root (`/`) is always skipped. File, exec, and read tools still work on a gated
-root; supplying an explicit `-w` or completing an MCP `roots` handshake
-re-roots the session to a real project and indexes it normally.
+instance to ~1.3 GB RSS. A skipped warmup is not an empty-search failure:
+the first file search performs a bounded population and reports `partial`
+coverage when it reaches the cap. After population, a watcher marks the warm
+index dirty so the next search refreshes external changes.
 
 The default `skip_extensions` list covers images, audio, video, archives,
 compiled objects, fonts, databases, and office documents. Directories named
@@ -168,9 +167,8 @@ compiled objects, fonts, databases, and office documents. Directories named
 
 ```toml
 [index]
+mode = "hybrid"
 max_depth = 20
-max_file_size = 1_000_000
-binary_sniff_bytes = 512
 skip_extensions = [
   "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg",
   "mp3", "mp4", "avi", "mov", "mkv", "flac", "wav", "ogg", "webm",
@@ -651,13 +649,13 @@ These are not part of the config file but affect daimonos behavior:
 
 ## Performance Tuning Tips
 
-**Large monorepos**: increase `max_depth` and `max_file_size` if important
-files are deeply nested or large. Consider adding project-specific binary
-extensions to `skip_extensions`.
+**Large monorepos**: increase `max_depth` or `max_files` if important paths
+fall outside reported coverage. Add project-specific generated/binary
+extensions to `skip_extensions` to spend the path budget on useful files.
 
-**Slow indexing**: the index builds incrementally after the first full scan.
-If the initial scan is slow, check that `skip_extensions` covers your binary
-artifacts.
+**Slow first file search**: use `mode = "hybrid"` or `"eager"` to warm
+long-lived sessions, or narrow `path` and `glob` filters. Later searches reuse
+the warm path index until its watcher reports a filesystem change.
 
 **Truncated exec output**: if you're losing important build output, increase
 `exec_output_max_chars`. The default of 100 KB covers most cases.

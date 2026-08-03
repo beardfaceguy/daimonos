@@ -182,6 +182,8 @@ pub fn all_tools() -> Vec<ToolDef> {
                     Ok(Request::Single(Op {
                         c: protocol::op::FIND,
                         p: get_str(args, "pattern"),
+                        q: get_str(args, "path"),
+                        g: get_str(args, "glob"),
                         n: get_i64(args, "max_results"),
                         ..Default::default()
                     }))

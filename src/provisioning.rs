@@ -31,13 +31,11 @@ pub struct ToolServices {
 
 /// Build the full service set for a workspace.
 ///
-/// `eager_index` controls the workspace-index warmup: long-lived servers
-/// (MCP, ACP) pass `true` to spawn the background reindex up front; a one-shot
-/// `daimonos agent` run passes `false` so it doesn't pay for a background
-/// walk it may never use (search still works on demand). The overbroad-root
-/// guard ([`index::should_eager_index`], a project-signal criterion, not a
-/// path blocklist) is always honored, so a reindex is only spawned when the
-/// root looks like a real project AND `eager_index` is set.
+/// `eager_index` identifies long-lived frontends that may warm in the
+/// background. The configured index mode then decides whether they do:
+/// `eager` always warms, `lazy` never does, and `hybrid` uses the bounded
+/// project-signal heuristic. One-shot agent runs stay cold in every mode;
+/// file search populates the index on demand.
 ///
 /// `background_work` gates the pipeline-cache config watcher the same way.
 pub async fn build_tool_services(
@@ -55,7 +53,7 @@ pub async fn build_tool_services(
         &cfg.index,
         !quiet_stderr,
     ));
-    let background_work = eager_index && index::should_eager_index(workspace, &cfg.index);
+    let background_work = index::should_warm_index(workspace, &cfg.index, eager_index);
     if background_work {
         index.spawn_reindex();
     }

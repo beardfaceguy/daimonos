@@ -9,6 +9,7 @@ mod tool_ops;
 
 use crate::protocol::{self, Op, Request, Response};
 use crate::session::Session;
+pub(crate) use file_ops::SKIP_INDEX_OBSERVATION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecProgress {
@@ -103,8 +104,16 @@ async fn find(session: &Session, op: &Op) -> Response {
         Some(i) => i,
         None => return Response::err(4, "index not available"),
     };
+    let file_glob = match op.g.as_deref().map(glob::Pattern::new) {
+        Some(Ok(pattern)) => Some(pattern),
+        Some(Err(error)) => return Response::err(3, &format!("invalid glob: {error}")),
+        None => None,
+    };
 
-    let results = idx.search(&query, max).await;
+    idx.ensure_populated().await;
+    let results = idx
+        .search_scoped(&query, max, op.q.as_deref(), file_glob.as_ref())
+        .await;
     let stats = idx.stats().await;
 
     Response::ok(serde_json::json!({

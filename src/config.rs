@@ -67,19 +67,25 @@ pub struct ToolConfig {
     pub manifest: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMode {
+    Eager,
+    Lazy,
+    #[default]
+    Hybrid,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
+    pub mode: IndexMode,
     pub max_depth: usize,
-    pub max_file_size: usize,
-    pub binary_sniff_bytes: usize,
     pub skip_extensions: Vec<String>,
-    /// Hard cap on the number of files the trigram index will hold. The
+    /// Hard cap on the number of paths the trigram index will hold. The
     /// walk stops once this many files have been collected. Bounds index
-    /// RSS on legitimately huge monorepos. Also doubles as the budget for
-    /// the over-broad-root preflight (see `guard_overbroad_roots`). 0
-    /// disables the cap (an internal default budget is used for the
-    /// preflight in that case).
+    /// RSS on legitimately huge monorepos and bounds cold search. Also doubles
+    /// as the over-broad-root preflight budget. 0 uses an internal safety cap.
     pub max_files: usize,
     /// When true (default), gate eager indexing on a signal rather than a
     /// path blocklist: a root larger than the `max_files` preflight budget
@@ -88,9 +94,8 @@ pub struct IndexConfig {
     /// crawling gigabytes of an over-broad root — `$HOME`, a NAS mount, a
     /// downloads dir — that an editor inherited as cwd (a single such
     /// instance was observed at ~1.3 GB RSS). A gated root gets an empty
-    /// index; file/exec tools still work, and an explicit `-w` or an MCP
-    /// `roots` handshake re-roots to a real project and indexes normally.
-    /// Small roots (within budget) are always indexed regardless of markers.
+    /// cold index in hybrid mode; file search populates it on demand under the
+    /// same cap. Small roots are warmed regardless of markers.
     pub guard_overbroad_roots: bool,
     /// Filenames whose presence at the workspace root marks it as a "real
     /// project" worth eagerly indexing even when it exceeds the preflight
@@ -929,9 +934,8 @@ impl AnalyticsConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
+            mode: IndexMode::Hybrid,
             max_depth: 20,
-            max_file_size: 1_000_000,
-            binary_sniff_bytes: 512,
             skip_extensions: default_skip_extensions(),
             max_files: 50_000,
             guard_overbroad_roots: true,
@@ -1258,7 +1262,7 @@ mod tests {
     fn default_config_values() {
         let cfg = Config::default();
         assert_eq!(cfg.index.max_depth, 20);
-        assert_eq!(cfg.index.max_file_size, 1_000_000);
+        assert_eq!(cfg.index.mode, IndexMode::Hybrid);
         assert_eq!(cfg.search.default_grep_max, 100);
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.acp.session_list_page_size, 50);
@@ -1307,6 +1311,7 @@ mod tests {
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.index.mode, IndexMode::Hybrid);
         assert_eq!(cfg.tool_output.max_bytes, 50 * 1024);
         assert_eq!(cfg.tool_output.max_lines, 2_000);
         assert_eq!(cfg.tool_output.retention_days, 7);

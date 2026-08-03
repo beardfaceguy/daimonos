@@ -1,7 +1,8 @@
-use crate::config::IndexConfig;
+use crate::config::{IndexConfig, IndexMode};
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -9,11 +10,14 @@ use tokio::sync::RwLock;
 /// A trigram is a 3-byte sequence used for fast substring search.
 type Trigram = [u8; 3];
 
-/// Background workspace indexer.
-/// Builds a trigram index over all text files for sub-millisecond search.
+/// Lazy workspace path index with optional background warming.
+/// Builds trigrams from relative filenames and paths, never file contents.
 pub struct WorkspaceIndex {
     root: PathBuf,
     inner: Arc<RwLock<IndexState>>,
+    indexed: Arc<tokio::sync::Notify>,
+    dirty: Arc<AtomicBool>,
+    watcher: Arc<std::sync::Mutex<Option<notify::RecommendedWatcher>>>,
     /// Serializes concurrent reindexes. Without this, two overlapping
     /// `spawn_reindex` calls each take a `blocking_read` snapshot, walk
     /// the tree, and then race on the final `blocking_write` — and
@@ -24,15 +28,10 @@ pub struct WorkspaceIndex {
     /// order, each observing the result of its predecessor."
     reindex_lock: Arc<std::sync::Mutex<()>>,
     max_depth: usize,
-    max_file_size: usize,
-    binary_sniff_bytes: usize,
     skip_extensions: HashSet<String>,
     /// Hard cap on indexed files (0 = unbounded). See `IndexConfig::max_files`.
     max_files: usize,
-    /// When true, the configured root is "over-broad" (home/system dir) and
-    /// auto-indexing is suppressed — `spawn_reindex` no-ops, leaving an empty
-    /// index. Computed once at construction from `is_overbroad_root`.
-    guard: bool,
+    mode: IndexMode,
     /// When true, print one-line indexer stats to stderr after each reindex.
     /// Disabled in MCP quiet mode so hosts like Cursor don't surface benign
     /// lines as `[error]` (they classify all subprocess stderr as errors).
@@ -40,7 +39,7 @@ pub struct WorkspaceIndex {
 }
 
 struct IndexState {
-    /// Trigram -> set of file IDs that contain it
+    /// Path trigram -> set of file IDs that contain it
     trigrams: HashMap<Trigram, Vec<u32>>,
     /// File ID -> relative path
     files: Vec<String>,
@@ -52,6 +51,8 @@ struct IndexState {
     file_count: usize,
     /// Time of last index operation
     last_indexed: Option<Instant>,
+    coverage: IndexCoverage,
+    capped: bool,
 }
 
 impl IndexState {
@@ -63,8 +64,19 @@ impl IndexState {
             path_to_id: HashMap::new(),
             file_count: 0,
             last_indexed: None,
+            coverage: IndexCoverage::Cold,
+            capped: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexCoverage {
+    Cold,
+    Building,
+    Complete,
+    Partial,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -72,6 +84,9 @@ pub struct IndexStats {
     pub files: usize,
     pub trigrams: usize,
     pub age_ms: Option<u64>,
+    pub mode: IndexMode,
+    pub coverage: IndexCoverage,
+    pub capped: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -82,62 +97,74 @@ pub struct SearchResult {
 
 impl WorkspaceIndex {
     pub fn new(root: PathBuf, cfg: &IndexConfig, log_progress: bool) -> Self {
-        let guard = !should_eager_index(&root, cfg);
         Self {
             root,
             inner: Arc::new(RwLock::new(IndexState::new())),
+            indexed: Arc::new(tokio::sync::Notify::new()),
+            dirty: Arc::new(AtomicBool::new(false)),
+            watcher: Arc::new(std::sync::Mutex::new(None)),
             reindex_lock: Arc::new(std::sync::Mutex::new(())),
             max_depth: cfg.max_depth,
-            max_file_size: cfg.max_file_size,
-            binary_sniff_bytes: cfg.binary_sniff_bytes,
             skip_extensions: cfg.skip_set(),
             max_files: cfg.max_files,
-            guard,
+            mode: cfg.mode,
             log_progress,
         }
     }
 
     /// Rebuild the index in the background.
     /// On first call, does a full build. On subsequent calls, performs an
-    /// incremental update: skips files whose mtime hasn't changed, removes
-    /// deleted files, and only re-extracts trigrams for new/modified files.
+    /// incremental update: skips unchanged paths, removes deleted files, and
+    /// extracts relative-path trigrams for new or renamed files.
     pub fn spawn_reindex(&self) {
+        drop(self.spawn_reindex_task(false));
+    }
+
+    pub async fn ensure_populated(&self) -> IndexStats {
+        loop {
+            let notified = self.indexed.notified();
+            let coverage = { self.inner.read().await.coverage };
+            match coverage {
+                IndexCoverage::Cold => {
+                    if self.spawn_reindex_task(true).await.is_err() {
+                        let mut state = self.inner.write().await;
+                        state.coverage = IndexCoverage::Cold;
+                    }
+                    return self.stats().await;
+                }
+                IndexCoverage::Building => notified.await,
+                IndexCoverage::Complete | IndexCoverage::Partial => {
+                    if self.dirty.swap(false, Ordering::AcqRel) {
+                        let _ = self.spawn_reindex_task(false).await;
+                    }
+                    return self.stats().await;
+                }
+            }
+        }
+    }
+
+    fn spawn_reindex_task(&self, cold_only: bool) -> tokio::task::JoinHandle<()> {
         tracing::debug!(
             target: "daimonos::index",
             event = "index_requested",
             root = %self.root.display(),
-            guarded = self.guard,
+            mode = ?self.mode,
+            cold_only,
         );
-        // Over-broad roots are never auto-indexed: a large directory with no
-        // project marker (e.g. $HOME inherited as cwd) would build a
-        // multi-gigabyte trigram index over unrelated files. Leave the index
-        // empty; an explicit -w or an MCP roots re-root replaces this index
-        // with one on a real project.
-        if self.guard {
-            tracing::info!(
-                target: "daimonos::index",
-                event = "index_skipped_overbroad_root",
-                root = %self.root.display(),
-                max_files = self.max_files,
-            );
-            if self.log_progress {
-                eprintln!(
-                    "index: skipping auto-index of over-broad root {:?} (exceeds max_files \
-                     and has no project marker); set -w or use MCP roots to index a real project",
-                    self.root
-                );
-            }
-            return;
-        }
 
         let root = self.root.clone();
         let inner = Arc::clone(&self.inner);
+        let indexed = Arc::clone(&self.indexed);
+        let dirty = Arc::clone(&self.dirty);
+        let watcher = Arc::clone(&self.watcher);
         let reindex_lock = Arc::clone(&self.reindex_lock);
         let max_depth = self.max_depth;
-        let max_file_size = self.max_file_size;
-        let binary_sniff_bytes = self.binary_sniff_bytes;
         let skip_ext = self.skip_extensions.clone();
-        let max_files = self.max_files;
+        let max_files = if self.max_files == 0 {
+            DEFAULT_EAGER_PROBE
+        } else {
+            self.max_files
+        };
         let log_progress = self.log_progress;
 
         tokio::task::spawn_blocking(move || {
@@ -146,6 +173,11 @@ impl WorkspaceIndex {
             // wedge subsequent reindexes — we just continue with the next
             // one and let it rebuild the state.
             let _lock = reindex_lock.lock().unwrap_or_else(|p| p.into_inner());
+            if cold_only && inner.blocking_read().coverage != IndexCoverage::Cold {
+                return;
+            }
+            inner.blocking_write().coverage = IndexCoverage::Building;
+            dirty.store(false, Ordering::Release);
             let start = Instant::now();
             tracing::info!(
                 target: "daimonos::index",
@@ -190,14 +222,22 @@ impl WorkspaceIndex {
                 .build();
 
             let mut capped = false;
-            for entry in walker.flatten() {
-                if max_files != 0 && current_files.len() >= max_files {
-                    capped = true;
-                    break;
-                }
+            let mut walk_failed = false;
+            for entry in walker {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        walk_failed = true;
+                        continue;
+                    }
+                };
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
+                }
+                if current_files.len() >= max_files {
+                    capped = true;
+                    break;
                 }
 
                 let ext = path
@@ -333,19 +373,11 @@ impl WorkspaceIndex {
             // file_ids are assigned here, AFTER id_remap, so they cannot
             // collide with any old_id that was used as a remap source.
             for (rel, mtime, _) in &to_extract {
-                let path = root.join(rel);
-                let content = match std::fs::read(&path) {
-                    Ok(c) if c.len() <= max_file_size => c,
-                    _ => continue,
-                };
-                if content.iter().take(binary_sniff_bytes).any(|&b| b == 0) {
-                    continue;
-                }
                 let file_id = new_files.len() as u32;
                 new_files.push(rel.clone());
                 new_mtimes.push(*mtime);
                 new_path_to_id.insert(rel.clone(), file_id);
-                extract_trigrams(&content, file_id, &mut trigrams);
+                extract_trigrams(rel.as_bytes(), file_id, &mut trigrams);
             }
 
             // Clean up any empty trigram entries
@@ -361,6 +393,12 @@ impl WorkspaceIndex {
                 path_to_id: new_path_to_id,
                 file_count,
                 last_indexed: Some(start),
+                coverage: if capped || walk_failed {
+                    IndexCoverage::Partial
+                } else {
+                    IndexCoverage::Complete
+                },
+                capped,
             };
 
             // Same rationale as the snapshot read above: stay on the
@@ -369,6 +407,8 @@ impl WorkspaceIndex {
                 let mut guard = inner.blocking_write();
                 *guard = state;
             }
+            start_watcher(&root, &watcher, &dirty);
+            indexed.notify_waiters();
 
             tracing::info!(
                 target: "daimonos::index",
@@ -403,17 +443,110 @@ impl WorkspaceIndex {
                     );
                 }
             }
-        });
+        })
     }
 
-    /// Search the trigram index for files likely containing the query.
-    pub async fn search(&self, query: &str, max: usize) -> Vec<SearchResult> {
-        let query_trigrams = query_to_trigrams(query.as_bytes());
-        if query_trigrams.is_empty() {
-            return Vec::new();
+    fn relative_index_path(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        if relative.components().count() > self.max_depth
+            || relative.components().any(|component| match component {
+                Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => true,
+                Component::CurDir => false,
+            })
+        {
+            return None;
         }
+        let extension = relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if self.skip_extensions.contains(&extension) {
+            return None;
+        }
+        Some(relative.to_string_lossy().to_string())
+    }
 
+    pub async fn observe_path(&self, path: &Path) -> bool {
+        self.observe_paths(std::iter::once(path.to_path_buf()))
+            .await
+            == 1
+    }
+
+    pub async fn observe_paths(&self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
+        let mut relative_paths = Vec::new();
+        for path in paths {
+            if path.is_file() {
+                if let Some(relative) = self.relative_index_path(&path) {
+                    relative_paths.push(relative);
+                }
+            }
+        }
+        relative_paths.sort_unstable();
+        relative_paths.dedup();
+        if relative_paths.is_empty() {
+            return 0;
+        }
+        let mut state = self.inner.write().await;
+        let max_files = if self.max_files == 0 {
+            DEFAULT_EAGER_PROBE
+        } else {
+            self.max_files
+        };
+        let mut added = 0usize;
+        for relative in relative_paths {
+            if state.path_to_id.contains_key(&relative) {
+                continue;
+            }
+            if state.files.len() >= max_files {
+                state.coverage = IndexCoverage::Partial;
+                state.capped = true;
+                break;
+            }
+            let file_id = state.files.len() as u32;
+            state.files.push(relative.clone());
+            state.mtimes.push(0);
+            state.path_to_id.insert(relative.clone(), file_id);
+            extract_trigrams(relative.as_bytes(), file_id, &mut state.trigrams);
+            added += 1;
+        }
+        if added > 0 {
+            state.file_count = state.files.len();
+            state.last_indexed = Some(Instant::now());
+        }
+        added
+    }
+
+    /// Search the trigram index for relative paths likely matching the query.
+    #[cfg(test)]
+    pub async fn search(&self, query: &str, max: usize) -> Vec<SearchResult> {
+        self.search_scoped(query, max, None, None).await
+    }
+
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        max: usize,
+        scope: Option<&str>,
+        file_glob: Option<&glob::Pattern>,
+    ) -> Vec<SearchResult> {
+        let query_trigrams = query_to_trigrams(query.as_bytes());
         let guard = self.inner.read().await;
+        if query_trigrams.is_empty() {
+            let mut results: Vec<SearchResult> = guard
+                .files
+                .iter()
+                .filter(|file| file.contains(query) && path_matches_filters(file, scope, file_glob))
+                .map(|file| SearchResult {
+                    file: file.clone(),
+                    score: 1,
+                })
+                .collect();
+            results.sort_by(|left, right| left.file.cmp(&right.file));
+            results.truncate(max);
+            return results;
+        }
 
         let mut scores: HashMap<u32, u32> = HashMap::new();
         for tri in &query_trigrams {
@@ -433,9 +566,15 @@ impl WorkspaceIndex {
                 file: guard.files.get(fid as usize).cloned().unwrap_or_default(),
                 score,
             })
+            .filter(|result| path_matches_filters(&result.file, scope, file_glob))
             .collect();
 
-        results.sort_by_key(|r| std::cmp::Reverse(r.score));
+        results.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.file.cmp(&right.file))
+        });
         results.truncate(max);
         results
     }
@@ -446,13 +585,93 @@ impl WorkspaceIndex {
             files: guard.file_count,
             trigrams: guard.trigrams.len(),
             age_ms: guard.last_indexed.map(|t| t.elapsed().as_millis() as u64),
+            mode: self.mode,
+            coverage: guard.coverage,
+            capped: guard.capped,
         }
+    }
+}
+
+fn path_matches_filters(
+    file: &str,
+    scope: Option<&str>,
+    file_glob: Option<&glob::Pattern>,
+) -> bool {
+    let in_scope = scope
+        .map(|scope| scope.trim_matches('/'))
+        .map(|scope| scope.strip_prefix("./").unwrap_or(scope))
+        .filter(|scope| !scope.is_empty() && *scope != ".")
+        .map(|scope| file == scope || file.starts_with(&format!("{scope}/")))
+        .unwrap_or(true);
+    let matches_glob = file_glob
+        .map(|pattern| {
+            Path::new(file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| pattern.matches(name))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true);
+    in_scope && matches_glob
+}
+
+fn start_watcher(
+    root: &Path,
+    slot: &std::sync::Mutex<Option<notify::RecommendedWatcher>>,
+    dirty: &Arc<AtomicBool>,
+) {
+    use notify::Watcher;
+
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return;
+    }
+    let callback_dirty = Arc::clone(dirty);
+    let watcher =
+        notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+            if matches!(
+                event.map(|event| event.kind),
+                Ok(notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_)
+                    | notify::EventKind::Remove(_))
+            ) {
+                callback_dirty.store(true, Ordering::Release);
+            }
+        });
+    match watcher {
+        Ok(mut watcher) => {
+            if let Err(error) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+                tracing::warn!(
+                    target: "daimonos::index",
+                    event = "index_watcher_failed",
+                    root = %root.display(),
+                    error = %error,
+                );
+                return;
+            }
+            *guard = Some(watcher);
+        }
+        Err(error) => tracing::warn!(
+            target: "daimonos::index",
+            event = "index_watcher_failed",
+            root = %root.display(),
+            error = %error,
+        ),
     }
 }
 
 /// Internal preflight budget used when `max_files` is 0 (cap disabled) so the
 /// over-broad-root probe still has a bound to early-exit against.
 const DEFAULT_EAGER_PROBE: usize = 50_000;
+
+pub fn should_warm_index(root: &Path, cfg: &IndexConfig, long_lived: bool) -> bool {
+    long_lived
+        && match cfg.mode {
+            IndexMode::Eager => true,
+            IndexMode::Lazy => false,
+            IndexMode::Hybrid => should_eager_index(root, cfg),
+        }
+}
 
 /// Decide whether to eagerly crawl `root` and build a full index, based on a
 /// signal rather than a path blocklist (vikunja #47). The rules:
@@ -610,7 +829,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stats = idx.stats().await;
         assert_eq!(stats.files, 1, "multi-thread reindex did not complete");
-        let hits = idx.search("alpha_marker", 10).await;
+        let hits = idx.search("a.rs", 10).await;
         assert!(!hits.is_empty(), "search after multi-thread reindex empty");
     }
 
@@ -624,7 +843,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stats = idx.stats().await;
         assert_eq!(stats.files, 1, "current-thread reindex did not complete");
-        let hits = idx.search("beta_marker", 10).await;
+        let hits = idx.search("a.rs", 10).await;
         assert!(
             !hits.is_empty(),
             "search after current-thread reindex empty"
@@ -648,13 +867,13 @@ mod tests {
         let stats = idx.stats().await;
         assert!(stats.files >= 3, "expected >= 3 files, got {}", stats.files);
 
-        let results = idx.search("alpha_function", 10).await;
-        assert!(!results.is_empty(), "expected to find alpha_function");
+        let results = idx.search("alpha.rs", 10).await;
+        assert!(!results.is_empty(), "expected to find alpha.rs");
         assert!(results[0].file.contains("alpha"));
     }
 
     #[tokio::test]
-    async fn index_skips_binary_files() {
+    async fn path_index_does_not_read_binary_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut binary = vec![0u8; 100];
         binary[0] = 0;
@@ -667,7 +886,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let stats = idx.stats().await;
-        assert_eq!(stats.files, 1, "binary file should be skipped");
+        assert_eq!(
+            stats.files, 2,
+            "path indexing should not inspect file contents"
+        );
+        assert!(!idx.search("bin.dat", 10).await.is_empty());
     }
 
     #[tokio::test]
@@ -675,8 +898,89 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = IndexConfig::default();
         let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
+        let stats = idx.stats().await;
+        assert_eq!(stats.mode, crate::config::IndexMode::Hybrid);
+        assert_eq!(stats.coverage, IndexCoverage::Cold);
         let results = idx.search("anything", 10).await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_population_indexes_paths_not_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("needle_name.rs"), "unrelated").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "needle_name").unwrap();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &IndexConfig::default(), false);
+
+        let stats = idx.ensure_populated().await;
+        let results = idx.search("needle_name", 10).await;
+
+        assert_eq!(stats.coverage, IndexCoverage::Complete);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["needle_name.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_path_is_searchable_before_full_population() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newly_touched.rs");
+        std::fs::write(&path, "content").unwrap();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &IndexConfig::default(), false);
+
+        assert!(idx.observe_path(&path).await);
+        let results = idx.search("newly_touched", 10).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file, "newly_touched.rs");
+        assert_eq!(idx.stats().await.coverage, IndexCoverage::Cold);
+    }
+
+    #[tokio::test]
+    async fn path_search_honors_scope_and_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("root_match.rs"), "content").unwrap();
+        std::fs::write(dir.path().join("src/scoped_match.rs"), "content").unwrap();
+        std::fs::write(dir.path().join("src/scoped_match.txt"), "content").unwrap();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &IndexConfig::default(), false);
+        idx.ensure_populated().await;
+        let file_glob = glob::Pattern::new("*.rs").unwrap();
+
+        let results = idx
+            .search_scoped("match", 10, Some("src"), Some(&file_glob))
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file, "src/scoped_match.rs");
+    }
+
+    #[tokio::test]
+    async fn warm_index_revalidates_after_external_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("externally_deleted.rs");
+        std::fs::write(&path, "content").unwrap();
+        let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &IndexConfig::default(), false);
+        idx.ensure_populated().await;
+        assert!(!idx.search("externally_deleted", 10).await.is_empty());
+
+        std::fs::remove_file(path).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            idx.ensure_populated().await;
+            if idx.search("externally_deleted", 10).await.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher did not refresh warm index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     // --- Over-broad root gate tests (vikunja #47) ---
@@ -757,9 +1061,26 @@ mod tests {
         assert!(should_eager_index(dir.path(), &cfg));
     }
 
+    #[test]
+    fn warm_policy_respects_explicit_modes_and_frontend_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_n_files(dir.path(), 8);
+        let mut cfg = IndexConfig {
+            max_files: 3,
+            ..Default::default()
+        };
+
+        assert!(!should_warm_index(dir.path(), &cfg, true));
+        cfg.mode = IndexMode::Lazy;
+        assert!(!should_warm_index(dir.path(), &cfg, true));
+        cfg.mode = IndexMode::Eager;
+        assert!(should_warm_index(dir.path(), &cfg, true));
+        assert!(!should_warm_index(dir.path(), &cfg, false));
+    }
+
     #[tokio::test]
-    async fn gated_root_skips_indexing() {
-        // Large + unmarked -> WorkspaceIndex stays empty after spawn_reindex.
+    async fn hybrid_large_unmarked_root_starts_cold() {
+        // Hybrid warm-start policy skips large unmarked roots; construction is O(1).
         let dir = tempfile::tempdir().unwrap();
         write_n_files(dir.path(), 8);
         let cfg = IndexConfig {
@@ -767,10 +1088,10 @@ mod tests {
             ..Default::default()
         };
         let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, false);
-        idx.spawn_reindex();
-        wait_for_index().await;
         let stats = idx.stats().await;
-        assert_eq!(stats.files, 0, "gated root must not be auto-indexed");
+        assert!(!should_eager_index(dir.path(), &cfg));
+        assert_eq!(stats.files, 0);
+        assert_eq!(stats.coverage, IndexCoverage::Cold);
     }
 
     #[tokio::test]
@@ -789,6 +1110,8 @@ mod tests {
         wait_for_index().await;
         let stats = idx.stats().await;
         assert_eq!(stats.files, 4, "index must stop at max_files");
+        assert_eq!(stats.coverage, IndexCoverage::Partial);
+        assert!(stats.capped);
     }
 
     // --- Incremental index tests ---
@@ -898,7 +1221,7 @@ mod tests {
         wait_for_index().await;
         assert_eq!(idx.stats().await.files, 2);
 
-        let results = idx.search("brand_new_function", 10).await;
+        let results = idx.search("brand_new.rs", 10).await;
         assert!(!results.is_empty(), "new file should be searchable");
     }
 
@@ -915,7 +1238,7 @@ mod tests {
         wait_for_index().await;
         assert_eq!(idx.stats().await.files, 2);
 
-        let results = idx.search("delete_me_unique", 10).await;
+        let results = idx.search("delete_me.rs", 10).await;
         assert!(!results.is_empty());
 
         // Delete the file
@@ -925,12 +1248,12 @@ mod tests {
         wait_for_index().await;
         assert_eq!(idx.stats().await.files, 1);
 
-        let results = idx.search("delete_me_unique", 10).await;
+        let results = idx.search("delete_me.rs", 10).await;
         assert!(results.is_empty(), "deleted file should not be searchable");
     }
 
     #[tokio::test]
-    async fn incremental_updates_modified_files() {
+    async fn incremental_content_changes_keep_path_search_stable() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("mutable.rs"), "fn old_function_name() {}").unwrap();
 
@@ -940,7 +1263,7 @@ mod tests {
         idx.spawn_reindex();
         wait_for_index().await;
 
-        let results = idx.search("old_function_name", 10).await;
+        let results = idx.search("mutable.rs", 10).await;
         assert!(!results.is_empty());
 
         // Modify the file (need to change mtime — sleep briefly to ensure different mtime)
@@ -950,14 +1273,9 @@ mod tests {
         idx.spawn_reindex();
         wait_for_index().await;
 
-        let old_results = idx.search("old_function_name", 10).await;
-        assert!(
-            old_results.is_empty(),
-            "old content should not be searchable"
-        );
-
-        let new_results = idx.search("new_function_name", 10).await;
-        assert!(!new_results.is_empty(), "new content should be searchable");
+        assert!(!idx.search("mutable.rs", 10).await.is_empty());
+        assert!(idx.search("old_function_name", 10).await.is_empty());
+        assert!(idx.search("new_function_name", 10).await.is_empty());
     }
 
     #[tokio::test]
@@ -981,24 +1299,20 @@ mod tests {
         std::fs::write(dir.path().join("added.rs"), "fn freshly_added() {}").unwrap();
 
         idx.spawn_reindex();
-        // Cannot rely on `wait_for_index` + file-count assert here: the
-        // count is 3 both before (keep+modify+remove) and after
-        // (keep+modify+added), so the assertion fires `true` even if
-        // reindex 2 hasn't run yet. Wait until the index actually
-        // contains the new file's content.
-        wait_for_search_hit(&idx, "freshly_added").await;
+        wait_for_search_hit(&idx, "added.rs").await;
         assert_eq!(idx.stats().await.files, 3); // keep + modify + added
 
         // Unchanged file still searchable
-        assert!(!idx.search("keep_unchanged", 10).await.is_empty());
-        // Modified file has new content
+        assert!(!idx.search("keep.rs", 10).await.is_empty());
+        // Content changes do not affect path search.
+        assert!(!idx.search("modify.rs", 10).await.is_empty());
         assert!(idx.search("before_modify", 10).await.is_empty());
-        assert!(!idx.search("after_modify", 10).await.is_empty());
+        assert!(idx.search("after_modify", 10).await.is_empty());
         // Deleted file gone
-        assert!(idx.search("will_be_removed", 10).await.is_empty());
+        assert!(idx.search("remove.rs", 10).await.is_empty());
         // New file searchable (already verified by `wait_for_search_hit`;
         // kept as an explicit assertion for documentation).
-        assert!(!idx.search("freshly_added", 10).await.is_empty());
+        assert!(!idx.search("added.rs", 10).await.is_empty());
     }
 
     /// Regression test for the `spawn_reindex` race condition. Two
@@ -1024,14 +1338,14 @@ mod tests {
     #[tokio::test]
     async fn concurrent_reindexes_serialize_correctly() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
+        std::fs::write(dir.path().join("alpha_marker.rs"), "content").unwrap();
 
         let cfg = IndexConfig::default();
         let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, true);
 
         idx.spawn_reindex();
         // No wait — deliberately stack the next reindex on top.
-        std::fs::write(dir.path().join("b.rs"), "fn beta_marker() {}").unwrap();
+        std::fs::write(dir.path().join("beta_marker.rs"), "content").unwrap();
         idx.spawn_reindex();
 
         wait_for_index().await;
