@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "stages": [
+    {
+      "id": "F0",
+      "parent": null,
+      "feature": "Pre-1193/1194 Anthropic full-suite baseline",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "8b97ff0e19c626c25125914085500c125994c5b9afd2872f2eba255b08ac6c81",
+      "git_commit": "c3d103a63aaade00472f7b2a289e0513a446ad64",
+      "report_path": "benchmarks/results/1193-1194-anthropic-medium-comparison.md",
+      "created_at": "2026-08-01T05:13:55Z",
+      "run_dirs": [
+        "20260731-213413-agent-pre-1193-1194-anthropic-baseline-r1",
+        "20260731-213655-agent-pre-1193-1194-anthropic-baseline-r2",
+        "20260731-213940-agent-pre-1193-1194-anthropic-baseline-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [416652.3333333333, "tokens"],
+        "mean_cost_usd": [2.255455, "usd"],
+        "mean_wall_ms": [145666.6666666667, "milliseconds"],
+        "correct_task_runs": [33, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/1193-1194-anthropic-medium-comparison.md",
+          "sha256": "62040f03e174db7fcf4cdd01ba1973357b307debc282f5cc2446c9e7bfa799b0",
+          "kind": "comparison"
+        }
+      ]
+    },
+    {
+      "id": "F1",
+      "parent": "F0",
+      "feature": "Universal tool-output bounding and intra-turn microcompaction",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "56714a241b7488299c5a6e7c77f1039a0ee26750605989a1d211b5133de5db39",
+      "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
+      "report_path": "benchmarks/results/1193-1194-anthropic-medium-comparison.md",
+      "created_at": "2026-08-01T05:13:55Z",
+      "run_dirs": [
+        "20260731-210527-agent-post-1193-1194-r1",
+        "20260731-214218-agent-post-1193-1194-r2",
+        "20260731-214457-agent-post-1193-1194-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [427627.6666666667, "tokens"],
+        "mean_cost_usd": [2.306165, "usd"],
+        "mean_wall_ms": [146666.6666666667, "milliseconds"],
+        "correct_task_runs": [33, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/1193-1194-anthropic-medium-comparison.md",
+          "sha256": "62040f03e174db7fcf4cdd01ba1973357b307debc282f5cc2446c9e7bfa799b0",
+          "kind": "comparison"
+        }
+      ]
+    },
+    {
+      "id": "F2",
+      "parent": "F1",
+      "feature": "Opt-in Anthropic tool-prefix caching",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "9bb3562d987ce63832dfb36d85dced4241966975db0014fb33e719f0cf164b53",
+      "git_commit": "1a217e30445eb5d8d76ec8ec330c5483591ce3b6",
+      "report_path": "benchmarks/results/2026-08-03-full-suite-prompt-cache.md",
+      "created_at": "2026-08-03T15:23:12Z",
+      "run_dirs": [
+        "20260803-082312-agent-context-947-full-cache-r1",
+        "20260803-082605-agent-context-947-full-cache-r2",
+        "20260803-082911-agent-context-947-full-cache-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [402699, "tokens"],
+        "mean_prompt_tokens": [394135.6666666667, "tokens"],
+        "mean_fresh_input_tokens": [56503.6666666667, "tokens"],
+        "mean_cache_write_tokens": [3517, "tokens"],
+        "mean_cache_read_tokens": [334115, "tokens"],
+        "mean_output_tokens": [8563.3333333333, "tokens"],
+        "mean_llm_calls": [32, "count"],
+        "mean_cost_usd": [0.685636, "usd"],
+        "mean_wall_ms": [156000, "milliseconds"],
+        "correct_task_runs": [33, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-full-suite-prompt-cache.md",
+          "sha256": "c3b579bb5c0299d02b73919fe030ea9d4832034f27b7581ab1ced50ab84749e9",
+          "kind": "report"
+        }
+      ]
+    },
+    {
+      "id": "C0",
+      "parent": null,
+      "feature": "Controlled tool-output feature-disabled baseline",
+      "scope_fingerprint": "controlled-tool-output-v1|api-free",
+      "benchmark_kind": "controlled",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": [],
+      "binary_sha256": "715a834dbabb64084116c218e2d4984bc0369067a294bb5c7e07f30da3c231e9",
+      "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
+      "run_dirs": [],
+      "metrics": {
+        "agent_model_visible_tokens": [147899, "tokens"],
+        "mcp_model_visible_bytes": [360248, "bytes"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/20260731-223047-controlled-tool-output-vikunja-1193-1194-final.json",
+          "sha256": "6649ca288ad41c1d0424830b16be3f7ec283a9dc6d08c8e9300cb211b700e18e",
+          "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "C1",
+      "parent": "C0",
+      "feature": "Controlled tool-output bounding and microcompaction candidate",
+      "scope_fingerprint": "controlled-tool-output-v1|api-free",
+      "benchmark_kind": "controlled",
+      "provider": null,
+      "model": null,
+      "thinking": null,
+      "task_ids": [],
+      "binary_sha256": "715a834dbabb64084116c218e2d4984bc0369067a294bb5c7e07f30da3c231e9",
+      "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
+      "run_dirs": [],
+      "metrics": {
+        "agent_model_visible_tokens": [38432, "tokens"],
+        "agent_token_reduction_pct": [74.0146992204, "percent"],
+        "mcp_model_visible_bytes": [102514, "bytes"],
+        "mcp_byte_reduction_pct": [71.5434922609, "percent"],
+        "offload_files": [8, "count"],
+        "pruned_results": [7, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/20260731-223047-controlled-tool-output-vikunja-1193-1194-final.json",
+          "sha256": "6649ca288ad41c1d0424830b16be3f7ec283a9dc6d08c8e9300cb211b700e18e",
+          "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "T0",
+      "parent": null,
+      "feature": "Original Task 04 baseline slice",
+      "scope_fingerprint": "task04-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": ["04-explore-architecture"],
+      "binary_sha256": "8b97ff0e19c626c25125914085500c125994c5b9afd2872f2eba255b08ac6c81",
+      "git_commit": "c3d103a63aaade00472f7b2a289e0513a446ad64",
+      "run_dirs": [
+        "20260731-213413-agent-pre-1193-1194-anthropic-baseline-r1",
+        "20260731-213655-agent-pre-1193-1194-anthropic-baseline-r2",
+        "20260731-213940-agent-pre-1193-1194-anthropic-baseline-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [42569.3333333333, "tokens"],
+        "mean_cost_usd": [0.2626733333333333, "usd"],
+        "mean_wall_ms": [37333.3333333333, "milliseconds"]
+      }
+    },
+    {
+      "id": "T1",
+      "parent": "T0",
+      "feature": "Task 04 after tool-output bounding and microcompaction",
+      "scope_fingerprint": "task04-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": ["04-explore-architecture"],
+      "binary_sha256": "56714a241b7488299c5a6e7c77f1039a0ee26750605989a1d211b5133de5db39",
+      "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
+      "run_dirs": [
+        "20260731-210527-agent-post-1193-1194-r1",
+        "20260731-214218-agent-post-1193-1194-r2",
+        "20260731-214457-agent-post-1193-1194-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [56569, "tokens"],
+        "mean_cost_usd": [0.3327583333333333, "usd"],
+        "mean_wall_ms": [38666.6666666667, "milliseconds"]
+      }
+    },
+    {
+      "id": "T2",
+      "parent": "T1",
+      "feature": "Metadata-only native context diagnostics, cache disabled",
+      "scope_fingerprint": "task04-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": ["04-explore-architecture"],
+      "binary_sha256": "7f7c16d19afcffe40c2b4be051045a9fd537aaa11809a0f094779bcf281eda9a",
+      "git_commit": "6c634e31675f5aaaea250195aae13d23c33aa501",
+      "report_path": "benchmarks/results/2026-08-01-native-context-cache.md",
+      "run_dirs": [
+        "20260801-182400-agent-context-947-baseline-r1",
+        "20260801-182454-agent-context-947-baseline-r2",
+        "20260801-182944-agent-context-947-baseline-r3",
+        "20260801-183028-agent-context-947-baseline-r4"
+      ],
+      "metrics": {
+        "mean_total_tokens": [42459, "tokens"],
+        "mean_cost_usd": [0.25999, "usd"],
+        "mean_wall_ms": [38500, "milliseconds"],
+        "mean_prompt_tokens_per_call": [13358.0833333333, "tokens_per_call"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-01-native-context-cache.md",
+          "sha256": "5b7488cb2f9f3c7182c92cbba845d3941f7170445de5a789354c357ec2110e09",
+          "kind": "report"
+        }
+      ]
+    },
+    {
+      "id": "T3",
+      "parent": "T2",
+      "feature": "Anthropic tool-prefix cache enabled",
+      "scope_fingerprint": "task04-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": ["04-explore-architecture"],
+      "binary_sha256": "78f17525baa9bc6d73f3d459d0d4067f21d2c3ce6f045ee712678dda33a4bbc9",
+      "git_commit": "6c634e31675f5aaaea250195aae13d23c33aa501",
+      "report_path": "benchmarks/results/2026-08-01-native-context-cache.md",
+      "run_dirs": [
+        "20260801-182801-agent-context-947-candidate-r1",
+        "20260801-182857-agent-context-947-candidate-r2",
+        "20260801-183112-agent-context-947-candidate-r3",
+        "20260801-183202-agent-context-947-candidate-r4"
+      ],
+      "metrics": {
+        "mean_total_tokens": [51995.25, "tokens"],
+        "mean_cost_usd": [0.14796025, "usd"],
+        "mean_wall_ms": [38000, "milliseconds"],
+        "fresh_input_reduction_pct": [75.3, "percent"],
+        "cost_reduction_pct": [43.09, "percent"],
+        "mean_prompt_tokens_per_call": [13187.2, "tokens_per_call"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-01-native-context-cache.md",
+          "sha256": "5b7488cb2f9f3c7182c92cbba845d3941f7170445de5a789354c357ec2110e09",
+          "kind": "report"
+        }
+      ]
+    }
+  ]
+}

@@ -43,6 +43,8 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -359,14 +361,21 @@ fn message_to_anthropic(msg: &Message, is_prefix_boundary: bool) -> Option<Anthr
     })
 }
 
-fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
+fn build_request_with_cache(
+    ctx: &Context,
+    opts: &CompleteOpts,
+    prompt_cache: bool,
+) -> AnthropicRequest {
+    let last_tool = ctx.tools.len().checked_sub(1);
     let tools = ctx
         .tools
         .iter()
-        .map(|t| AnthropicTool {
+        .enumerate()
+        .map(|(index, t)| AnthropicTool {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            cache_control: (prompt_cache && Some(index) == last_tool).then(CacheControl::ephemeral),
         })
         .collect();
 
@@ -417,6 +426,11 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
         temperature,
         stream: false,
     }
+}
+
+#[cfg(test)]
+fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
+    build_request_with_cache(ctx, opts, false)
 }
 
 // --- Streaming (vikunja #957) ---
@@ -570,6 +584,7 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    prompt_cache: bool,
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -587,11 +602,17 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            prompt_cache: false,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = enabled;
         self
     }
 
@@ -609,7 +630,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
-        let request = build_request(ctx, opts);
+        let request = build_request_with_cache(ctx, opts, self.prompt_cache);
 
         let result = self
             .client
@@ -667,7 +688,7 @@ impl LlmProvider for AnthropicProvider {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
-        let mut request = build_request(ctx, opts);
+        let mut request = build_request_with_cache(ctx, opts, self.prompt_cache);
         request.stream = true;
 
         let result = self
@@ -1208,6 +1229,44 @@ mod tests {
         let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
         assert_eq!(json["tools"][0]["name"], "read_file");
         assert_eq!(json["tools"][0]["description"], "Read a file");
+    }
+
+    #[test]
+    fn build_request_caches_the_stable_tool_definition_prefix() {
+        let ctx = Context {
+            messages: vec![Message::user("go")],
+            system: Some("stable system".into()),
+            tools: vec![
+                ToolSchema {
+                    name: "read_file".into(),
+                    description: "Read".into(),
+                    input_schema: json!({"type":"object"}),
+                },
+                ToolSchema {
+                    name: "write_file".into(),
+                    description: "Write".into(),
+                    input_schema: json!({"type":"object"}),
+                },
+            ],
+            stable_prefix_len: 0,
+        };
+
+        let default_json =
+            serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        assert!(default_json["tools"][0].get("cache_control").is_none());
+        assert!(default_json["tools"][1].get("cache_control").is_none());
+
+        let cached_json = serde_json::to_value(build_request_with_cache(
+            &ctx,
+            &CompleteOpts::default(),
+            true,
+        ))
+        .unwrap();
+        assert!(cached_json["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            cached_json["tools"][1]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     // --- from_env ---

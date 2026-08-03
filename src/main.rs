@@ -9,6 +9,7 @@ mod cli;
 mod client_transport;
 mod compaction;
 mod config;
+mod context_metrics;
 mod coordination;
 mod index;
 mod kgl;

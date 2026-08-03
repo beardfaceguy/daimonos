@@ -22,7 +22,23 @@ JSON matches the JS it replaces (same fields, values, and semantics).
 
 import json
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
+
+CONTEXT_BYTE_FIELDS = [
+    "system_bytes",
+    "tool_name_bytes",
+    "tool_description_bytes",
+    "tool_schema_bytes",
+    "user_text_bytes",
+    "assistant_text_bytes",
+    "thinking_bytes",
+    "provider_state_bytes",
+    "tool_call_argument_bytes",
+    "tool_result_ok_bytes",
+    "tool_result_error_bytes",
+    "image_bytes",
+]
 
 
 def read_lines(path):
@@ -101,6 +117,12 @@ def main(argv):
     llm_calls = None
     is_error = True
     cost = None  # null = unknown (Cursor: comes from admin CSV later)
+    context_estimates = []
+    context_component_bytes = defaultdict(int)
+    context_component_tokens = defaultdict(int)
+    tool_loop_calls = 0
+    final_calls = 0
+    failed_calls = 0
 
     if runtime == "claude":
         events = json_events(raw_file)
@@ -195,6 +217,23 @@ def main(argv):
                 m["cost"] += float(ev.get("cost_usd"))
             except (TypeError, ValueError):
                 pass
+            stop_reason = ev.get("stop_reason")
+            if stop_reason == "tool_use":
+                tool_loop_calls += 1
+            elif stop_reason in ("end_turn", "max_tokens", "refusal"):
+                final_calls += 1
+            elif stop_reason in ("error", "aborted"):
+                failed_calls += 1
+            context = ev.get("context")
+            if isinstance(context, dict):
+                estimate = context.get("payload_tokens_est")
+                if isinstance(estimate, (int, float)):
+                    context_estimates.append(estimate)
+                for field in CONTEXT_BYTE_FIELDS:
+                    value = context.get(field)
+                    if isinstance(value, (int, float)):
+                        context_component_bytes[field] += value
+                        context_component_tokens[field] += (int(value) + 3) // 4
             calls += 1
             saw_line = True
         cost = m["cost"]  # OpenRouter path often reports 0; tokens are primary
@@ -206,6 +245,24 @@ def main(argv):
         return 2
 
     total = m["input"] + m["cache_write"] + m["cache_read"] + m["output"]
+    prompt_tokens = m["input"] + m["cache_write"] + m["cache_read"]
+    calls_with_context = len(context_estimates)
+    mean_prompt_tokens = (
+        prompt_tokens / llm_calls if isinstance(llm_calls, int) and llm_calls else None
+    )
+    mean_cache_read = (
+        m["cache_read"] / llm_calls if isinstance(llm_calls, int) and llm_calls else None
+    )
+    cache_hit_ratio = m["cache_read"] / prompt_tokens if prompt_tokens else None
+    context_total = sum(context_estimates) if context_estimates else None
+    context_mean = (
+        context_total / calls_with_context if calls_with_context else None
+    )
+    context_growth = (
+        (context_estimates[-1] - context_estimates[0]) / (calls_with_context - 1)
+        if calls_with_context >= 2
+        else None
+    )
 
     summary = {
         "task_id": task_id,
@@ -221,6 +278,42 @@ def main(argv):
         "cache_read": m["cache_read"],
         "output": m["output"],
         "total_tokens": total,
+        "prompt_tokens": prompt_tokens,
+        "fresh_input_tokens": m["input"],
+        "mean_prompt_tokens_per_call": mean_prompt_tokens,
+        "mean_cache_read_per_call": mean_cache_read,
+        "cache_hit_ratio": cache_hit_ratio,
+        "calls_with_context": calls_with_context,
+        "context_coverage_pct": (
+            calls_with_context / llm_calls * 100.0
+            if isinstance(llm_calls, int) and llm_calls
+            else None
+        ),
+        "context_estimated_tokens_total": context_total,
+        "context_estimated_tokens_mean": context_mean,
+        "context_estimated_tokens_first": (
+            context_estimates[0] if context_estimates else None
+        ),
+        "context_estimated_tokens_last": (
+            context_estimates[-1] if context_estimates else None
+        ),
+        "context_estimated_tokens_max": (
+            max(context_estimates) if context_estimates else None
+        ),
+        "context_growth_tokens_per_measured_call": context_growth,
+        "context_component_bytes_total": (
+            dict(sorted(context_component_bytes.items()))
+            if context_estimates
+            else None
+        ),
+        "context_component_tokens_est_total": (
+            dict(sorted(context_component_tokens.items()))
+            if context_estimates
+            else None
+        ),
+        "tool_loop_calls": tool_loop_calls,
+        "final_calls": final_calls,
+        "failed_calls": failed_calls,
         "cost_usd": cost,
         "tool_calls": tool_calls,
         "llm_calls": llm_calls,

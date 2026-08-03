@@ -112,6 +112,24 @@ provider (pick `xhigh` unless you specifically want `max` to mean the
 maximum on a provider that exposes a distinct level). Provider defaults and
 the Anthropic adaptive thinking behavior are unchanged by this key.
 
+### Anthropic tool-prefix caching (`DAIMONOS_AGENT_PROMPT_CACHE`)
+
+Optional and default-off. Set `DAIMONOS_AGENT_PROMPT_CACHE=on` to place an
+ephemeral Anthropic prompt-cache breakpoint on the final tool definition,
+caching the complete stable tool-schema prefix. Other providers ignore this
+setting.
+
+The first request pays Anthropic's cache-write premium. Repeated requests with
+the same tools then use cheaper cache reads, so this favors tool-loop turns and
+can cost more for a one-call response. A four-run Opus 4.8 Task 04 experiment
+reduced fresh input 75.3% and cost 43.1% overall; at matched three-call behavior,
+warm-cache cost fell approximately 54.7%. Keep it opt-in until the broader
+native-agent suite confirms the one-call trade-off.
+
+```dotenv
+DAIMONOS_AGENT_PROMPT_CACHE=on
+```
+
 ## Settings
 
 ### `[index]` — Workspace Indexing

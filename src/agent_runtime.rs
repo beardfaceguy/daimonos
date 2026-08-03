@@ -12,6 +12,7 @@ fn try_build_provider(
     provider: &str,
     api_key: &str,
     base_url: &str,
+    prompt_cache: bool,
 ) -> Result<Box<dyn providers::LlmProvider>, String> {
     match provider {
         "openrouter" => providers::openrouter::OpenRouterProvider::new(
@@ -21,7 +22,8 @@ fn try_build_provider(
         .map(|provider| Box::new(provider) as Box<dyn providers::LlmProvider>),
         "anthropic" => Ok(Box::new(
             providers::anthropic::AnthropicProvider::new(api_key.to_string())
-                .with_base_url(base_url.to_string()),
+                .with_base_url(base_url.to_string())
+                .with_prompt_cache(prompt_cache),
         )),
         "openai" => {
             providers::openai::OpenAiProvider::new(api_key.to_string(), base_url.to_string())
@@ -37,8 +39,13 @@ fn build_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
 ) -> anyhow::Result<Box<dyn providers::LlmProvider>> {
-    try_build_provider(effective_provider, &agent.api_key, &agent.base_url)
-        .map_err(anyhow::Error::msg)
+    try_build_provider(
+        effective_provider,
+        &agent.api_key,
+        &agent.base_url,
+        agent.prompt_cache,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 pub async fn run_agent(
@@ -197,7 +204,8 @@ pub async fn run_acp(
         let provider = effective_provider.clone();
         let api_key = agent.api_key.clone();
         let base_url = agent.base_url.clone();
-        Arc::new(move || try_build_provider(&provider, &api_key, &base_url))
+        let prompt_cache = agent.prompt_cache;
+        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache))
     };
     let compaction_follows_model = matches!(
         &agent.compaction,
@@ -258,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_openai_provider_builds_and_reports_known_window() {
-        let provider = try_build_provider("openai", "key", "https://api.openai.com/v1")
+        let provider = try_build_provider("openai", "key", "https://api.openai.com/v1", false)
             .expect("native OpenAI provider");
         assert_eq!(
             provider.context_window("gpt-5.6-sol").await,
@@ -269,7 +277,7 @@ mod tests {
 
     #[test]
     fn unsupported_provider_names_openai_in_valid_set() {
-        let error = try_build_provider("ollama", "key", "http://localhost")
+        let error = try_build_provider("ollama", "key", "http://localhost", false)
             .err()
             .expect("unsupported provider error");
         assert!(error.contains("openai"));
