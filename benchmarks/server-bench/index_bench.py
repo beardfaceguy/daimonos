@@ -236,7 +236,7 @@ def summarize_samples(samples: list[Sample]) -> dict:
 
 def create_fixture(root: Path, profile: Profile) -> Path:
     workspace = root / profile.name
-    workspace.mkdir(parents=True)
+    workspace.mkdir(parents=True, exist_ok=True)
     (workspace / TARGET_FILE).write_text(
         f"// {QUERY}\npub fn benchmark_target() {{}}\n"
     )
@@ -389,7 +389,10 @@ def run_replicate(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         shutil.rmtree(run_dir, ignore_errors=True)
 
 

@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-08-03)
 
 ## Corpus Check
-- 213 files · ~281,397 words
+- 213 files · ~281,402 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5496 nodes · 12867 edges · 235 communities (217 shown, 18 thin omitted)
+- 5496 nodes · 12867 edges · 234 communities (216 shown, 18 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 52 edges (avg confidence: 0.69)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `a31e4703`
+- Built from commit: `6f197209`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -226,7 +226,6 @@
 - [[_COMMUNITY_Community 217|Community 217]]
 - [[_COMMUNITY_Community 218|Community 218]]
 - [[_COMMUNITY_Community 219|Community 219]]
-- [[_COMMUNITY_Community 220|Community 220]]
 - [[_COMMUNITY_Community 221|Community 221]]
 - [[_COMMUNITY_Community 222|Community 222]]
 - [[_COMMUNITY_Community 223|Community 223]]
@@ -288,7 +287,7 @@
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 - 1-file cycle: `src/kgl/store.rs -> src/kgl/store.rs`
 
-## Communities (235 total, 18 thin omitted)
+## Communities (234 total, 18 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.17
@@ -519,8 +518,8 @@ Cohesion: 0.10
 Nodes (21): _expected_version(), _instructions(), Tests for MCP initialize handshake and tool listing., The externalized default MCP instructions (prompts/mcp_instructions.md)     are, A `[prompts].mcp_instructions` override in daimonos.toml replaces the     embedd, A partial catalog overrides tool + parameter text while preserving     embedded, Core tools + git + snapshots are exposed by default., list_all_tools returns a catalog of all available tools. (+13 more)
 
 ### Community 57 - "Community 57"
-Cohesion: 0.22
-Nodes (9): AnthropicImageSource, AnthropicThinking, CacheControl, complete_returns_error_on_api_401(), context_window_returns_none_on_http_error(), from_env_errors_when_key_not_set(), Into, Self (+1 more)
+Cohesion: 0.19
+Nodes (10): AnthropicImageSource, AnthropicThinking, complete_returns_error_on_api_401(), context_window_returns_none_on_http_error(), from_env_errors_when_key_not_set(), Formatter, Into, Result (+2 more)
 
 ### Community 58 - "Community 58"
 Cohesion: 0.07
@@ -543,8 +542,8 @@ Cohesion: 0.53
 Nodes (3): reset_workspace(), run_task(), bench-codex.sh script
 
 ### Community 63 - "Community 63"
-Cohesion: 0.17
-Nodes (15): CacheControl, AnthropicBlock, AnthropicResponseBlock, AnthropicTool, content_block_to_anthropic(), map_stop_reason(), max_input_tokens_from_model(), message_to_anthropic() (+7 more)
+Cohesion: 0.15
+Nodes (16): CacheControl, AnthropicBlock, AnthropicResponseBlock, AnthropicTool, CacheControl, content_block_to_anthropic(), map_stop_reason(), max_input_tokens_from_model() (+8 more)
 
 ### Community 64 - "Community 64"
 Cohesion: 0.32
@@ -619,8 +618,8 @@ Cohesion: 0.24
 Nodes (11): _payload(), MCP-level tests for the shellcheck tool plugin (#34)., Each diagnostic should reference the file that was checked., Verify schema params are forwarded without an RPC-level crash., test_shellcheck_clean_script(), test_shellcheck_diagnostic_has_file_path(), test_shellcheck_missing_file_returns_error(), test_shellcheck_multiple_files() (+3 more)
 
 ### Community 82 - "Community 82"
-Cohesion: 0.17
-Nodes (18): RecordedCall, acknowledge_coordination_model_notice(), agent_session_prompt_delivers_model_notice(), AgentSession, BenchmarkCaptureProvider, CaptureProvider, coordination_model_notice(), coordination_model_notice_is_metadata_only_and_deduplicated() (+10 more)
+Cohesion: 0.09
+Nodes (34): RecordedCall, acknowledge_coordination_model_notice(), agent_session_prompt_delivers_model_notice(), AgentConfig, AgentSession, BenchmarkCaptureProvider, CaptureProvider, controlled_tool_schemas() (+26 more)
 
 ### Community 83 - "Community 83"
 Cohesion: 0.30
@@ -647,8 +646,8 @@ Cohesion: 0.38
 Nodes (8): descriptor_round_trip(), GenericCliPlugin, make_descriptor(), new_stores_descriptor(), no_quickfixes_by_default(), Self, ToolDescriptor, ToolPlugin
 
 ### Community 89 - "Community 89"
-Cohesion: 0.17
-Nodes (13): Debug, AnthropicProvider, build_request_with_cache(), is_context_overflow_error(), Client, CompleteOpts, Context, FnMut (+5 more)
+Cohesion: 0.22
+Nodes (11): Debug, AnthropicProvider, build_request_with_cache(), is_context_overflow_error(), Client, CompleteOpts, Context, FnMut (+3 more)
 
 ### Community 90 - "Community 90"
 Cohesion: 0.23
@@ -783,8 +782,8 @@ Cohesion: 0.70
 Nodes (4): aggregate(), compare(), load(), main()
 
 ### Community 126 - "Community 126"
-Cohesion: 0.22
-Nodes (10): MockProvider, CompleteOpts, Context, FnMut, LlmResponse, Self, Send, StreamEvent (+2 more)
+Cohesion: 0.32
+Nodes (7): CompleteOpts, Context, FnMut, LlmResponse, Send, StreamEvent, StreamingMockProvider
 
 ### Community 127 - "Community 127"
 Cohesion: 0.22
@@ -879,8 +878,8 @@ Cohesion: 0.40
 Nodes (4): Agent coordination, Execution plans, Keep the context lean (offload large data), Tool efficiency rules
 
 ### Community 167 - "Community 167"
-Cohesion: 0.14
-Nodes (17): ContextComposition, AgentResult, GenerationLogMetadata, has_orphan_tool_calls(), last_assistant_text(), orphan_ids(), retry_error_type(), retry_replaces_latest_turn_without_duplicate_user_message() (+9 more)
+Cohesion: 0.15
+Nodes (17): ContextComposition, AgentResult, close_orphan_tool_calls(), close_orphan_tool_calls_closes_only_the_unanswered_parallel_call(), close_orphan_tool_calls_pairs_a_turn_cut_off_mid_call(), GenerationLogMetadata, has_orphan_tool_calls(), last_assistant_text() (+9 more)
 
 ### Community 168 - "Community 168"
 Cohesion: 0.09
@@ -931,8 +930,8 @@ Cohesion: 0.19
 Nodes (10): AnalyticsConfig, dirs_next(), LoggingConfig, PromptsConfig, Option, PathBuf, ToolDescriptions, search_candidates() (+2 more)
 
 ### Community 181 - "Community 181"
-Cohesion: 0.09
-Nodes (40): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult (+32 more)
+Cohesion: 0.08
+Nodes (43): CompactionEvent, accumulate_sums_cost(), accumulate_sums_tokens(), accumulate_usage(), accumulate_zero_is_identity(), AfterHookResult, append_remote_tools_to_catalog(), BeforeHookResult (+35 more)
 
 ### Community 182 - "Community 182"
 Cohesion: 0.07
@@ -1066,10 +1065,6 @@ Nodes (13): CallToolError, CallToolRequestParams, ScriptResult, bounded_text_too
 Cohesion: 0.05
 Nodes (38): ACP remains a supported adapter, ADR-010: Daemon-owned agent sessions, local TUI, and remote control, Adversaries, Agent mail is not a stream transport, Build a generic `Tool` hierarchy now, Build a new `LlmBackend`, Consequences, Context (+30 more)
 
-### Community 220 - "Community 220"
-Cohesion: 0.13
-Nodes (16): AgentConfig, close_orphan_tool_calls(), close_orphan_tool_calls_closes_only_the_unanswered_parallel_call(), close_orphan_tool_calls_pairs_a_turn_cut_off_mid_call(), controlled_tool_schemas(), repaired_history_is_accepted_by_the_next_prompt_context(), AfterHook, AtomicU64 (+8 more)
-
 ### Community 221 - "Community 221"
 Cohesion: 0.18
 Nodes (13): AGENTS.md — Cross-tool Agent Guidance, Added, Changed, Changelog, [Unreleased], Contributing Guide, Installation & Setup Guide, README — Daimonos Project Overview (+5 more)
@@ -1144,7 +1139,7 @@ _Questions this graph is uniquely positioned to answer:_
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
 - **What is the exact relationship between `Installation & Setup Guide` and `README — Daimonos Project Overview`?**
   _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
-- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 109`, `Community 220`, `Community 127`?**
+- **Why does `parse_plan_entries()` connect `Community 181` to `Community 192`, `Community 0`, `Community 109`, `Community 82`, `Community 127`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `Command` connect `Community 10` to `Community 33`, `Community 35`, `Community 11`, `Community 44`, `Community 16`, `Community 22`, `Community 26`, `Community 27`, `Community 31`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
