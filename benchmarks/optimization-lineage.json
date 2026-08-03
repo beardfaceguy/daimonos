@@ -92,6 +92,57 @@
       ]
     },
     {
+      "id": "F2",
+      "parent": "F1",
+      "feature": "Opt-in Anthropic tool-prefix caching",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "9bb3562d987ce63832dfb36d85dced4241966975db0014fb33e719f0cf164b53",
+      "git_commit": "1a217e30445eb5d8d76ec8ec330c5483591ce3b6",
+      "report_path": "benchmarks/results/2026-08-03-full-suite-prompt-cache.md",
+      "created_at": "2026-08-03T15:23:12Z",
+      "run_dirs": [
+        "20260803-082312-agent-context-947-full-cache-r1",
+        "20260803-082605-agent-context-947-full-cache-r2",
+        "20260803-082911-agent-context-947-full-cache-r3"
+      ],
+      "metrics": {
+        "mean_total_tokens": [402699, "tokens"],
+        "mean_prompt_tokens": [394135.6666666667, "tokens"],
+        "mean_fresh_input_tokens": [56503.6666666667, "tokens"],
+        "mean_cache_write_tokens": [3517, "tokens"],
+        "mean_cache_read_tokens": [334115, "tokens"],
+        "mean_output_tokens": [8563.3333333333, "tokens"],
+        "mean_llm_calls": [32, "count"],
+        "mean_cost_usd": [0.685636, "usd"],
+        "mean_wall_ms": [156000, "milliseconds"],
+        "correct_task_runs": [33, "count"]
+      },
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-full-suite-prompt-cache.md",
+          "sha256": "c3b579bb5c0299d02b73919fe030ea9d4832034f27b7581ab1ced50ab84749e9",
+          "kind": "report"
+        }
+      ]
+    },
+    {
       "id": "C0",
       "parent": null,
       "feature": "Controlled tool-output feature-disabled baseline",

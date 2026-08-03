@@ -34,7 +34,7 @@ thinking=medium / compaction=off / 3 passes`.
 |---|---|---:|---:|---:|---:|---|---|
 | F0 | Pre-1193/1194 baseline | 416,652 | $2.2555 | 145.7s | 33/33 | baseline | baseline |
 | F1 | Universal tool-output bounding + intra-turn microcompaction | 427,628 | $2.3062 | 146.7s | 33/33 | tokens +2.63%; cost +2.25%; wall +0.69% | same |
-| F2 | Context diagnostics + opt-in tool-prefix caching | pending broader suite | — | — | — | not yet comparable | not yet comparable |
+| F2 | Context diagnostics + opt-in tool-prefix caching | 402,699 | $0.6856 | 156.0s | 33/33 | tokens -5.83%; cost -70.27%; wall +6.36% | tokens -3.35%; cost -69.60%; wall +7.09% |
 
 F0/F1 report:
 [`1193-1194-anthropic-medium-comparison.md`](1193-1194-anthropic-medium-comparison.md).
@@ -66,8 +66,9 @@ calls instead of three. Symmetric decomposition attributes +39,817.9 prompt
 tokens to call count and -2,306.9 to mean context size. The three matched
 three-call warm-cache runs reduced cost approximately 54.7%.
 
-## Next required stage
+F2 report:
+[`2026-08-03-full-suite-prompt-cache.md`](2026-08-03-full-suite-prompt-cache.md).
 
-Before enabling prompt caching by default, run F2 over the complete 11-task
-scope. Append its aggregate and every per-task delta here, preserving both the
-immediate F2-vs-F1 and cumulative F2-vs-F0 comparisons.
+F2 reduced mean total tokens and cost versus both F1 and F0, but increased
+mean wall time by 6–7%. The per-task table in the report remains the source of
+truth for local upward blips.
