@@ -145,6 +145,82 @@ def test_daimonos_sums_tokenlog_within_window(tmp_path):
     assert s["tool_calls"] is None
     assert s["is_error"] is False
     assert abs(s["cost_usd"] - 0.0030) < 1e-9
+    assert s["calls_with_context"] == 0
+    assert s["context_coverage_pct"] == 0
+    assert s["context_estimated_tokens_total"] is None
+    assert s["context_component_bytes_total"] is None
+
+
+def test_daimonos_aggregates_additive_context_composition(tmp_path):
+    lines = [
+        json.dumps({
+            "ts": "2026-01-01T00:01:00Z",
+            "input": 10,
+            "output": 5,
+            "cache_write": 1,
+            "cache_read": 2,
+            "stop_reason": "tool_use",
+            "context": {
+                "payload_tokens_est": 100,
+                "system_bytes": 40,
+                "tool_schema_bytes": 80,
+                "tool_result_ok_bytes": 0,
+            },
+        }),
+        json.dumps({
+            "ts": "2026-01-01T00:02:00Z",
+            "input": 20,
+            "output": 6,
+            "cache_write": 0,
+            "cache_read": 4,
+            "stop_reason": "end_turn",
+            "context": {
+                "payload_tokens_est": 150,
+                "system_bytes": 40,
+                "tool_schema_bytes": 80,
+                "tool_result_ok_bytes": 120,
+            },
+        }),
+        # Legacy call line: usage still counts, context coverage does not.
+        json.dumps({
+            "ts": "2026-01-01T00:02:30Z",
+            "input": 5,
+            "output": 1,
+            "cache_write": 0,
+            "cache_read": 0,
+        }),
+    ]
+
+    s = run_extractor(
+        tmp_path,
+        "daimonos",
+        "stdout",
+        tokenlog_text="\n".join(lines) + "\n",
+    )
+
+    assert s["llm_calls"] == 3
+    assert s["prompt_tokens"] == 42
+    assert s["mean_prompt_tokens_per_call"] == 14
+    assert s["calls_with_context"] == 2
+    assert abs(s["context_coverage_pct"] - (200 / 3)) < 1e-9
+    assert s["context_estimated_tokens_total"] == 250
+    assert s["context_estimated_tokens_mean"] == 125
+    assert s["context_estimated_tokens_first"] == 100
+    assert s["context_estimated_tokens_last"] == 150
+    assert s["context_estimated_tokens_max"] == 150
+    assert s["context_growth_tokens_per_call"] == 50
+    assert s["tool_loop_calls"] == 1
+    assert s["final_calls"] == 1
+    assert s["context_component_bytes_total"] == {
+        "system_bytes": 80,
+        "tool_result_ok_bytes": 120,
+        "tool_schema_bytes": 160,
+    }
+    assert s["context_component_tokens_est_total"] == {
+        "system_bytes": 20,
+        "tool_result_ok_bytes": 30,
+        "tool_schema_bytes": 40,
+    }
 
 
 def test_daimonos_no_calls_is_error(tmp_path):

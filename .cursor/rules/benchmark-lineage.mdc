@@ -1,0 +1,23 @@
+---
+description: Preserve immutable, comparable benchmark stages for every optimization
+alwaysApply: true
+---
+
+# Optimization Benchmark Lineage
+
+For any change intended to improve tokens, cost, latency, output size, or model
+turn count:
+
+1. Record a correctness-gated baseline before implementation.
+2. Append the result to `benchmarks/results/optimization-lineage.md`; never
+   replace an older stage.
+3. Record provider, exact model, thinking level, task-set fingerprint, fixture
+   commit, repetitions, binary/commit hash, and raw run directories.
+4. Report both immediate delta from the parent stage and cumulative delta from
+   the original comparable baseline.
+5. Preserve every per-task regression even when aggregate metrics improve.
+6. Compare only matching scope fingerprints. Keep targeted experiments in a
+   separate lineage from full-suite results.
+7. Do not claim savings from failed or correctness-ungated runs.
+8. Update `benchmarks/optimization-lineage.json`, then sync it into
+   `~/.daimonos/benchmarks.db` with `benchmarks/benchmark_db.py`.

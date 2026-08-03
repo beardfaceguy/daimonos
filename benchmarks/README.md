@@ -18,6 +18,7 @@ keep current.
 | `bench-cursor.sh` | Runs the suite through `cursor-agent` (external-agent comparison). |
 | `bench-codex.sh` | Runs the suite through `codex exec` via OpenRouter (controlled harness A/B). |
 | `analyze.py` | Aggregates one or more result dirs, grouped by model, correctness-gated. |
+| `context_compare.py` | Separates call-count and mean-context effects and ranks context components. |
 | `tasks/*.json` | The task suite (prompt + machine-checkable `checks`). |
 | `workspace/` | A git repo the agent operates in; reset (`git checkout` + `clean`) before each task. |
 | `check_task.py` | Correctness gate: runs each task's `checks` against the response + workspace. |
@@ -80,6 +81,80 @@ hits before reporting model-visible tokens and wall time.
 
 No provider or API key is used. Results are written under
 `benchmarks/results/*-controlled-tool-output*.json`.
+
+## Native context composition diagnostics
+
+`--debug-tokens` generation records use additive schema version 2. In addition
+to provider usage, each native agent generation records numeric-only context
+composition: system bytes, tool names/descriptions/schemas, user/assistant
+text, thinking/provider state, tool-call arguments, successful/error tool
+results, and encoded image bytes. Prompt or tool content is never logged.
+
+`extract_tokens.py` aggregates these records into each task summary, including
+actual prompt occupancy, context coverage/growth, component exposure, tool-loop
+call count, and final-call count. Old logs remain valid and report no context
+coverage instead of treating missing measurements as zero.
+
+Compare repeated baseline and candidate run directories with:
+
+```sh
+python3 context_compare.py \
+  --baseline results/<baseline-r1> results/<baseline-r2> \
+  --candidate results/<candidate-r1> results/<candidate-r2>
+```
+
+The comparison uses a symmetric two-factor decomposition:
+
+- call-count effect — additional/fewer model requests at the average context;
+- mean-context effect — larger/smaller requests at the average call count.
+
+The two effects sum exactly to the total prompt-token difference.
+
+## Optimization lineage policy
+
+Every optimization benchmark must append a stage to
+[`results/optimization-lineage.md`](results/optimization-lineage.md) before
+shipping. Do not overwrite prior stages.
+
+Record both:
+
+- immediate delta from the directly preceding implementation;
+- cumulative delta from the original comparable baseline.
+
+Include per-task regressions even when the aggregate improves. Stages with
+different task sets, providers, models, thinking levels, fixture commits, or
+correctness gates must use separate scope fingerprints and must not be compared
+as one continuous total.
+
+### SQLite benchmark database
+
+The tracked machine-readable source is `benchmarks/optimization-lineage.json`.
+Synchronize it and any available raw run directories into the private local
+database:
+
+```sh
+python3 benchmarks/benchmark_db.py \
+  --db ~/.daimonos/benchmarks.db \
+  sync \
+  --manifest benchmarks/optimization-lineage.json \
+  --results-dir benchmarks/results
+```
+
+The database is created with mode `0600`; it is local and never committed.
+
+```sh
+# List immutable stages
+python3 benchmarks/benchmark_db.py --db ~/.daimonos/benchmarks.db list
+
+# Compare matching stages, including every per-task regression
+python3 benchmarks/benchmark_db.py \
+  --db ~/.daimonos/benchmarks.db compare F0 F1
+
+# Query directly
+sqlite3 ~/.daimonos/benchmarks.db
+```
+
+`compare` rejects stages with different scope or task-set fingerprints.
 
 ## Environment variables
 

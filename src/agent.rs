@@ -147,6 +147,14 @@ pub struct TokenLogConfig {
     pub label: String,
 }
 
+struct GenerationLogMetadata<'a> {
+    kind: &'a str,
+    ordinal: u64,
+    stop_reason: &'a StopReason,
+    response_tool_calls: usize,
+    context: &'a crate::context_metrics::ContextComposition,
+}
+
 // --- Config and Result ---
 
 #[derive(Default)]
@@ -258,8 +266,13 @@ fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> Stri
 }
 
 /// Render one `--debug-tokens` log line for a single LLM API call.
-fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
-    serde_json::json!({
+fn token_log_line(
+    label: &str,
+    model: &str,
+    usage: &Usage,
+    metadata: Option<&GenerationLogMetadata<'_>>,
+) -> String {
+    let mut line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "cmd": label,
         "model": model,
@@ -272,15 +285,28 @@ fn token_log_line(label: &str, model: &str, usage: &Usage) -> String {
         // in scientific notation (e.g. 3e-6), which is diff-unfriendly and awkward
         // to parse. Six decimals = microdollar precision, enough for per-call cost.
         "cost_usd": format!("{:.6}", usage.cost.total_usd),
-    })
-    .to_string()
+    });
+    if let Some(metadata) = metadata {
+        line["schema_version"] = serde_json::json!(2);
+        line["generation_kind"] = serde_json::json!(metadata.kind);
+        line["ordinal"] = serde_json::json!(metadata.ordinal);
+        line["stop_reason"] = serde_json::json!(metadata.stop_reason.as_str());
+        line["response_tool_calls"] = serde_json::json!(metadata.response_tool_calls);
+        line["context"] = serde_json::to_value(metadata.context).unwrap_or(serde_json::Value::Null);
+    }
+    line.to_string()
 }
 
 /// Best-effort append of one token-usage line. Never panics or propagates
 /// I/O errors — a debug log must not be able to break the agent loop.
-fn log_token_usage(cfg: &TokenLogConfig, model: &str, usage: &Usage) {
+fn log_token_usage(
+    cfg: &TokenLogConfig,
+    model: &str,
+    usage: &Usage,
+    metadata: Option<&GenerationLogMetadata<'_>>,
+) {
     use std::io::Write;
-    let line = token_log_line(&cfg.label, model, usage);
+    let line = token_log_line(&cfg.label, model, usage, metadata);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -500,6 +526,10 @@ pub async fn run(
             tools: config.tools.clone(),
             stable_prefix_len: 0,
         };
+        let context_composition = config
+            .token_log
+            .as_ref()
+            .map(|_| crate::context_metrics::measure_context(&ctx));
 
         let ordinal = config
             .generation_ordinal
@@ -545,7 +575,25 @@ pub async fn run(
         }
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
         if let Some(log_cfg) = &config.token_log {
-            log_token_usage(log_cfg, &config.opts.model, &resp.usage);
+            let response_tool_calls = resp
+                .content
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
+                .count();
+            log_token_usage(
+                log_cfg,
+                &config.opts.model,
+                &resp.usage,
+                Some(&GenerationLogMetadata {
+                    kind: "agent",
+                    ordinal,
+                    stop_reason: &resp.stop_reason,
+                    response_tool_calls,
+                    context: context_composition
+                        .as_ref()
+                        .expect("token logging enables context measurement"),
+                }),
+            );
         }
 
         // Assistant turn appended BEFORE tool results (Anthropic API requirement)
@@ -1315,6 +1363,11 @@ impl AgentSession {
             tools: vec![],
             stable_prefix_len: 0,
         };
+        let context_composition = self
+            .config
+            .token_log
+            .as_ref()
+            .map(|_| crate::context_metrics::measure_context(&ctx));
 
         // One attempt + one retry (ADR-002 Q4); its tokens count toward the
         // session's cumulative usage like any other call. The whole loop is
@@ -1350,7 +1403,20 @@ impl AgentSession {
                 self.total_usage =
                     accumulate_usage(std::mem::take(&mut self.total_usage), resp.usage.clone());
                 if let Some(log_cfg) = &self.config.token_log {
-                    log_token_usage(log_cfg, &summary_model, &resp.usage);
+                    log_token_usage(
+                        log_cfg,
+                        &summary_model,
+                        &resp.usage,
+                        Some(&GenerationLogMetadata {
+                            kind: "compaction_summary",
+                            ordinal,
+                            stop_reason: &resp.stop_reason,
+                            response_tool_calls: 0,
+                            context: context_composition
+                                .as_ref()
+                                .expect("token logging enables context measurement"),
+                        }),
+                    );
                 }
                 if resp.error_message.is_none() {
                     let text: String = resp
@@ -2838,7 +2904,23 @@ mod tests {
                 ..Cost::default()
             },
         };
-        let line = token_log_line("chat", "claude-haiku-4-5", &usage);
+        let composition = crate::context_metrics::ContextComposition {
+            messages: 3,
+            tools_exposed: 2,
+            system_bytes: 100,
+            tool_result_ok_bytes: 200,
+            payload_bytes: 300,
+            payload_tokens_est: 75,
+            ..crate::context_metrics::ContextComposition::default()
+        };
+        let metadata = GenerationLogMetadata {
+            kind: "agent",
+            ordinal: 4,
+            stop_reason: &StopReason::ToolUse,
+            response_tool_calls: 2,
+            context: &composition,
+        };
+        let line = token_log_line("chat", "claude-haiku-4-5", &usage, Some(&metadata));
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["cmd"], "chat");
         assert_eq!(parsed["model"], "claude-haiku-4-5");
@@ -2848,6 +2930,14 @@ mod tests {
         assert_eq!(parsed["cache_read"], 3);
         assert_eq!(parsed["cache_write"], 7);
         assert_eq!(parsed["cost_usd"], "0.001200");
+        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["generation_kind"], "agent");
+        assert_eq!(parsed["ordinal"], 4);
+        assert_eq!(parsed["stop_reason"], "tool_use");
+        assert_eq!(parsed["response_tool_calls"], 2);
+        assert_eq!(parsed["context"]["messages"], 3);
+        assert_eq!(parsed["context"]["tool_result_ok_bytes"], 200);
+        assert_eq!(parsed["context"]["payload_tokens_est"], 75);
         assert!(parsed["ts"].is_string(), "must include a timestamp");
     }
 
@@ -2858,8 +2948,8 @@ mod tests {
             path: dir.path().join("tokens.log"),
             label: "agent".to_string(),
         };
-        log_token_usage(&cfg, "m1", &mock_usage(10, 5));
-        log_token_usage(&cfg, "m1", &mock_usage(20, 8));
+        log_token_usage(&cfg, "m1", &mock_usage(10, 5), None);
+        log_token_usage(&cfg, "m1", &mock_usage(20, 8), None);
         let content = std::fs::read_to_string(&cfg.path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "each call should append exactly one line");
@@ -2876,7 +2966,7 @@ mod tests {
             path: dir.path().join("nested_does_not_exist_yet.log"),
             label: "agent".to_string(),
         };
-        log_token_usage(&cfg, "m1", &mock_usage(1, 1));
+        log_token_usage(&cfg, "m1", &mock_usage(1, 1), None);
         assert!(cfg.path.exists());
     }
 
@@ -2896,7 +2986,13 @@ mod tests {
         run(&provider, shared(s), vec![Message::user("hi")], &config).await;
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(content.lines().count(), 1);
-        assert!(content.contains("\"cmd\":\"agent\""));
+        let entry: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["cmd"], "agent");
+        assert_eq!(entry["generation_kind"], "agent");
+        assert_eq!(entry["stop_reason"], "end_turn");
+        assert_eq!(entry["ordinal"], 0);
+        assert_eq!(entry["context"]["messages"], 1);
+        assert!(entry["context"]["payload_tokens_est"].as_u64().unwrap() > 0);
     }
 
     /// vikunja 1112. The catalog handed to the model advertised 19 tools the

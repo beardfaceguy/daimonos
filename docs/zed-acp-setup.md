@@ -157,7 +157,10 @@ the equivalent notice.
 - Verify the binary works standalone first: `daimonos agent "say hi"`.
 - `--debug-tokens` logs per-call token usage to
   `~/.config/daimonos/token-debug.log` if you want to inspect usage
-  independent of Zed's own display. It's a global flag, so it must come
+  independent of Zed's own display. Native-agent records also include
+  metadata-only context composition (numeric sizes/counts by category); prompt,
+  tool, image, path, and provider-state content is never logged. It's a global
+  flag, so it must come
   **before** the `acp` subcommand in `args` (unlike `--model`/`--agent-env`,
   which are `acp` subcommand options and come after):
 
