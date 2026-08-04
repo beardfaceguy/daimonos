@@ -217,6 +217,11 @@ def daimonos_factory(daimonos_binary):
     for tests that must write a ``daimonos.toml`` *before* startup (config is
     read once, at launch) or that need two processes sharing one workspace to
     exercise cross-process state. Every spawned process is torn down.
+
+    ``env`` is merged *over* the inherited environment (add/override only): it
+    cannot unset an inherited variable. A test that must hide an inherited var
+    from the child should delete it from ``os.environ`` first (e.g. pytest's
+    ``monkeypatch.delenv``, which is restored at teardown).
     """
     procs = []
 

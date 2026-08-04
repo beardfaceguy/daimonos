@@ -15,8 +15,6 @@ launch-time config effect on what ``tools/list`` returns.
 
 from __future__ import annotations
 
-import os
-
 
 def _has_properties(schema) -> bool:
     """True when a JSON Schema advertises at least one property."""
@@ -24,11 +22,12 @@ def _has_properties(schema) -> bool:
 
 
 def test_daimonos_toml_full_tool_schemas_gates_schema_exposure_at_launch(
-    daimonos_factory, tmp_path
+    daimonos_factory, tmp_path, monkeypatch
 ):
     # `full_tool_schemas` has an env override that would otherwise mask the
-    # config we write; clear it so the workspace daimonos.toml is authoritative.
-    os.environ.pop("DAIMONOS_MCP_FULL_SCHEMAS", None)
+    # config we write; clear it (auto-restored at teardown) so the workspace
+    # daimonos.toml is authoritative.
+    monkeypatch.delenv("DAIMONOS_MCP_FULL_SCHEMAS", raising=False)
 
     # Process A: no daimonos.toml -> built-in default (full_tool_schemas = false).
     ws_default = tmp_path / "default"
