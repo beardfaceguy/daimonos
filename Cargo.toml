@@ -66,6 +66,7 @@ opentelemetry_sdk = { version = "0.32.1", default-features = false, features = [
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 base64 = "0.22.1"
+ratatui = "0.29"
 
 # Only for fcntl(F_GETFL/F_SETFL) on the ACP stdin descriptor, to clear an
 # O_NONBLOCK flag a child process left behind on the shared file description.
