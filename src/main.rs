@@ -38,6 +38,7 @@ mod tool_facade;
 mod tool_output;
 mod tool_runner;
 mod tools;
+mod tui;
 mod verbosity;
 mod zed_config;
 
