@@ -314,9 +314,16 @@ mod tests {
             !mcp_only.is_empty(),
             "expected at least one McpOnly tool for this guard to be meaningful"
         );
+        // Whole-word scan rather than a backtick-only match: a bare prose
+        // mention is just as misleading to the model. Splitting on non-word
+        // characters means "`batch`" and "use batch for..." both trip, while
+        // longer words that merely contain the name (e.g. "batching") do not.
+        let words: std::collections::HashSet<&str> = AGENT_SYSTEM_DEFAULT
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .collect();
         for name in mcp_only {
             assert!(
-                !AGENT_SYSTEM_DEFAULT.contains(&format!("`{name}`")),
+                !words.contains(name),
                 "prompts/agent_system.md references `{name}`, which is \
                  ToolTier::McpOnly and therefore NOT callable from the \
                  agent/chat/ACP loop"
