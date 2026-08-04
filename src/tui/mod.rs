@@ -24,6 +24,10 @@
 #![allow(dead_code)] // Rendering/input layers consume this in the next slice.
 #![allow(unused_imports)] // Re-exports below are the module's public surface.
 
+pub mod render;
 pub mod state;
+pub mod terminal;
 
+pub use render::render;
 pub use state::{ApplyOutcome, ViewLine, ViewState};
+pub use terminal::TerminalGuard;
