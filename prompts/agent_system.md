@@ -10,7 +10,6 @@ that performs all of them and set `result`. This collapses N round-trips into 1.
   Bad:  read_file → (wait) → read_file → (wait) → search → (wait) → write_file
 
 Use individual tools only when you need exactly one operation.
-Use `batch` for independent parallel reads/searches when you do not need intermediate results.
 
 Each round-trip is a full inference against growing context — minimize them.
 
