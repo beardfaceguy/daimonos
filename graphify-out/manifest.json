@@ -470,8 +470,8 @@
     "semantic_hash": "438d6e45db829aed66343076deb0ff1e"
   },
   "tests/conftest.py": {
-    "mtime": 1785785707.264237,
-    "ast_hash": "f3785ab6960b5d1ae7f26d581c1e4530",
+    "mtime": 1785813564.384995,
+    "ast_hash": "5d1eaca5a277a0b94d2018a4e14a22c7",
     "semantic_hash": ""
   },
   "tests/test_analytics.py": {
@@ -590,7 +590,7 @@
     "semantic_hash": ""
   },
   "tests/test_server_bench_smoke.py": {
-    "mtime": 1785785157.847181,
+    "mtime": 1785811553.1381335,
     "ast_hash": "d2c35f77527c32796bbe26ee4e288de3",
     "semantic_hash": ""
   },
@@ -705,7 +705,7 @@
     "semantic_hash": ""
   },
   "benchmarks/server-bench/README.md": {
-    "mtime": 1785785168.240069,
+    "mtime": 1785811553.1281335,
     "ast_hash": "23ce82a59f62d086baa2deb0e354fbcb",
     "semantic_hash": ""
   },
@@ -750,8 +750,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785785683.656493,
-    "ast_hash": "885eb32565d265768376d3724713385b",
+    "mtime": 1785813564.281996,
+    "ast_hash": "b3d432299aa4ac1d9a74b6b4402a4b62",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -1060,7 +1060,7 @@
     "semantic_hash": ""
   },
   "benchmarks/results/optimization-lineage.md": {
-    "mtime": 1785786110.0078719,
+    "mtime": 1785813564.202997,
     "ast_hash": "e1084eb5bb0ca1d10b3a326576f100dd",
     "semantic_hash": ""
   },
@@ -1070,7 +1070,7 @@
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {
-    "mtime": 1785786099.931981,
+    "mtime": 1785813564.202997,
     "ast_hash": "2de8a1573915a982d1e66c959d064ba2",
     "semantic_hash": ""
   },
@@ -1084,9 +1084,9 @@
     "ast_hash": "ddc377a21c0d6847f2166c3e4075dce7",
     "semantic_hash": ""
   },
-  "benchmarks/server-bench/index_bench.py": {
-    "mtime": 1785793709.7498436,
-    "ast_hash": "78830bae7f5c7260703d76827191bd3e",
+  "tests/test_tool_provisioning.py": {
+    "mtime": 1785813564.385995,
+    "ast_hash": "bce00129d13f61f69d62b7d8346f0ef2",
     "semantic_hash": ""
   },
   "HANDOFF_unified_tool_provisioning.md": {
@@ -1094,8 +1094,13 @@
     "ast_hash": "b18a81748522565f8ec5d22188d05a34",
     "semantic_hash": ""
   },
+  "benchmarks/server-bench/index_bench.py": {
+    "mtime": 1785811553.1281335,
+    "ast_hash": "78830bae7f5c7260703d76827191bd3e",
+    "semantic_hash": ""
+  },
   "benchmarks/results/2026-08-03-index-lifecycle.md": {
-    "mtime": 1785786039.5686352,
+    "mtime": 1785811553.1271336,
     "ast_hash": "6ab255a6d39f15f7e46ec53f06272ac0",
     "semantic_hash": ""
   }

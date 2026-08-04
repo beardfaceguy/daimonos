@@ -77,6 +77,33 @@ class DaimonosClient:
         return resp.get("result", {}).get("tools", [])
 
 
+def _handshake(proc, workspace) -> DaimonosClient:
+    """Wrap a spawned daimonos process in a client and run the MCP handshake."""
+    client = DaimonosClient(proc, str(workspace))
+    init_resp = client.send_raw({
+        "jsonrpc": "2.0",
+        "id": client._next_id(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1.0.0"},
+        },
+    })
+    assert "result" in init_resp, f"initialize failed: {init_resp}"
+    client.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    return client
+
+
+def _terminate(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _find_binary():
     """Return path to daimonos binary, building if necessary."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -178,3 +205,41 @@ def daimonos_observe(daimonos_binary, tmp_path):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+@pytest.fixture
+def daimonos_factory(daimonos_binary):
+    """Spawn one *or more* daimonos MCP subprocesses within a single test.
+
+    Yields a ``spawn(workspace, env=None, args=None)`` callable returning a
+    handshaken :class:`DaimonosClient`. Unlike the single-process ``daimonos``
+    fixture, the caller controls the workspace and the spawn moment - required
+    for tests that must write a ``daimonos.toml`` *before* startup (config is
+    read once, at launch) or that need two processes sharing one workspace to
+    exercise cross-process state. Every spawned process is torn down.
+
+    ``env`` is merged *over* the inherited environment (add/override only): it
+    cannot unset an inherited variable. A test that must hide an inherited var
+    from the child should delete it from ``os.environ`` first (e.g. pytest's
+    ``monkeypatch.delenv``, which is restored at teardown).
+    """
+    procs = []
+
+    def spawn(workspace, env=None, args=None):
+        cmd = [daimonos_binary, "--mcp", "-w", str(workspace)]
+        if args:
+            cmd.extend(args)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, **(env or {})} if env else None,
+        )
+        procs.append(proc)
+        return _handshake(proc, workspace)
+
+    yield spawn
+
+    for proc in procs:
+        _terminate(proc)
