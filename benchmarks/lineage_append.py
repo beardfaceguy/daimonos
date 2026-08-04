@@ -102,6 +102,11 @@ def aggregate(run_dirs):
                 models[m] = models.get(m, 0) + 1
             if s.get("correct") is True:
                 correct_task_runs += 1
+            # Per-task summary keys are written by extract_tokens.py / the bench
+            # runners: fresh input is `input` (a `prompt_tokens` alias may also
+            # be present), model output is `output`, plus `cache_read`,
+            # `cache_write`, `total_tokens`, `cost_usd`, `wall_ms`, `llm_calls`.
+            # Stored metric names differ intentionally (e.g. `mean_fresh_input_tokens`).
             tok += num(s.get("total_tokens")) or 0
             wall += num(s.get("wall_ms")) or 0
             out += num(s.get("output")) or 0
