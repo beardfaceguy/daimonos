@@ -14,9 +14,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
-use crate::session_protocol::{ToolCallStateStatus, TranscriptRole, TurnStatus};
+use crate::session_protocol::{
+    RuntimeOption, RuntimeOptionSpec, RuntimeValue, ToolCallStateStatus, TranscriptRole, TurnStatus,
+};
 use crate::tui::state::ViewState;
 
 /// Render the whole TUI frame for `state` into `area` of `buf`.
@@ -36,6 +38,10 @@ pub fn render(state: &ViewState, composer: &str, area: Rect, buf: &mut Buffer) {
     render_transcript(state, chunks[0], buf);
     render_status(state, chunks[1], buf);
     render_composer(composer, chunks[2], buf);
+    // Overlay last so it sits above every base layer. It is the one thing a
+    // human must act on, and ADR-011 keeps approval authority with the local
+    // TUI regardless of which client ultimately answers.
+    render_approval_modal(state, area, buf);
 }
 
 fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
@@ -80,21 +86,8 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_status(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    // Approval need dominates the status line — it is the one thing a human
-    // must act on. Full modal overlay is phase 4; this is the banner.
-    if let Some(approval) = state.active_approval() {
-        let text = format!(" APPROVAL NEEDED · {} — press a to review ", approval.tool);
-        Paragraph::new(Line::from(sanitize(&text)))
-            .style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .render(area, buf);
-        return;
-    }
-
+    // A pending approval is surfaced by the modal overlay (drawn last in
+    // `render`), so the status line stays purely informational here.
     let turn = turn_label(state.turn_status());
     let usage = state
         .context_usage()
@@ -102,10 +95,110 @@ fn render_status(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .map(|bp| format!("ctx {}%", bp / 100))
         .unwrap_or_else(|| "ctx --".to_string());
     let session = state.session_id();
-    let text = format!(" {turn} · {usage} · session {session} ");
+    let model = current_model(state)
+        .map(|m| format!("{m} · "))
+        .unwrap_or_default();
+    let text = format!(" {turn} · {model}{usage} · session {session} ");
     Paragraph::new(Line::from(sanitize(&text)))
         .style(Style::default().fg(Color::White).bg(Color::Blue))
         .render(area, buf);
+}
+
+/// Centered sub-rectangle of `area`, clamped so it never exceeds the frame.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
+/// Human-readable current value of a runtime option (resolves a `Select`
+/// option's chosen id to its label).
+fn option_display(option: &RuntimeOption) -> String {
+    let raw = match &option.value {
+        RuntimeValue::String(s) => s.clone(),
+        RuntimeValue::Bool(b) => b.to_string(),
+        RuntimeValue::Integer(i) => i.to_string(),
+    };
+    if let RuntimeOptionSpec::Select { choices } = &option.spec {
+        if let Some(choice) = choices.iter().find(|c| c.id == raw) {
+            return choice.label.clone();
+        }
+    }
+    raw
+}
+
+fn current_model(state: &ViewState) -> Option<String> {
+    state
+        .runtime_options()
+        .iter()
+        .find(|o| o.id == "model")
+        .map(option_display)
+}
+
+/// Centered modal for the active approval request. No-op when none is pending.
+fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let Some(approval) = state.active_approval() else {
+        return;
+    };
+    let modal = centered_rect(60, 9, area);
+    // Clear the cells under the modal so the transcript does not bleed through.
+    Clear.render(modal, buf);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("tool: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                sanitize(&approval.tool),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(String::new()),
+    ];
+    for part in sanitize(&approval.detail).split('\n') {
+        lines.push(Line::from(part.to_string()));
+    }
+    lines.push(Line::from(String::new()));
+
+    let mut options = vec![
+        Span::styled(
+            "[y]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" allow once   "),
+        Span::styled(
+            "[n]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" deny"),
+    ];
+    if approval.allow_always_available {
+        options.push(Span::raw("   "));
+        options.push(Span::styled(
+            "[a]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        options.push(Span::raw(" allow always"));
+    }
+    lines.push(Line::from(options));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Approval required")
+        .border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .render(modal, buf);
 }
 
 fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
@@ -306,23 +399,17 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_prioritizes_pending_approval() {
-        use crate::session_protocol::ApprovalRequest;
-        let mut state = ViewState::new("sess-1");
-        let request = ApprovalRequest {
-            id: "a1".into(),
-            tool_call_id: "t1".into(),
-            tool: "exec".into(),
-            detail: "rm -rf /tmp/x".into(),
-            allow_always_available: true,
-        };
-        state.apply_event(1, SessionEvent::ApprovalRequested { request });
-        let out = render_to_string(&state, "", 60, 12);
-        assert!(
-            out.contains("APPROVAL NEEDED"),
-            "approval banner missing:\n{out}"
-        );
+    fn pending_approval_shows_modal_over_informational_status() {
+        // The modal is the approval surface; the status line stays
+        // informational (session id still visible) rather than being hijacked.
+        let state = approval_state(true, "rm -rf /tmp/x");
+        let out = render_to_string(&state, "", 72, 22);
+        assert!(out.contains("Approval required"), "modal missing:\n{out}");
         assert!(out.contains("exec"), "approval tool missing:\n{out}");
+        assert!(
+            out.contains("sess-1"),
+            "status line should still show the session id:\n{out}"
+        );
     }
 
     #[test]
@@ -348,6 +435,80 @@ mod tests {
         assert!(
             out.contains("draft message"),
             "composer text missing:\n{out}"
+        );
+    }
+
+    fn approval_state(allow_always: bool, detail: &str) -> ViewState {
+        use crate::session_protocol::ApprovalRequest;
+        let mut state = ViewState::new("sess-1");
+        state.apply_event(
+            1,
+            SessionEvent::ApprovalRequested {
+                request: ApprovalRequest {
+                    id: "a1".into(),
+                    tool_call_id: "t1".into(),
+                    tool: "exec".into(),
+                    detail: detail.into(),
+                    allow_always_available: allow_always,
+                },
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn approval_modal_renders_detail_and_options() {
+        let state = approval_state(true, "rm -rf /tmp/x");
+        let out = render_to_string(&state, "", 72, 18);
+        assert!(
+            out.contains("Approval required"),
+            "modal title missing:\n{out}"
+        );
+        assert!(out.contains("exec"), "tool missing:\n{out}");
+        assert!(out.contains("rm -rf /tmp/x"), "detail missing:\n{out}");
+        assert!(out.contains("[y]"), "allow-once key missing:\n{out}");
+        assert!(out.contains("[n]"), "deny key missing:\n{out}");
+        assert!(out.contains("[a]"), "allow-always key missing:\n{out}");
+    }
+
+    #[test]
+    fn approval_modal_hides_allow_always_when_gated() {
+        let state = approval_state(false, "touch x");
+        let out = render_to_string(&state, "", 72, 18);
+        assert!(out.contains("[y]"), "allow-once key missing:\n{out}");
+        assert!(
+            !out.contains("[a]"),
+            "allow-always must be hidden when host-gated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn approval_modal_sanitizes_detail() {
+        let state = approval_state(true, "danger \x1b[2J wipe");
+        let out = render_to_string(&state, "", 72, 18);
+        assert!(!out.contains('\x1b'), "escape leaked through modal:\n{out}");
+    }
+
+    #[test]
+    fn status_bar_shows_current_model() {
+        use crate::session_protocol::{RuntimeChoice, RuntimeOption, RuntimeValue};
+        let mut state = ViewState::new("sess-1");
+        let option = RuntimeOption::select(
+            "model",
+            "Model",
+            RuntimeValue::String("opus-5".into()),
+            vec![RuntimeChoice::new("opus-5", "Claude Opus 5")],
+        );
+        state.apply_event(
+            1,
+            SessionEvent::RuntimeOptionsChanged {
+                options: vec![option],
+            },
+        );
+        let out = render_to_string(&state, "", 72, 12);
+        assert!(
+            out.contains("Claude Opus 5"),
+            "resolved model label missing from status bar:\n{out}"
         );
     }
 }
