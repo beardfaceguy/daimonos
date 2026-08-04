@@ -1070,8 +1070,8 @@
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {
-    "mtime": 1785786099.931981,
-    "ast_hash": "2de8a1573915a982d1e66c959d064ba2",
+    "mtime": 1785807032.1177838,
+    "ast_hash": "5ebcdb3b350d8b42264db113cb5e6980",
     "semantic_hash": ""
   },
   "tests/test_benchmark_db.py": {
@@ -1097,6 +1097,26 @@
   "benchmarks/results/2026-08-03-index-lifecycle.md": {
     "mtime": 1785786039.5686352,
     "ast_hash": "6ab255a6d39f15f7e46ec53f06272ac0",
+    "semantic_hash": ""
+  },
+  "benchmarks/bench-ab.sh": {
+    "mtime": 1785801734.1875253,
+    "ast_hash": "0bb23c9ed0ac6b00c72cb4e4e4fe5ddb",
+    "semantic_hash": ""
+  },
+  "benchmarks/lineage_append.py": {
+    "mtime": 1785804027.577771,
+    "ast_hash": "7d56ca00cde0a8b5e39051df2c38af2d",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-03-cache-on-126-vs-f3.md": {
+    "mtime": 1785807032.1171117,
+    "ast_hash": "971f8c22f0d33884e09e452dff4eb48c",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-03-post-126-vs-f0.md": {
+    "mtime": 1785805485.2248864,
+    "ast_hash": "d5f4ad8de0cfcd931ab8ffcdf782fa5c",
     "semantic_hash": ""
   }
 }

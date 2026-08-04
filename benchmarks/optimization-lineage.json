@@ -33,10 +33,22 @@
         "20260731-213940-agent-pre-1193-1194-anthropic-baseline-r3"
       ],
       "metrics": {
-        "mean_total_tokens": [416652.3333333333, "tokens"],
-        "mean_cost_usd": [2.255455, "usd"],
-        "mean_wall_ms": [145666.6666666667, "milliseconds"],
-        "correct_task_runs": [33, "count"]
+        "mean_total_tokens": [
+          416652.3333333333,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          2.255455,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          145666.6666666667,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          33,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -78,10 +90,22 @@
         "20260731-214457-agent-post-1193-1194-r3"
       ],
       "metrics": {
-        "mean_total_tokens": [427627.6666666667, "tokens"],
-        "mean_cost_usd": [2.306165, "usd"],
-        "mean_wall_ms": [146666.6666666667, "milliseconds"],
-        "correct_task_runs": [33, "count"]
+        "mean_total_tokens": [
+          427627.6666666667,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          2.306165,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          146666.6666666667,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          33,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -123,16 +147,46 @@
         "20260803-082911-agent-context-947-full-cache-r3"
       ],
       "metrics": {
-        "mean_total_tokens": [402699, "tokens"],
-        "mean_prompt_tokens": [394135.6666666667, "tokens"],
-        "mean_fresh_input_tokens": [56503.6666666667, "tokens"],
-        "mean_cache_write_tokens": [3517, "tokens"],
-        "mean_cache_read_tokens": [334115, "tokens"],
-        "mean_output_tokens": [8563.3333333333, "tokens"],
-        "mean_llm_calls": [32, "count"],
-        "mean_cost_usd": [0.685636, "usd"],
-        "mean_wall_ms": [156000, "milliseconds"],
-        "correct_task_runs": [33, "count"]
+        "mean_total_tokens": [
+          402699,
+          "tokens"
+        ],
+        "mean_prompt_tokens": [
+          394135.6666666667,
+          "tokens"
+        ],
+        "mean_fresh_input_tokens": [
+          56503.6666666667,
+          "tokens"
+        ],
+        "mean_cache_write_tokens": [
+          3517,
+          "tokens"
+        ],
+        "mean_cache_read_tokens": [
+          334115,
+          "tokens"
+        ],
+        "mean_output_tokens": [
+          8563.3333333333,
+          "tokens"
+        ],
+        "mean_llm_calls": [
+          32,
+          "count"
+        ],
+        "mean_cost_usd": [
+          0.685636,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          156000,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          33,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -156,8 +210,14 @@
       "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
       "run_dirs": [],
       "metrics": {
-        "agent_model_visible_tokens": [147899, "tokens"],
-        "mcp_model_visible_bytes": [360248, "bytes"]
+        "agent_model_visible_tokens": [
+          147899,
+          "tokens"
+        ],
+        "mcp_model_visible_bytes": [
+          360248,
+          "bytes"
+        ]
       },
       "artifacts": [
         {
@@ -181,12 +241,30 @@
       "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
       "run_dirs": [],
       "metrics": {
-        "agent_model_visible_tokens": [38432, "tokens"],
-        "agent_token_reduction_pct": [74.0146992204, "percent"],
-        "mcp_model_visible_bytes": [102514, "bytes"],
-        "mcp_byte_reduction_pct": [71.5434922609, "percent"],
-        "offload_files": [8, "count"],
-        "pruned_results": [7, "count"]
+        "agent_model_visible_tokens": [
+          38432,
+          "tokens"
+        ],
+        "agent_token_reduction_pct": [
+          74.0146992204,
+          "percent"
+        ],
+        "mcp_model_visible_bytes": [
+          102514,
+          "bytes"
+        ],
+        "mcp_byte_reduction_pct": [
+          71.5434922609,
+          "percent"
+        ],
+        "offload_files": [
+          8,
+          "count"
+        ],
+        "pruned_results": [
+          7,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -205,7 +283,9 @@
       "provider": "anthropic",
       "model": "claude-opus-4-8",
       "thinking": "medium",
-      "task_ids": ["04-explore-architecture"],
+      "task_ids": [
+        "04-explore-architecture"
+      ],
       "binary_sha256": "8b97ff0e19c626c25125914085500c125994c5b9afd2872f2eba255b08ac6c81",
       "git_commit": "c3d103a63aaade00472f7b2a289e0513a446ad64",
       "run_dirs": [
@@ -214,9 +294,18 @@
         "20260731-213940-agent-pre-1193-1194-anthropic-baseline-r3"
       ],
       "metrics": {
-        "mean_total_tokens": [42569.3333333333, "tokens"],
-        "mean_cost_usd": [0.2626733333333333, "usd"],
-        "mean_wall_ms": [37333.3333333333, "milliseconds"]
+        "mean_total_tokens": [
+          42569.3333333333,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.2626733333333333,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          37333.3333333333,
+          "milliseconds"
+        ]
       }
     },
     {
@@ -228,7 +317,9 @@
       "provider": "anthropic",
       "model": "claude-opus-4-8",
       "thinking": "medium",
-      "task_ids": ["04-explore-architecture"],
+      "task_ids": [
+        "04-explore-architecture"
+      ],
       "binary_sha256": "56714a241b7488299c5a6e7c77f1039a0ee26750605989a1d211b5133de5db39",
       "git_commit": "c32949fbb77e89c88ae24d817bcf76bc700a2a9d",
       "run_dirs": [
@@ -237,9 +328,18 @@
         "20260731-214457-agent-post-1193-1194-r3"
       ],
       "metrics": {
-        "mean_total_tokens": [56569, "tokens"],
-        "mean_cost_usd": [0.3327583333333333, "usd"],
-        "mean_wall_ms": [38666.6666666667, "milliseconds"]
+        "mean_total_tokens": [
+          56569,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.3327583333333333,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          38666.6666666667,
+          "milliseconds"
+        ]
       }
     },
     {
@@ -251,7 +351,9 @@
       "provider": "anthropic",
       "model": "claude-opus-4-8",
       "thinking": "medium",
-      "task_ids": ["04-explore-architecture"],
+      "task_ids": [
+        "04-explore-architecture"
+      ],
       "binary_sha256": "7f7c16d19afcffe40c2b4be051045a9fd537aaa11809a0f094779bcf281eda9a",
       "git_commit": "6c634e31675f5aaaea250195aae13d23c33aa501",
       "report_path": "benchmarks/results/2026-08-01-native-context-cache.md",
@@ -262,10 +364,22 @@
         "20260801-183028-agent-context-947-baseline-r4"
       ],
       "metrics": {
-        "mean_total_tokens": [42459, "tokens"],
-        "mean_cost_usd": [0.25999, "usd"],
-        "mean_wall_ms": [38500, "milliseconds"],
-        "mean_prompt_tokens_per_call": [13358.0833333333, "tokens_per_call"]
+        "mean_total_tokens": [
+          42459,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.25999,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          38500,
+          "milliseconds"
+        ],
+        "mean_prompt_tokens_per_call": [
+          13358.0833333333,
+          "tokens_per_call"
+        ]
       },
       "artifacts": [
         {
@@ -284,7 +398,9 @@
       "provider": "anthropic",
       "model": "claude-opus-4-8",
       "thinking": "medium",
-      "task_ids": ["04-explore-architecture"],
+      "task_ids": [
+        "04-explore-architecture"
+      ],
       "binary_sha256": "78f17525baa9bc6d73f3d459d0d4067f21d2c3ce6f045ee712678dda33a4bbc9",
       "git_commit": "6c634e31675f5aaaea250195aae13d23c33aa501",
       "report_path": "benchmarks/results/2026-08-01-native-context-cache.md",
@@ -295,12 +411,30 @@
         "20260801-183202-agent-context-947-candidate-r4"
       ],
       "metrics": {
-        "mean_total_tokens": [51995.25, "tokens"],
-        "mean_cost_usd": [0.14796025, "usd"],
-        "mean_wall_ms": [38000, "milliseconds"],
-        "fresh_input_reduction_pct": [75.3, "percent"],
-        "cost_reduction_pct": [43.09, "percent"],
-        "mean_prompt_tokens_per_call": [13187.2, "tokens_per_call"]
+        "mean_total_tokens": [
+          51995.25,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.14796025,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          38000,
+          "milliseconds"
+        ],
+        "fresh_input_reduction_pct": [
+          75.3,
+          "percent"
+        ],
+        "cost_reduction_pct": [
+          43.09,
+          "percent"
+        ],
+        "mean_prompt_tokens_per_call": [
+          13187.2,
+          "tokens_per_call"
+        ]
       },
       "artifacts": [
         {
@@ -319,24 +453,61 @@
       "provider": null,
       "model": null,
       "thinking": null,
-      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "task_ids": [
+        "small",
+        "large-unmarked",
+        "large-marked"
+      ],
       "binary_sha256": "3448d9aea0399edb944b59bef262220c294cc7404c1553b6caec99c009ab02c8",
       "git_commit": "53339f9dfbe468e5059439bb2b1e3403e3c41bd7",
       "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
       "created_at": "2026-08-03T19:38:53Z",
       "run_dirs": [],
       "metrics": {
-        "correct_profile_runs": [30, "count"],
-        "small_startup_median_ms": [228.399947, "milliseconds"],
-        "small_ready_median_ms": [0.856903, "milliseconds"],
-        "small_warm_median_ms": [0.016871, "milliseconds"],
-        "small_peak_rss_median_kb": [22170, "kibibytes"],
-        "large_unmarked_startup_median_ms": [226.321175, "milliseconds"],
-        "large_unmarked_correct_runs": [0, "count"],
-        "large_unmarked_peak_rss_median_kb": [21698, "kibibytes"],
-        "large_marked_startup_median_ms": [244.522544, "milliseconds"],
-        "large_marked_correct_runs": [0, "count"],
-        "large_marked_peak_rss_median_kb": [22362, "kibibytes"]
+        "correct_profile_runs": [
+          30,
+          "count"
+        ],
+        "small_startup_median_ms": [
+          228.399947,
+          "milliseconds"
+        ],
+        "small_ready_median_ms": [
+          0.856903,
+          "milliseconds"
+        ],
+        "small_warm_median_ms": [
+          0.016871,
+          "milliseconds"
+        ],
+        "small_peak_rss_median_kb": [
+          22170,
+          "kibibytes"
+        ],
+        "large_unmarked_startup_median_ms": [
+          226.321175,
+          "milliseconds"
+        ],
+        "large_unmarked_correct_runs": [
+          0,
+          "count"
+        ],
+        "large_unmarked_peak_rss_median_kb": [
+          21698,
+          "kibibytes"
+        ],
+        "large_marked_startup_median_ms": [
+          244.522544,
+          "milliseconds"
+        ],
+        "large_marked_correct_runs": [
+          0,
+          "count"
+        ],
+        "large_marked_peak_rss_median_kb": [
+          22362,
+          "kibibytes"
+        ]
       },
       "artifacts": [
         {
@@ -360,20 +531,45 @@
       "provider": null,
       "model": null,
       "thinking": null,
-      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "task_ids": [
+        "small",
+        "large-unmarked",
+        "large-marked"
+      ],
       "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
       "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
       "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
       "created_at": "2026-08-03T19:38:53Z",
       "run_dirs": [],
       "metrics": {
-        "correct_profile_runs": [90, "count"],
-        "small_startup_median_ms": [226.493211, "milliseconds"],
-        "small_ready_median_ms": [0.507517, "milliseconds"],
-        "small_warm_median_ms": [0.023985, "milliseconds"],
-        "large_unmarked_ready_median_ms": [0.591658, "milliseconds"],
-        "large_marked_ready_median_ms": [0.680634, "milliseconds"],
-        "max_inotify_watches": [42, "count"]
+        "correct_profile_runs": [
+          90,
+          "count"
+        ],
+        "small_startup_median_ms": [
+          226.493211,
+          "milliseconds"
+        ],
+        "small_ready_median_ms": [
+          0.507517,
+          "milliseconds"
+        ],
+        "small_warm_median_ms": [
+          0.023985,
+          "milliseconds"
+        ],
+        "large_unmarked_ready_median_ms": [
+          0.591658,
+          "milliseconds"
+        ],
+        "large_marked_ready_median_ms": [
+          0.680634,
+          "milliseconds"
+        ],
+        "max_inotify_watches": [
+          42,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -397,20 +593,45 @@
       "provider": null,
       "model": null,
       "thinking": null,
-      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "task_ids": [
+        "small",
+        "large-unmarked",
+        "large-marked"
+      ],
       "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
       "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
       "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
       "created_at": "2026-08-03T19:38:53Z",
       "run_dirs": [],
       "metrics": {
-        "correct_profile_runs": [90, "count"],
-        "small_startup_median_ms": [226.071494, "milliseconds"],
-        "small_ready_median_ms": [2.678786, "milliseconds"],
-        "small_warm_median_ms": [0.024521, "milliseconds"],
-        "large_unmarked_ready_median_ms": [8.130284, "milliseconds"],
-        "large_marked_ready_median_ms": [8.623008, "milliseconds"],
-        "max_inotify_watches": [21, "count"]
+        "correct_profile_runs": [
+          90,
+          "count"
+        ],
+        "small_startup_median_ms": [
+          226.071494,
+          "milliseconds"
+        ],
+        "small_ready_median_ms": [
+          2.678786,
+          "milliseconds"
+        ],
+        "small_warm_median_ms": [
+          0.024521,
+          "milliseconds"
+        ],
+        "large_unmarked_ready_median_ms": [
+          8.130284,
+          "milliseconds"
+        ],
+        "large_marked_ready_median_ms": [
+          8.623008,
+          "milliseconds"
+        ],
+        "max_inotify_watches": [
+          21,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -434,27 +655,73 @@
       "provider": null,
       "model": null,
       "thinking": null,
-      "task_ids": ["small", "large-unmarked", "large-marked"],
+      "task_ids": [
+        "small",
+        "large-unmarked",
+        "large-marked"
+      ],
       "binary_sha256": "f1107f130d908233e08bf15ced6ea203735e624ce3e54efce79ff9c542a818ba",
       "git_commit": "cc6ecb36f7d342838053d2f46ad424b3296fd4d9",
       "report_path": "benchmarks/results/2026-08-03-index-lifecycle.md",
       "created_at": "2026-08-03T19:38:53Z",
       "run_dirs": [],
       "metrics": {
-        "correct_profile_runs": [90, "count"],
-        "small_startup_median_ms": [229.410201, "milliseconds"],
-        "small_ready_median_ms": [0.447394, "milliseconds"],
-        "small_warm_median_ms": [0.025567, "milliseconds"],
-        "small_peak_rss_median_kb": [22480, "kibibytes"],
-        "large_unmarked_startup_median_ms": [227.355704, "milliseconds"],
-        "large_unmarked_ready_median_ms": [7.780792, "milliseconds"],
-        "large_unmarked_warm_median_ms": [0.115726, "milliseconds"],
-        "large_unmarked_peak_rss_median_kb": [23184, "kibibytes"],
-        "large_marked_startup_median_ms": [244.034173, "milliseconds"],
-        "large_marked_ready_median_ms": [0.651861, "milliseconds"],
-        "large_marked_warm_median_ms": [0.122638, "milliseconds"],
-        "large_marked_peak_rss_median_kb": [23196, "kibibytes"],
-        "max_inotify_watches": [42, "count"]
+        "correct_profile_runs": [
+          90,
+          "count"
+        ],
+        "small_startup_median_ms": [
+          229.410201,
+          "milliseconds"
+        ],
+        "small_ready_median_ms": [
+          0.447394,
+          "milliseconds"
+        ],
+        "small_warm_median_ms": [
+          0.025567,
+          "milliseconds"
+        ],
+        "small_peak_rss_median_kb": [
+          22480,
+          "kibibytes"
+        ],
+        "large_unmarked_startup_median_ms": [
+          227.355704,
+          "milliseconds"
+        ],
+        "large_unmarked_ready_median_ms": [
+          7.780792,
+          "milliseconds"
+        ],
+        "large_unmarked_warm_median_ms": [
+          0.115726,
+          "milliseconds"
+        ],
+        "large_unmarked_peak_rss_median_kb": [
+          23184,
+          "kibibytes"
+        ],
+        "large_marked_startup_median_ms": [
+          244.034173,
+          "milliseconds"
+        ],
+        "large_marked_ready_median_ms": [
+          0.651861,
+          "milliseconds"
+        ],
+        "large_marked_warm_median_ms": [
+          0.122638,
+          "milliseconds"
+        ],
+        "large_marked_peak_rss_median_kb": [
+          23196,
+          "kibibytes"
+        ],
+        "max_inotify_watches": [
+          42,
+          "count"
+        ]
       },
       "artifacts": [
         {
@@ -466,6 +733,160 @@
           "path": "benchmarks/results/2026-08-03-index-lifecycle-r4.json",
           "sha256": "59134d3f09318c0170785a3f52eb4a0501c93673e6a6c01bde411c86c39e85ee",
           "kind": "raw_aggregate"
+        }
+      ]
+    },
+    {
+      "id": "F3",
+      "parent": "F0",
+      "feature": "Post-round #126 full-suite, 3-run mean (orphan-repair, tool-output bounding, lazy indexing); prompt-cache OFF - directly comparable to F0",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "c40b74b9165e2507db7ac9f84f90f149fa4f1f413f4a92a0a38cbfff277e4c3f",
+      "git_commit": "a31e4703a07364bd67cf5fd96926c44c22cfbff5",
+      "created_at": "2026-08-04T01:04:10Z",
+      "run_dirs": [
+        "20260803-173644-agent-post-opt-126-full",
+        "20260803-175841-agent-post-opt-126-full",
+        "20260803-180114-agent-post-opt-126-full"
+      ],
+      "metrics": {
+        "mean_total_tokens": [
+          414881.3333333333,
+          "tokens"
+        ],
+        "mean_fresh_input_tokens": [
+          406170.0,
+          "tokens"
+        ],
+        "mean_cache_read_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_cache_write_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_output_tokens": [
+          8711.333333333334,
+          "tokens"
+        ],
+        "mean_llm_calls": [
+          32.666666666666664,
+          "count"
+        ],
+        "mean_cost_usd": [
+          2.2486333333333333,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          145000.0,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          33,
+          "count"
+        ]
+      },
+      "report_path": "benchmarks/results/2026-08-03-post-126-vs-f0.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-post-126-vs-f0.md",
+          "sha256": "b01d15a57d80f1a05d7cb935f39905b50cfbbaab14dd13df12e99e3173c9fe92",
+          "kind": "comparison"
+        }
+      ]
+    },
+    {
+      "id": "F4",
+      "parent": "F3",
+      "feature": "Cache-ON variant of #126 full-suite, 3-run mean (Anthropic tool-prefix caching enabled). Same binary/scope as F3 with prompt-cache ON - isolates the caching cost effect.",
+      "scope_fingerprint": "agent-full11-v1|anthropic|claude-opus-4-8|medium|compaction-off",
+      "benchmark_kind": "full_suite",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "01-read-understand",
+        "02-search-usages",
+        "03-edit-rename",
+        "04-explore-architecture",
+        "05-execute-tests",
+        "06-git-status",
+        "07-snapshot-rollback",
+        "08-exec-cargo-test",
+        "09-exec-git-log",
+        "10-exec-build-check",
+        "11-exec-multi-command"
+      ],
+      "binary_sha256": "c40b74b9165e2507db7ac9f84f90f149fa4f1f413f4a92a0a38cbfff277e4c3f",
+      "git_commit": "a31e4703a07364bd67cf5fd96926c44c22cfbff5",
+      "created_at": "2026-08-04T01:29:56Z",
+      "run_dirs": [
+        "20260803-182221-agent-post-opt-126-cache-on",
+        "20260803-182456-agent-post-opt-126-cache-on",
+        "20260803-182714-agent-post-opt-126-cache-on"
+      ],
+      "metrics": {
+        "mean_total_tokens": [
+          409464.6666666667,
+          "tokens"
+        ],
+        "mean_fresh_input_tokens": [
+          58609.0,
+          "tokens"
+        ],
+        "mean_cache_read_tokens": [
+          342345.3333333333,
+          "tokens"
+        ],
+        "mean_cache_write_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_output_tokens": [
+          8510.333333333334,
+          "tokens"
+        ],
+        "mean_llm_calls": [
+          32.333333333333336,
+          "count"
+        ],
+        "mean_cost_usd": [
+          0.6769759999999999,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          146000.0,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          33,
+          "count"
+        ]
+      },
+      "report_path": "benchmarks/results/2026-08-03-cache-on-126-vs-f3.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-03-cache-on-126-vs-f3.md",
+          "sha256": "62825aa9880a8b2425a9e2d727abc651d716d0afead1de8cc537795007df5436",
+          "kind": "comparison"
         }
       ]
     }
