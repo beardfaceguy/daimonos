@@ -90,9 +90,9 @@
     "semantic_hash": "8bb667d2550fbfe674ea3a0a2169ef6e"
   },
   "benchmarks/tasks/07-snapshot-rollback.json": {
-    "mtime": 1783364996.0141795,
-    "ast_hash": "2e4b248306c79e54d64b51e1d59882cf",
-    "semantic_hash": "2e4b248306c79e54d64b51e1d59882cf"
+    "mtime": 1785879377.2895873,
+    "ast_hash": "e53949a8f5f9dca45e13fb481a61f3ef",
+    "semantic_hash": ""
   },
   "benchmarks/tasks/08-exec-cargo-test.json": {
     "mtime": 1783364996.0142336,
@@ -400,8 +400,8 @@
     "semantic_hash": "17bd493a4f351e18a645d99c18e7612b"
   },
   "src/prompts.rs": {
-    "mtime": 1785459827.7389514,
-    "ast_hash": "2dfe69ca185af7d7b73750d5ae740cc8",
+    "mtime": 1785878101.5528295,
+    "ast_hash": "b1d6248c4acf48d41bd86558496992c1",
     "semantic_hash": ""
   },
   "src/protocol.rs": {
@@ -750,8 +750,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785871697.5859706,
-    "ast_hash": "885eb32565d265768376d3724713385b",
+    "mtime": 1785877463.7371898,
+    "ast_hash": "b3d432299aa4ac1d9a74b6b4402a4b62",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -810,8 +810,8 @@
     "semantic_hash": ""
   },
   "prompts/agent_system.md": {
-    "mtime": 1785459827.7389514,
-    "ast_hash": "c04b6176553f07b774e2a12fe5f09462",
+    "mtime": 1785878124.6017852,
+    "ast_hash": "d8babc9eecc7fdf29c20b1a002d29633",
     "semantic_hash": ""
   },
   "prompts/kgl_hint.md": {
@@ -995,8 +995,8 @@
     "semantic_hash": ""
   },
   "benchmarks/bench-agent.sh": {
-    "mtime": 1785875781.696667,
-    "ast_hash": "e958a12a3e5e89efd19f2794a281242a",
+    "mtime": 1785879360.7529206,
+    "ast_hash": "e759b1232f22b1ce20846ea4fb75cdf5",
     "semantic_hash": ""
   },
   "benchmarks/bench-cursor.sh": {
@@ -1089,11 +1089,6 @@
     "ast_hash": "bce00129d13f61f69d62b7d8346f0ef2",
     "semantic_hash": ""
   },
-  "HANDOFF_unified_tool_provisioning.md": {
-    "mtime": 1785435548.128466,
-    "ast_hash": "b18a81748522565f8ec5d22188d05a34",
-    "semantic_hash": ""
-  },
   "benchmarks/server-bench/index_bench.py": {
     "mtime": 1785811553.1281335,
     "ast_hash": "78830bae7f5c7260703d76827191bd3e",
@@ -1154,9 +1149,14 @@
     "ast_hash": "6c7c9f713284c15ba93ea71571d4591c",
     "semantic_hash": ""
   },
-  "benchmarks/prototypes/agent_system_batch.md": {
-    "mtime": 1785875781.6956358,
-    "ast_hash": "0790d47770d66329c820905ae65211ff",
+  "src/tui/agent_mode.rs": {
+    "mtime": 1785877738.2868633,
+    "ast_hash": "420916e16ec2885965509531dc8b8ce7",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-04-correctness-gate-audit.md": {
+    "mtime": 1785879436.040095,
+    "ast_hash": "9c2156303fcc998ab65434749f2a7c72",
     "semantic_hash": ""
   }
 }

@@ -96,6 +96,13 @@ reset_workspace() {
   cd "$WORKSPACE"
   git checkout -- . 2>/dev/null || true
   git clean -fd 2>/dev/null || true
+  # `git clean -fd` cannot remove .daimonos/snapshots: snapshot dirs contain
+  # gitignored paths (.cursor/), so git leaves them and they LEAK across tasks
+  # and runs -- snapshot copies of src/ pollute workspace-wide searches, and
+  # "a snapshot exists" becomes unusable as a correctness signal. `-x` would
+  # fix it but also wipe target/, forcing a full rebuild every task. Remove
+  # it explicitly instead.
+  rm -rf .daimonos
 }
 
 run_task() {
