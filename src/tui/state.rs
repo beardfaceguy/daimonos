@@ -145,8 +145,12 @@ impl ViewState {
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
-        // A snapshot never carries "session already ended"; `SessionEnding`
-        // is delivered as an event, so leave `ending_reason` untouched.
+        // A snapshot is a full canonical resync of live session state, so any
+        // `ending_reason` observed before a reconnect must clear: if the
+        // session were really ending, that would arrive again as a fresh
+        // `SessionEnding` event after the snapshot. Leaving it set would wedge
+        // renderers that gate input on `ending_reason().is_some()`.
+        self.ending_reason = None;
     }
 
     // ---- event application ----------------------------------------------
@@ -607,5 +611,37 @@ mod tests {
         );
         assert_eq!(s.transcript().len(), 3);
         assert_eq!(s.last_seq(), 11);
+    }
+
+    #[test]
+    fn snapshot_clears_stale_ending_reason() {
+        // A session that emitted SessionEnding, then reconnected and got a
+        // fresh canonical snapshot, must not stay wedged as "ending".
+        let mut s = ViewState::new("sess-1");
+        ev(
+            &mut s,
+            1,
+            SessionEvent::SessionEnding {
+                reason: "idle timeout".into(),
+            },
+        );
+        assert_eq!(s.ending_reason(), Some("idle timeout"));
+
+        let snap = SessionSnapshot {
+            session_id: "sess-1".into(),
+            seq: 9,
+            turn_status: TurnStatus::Idle,
+            transcript: Vec::new(),
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+        };
+        s.apply_snapshot(snap);
+        assert_eq!(
+            s.ending_reason(),
+            None,
+            "stale ending_reason survived resync"
+        );
     }
 }

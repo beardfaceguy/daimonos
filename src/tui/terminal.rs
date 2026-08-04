@@ -34,8 +34,11 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut out = io::stdout();
         if let Err(err) = execute!(out, EnterAlternateScreen, EnableBracketedPaste) {
-            // Roll back the raw-mode change we already made.
-            let _ = disable_raw_mode();
+            // `execute!` may have applied EnterAlternateScreen before failing
+            // on EnableBracketedPaste, so roll back the *full* terminal state
+            // (alt screen + bracketed paste + cursor + raw mode), not just the
+            // raw-mode change, or a partial enter leaves the terminal wedged.
+            restore_terminal(&mut out);
             return Err(err);
         }
         Ok(Self { active: true })

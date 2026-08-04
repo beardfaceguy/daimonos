@@ -1130,8 +1130,8 @@
     "semantic_hash": ""
   },
   "src/tui/state.rs": {
-    "mtime": 1785875407.273823,
-    "ast_hash": "748d2373531ccd823512b68f0c2c0219",
+    "mtime": 1785876743.825917,
+    "ast_hash": "97e3e9e6f868f87baf85ceebb9b570b4",
     "semantic_hash": ""
   },
   "docs/adr/011-interactive-terminal-ui.md": {
@@ -1145,8 +1145,8 @@
     "semantic_hash": ""
   },
   "src/tui/terminal.rs": {
-    "mtime": 1785875407.273823,
-    "ast_hash": "3d6960bf77733d8e655baf7295280568",
+    "mtime": 1785876678.105649,
+    "ast_hash": "5339f71f5bd5712aa0d489cc6b4e8216",
     "semantic_hash": ""
   },
   "src/tui/commands.rs": {
