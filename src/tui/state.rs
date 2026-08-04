@@ -318,16 +318,12 @@ mod tests {
         ev(
             &mut s,
             2,
-            SessionEvent::AssistantDelta {
-                text: "Hel".into(),
-            },
+            SessionEvent::AssistantDelta { text: "Hel".into() },
         );
         ev(
             &mut s,
             3,
-            SessionEvent::AssistantDelta {
-                text: "lo!".into(),
-            },
+            SessionEvent::AssistantDelta { text: "lo!".into() },
         );
         // Mid-stream the assistant line is still open.
         assert!(s.transcript().last().unwrap().open);
@@ -365,11 +361,7 @@ mod tests {
         ev(&mut s, 1, SessionEvent::UserMessage { text: "a".into() });
         // seq 3 arrives before seq 2.
         assert_eq!(
-            ev(
-                &mut s,
-                3,
-                SessionEvent::AssistantDelta { text: "x".into() }
-            ),
+            ev(&mut s, 3, SessionEvent::AssistantDelta { text: "x".into() }),
             ApplyOutcome::Gap { expected_seq: 2 }
         );
         // Nothing changed; watermark held at 1.
@@ -377,11 +369,7 @@ mod tests {
         assert_eq!(s.transcript().len(), 1);
         // The missing frame can still be applied in order.
         assert_eq!(
-            ev(
-                &mut s,
-                2,
-                SessionEvent::AssistantDelta { text: "x".into() }
-            ),
+            ev(&mut s, 2, SessionEvent::AssistantDelta { text: "x".into() }),
             ApplyOutcome::Applied
         );
         assert_eq!(assistant_text(&s), "x");
@@ -405,7 +393,10 @@ mod tests {
             },
         );
         let roles: Vec<_> = s.transcript().iter().map(|l| l.role).collect();
-        assert_eq!(roles, vec![TranscriptRole::Thought, TranscriptRole::Assistant]);
+        assert_eq!(
+            roles,
+            vec![TranscriptRole::Thought, TranscriptRole::Assistant]
+        );
         // Thought line sealed, assistant line still streaming.
         assert!(!s.transcript()[0].open);
         assert!(s.transcript()[1].open);
@@ -564,7 +555,13 @@ mod tests {
     fn snapshot_resets_then_events_resume_in_order() {
         let mut s = ViewState::new("placeholder");
         // Some stale local state that the snapshot should blow away.
-        ev(&mut s, 1, SessionEvent::UserMessage { text: "stale".into() });
+        ev(
+            &mut s,
+            1,
+            SessionEvent::UserMessage {
+                text: "stale".into(),
+            },
+        );
 
         let snap = SessionSnapshot {
             session_id: "sess-42".into(),
