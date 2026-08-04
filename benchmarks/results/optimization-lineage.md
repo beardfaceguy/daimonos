@@ -72,3 +72,24 @@ F2 report:
 F2 reduced mean total tokens and cost versus both F1 and F0, but increased
 mean wall time by 6–7%. The per-task table in the report remains the source of
 truth for local upward blips.
+
+## Index lifecycle lineage
+
+Scope fingerprint: `index-lifecycle-v1 / small=200 / large=3000 /
+max_files=500 / max_walk_entries=1000 / 30 interleaved replicates / 20 warm
+calls`.
+
+| Stage | Parent | Mode | Correct profile-runs | Small startup | Large unmarked ready | Large marked ready | Max inotify |
+|---|---|---|---:|---:|---:|---:|---:|
+| I0 | — | legacy | 30/90 | 228.40 ms | no correct result | no correct result | 21 |
+| I1 | I0 | eager | 90/90 | 226.49 ms | 0.59 ms | 0.68 ms | 42 |
+| I2 | I0 | lazy | 90/90 | 226.07 ms | 8.13 ms | 8.62 ms | 21 |
+| I3 | I0 | hybrid (default) | 90/90 | 229.41 ms | 7.78 ms | 0.65 ms | 42 |
+
+Report:
+[`2026-08-03-index-lifecycle.md`](2026-08-03-index-lifecycle.md).
+
+I3 keeps startup within ±0.5% of I0 on all fixtures and restores deterministic
+filename correctness under partial coverage. The retained upward blip is a
+second recursive watcher set on warm projects (21 → 42 watches in this
+fixture); follow-up Vikunja task 1210 tracks watcher sharing.

@@ -23,6 +23,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCH = REPO_ROOT / "benchmarks" / "server-bench" / "bench.py"
+INDEX_BENCH = (
+    REPO_ROOT / "benchmarks" / "server-bench" / "index_bench.py"
+)
 
 
 @pytest.mark.skipif(
@@ -71,3 +74,49 @@ def test_bench_harness_runs_one_task(tmp_path):
     assert s["median_ns"] > 0
     assert s["p99_ns"] >= s["median_ns"]
     assert s["max_ns"] >= s["p99_ns"]
+
+
+@pytest.mark.skipif(
+    not (REPO_ROOT / "target" / "release" / "daimonos").exists()
+    and not (REPO_ROOT / "target" / "debug" / "daimonos").exists(),
+    reason="no daimonos binary; build first",
+)
+def test_index_bench_runs_cold_and_warm_searches(tmp_path):
+    binary = REPO_ROOT / "target" / "release" / "daimonos"
+    if not binary.exists():
+        binary = REPO_ROOT / "target" / "debug" / "daimonos"
+    out = tmp_path / "index-results"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(INDEX_BENCH),
+            "--arm",
+            f"smoke=hybrid=test={binary}",
+            "--profiles",
+            "small",
+            "--small-files",
+            "3",
+            "--max-files",
+            "3",
+            "--max-walk-entries",
+            "10",
+            "--replicates",
+            "1",
+            "--warm-calls",
+            "2",
+            "--out",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"index_bench.py failed: {proc.stderr!r}"
+    payload = json.loads((out / "results.json").read_text())
+    assert (out / "report.md").exists()
+    arm = payload["profiles"][0]["arms"][0]
+    assert arm["mode"] == "hybrid"
+    assert arm["summary"]["first_search_correct"] == 1
+    assert arm["summary"]["eventually_correct"] == 1
+    assert arm["summary"]["startup"]["median_ns"] > 0
+    assert arm["summary"]["warm_search"]["count"] == 2

@@ -34,6 +34,27 @@ python3 benchmarks/server-bench/compare.py \
     benchmarks/server-bench/results/candidate/
 ```
 
+### Index lifecycle benchmark
+
+`index_bench.py` compares filename/path indexing across binaries and modes
+without an LLM. It starts a fresh daemon for every replicate and records
+socket-ready startup latency, first-search correctness/latency, time until a
+correct result is available, repeated warm-search latency, index coverage,
+RSS, file descriptors, and inotify watches.
+
+```bash
+python3 benchmarks/server-bench/index_bench.py \
+  --arm baseline=legacy=53339f9=/tmp/daimonos-baseline \
+  --arm eager=eager=cc6ecb3=target/release/daimonos \
+  --arm lazy=lazy=cc6ecb3=target/release/daimonos \
+  --arm hybrid=hybrid=cc6ecb3=target/release/daimonos
+```
+
+Default fixtures cover a small unmarked workspace, a large unmarked
+workspace, and a large marked project. Results include `results.json` plus a
+human-readable `report.md` under
+`benchmarks/server-bench/results/index-<timestamp>/`.
+
 ## Tasks
 
 Each task is a Python module under `tasks/`. They share one interface:
