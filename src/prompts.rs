@@ -299,6 +299,31 @@ mod tests {
 
     // --- embedded defaults ---
 
+    /// The agent/chat/ACP prompt must never advertise a tool the agent cannot
+    /// call. `ToolTier::McpOnly` tools are exposed over MCP but deliberately
+    /// withheld from the agent loop (vikunja 1112), so naming one here tells
+    /// the model to call something absent from its own catalog.
+    #[test]
+    fn agent_system_prompt_never_names_mcp_only_tools() {
+        let mcp_only: Vec<&str> = crate::tools::all_tools()
+            .iter()
+            .filter(|t| t.tier == crate::tools::ToolTier::McpOnly)
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !mcp_only.is_empty(),
+            "expected at least one McpOnly tool for this guard to be meaningful"
+        );
+        for name in mcp_only {
+            assert!(
+                !AGENT_SYSTEM_DEFAULT.contains(&format!("`{name}`")),
+                "prompts/agent_system.md references `{name}`, which is \
+                 ToolTier::McpOnly and therefore NOT callable from the \
+                 agent/chat/ACP loop"
+            );
+        }
+    }
+
     #[test]
     fn agent_system_default_prefers_execute_script() {
         let p = AGENT_SYSTEM_DEFAULT;
