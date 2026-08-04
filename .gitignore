@@ -33,3 +33,6 @@ VIKUNJA_TRACKING.md
 
 # Third-party reference clone (analyzed for project #178; not our code)
 ponytail/
+
+# Benchmark baseline/post binaries (large, per-machine; rebuild from git_commit in benchmarks/optimization-lineage.json)
+bench/bin/

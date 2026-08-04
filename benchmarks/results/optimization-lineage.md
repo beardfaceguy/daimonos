@@ -35,6 +35,8 @@ thinking=medium / compaction=off / 3 passes`.
 | F0 | Pre-1193/1194 baseline | 416,652 | $2.2555 | 145.7s | 33/33 | baseline | baseline |
 | F1 | Universal tool-output bounding + intra-turn microcompaction | 427,628 | $2.3062 | 146.7s | 33/33 | tokens +2.63%; cost +2.25%; wall +0.69% | same |
 | F2 | Context diagnostics + opt-in tool-prefix caching | 402,699 | $0.6856 | 156.0s | 33/33 | tokens -5.83%; cost -70.27%; wall +6.36% | tokens -3.35%; cost -69.60%; wall +7.09% |
+| F3 | Post-round #126 (`a31e470`), cache OFF — parent F0 | 414,881 | $2.2486 | 145.0s | 33/33 | tokens -0.43%; cost -0.30%; wall -0.46% | tokens -0.43%; cost -0.30%; wall -0.46% |
+| F4 | #126 with tool-prefix caching ON — parent F3 | 409,465 | $0.6770 | 146.0s | 33/33 | tokens -1.31%; cost **-69.89%**; wall +0.69% | tokens -1.73%; cost **-69.98%**; wall +0.23% |
 
 F0/F1 report:
 [`1193-1194-anthropic-medium-comparison.md`](1193-1194-anthropic-medium-comparison.md).
@@ -45,6 +47,31 @@ Important F1 per-task upward blips retained in that report:
 - Task 09 exec git log: **+50.12%** tokens
 
 These remain visible even though other tasks improved.
+
+### F3 / F4 — end-of-round (#126) and the cache toggle
+
+F3 and F4 branch off **F0** (not the F1/F2 intermediate chain) to measure the
+*cumulative* #122–#126 round on binary `a31e470` (#126), and to isolate the
+Anthropic tool-prefix cache on that single binary:
+
+- **F3 (cache OFF) vs F0:** token/cost-neutral — the −0.4% token / −0.3% cost
+  delta is smaller than F3's own ~13% run-to-run total-token spread. Cache-off,
+  the round's value is robustness/correctness (33/33 held), not raw suite tokens
+  — consistent with F1 measuring *higher* full-suite tokens than F0.
+- **F4 (cache ON) vs F3 (same binary):** mean cost **$0.6770 vs $2.2486 =
+  −69.9%** at 33/33 correct, converting ~406k fresh input tokens/run into ~342k
+  cheap cache reads (fresh input −85.6%). This reproduces F2's cache win
+  ($0.6856) on #126. Enable with `DAIMONOS_AGENT_PROMPT_CACHE=true`.
+
+Reports:
+[`2026-08-03-post-126-vs-f0.md`](2026-08-03-post-126-vs-f0.md) (F3),
+[`2026-08-03-cache-on-126-vs-f3.md`](2026-08-03-cache-on-126-vs-f3.md) (F4).
+
+Baseline caveat: `c3d103a` (F0's commit) can no longer run live against
+Anthropic — `thinking.signature` enforcement landed *inside* the round — so
+F0's recorded numbers are the pre-round reference; a fresh live baseline on this
+scope is not reproducible today. Recorded on branch
+`bench/opt-lineage-f3-f4-cache` (commit `c5e49aa`).
 
 ## Task 04 targeted lineage
 

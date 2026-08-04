@@ -470,7 +470,7 @@
     "semantic_hash": "438d6e45db829aed66343076deb0ff1e"
   },
   "tests/conftest.py": {
-    "mtime": 1785813564.384995,
+    "mtime": 1785814043.3084788,
     "ast_hash": "5d1eaca5a277a0b94d2018a4e14a22c7",
     "semantic_hash": ""
   },
@@ -1060,8 +1060,8 @@
     "semantic_hash": ""
   },
   "benchmarks/results/optimization-lineage.md": {
-    "mtime": 1785813564.202997,
-    "ast_hash": "e1084eb5bb0ca1d10b3a326576f100dd",
+    "mtime": 1785814043.1404808,
+    "ast_hash": "ea66ec0eb3c285993db096b27fe931fa",
     "semantic_hash": ""
   },
   "benchmarks/benchmark_db.py": {
@@ -1070,8 +1070,8 @@
     "semantic_hash": ""
   },
   "benchmarks/optimization-lineage.json": {
-    "mtime": 1785813564.202997,
-    "ast_hash": "2de8a1573915a982d1e66c959d064ba2",
+    "mtime": 1785814043.1394808,
+    "ast_hash": "5ebcdb3b350d8b42264db113cb5e6980",
     "semantic_hash": ""
   },
   "tests/test_benchmark_db.py": {
@@ -1085,7 +1085,7 @@
     "semantic_hash": ""
   },
   "tests/test_tool_provisioning.py": {
-    "mtime": 1785813564.385995,
+    "mtime": 1785814043.3084788,
     "ast_hash": "bce00129d13f61f69d62b7d8346f0ef2",
     "semantic_hash": ""
   },
@@ -1102,6 +1102,26 @@
   "benchmarks/results/2026-08-03-index-lifecycle.md": {
     "mtime": 1785811553.1271336,
     "ast_hash": "6ab255a6d39f15f7e46ec53f06272ac0",
+    "semantic_hash": ""
+  },
+  "benchmarks/bench-ab.sh": {
+    "mtime": 1785814043.1374807,
+    "ast_hash": "0bb23c9ed0ac6b00c72cb4e4e4fe5ddb",
+    "semantic_hash": ""
+  },
+  "benchmarks/lineage_append.py": {
+    "mtime": 1785814043.1394808,
+    "ast_hash": "8e4d38d399be40865b2ee3fa93787014",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-03-cache-on-126-vs-f3.md": {
+    "mtime": 1785814043.1394808,
+    "ast_hash": "971f8c22f0d33884e09e452dff4eb48c",
+    "semantic_hash": ""
+  },
+  "benchmarks/results/2026-08-03-post-126-vs-f0.md": {
+    "mtime": 1785814043.1404808,
+    "ast_hash": "d5f4ad8de0cfcd931ab8ffcdf782fa5c",
     "semantic_hash": ""
   }
 }
