@@ -145,10 +145,12 @@ pub async fn append(session: &mut Session, op: &Op) -> Response {
     if let Err(e) = file.write_all(content.as_bytes()).await {
         return Response::err(4, &format!("append: {e}"));
     }
-    // write_all issues real write(2) calls (tokio::fs::File is unbuffered), so the
-    // bytes reach the OS before we return. We deliberately do NOT fsync — this
-    // matches the `write` op's durability; per-chunk fsync would be costly and
-    // inconsistent with the rest of the file ops.
+    // tokio::fs::File buffers writes internally; flush pushes them to the OS so a
+    // subsequent read (and this call's success report) reflects the append. We do
+    // NOT fsync — durability matches the `write` op (a deliberate cost choice).
+    if let Err(e) = file.flush().await {
+        return Response::err(4, &format!("append: {e}"));
+    }
 
     session.invalidate_read_cache(&path);
     if let Some(index) = &session.index {
@@ -751,14 +753,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session_in(dir.path());
         assert!(
-            !append(&mut s, &Op { c: 27, s: Some("x".into()), ..Op::default() })
-                .await
-                .ok
+            !append(
+                &mut s,
+                &Op {
+                    c: 27,
+                    s: Some("x".into()),
+                    ..Op::default()
+                }
+            )
+            .await
+            .ok
         );
         assert!(
             !append(
                 &mut s,
-                &Op { c: 27, p: Some("f.txt".into()), ..Op::default() }
+                &Op {
+                    c: 27,
+                    p: Some("f.txt".into()),
+                    ..Op::default()
+                }
             )
             .await
             .ok

@@ -681,7 +681,10 @@ fn tool_call_locations(
     name: &str,
     input: &serde_json::Value,
 ) -> Vec<ToolCallLocation> {
-    if !matches!(name, "read_file" | "write_file" | "edit_file" | "append_file" | "search") {
+    if !matches!(
+        name,
+        "read_file" | "write_file" | "edit_file" | "append_file" | "search"
+    ) {
         return Vec::new();
     }
     let Some(path) = tool_target_path(workspace, input) else {

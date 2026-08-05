@@ -3652,8 +3652,7 @@ mod tests {
     async fn text_truncation_auto_continue_inserts_user_turn_between_assistants() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
-        let provider =
-            BenchmarkCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
+        let provider = BenchmarkCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
         let contexts = provider.contexts_handle();
         let config = AgentConfig {
             auto_continue_budget: Some(2),
@@ -3679,8 +3678,7 @@ mod tests {
     async fn auto_continue_forces_thinking_off_on_continuation() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
-        let provider =
-            ThinkingCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
+        let provider = ThinkingCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
         let thinking = provider.thinking_handle();
         let config = AgentConfig {
             auto_continue_budget: Some(2),
