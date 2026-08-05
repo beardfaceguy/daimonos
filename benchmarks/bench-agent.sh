@@ -102,6 +102,18 @@ reset_workspace() {
   # "a snapshot exists" becomes unusable as a correctness signal. `-x` would
   # fix it but also wipe target/, forcing a full rebuild every task. Remove
   # it explicitly instead.
+  # Guard: if a fixture still TRACKS .daimonos, `git checkout -- .` above restores
+  # leaked snapshots, task 07's gate would pass vacuously, and removing them would
+  # leave the repo dirty (breaking 06/09/11, which assert a clean git status).
+  if [ -n "$(git ls-files .daimonos 2>/dev/null)" ]; then
+    echo "FATAL: .daimonos is tracked in the benchmark fixture." >&2
+    echo "  Task 07's correctness gate would pass vacuously on leaked snapshots." >&2
+    echo "  Fix in $WORKSPACE:" >&2
+    echo "    git rm -r --cached .daimonos; echo .daimonos/ >> .gitignore" >&2
+    echo "    git commit --amend --no-edit   # amend, NOT a new commit:" >&2
+    echo "                                  # tasks 06/09 assert exactly 7 commits" >&2
+    exit 1
+  fi
   rm -rf .daimonos
 }
 
