@@ -890,8 +890,8 @@
     "semantic_hash": ""
   },
   "tests/test_cli_modes.py": {
-    "mtime": 1785902095.2632337,
-    "ast_hash": "d3c7f341dd80794e0cfa4b9e02e50845",
+    "mtime": 1785903636.2468877,
+    "ast_hash": "58ac329eef15728f8fe30697d0c8dac4",
     "semantic_hash": ""
   },
   "docs/runtime-modes.md": {
@@ -900,8 +900,8 @@
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785902105.7491155,
-    "ast_hash": "a5cefebe82a37fbee69688f72aadd18e",
+    "mtime": 1785903627.5999846,
+    "ast_hash": "38dba3a4240c8dc2c56c7394085669a8",
     "semantic_hash": ""
   },
   "src/observability.rs": {
@@ -1160,8 +1160,8 @@
     "semantic_hash": ""
   },
   "src/tui/app.rs": {
-    "mtime": 1785903290.3617768,
-    "ast_hash": "c0b9627d763ea881362ae68195e68c94",
+    "mtime": 1785903601.077283,
+    "ast_hash": "77413148e6f9f94c68d9cfa5e3f9a6b6",
     "semantic_hash": ""
   }
 }

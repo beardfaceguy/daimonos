@@ -170,8 +170,9 @@ pub async fn run(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
-    terminal.show_cursor()?;
+    let show_cursor = terminal.show_cursor();
     guard.restore();
+    show_cursor?;
     outcome
 }
 
@@ -404,6 +405,8 @@ async fn cancel_turn(
     };
     active.abort();
     match active.await {
+        // A successful task emits AssistantDone + its terminal status before
+        // returning, so there is nothing for the interrupt path to synthesize.
         Ok(()) => return,
         Err(error) if error.is_cancelled() => {}
         Err(error) => {
@@ -482,6 +485,10 @@ fn build_before_tool_call_hook(
                         }
                     };
                     if !registered {
+                        // The TUI admits one active turn and AgentSession runs
+                        // tool calls serially. Treat a violated invariant as a
+                        // blocked call instead of silently replacing the first
+                        // operator decision channel.
                         BeforeHookResult::Block(
                             "another tool approval is already pending".to_string(),
                         )

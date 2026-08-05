@@ -64,12 +64,9 @@ pub async fn run_agent(
         dry_run,
         agent_env,
     } = args;
-    let mode = tui::resolve_agent_mode(
-        interactive,
-        print,
-        dry_run,
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-    );
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let interactive_fell_back = interactive && !print && !dry_run && !tty;
+    let mode = tui::resolve_agent_mode(interactive, print, dry_run, tty);
 
     struct DryRunProvider;
     #[async_trait]
@@ -84,7 +81,7 @@ pub async fn run_agent(
     }
 
     if mode == tui::AgentMode::DryRun {
-        let task = require_agent_task(task, mode)?;
+        let task = require_agent_task(task, mode, false)?;
         let args = agent_cmd::AgentCmdArgs {
             task,
             model,
@@ -109,7 +106,7 @@ pub async fn run_agent(
     }
 
     let task = if mode == tui::AgentMode::Print {
-        Some(require_agent_task(task, mode)?)
+        Some(require_agent_task(task, mode, interactive_fell_back)?)
     } else {
         task
     };
@@ -154,7 +151,7 @@ pub async fn run_agent(
         .await;
     }
 
-    let task = require_agent_task(task, mode)?;
+    let task = require_agent_task(task, mode, false)?;
     let approve_fn = if agent.approval_mode == "auto" {
         None
     } else {
@@ -297,9 +294,15 @@ fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> 
     agent_env::AgentEnv::load(path).map_err(|error| anyhow::anyhow!("agent config: {error}"))
 }
 
-fn require_agent_task(task: Option<String>, mode: tui::AgentMode) -> anyhow::Result<String> {
+fn require_agent_task(
+    task: Option<String>,
+    mode: tui::AgentMode,
+    interactive_fell_back: bool,
+) -> anyhow::Result<String> {
     task.filter(|task| !task.trim().is_empty()).ok_or_else(|| {
-        let hint = if mode == tui::AgentMode::Print {
+        let hint = if interactive_fell_back {
+            "--interactive was disabled because stdin or stdout is not a TTY"
+        } else if mode == tui::AgentMode::Print {
             "pass a task or launch a TTY with --interactive"
         } else {
             "pass a task"

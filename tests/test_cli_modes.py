@@ -78,4 +78,5 @@ def test_interactive_without_tty_falls_back_before_loading_agent_env(
 
     assert completed.returncode != 0
     assert "agent task is required in print mode" in completed.stderr
+    assert "--interactive was disabled because stdin or stdout is not a TTY" in completed.stderr
     assert "agent config" not in completed.stderr
