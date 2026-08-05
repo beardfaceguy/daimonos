@@ -494,6 +494,33 @@ async fn record_agent_tool_output_savings(
     }
 }
 
+/// Best-effort hardening (vikunja #136, item 2): flush any analytics writes
+/// spawned by `record_async` during this run before returning to the caller,
+/// which may `std::process::exit` immediately afterward and drop the blocking
+/// pool mid-INSERT — silently losing the trailing tool calls of the session.
+/// Mirrors the drain `src/mcp.rs` performs at its idle-exit. It **warns rather
+/// than fails** on timeout: losing a few analytics rows must never block or
+/// crash an agent turn. This covers the library boundary; the authoritative
+/// process-exit drain still belongs at the CLI entry point.
+async fn drain_agent_analytics(session: &std::sync::Arc<tokio::sync::Mutex<Session>>) {
+    let analytics = {
+        let guard = session.lock().await;
+        guard.analytics.clone()
+    };
+    if let Some(analytics) = analytics {
+        if analytics.pending_writes() > 0
+            && !analytics
+                .wait_until_quiet(std::time::Duration::from_secs(2))
+                .await
+        {
+            tracing::warn!(
+                pending = analytics.pending_writes(),
+                "analytics drain timed out at agent run exit; some tool-call rows may be lost"
+            );
+        }
+    }
+}
+
 pub async fn run(
     provider: &dyn LlmProvider,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -602,6 +629,7 @@ pub async fn run(
             | StopReason::Refusal
             | StopReason::Aborted
             | StopReason::Error => {
+                drain_agent_analytics(&session).await;
                 return AgentResult {
                     messages: close_orphan_tool_calls(messages),
                     usage: total_usage,
@@ -668,6 +696,11 @@ pub async fn run(
                         .as_ref()
                         .map(|_| &on_progress as &crate::ops::ExecProgressCallback<'_>);
                     let request_chars = serde_json::to_string(&input).map(|s| s.len()).unwrap_or(0);
+                    // Wall-clock for this call's analytics record (vikunja #136).
+                    // Started here (not before the before_tool_call hook) so it
+                    // aligns with the `tool.call` span, which also opens after
+                    // this point.
+                    let call_started = std::time::Instant::now();
                     // Native/opcode tools and the plan tool run through the
                     // facade; open a `tool.call` span around them so latency is
                     // measured. Remote MCP tools are spanned as `mcp.remote_tool`
@@ -984,6 +1017,53 @@ pub async fn run(
                     }
                     content = bounded.content;
 
+                    // vikunja #136: record this direct agent-mode tool call so
+                    // it is visible in analytics alongside `execute_script`
+                    // sub-calls (`script:*`) and bridged remote MCP calls.
+                    // Before this, agent mode recorded only `context:*`
+                    // bookkeeping, so a plain `read_file`/`snapshot`/`edit_file`
+                    // issued directly by the agent left no trace — biasing any
+                    // batched-vs-direct analysis toward "always uses scripts".
+                    // The bare tool name (no `script:` prefix) keeps direct and
+                    // scripted usage distinguishable. `outcome.is_some()` is true
+                    // exactly for the native/plugin/meta/execute_script/plan
+                    // paths; remote MCP tools take the `None` path and are
+                    // recorded by `mcp_bridge.rs`, so skipping them here avoids
+                    // double-counting, and "unavailable" tools (also `None`) ran
+                    // nothing to record.
+                    if let Some(oc) = outcome.as_ref() {
+                        let (analytics, external_session_id) = {
+                            let guard = session.lock().await;
+                            (guard.analytics.clone(), guard.external_session_id.clone())
+                        };
+                        if let Some(analytics) = analytics {
+                            let original_est =
+                                oc.response_tokens_est as i64 + oc.saved_tokens_est.max(0);
+                            let savings_pct = if original_est > 0 {
+                                (oc.saved_tokens_est as f64 / original_est as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            analytics.record_async(crate::analytics::ToolCallRecord {
+                                tool_name: name.clone(),
+                                command: input
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                request_tokens: oc.request_tokens_est,
+                                response_tokens: oc.response_tokens_est,
+                                saved_tokens: oc.saved_tokens_est,
+                                savings_pct,
+                                exec_time_ms: call_started.elapsed().as_millis() as u64,
+                                was_redirect: oc.redirect,
+                                was_filtered: oc.filtered,
+                                read_dedup: oc.read_dedup,
+                                batch_size: u32::try_from(oc.batch_size).unwrap_or(u32::MAX),
+                                external_session_id,
+                            });
+                        }
+                    }
+
                     if let Some(tool_span) = tool_span {
                         let status = if is_error {
                             crate::observability::ToolStatus::Error
@@ -1008,6 +1088,7 @@ pub async fn run(
                 }
 
                 if terminate {
+                    drain_agent_analytics(&session).await;
                     return AgentResult {
                         messages,
                         usage: total_usage,
@@ -3629,6 +3710,64 @@ mod tests {
         } else {
             panic!("expected ToolResult");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_tool_call_is_recorded_in_analytics() {
+        // vikunja #136: a plain tool call issued directly by the agent — not via
+        // execute_script, not a bridged remote MCP tool — must leave a durable
+        // per-tool analytics record under its BARE name. Before the fix, agent
+        // mode recorded only `context:*` bookkeeping, so direct calls were
+        // invisible and any batched-vs-direct analysis was biased toward
+        // "always uses scripts".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello agent").unwrap();
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = session_in(dir.path());
+        session.analytics = Some(Arc::clone(&analytics));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "read_file", json!({"path": "test.txt"})),
+            end_turn_resp(),
+        ]);
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("read it")],
+            &AgentConfig::default(),
+        )
+        .await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+        // The run-exit drain (item 2) should already have flushed; the explicit
+        // wait is belt-and-suspenders for the async write pool.
+        assert!(
+            analytics
+                .wait_until_quiet(std::time::Duration::from_secs(2))
+                .await
+        );
+        let stats = analytics.session_summary();
+
+        // Positive direction: the direct call is recorded under its bare name,
+        // exactly once.
+        let read = stats
+            .per_tool
+            .get("read_file")
+            .expect("direct read_file call must be recorded in analytics");
+        assert_eq!(read.calls, 1, "direct call must be counted exactly once");
+
+        // Negative direction: it must not be mislabeled as a scripted sub-call,
+        // and we must not invent calls that never happened.
+        assert!(
+            !stats.per_tool.contains_key("script:read_file"),
+            "a direct call must not be recorded under the script: prefix"
+        );
+        assert!(
+            !stats.per_tool.contains_key("write_file"),
+            "only tools actually dispatched may appear in analytics"
+        );
     }
 
     #[tokio::test]
