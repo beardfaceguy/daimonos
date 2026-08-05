@@ -23,7 +23,11 @@ full = """Preferred over rewriting a file with write_file — you emit only the 
 path = "Relative path"
 edits = "[old, new, old, new, ...] pairs. Each `old`: minimal + unique; whitespace-tolerant."
 [append_file]
-full = """Append `content` to the end of a file, creating it (and parent dirs) if absent. Only the appended `content` is emitted as output tokens, so this is how you build a large file across several bounded calls: write a first section with write_file, then extend it with repeated append_file calls, keeping every call well under one turn's output budget. Returns {ok, appended_bytes}."""
+full = """Append `content` to the end of a file, creating it (and parent dirs) if absent. Only the appended `content` is emitted as output tokens, so this is how you build a large file across several bounded calls: write a first section with write_file, then extend it with repeated append_file calls, keeping every call well under one turn's output budget. Returns {ok, appended_bytes} — appended_bytes is the number of UTF-8 bytes written (not characters)."""
+
+[append_file.parameters]
+path = "Relative path; created (with parent dirs) if absent."
+content = "Text appended verbatim to the end of the file."
 [search]
 full = """Regex content search or trigram relative filename/path search. File mode populates lazily and reports index coverage."""
 
