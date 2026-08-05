@@ -77,21 +77,58 @@ pub fn default_agent_instructions_path() -> Option<PathBuf> {
     crate::config::dirs_next().map(|d| d.join("daimonos").join("agent-instructions.md"))
 }
 
-/// Load additional instructions for `agent`, `chat`, and ACP. An explicit CLI
-/// path must be readable. With no CLI override, a missing default file is the
-/// normal "no extra rules" case; any other read error is surfaced so an
+/// Path to the optional project-local rule-set: `<workspace>/agent-instructions.md`.
+pub fn workspace_agent_instructions_path(workspace: &std::path::Path) -> PathBuf {
+    workspace.join("agent-instructions.md")
+}
+
+/// Load additional instructions for `agent`, `chat`, and ACP.
+///
+/// An explicit `--agent-instructions` path is a precise single-file override: it
+/// must be readable and no layering is applied. With no CLI override, the global
+/// rule-set (`~/.config/daimonos/agent-instructions.md`) and an optional
+/// project-local `<workspace>/agent-instructions.md` are layered — mirroring
+/// `agent.env`, the workspace file extends (and, appended last, can countermand)
+/// the global one. Both are missing-ok; any other read error is surfaced so an
 /// existing rules file is never silently ignored.
 pub async fn load_agent_instructions(
     cli_path: Option<&std::path::Path>,
+    workspace: &std::path::Path,
 ) -> std::io::Result<Option<String>> {
-    let (path, missing_is_ok) = match cli_path {
-        Some(path) => (path.to_path_buf(), false),
-        None => match default_agent_instructions_path() {
-            Some(path) => (path, true),
-            None => return Ok(None),
-        },
-    };
-    read_agent_instructions(&path, missing_is_ok).await
+    if let Some(path) = cli_path {
+        return read_agent_instructions(path, false).await;
+    }
+    let global = default_agent_instructions_path();
+    let workspace_file = workspace_agent_instructions_path(workspace);
+    load_layered_instructions(global.as_deref(), &workspace_file).await
+}
+
+/// Layer an optional global rule-set with an optional project-local one. Present,
+/// non-blank sections are concatenated global-first (workspace last so it can
+/// countermand). Both are missing-ok. Factored out with explicit paths so the
+/// layering is testable without depending on the caller's real config dir.
+async fn load_layered_instructions(
+    global: Option<&std::path::Path>,
+    workspace_file: &std::path::Path,
+) -> std::io::Result<Option<String>> {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(global) = global {
+        if let Some(text) = read_agent_instructions(global, true).await? {
+            if !text.trim().is_empty() {
+                sections.push(text);
+            }
+        }
+    }
+    if let Some(text) = read_agent_instructions(workspace_file, true).await? {
+        if !text.trim().is_empty() {
+            sections.push(text);
+        }
+    }
+    Ok(if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    })
 }
 
 async fn read_agent_instructions(
@@ -468,7 +505,7 @@ mod tests {
         std::fs::write(&path, "MY RULES").unwrap();
 
         assert_eq!(
-            load_agent_instructions(Some(&path))
+            load_agent_instructions(Some(&path), dir.path())
                 .await
                 .unwrap()
                 .as_deref(),
@@ -479,7 +516,9 @@ mod tests {
     #[tokio::test]
     async fn missing_explicit_agent_instructions_file_errors() {
         let path = std::path::Path::new("/definitely/not/agent-instructions.md");
-        let err = load_agent_instructions(Some(path)).await.unwrap_err();
+        let err = load_agent_instructions(Some(path), std::path::Path::new("/tmp"))
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
     }
@@ -489,6 +528,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-default.md");
         assert_eq!(read_agent_instructions(&path, true).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn workspace_instructions_extend_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.md");
+        let workspace = dir.path().join("agent-instructions.md");
+        std::fs::write(&global, "GLOBAL RULES").unwrap();
+        std::fs::write(&workspace, "PROJECT RULES").unwrap();
+        assert_eq!(
+            load_layered_instructions(Some(&global), &workspace)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("GLOBAL RULES\n\nPROJECT RULES")
+        );
+    }
+
+    #[tokio::test]
+    async fn layering_uses_whichever_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.md");
+        let present = dir.path().join("agent-instructions.md");
+        std::fs::write(&present, "ONLY ME").unwrap();
+        // workspace-only (no global)
+        assert_eq!(
+            load_layered_instructions(None, &present)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ONLY ME")
+        );
+        // global-only (workspace missing)
+        assert_eq!(
+            load_layered_instructions(Some(&present), &missing)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ONLY ME")
+        );
+    }
+
+    #[tokio::test]
+    async fn layering_both_missing_is_none_and_blank_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.md");
+        let workspace = dir.path().join("agent-instructions.md");
+        assert_eq!(
+            load_layered_instructions(Some(&missing), &missing)
+                .await
+                .unwrap(),
+            None
+        );
+        // A blank workspace file contributes nothing (no stray separators).
+        std::fs::write(&workspace, "   \n").unwrap();
+        assert_eq!(
+            load_layered_instructions(Some(&missing), &workspace)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
