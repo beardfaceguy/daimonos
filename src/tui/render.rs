@@ -204,7 +204,7 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
 fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("message (Enter to send · Ctrl-C interrupts)");
+        .title("message (Enter to send · Ctrl-C interrupts · /help for help)");
     Paragraph::new(Line::from(sanitize(composer)))
         .block(block)
         .wrap(Wrap { trim: false })
@@ -436,6 +436,14 @@ mod tests {
             out.contains("draft message"),
             "composer text missing:\n{out}"
         );
+    }
+
+    #[test]
+    fn composer_title_points_to_help() {
+        let state = ViewState::new("sess-1");
+        let out = render_to_string(&state, "", 80, 8);
+
+        assert!(out.contains("/help for help"), "help hint missing:\n{out}");
     }
 
     fn approval_state(allow_always: bool, detail: &str) -> ViewState {

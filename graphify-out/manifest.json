@@ -1135,8 +1135,8 @@
     "semantic_hash": ""
   },
   "src/tui/render.rs": {
-    "mtime": 1785876088.8752136,
-    "ast_hash": "9c73aba7445889634c341bca0a60a189",
+    "mtime": 1785907635.8124819,
+    "ast_hash": "bbddff77db666a1286b1a8eee1d6607d",
     "semantic_hash": ""
   },
   "src/tui/terminal.rs": {
