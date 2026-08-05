@@ -1508,6 +1508,9 @@ fn build_agent_config(
             thinking,
             ..CompleteOpts::default()
         },
+        // Item 3: leave unset so `run()` resolves it from
+        // `DAIMONOS_AGENT_AUTO_CONTINUE` (off unless the operator opts in).
+        auto_continue_budget: None,
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),

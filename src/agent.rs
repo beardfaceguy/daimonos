@@ -179,6 +179,14 @@ pub struct AgentConfig {
     /// one-shot/agent-cmd runs and tests, where sub-calls are unavailable.
     pub subcall_provider: Option<std::sync::Arc<dyn LlmProvider>>,
     pub generation_ordinal: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Automatic continuations after a `max_tokens` stop within a single user
+    /// turn (item 3 of the large-output UX work). `None` falls back to the
+    /// `DAIMONOS_AGENT_AUTO_CONTINUE` env var, then to
+    /// [`DEFAULT_AUTO_CONTINUE_BUDGET`]. `Some(0)` disables it, so the turn
+    /// returns a terminal `MaxTokens` exactly as before. Each auto-continuation
+    /// reissues the truncated turn with thinking forced off so reasoning cannot
+    /// re-consume the output budget and stall progress.
+    pub auto_continue_budget: Option<u32>,
 }
 
 pub struct AgentResult {
@@ -494,6 +502,23 @@ async fn record_agent_tool_output_savings(
     }
 }
 
+/// Default cap on automatic continuations after a `max_tokens` stop within a
+/// single user turn. `0` keeps the historical behavior (return terminal
+/// `MaxTokens`); operators opt in via `DAIMONOS_AGENT_AUTO_CONTINUE` or
+/// [`AgentConfig::auto_continue_budget`].
+pub const DEFAULT_AUTO_CONTINUE_BUDGET: u32 = 0;
+
+/// Parse `DAIMONOS_AGENT_AUTO_CONTINUE` as the auto-continue cap. Absent or
+/// unparseable yields `None`, leaving the config field / built-in default to
+/// decide.
+fn auto_continue_budget_from_env() -> Option<u32> {
+    std::env::var("DAIMONOS_AGENT_AUTO_CONTINUE")
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
 pub async fn run(
     provider: &dyn LlmProvider,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -502,6 +527,16 @@ pub async fn run(
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+
+    // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
+    // once per turn — explicit config wins, then the env override, then the
+    // built-in default (0 = off).
+    let auto_continue_budget = config
+        .auto_continue_budget
+        .or_else(auto_continue_budget_from_env)
+        .unwrap_or(DEFAULT_AUTO_CONTINUE_BUDGET);
+    let mut auto_continues_used: u32 = 0;
+    let mut continued_after_max_tokens = false;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -526,16 +561,31 @@ pub async fn run(
             tools: config.tools.clone(),
             stable_prefix_len: 0,
         };
+        // On a continuation after a `max_tokens` stop, reissue with thinking
+        // forced off so reasoning cannot re-consume the output budget and stall
+        // progress; otherwise use the caller's opts unchanged (item 3).
+        let continuation_opts;
+        let opts: &CompleteOpts = if continued_after_max_tokens {
+            continuation_opts = CompleteOpts {
+                model: config.opts.model.clone(),
+                max_tokens: config.opts.max_tokens,
+                thinking: ThinkingLevel::Off,
+                temperature: config.opts.temperature,
+            };
+            &continuation_opts
+        } else {
+            &config.opts
+        };
         let ordinal = config
             .generation_ordinal
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let generation =
             crate::observability::GenerationSpan::new(crate::observability::GenerationMetadata {
                 kind: "agent",
-                model: &config.opts.model,
-                max_tokens: config.opts.max_tokens,
-                thinking: config.opts.thinking.clone(),
-                temperature: config.opts.temperature,
+                model: &opts.model,
+                max_tokens: opts.max_tokens,
+                thinking: opts.thinking.clone(),
+                temperature: opts.temperature,
                 ordinal,
                 tools_exposed: ctx.tools.len(),
                 stable_prefix_len: ctx.stable_prefix_len,
@@ -543,7 +593,7 @@ pub async fn run(
         let resp = match &config.on_stream_event {
             Some(hook) => {
                 provider
-                    .stream(&ctx, &config.opts, &mut |ev| {
+                    .stream(&ctx, opts, &mut |ev| {
                         generation.mark_first_token();
                         hook(ev);
                     })
@@ -552,7 +602,7 @@ pub async fn run(
             }
             None => {
                 provider
-                    .stream(&ctx, &config.opts, &mut |_| {
+                    .stream(&ctx, opts, &mut |_| {
                         generation.mark_first_token();
                     })
                     .instrument(generation.span().clone())
@@ -597,6 +647,23 @@ pub async fn run(
         });
 
         match resp.stop_reason {
+            StopReason::MaxTokens
+                if auto_continue_budget > 0 && auto_continues_used < auto_continue_budget =>
+            {
+                // Item 3: auto-continue instead of dead-stopping to the client.
+                // Close any truncated (orphan) tool call so history stays valid
+                // and is NOT executed; a plain-text truncation leaves the partial
+                // assistant turn in place as a continuation seed. The next
+                // generation runs with thinking off (`continuation_opts`) so
+                // reasoning cannot re-consume the budget and stall. Bounded by
+                // `auto_continue_budget`; once it is exhausted the next
+                // `MaxTokens` falls through to the terminal arm below and still
+                // returns `MaxTokens` to the caller.
+                auto_continues_used += 1;
+                continued_after_max_tokens = true;
+                messages = close_orphan_tool_calls(messages);
+                continue;
+            }
             StopReason::EndTurn
             | StopReason::MaxTokens
             | StopReason::Refusal
@@ -3452,6 +3519,159 @@ mod tests {
         )
         .await;
         assert_eq!(result.stop_reason, StopReason::MaxTokens);
+    }
+
+    fn max_tokens_text_resp() -> LlmResponse {
+        LlmResponse {
+            content: vec![ContentBlock::Text("partial output".to_string())],
+            stop_reason: StopReason::MaxTokens,
+            error_message: None,
+            context_overflow: false,
+            usage: mock_usage(100, 50),
+        }
+    }
+
+    struct ThinkingCaptureProvider {
+        responses: Mutex<VecDeque<LlmResponse>>,
+        thinking: Arc<Mutex<Vec<ThinkingLevel>>>,
+    }
+
+    impl ThinkingCaptureProvider {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                thinking: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn thinking_handle(&self) -> Arc<Mutex<Vec<ThinkingLevel>>> {
+            Arc::clone(&self.thinking)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ThinkingCaptureProvider {
+        async fn complete(&self, _ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+            self.thinking.lock().unwrap().push(opts.thinking.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| LlmResponse::error("ThinkingCaptureProvider exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_auto_continue_completes_in_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
+        let config = AgentConfig {
+            auto_continue_budget: Some(3),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        // A plain-text truncation is auto-continued into a single logical turn
+        // that ends cleanly instead of dead-stopping to the client.
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_disabled_returns_terminal_max_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![max_tokens_text_resp()]);
+        let config = AgentConfig {
+            auto_continue_budget: Some(0),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        // Budget 0 preserves the historical behavior: terminal MaxTokens.
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_is_bounded_by_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = BenchmarkCaptureProvider::new(vec![
+            max_tokens_text_resp(),
+            max_tokens_text_resp(),
+            end_turn_resp(),
+        ]);
+        let contexts = provider.contexts_handle();
+        let config = AgentConfig {
+            auto_continue_budget: Some(1),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        // Budget 1: exactly one continuation, then the second MaxTokens exhausts
+        // the budget and returns terminal MaxTokens — the queued EndTurn (a
+        // third call) is never reached.
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+        assert_eq!(contexts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_forces_thinking_off_on_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider =
+            ThinkingCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
+        let thinking = provider.thinking_handle();
+        let config = AgentConfig {
+            auto_continue_budget: Some(2),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let seen = thinking.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one continuation after the truncation");
+        assert!(
+            !matches!(seen[0], ThinkingLevel::Off),
+            "first call keeps the caller's thinking level"
+        );
+        assert!(
+            matches!(seen[1], ThinkingLevel::Off),
+            "continuation forces thinking off so reasoning can't re-consume the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tokens_truncated_tool_call_auto_continues_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = BenchmarkCaptureProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::ToolCall {
+                    id: "cut-off-call".into(),
+                    name: "write_file".into(),
+                    input: json!({
+                        "path": "must-not-exist.txt",
+                        "content": "must not be written"
+                    }),
+                }],
+                stop_reason: StopReason::MaxTokens,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage::default(),
+            },
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            auto_continue_budget: Some(2),
+            ..AgentConfig::default()
+        };
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("go")],
+            &config,
+        )
+        .await;
+        // The truncated tool call is closed as interrupted (not executed), then
+        // the turn auto-continues to a clean end.
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+        assert!(orphan_ids(&result.messages).is_empty());
     }
 
     #[tokio::test]
