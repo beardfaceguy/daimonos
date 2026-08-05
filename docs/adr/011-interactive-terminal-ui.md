@@ -51,13 +51,14 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 
 ### 2. CLI compatibility (explicit, non-negotiable)
 
-- `daimonos agent` becomes an **interactive persistent TUI when attached to a
-  TTY**, with an optional initial prompt.
+- `daimonos agent --interactive` launches the persistent TUI when stdin and
+  stdout are attached to a TTY, with an optional initial prompt. Interactive
+  mode is deliberately opt-in while the daemon-owned detach/reconnect path is
+  still being completed.
 - A **stable, explicit non-interactive mode** is preserved for scripts, CI,
-  benchmarks, and shell composition (e.g. `daimonos agent --print "task"`). The
-  exact flag set is finalized in the phase-7 slice; the invariant is that a
-  documented, scriptable print/line mode always exists and never emits terminal
-  control codes.
+  benchmarks, and shell composition: `daimonos agent "task"` remains the
+  default and `daimonos agent --print "task"` forces it when flags are composed.
+  This documented print mode never emits terminal control codes.
 - **Non-TTY stdin/stdout falls back to print/line mode automatically** rather
   than emitting raw-mode escapes.
 - `daimonos chat` becomes an alias/compatibility fallback; we do **not** maintain
@@ -65,13 +66,21 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
   non-full-screen fallback editor but must never own stdin concurrently with a
   raw-mode TUI.
 
-### 3. Detach vs stop (daemon-owned session)
+### 3. Future detach vs stop contract (not currently exposed)
 
-- The session is **daemon-owned**: closing/detaching the TUI does not kill it.
-- `/detach` (or closing the terminal) leaves the daemon session alive and
-  reconnectable; `/stop-session` explicitly terminates it.
-- The local TUI retains authority to approve, interrupt, revoke remote clients,
+The intended daemon-owned contract remains:
+
+- closing/detaching a client does not kill its daemon session;
+- reattaching by session id or picker restores a canonical snapshot;
+- `/stop-session` explicitly terminates the session;
+- the local TUI retains authority to approve, interrupt, revoke remote clients,
   and stop the session, regardless of remote attachment (ADR-010 arbitration).
+
+The current TUI is process-local, so `/detach` is intentionally disabled and
+omitted from help. `/quit` exits the TUI and ends its session. Do not expose
+detach until the daemon provides local attach, session discovery, reconnect
+snapshot recovery, explicit stop/delete, and bounded idle/retention cleanup;
+without those pieces detach would only create unreachable abandoned sessions.
 
 ### 4. Terminal correctness (hard requirements)
 
@@ -88,17 +97,20 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 
 ## Phases (map to #1091)
 
-0. **This ADR** — CLI compat, detach/stop, event projection, fallback. *(done)*
+0. **This ADR** — CLI compatibility, future detach/stop contract, event
+   projection, and fallback. *(done)*
 1. Daemon-owned session core + UDS ACP transport. *(largely pre-landed by
    #1090: `session_core` / `session_protocol` / `client_transport`.)*
 2. **Pure view reducer + exhaustive unit tests.** *(this slice)*
 3. Streaming assistant output, tool lifecycle cards, interrupt (render layer).
 4. Permission modal + local control authority.
 5. Session/model/usage/remote-control commands + status bar.
-6. Polish: expandable diffs/terminal output, search/copy, resize/suspend,
-   accessibility (no-color, keyboard-only).
-7. Make the interactive TUI the TTY default; retain the explicit stable print
-   mode.
+6. Polish: bounded scrollback + navigation, prompt history, and no-color
+   rendering are implemented; expandable diffs/terminal output, search/copy,
+   resize/suspend, and broader accessibility remain.
+7. Wire the TUI behind opt-in `--interactive`; retain the default and explicit
+   `--print` stable print modes. Reconsider a TTY default only after the
+   daemon-owned detach/reconnect lifecycle is complete.
 
 ## Verification gates (TDD)
 

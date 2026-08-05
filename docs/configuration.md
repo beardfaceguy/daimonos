@@ -302,6 +302,22 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `[tui]` — Interactive terminal frontend
+
+These limits apply to `daimonos agent --interactive`. History is process-local
+and is not persisted across launches.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `history_entries` | `100` | Maximum submitted prompts retained for Up/Down navigation. Valid range: 1–10,000. |
+| `scrollback_entries` | `2000` | Maximum entries retained independently for transcript lines and tool cards. Valid range: 1–50,000. |
+
+```toml
+[tui]
+history_entries = 100
+scrollback_entries = 2000
+```
+
 ### `[acp]` — Native agent protocol (`acp`)
 
 These settings apply to native ACP integrations such as Zed.

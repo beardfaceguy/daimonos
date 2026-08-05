@@ -70,6 +70,7 @@ pub struct ViewState {
     pending_approvals: Vec<ApprovalRequest>,
     runtime_options: Vec<RuntimeOption>,
     context_usage: Option<ContextUsage>,
+    max_scrollback_entries: usize,
     /// Set once a `SessionEnding` event arrives; a renderer can surface this
     /// and stop accepting input.
     ending_reason: Option<String>,
@@ -78,6 +79,13 @@ pub struct ViewState {
 impl ViewState {
     /// A fresh, empty view for `session_id` before any snapshot/event.
     pub fn new(session_id: impl Into<String>) -> Self {
+        Self::with_scrollback_limit(session_id, crate::config::DEFAULT_TUI_SCROLLBACK_ENTRIES)
+    }
+
+    pub fn with_scrollback_limit(
+        session_id: impl Into<String>,
+        max_scrollback_entries: usize,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             last_seq: 0,
@@ -87,6 +95,7 @@ impl ViewState {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            max_scrollback_entries: max_scrollback_entries.max(1),
             ending_reason: None,
         }
     }
@@ -125,6 +134,25 @@ impl ViewState {
         self.pending_approvals.first()
     }
 
+    /// Clear local conversation/tool presentation after `/clear`.
+    ///
+    /// Session identity, runtime options, usage, and sequence ordering remain
+    /// intact; the backing [`AgentSession`] clears its model history separately.
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.tool_calls.clear();
+    }
+
+    /// Append a committed frontend-local notice without changing session
+    /// sequencing. Slash-command help and validation use this for information
+    /// that is intentionally not sent to the model or daemon.
+    pub fn push_system_message(&mut self, text: impl Into<String>) {
+        self.close_open_line();
+        self.transcript
+            .push(ViewLine::committed(TranscriptRole::System, text.into()));
+        self.trim_scrollback();
+    }
+
     // ---- snapshot application (attach / reconnect) -----------------------
 
     /// Replace the entire view with a canonical daemon snapshot.
@@ -145,6 +173,7 @@ impl ViewState {
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
+        self.trim_scrollback();
         // A snapshot is a full canonical resync of live session state, so any
         // `ending_reason` observed before a reconnect must clear: if the
         // session were really ending, that would arrive again as a fresh
@@ -171,6 +200,7 @@ impl ViewState {
         }
         self.last_seq = seq;
         self.apply_event_body(event);
+        self.trim_scrollback();
         ApplyOutcome::Applied
     }
 
@@ -275,6 +305,18 @@ impl ViewState {
             last.open = false;
         }
     }
+
+    fn trim_scrollback(&mut self) {
+        trim_oldest(&mut self.transcript, self.max_scrollback_entries);
+        trim_oldest(&mut self.tool_calls, self.max_scrollback_entries);
+    }
+}
+
+fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
+    let excess = entries.len().saturating_sub(max_entries);
+    if excess > 0 {
+        entries.drain(..excess);
+    }
 }
 
 fn transcript_entry_to_line(entry: TranscriptEntry) -> ViewLine {
@@ -344,6 +386,56 @@ mod tests {
         // User line + one assistant line, no system note on clean completion.
         assert_eq!(s.transcript().len(), 2);
         assert_eq!(s.transcript()[0].role, TranscriptRole::User);
+    }
+
+    #[test]
+    fn local_system_message_preserves_sequence_and_closes_stream() {
+        let mut state = ViewState::new("sess-1");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::AssistantDelta {
+                text: "partial".into(),
+            },
+        );
+
+        state.push_system_message("help");
+
+        assert_eq!(state.last_seq(), 1);
+        assert!(!state.transcript()[0].open);
+        assert_eq!(state.transcript()[1].role, TranscriptRole::System);
+        assert_eq!(state.transcript()[1].text, "help");
+    }
+
+    #[test]
+    fn scrollback_limit_keeps_newest_transcript_and_tool_entries() {
+        let mut state = ViewState::with_scrollback_limit("sess-1", 2);
+        for (seq, text) in [(1, "one"), (2, "two"), (3, "three")] {
+            ev(
+                &mut state,
+                seq,
+                SessionEvent::UserMessage { text: text.into() },
+            );
+        }
+        for (seq, id) in [(4, "t1"), (5, "t2"), (6, "t3")] {
+            ev(
+                &mut state,
+                seq,
+                SessionEvent::ToolCallStarted {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    title: id.into(),
+                    input_summary: None,
+                },
+            );
+        }
+
+        assert_eq!(state.transcript().len(), 2);
+        assert_eq!(state.transcript()[0].text, "two");
+        assert_eq!(state.transcript()[1].text, "three");
+        assert_eq!(state.tool_calls().len(), 2);
+        assert_eq!(state.tool_calls()[0].id, "t2");
+        assert_eq!(state.tool_calls()[1].id, "t3");
     }
 
     #[test]

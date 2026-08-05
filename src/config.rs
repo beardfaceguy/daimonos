@@ -21,6 +21,7 @@ pub struct Config {
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
     pub acp: AcpConfig,
+    pub tui: TuiConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
     pub coordination: CoordinationConfig,
@@ -244,6 +245,52 @@ pub struct AcpConfig {
     /// MCP-server bridge: consume the MCP servers Zed forwards on
     /// session/new/load and expose their tools to the model (ADR-003, #990).
     pub mcp: AcpMcpConfig,
+}
+
+pub const DEFAULT_TUI_HISTORY_ENTRIES: usize = 100;
+pub const DEFAULT_TUI_SCROLLBACK_ENTRIES: usize = 2_000;
+pub const MAX_TUI_HISTORY_ENTRIES: usize = 10_000;
+pub const MAX_TUI_SCROLLBACK_ENTRIES: usize = 50_000;
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Process-local submitted prompt history retained for Up/Down navigation.
+    pub history_entries: usize,
+    /// Maximum entries retained in each rendered-view collection (transcript
+    /// lines and tool cards are bounded independently).
+    pub scrollback_entries: usize,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            history_entries: DEFAULT_TUI_HISTORY_ENTRIES,
+            scrollback_entries: DEFAULT_TUI_SCROLLBACK_ENTRIES,
+        }
+    }
+}
+
+impl TuiConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.history_entries == 0 {
+            return Err("tui.history_entries must be greater than zero".to_string());
+        }
+        if self.history_entries > MAX_TUI_HISTORY_ENTRIES {
+            return Err(format!(
+                "tui.history_entries must be <= {MAX_TUI_HISTORY_ENTRIES}"
+            ));
+        }
+        if self.scrollback_entries == 0 {
+            return Err("tui.scrollback_entries must be greater than zero".to_string());
+        }
+        if self.scrollback_entries > MAX_TUI_SCROLLBACK_ENTRIES {
+            return Err(format!(
+                "tui.scrollback_entries must be <= {MAX_TUI_SCROLLBACK_ENTRIES}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for AcpConfig {
@@ -1052,6 +1099,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.index.validate()?;
         self.acp.validate()?;
+        self.tui.validate()?;
         self.process.validate()?;
         self.tool_output.validate()?;
         self.logging.validate()?;
@@ -1330,6 +1378,8 @@ mod tests {
         assert_eq!(cfg.search.default_grep_max, 100);
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.acp.session_list_page_size, 50);
+        assert_eq!(cfg.tui.history_entries, DEFAULT_TUI_HISTORY_ENTRIES);
+        assert_eq!(cfg.tui.scrollback_entries, DEFAULT_TUI_SCROLLBACK_ENTRIES);
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
@@ -1375,6 +1425,8 @@ mod tests {
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.tui.history_entries, 100);
+        assert_eq!(cfg.tui.scrollback_entries, 2_000);
         assert_eq!(cfg.index.mode, IndexMode::Hybrid);
         assert_eq!(cfg.index.max_walk_entries, 100_000);
         assert_eq!(cfg.tool_output.max_bytes, 50 * 1024);
@@ -1599,6 +1651,33 @@ mod tests {
             .validate()
             .expect_err("zero page size must be rejected")
             .contains("acp.session_list_page_size"));
+    }
+
+    #[test]
+    fn tui_limits_parse_and_must_be_positive() {
+        let cfg: Config =
+            toml::from_str("[tui]\nhistory_entries = 25\nscrollback_entries = 500\n").unwrap();
+        assert_eq!(cfg.tui.history_entries, 25);
+        assert_eq!(cfg.tui.scrollback_entries, 500);
+        assert!(cfg.validate().is_ok());
+
+        for toml in [
+            "[tui]\nhistory_entries = 0\n",
+            "[tui]\nscrollback_entries = 0\n",
+        ] {
+            let invalid: Config = toml::from_str(toml).unwrap();
+            assert!(invalid.validate().unwrap_err().contains("tui."));
+        }
+
+        let mut invalid = Config::default();
+        invalid.tui.history_entries = MAX_TUI_HISTORY_ENTRIES + 1;
+        assert!(invalid.validate().unwrap_err().contains("history_entries"));
+        let mut invalid = Config::default();
+        invalid.tui.scrollback_entries = MAX_TUI_SCROLLBACK_ENTRIES + 1;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .contains("scrollback_entries"));
     }
 
     #[test]

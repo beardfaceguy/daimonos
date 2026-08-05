@@ -21,30 +21,55 @@ use crate::session_protocol::{
 };
 use crate::tui::state::ViewState;
 
+pub const STATUS_HEIGHT: u16 = 1;
+pub const COMPOSER_HEIGHT: u16 = 3;
+pub const TUI_CHROME_HEIGHT: u16 = STATUS_HEIGHT + COMPOSER_HEIGHT;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    pub no_color: bool,
+    pub scroll_from_bottom: usize,
+}
+
 /// Render the whole TUI frame for `state` into `area` of `buf`.
 ///
 /// `composer` is the UI-local input buffer (not part of canonical session
 /// state). Layout top-to-bottom: transcript (flex) / status bar (1 row) /
 /// composer (3 rows, bordered).
 pub fn render(state: &ViewState, composer: &str, area: Rect, buf: &mut Buffer) {
+    render_with_options(state, composer, area, buf, RenderOptions::default());
+}
+
+pub fn render_with_options(
+    state: &ViewState,
+    composer: &str,
+    area: Rect,
+    buf: &mut Buffer,
+    options: RenderOptions,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(STATUS_HEIGHT),
+            Constraint::Length(COMPOSER_HEIGHT),
         ])
         .split(area);
-    render_transcript(state, chunks[0], buf);
+    render_transcript(state, chunks[0], buf, options.scroll_from_bottom);
     render_status(state, chunks[1], buf);
     render_composer(composer, chunks[2], buf);
     // Overlay last so it sits above every base layer. It is the one thing a
     // human must act on, and ADR-011 keeps approval authority with the local
     // TUI regardless of which client ultimately answers.
     render_approval_modal(state, area, buf);
+    if options.no_color {
+        for cell in &mut buf.content {
+            cell.set_fg(Color::Reset).set_bg(Color::Reset);
+        }
+    }
 }
 
-fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
+fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_from_bottom: usize) {
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in state.transcript() {
@@ -80,8 +105,13 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(spans));
     }
 
-    Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let max_top = paragraph
+        .line_count(area.width)
+        .saturating_sub(usize::from(area.height));
+    let top = max_top.saturating_sub(scroll_from_bottom.min(max_top));
+    paragraph
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
         .render(area, buf);
 }
 
@@ -204,7 +234,7 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
 fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("message (Enter to send · Ctrl-C interrupts)");
+        .title("message (Enter to send · Ctrl-C interrupts · /help for help)");
     Paragraph::new(Line::from(sanitize(composer)))
         .block(block)
         .wrap(Wrap { trim: false })
@@ -436,6 +466,113 @@ mod tests {
             out.contains("draft message"),
             "composer text missing:\n{out}"
         );
+    }
+
+    #[test]
+    fn composer_title_points_to_help() {
+        let state = ViewState::new("sess-1");
+        let out = render_to_string(&state, "", 80, 8);
+
+        assert!(out.contains("/help for help"), "help hint missing:\n{out}");
+    }
+
+    #[test]
+    fn no_color_mode_resets_every_rendered_cell_color() {
+        let mut state = ViewState::new("sess-1");
+        state.apply_event(
+            1,
+            SessionEvent::UserMessage {
+                text: "hello".into(),
+            },
+        );
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut buf,
+            RenderOptions {
+                no_color: true,
+                ..RenderOptions::default()
+            },
+        );
+
+        assert!(buf
+            .content
+            .iter()
+            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn transcript_scroll_moves_away_from_and_back_to_latest_entries() {
+        let mut state = ViewState::new("sess-1");
+        for index in 1..=6 {
+            state.apply_event(
+                index,
+                SessionEvent::UserMessage {
+                    text: format!("message-{index}"),
+                },
+            );
+        }
+        let area = Rect::new(0, 0, 40, 8);
+        let mut latest = Buffer::empty(area);
+        render_with_options(&state, "", area, &mut latest, RenderOptions::default());
+        let mut earlier = Buffer::empty(area);
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut earlier,
+            RenderOptions {
+                scroll_from_bottom: usize::MAX,
+                ..RenderOptions::default()
+            },
+        );
+
+        let latest = buffer_to_string(&latest);
+        let earlier = buffer_to_string(&earlier);
+        assert!(latest.contains("message-6"));
+        assert!(!latest.contains("message-1"));
+        assert!(earlier.contains("message-1"));
+        assert!(!earlier.contains("message-6"));
+    }
+
+    #[test]
+    fn transcript_scroll_counts_wrapped_rows() {
+        let mut state = ViewState::new("sess-1");
+        state.apply_event(
+            1,
+            SessionEvent::UserMessage {
+                text: "FIRST-START 111111111111111111111111 FIRST-END".into(),
+            },
+        );
+        state.apply_event(
+            2,
+            SessionEvent::UserMessage {
+                text: "SECOND-START 222222222222222222222 SECOND-END".into(),
+            },
+        );
+        let area = Rect::new(0, 0, 20, 8);
+        let mut latest = Buffer::empty(area);
+        render_with_options(&state, "", area, &mut latest, RenderOptions::default());
+        let mut earlier = Buffer::empty(area);
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut earlier,
+            RenderOptions {
+                scroll_from_bottom: 2,
+                ..RenderOptions::default()
+            },
+        );
+
+        let latest = buffer_to_string(&latest);
+        let earlier = buffer_to_string(&earlier);
+        assert_ne!(latest, earlier, "wrapped-row scroll should move the view");
+        assert!(earlier.contains("FIRST-START"));
     }
 
     fn approval_state(allow_always: bool, detail: &str) -> ViewState {

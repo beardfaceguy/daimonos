@@ -3,8 +3,22 @@ use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub struct AgentArgs {
-    /// Task description for the agent
-    pub task: String,
+    /// Optional initial task. Required unless --interactive launches on a TTY.
+    pub task: Option<String>,
+    /// Launch the full-screen terminal UI when stdin and stdout are terminals.
+    #[arg(short = 'i', long, default_value_t = false)]
+    pub interactive: bool,
+    /// Render the interactive TUI without terminal colors.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "interactive",
+        conflicts_with = "print"
+    )]
+    pub no_color: bool,
+    /// Force stable one-shot output, including when --interactive is also set.
+    #[arg(long, default_value_t = false)]
+    pub print: bool,
     /// Model override (default: from the agent env file)
     #[arg(long)]
     pub model: Option<String>,
@@ -63,7 +77,7 @@ pub struct McpArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the agent on a one-shot task and exit.
+    /// Run the agent once, or launch the opt-in interactive terminal UI.
     Agent(AgentArgs),
     /// Start an interactive chat REPL over a stateful agent session.
     Chat(ChatArgs),
@@ -238,6 +252,56 @@ mod tests {
         assert_eq!(mode(&["daimonos", "chat", "--list"]), RuntimeMode::Chat);
         assert_eq!(mode(&["daimonos", "acp"]), RuntimeMode::Acp);
         assert_eq!(mode(&["daimonos", "--stats"]), RuntimeMode::Stats);
+    }
+
+    #[test]
+    fn interactive_agent_accepts_no_initial_task() {
+        let cli = Cli::try_parse_from(["daimonos", "agent", "--interactive"])
+            .expect("interactive agent should allow an empty composer");
+        let Some(Command::Agent(args)) = cli.command else {
+            panic!("agent command");
+        };
+
+        assert!(args.interactive);
+        assert!(!args.print);
+        assert!(args.task.is_none());
+    }
+
+    #[test]
+    fn no_color_is_scoped_to_interactive_agent_mode() {
+        let cli = Cli::try_parse_from(["daimonos", "agent", "--interactive", "--no-color"])
+            .expect("interactive no-color mode");
+        let Some(Command::Agent(args)) = cli.command else {
+            panic!("agent command");
+        };
+        assert!(args.no_color);
+
+        assert!(
+            Cli::try_parse_from(["daimonos", "agent", "--no-color", "do work"]).is_err(),
+            "--no-color without --interactive should be rejected"
+        );
+        assert!(Cli::try_parse_from([
+            "daimonos",
+            "agent",
+            "--interactive",
+            "--print",
+            "--no-color",
+            "do work",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn print_agent_keeps_optional_task_for_runtime_validation() {
+        let cli = Cli::try_parse_from(["daimonos", "agent", "--print", "do work"])
+            .expect("explicit print mode");
+        let Some(Command::Agent(args)) = cli.command else {
+            panic!("agent command");
+        };
+
+        assert!(args.print);
+        assert!(!args.interactive);
+        assert_eq!(args.task.as_deref(), Some("do work"));
     }
 
     #[test]
