@@ -1368,8 +1368,6 @@ mod tests {
         assert_eq!(cfg.tui.history_entries, DEFAULT_TUI_HISTORY_ENTRIES);
         assert_eq!(cfg.tui.scrollback_entries, DEFAULT_TUI_SCROLLBACK_ENTRIES);
         assert_eq!(cfg.process.poll_tail_lines, 20);
-        assert_eq!(cfg.tui.history_entries, 100);
-        assert_eq!(cfg.tui.scrollback_entries, 2_000);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert!(cfg.logging.enabled);
@@ -1414,6 +1412,8 @@ mod tests {
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.tui.history_entries, 100);
+        assert_eq!(cfg.tui.scrollback_entries, 2_000);
         assert_eq!(cfg.index.mode, IndexMode::Hybrid);
         assert_eq!(cfg.index.max_walk_entries, 100_000);
         assert_eq!(cfg.tool_output.max_bytes, 50 * 1024);

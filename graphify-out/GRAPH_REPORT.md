@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `26cec08b`
+- Built from commit: `16f4de46`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -510,8 +510,8 @@ Cohesion: 0.10
 Nodes (41): Path, Client, Path, Popen, ResourceSnapshot, CallSample, Client, find_binary() (+33 more)
 
 ### Community 51 - "Community 51"
-Cohesion: 0.08
-Nodes (27): CoreRuntimeOption, DateTime, Event, LevelFilter, S, AcpCommand, assistant_texts(), canonical_model_options() (+19 more)
+Cohesion: 0.07
+Nodes (31): CoreRuntimeOption, DateTime, Event, LevelFilter, S, AcpCommand, assistant_texts(), canonical_model_options() (+23 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.08
@@ -927,7 +927,7 @@ Nodes (5): ApprovalDecision, Option, approval_from_key(), parse_command(), UiCom
 
 ### Community 175 - "Community 175"
 Cohesion: 0.07
-Nodes (30): AsyncRead, Pin, Poll, Read, AlwaysWouldBlockWriter, clear_fd_nonblocking(), EofAwareReader, EofAwareReader<R> (+22 more)
+Nodes (29): AsyncRead, Pin, Poll, Read, AlwaysWouldBlockWriter, clear_fd_nonblocking(), EofAwareReader<R>, ErrorReader (+21 more)
 
 ### Community 176 - "Community 176"
 Cohesion: 0.09
@@ -1135,7 +1135,7 @@ Nodes (7): Aggregate lineage, Conclusion, F2 pass totals, Full-suite Anthropic t
 
 ### Community 233 - "Community 233"
 Cohesion: 0.05
-Nodes (79): AcpContentBlock, CoreMessage, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled() (+71 more)
+Nodes (76): AcpContentBlock, CoreMessage, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled() (+68 more)
 
 ### Community 234 - "Community 234"
 Cohesion: 0.33
