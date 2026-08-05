@@ -186,7 +186,9 @@ def test_tool_description_override_reaches_list_tools(daimonos_binary, tmp_path)
             tools["read_file"]["inputSchema"]["properties"]["offset"]["description"]
             == "Start line (0-based)"
         )
-        assert tools["write_file"]["description"] == "Write file, creating parent dirs."
+        assert tools["write_file"]["description"].startswith(
+            "Write file, creating parent dirs."
+        )
     finally:
         proc.terminate()
         proc.wait(timeout=5)

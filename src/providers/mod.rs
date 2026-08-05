@@ -237,6 +237,7 @@ pub struct Context {
     pub stable_prefix_len: usize,
 }
 
+#[derive(Clone)]
 pub struct CompleteOpts {
     pub model: String,
     pub max_tokens: u32,

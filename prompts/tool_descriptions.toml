@@ -12,16 +12,22 @@ path = "Relative path"
 offset = "Start line (0-based)"
 limit = "Max lines"
 [write_file]
-full = """Write file, creating parent dirs."""
+full = """Write file, creating parent dirs. The ENTIRE `content` is emitted as output tokens and must fit in one turn's output budget, so an oversized write can hit the model output limit and be discarded unwritten. Use `edit_file` for any change to an existing file (small diffs, never a full rewrite); build a large NEW file incrementally — a bounded first section here, then extend it with append_file — rather than emitting it all at once."""
 
 [write_file.parameters]
 path = "Relative path"
 [edit_file]
-full = """String-replace edits: `edits` is [old, new, old, new, ...]. Keep each `old` as SMALL as possible — just the changing line(s) plus only enough surrounding context to be UNIQUE in the file; do not paste large unchanged regions. Leading-indentation differences are tolerated (match is by line content), so don't reproduce exact whitespace. Returns {applied, diffs}; on a miss or ambiguous match it returns a `failures` array naming the offending `old` and why — fix just that pair (make it unique or correct it), don't re-send the whole file."""
+full = """Preferred over rewriting a file with write_file — you emit only the changed hunks, not the whole file, so it stays well within the output budget. String-replace edits: `edits` is [old, new, old, new, ...]. Keep each `old` as SMALL as possible — just the changing line(s) plus only enough surrounding context to be UNIQUE in the file; do not paste large unchanged regions. Leading-indentation differences are tolerated (match is by line content), so don't reproduce exact whitespace. Returns {applied, diffs}; on a miss or ambiguous match it returns a `failures` array naming the offending `old` and why — fix just that pair (make it unique or correct it), don't re-send the whole file."""
 
 [edit_file.parameters]
 path = "Relative path"
 edits = "[old, new, old, new, ...] pairs. Each `old`: minimal + unique; whitespace-tolerant."
+[append_file]
+full = """Append `content` to the end of a file, creating it (and parent dirs) if absent. Only the appended `content` is emitted as output tokens, so this is how you build a large file across several bounded calls: write a first section with write_file, then extend it with repeated append_file calls, keeping every call well under one turn's output budget. Returns {ok, appended_bytes} — appended_bytes is the number of UTF-8 bytes written (not characters)."""
+
+[append_file.parameters]
+path = "Relative path; created (with parent dirs) if absent."
+content = "Text appended verbatim to the end of the file."
 [search]
 full = """Regex content search or trigram relative filename/path search. File mode populates lazily and reports index coverage."""
 

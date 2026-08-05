@@ -13,6 +13,7 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
     "exec",
     "write_file",
     "edit_file",
+    "append_file",
     "git",
     "docker",
     "cargo",
