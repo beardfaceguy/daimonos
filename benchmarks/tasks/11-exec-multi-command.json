@@ -26,20 +26,38 @@
     {
       "type": "response",
       "any": [
-        "git",
-        "commit"
-      ],
-      "min": 1
+        "15\\s+(tests?|passed|passing)",
+        "(tests?|passed|passing)[^0-9]{0,15}15",
+        "15/15"
+      ]
     },
     {
       "type": "response",
       "any": [
-        "pass",
-        "ok",
-        "succe",
-        "clean"
-      ],
-      "min": 1
+        "2\\s+warning",
+        "two\\s+warning",
+        "apply_discount",
+        "never used",
+        "dead[ _]code"
+      ]
+    },
+    {
+      "type": "response",
+      "any": [
+        "Initial benchmark workspace",
+        "Add inventory data",
+        "Initial project setup",
+        "gitignore"
+      ]
+    },
+    {
+      "type": "response",
+      "any": [
+        "clean",
+        "nothing to commit",
+        "no uncommitted",
+        "no changes"
+      ]
     }
   ]
 }

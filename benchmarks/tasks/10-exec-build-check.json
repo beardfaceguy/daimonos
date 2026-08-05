@@ -23,23 +23,18 @@
     {
       "type": "response",
       "any": [
-        "compil",
-        "check",
-        "build"
-      ],
-      "min": 1
+        "apply_discount",
+        "find_by_sku",
+        "find_by_category"
+      ]
     },
     {
       "type": "response",
       "any": [
-        "clean",
-        "succe",
-        "no error",
-        "ok",
-        "pass",
-        "without"
-      ],
-      "min": 1
+        "never used",
+        "dead[ _]code",
+        "unused"
+      ]
     }
   ]
 }
