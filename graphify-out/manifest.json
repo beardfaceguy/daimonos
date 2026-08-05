@@ -1120,8 +1120,8 @@
     "semantic_hash": ""
   },
   "src/tui/mod.rs": {
-    "mtime": 1785908680.1080334,
-    "ast_hash": "7da1509d0c6654fe57b2be324fe4d76f",
+    "mtime": 1785910282.705546,
+    "ast_hash": "28cd753926d40c9a9a0e64f208fdee5a",
     "semantic_hash": ""
   },
   "src/tui/state.rs": {
@@ -1135,8 +1135,8 @@
     "semantic_hash": ""
   },
   "src/tui/render.rs": {
-    "mtime": 1785909692.0829988,
-    "ast_hash": "00ba6ea832c06d734d4154be1ee48153",
+    "mtime": 1785910263.6157546,
+    "ast_hash": "0d5ce2443188bb86e64727c71ed7d6cb",
     "semantic_hash": ""
   },
   "src/tui/terminal.rs": {
@@ -1160,8 +1160,8 @@
     "semantic_hash": ""
   },
   "src/tui/app.rs": {
-    "mtime": 1785909101.5764332,
-    "ast_hash": "6ca42487a9e0ae292a3c89fad53f4afa",
+    "mtime": 1785910270.9216747,
+    "ast_hash": "0f2d1d9b639db8afd3f024742b568a6b",
     "semantic_hash": ""
   },
   "src/tui/input.rs": {

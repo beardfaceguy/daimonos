@@ -388,7 +388,11 @@ fn transcript_page_height(
     terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> anyhow::Result<usize> {
     Ok(usize::from(
-        terminal.size()?.height.saturating_sub(4).max(1),
+        terminal
+            .size()?
+            .height
+            .saturating_sub(super::TUI_CHROME_HEIGHT)
+            .max(1),
     ))
 }
 

@@ -21,6 +21,10 @@ use crate::session_protocol::{
 };
 use crate::tui::state::ViewState;
 
+pub const STATUS_HEIGHT: u16 = 1;
+pub const COMPOSER_HEIGHT: u16 = 3;
+pub const TUI_CHROME_HEIGHT: u16 = STATUS_HEIGHT + COMPOSER_HEIGHT;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderOptions {
     pub no_color: bool,
@@ -47,8 +51,8 @@ pub fn render_with_options(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(STATUS_HEIGHT),
+            Constraint::Length(COMPOSER_HEIGHT),
         ])
         .split(area);
     render_transcript(state, chunks[0], buf, options.scroll_from_bottom);
@@ -101,16 +105,13 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_fro
         lines.push(Line::from(spans));
     }
 
-    let visible_entries = usize::from(area.height.max(1));
-    let max_start = lines.len().saturating_sub(visible_entries);
-    let start = max_start.saturating_sub(scroll_from_bottom.min(max_start));
-    let visible = lines
-        .into_iter()
-        .skip(start)
-        .take(visible_entries)
-        .collect::<Vec<_>>();
-    Paragraph::new(Text::from(visible))
-        .wrap(Wrap { trim: false })
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let max_top = paragraph
+        .line_count(area.width)
+        .saturating_sub(usize::from(area.height));
+    let top = max_top.saturating_sub(scroll_from_bottom.min(max_top));
+    paragraph
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
         .render(area, buf);
 }
 
@@ -536,6 +537,42 @@ mod tests {
         assert!(!latest.contains("message-1"));
         assert!(earlier.contains("message-1"));
         assert!(!earlier.contains("message-6"));
+    }
+
+    #[test]
+    fn transcript_scroll_counts_wrapped_rows() {
+        let mut state = ViewState::new("sess-1");
+        state.apply_event(
+            1,
+            SessionEvent::UserMessage {
+                text: "FIRST-START 111111111111111111111111 FIRST-END".into(),
+            },
+        );
+        state.apply_event(
+            2,
+            SessionEvent::UserMessage {
+                text: "SECOND-START 222222222222222222222 SECOND-END".into(),
+            },
+        );
+        let area = Rect::new(0, 0, 20, 8);
+        let mut latest = Buffer::empty(area);
+        render_with_options(&state, "", area, &mut latest, RenderOptions::default());
+        let mut earlier = Buffer::empty(area);
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut earlier,
+            RenderOptions {
+                scroll_from_bottom: 2,
+                ..RenderOptions::default()
+            },
+        );
+
+        let latest = buffer_to_string(&latest);
+        let earlier = buffer_to_string(&earlier);
+        assert_ne!(latest, earlier, "wrapped-row scroll should move the view");
+        assert!(earlier.contains("FIRST-START"));
     }
 
     fn approval_state(allow_always: bool, detail: &str) -> ViewState {
