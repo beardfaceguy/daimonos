@@ -1,16 +1,16 @@
 # Graph Report - daimonos  (2026-08-04)
 
 ## Corpus Check
-- 227 files · ~297,592 words
+- 227 files · ~297,670 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5818 nodes · 13532 edges · 250 communities (232 shown, 18 thin omitted)
+- 5818 nodes · 13533 edges · 249 communities (231 shown, 18 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 61 edges (avg confidence: 0.71)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `200ff7c1`
+- Built from commit: `da0cc961`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -235,7 +235,6 @@
 - [[_COMMUNITY_Community 227|Community 227]]
 - [[_COMMUNITY_Community 228|Community 228]]
 - [[_COMMUNITY_Community 229|Community 229]]
-- [[_COMMUNITY_Community 230|Community 230]]
 - [[_COMMUNITY_Community 231|Community 231]]
 - [[_COMMUNITY_Community 232|Community 232]]
 - [[_COMMUNITY_Community 233|Community 233]]
@@ -302,7 +301,7 @@
 - 1-file cycle: `src/kgl/observe.rs -> src/kgl/observe.rs`
 - 1-file cycle: `src/kgl/query.rs -> src/kgl/query.rs`
 
-## Communities (250 total, 18 thin omitted)
+## Communities (249 total, 18 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.15
@@ -321,8 +320,8 @@ Cohesion: 0.07
 Nodes (32): a_fresh_tracker_starts_idle_and_unoccupied(), bound_call_tool_result(), BoundResultStats, build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs() (+24 more)
 
 ### Community 4 - "Community 4"
-Cohesion: 0.08
-Nodes (22): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_redact_sensitive_hides_env_token(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled() (+14 more)
+Cohesion: 0.09
+Nodes (23): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_redact_sensitive_hides_env_token(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled() (+15 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.11
@@ -733,8 +732,8 @@ Cohesion: 0.09
 Nodes (22): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig, SearchConfig, Config, effective_full_tool_schemas() (+14 more)
 
 ### Community 108 - "Community 108"
-Cohesion: 0.22
-Nodes (9): E, build_provider(), generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, RemoteToolSpan, saturated_queue_drops_spans_without_blocking_producer() (+1 more)
+Cohesion: 0.14
+Nodes (14): Span, CompactionSpan, CoordinationSpan, generation_span_is_child_and_exports_usage_without_content(), GenerationSpan, prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, RemoteToolSpan (+6 more)
 
 ### Community 109 - "Community 109"
 Cohesion: 0.08
@@ -941,8 +940,8 @@ Cohesion: 0.20
 Nodes (9): ACP presentation and replay, ADR-004: Provider-neutral execution plans with ACP Plan updates, Agent-only `update_plan` tool, Decision, Problem, Prompt behavior, Provider-neutral hook, Rejected alternatives (+1 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.09
-Nodes (27): ExporterBuildError, SdkTracerProvider, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CoordinationOutcome (+19 more)
+Cohesion: 0.08
+Nodes (31): ExporterBuildError, SdkTracerProvider, SocketAddr, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter() (+23 more)
 
 ### Community 179 - "Community 179"
 Cohesion: 0.12
@@ -969,8 +968,8 @@ Cohesion: 0.18
 Nodes (14): builds_code_only_graph_from_graphify_json(), classify(), GraphifySubstrate, map_relation(), missing_graph_degrades_to_empty(), write_graph(), NodeKind, EdgeKind (+6 more)
 
 ### Community 186 - "Community 186"
-Cohesion: 0.26
-Nodes (21): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), coordination_span_error_status_records_bounded_class(), coordination_span_never_records_message_content(), coordination_span_records_metadata_only() (+13 more)
+Cohesion: 0.24
+Nodes (23): InMemorySpanExporter, attribute_map(), blocked_tool_span_records_status_without_sizes(), bridge_lifecycle_span_roots_own_trace_without_credentials(), compaction_span_records_metadata_and_nests_summary_generation(), coordination_span_error_status_records_bounded_class(), coordination_span_never_records_message_content(), coordination_span_records_metadata_only() (+15 more)
 
 ### Community 187 - "Community 187"
 Cohesion: 0.18
@@ -1097,8 +1096,8 @@ Cohesion: 0.50
 Nodes (4): _has_properties(), Config-gated tool provisioning, exercised through the ``daimonos_factory`` fixtu, True when a JSON Schema advertises at least one property., test_daimonos_toml_full_tool_schemas_gates_schema_exposure_at_launch()
 
 ### Community 224 - "Community 224"
-Cohesion: 0.11
-Nodes (15): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, CoordinationSpan, GenerationMetadata, GenerationSpan, AtomicBool (+7 more)
+Cohesion: 0.18
+Nodes (10): E, build_provider(), CompactionMetadata, GenerationMetadata, PromptMetadata, Path, Self, ThinkingLevel (+2 more)
 
 ### Community 225 - "Community 225"
 Cohesion: 0.12
@@ -1119,10 +1118,6 @@ Nodes (8): Conclusion, Hybrid lazy indexing lifecycle benchmark, Large marked fi
 ### Community 229 - "Community 229"
 Cohesion: 0.22
 Nodes (4): Bottom line for the round, Cache-ON variant on #126: F4 (cache on) vs F3 (cache off), same binary, Provenance, Read
-
-### Community 230 - "Community 230"
-Cohesion: 0.33
-Nodes (6): SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthenticated_otlp_collector(), mock_otlp_server(), JoinHandle, SdkTracer
 
 ### Community 231 - "Community 231"
 Cohesion: 0.29

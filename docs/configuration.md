@@ -309,8 +309,8 @@ and is not persisted across launches.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `history_entries` | `100` | Maximum submitted prompts retained for Up/Down navigation. Must be greater than zero. |
-| `scrollback_entries` | `2000` | Maximum entries retained independently for transcript lines and tool cards. Must be greater than zero. |
+| `history_entries` | `100` | Maximum submitted prompts retained for Up/Down navigation. Valid range: 1–10,000. |
+| `scrollback_entries` | `2000` | Maximum entries retained independently for transcript lines and tool cards. Valid range: 1–50,000. |
 
 ```toml
 [tui]

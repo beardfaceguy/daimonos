@@ -249,6 +249,8 @@ pub struct AcpConfig {
 
 pub const DEFAULT_TUI_HISTORY_ENTRIES: usize = 100;
 pub const DEFAULT_TUI_SCROLLBACK_ENTRIES: usize = 2_000;
+pub const MAX_TUI_HISTORY_ENTRIES: usize = 10_000;
+pub const MAX_TUI_SCROLLBACK_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
@@ -274,8 +276,18 @@ impl TuiConfig {
         if self.history_entries == 0 {
             return Err("tui.history_entries must be greater than zero".to_string());
         }
+        if self.history_entries > MAX_TUI_HISTORY_ENTRIES {
+            return Err(format!(
+                "tui.history_entries must be <= {MAX_TUI_HISTORY_ENTRIES}"
+            ));
+        }
         if self.scrollback_entries == 0 {
             return Err("tui.scrollback_entries must be greater than zero".to_string());
+        }
+        if self.scrollback_entries > MAX_TUI_SCROLLBACK_ENTRIES {
+            return Err(format!(
+                "tui.scrollback_entries must be <= {MAX_TUI_SCROLLBACK_ENTRIES}"
+            ));
         }
         Ok(())
     }
@@ -1656,6 +1668,16 @@ mod tests {
             let invalid: Config = toml::from_str(toml).unwrap();
             assert!(invalid.validate().unwrap_err().contains("tui."));
         }
+
+        let mut invalid = Config::default();
+        invalid.tui.history_entries = MAX_TUI_HISTORY_ENTRIES + 1;
+        assert!(invalid.validate().unwrap_err().contains("history_entries"));
+        let mut invalid = Config::default();
+        invalid.tui.scrollback_entries = MAX_TUI_SCROLLBACK_ENTRIES + 1;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .contains("scrollback_entries"));
     }
 
     #[test]

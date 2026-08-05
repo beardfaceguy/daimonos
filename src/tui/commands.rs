@@ -39,8 +39,10 @@ pub enum UiCommand {
     Interrupt,
     /// Exit the process-local TUI and end its session.
     Quit,
-    /// Explicitly terminate the daemon session.
+    /// End the current process-local session and exit.
     StopSession,
+    /// Reserved for the future daemon reattach lifecycle; currently disabled.
+    DetachUnavailable,
     /// An unrecognized `/command` (echoed back so the UI can hint).
     Unknown(String),
 }
@@ -55,7 +57,7 @@ Commands:
   /compact           compact context now
   /interrupt, /stop  interrupt the in-flight turn
   /quit, /exit       exit the TUI and end this process-local session
-  /stop-session      terminate the daemon session
+  /stop-session      end the current session and exit
 Anything else is sent to the agent as a prompt.
 Enter sends · Ctrl-C interrupts the current turn.
 Up/Down browse prompt history · PageUp/PageDown scroll · Home/End jump.";
@@ -83,6 +85,7 @@ pub fn parse_command(line: &str) -> UiCommand {
         "/compact" => UiCommand::Compact,
         "/interrupt" | "/stop" | "/cancel" => UiCommand::Interrupt,
         "/quit" | "/exit" | "/q" => UiCommand::Quit,
+        "/detach" => UiCommand::DetachUnavailable,
         "/stop-session" | "/kill" => UiCommand::StopSession,
         other => UiCommand::Unknown(other.to_string()),
     }
@@ -156,10 +159,7 @@ mod tests {
 
     #[test]
     fn detach_is_disabled_until_reattach_exists() {
-        assert_eq!(
-            parse_command("/detach"),
-            UiCommand::Unknown("/detach".to_string())
-        );
+        assert_eq!(parse_command("/detach"), UiCommand::DetachUnavailable);
         assert!(!HELP_TEXT.contains("/detach"));
     }
 

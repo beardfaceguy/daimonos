@@ -185,8 +185,10 @@ pub async fn run(
         .take();
     let show_cursor = terminal.show_cursor();
     guard.restore();
-    show_cursor?;
-    outcome
+    match outcome {
+        Err(error) => Err(error),
+        Ok(()) => show_cursor.map_err(Into::into),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,14 +320,14 @@ async fn run_event_loop(
                                     "manual compaction is not available in this frontend",
                                 );
                             }
+                            UiCommand::DetachUnavailable => {
+                                push_notice(
+                                    view,
+                                    "detach is unavailable until daemon reattach support exists; use /quit",
+                                );
+                            }
                             UiCommand::Unknown(command) => {
-                                let message = if command == "/detach" {
-                                    "detach is unavailable until daemon reattach support exists; use /quit"
-                                        .to_string()
-                                } else {
-                                    format!("unknown command: {command}")
-                                };
-                                push_notice(view, message);
+                                push_notice(view, format!("unknown command: {command}"));
                             }
                             UiCommand::Clear | UiCommand::Model(Some(_)) => {
                                 push_notice(view, "command unavailable while a turn is running");
