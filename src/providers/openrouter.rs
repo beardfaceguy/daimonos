@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::providers::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
-    StreamEvent, ToolSchema, Usage,
+    resolve_max_output, CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse,
+    Message, Role, StopReason, StreamEvent, ToolSchema, Usage,
 };
 
 pub struct OpenRouterProvider {
@@ -38,7 +38,7 @@ impl LlmProvider for OpenRouterProvider {
         let mut body = json!({
             "model": opts.model,
             "messages": messages,
-            "max_tokens": opts.max_tokens,
+            "max_tokens": resolve_max_output(opts.max_tokens, None, None),
             "stream": false,
         });
 
@@ -101,7 +101,7 @@ impl LlmProvider for OpenRouterProvider {
         let mut body = json!({
             "model": opts.model,
             "messages": messages,
-            "max_tokens": opts.max_tokens,
+            "max_tokens": resolve_max_output(opts.max_tokens, None, None),
             "stream": true,
         });
 

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
-    StreamEvent, ThinkingLevel, Usage,
+    resolve_max_output, CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse,
+    Message, Role, StopReason, StreamEvent, ThinkingLevel, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -300,6 +300,32 @@ fn supports_adaptive_thinking(model: &str) -> bool {
         || model.starts_with("claude-fable")
 }
 
+/// Output-token budget for an adaptive-thinking Claude model when the caller
+/// leaves `max_tokens` at the [`DEFAULT_MAX_TOKENS`](super::DEFAULT_MAX_TOKENS)
+/// sentinel. 8192 is too small once reasoning draws from the same budget and
+/// truncates a fresh turn (`stop_reason: max_tokens`, surfaced as "Output Limit
+/// Reached").
+///
+/// We deliberately use one conservative floor rather than per-family guesses:
+/// [`ADAPTIVE_MAX_OUTPUT`] is the documented Opus-family standard max output,
+/// the smallest ceiling among adaptive Claude 4+ models, so every such model
+/// accepts at least this much. That removes any risk of a hard
+/// `max_tokens > model max` rejection (which is NOT a context-overflow error
+/// and would not self-heal via reactive compaction) while still giving ~4x the
+/// old headroom — ample for reasoning plus answer on a fresh turn. Operators who
+/// want more can set `DAIMONOS_AGENT_MAX_TOKENS`. Models without default
+/// reasoning (e.g. haiku) return `None` and keep the 8192 default.
+///
+/// Note: Anthropic counts `input + max_tokens` against the serving window, so
+/// this applies cleanly on fresh/short sessions; long sessions rely on ADR-002
+/// compaction keeping input below `window - output_reservation` (which itself
+/// defaults to 8192 — see the PR's `output_reservation` follow-up).
+const ADAPTIVE_MAX_OUTPUT: u32 = 32_000;
+
+fn default_max_output(model: &str) -> Option<u32> {
+    supports_adaptive_thinking(model).then_some(ADAPTIVE_MAX_OUTPUT)
+}
+
 fn content_block_to_anthropic(
     block: &ContentBlock,
     next_block: Option<&ContentBlock>,
@@ -441,7 +467,7 @@ fn build_request_with_cache(
 
     AnthropicRequest {
         model: opts.model.clone(),
-        max_tokens: opts.max_tokens,
+        max_tokens: resolve_max_output(opts.max_tokens, default_max_output(&opts.model), None),
         system: ctx.system.clone(),
         tools,
         messages,
@@ -1171,6 +1197,77 @@ mod tests {
         };
         let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
         assert_eq!(json["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn build_request_raises_sentinel_max_tokens_for_opus_4() {
+        // Fresh session leaves max_tokens at 8192; opus-4 gets its real 32k max
+        // output instead of truncating mid-reasoning ("Output Limit Reached").
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-4-8".to_string(),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["max_tokens"], 32_000);
+    }
+
+    #[test]
+    fn build_request_raises_sentinel_max_tokens_for_opus_5() {
+        // opus-5 is adaptive too, so it gets the same safe floor as opus-4.
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-5".to_string(),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["max_tokens"], 32_000);
+    }
+
+    #[test]
+    fn build_request_honors_explicit_max_tokens() {
+        // A deliberate, non-sentinel budget is passed through untouched.
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 2_000,
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["max_tokens"], 2_000);
+    }
+
+    #[test]
+    fn build_request_leaves_sentinel_for_unknown_model() {
+        // Models without a known ceiling (e.g. haiku, no adaptive thinking) keep
+        // the 8192 default.
+        let ctx = Context {
+            messages: vec![Message::user("hello")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "claude-haiku-4-5".to_string(),
+            ..CompleteOpts::default()
+        };
+        let json = serde_json::to_value(build_request(&ctx, &opts)).unwrap();
+        assert_eq!(json["max_tokens"], 8192);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::providers::{
-    CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse, Message, Role, StopReason,
-    StreamEvent, ThinkingLevel, ToolSchema, Usage,
+    resolve_max_output, CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse,
+    Message, Role, StopReason, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -150,10 +150,18 @@ pub(crate) fn known_context_window(model: &str) -> Option<u64> {
 }
 
 pub(crate) fn build_request(ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
+    // A fresh session inherits CompleteOpts' 8192 sentinel; with reasoning on
+    // that truncates before the answer (incomplete_details.reason =
+    // "max_output_tokens"). Substitute the model's real max output for the
+    // sentinel, honor explicit values, and never exceed the model ceiling.
     let max_output_tokens = if is_gpt_56_sol(&opts.model) {
-        opts.max_tokens.min(GPT_56_MAX_OUTPUT)
+        resolve_max_output(
+            opts.max_tokens,
+            Some(GPT_56_MAX_OUTPUT),
+            Some(GPT_56_MAX_OUTPUT),
+        )
     } else {
-        opts.max_tokens
+        resolve_max_output(opts.max_tokens, None, None)
     };
     let mut body = json!({
         "model": opts.model,
@@ -856,6 +864,22 @@ mod tests {
         };
         let mut options = opts();
         options.max_tokens = u32::MAX;
+        let body = build_request(&ctx, &options, false);
+        assert_eq!(body["max_output_tokens"], GPT_56_MAX_OUTPUT);
+    }
+
+    #[test]
+    fn gpt_56_sentinel_output_becomes_model_max() {
+        // A fresh session's 8192 sentinel is raised to the model's real max
+        // output rather than truncating a reasoning turn before the answer.
+        let ctx = Context {
+            messages: vec![],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let mut options = opts();
+        options.max_tokens = crate::providers::DEFAULT_MAX_TOKENS;
         let body = build_request(&ctx, &options, false);
         assert_eq!(body["max_output_tokens"], GPT_56_MAX_OUTPUT);
     }
