@@ -4,19 +4,25 @@ This is the durable index for optimization benchmarks. Append a stage for
 every optimization implementation; never replace an older row. Raw run
 directories remain local, while each stage links to a committed report.
 
-> ## ⚠️ Correctness figures for stages F0–F4 are OVERSTATED
+> ## ⚠️ Correctness figures for stages F0–F4 are UNVERIFIED
 >
-> Every F-series stage reports "33/33 correct". That is **wrong** for
-> `07-snapshot-rollback`, whose gate was **vacuous** until 2026-08-04: it asserted
-> `! grep -qi toys src/config.rs`, but the *pristine* file doesn't contain `toys`
-> either — success was byte-identical to never-started. Two of ten runs created **no
-> snapshot and made no edit** (0 ops in `~/.daimonos/analytics.db`) yet scored
-> correct. Retroactive re-grade: **task 07 was 80% correct, not 100%**, i.e. there
-> was an invisible ~20% silent-failure rate.
+> Every F-series stage reports "33/33 correct". For `07-snapshot-rollback` that
+> figure **cannot be trusted**: the gate was **vacuous** until 2026-08-04. It
+> asserted `! grep -qi toys src/config.rs`, but the *pristine* file doesn't contain
+> `toys` either — a run that did nothing was byte-identical to one that succeeded, so
+> the check **could not distinguish success from inaction**. It simply did not
+> verify the work.
+>
+> An earlier version of this note claimed an "**invisible ~20% silent-failure rate**
+> (task 07 was 80% correct)", inferred from two runs showing 0 ops in
+> `~/.daimonos/analytics.db`. **That inference is withdrawn.** In agent mode
+> `analytics.db` does not record *direct* (non-scripted) tool calls (Vikunja #136),
+> so "0 ops" does **not** establish that those runs did no work. The true historical
+> pass/fail rate for task 07 under the old gate is therefore **unknown** — not 80%.
 >
 > **Token, cost and call-count figures in F0–F4 are unaffected** — only the
-> correctness column is. The −70% caching result (F4 vs F3) and the F3-vs-F0
-> deltas still stand.
+> correctness column is in question. The −70% caching result (F4 vs F3) and the
+> F3-vs-F0 deltas still stand.
 >
 > Also fixed at the same time: leaked snapshots were **tracked in the fixture's
 > HEAD**, so `git checkout -- .` restored them on every reset (which is why
