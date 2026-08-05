@@ -244,7 +244,11 @@ async fn run_event_loop(
                                 break;
                             }
                             UiCommand::Interrupt => {
-                                cancel_turn(turn, events, pending_approval).await;
+                                if turn.is_some() {
+                                    cancel_turn(turn, events, pending_approval).await;
+                                } else {
+                                    push_notice(view, "no turn is running");
+                                }
                             }
                             UiCommand::Clear if turn.is_none() => {
                                 session.lock().await.clear();
@@ -398,11 +402,26 @@ async fn cancel_turn(
     let Some(active) = turn.take() else {
         return;
     };
+    active.abort();
+    match active.await {
+        Ok(()) => return,
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            let _ = events.emit(SessionEvent::AssistantDone {
+                outcome: AssistantOutcome::Errored {
+                    context_overflow: false,
+                    message: format!("turn task failed: {error}"),
+                },
+            });
+            let _ = events.emit(SessionEvent::TurnStatusChanged {
+                status: TurnStatus::Idle,
+            });
+            return;
+        }
+    }
     let _ = events.emit(SessionEvent::TurnStatusChanged {
         status: TurnStatus::Cancelling,
     });
-    active.abort();
-    let _ = active.await;
     pending_approval
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -451,40 +470,53 @@ fn build_before_tool_call_hook(
                 Gate::NeedsApproval => {
                     let approval_id = uuid::Uuid::new_v4().to_string();
                     let (sender, receiver) = oneshot::channel();
-                    *pending_approval
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        Some(PendingApproval { sender });
-                    let _ = events.emit(SessionEvent::TurnStatusChanged {
-                        status: TurnStatus::WaitingForApproval,
-                    });
-                    let _ = events.emit(SessionEvent::ApprovalRequested {
-                        request: ApprovalRequest {
-                            id: approval_id.clone(),
-                            tool_call_id: id.clone(),
-                            tool: name.clone(),
-                            detail,
-                            allow_always_available: true,
-                        },
-                    });
-                    let approval = receiver.await.unwrap_or(ApprovalDecision::Deny);
-                    let _ = events.emit(SessionEvent::ApprovalResolved {
-                        approval_id,
-                        decision: approval,
-                        resolved_by: "tui_local".to_string(),
-                    });
-                    let _ = events.emit(SessionEvent::TurnStatusChanged {
-                        status: TurnStatus::Running,
-                    });
-                    match approval {
-                        ApprovalDecision::AllowOnce => BeforeHookResult::Allow,
-                        ApprovalDecision::AllowAlways => {
-                            safety.remember_always(&name);
-                            BeforeHookResult::Allow
+                    let registered = {
+                        let mut pending = pending_approval
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if pending.is_some() {
+                            false
+                        } else {
+                            *pending = Some(PendingApproval { sender });
+                            true
                         }
-                        ApprovalDecision::Deny => BeforeHookResult::Block(format!(
-                            "blocked: operator declined approval for '{name}'"
-                        )),
+                    };
+                    if !registered {
+                        BeforeHookResult::Block(
+                            "another tool approval is already pending".to_string(),
+                        )
+                    } else {
+                        let _ = events.emit(SessionEvent::TurnStatusChanged {
+                            status: TurnStatus::WaitingForApproval,
+                        });
+                        let _ = events.emit(SessionEvent::ApprovalRequested {
+                            request: ApprovalRequest {
+                                id: approval_id.clone(),
+                                tool_call_id: id.clone(),
+                                tool: name.clone(),
+                                detail,
+                                allow_always_available: true,
+                            },
+                        });
+                        let approval = receiver.await.unwrap_or(ApprovalDecision::Deny);
+                        let _ = events.emit(SessionEvent::ApprovalResolved {
+                            approval_id,
+                            decision: approval,
+                            resolved_by: "tui_local".to_string(),
+                        });
+                        let _ = events.emit(SessionEvent::TurnStatusChanged {
+                            status: TurnStatus::Running,
+                        });
+                        match approval {
+                            ApprovalDecision::AllowOnce => BeforeHookResult::Allow,
+                            ApprovalDecision::AllowAlways => {
+                                safety.remember_always(&name);
+                                BeforeHookResult::Allow
+                            }
+                            ApprovalDecision::Deny => BeforeHookResult::Block(format!(
+                                "blocked: operator declined approval for '{name}'"
+                            )),
+                        }
                     }
                 }
             };
@@ -702,5 +734,88 @@ mod tests {
         assert!(view.active_approval().is_none());
         assert_eq!(view.turn_status(), TurnStatus::Running);
         assert_eq!(view.tool_calls()[0].status, ToolCallStateStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn completed_turn_is_not_relabelled_cancelled() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let handler_seen = Arc::clone(&seen);
+        let events = Arc::new(SessionEventRouter::new(Some(Arc::new(
+            move |_seq, event| {
+                handler_seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let pending: SharedApproval = Arc::new(StdMutex::new(None));
+        let mut turn = Some(tokio::spawn(async {}));
+        while !turn.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        cancel_turn(&mut turn, &events, &pending).await;
+
+        assert!(turn.is_none());
+        assert!(seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_approval_is_blocked_without_replacing_first() {
+        let events = Arc::new(SessionEventRouter::default());
+        let pending: SharedApproval = Arc::new(StdMutex::new(None));
+        let safety = Arc::new(SafetyPolicy {
+            approval_mode: ApprovalMode::Paranoid,
+            ..SafetyPolicy::default()
+        });
+        let hook = build_before_tool_call_hook(Arc::clone(&events), Arc::clone(&pending), safety);
+        let first_info = ToolCallInfo {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            input: json!({"path": "one"}),
+        };
+        let second_info = ToolCallInfo {
+            id: "call-2".to_string(),
+            name: "read_file".to_string(),
+            input: json!({"path": "two"}),
+        };
+        let first = hook(&first_info);
+        tokio::pin!(first);
+        loop {
+            tokio::select! {
+                _ = &mut first => panic!("first approval resolved before a response"),
+                _ = tokio::task::yield_now() => {
+                    if pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let second = tokio::time::timeout(Duration::from_millis(50), hook(&second_info))
+            .await
+            .expect("second approval should not wait");
+
+        assert!(matches!(
+            second,
+            BeforeHookResult::Block(ref reason) if reason.contains("already pending")
+        ));
+        let first_pending = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("first approval remains registered");
+        first_pending
+            .sender
+            .send(ApprovalDecision::AllowOnce)
+            .unwrap();
+        assert!(matches!(first.await, BeforeHookResult::Allow));
     }
 }
