@@ -232,7 +232,9 @@ async fn main() -> anyhow::Result<()> {
     };
     if uses_agent_prompt {
         cfg.prompts.additional_agent_instructions =
-            match prompts::load_agent_instructions(cli.agent_instructions.as_deref()).await {
+            match prompts::load_agent_instructions(cli.agent_instructions.as_deref(), &workspace)
+                .await
+            {
                 Ok(instructions) => instructions,
                 Err(e) => {
                     eprintln!("agent instructions: {e}");

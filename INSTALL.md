@@ -124,6 +124,19 @@ loader/interpreter-hijacking variables (`LD_PRELOAD`, `DYLD_*`, `PATH`,
 stderr; set those in the real environment if you truly need them. Keep
 `agent.env` out of version control (add it to `.gitignore`).
 
+## Agent rule-set (`agent-instructions.md`)
+
+Extra agent rules/instructions are appended to the system prompt for `agent`,
+`chat`, and `acp`. Like `agent.env`, a global file and an optional project-local
+file are layered (the workspace file extends and, appended last, can countermand
+the global one):
+
+1. `$XDG_CONFIG_HOME/daimonos/agent-instructions.md` (else `~/.config/daimonos/agent-instructions.md`) — global
+2. `<workspace>/agent-instructions.md` — project-local
+
+Both are optional. Passing `--agent-instructions <path>` is a precise
+single-file override (must exist) and disables layering.
+
 ## What You Get
 
 | Feature | Benefit |
