@@ -551,7 +551,10 @@ pub async fn run(
         .or_else(auto_continue_budget_from_env)
         .unwrap_or(DEFAULT_AUTO_CONTINUE_BUDGET);
     let mut auto_continues_used: u32 = 0;
-    let mut continued_after_max_tokens = false;
+    // True only for the generation immediately following a `max_tokens`
+    // continuation; consumed each iteration so later non-continuation
+    // generations in the same turn regain the caller's thinking level.
+    let mut force_thinking_off = false;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -580,7 +583,7 @@ pub async fn run(
         // forced off so reasoning cannot re-consume the output budget and stall
         // progress; otherwise use the caller's opts unchanged (item 3).
         let continuation_opts;
-        let opts: &CompleteOpts = if continued_after_max_tokens {
+        let opts: &CompleteOpts = if force_thinking_off {
             continuation_opts = CompleteOpts {
                 thinking: ThinkingLevel::Off,
                 ..config.opts.clone()
@@ -589,6 +592,8 @@ pub async fn run(
         } else {
             &config.opts
         };
+        // Consumed for this generation only.
+        force_thinking_off = false;
         let ordinal = config
             .generation_ordinal
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -673,16 +678,25 @@ pub async fn run(
                 // `MaxTokens` falls through to the terminal arm below and still
                 // returns `MaxTokens` to the caller.
                 auto_continues_used += 1;
-                continued_after_max_tokens = true;
-                messages = close_orphan_tool_calls(messages);
-                // A truncated tool call is already followed by a synthetic user
-                // tool_result (from close_orphan_tool_calls). A plain-text
-                // truncation instead leaves the partial assistant turn last; add
-                // a minimal user turn so roles alternate — providers such as
+                force_thinking_off = true;
+                tracing::info!(
+                    target: "daimonos::agent",
+                    event = "max_tokens_auto_continue",
+                    auto_continue = auto_continues_used,
+                    budget = auto_continue_budget,
+                    "continuing after a max_tokens truncation"
+                );
+                // Decide the truncation shape BEFORE close_orphan_tool_calls
+                // mutates it: a truncated tool call gets a synthetic user
+                // tool_result (below) and already alternates; a plain-text
+                // truncation leaves the partial assistant turn last and needs a
+                // minimal user turn so roles alternate — providers such as
                 // Anthropic reject consecutive assistant messages, which would
                 // otherwise accumulate across continuations and break the next
                 // real user turn.
-                if matches!(messages.last(), Some(m) if m.role == Role::Assistant) {
+                let text_only_truncation = !has_orphan_tool_calls(&messages);
+                messages = close_orphan_tool_calls(messages);
+                if text_only_truncation {
                     messages.push(Message::user(AUTO_CONTINUE_NUDGE));
                 }
                 continue;

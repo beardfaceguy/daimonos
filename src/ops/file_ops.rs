@@ -145,10 +145,10 @@ pub async fn append(session: &mut Session, op: &Op) -> Response {
     if let Err(e) = file.write_all(content.as_bytes()).await {
         return Response::err(4, &format!("append: {e}"));
     }
-    // Flush so a late IO error surfaces before we report success.
-    if let Err(e) = file.flush().await {
-        return Response::err(4, &format!("append: {e}"));
-    }
+    // write_all issues real write(2) calls (tokio::fs::File is unbuffered), so the
+    // bytes reach the OS before we return. We deliberately do NOT fsync — this
+    // matches the `write` op's durability; per-chunk fsync would be costly and
+    // inconsistent with the rest of the file ops.
 
     session.invalidate_read_cache(&path);
     if let Some(index) = &session.index {
