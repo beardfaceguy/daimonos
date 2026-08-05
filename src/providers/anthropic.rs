@@ -270,6 +270,29 @@ pub(crate) fn max_input_tokens_from_model(body: &Value) -> Option<u64> {
     body["max_input_tokens"].as_u64().filter(|&n| n > 0)
 }
 
+/// The largest context window Anthropic actually serves this adapter.
+///
+/// The models endpoint's `max_input_tokens` reports the absolute API input
+/// ceiling — the 1M long-context beta — which is only reachable when a
+/// request carries the `context-1m` beta header. This adapter never sends
+/// that header, so requests are rejected at the standard ~200k window
+/// regardless of what the endpoint advertises. Treating the 1M ceiling as
+/// the window made every downstream consumer compute against ~5x reality:
+/// ADR-002 compaction thresholds landed near 744k tokens and never fired
+/// while sessions exhausted the real window, and context-usage projections
+/// showed mostly-free context on nearly-full sessions (vikunja #1228).
+///
+/// An explicit `DAIMONOS_AGENT_CONTEXT_WINDOW` in the agent env still
+/// overrides provider resolution entirely for users who do have 1M access;
+/// revisit this cap if the adapter ever sends the `context-1m` beta header.
+const SERVING_WINDOW_CAP: u64 = 200_000;
+
+/// Clamp a models-endpoint `max_input_tokens` to the window this adapter's
+/// requests can actually use.
+pub(crate) fn effective_context_window(reported: u64) -> u64 {
+    reported.min(SERVING_WINDOW_CAP)
+}
+
 fn supports_adaptive_thinking(model: &str) -> bool {
     model.starts_with("claude-opus-4")
         || model.starts_with("claude-opus-5")
@@ -762,7 +785,7 @@ impl LlmProvider for AnthropicProvider {
             return None;
         }
         let body: Value = resp.json().await.ok()?;
-        max_input_tokens_from_model(&body)
+        max_input_tokens_from_model(&body).map(effective_context_window)
     }
 }
 
@@ -887,6 +910,64 @@ mod tests {
     fn max_input_tokens_zero_is_none() {
         let body = json!({"id": "claude-opus-4-8", "max_input_tokens": 0});
         assert_eq!(max_input_tokens_from_model(&body), None);
+    }
+
+    // --- effective_context_window (vikunja #1228) ---
+
+    #[test]
+    fn beta_ceiling_is_clamped_to_serving_window() {
+        // The models endpoint advertises the 1M long-context beta ceiling;
+        // without the `context-1m` beta header our requests cap at 200k.
+        assert_eq!(effective_context_window(1_000_000), 200_000);
+    }
+
+    #[test]
+    fn windows_at_or_below_the_cap_pass_through() {
+        assert_eq!(effective_context_window(200_000), 200_000);
+        assert_eq!(effective_context_window(150_000), 150_000);
+    }
+
+    #[tokio::test]
+    async fn context_window_clamps_models_api_beta_ceiling() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Drain the request head before responding so the client never
+                // sees the connection close with unread request bytes in
+                // flight (a connection-reset flake on some platforms).
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let mut head = Vec::new();
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r#"{"id":"claude-opus-5","max_input_tokens":1000000}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.ok();
+            }
+        });
+        let provider =
+            AnthropicProvider::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        // Regression for vikunja #1228: 1M-advertised models must resolve to
+        // the real serving window or ADR-002 compaction never triggers.
+        assert_eq!(
+            provider.context_window("claude-opus-5").await,
+            Some(200_000)
+        );
     }
 
     #[tokio::test]
