@@ -36,3 +36,7 @@ ponytail/
 
 # Benchmark baseline/post binaries (large, per-machine; rebuild from git_commit in benchmarks/optimization-lineage.json)
 bench/bin/
+
+# Local dotenv-style secrets/config loaded by daimonos at startup
+agent.env
+
