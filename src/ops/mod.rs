@@ -52,6 +52,7 @@ async fn dispatch_op(
         protocol::op::READ => file_ops::read(session, &op).await,
         protocol::op::WRITE => file_ops::write(session, &op).await,
         protocol::op::PATCH => file_ops::patch(session, &op).await,
+        protocol::op::APPEND => file_ops::append(session, &op).await,
         protocol::op::LS => file_ops::ls(session, &op).await,
         protocol::op::STAT => file_ops::stat(session, &op).await,
         protocol::op::GLOB => file_ops::glob(session, &op).await,

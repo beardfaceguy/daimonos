@@ -681,7 +681,7 @@ fn tool_call_locations(
     name: &str,
     input: &serde_json::Value,
 ) -> Vec<ToolCallLocation> {
-    if !matches!(name, "read_file" | "write_file" | "edit_file" | "search") {
+    if !matches!(name, "read_file" | "write_file" | "edit_file" | "append_file" | "search") {
         return Vec::new();
     }
     let Some(path) = tool_target_path(workspace, input) else {
@@ -749,7 +749,7 @@ fn tool_kind_for(name: &str) -> ToolKind {
     match name {
         "read_file" | "search" | "kgl_query" | "ls" | "get_tool_schema" | "list_all_tools"
         | "workspace_info" | "session_stats" => ToolKind::Read,
-        "write_file" | "edit_file" => ToolKind::Edit,
+        "write_file" | "edit_file" | "append_file" => ToolKind::Edit,
         "exec" | "execute_script" | "cargo" | "npm" | "pytest" | "docker" | "git" | "gh"
         | "batch" | "kgl_assert" => ToolKind::Execute,
         "curl" => ToolKind::Fetch,
