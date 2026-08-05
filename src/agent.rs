@@ -508,15 +508,30 @@ async fn record_agent_tool_output_savings(
 /// [`AgentConfig::auto_continue_budget`].
 pub const DEFAULT_AUTO_CONTINUE_BUDGET: u32 = 0;
 
+/// Injected as a trailing user turn when a *plain-text* turn is auto-continued
+/// after a `max_tokens` stop. Without it the partial assistant turn would be
+/// followed by another assistant turn on the next generation, and providers such
+/// as Anthropic reject consecutive assistant messages. Terse to spend near-zero
+/// tokens.
+const AUTO_CONTINUE_NUDGE: &str = "Continue exactly where the previous message was cut off. Do not repeat earlier output; if the remaining work is large, continue in smaller steps.";
+
 /// Parse `DAIMONOS_AGENT_AUTO_CONTINUE` as the auto-continue cap. Absent or
 /// unparseable yields `None`, leaving the config field / built-in default to
 /// decide.
 fn auto_continue_budget_from_env() -> Option<u32> {
-    std::env::var("DAIMONOS_AGENT_AUTO_CONTINUE")
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
+    let raw = std::env::var("DAIMONOS_AGENT_AUTO_CONTINUE").ok()?;
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(
+                target: "daimonos::agent",
+                value = %trimmed,
+                "ignoring unparseable DAIMONOS_AGENT_AUTO_CONTINUE (want a non-negative integer); using config/default"
+            );
+            None
+        }
+    }
 }
 
 pub async fn run(
@@ -567,10 +582,8 @@ pub async fn run(
         let continuation_opts;
         let opts: &CompleteOpts = if continued_after_max_tokens {
             continuation_opts = CompleteOpts {
-                model: config.opts.model.clone(),
-                max_tokens: config.opts.max_tokens,
                 thinking: ThinkingLevel::Off,
-                temperature: config.opts.temperature,
+                ..config.opts.clone()
             };
             &continuation_opts
         } else {
@@ -662,6 +675,16 @@ pub async fn run(
                 auto_continues_used += 1;
                 continued_after_max_tokens = true;
                 messages = close_orphan_tool_calls(messages);
+                // A truncated tool call is already followed by a synthetic user
+                // tool_result (from close_orphan_tool_calls). A plain-text
+                // truncation instead leaves the partial assistant turn last; add
+                // a minimal user turn so roles alternate — providers such as
+                // Anthropic reject consecutive assistant messages, which would
+                // otherwise accumulate across continuations and break the next
+                // real user turn.
+                if matches!(messages.last(), Some(m) if m.role == Role::Assistant) {
+                    messages.push(Message::user(AUTO_CONTINUE_NUDGE));
+                }
                 continue;
             }
             StopReason::EndTurn
@@ -3609,6 +3632,33 @@ mod tests {
         // third call) is never reached.
         assert_eq!(result.stop_reason, StopReason::MaxTokens);
         assert_eq!(contexts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn text_truncation_auto_continue_inserts_user_turn_between_assistants() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider =
+            BenchmarkCaptureProvider::new(vec![max_tokens_text_resp(), end_turn_resp()]);
+        let contexts = provider.contexts_handle();
+        let config = AgentConfig {
+            auto_continue_budget: Some(2),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let ctxs = contexts.lock().unwrap();
+        // The continuation (2nd) call must not present two consecutive assistant
+        // messages: a user turn is inserted after the truncated assistant turn.
+        let second = &ctxs[1];
+        assert!(matches!(second.last().unwrap().role, Role::User));
+        for pair in second.windows(2) {
+            assert!(
+                !(matches!(pair[0].role, Role::Assistant)
+                    && matches!(pair[1].role, Role::Assistant)),
+                "consecutive assistant messages must not reach the provider"
+            );
+        }
     }
 
     #[tokio::test]

@@ -111,7 +111,8 @@ pub async fn write(session: &mut Session, op: &Op) -> Response {
 /// Item 4 of the large-output UX work: distinct from [`write`] so the agent can
 /// grow a large file across several bounded calls without re-emitting the whole
 /// file each time (which risks the model output-token ceiling). Only the new
-/// `content` is written; existing bytes are preserved.
+/// `content` is written; existing bytes are preserved. The response's
+/// `appended_bytes` field is the number of UTF-8 bytes written (not characters).
 pub async fn append(session: &mut Session, op: &Op) -> Response {
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
