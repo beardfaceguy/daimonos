@@ -195,7 +195,7 @@ full_tool_schemas = false
 [tui]
 # Process-local submitted prompts retained for Up/Down history navigation.
 history_entries = 100
-# Maximum transcript and tool-card entries retained by the full-screen view.
+# Maximum entries retained independently for transcript lines and tool cards.
 scrollback_entries = 2_000
 
 [acp]

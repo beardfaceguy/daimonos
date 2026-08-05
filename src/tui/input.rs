@@ -63,7 +63,8 @@ impl ComposerHistory {
         self.draft.clear();
     }
 
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.entries.len()
     }
 }

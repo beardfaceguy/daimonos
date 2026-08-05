@@ -101,10 +101,15 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_fro
         lines.push(Line::from(spans));
     }
 
-    let max_top = lines.len().saturating_sub(usize::from(area.height));
-    let top = max_top.saturating_sub(scroll_from_bottom.min(max_top));
-    Paragraph::new(Text::from(lines))
-        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
+    let visible_entries = usize::from(area.height.max(1));
+    let max_start = lines.len().saturating_sub(visible_entries);
+    let start = max_start.saturating_sub(scroll_from_bottom.min(max_start));
+    let visible = lines
+        .into_iter()
+        .skip(start)
+        .take(visible_entries)
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from(visible))
         .wrap(Wrap { trim: false })
         .render(area, buf);
 }

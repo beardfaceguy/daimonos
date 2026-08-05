@@ -255,7 +255,8 @@ pub const DEFAULT_TUI_SCROLLBACK_ENTRIES: usize = 2_000;
 pub struct TuiConfig {
     /// Process-local submitted prompt history retained for Up/Down navigation.
     pub history_entries: usize,
-    /// Maximum transcript and tool-card entries retained in the rendered view.
+    /// Maximum entries retained in each rendered-view collection (transcript
+    /// lines and tool cards are bounded independently).
     pub scrollback_entries: usize,
 }
 
