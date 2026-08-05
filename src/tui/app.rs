@@ -266,6 +266,10 @@ async fn run_event_loop(
                             }
                             UiCommand::Prompt(prompt) if !prompt.is_empty() => {
                                 *composer = prompt;
+                                push_notice(
+                                    view,
+                                    "a turn is already running; wait for it or press Ctrl-C to interrupt",
+                                );
                             }
                             UiCommand::Quit => break,
                             UiCommand::StopSession => {
@@ -315,10 +319,13 @@ async fn run_event_loop(
                                 push_notice(view, format!("models: {}", models.join(", ")));
                             }
                             UiCommand::Compact => {
-                                push_notice(
-                                    view,
-                                    "manual compaction is not available in this frontend",
-                                );
+                                let message = if compaction.is_some() {
+                                    "manual compaction is not implemented in the TUI yet; \
+                                     automatic compaction remains active"
+                                } else {
+                                    "manual compaction is not available in this frontend"
+                                };
+                                push_notice(view, message);
                             }
                             UiCommand::DetachUnavailable => {
                                 push_notice(
@@ -662,7 +669,10 @@ fn context_usage(turn: &TurnResult, compaction: Option<&CompactionPolicy>) -> Co
         (
             Some(policy.context_window),
             policy.output_reservation,
-            Some((policy.high_water * policy.budget() as f64) as u64),
+            // agent_env enforces 0 < low_water < high_water < 1 at load time;
+            // the clamp is defense-in-depth so a nonsensical threshold can
+            // never reach the UI even if a new config path skips validation.
+            Some((policy.high_water.clamp(0.0, 1.0) * policy.budget() as f64) as u64),
         )
     });
     ContextUsage::new(

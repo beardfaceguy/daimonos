@@ -66,6 +66,9 @@ pub async fn run_agent(
         agent_env,
     } = args;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // Pre-resolution intent capture: the operator asked for interactive but
+    // no TTY is attached. Only the Print fallback's require_agent_task error
+    // text consumes this, to explain why a task argument became mandatory.
     let interactive_fell_back = interactive && !print && !dry_run && !tty;
     let mode = tui::resolve_agent_mode(interactive, print, dry_run, tty);
 
