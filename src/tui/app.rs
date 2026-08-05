@@ -34,12 +34,14 @@ use crate::session_protocol::{
 use crate::tool_facade;
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
+use super::input::{ComposerHistory, TranscriptScroll};
 use super::state::ViewState;
 use super::terminal::{install_panic_hook, TerminalGuard};
 
 /// Runtime inputs already resolved by `agent_runtime`.
 pub struct TuiOptions {
     pub initial_prompt: Option<String>,
+    pub no_color: bool,
     pub model: String,
     pub models: Vec<String>,
     pub safety: SafetyPolicy,
@@ -64,7 +66,12 @@ pub async fn run(
     options: TuiOptions,
 ) -> anyhow::Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let view = Arc::new(StdMutex::new(ViewState::new(session_id.clone())));
+    let history_entries = cfg.tui.history_entries;
+    let scrollback_entries = cfg.tui.scrollback_entries;
+    let view = Arc::new(StdMutex::new(ViewState::with_scrollback_limit(
+        session_id.clone(),
+        scrollback_entries,
+    )));
     let handler_view = Arc::clone(&view);
     let handler: SessionEventHandler = Arc::new(move |seq, event| {
         let mut view = handler_view
@@ -134,11 +141,14 @@ pub async fn run(
     terminal.clear()?;
 
     let mut composer = String::new();
+    let mut history = ComposerHistory::new(history_entries);
+    let mut scroll = TranscriptScroll::default();
     let mut turn = None;
     if let Some(prompt) = options
         .initial_prompt
         .filter(|prompt| !prompt.trim().is_empty())
     {
+        history.record(prompt.clone());
         turn = Some(start_turn(
             prompt,
             Arc::clone(&session),
@@ -151,6 +161,9 @@ pub async fn run(
     let outcome = run_event_loop(
         &mut terminal,
         &mut composer,
+        &mut history,
+        &mut scroll,
+        options.no_color,
         &view,
         &session,
         &events,
@@ -180,6 +193,9 @@ pub async fn run(
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     composer: &mut String,
+    history: &mut ComposerHistory,
+    scroll: &mut TranscriptScroll,
+    no_color: bool,
     view: &SharedView,
     session: &Arc<tokio::sync::Mutex<AgentSession>>,
     events: &Arc<SessionEventRouter>,
@@ -202,7 +218,16 @@ async fn run_event_loop(
         {
             let view = view.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             terminal.draw(|frame| {
-                super::render(&view, composer, frame.area(), frame.buffer_mut());
+                super::render_with_options(
+                    &view,
+                    composer,
+                    frame.area(),
+                    frame.buffer_mut(),
+                    super::RenderOptions {
+                        no_color,
+                        scroll_from_bottom: scroll.bottom_offset(),
+                    },
+                );
             })?;
         }
 
@@ -221,11 +246,14 @@ async fn run_event_loop(
                 match key.code {
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         composer.push('\n');
+                        history.reset_navigation();
                     }
                     KeyCode::Enter => {
                         let line = std::mem::take(composer);
                         match parse_command(&line) {
                             UiCommand::Prompt(prompt) if !prompt.is_empty() && turn.is_none() => {
+                                history.record(prompt.clone());
+                                scroll.jump_to_end();
                                 *turn = Some(start_turn(
                                     prompt,
                                     Arc::clone(session),
@@ -307,6 +335,29 @@ async fn run_event_loop(
                     }
                     KeyCode::Backspace => {
                         composer.pop();
+                        history.reset_navigation();
+                    }
+                    KeyCode::Up => {
+                        if let Some(previous) = history.previous(composer) {
+                            *composer = previous;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(next) = history.next() {
+                            *composer = next;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        scroll.page_up(transcript_page_height(terminal)?);
+                    }
+                    KeyCode::PageDown => {
+                        scroll.page_down(transcript_page_height(terminal)?);
+                    }
+                    KeyCode::Home => {
+                        scroll.jump_to_start();
+                    }
+                    KeyCode::End => {
+                        scroll.jump_to_end();
                     }
                     KeyCode::Char(ch)
                         if !key.modifiers.intersects(
@@ -314,11 +365,15 @@ async fn run_event_loop(
                         ) =>
                     {
                         composer.push(ch);
+                        history.reset_navigation();
                     }
                     _ => {}
                 }
             }
-            Event::Paste(text) => composer.push_str(&text),
+            Event::Paste(text) => {
+                composer.push_str(&text);
+                history.reset_navigation();
+            }
             Event::Resize(_, _)
             | Event::FocusGained
             | Event::FocusLost
@@ -327,6 +382,14 @@ async fn run_event_loop(
         }
     }
     Ok(())
+}
+
+fn transcript_page_height(
+    terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> anyhow::Result<usize> {
+    Ok(usize::from(
+        terminal.size()?.height.saturating_sub(4).max(1),
+    ))
 }
 
 fn accepts_key(key: KeyEvent) -> bool {

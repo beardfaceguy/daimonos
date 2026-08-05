@@ -57,7 +57,8 @@ Commands:
   /quit, /exit       exit the TUI and end this process-local session
   /stop-session      terminate the daemon session
 Anything else is sent to the agent as a prompt.
-Enter sends · Ctrl-C interrupts the current turn.";
+Enter sends · Ctrl-C interrupts the current turn.
+Up/Down browse prompt history · PageUp/PageDown scroll · Home/End jump.";
 
 /// Parse one composer line into a [`UiCommand`].
 ///

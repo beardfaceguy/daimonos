@@ -192,6 +192,12 @@ startup_logs = false
 # in the Glama Dockerfile build (recommended for release scoring only).
 full_tool_schemas = false
 
+[tui]
+# Process-local submitted prompts retained for Up/Down history navigation.
+history_entries = 100
+# Maximum transcript and tool-card entries retained by the full-screen view.
+scrollback_entries = 2_000
+
 [acp]
 # Maximum saved sessions returned by one session/list response. Clients receive
 # an opaque continuation cursor when more sessions remain.

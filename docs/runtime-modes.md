@@ -31,6 +31,10 @@ describe the selected runtime unambiguously.
 explicitly forces one-shot output when flags are composed; without
 `--interactive`, one-shot mode remains the default.
 
+Interactive controls include Up/Down prompt history, PageUp/PageDown transcript
+scrolling, Home/End jumps, and `/help`. Pass `--no-color` for monochrome
+rendering. History and scrollback limits are configured under `[tui]`.
+
 Inspection operations (`--stats`, `--print-config-path`, `--print-prompt`, and
 `--dump-prompts`) remain top-level flags because they do not launch a persistent
 runtime.

@@ -21,12 +21,28 @@ use crate::session_protocol::{
 };
 use crate::tui::state::ViewState;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    pub no_color: bool,
+    pub scroll_from_bottom: usize,
+}
+
 /// Render the whole TUI frame for `state` into `area` of `buf`.
 ///
 /// `composer` is the UI-local input buffer (not part of canonical session
 /// state). Layout top-to-bottom: transcript (flex) / status bar (1 row) /
 /// composer (3 rows, bordered).
 pub fn render(state: &ViewState, composer: &str, area: Rect, buf: &mut Buffer) {
+    render_with_options(state, composer, area, buf, RenderOptions::default());
+}
+
+pub fn render_with_options(
+    state: &ViewState,
+    composer: &str,
+    area: Rect,
+    buf: &mut Buffer,
+    options: RenderOptions,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -35,16 +51,21 @@ pub fn render(state: &ViewState, composer: &str, area: Rect, buf: &mut Buffer) {
             Constraint::Length(3),
         ])
         .split(area);
-    render_transcript(state, chunks[0], buf);
+    render_transcript(state, chunks[0], buf, options.scroll_from_bottom);
     render_status(state, chunks[1], buf);
     render_composer(composer, chunks[2], buf);
     // Overlay last so it sits above every base layer. It is the one thing a
     // human must act on, and ADR-011 keeps approval authority with the local
     // TUI regardless of which client ultimately answers.
     render_approval_modal(state, area, buf);
+    if options.no_color {
+        for cell in &mut buf.content {
+            cell.set_fg(Color::Reset).set_bg(Color::Reset);
+        }
+    }
 }
 
-fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
+fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_from_bottom: usize) {
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in state.transcript() {
@@ -80,7 +101,10 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(spans));
     }
 
+    let max_top = lines.len().saturating_sub(usize::from(area.height));
+    let top = max_top.saturating_sub(scroll_from_bottom.min(max_top));
     Paragraph::new(Text::from(lines))
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
         .wrap(Wrap { trim: false })
         .render(area, buf);
 }
@@ -444,6 +468,69 @@ mod tests {
         let out = render_to_string(&state, "", 80, 8);
 
         assert!(out.contains("/help for help"), "help hint missing:\n{out}");
+    }
+
+    #[test]
+    fn no_color_mode_resets_every_rendered_cell_color() {
+        let mut state = ViewState::new("sess-1");
+        state.apply_event(
+            1,
+            SessionEvent::UserMessage {
+                text: "hello".into(),
+            },
+        );
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut buf,
+            RenderOptions {
+                no_color: true,
+                ..RenderOptions::default()
+            },
+        );
+
+        assert!(buf
+            .content
+            .iter()
+            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn transcript_scroll_moves_away_from_and_back_to_latest_entries() {
+        let mut state = ViewState::new("sess-1");
+        for index in 1..=6 {
+            state.apply_event(
+                index,
+                SessionEvent::UserMessage {
+                    text: format!("message-{index}"),
+                },
+            );
+        }
+        let area = Rect::new(0, 0, 40, 8);
+        let mut latest = Buffer::empty(area);
+        render_with_options(&state, "", area, &mut latest, RenderOptions::default());
+        let mut earlier = Buffer::empty(area);
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut earlier,
+            RenderOptions {
+                scroll_from_bottom: usize::MAX,
+                ..RenderOptions::default()
+            },
+        );
+
+        let latest = buffer_to_string(&latest);
+        let earlier = buffer_to_string(&earlier);
+        assert!(latest.contains("message-6"));
+        assert!(!latest.contains("message-1"));
+        assert!(earlier.contains("message-1"));
+        assert!(!earlier.contains("message-6"));
     }
 
     fn approval_state(allow_always: bool, detail: &str) -> ViewState {

@@ -8,6 +8,14 @@ pub struct AgentArgs {
     /// Launch the full-screen terminal UI when stdin and stdout are terminals.
     #[arg(short = 'i', long, default_value_t = false)]
     pub interactive: bool,
+    /// Render the interactive TUI without terminal colors.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "interactive",
+        conflicts_with = "print"
+    )]
+    pub no_color: bool,
     /// Force stable one-shot output, including when --interactive is also set.
     #[arg(long, default_value_t = false)]
     pub print: bool,
@@ -257,6 +265,30 @@ mod tests {
         assert!(args.interactive);
         assert!(!args.print);
         assert!(args.task.is_none());
+    }
+
+    #[test]
+    fn no_color_is_scoped_to_interactive_agent_mode() {
+        let cli = Cli::try_parse_from(["daimonos", "agent", "--interactive", "--no-color"])
+            .expect("interactive no-color mode");
+        let Some(Command::Agent(args)) = cli.command else {
+            panic!("agent command");
+        };
+        assert!(args.no_color);
+
+        assert!(
+            Cli::try_parse_from(["daimonos", "agent", "--no-color", "do work"]).is_err(),
+            "--no-color without --interactive should be rejected"
+        );
+        assert!(Cli::try_parse_from([
+            "daimonos",
+            "agent",
+            "--interactive",
+            "--print",
+            "--no-color",
+            "do work",
+        ])
+        .is_err());
     }
 
     #[test]

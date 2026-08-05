@@ -27,6 +27,7 @@
 pub mod agent_mode;
 pub mod app;
 pub mod commands;
+pub mod input;
 pub mod render;
 pub mod state;
 pub mod terminal;
@@ -34,6 +35,6 @@ pub mod terminal;
 pub use agent_mode::{resolve_agent_mode, AgentMode};
 pub use app::{run as run_tui, TuiOptions};
 pub use commands::{approval_from_key, parse_command, UiCommand};
-pub use render::render;
+pub use render::{render, render_with_options, RenderOptions};
 pub use state::{ApplyOutcome, ViewLine, ViewState};
 pub use terminal::TerminalGuard;

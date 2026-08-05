@@ -55,6 +55,7 @@ def test_agent_help_lists_explicit_interactive_and_print_modes(daimonos_binary):
     )
 
     assert "--interactive" in completed.stdout
+    assert "--no-color" in completed.stdout
     assert "--print" in completed.stdout
 
 

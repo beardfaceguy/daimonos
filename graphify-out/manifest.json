@@ -220,8 +220,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1785784419.6551647,
-    "ast_hash": "a8542f5a33b02e75d80d2c49e2fa901d",
+    "mtime": 1785909021.6333044,
+    "ast_hash": "faecd60c5d4fa27384f347a33d299a6e",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -750,8 +750,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785877463.7371898,
-    "ast_hash": "b3d432299aa4ac1d9a74b6b4402a4b62",
+    "mtime": 1785908937.9742157,
+    "ast_hash": "d85964fbe5fb6ca37b01540148631021",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -885,23 +885,23 @@
     "semantic_hash": ""
   },
   "src/cli.rs": {
-    "mtime": 1785905283.9484284,
-    "ast_hash": "eee7d0a0ee61c12a0dbb99ce300e7453",
+    "mtime": 1785909009.7384338,
+    "ast_hash": "791fe505c90ed504ed3ca346361d9366",
     "semantic_hash": ""
   },
   "tests/test_cli_modes.py": {
-    "mtime": 1785905284.1741645,
-    "ast_hash": "58ac329eef15728f8fe30697d0c8dac4",
+    "mtime": 1785908974.7508152,
+    "ast_hash": "6a5a6e2c978e237644aeadd34321f505",
     "semantic_hash": ""
   },
   "docs/runtime-modes.md": {
-    "mtime": 1785905283.9404283,
-    "ast_hash": "2435bee8332823c68dceafc987c41d61",
+    "mtime": 1785908995.4265897,
+    "ast_hash": "5445d56121887ac268ccda16b847ef51",
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785905284.1734257,
-    "ast_hash": "38dba3a4240c8dc2c56c7394085669a8",
+    "mtime": 1785908609.2878094,
+    "ast_hash": "6382b61ba64a6a5a24f196c35e5fe70b",
     "semantic_hash": ""
   },
   "src/observability.rs": {
@@ -1120,23 +1120,23 @@
     "semantic_hash": ""
   },
   "src/tui/mod.rs": {
-    "mtime": 1785905283.9484284,
-    "ast_hash": "fdf0f28c344257032ae300901ed30f24",
+    "mtime": 1785908680.1080334,
+    "ast_hash": "7da1509d0c6654fe57b2be324fe4d76f",
     "semantic_hash": ""
   },
   "src/tui/state.rs": {
-    "mtime": 1785905283.9494283,
-    "ast_hash": "75fe0bb5df676fc4c46f8f01c2c2bb35",
+    "mtime": 1785908858.3260837,
+    "ast_hash": "bada3f12c340e7dd3ee3162c6a7042e9",
     "semantic_hash": ""
   },
   "docs/adr/011-interactive-terminal-ui.md": {
-    "mtime": 1785906967.5568273,
-    "ast_hash": "d7b0a6a7dc76243bc6596a76a9176bc4",
+    "mtime": 1785909052.0039732,
+    "ast_hash": "25079babf128b6db79c12987f44eda35",
     "semantic_hash": ""
   },
   "src/tui/render.rs": {
-    "mtime": 1785907635.8124819,
-    "ast_hash": "bbddff77db666a1286b1a8eee1d6607d",
+    "mtime": 1785908886.460777,
+    "ast_hash": "1071bc084c9e4d506368624d3fd8b95b",
     "semantic_hash": ""
   },
   "src/tui/terminal.rs": {
@@ -1145,8 +1145,8 @@
     "semantic_hash": ""
   },
   "src/tui/commands.rs": {
-    "mtime": 1785906950.581014,
-    "ast_hash": "7e95f6a51e5154eb50d38bbcce829c74",
+    "mtime": 1785908924.2593653,
+    "ast_hash": "8b533b022f541ca6a837b4295002b860",
     "semantic_hash": ""
   },
   "src/tui/agent_mode.rs": {
@@ -1160,8 +1160,13 @@
     "semantic_hash": ""
   },
   "src/tui/app.rs": {
-    "mtime": 1785906957.2409406,
-    "ast_hash": "fa71b32c29cc0787e586ee388a4a4812",
+    "mtime": 1785909101.5764332,
+    "ast_hash": "6ca42487a9e0ae292a3c89fad53f4afa",
+    "semantic_hash": ""
+  },
+  "src/tui/input.rs": {
+    "mtime": 1785909095.255502,
+    "ast_hash": "b3db1f521b67745a35a563522c26dd05",
     "semantic_hash": ""
   }
 }

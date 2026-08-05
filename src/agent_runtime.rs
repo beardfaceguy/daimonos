@@ -58,6 +58,7 @@ pub async fn run_agent(
     let AgentArgs {
         task,
         interactive,
+        no_color,
         print,
         model,
         provider,
@@ -139,6 +140,7 @@ pub async fn run_agent(
             cfg,
             tui::TuiOptions {
                 initial_prompt: task,
+                no_color,
                 model: effective_model,
                 models,
                 safety: agent.to_safety_policy(None),

@@ -105,8 +105,9 @@ without those pieces detach would only create unreachable abandoned sessions.
 3. Streaming assistant output, tool lifecycle cards, interrupt (render layer).
 4. Permission modal + local control authority.
 5. Session/model/usage/remote-control commands + status bar.
-6. Polish: expandable diffs/terminal output, search/copy, resize/suspend,
-   accessibility (no-color, keyboard-only).
+6. Polish: bounded scrollback + navigation, prompt history, and no-color
+   rendering are implemented; expandable diffs/terminal output, search/copy,
+   resize/suspend, and broader accessibility remain.
 7. Wire the TUI behind opt-in `--interactive`; retain the default and explicit
    `--print` stable print modes. Reconsider a TTY default only after the
    daemon-owned detach/reconnect lifecycle is complete.
