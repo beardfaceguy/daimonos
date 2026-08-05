@@ -106,6 +106,56 @@ pub async fn write(session: &mut Session, op: &Op) -> Response {
     }
 }
 
+/// Append `content` to a file, creating it (and parent dirs) if absent.
+///
+/// Item 4 of the large-output UX work: distinct from [`write`] so the agent can
+/// grow a large file across several bounded calls without re-emitting the whole
+/// file each time (which risks the model output-token ceiling). Only the new
+/// `content` is written; existing bytes are preserved.
+pub async fn append(session: &mut Session, op: &Op) -> Response {
+    let path = match &op.p {
+        Some(p) => session.resolve_path(p),
+        None => return Response::err(3, "append requires path in 'p'"),
+    };
+
+    let content = match &op.s {
+        Some(c) => c,
+        None => return Response::err(3, "append requires content in 's'"),
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return Response::err(4, &format!("mkdir: {e}"));
+            }
+        }
+    }
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => return Response::err(4, &format!("open: {e}")),
+    };
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        return Response::err(4, &format!("append: {e}"));
+    }
+    // Flush so a late IO error surfaces before we report success.
+    if let Err(e) = file.flush().await {
+        return Response::err(4, &format!("append: {e}"));
+    }
+
+    session.invalidate_read_cache(&path);
+    if let Some(index) = &session.index {
+        index.observe_path(&path).await;
+    }
+    Response::ok(json!({"ok": true, "appended_bytes": content.len()}))
+}
+
 pub async fn patch(session: &mut Session, op: &Op) -> Response {
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
@@ -642,6 +692,76 @@ mod tests {
             p: Some(path.to_string()),
             ..Op::default()
         }
+    }
+
+    #[tokio::test]
+    async fn append_creates_then_extends_without_reemitting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let a1 = append(
+            &mut s,
+            &Op {
+                c: 27,
+                p: Some("build.txt".into()),
+                s: Some("part1\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(a1.ok);
+
+        let a2 = append(
+            &mut s,
+            &Op {
+                c: 27,
+                p: Some("build.txt".into()),
+                s: Some("part2\n".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(a2.ok);
+
+        let r = read(&mut s, &op_read("build.txt")).await;
+        assert_eq!(r.d.unwrap()["content"], "part1\npart2\n");
+    }
+
+    #[tokio::test]
+    async fn append_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        let a = append(
+            &mut s,
+            &Op {
+                c: 27,
+                p: Some("a/b/c.txt".into()),
+                s: Some("hi".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(a.ok);
+        assert!(dir.path().join("a/b/c.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn append_requires_path_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+        assert!(
+            !append(&mut s, &Op { c: 27, s: Some("x".into()), ..Op::default() })
+                .await
+                .ok
+        );
+        assert!(
+            !append(
+                &mut s,
+                &Op { c: 27, p: Some("f.txt".into()), ..Op::default() }
+            )
+            .await
+            .ok
+        );
     }
 
     #[tokio::test]

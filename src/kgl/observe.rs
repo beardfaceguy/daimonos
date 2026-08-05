@@ -25,7 +25,7 @@ pub fn record_file_op(
     cfg: &KglConfig,
 ) -> Result<()> {
     let kind = match tool {
-        "write_file" | "edit_file" => EdgeKind::Mutates,
+        "write_file" | "edit_file" | "append_file" => EdgeKind::Mutates,
         "read_file" => EdgeKind::Reads,
         _ => return Ok(()),
     };

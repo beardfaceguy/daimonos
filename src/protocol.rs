@@ -259,6 +259,10 @@ pub mod op {
     pub const READ: u8 = 0;
     pub const WRITE: u8 = 1;
     pub const PATCH: u8 = 2;
+    /// Append content to a file, creating it if absent. Distinct opcode from
+    /// WRITE so the agent can grow a large file across bounded calls without
+    /// re-emitting it (item 4 of the large-output UX work).
+    pub const APPEND: u8 = 27;
     pub const LS: u8 = 3;
     pub const STAT: u8 = 4;
     pub const GLOB: u8 = 5;

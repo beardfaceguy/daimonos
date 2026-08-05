@@ -139,6 +139,27 @@ pub fn all_tools() -> Vec<ToolDef> {
             context_check: None,
         },
         ToolDef {
+            name: "append_file",
+            tier: ToolTier::Full,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+            to_request: Some(|args| {
+                Ok(Request::Single(Op {
+                    c: protocol::op::APPEND,
+                    p: get_str(args, "path"),
+                    s: get_str(args, "content"),
+                    ..Default::default()
+                }))
+            }),
+            context_check: None,
+        },
+        ToolDef {
             name: "edit_file",
             tier: ToolTier::Full,
             schema: json!({
