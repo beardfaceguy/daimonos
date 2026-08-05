@@ -256,6 +256,36 @@ intra_turn_keep_recent_results = 5
 old_argument_max_chars = 2_000
 ```
 
+### `[loop_detector]` — Tool retry-storm detection
+
+Deterministic, LLM-free detection of tool retry storms inside a single agent
+turn (vikunja #1197, adapted from Octomind). Each complete parallel batch of
+tool calls plus results is one detector *round*. Every `(call, result)` pair is
+fingerprinted; a round containing any novel pair counts as progress and resets
+the windows, so legitimate repeated polls or staged reads never trigger it.
+Uninterrupted identical repetition first injects a bounded corrective hint
+(rotating sections from the `loop_steer` prompt) into the next request as
+ephemeral system context. If the model changes its call-set, the detector
+de-escalates; if it keeps repeating the exact call-set, reminders back off
+exponentially until a hard circuit breaker ends the turn before paying for
+another generation. Steers and breaker trips are recorded in analytics as
+`context:loop_detector`.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Master switch; `false` removes the detector from the agent loop |
+| `repeat_threshold` | `3` | Steer once an identical `(call, result)` pair repeats this many consecutive rounds; `0` disables |
+| `no_novelty_rounds` | `3` | Steer after this many consecutive rounds with no novel pair; `0` disables |
+| `circuit_breaker_rounds` | `12` | Hard-stop the turn after this many consecutive no-novelty rounds; `0` disables (steers only) |
+
+```toml
+[loop_detector]
+enabled = true
+repeat_threshold = 3
+no_novelty_rounds = 3
+circuit_breaker_rounds = 12
+```
+
 ### `[mcp]` — MCP server (`--mcp`)
 
 These settings apply only when running as an MCP server over stdio (Cursor,

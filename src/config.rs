@@ -14,6 +14,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub process: ProcessConfig,
     pub tool_output: ToolOutputConfig,
+    pub loop_detector: LoopDetectorConfig,
     pub logging: LoggingConfig,
     pub observability: ObservabilityConfig,
     pub analytics: AnalyticsConfig,
@@ -46,6 +47,8 @@ pub struct PromptsConfig {
     pub kgl_hint: Option<String>,
     /// Compaction summarizer system prompt.
     pub summary: Option<String>,
+    /// Loop-detector corrective steer template (vikunja #1197).
+    pub loop_steer: Option<String>,
     /// Top-level full/terse tool-description catalog.
     pub tool_descriptions: Option<String>,
     /// Additional user instructions loaded at startup for agent/chat/ACP and
@@ -193,6 +196,38 @@ impl Default for ToolOutputConfig {
             intra_turn_result_budget_tokens: 40_000,
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
+        }
+    }
+}
+
+/// Deterministic tool retry-storm detection inside one agent turn (vikunja
+/// #1197, adapted from Octomind). All windows are model-round counts; a round
+/// is one complete parallel batch of tool calls with their results. No LLM
+/// call is ever made by the detector.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LoopDetectorConfig {
+    /// Master switch; `false` removes the detector from the agent loop.
+    pub enabled: bool,
+    /// Steer once an identical `(call, result)` pair has repeated for this
+    /// many consecutive rounds (any novel pair resets the window). `0`
+    /// disables the repeat signal.
+    pub repeat_threshold: u32,
+    /// Steer once this many consecutive rounds produced no novel
+    /// `(call, result)` pair. `0` disables the window signal.
+    pub no_novelty_rounds: u32,
+    /// Hard-stop the turn after this many consecutive no-novelty rounds.
+    /// `0` disables the circuit breaker (steers only).
+    pub circuit_breaker_rounds: u32,
+}
+
+impl Default for LoopDetectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repeat_threshold: 3,
+            no_novelty_rounds: 3,
+            circuit_breaker_rounds: 12,
         }
     }
 }

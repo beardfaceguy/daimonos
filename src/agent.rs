@@ -426,17 +426,19 @@ async fn acknowledge_coordination_model_notice(
     s.coordination_model_watermark = s.coordination_model_watermark.max(newest_message_id);
 }
 
+/// Returns `true` when anything was pruned, so the caller can reset
+/// loop-detector novelty windows that referenced the removed results.
 async fn microcompact_agent_history(
     messages: &mut [Message],
     session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
-) {
+) -> bool {
     let cfg = {
         let guard = session.lock().await;
         guard.cfg.tool_output.clone()
     };
     let stats = crate::tool_output::microcompact_history(messages, &cfg).await;
     if stats.results_pruned == 0 && stats.arguments_pruned == 0 {
-        return;
+        return false;
     }
 
     let (analytics, external_session_id) = {
@@ -465,6 +467,36 @@ async fn microcompact_agent_history(
             read_dedup: false,
             batch_size: u32::try_from(stats.results_pruned.saturating_add(stats.arguments_pruned))
                 .unwrap_or(u32::MAX),
+            external_session_id,
+        });
+    }
+    true
+}
+
+/// Record one loop-detector event (`steer` or `circuit_breaker`) in analytics
+/// (vikunja #1197). Mirrors the `context:microcompact` convention.
+async fn record_loop_detector_event(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    kind: &str,
+    stats: crate::loop_detector::DetectorStats,
+) {
+    let (analytics, external_session_id) = {
+        let guard = session.lock().await;
+        (guard.analytics.clone(), guard.external_session_id.clone())
+    };
+    if let Some(analytics) = analytics {
+        analytics.record_async(crate::analytics::ToolCallRecord {
+            tool_name: "context:loop_detector".to_string(),
+            command: Some(kind.to_string()),
+            request_tokens: 0,
+            response_tokens: 0,
+            saved_tokens: 0,
+            savings_pct: 0.0,
+            exec_time_ms: 0,
+            was_redirect: false,
+            was_filtered: false,
+            read_dedup: false,
+            batch_size: stats.max_pair_repeats,
             external_session_id,
         });
     }
@@ -551,6 +583,23 @@ pub async fn run(
         .or_else(auto_continue_budget_from_env)
         .unwrap_or(DEFAULT_AUTO_CONTINUE_BUDGET);
     let mut auto_continues_used: u32 = 0;
+    // Deterministic retry-storm detection (vikunja #1197). Detector state is
+    // scoped to this `run` call, so a new user task starts with fresh windows.
+    let mut loop_detector = {
+        let cfg = { session.lock().await.cfg.clone() };
+        if cfg.loop_detector.enabled {
+            let template = crate::prompts::loop_steer(&cfg).await;
+            Some(crate::loop_detector::LoopDetector::new(
+                cfg.loop_detector.clone(),
+                &template,
+            ))
+        } else {
+            None
+        }
+    };
+    // Corrective hint emitted by the detector; consumed by the NEXT model
+    // request as ephemeral system context, never as fake history.
+    let mut pending_steer: Option<String> = None;
     // True only for the generation immediately following a `max_tokens`
     // continuation; consumed each iteration so later non-continuation
     // generations in the same turn regain the caller's thinking level.
@@ -560,18 +609,33 @@ pub async fn run(
         // Deterministically shed old successful tool context before every
         // provider call. This runs inside a single user turn, where ADR-002's
         // between-turn compaction cannot help.
-        microcompact_agent_history(&mut messages, &session).await;
+        let pruned = microcompact_agent_history(&mut messages, &session).await;
+        if pruned {
+            // Fingerprinted results the model could "see" may be gone now;
+            // stale novelty windows must not accuse it of re-reading them.
+            if let Some(detector) = loop_detector.as_mut() {
+                detector.on_context_pruned();
+            }
+        }
 
         // Safe boundary: no provider stream or tool call is active here. This
         // runs before the initial generation and after complete tool-result
         // batches; the notice is ephemeral system context, not fake history.
         let coordination_notice = coordination_model_notice(&session).await;
         let notice_text = coordination_notice.as_ref().map(|(text, _)| text.as_str());
-        let system = match (config.system.as_deref(), notice_text) {
-            (Some(base), Some(notice)) => Some(format!("{base}\n\n{notice}")),
-            (None, Some(notice)) => Some(notice.to_string()),
-            (Some(base), None) => Some(base.to_string()),
-            (None, None) => None,
+        // Loop-detector steer rides the same ephemeral channel as the
+        // coordination notice: appended to system for exactly one generation.
+        let steer_text = pending_steer.take();
+        let system = {
+            let parts: Vec<&str> = [config.system.as_deref(), notice_text, steer_text.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
         };
         let ctx = Context {
             messages: messages.clone(),
@@ -733,6 +797,7 @@ pub async fn run(
                     guard.cfg.tool_output.clone()
                 };
                 let mut tool_results = Vec::new();
+                let mut round_observations = Vec::new();
                 let mut terminate = false;
 
                 for (id, name, input) in calls {
@@ -1097,6 +1162,15 @@ pub async fn run(
                         tool_span.finish(status, outcome.unwrap_or_default());
                     }
 
+                    // Observe the MODEL-VISIBLE result (post output-bounding):
+                    // a repeated truncation placeholder is exactly the kind of
+                    // no-progress signal the detector must see (vikunja #1197).
+                    if loop_detector.is_some() {
+                        round_observations.push(crate::loop_detector::CallObservation::new(
+                            &name, &input, is_error, &content,
+                        ));
+                    }
+
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
                         content,
@@ -1120,6 +1194,49 @@ pub async fn run(
                         last_call_usage: resp.usage,
                         context_overflow: false,
                     };
+                }
+
+                // One detector round per complete parallel batch (#1197). A
+                // steer becomes ephemeral system context on the next request;
+                // the circuit breaker ends the turn BEFORE paying for another
+                // generation, with all tool results already paired above.
+                if let Some(detector) = loop_detector.as_mut() {
+                    match detector.observe_round(&round_observations) {
+                        crate::loop_detector::RoundVerdict::Proceed => {}
+                        crate::loop_detector::RoundVerdict::Steer(text) => {
+                            let stats = detector.stats();
+                            tracing::info!(
+                                target: "daimonos::agent",
+                                event = "loop_detector_steer",
+                                steers_emitted = stats.steers_emitted,
+                                steers_suppressed = stats.steers_suppressed,
+                                max_pair_repeats = stats.max_pair_repeats,
+                                "injecting corrective steer after repeated no-progress tool rounds"
+                            );
+                            record_loop_detector_event(&session, "steer", stats).await;
+                            pending_steer = Some(text);
+                        }
+                        crate::loop_detector::RoundVerdict::Break(message) => {
+                            let stats = detector.stats();
+                            tracing::warn!(
+                                target: "daimonos::agent",
+                                event = "loop_detector_circuit_breaker",
+                                rounds_observed = stats.rounds_observed,
+                                steers_emitted = stats.steers_emitted,
+                                max_pair_repeats = stats.max_pair_repeats,
+                                "stopping turn: tool retry storm exhausted the circuit breaker"
+                            );
+                            record_loop_detector_event(&session, "circuit_breaker", stats).await;
+                            return AgentResult {
+                                messages,
+                                usage: total_usage,
+                                stop_reason: StopReason::Aborted,
+                                error_message: Some(message),
+                                last_call_usage: resp.usage,
+                                context_overflow: false,
+                            };
+                        }
+                    }
                 }
             }
         }

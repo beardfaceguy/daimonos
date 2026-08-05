@@ -30,14 +30,19 @@ pub const KGL_HINT_DEFAULT: &str = include_str!("../prompts/kgl_hint.md");
 /// Embedded default: compaction summarizer system prompt.
 pub const SUMMARY_DEFAULT: &str = include_str!("../prompts/summary.md");
 
+/// Corrective steer injected by the deterministic loop detector (vikunja
+/// #1197). Sections separated by `---` lines are rotated per emission.
+pub const LOOP_STEER_DEFAULT: &str = include_str!("../prompts/loop_steer.md");
+
 /// Canonical prompt keys, in a stable display order. This is the single list
 /// used by `default_by_name`, the `--print-prompt` flag, and the `--dump-prompts`
 /// scaffold, so adding a prompt means editing here and `default_by_name` only.
-pub const PROMPT_NAMES: [&str; 5] = [
+pub const PROMPT_NAMES: [&str; 6] = [
     "agent_system",
     "mcp_instructions",
     "kgl_hint",
     "summary",
+    "loop_steer",
     "tool_descriptions",
 ];
 
@@ -50,6 +55,7 @@ pub fn default_by_name(name: &str) -> Option<&'static str> {
         "mcp_instructions" => Some(MCP_INSTRUCTIONS_DEFAULT),
         "kgl_hint" => Some(KGL_HINT_DEFAULT),
         "summary" => Some(SUMMARY_DEFAULT),
+        "loop_steer" => Some(LOOP_STEER_DEFAULT),
         "tool_descriptions" => Some(crate::tool_descriptions::DEFAULT_TEXT),
         _ => None,
     }
@@ -276,6 +282,16 @@ pub async fn mcp_instructions(cfg: &Config) -> String {
         "mcp_instructions",
         cfg.prompts.mcp_instructions.as_deref(),
         MCP_INSTRUCTIONS_DEFAULT,
+    )
+    .await
+}
+
+/// Loop-detector corrective steer template (vikunja #1197).
+pub async fn loop_steer(cfg: &Config) -> String {
+    resolve(
+        "loop_steer",
+        cfg.prompts.loop_steer.as_deref(),
+        LOOP_STEER_DEFAULT,
     )
     .await
 }
