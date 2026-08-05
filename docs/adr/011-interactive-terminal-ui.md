@@ -66,13 +66,21 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
   non-full-screen fallback editor but must never own stdin concurrently with a
   raw-mode TUI.
 
-### 3. Detach vs stop (daemon-owned session)
+### 3. Future detach vs stop contract (not currently exposed)
 
-- The session is **daemon-owned**: closing/detaching the TUI does not kill it.
-- `/detach` (or closing the terminal) leaves the daemon session alive and
-  reconnectable; `/stop-session` explicitly terminates it.
-- The local TUI retains authority to approve, interrupt, revoke remote clients,
+The intended daemon-owned contract remains:
+
+- closing/detaching a client does not kill its daemon session;
+- reattaching by session id or picker restores a canonical snapshot;
+- `/stop-session` explicitly terminates the session;
+- the local TUI retains authority to approve, interrupt, revoke remote clients,
   and stop the session, regardless of remote attachment (ADR-010 arbitration).
+
+The current TUI is process-local, so `/detach` is intentionally disabled and
+omitted from help. `/quit` exits the TUI and ends its session. Do not expose
+detach until the daemon provides local attach, session discovery, reconnect
+snapshot recovery, explicit stop/delete, and bounded idle/retention cleanup;
+without those pieces detach would only create unreachable abandoned sessions.
 
 ### 4. Terminal correctness (hard requirements)
 
@@ -89,7 +97,8 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 
 ## Phases (map to #1091)
 
-0. **This ADR** — CLI compat, detach/stop, event projection, fallback. *(done)*
+0. **This ADR** — CLI compatibility, future detach/stop contract, event
+   projection, and fallback. *(done)*
 1. Daemon-owned session core + UDS ACP transport. *(largely pre-landed by
    #1090: `session_core` / `session_protocol` / `client_transport`.)*
 2. **Pure view reducer + exhaustive unit tests.** *(this slice)*

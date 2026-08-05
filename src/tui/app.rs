@@ -56,7 +56,7 @@ struct PendingApproval {
 type SharedView = Arc<StdMutex<ViewState>>;
 type SharedApproval = Arc<StdMutex<Option<PendingApproval>>>;
 
-/// Run the opt-in full-screen TUI until detach or stop-session.
+/// Run the opt-in full-screen TUI until quit or stop-session.
 pub async fn run(
     provider: Box<dyn LlmProvider>,
     workspace: &Path,
@@ -237,7 +237,7 @@ async fn run_event_loop(
                             UiCommand::Prompt(prompt) if !prompt.is_empty() => {
                                 *composer = prompt;
                             }
-                            UiCommand::Detach => break,
+                            UiCommand::Quit => break,
                             UiCommand::StopSession => {
                                 let _ = events.emit(SessionEvent::SessionEnding {
                                     reason: "stopped by local terminal".to_string(),
@@ -291,7 +291,13 @@ async fn run_event_loop(
                                 );
                             }
                             UiCommand::Unknown(command) => {
-                                push_notice(view, format!("unknown command: {command}"));
+                                let message = if command == "/detach" {
+                                    "detach is unavailable until daemon reattach support exists; use /quit"
+                                        .to_string()
+                                } else {
+                                    format!("unknown command: {command}")
+                                };
+                                push_notice(view, message);
                             }
                             UiCommand::Clear | UiCommand::Model(Some(_)) => {
                                 push_notice(view, "command unavailable while a turn is running");

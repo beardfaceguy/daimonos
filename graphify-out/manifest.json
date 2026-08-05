@@ -1130,8 +1130,8 @@
     "semantic_hash": ""
   },
   "docs/adr/011-interactive-terminal-ui.md": {
-    "mtime": 1785905283.9404283,
-    "ast_hash": "52b10f81204a7c586463faa21c876cc2",
+    "mtime": 1785906967.5568273,
+    "ast_hash": "d7b0a6a7dc76243bc6596a76a9176bc4",
     "semantic_hash": ""
   },
   "src/tui/render.rs": {
@@ -1145,8 +1145,8 @@
     "semantic_hash": ""
   },
   "src/tui/commands.rs": {
-    "mtime": 1785876088.8732138,
-    "ast_hash": "6c7c9f713284c15ba93ea71571d4591c",
+    "mtime": 1785906950.581014,
+    "ast_hash": "7e95f6a51e5154eb50d38bbcce829c74",
     "semantic_hash": ""
   },
   "src/tui/agent_mode.rs": {
@@ -1160,8 +1160,8 @@
     "semantic_hash": ""
   },
   "src/tui/app.rs": {
-    "mtime": 1785905284.174049,
-    "ast_hash": "77413148e6f9f94c68d9cfa5e3f9a6b6",
+    "mtime": 1785906957.2409406,
+    "ast_hash": "fa71b32c29cc0787e586ee388a4a4812",
     "semantic_hash": ""
   }
 }

@@ -37,8 +37,8 @@ pub enum UiCommand {
     Compact,
     /// Interrupt the in-flight turn without quitting.
     Interrupt,
-    /// Leave the TUI but keep the daemon session alive and reconnectable.
-    Detach,
+    /// Exit the process-local TUI and end its session.
+    Quit,
     /// Explicitly terminate the daemon session.
     StopSession,
     /// An unrecognized `/command` (echoed back so the UI can hint).
@@ -54,7 +54,7 @@ Commands:
   /model [id]        switch model (no id opens the picker)
   /compact           compact context now
   /interrupt, /stop  interrupt the in-flight turn
-  /detach, /quit     leave the TUI; the session keeps running
+  /quit, /exit       exit the TUI and end this process-local session
   /stop-session      terminate the daemon session
 Anything else is sent to the agent as a prompt.
 Enter sends · Ctrl-C interrupts the current turn.";
@@ -81,7 +81,7 @@ pub fn parse_command(line: &str) -> UiCommand {
         "/model" => UiCommand::Model(rest.map(str::to_string)),
         "/compact" => UiCommand::Compact,
         "/interrupt" | "/stop" | "/cancel" => UiCommand::Interrupt,
-        "/detach" | "/quit" | "/exit" | "/q" => UiCommand::Detach,
+        "/quit" | "/exit" | "/q" => UiCommand::Quit,
         "/stop-session" | "/kill" => UiCommand::StopSession,
         other => UiCommand::Unknown(other.to_string()),
     }
@@ -144,21 +144,22 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_and_detach_and_stop_have_aliases() {
+    fn interrupt_quit_and_stop_have_aliases() {
         assert_eq!(parse_command("/interrupt"), UiCommand::Interrupt);
         assert_eq!(parse_command("/stop"), UiCommand::Interrupt);
-        assert_eq!(parse_command("/detach"), UiCommand::Detach);
-        assert_eq!(parse_command("/quit"), UiCommand::Detach);
-        assert_eq!(parse_command("/exit"), UiCommand::Detach);
+        assert_eq!(parse_command("/quit"), UiCommand::Quit);
+        assert_eq!(parse_command("/exit"), UiCommand::Quit);
         assert_eq!(parse_command("/stop-session"), UiCommand::StopSession);
         assert_eq!(parse_command("/kill"), UiCommand::StopSession);
     }
 
     #[test]
-    fn detach_and_stop_session_are_distinct() {
-        // The whole point of ADR-011's detach/stop split: /quit must NOT kill
-        // the daemon session.
-        assert_ne!(parse_command("/quit"), parse_command("/stop-session"));
+    fn detach_is_disabled_until_reattach_exists() {
+        assert_eq!(
+            parse_command("/detach"),
+            UiCommand::Unknown("/detach".to_string())
+        );
+        assert!(!HELP_TEXT.contains("/detach"));
     }
 
     #[test]

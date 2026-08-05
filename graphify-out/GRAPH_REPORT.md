@@ -1,7 +1,7 @@
 # Graph Report - daimonos  (2026-08-04)
 
 ## Corpus Check
-- 226 files · ~296,292 words
+- 226 files · ~296,359 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `52d4f8dd`
+- Built from commit: `0da7bfff`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -448,8 +448,8 @@ Cohesion: 0.16
 Nodes (31): compact_audit(), compact_audit_clean_project(), compact_audit_missing_metadata_defaults_clean(), compact_audit_with_vulnerabilities(), is_available(), npm_audit(), npm_audit_in_valid_project(), npm_audit_no_package_json_returns_error() (+23 more)
 
 ### Community 34 - "Community 34"
-Cohesion: 0.13
-Nodes (20): S, end_turn_resp(), EofAwareReader, ImageCapableProvider, MockProvider, ModelCaptureProvider, CompleteOpts, Context (+12 more)
+Cohesion: 0.17
+Nodes (13): S, end_turn_resp(), ImageCapableProvider, MockProvider, CompleteOpts, Context, FnMut, LlmResponse (+5 more)
 
 ### Community 35 - "Community 35"
 Cohesion: 0.12
@@ -516,8 +516,8 @@ Cohesion: 0.10
 Nodes (41): Path, Client, Path, Popen, ResourceSnapshot, CallSample, Client, find_binary() (+33 more)
 
 ### Community 51 - "Community 51"
-Cohesion: 0.05
-Nodes (83): AcpContentBlock, ConnectTo, CoreMessage, InitializeRequest, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images() (+75 more)
+Cohesion: 0.03
+Nodes (75): AcpContentBlock, AvailableCommand, CoreAssistantOutcome, CoreMessage, DateTime, InitializeRequest, SessionInfo, acp_prompt_turn_uses_agent_env_thinking_level() (+67 more)
 
 ### Community 52 - "Community 52"
 Cohesion: 0.08
@@ -744,8 +744,8 @@ Cohesion: 0.22
 Nodes (9): E, build_provider(), generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, RemoteToolSpan, saturated_queue_drops_spans_without_blocking_producer() (+1 more)
 
 ### Community 109 - "Community 109"
-Cohesion: 0.09
-Nodes (63): AcpClientRole, AcpPlan, AcpStopReason, ActiveToolCalls, AgentPlanEntry, ConnectionTo, CurrentConnection, DiffStash (+55 more)
+Cohesion: 0.08
+Nodes (67): AcpClientRole, AcpPlan, AcpStopReason, ActiveToolCalls, AgentPlanEntry, ConnectionTo, CurrentConnection, DiffStash (+59 more)
 
 ### Community 110 - "Community 110"
 Cohesion: 0.70
@@ -905,7 +905,7 @@ Nodes (22): ContextComposition, AgentResult, auto_continue_budget_from_env(), cl
 
 ### Community 168 - "Community 168"
 Cohesion: 0.09
-Nodes (54): AvailableCommand, BridgeSlot, CoreRuntimeOption, DateTime, McpBridge, McpClientPool, SessionCompaction, SessionCore (+46 more)
+Nodes (56): CoreRuntimeOption, LevelFilter, McpClientPool, SessionCompaction, SessionCore, AcpState, align_client_user_message_ids(), assistant_texts() (+48 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.30
@@ -932,8 +932,8 @@ Cohesion: 0.14
 Nodes (5): ApprovalDecision, Option, approval_from_key(), parse_command(), UiCommand
 
 ### Community 175 - "Community 175"
-Cohesion: 0.08
-Nodes (26): AsyncRead, Pin, Poll, Read, AlwaysWouldBlockWriter, clear_fd_nonblocking(), EofAwareReader<R>, ErrorReader (+18 more)
+Cohesion: 0.07
+Nodes (29): AsyncRead, Pin, Poll, Read, AlwaysWouldBlockWriter, clear_fd_nonblocking(), EofAwareReader<R>, ErrorReader (+21 more)
 
 ### Community 176 - "Community 176"
 Cohesion: 0.09
@@ -1140,8 +1140,8 @@ Cohesion: 0.29
 Nodes (7): Aggregate lineage, Conclusion, F2 pass totals, Full-suite Anthropic tool-prefix cache benchmark, Method, Per-task latency regressions versus F1, Per-task token lineage
 
 ### Community 233 - "Community 233"
-Cohesion: 0.13
-Nodes (22): SessionInfo, decode_session_list_cursor(), encode_session_list_cursor(), legacy_session_info_uses_process_workspace_fallback(), locations_for_read_file_include_offset_as_line(), locations_for_read_file_without_offset_have_no_line(), locations_for_write_and_edit_carry_path_only(), paginate_session_summaries() (+14 more)
+Cohesion: 0.12
+Nodes (43): ConnectTo, ProviderFactory, SessionConfigOption, SessionConfigSelect, acp_advertises_embedded_context_and_provider_gated_images(), acp_advertises_list_delete_only_when_persistence_enabled(), acp_advertises_load_session_capability(), acp_cancelled_permission_finishes_the_announced_call() (+35 more)
 
 ### Community 234 - "Community 234"
 Cohesion: 0.33
@@ -1165,7 +1165,7 @@ Nodes (6): SocketAddr, exports_otlp_http_with_basic_auth(), exports_to_unauthent
 
 ### Community 240 - "Community 240"
 Cohesion: 0.18
-Nodes (10): 1. Layering (strict, independently testable), 2. CLI compatibility (explicit, non-negotiable), 3. Detach vs stop (daemon-owned session), 4. Terminal correctness (hard requirements), ADR-011: Interactive full-screen terminal UI for agent sessions, Consequences, Context, Decision (+2 more)
+Nodes (10): 1. Layering (strict, independently testable), 2. CLI compatibility (explicit, non-negotiable), 3. Future detach vs stop contract (not currently exposed), 4. Terminal correctness (hard requirements), ADR-011: Interactive full-screen terminal UI for agent sessions, Consequences, Context, Decision (+2 more)
 
 ### Community 241 - "Community 241"
 Cohesion: 0.18
@@ -1184,8 +1184,8 @@ Cohesion: 0.67
 Nodes (3): ApprovalDecision, Sender, PendingApproval
 
 ### Community 247 - "Community 247"
-Cohesion: 0.10
-Nodes (22): CoreAssistantOutcome, LevelFilter, AcpCommand, canonical_assistant_outcome(), capture_raw_error_logging(), emit_assistant_done(), error_has_http_status(), error_has_token() (+14 more)
+Cohesion: 0.29
+Nodes (7): BridgeSlot, McpBridge, agent_tools(), build_remote_dispatch_hook(), RemoteToolHook, ToolDescriptions, ToolSchema
 
 ### Community 248 - "Community 248"
 Cohesion: 0.17
