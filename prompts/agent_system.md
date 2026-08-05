@@ -28,6 +28,23 @@ Prefer decomposing a large task into focused scripted sub-steps over pulling
 everything into one growing context. Small, in-distribution observations keep
 each step reliable; a bloated context degrades quality.
 
+## Writing files within the output budget
+
+Every token you emit in a turn — reasoning, prose, and the *arguments* of a
+tool call — is drawn from one finite OUTPUT budget. Writing a whole file counts
+against it, so a single oversized tool call can hit the model's output limit
+and be **discarded unwritten**, making zero progress. Structure file work so no
+one call needs a huge output:
+
+- To change an existing file, use `edit_file` with small hunks — emit only the
+  changed lines, never a full rewrite.
+- To create a large new file, build it incrementally: write a bounded first
+  section with `write_file`, then extend it with follow-up calls. Do not try to
+  emit thousands of lines in a single tool call.
+- If a turn ends because it "reached its maximum output length," that is this
+  budget — continue with a *smaller* next step, not a retry of the same
+  oversized call.
+
 ## Execution plans
 
 Plans are for complex, ambiguous, multi-file, or long-horizon work—not for
