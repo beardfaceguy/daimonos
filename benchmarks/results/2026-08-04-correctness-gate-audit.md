@@ -70,3 +70,65 @@ full rebuild every task. Snapshots therefore accumulated across tasks and runs, 
 
 **True correctness on task 07 was 80%, not 100%.** Lineage stages F0-F4 all report
 "33/33 correct"; that figure is **overstated**. Token and cost numbers are unaffected.
+
+---
+
+## Follow-up (same day): tasks 10/11 tightened, and a correction
+
+### Correction to this document's earlier framing
+I initially wrote that task 10's gate "rewards the wrong answer" because the project
+emits 2 warnings while the check accepted `clean`/`ok`/`no error`. **That was too
+harsh** — "compiles cleanly, no errors" is defensible: warnings are not errors and
+compilation does succeed. The real flaw was **assertability** (every keyword is a word
+an agent would use when merely claiming success), not incorrectness.
+
+### Task 10 — calibration matters
+First attempt demanded the warning count (`2 warnings`). It failed **0 of 6** historical
+runs. Investigation: cargo reports *2 warnings* which between them name *3 methods*, and
+the agent said "4 total" in one line and "3 unused methods" in another. **Any specific
+count is defensibly ambiguous, so it is a bad discriminator.** Replaced with the
+method names, which cannot be produced without running the command:
+
+```json
+[{"all":["clippy"]},
+ {"any":["apply_discount","find_by_sku","find_by_category"]},
+ {"any":["never used","dead[ _]code","unused"]}]
+```
+
+### Task 11 — demand real facts
+Test count (`15`), a real clippy fact, a real commit subject from `git log --oneline -5`,
+and the true clean status.
+
+### Validation of all three (07 / 10 / 11)
+| task | real runs passing | fabricated answer passes |
+|---|---|---|
+| 07-snapshot-rollback | 6/6 | **no** |
+| 10-exec-build-check | 6/6 | **no** |
+| 11-exec-multi-command | 6/6 | **no** |
+
+Both directions checked: the gates admit genuine work and reject a plausible fabrication.
+
+## Fixture bug, corrected diagnosis
+
+My first explanation for the snapshot leak — "snapshot dirs contain gitignored
+`.cursor/` paths so `git clean -fd` skips them" — was **wrong**. The real cause: the two
+leaked snapshots were **tracked in the fixture's HEAD**. `git clean` only removes
+*untracked* files, and `git checkout -- .` actively **restored** them on every reset.
+
+Consequences that a naive fix would have caused:
+- `rm -rf .daimonos` alone leaves the fixture repo **dirty (20 deletions)**, which breaks
+  tasks `06`/`09`/`11` — they assert a clean `git status`.
+
+Correct fix applied to the fixture (local, see below):
+1. `git rm -r --cached .daimonos`, add `.daimonos/` to the fixture `.gitignore`;
+2. **`git commit --amend`** rather than a new commit — tasks `06`/`09` assert exactly
+   **7 commits**, and adding one would have broken them.
+
+Verified after the fix: 7 commits, HEAD subject preserved, clean status, and task 07's
+gate discriminating after a real `reset_workspace`.
+
+## Reproducibility gap (not fixed)
+`benchmarks/workspace/` is **gitignored by the outer repo** (0 tracked files). The
+fixture is therefore **local-only and not distributed**, so the lineage's "fixture
+commit" comparability criterion cannot be verified across machines. The fixture repair
+above is a local change and is deliberately **not** part of this commit.

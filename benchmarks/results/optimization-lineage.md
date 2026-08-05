@@ -4,6 +4,35 @@ This is the durable index for optimization benchmarks. Append a stage for
 every optimization implementation; never replace an older row. Raw run
 directories remain local, while each stage links to a committed report.
 
+> ## ⚠️ Correctness figures for stages F0–F4 are OVERSTATED
+>
+> Every F-series stage reports "33/33 correct". That is **wrong** for
+> `07-snapshot-rollback`, whose gate was **vacuous** until 2026-08-04: it asserted
+> `! grep -qi toys src/config.rs`, but the *pristine* file doesn't contain `toys`
+> either — success was byte-identical to never-started. Two of ten runs created **no
+> snapshot and made no edit** (0 ops in `~/.daimonos/analytics.db`) yet scored
+> correct. Retroactive re-grade: **task 07 was 80% correct, not 100%**, i.e. there
+> was an invisible ~20% silent-failure rate.
+>
+> **Token, cost and call-count figures in F0–F4 are unaffected** — only the
+> correctness column is. The −70% caching result (F4 vs F3) and the F3-vs-F0
+> deltas still stand.
+>
+> Also fixed at the same time: leaked snapshots were **tracked in the fixture's
+> HEAD**, so `git checkout -- .` restored them on every reset (which is why
+> `git clean -fd` never removed them). They polluted workspace-wide searches — a
+> plausible contributor to the variance in `02-search-usages`.
+>
+> Because the gate changed, **correctness is not comparable across 2026-08-04**;
+> token/cost remains comparable (the task *prompt* was deliberately left
+> unchanged). Tasks `10` and `11` were also tightened, having previously been
+> satisfiable by generic claims. Details:
+> [`2026-08-04-correctness-gate-audit.md`](2026-08-04-correctness-gate-audit.md).
+>
+> Caveat on reproducibility: `benchmarks/workspace/` is **gitignored by the outer
+> repo** (0 tracked files), so the fixture is local-only and not distributed. The
+> "fixture commit" criterion below cannot currently be verified across machines.
+
 The machine-readable source is `benchmarks/optimization-lineage.json`.
 `benchmarks/benchmark_db.py` synchronizes it and available raw runs into the
 private local `~/.daimonos/benchmarks.db` SQLite database.
