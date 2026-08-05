@@ -11,6 +11,7 @@ mod compaction;
 mod config;
 mod context_metrics;
 mod coordination;
+mod env_file;
 mod index;
 mod kgl;
 mod logging;
@@ -201,6 +202,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Load an optional `agent.env` (dotenv-style) before config load and mode
+    // dispatch, so every runtime mode and every later `std::env::var` read sees
+    // the same values from one place. The real environment wins; loader-hijack
+    // variables are refused. See `env_file`.
+    env_file::load_default(&workspace, runtime_mode.is_mcp_stdio() && !cli.verbose);
 
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = runtime_mode.is_mcp_stdio() && !startup_logs_early;

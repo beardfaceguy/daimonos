@@ -100,6 +100,30 @@ The minimal Cursor config (add to `.cursor/mcp.json` in your project):
 }
 ```
 
+## Environment variables (`agent.env`)
+
+Daimonos loads an optional dotenv-style **`agent.env`** at startup — before it
+loads config and before it picks a run mode — so the values apply uniformly to
+**all** modes (`--mcp`, `agent`, `chat`, `acp`). Search order (project-local
+wins over user-global; the real environment always wins over both):
+
+1. `<workspace>/agent.env`
+2. `$XDG_CONFIG_HOME/daimonos/agent.env` (else `~/.config/daimonos/agent.env`)
+
+```bash
+# <workspace>/agent.env
+DAIMONOS_AGENT_AUTO_CONTINUE=3
+ANTHROPIC_API_KEY=sk-...
+```
+
+A variable already set in the process environment (e.g. Zed's ACP server `env`
+block) is never overwritten. For safety, `agent.env` sits in an untrusted
+checkout yet daimonos' environment is inherited by every tool it runs, so
+loader/interpreter-hijacking variables (`LD_PRELOAD`, `DYLD_*`, `PATH`,
+`NODE_OPTIONS`, `BASH_ENV`, …) are **refused** from the file and reported on
+stderr; set those in the real environment if you truly need them. Keep
+`agent.env` out of version control (add it to `.gitignore`).
+
 ## What You Get
 
 | Feature | Benefit |
