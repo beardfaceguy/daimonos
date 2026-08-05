@@ -247,15 +247,80 @@ pub struct CompleteOpts {
     pub temperature: Option<f64>,
 }
 
+/// The sentinel output budget in [`CompleteOpts::default`]. A caller that
+/// leaves `max_tokens` at this value is treated as "unset": each provider
+/// substitutes the model's real maximum output (see [`resolve_max_output`]),
+/// because 8192 is far too small once adaptive reasoning draws from the same
+/// budget and truncates a fresh turn with `stop_reason: max_tokens` — which
+/// Zed surfaces to the user as "Output Limit Reached".
+pub const DEFAULT_MAX_TOKENS: u32 = 8192;
+
 impl Default for CompleteOpts {
     fn default() -> Self {
         CompleteOpts {
             model: "claude-opus-4-8".to_string(),
-            max_tokens: 8192,
+            max_tokens: DEFAULT_MAX_TOKENS,
             thinking: ThinkingLevel::default(),
             temperature: None,
         }
     }
+}
+
+/// Resolve the output-token budget a provider actually sends for a model.
+///
+/// The struct default of [`DEFAULT_MAX_TOKENS`] (8192) is a placeholder, not a
+/// real intent: production callers build `CompleteOpts { model, thinking,
+/// ..default() }` and never set `max_tokens`, so every fresh session inherits
+/// 8192. With adaptive reasoning on (the default), thinking tokens are drawn
+/// from that same budget, so a hard first prompt can exhaust it before the
+/// visible answer and truncate with `stop_reason: max_tokens`.
+///
+/// Resolution:
+/// - `max_tokens` left at the [`DEFAULT_MAX_TOKENS`] sentinel → substitute
+///   `DAIMONOS_AGENT_MAX_TOKENS` if set, else `model_default` (the model's real
+///   max output), else leave it unchanged for models we have no figure for.
+/// - an explicit, non-sentinel `max_tokens` is the caller's deliberate choice
+///   and is honored as-is.
+/// - `hard_cap`, when the model has a known ceiling, clamps the result so we
+///   never request more output than the model allows.
+pub(crate) fn resolve_max_output(
+    requested: u32,
+    model_default: Option<u32>,
+    hard_cap: Option<u32>,
+) -> u32 {
+    resolve_max_output_inner(
+        requested,
+        model_default,
+        hard_cap,
+        max_tokens_env_override(),
+    )
+}
+
+fn resolve_max_output_inner(
+    requested: u32,
+    model_default: Option<u32>,
+    hard_cap: Option<u32>,
+    env_override: Option<u32>,
+) -> u32 {
+    let base = if requested == DEFAULT_MAX_TOKENS {
+        env_override.or(model_default).unwrap_or(requested)
+    } else {
+        requested
+    };
+    match hard_cap {
+        Some(cap) => base.min(cap),
+        None => base,
+    }
+}
+
+/// `DAIMONOS_AGENT_MAX_TOKENS`, a positive integer, lets an operator raise or
+/// cap the default output budget without a code change. Ignored when empty,
+/// non-numeric, or zero.
+fn max_tokens_env_override() -> Option<u32> {
+    std::env::var("DAIMONOS_AGENT_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
 }
 
 /// An incremental piece of a turn, emitted while a provider streams a
@@ -459,6 +524,59 @@ mod tests {
         assert_eq!(opts.model, "claude-opus-4-8");
         assert_eq!(opts.max_tokens, 8192);
         assert_eq!(opts.thinking, ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn sentinel_with_no_model_default_passes_through() {
+        // Unknown model, no env override: the 8192 sentinel is left as-is.
+        assert_eq!(
+            resolve_max_output_inner(DEFAULT_MAX_TOKENS, None, None, None),
+            DEFAULT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn sentinel_substitutes_model_default() {
+        // The reported bug: a fresh session's 8192 becomes the model max.
+        assert_eq!(
+            resolve_max_output_inner(DEFAULT_MAX_TOKENS, Some(32_000), None, None),
+            32_000
+        );
+    }
+
+    #[test]
+    fn env_override_beats_model_default_on_sentinel() {
+        assert_eq!(
+            resolve_max_output_inner(DEFAULT_MAX_TOKENS, Some(32_000), None, Some(50_000)),
+            50_000
+        );
+    }
+
+    #[test]
+    fn explicit_value_is_honored_over_default_and_env() {
+        // A deliberate, non-sentinel caller value wins; env only fills the sentinel.
+        assert_eq!(
+            resolve_max_output_inner(4_096, Some(64_000), None, Some(50_000)),
+            4_096
+        );
+    }
+
+    #[test]
+    fn hard_cap_clamps_explicit_and_env() {
+        // Never request more output than the model ceiling.
+        assert_eq!(
+            resolve_max_output_inner(u32::MAX, Some(128_000), Some(128_000), None),
+            128_000
+        );
+        assert_eq!(
+            resolve_max_output_inner(
+                DEFAULT_MAX_TOKENS,
+                Some(128_000),
+                Some(128_000),
+                Some(999_999)
+            ),
+            128_000
+        );
     }
 
     #[test]
