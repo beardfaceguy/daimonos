@@ -103,6 +103,22 @@ intra_turn_keep_recent_results = 5
 # character count. Paths and other metadata are never truncated.
 old_argument_max_chars = 2_000
 
+[loop_detector]
+# Deterministic tool retry-storm detection inside one agent turn (no LLM
+# calls). A "round" is one complete parallel batch of tool calls + results.
+enabled = true
+# Steer once an identical (call, result) pair has repeated for this many
+# consecutive rounds (any novel pair resets the window). 0 disables the
+# repeat signal.
+repeat_threshold = 3
+# Steer once this many consecutive rounds produced no novel (call, result)
+# pair. 0 disables the window signal.
+no_novelty_rounds = 3
+# Hard-stop the turn after this many consecutive no-novelty rounds. Ignored
+# steers are re-emitted on exponential backoff until this trips. 0 disables
+# the hard stop (steers only).
+circuit_breaker_rounds = 12
+
 [logging]
 # Persist structured JSON diagnostics independently of the ACP/MCP client.
 enabled = true

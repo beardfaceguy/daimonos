@@ -15,6 +15,7 @@ mod env_file;
 mod index;
 mod kgl;
 mod logging;
+mod loop_detector;
 mod mcp;
 mod mcp_bridge;
 mod observability;
