@@ -1,11 +1,12 @@
 use async_trait::async_trait;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cli::{AcpArgs, AgentArgs, ChatArgs};
 use crate::{
     acp_cmd, agent, agent_cmd, agent_env, analytics, chat_cmd, config, paths, prompts, providers,
-    safety, session_store,
+    safety, session_store, tui,
 };
 
 fn try_build_provider(
@@ -56,11 +57,19 @@ pub async fn run_agent(
 ) -> anyhow::Result<()> {
     let AgentArgs {
         task,
+        interactive,
+        print,
         model,
         provider,
         dry_run,
         agent_env,
     } = args;
+    let mode = tui::resolve_agent_mode(
+        interactive,
+        print,
+        dry_run,
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    );
 
     struct DryRunProvider;
     #[async_trait]
@@ -74,7 +83,8 @@ pub async fn run_agent(
         }
     }
 
-    if dry_run {
+    if mode == tui::AgentMode::DryRun {
+        let task = require_agent_task(task, mode)?;
         let args = agent_cmd::AgentCmdArgs {
             task,
             model,
@@ -98,6 +108,11 @@ pub async fn run_agent(
         return Ok(());
     }
 
+    let task = if mode == tui::AgentMode::Print {
+        Some(require_agent_task(task, mode)?)
+    } else {
+        task
+    };
     let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -110,6 +125,36 @@ pub async fn run_agent(
     } else {
         None
     };
+
+    if mode == tui::AgentMode::Interactive {
+        let compaction = agent
+            .resolve_compaction(llm.as_ref(), &effective_model)
+            .await
+            .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
+        let compaction = prompts::apply_summary_override(compaction, &cfg).await;
+        let mut models = agent.models.clone();
+        if !models.iter().any(|model| model == &effective_model) {
+            models.insert(0, effective_model.clone());
+        }
+        return tui::run_tui(
+            llm,
+            workspace,
+            cfg,
+            tui::TuiOptions {
+                initial_prompt: task,
+                model: effective_model,
+                models,
+                safety: agent.to_safety_policy(None),
+                token_log,
+                compaction,
+                analytics: analytics_store,
+                thinking: agent.thinking,
+            },
+        )
+        .await;
+    }
+
+    let task = require_agent_task(task, mode)?;
     let approve_fn = if agent.approval_mode == "auto" {
         None
     } else {
@@ -250,6 +295,17 @@ pub async fn run_acp(
 
 fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {
     agent_env::AgentEnv::load(path).map_err(|error| anyhow::anyhow!("agent config: {error}"))
+}
+
+fn require_agent_task(task: Option<String>, mode: tui::AgentMode) -> anyhow::Result<String> {
+    task.filter(|task| !task.trim().is_empty()).ok_or_else(|| {
+        let hint = if mode == tui::AgentMode::Print {
+            "pass a task or launch a TTY with --interactive"
+        } else {
+            "pass a task"
+        };
+        anyhow::anyhow!("agent task is required in {} mode; {hint}", mode.as_str())
+    })
 }
 
 fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {

@@ -51,13 +51,14 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 
 ### 2. CLI compatibility (explicit, non-negotiable)
 
-- `daimonos agent` becomes an **interactive persistent TUI when attached to a
-  TTY**, with an optional initial prompt.
+- `daimonos agent --interactive` launches the persistent TUI when stdin and
+  stdout are attached to a TTY, with an optional initial prompt. Interactive
+  mode is deliberately opt-in while the daemon-owned detach/reconnect path is
+  still being completed.
 - A **stable, explicit non-interactive mode** is preserved for scripts, CI,
-  benchmarks, and shell composition (e.g. `daimonos agent --print "task"`). The
-  exact flag set is finalized in the phase-7 slice; the invariant is that a
-  documented, scriptable print/line mode always exists and never emits terminal
-  control codes.
+  benchmarks, and shell composition: `daimonos agent "task"` remains the
+  default and `daimonos agent --print "task"` forces it when flags are composed.
+  This documented print mode never emits terminal control codes.
 - **Non-TTY stdin/stdout falls back to print/line mode automatically** rather
   than emitting raw-mode escapes.
 - `daimonos chat` becomes an alias/compatibility fallback; we do **not** maintain
@@ -97,8 +98,9 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 5. Session/model/usage/remote-control commands + status bar.
 6. Polish: expandable diffs/terminal output, search/copy, resize/suspend,
    accessibility (no-color, keyboard-only).
-7. Make the interactive TUI the TTY default; retain the explicit stable print
-   mode.
+7. Wire the TUI behind opt-in `--interactive`; retain the default and explicit
+   `--print` stable print modes. Reconsider a TTY default only after the
+   daemon-owned detach/reconnect lifecycle is complete.
 
 ## Verification gates (TDD)
 

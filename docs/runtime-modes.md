@@ -9,6 +9,7 @@ listeners.
 |---|---|---|
 | `daimonos acp` | ACP agent for Zed and other ACP clients | unchanged |
 | `daimonos agent "<task>"` | One-shot autonomous agent | unchanged |
+| `daimonos agent --interactive ["<task>"]` | Opt-in full-screen terminal agent | non-TTY falls back to one-shot mode |
 | `daimonos chat` | Interactive agent REPL | unchanged |
 | `daimonos mcp` | MCP server over stdio | `daimonos --mcp` |
 | `daimonos mcp --socket <path>` | MCP server over a Unix socket | `daimonos --mcp-socket <path>` |
@@ -25,6 +26,10 @@ The legacy forms remain supported so existing editor configurations and service
 units do not require migration. New configuration should use the explicit
 subcommands because process listings, help output, and diagnostic logs then
 describe the selected runtime unambiguously.
+
+`agent --interactive` requires both terminal input and output. `--print`
+explicitly forces one-shot output when flags are composed; without
+`--interactive`, one-shot mode remains the default.
 
 Inspection operations (`--stats`, `--print-config-path`, `--print-prompt`, and
 `--dump-prompts`) remain top-level flags because they do not launch a persistent

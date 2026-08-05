@@ -24,11 +24,15 @@
 #![allow(dead_code)] // Rendering/input layers consume this in the next slice.
 #![allow(unused_imports)] // Re-exports below are the module's public surface.
 
+pub mod agent_mode;
+pub mod app;
 pub mod commands;
 pub mod render;
 pub mod state;
 pub mod terminal;
 
+pub use agent_mode::{resolve_agent_mode, AgentMode};
+pub use app::{run as run_tui, TuiOptions};
 pub use commands::{approval_from_key, parse_command, UiCommand};
 pub use render::render;
 pub use state::{ApplyOutcome, ViewLine, ViewState};

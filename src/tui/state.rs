@@ -125,6 +125,24 @@ impl ViewState {
         self.pending_approvals.first()
     }
 
+    /// Clear local conversation/tool presentation after `/clear`.
+    ///
+    /// Session identity, runtime options, usage, and sequence ordering remain
+    /// intact; the backing [`AgentSession`] clears its model history separately.
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.tool_calls.clear();
+    }
+
+    /// Append a committed frontend-local notice without changing session
+    /// sequencing. Slash-command help and validation use this for information
+    /// that is intentionally not sent to the model or daemon.
+    pub fn push_system_message(&mut self, text: impl Into<String>) {
+        self.close_open_line();
+        self.transcript
+            .push(ViewLine::committed(TranscriptRole::System, text.into()));
+    }
+
     // ---- snapshot application (attach / reconnect) -----------------------
 
     /// Replace the entire view with a canonical daemon snapshot.
@@ -344,6 +362,25 @@ mod tests {
         // User line + one assistant line, no system note on clean completion.
         assert_eq!(s.transcript().len(), 2);
         assert_eq!(s.transcript()[0].role, TranscriptRole::User);
+    }
+
+    #[test]
+    fn local_system_message_preserves_sequence_and_closes_stream() {
+        let mut state = ViewState::new("sess-1");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::AssistantDelta {
+                text: "partial".into(),
+            },
+        );
+
+        state.push_system_message("help");
+
+        assert_eq!(state.last_seq(), 1);
+        assert!(!state.transcript()[0].open);
+        assert_eq!(state.transcript()[1].role, TranscriptRole::System);
+        assert_eq!(state.transcript()[1].text, "help");
     }
 
     #[test]

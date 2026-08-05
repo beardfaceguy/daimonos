@@ -43,3 +43,39 @@ def test_help_lists_normalized_runtime_subcommands(daimonos_binary):
     )
     assert "mcp " in completed.stdout
     assert "daemon " in completed.stdout
+
+
+def test_agent_help_lists_explicit_interactive_and_print_modes(daimonos_binary):
+    completed = subprocess.run(
+        [daimonos_binary, "agent", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+
+    assert "--interactive" in completed.stdout
+    assert "--print" in completed.stdout
+
+
+def test_interactive_without_tty_falls_back_before_loading_agent_env(
+    daimonos_binary, tmp_path
+):
+    completed = subprocess.run(
+        [
+            daimonos_binary,
+            "--workspace",
+            str(tmp_path),
+            "agent",
+            "--interactive",
+            "--agent-env",
+            str(tmp_path / "missing.env"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode != 0
+    assert "agent task is required in print mode" in completed.stderr
+    assert "agent config" not in completed.stderr

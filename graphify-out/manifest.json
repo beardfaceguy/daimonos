@@ -90,7 +90,7 @@
     "semantic_hash": "8bb667d2550fbfe674ea3a0a2169ef6e"
   },
   "benchmarks/tasks/07-snapshot-rollback.json": {
-    "mtime": 1785879377.2895873,
+    "mtime": 1785896165.3682995,
     "ast_hash": "e53949a8f5f9dca45e13fb481a61f3ef",
     "semantic_hash": ""
   },
@@ -105,14 +105,14 @@
     "semantic_hash": "168d3abf2039892d0ed4658f64077aa0"
   },
   "benchmarks/tasks/10-exec-build-check.json": {
-    "mtime": 1783364996.014342,
-    "ast_hash": "34d0a1ef06955f1fbcb8e760ab68022b",
-    "semantic_hash": "34d0a1ef06955f1fbcb8e760ab68022b"
+    "mtime": 1785896165.3692997,
+    "ast_hash": "530b2cdc7b796480e06640fcb3a2ea14",
+    "semantic_hash": ""
   },
   "benchmarks/tasks/11-exec-multi-command.json": {
-    "mtime": 1783364996.014934,
-    "ast_hash": "a029a3bb8358dcce070d8a2791acd2da",
-    "semantic_hash": "a029a3bb8358dcce070d8a2791acd2da"
+    "mtime": 1785896165.3692997,
+    "ast_hash": "a31d0ec828fdcba76b853083c960383a",
+    "semantic_hash": ""
   },
   "distro/alpine-legacy/build.sh": {
     "mtime": 1779353632.6903975,
@@ -410,8 +410,8 @@
     "semantic_hash": ""
   },
   "src/providers/anthropic.rs": {
-    "mtime": 1785775407.1570706,
-    "ast_hash": "fc4095dff315b15b9444e3c4544394f2",
+    "mtime": 1785888890.967889,
+    "ast_hash": "8d2feb3edef2728ec5e108ea090a3c6d",
     "semantic_hash": ""
   },
   "src/providers/mod.rs": {
@@ -885,23 +885,23 @@
     "semantic_hash": ""
   },
   "src/cli.rs": {
-    "mtime": 1784656761.641541,
-    "ast_hash": "619b54cd0594de5fdbfbec7ade26289a",
+    "mtime": 1785901791.0086658,
+    "ast_hash": "eee7d0a0ee61c12a0dbb99ce300e7453",
     "semantic_hash": ""
   },
   "tests/test_cli_modes.py": {
-    "mtime": 1784656761.641541,
-    "ast_hash": "91cd93555e448733fbb70f6900e8318c",
+    "mtime": 1785902095.2632337,
+    "ast_hash": "d3c7f341dd80794e0cfa4b9e02e50845",
     "semantic_hash": ""
   },
   "docs/runtime-modes.md": {
-    "mtime": 1784656761.6125412,
-    "ast_hash": "f382ee9d015047ed23a285357ab441fd",
+    "mtime": 1785902747.6038802,
+    "ast_hash": "2435bee8332823c68dceafc987c41d61",
     "semantic_hash": ""
   },
   "src/agent_runtime.rs": {
-    "mtime": 1785775407.1570706,
-    "ast_hash": "21ff376a5c7f0a56969350d90e7c7861",
+    "mtime": 1785902105.7491155,
+    "ast_hash": "a5cefebe82a37fbee69688f72aadd18e",
     "semantic_hash": ""
   },
   "src/observability.rs": {
@@ -995,8 +995,8 @@
     "semantic_hash": ""
   },
   "benchmarks/bench-agent.sh": {
-    "mtime": 1785879360.7529206,
-    "ast_hash": "e759b1232f22b1ce20846ea4fb75cdf5",
+    "mtime": 1785896165.3672996,
+    "ast_hash": "71f1eec22fd765e42b4372adc771b9e6",
     "semantic_hash": ""
   },
   "benchmarks/bench-cursor.sh": {
@@ -1060,8 +1060,8 @@
     "semantic_hash": ""
   },
   "benchmarks/results/optimization-lineage.md": {
-    "mtime": 1785814043.1404808,
-    "ast_hash": "ea66ec0eb3c285993db096b27fe931fa",
+    "mtime": 1785896165.3682995,
+    "ast_hash": "1e9fafcc498fc1daf0680327f8138127",
     "semantic_hash": ""
   },
   "benchmarks/benchmark_db.py": {
@@ -1120,18 +1120,18 @@
     "semantic_hash": ""
   },
   "src/tui/mod.rs": {
-    "mtime": 1785876016.1880233,
-    "ast_hash": "249f4ebf0f094ca257f79025d289b607",
+    "mtime": 1785901970.6456394,
+    "ast_hash": "fdf0f28c344257032ae300901ed30f24",
     "semantic_hash": ""
   },
   "src/tui/state.rs": {
-    "mtime": 1785876743.825917,
-    "ast_hash": "97e3e9e6f868f87baf85ceebb9b570b4",
+    "mtime": 1785902334.0055406,
+    "ast_hash": "75fe0bb5df676fc4c46f8f01c2c2bb35",
     "semantic_hash": ""
   },
   "docs/adr/011-interactive-terminal-ui.md": {
-    "mtime": 1785875043.8978772,
-    "ast_hash": "2c65fa838826999436830a551cc7186d",
+    "mtime": 1785902213.8818958,
+    "ast_hash": "52b10f81204a7c586463faa21c876cc2",
     "semantic_hash": ""
   },
   "src/tui/render.rs": {
@@ -1150,13 +1150,18 @@
     "semantic_hash": ""
   },
   "src/tui/agent_mode.rs": {
-    "mtime": 1785877738.2868633,
-    "ast_hash": "420916e16ec2885965509531dc8b8ce7",
+    "mtime": 1785902002.2042835,
+    "ast_hash": "342e4e37a197de7eabb722ed048feabb",
     "semantic_hash": ""
   },
   "benchmarks/results/2026-08-04-correctness-gate-audit.md": {
-    "mtime": 1785879436.040095,
-    "ast_hash": "9c2156303fcc998ab65434749f2a7c72",
+    "mtime": 1785896165.3672996,
+    "ast_hash": "ecd2a996d12a893526d1762fd634da26",
+    "semantic_hash": ""
+  },
+  "src/tui/app.rs": {
+    "mtime": 1785902334.0015407,
+    "ast_hash": "c7562a3f724b9240a6cb47b11014daf3",
     "semantic_hash": ""
   }
 }
