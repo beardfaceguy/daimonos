@@ -338,6 +338,20 @@ impl SessionCore {
         }
     }
 
+    /// Resolve every approval and canonical tool call whose normal completion
+    /// path was dropped with a cancelled prompt or retry.
+    pub fn cleanup_cancelled_turn(&self) {
+        for resolution in self.approvals.cancel_all("session_cancelled") {
+            self.tool_lifecycle.apply_approval_side_effects(&resolution);
+            let _ = self.events.emit(SessionEvent::ApprovalResolved {
+                approval_id: resolution.approval_id,
+                decision: resolution.decision,
+                resolved_by: resolution.resolved_by,
+            });
+        }
+        self.tool_lifecycle.cancel_all();
+    }
+
     /// Execute one provider/tool turn without depending on any frontend
     /// transport. Adapters supply only presentation cleanup and the canonical
     /// terminal-outcome mapping; all state, cancellation, persistence, usage,
@@ -393,14 +407,7 @@ impl SessionCore {
         if turn.is_some() {
             active_turn.mark_completed();
         } else {
-            for resolution in self.approvals.cancel_all("session_cancelled") {
-                let _ = self.events.emit(SessionEvent::ApprovalResolved {
-                    approval_id: resolution.approval_id,
-                    decision: resolution.decision,
-                    resolved_by: resolution.resolved_by,
-                });
-            }
-            self.tool_lifecycle.cancel_all();
+            self.cleanup_cancelled_turn();
             on_cancel();
         }
         if turn.is_some() {
@@ -456,7 +463,7 @@ impl SessionCore {
     }
 }
 
-fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
+pub(crate) fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
     if ids.len() > user_turn_count {
         let excess = ids.len() - user_turn_count;
         ids.drain(..excess);
@@ -669,6 +676,7 @@ impl Drop for ActiveTurn<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalResolution {
     pub approval_id: String,
+    pub tool: String,
     pub decision: ApprovalDecision,
     pub resolved_by: String,
 }
@@ -694,6 +702,10 @@ struct PendingApproval {
 #[derive(Default)]
 struct ApprovalState {
     pending: HashMap<String, PendingApproval>,
+    /// Resolutions removed from `pending` but not yet claimed for canonical
+    /// event emission. The waiting prompt and cancellation cleanup race to
+    /// take each entry, guaranteeing exactly one `ApprovalResolved` event.
+    unemitted: HashMap<String, ApprovalResolution>,
     next_id: u64,
 }
 
@@ -784,9 +796,13 @@ impl ApprovalBroker {
         };
         let resolution = ApprovalResolution {
             approval_id: approval_id.to_string(),
+            tool: pending.request.tool.clone(),
             decision,
             resolved_by: resolved_by.to_string(),
         };
+        state
+            .unemitted
+            .insert(approval_id.to_string(), resolution.clone());
         let _ = pending.sender.send(resolution.clone());
         Ok(resolution)
     }
@@ -802,13 +818,24 @@ impl ApprovalBroker {
         for (approval_id, pending) in pending {
             let resolution = ApprovalResolution {
                 approval_id,
+                tool: pending.request.tool,
                 decision: ApprovalDecision::Deny,
                 resolved_by: resolved_by.to_string(),
             };
             let _ = pending.sender.send(resolution.clone());
             resolutions.push(resolution);
         }
+        resolutions.extend(state.unemitted.drain().map(|(_, resolution)| resolution));
+        resolutions.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
         resolutions
+    }
+
+    fn take_unemitted(&self, approval_id: &str) -> Option<ApprovalResolution> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unemitted
+            .remove(approval_id)
     }
 }
 
@@ -860,11 +887,13 @@ pub async fn request_approval(
         });
         ApprovalRequestError::BrokerClosed
     })?;
-    let _ = events.emit(SessionEvent::ApprovalResolved {
-        approval_id: resolution.approval_id.clone(),
-        decision: resolution.decision,
-        resolved_by: resolution.resolved_by.clone(),
-    });
+    if let Some(unemitted) = broker.take_unemitted(&approval_id) {
+        let _ = events.emit(SessionEvent::ApprovalResolved {
+            approval_id: unemitted.approval_id,
+            decision: unemitted.decision,
+            resolved_by: unemitted.resolved_by,
+        });
+    }
     let _ = events.emit(SessionEvent::TurnStatusChanged {
         status: TurnStatus::Running,
     });
@@ -883,6 +912,7 @@ fn deny_failed_approval(
         &[ClientCapability::ApproveOnce],
         ApprovalDecision::Deny,
     );
+    let _ = broker.take_unemitted(approval_id);
     let _ = events.emit(SessionEvent::TurnStatusChanged {
         status: TurnStatus::Running,
     });
@@ -939,7 +969,7 @@ impl CanonicalToolLifecycle {
             active.insert(info.id.clone());
         }
 
-        let title = canonical_tool_title(info);
+        let title = tool_call_title(info);
         let _ = self.events.emit(SessionEvent::ToolCallStarted {
             id: info.id.clone(),
             name: info.name.clone(),
@@ -963,10 +993,9 @@ impl CanonicalToolLifecycle {
                             self.safety.remember_always(&info.name);
                             crate::agent::BeforeHookResult::Allow
                         }
-                        ApprovalDecision::Deny => crate::agent::BeforeHookResult::Block(format!(
-                            "permission denied for '{}'",
-                            info.name
-                        )),
+                        ApprovalDecision::Deny => crate::agent::BeforeHookResult::Block(
+                            approval_denial_reason(&info.name, &resolution),
+                        ),
                     },
                     Err(_) => crate::agent::BeforeHookResult::Block(format!(
                         "permission broker unavailable for '{}'",
@@ -1014,7 +1043,7 @@ impl CanonicalToolLifecycle {
         true
     }
 
-    pub fn cancel_all(&self) -> Vec<String> {
+    pub fn cancel_all(&self) {
         let mut ids: Vec<String> = self
             .active
             .lock()
@@ -1033,23 +1062,29 @@ impl CanonicalToolLifecycle {
                 output: "cancelled".to_string(),
             });
         }
-        ids
     }
 
-    pub fn active_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        ids.sort();
-        ids
+    fn apply_approval_side_effects(&self, resolution: &ApprovalResolution) {
+        if resolution.decision == ApprovalDecision::AllowAlways {
+            self.safety.remember_always(&resolution.tool);
+        }
     }
 }
 
-fn canonical_tool_title(info: &crate::agent::ToolCallInfo) -> String {
+fn approval_denial_reason(tool: &str, resolution: &ApprovalResolution) -> String {
+    match resolution.resolved_by.as_str() {
+        "acp_cancelled" => format!("permission request cancelled for '{tool}'"),
+        "acp_unrecognized" => format!("unrecognized permission outcome for '{tool}'"),
+        "acp_request_failed" | "acp_unavailable" | "acp_spawn_failed" => {
+            format!("permission request failed for '{tool}'")
+        }
+        "broker_closed" => format!("permission broker closed for '{tool}'"),
+        "resolution_failed" => format!("permission resolution failed for '{tool}'"),
+        _ => format!("permission denied for '{tool}'"),
+    }
+}
+
+pub(crate) fn tool_call_title(info: &crate::agent::ToolCallInfo) -> String {
     if info.name == "exec" {
         info.input
             .get("command")
@@ -1137,6 +1172,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_but_unemitted_approval_is_claimed_by_cancellation_once() {
+        let broker = ApprovalBroker::new(true);
+        let registered = broker.register(request()).unwrap();
+        let resolution = broker
+            .resolve(
+                &registered.request.id,
+                "acp_local",
+                &[ClientCapability::ApproveAlways],
+                ApprovalDecision::AllowAlways,
+            )
+            .unwrap();
+
+        assert_eq!(
+            broker.cancel_all("session_cancelled"),
+            vec![resolution.clone()],
+            "cancellation must recover a resolution whose waiter was dropped"
+        );
+        assert!(broker.cancel_all("session_cancelled").is_empty());
+        assert_eq!(registered.receiver.await.unwrap(), resolution);
+    }
+
+    #[test]
+    fn recovered_allow_always_resolution_preserves_safety_side_effect() {
+        let safety = std::sync::Arc::new(crate::safety::SafetyPolicy {
+            approval_mode: crate::safety::ApprovalMode::Interactive,
+            ..crate::safety::SafetyPolicy::default()
+        });
+        assert!(matches!(
+            safety.gate("exec"),
+            crate::safety::Gate::NeedsApproval
+        ));
+        let lifecycle = CanonicalToolLifecycle::new(
+            std::sync::Arc::new(SessionEventRouter::default()),
+            std::sync::Arc::new(ApprovalBroker::new(true)),
+            std::sync::Arc::clone(&safety),
+            1,
+        );
+        lifecycle.apply_approval_side_effects(&ApprovalResolution {
+            approval_id: "approval-1".to_string(),
+            tool: "exec".to_string(),
+            decision: ApprovalDecision::AllowAlways,
+            resolved_by: "acp_local".to_string(),
+        });
+        assert!(matches!(safety.gate("exec"), crate::safety::Gate::Allow));
+    }
+
+    #[test]
+    fn approval_denial_reason_preserves_transport_failures() {
+        let reason = approval_denial_reason(
+            "exec",
+            &ApprovalResolution {
+                approval_id: "approval-1".to_string(),
+                tool: "exec".to_string(),
+                decision: ApprovalDecision::Deny,
+                resolved_by: "acp_request_failed".to_string(),
+            },
+        );
+        assert_eq!(reason, "permission request failed for 'exec'");
+        assert_eq!(
+            approval_denial_reason(
+                "exec",
+                &ApprovalResolution {
+                    approval_id: "approval-2".to_string(),
+                    tool: "exec".to_string(),
+                    decision: ApprovalDecision::Deny,
+                    resolved_by: "acp_cancelled".to_string(),
+                },
+            ),
+            "permission request cancelled for 'exec'"
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_approval_waits_for_transport_independent_broker_resolution() {
         let broker = std::sync::Arc::new(ApprovalBroker::new(false));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1212,7 +1320,6 @@ mod tests {
         ));
         assert!(lifecycle.finish(&info, "contents", false));
         assert!(!lifecycle.finish(&info, "duplicate", false));
-        assert!(lifecycle.active_ids().is_empty());
 
         let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(matches!(
@@ -1233,6 +1340,43 @@ mod tests {
                 && finished_id == "tool-1"
                 && output == "contents"
         ));
+    }
+
+    #[tokio::test]
+    async fn canonical_tool_lifecycle_enforces_duplicate_and_capacity_bounds() {
+        let events = std::sync::Arc::new(SessionEventRouter::default());
+        let lifecycle = CanonicalToolLifecycle::new(
+            events,
+            std::sync::Arc::new(ApprovalBroker::new(false)),
+            std::sync::Arc::new(crate::safety::SafetyPolicy::default()),
+            1,
+        );
+        let first = crate::agent::ToolCallInfo {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "README.md"}),
+        };
+        let second = crate::agent::ToolCallInfo {
+            id: "tool-2".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "AGENTS.md"}),
+        };
+
+        assert!(matches!(
+            lifecycle.before(&first).await,
+            crate::agent::BeforeHookResult::Allow
+        ));
+        assert!(matches!(
+            lifecycle.before(&first).await,
+            crate::agent::BeforeHookResult::Block(reason)
+                if reason.contains("already active")
+        ));
+        assert!(matches!(
+            lifecycle.before(&second).await,
+            crate::agent::BeforeHookResult::Block(reason)
+                if reason.contains("active tool-call limit")
+        ));
+        assert!(lifecycle.finish(&first, "done", false));
     }
 
     #[tokio::test]

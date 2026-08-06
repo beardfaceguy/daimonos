@@ -302,6 +302,20 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `[session]` — Daemon-owned agent sessions
+
+These limits apply to transport-independent agent sessions shared by ACP,
+the local TUI/UDS client, and future remote clients.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_active_tool_calls` | `16` | Maximum in-flight tool calls tracked by one session. Must be greater than zero. |
+
+```toml
+[session]
+max_active_tool_calls = 16
+```
+
 ### `[tui]` — Interactive terminal frontend
 
 These limits apply to `daimonos agent --interactive`. History is process-local

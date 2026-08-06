@@ -59,8 +59,9 @@ use crate::providers::{
 };
 use crate::session::Session;
 use crate::session_core::{
-    ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventHandler,
-    SessionEventRouter, SessionPersistence, SessionPromptError, SessionPromptOutcome, TurnError,
+    align_client_user_message_ids, tool_call_title, ApprovalBroker, CanonicalToolLifecycle,
+    SessionCompaction, SessionCore, SessionEventHandler, SessionEventRouter, SessionPersistence,
+    SessionPromptError, SessionPromptOutcome, TurnError,
 };
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
@@ -75,7 +76,13 @@ use crate::tool_facade;
 /// `ToolCallUpdate` path consults this set so cancellation, replay anomalies,
 /// or a late progress callback cannot update an id the client does not know
 /// (or resurrect a call that already reached a terminal state).
-type ActiveToolCalls = Arc<StdMutex<HashMap<String, bool>>>;
+#[derive(Clone)]
+struct ActiveToolCall {
+    terminal_output: bool,
+    raw_input: serde_json::Value,
+}
+
+type ActiveToolCalls = Arc<StdMutex<HashMap<String, ActiveToolCall>>>;
 
 /// ACP presentation hooks read the current client connection for rich
 /// notifications. Canonical tool and approval lifecycles no longer require
@@ -842,18 +849,6 @@ fn terminal_info_meta(workspace: &Path, info: &ToolCallInfo) -> Option<Meta> {
     })
 }
 
-fn tool_call_title(info: &ToolCallInfo) -> String {
-    if info.name == "exec" {
-        info.input
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| info.name.clone())
-    } else {
-        info.name.clone()
-    }
-}
-
 fn terminal_exit_meta(info: &ToolCallInfo, code: Option<i32>, signal: Option<String>) -> Meta {
     Meta::from_iter([(
         "terminal_exit".to_string(),
@@ -914,7 +909,7 @@ fn cancel_active_tool_calls(
         .iter()
         .map(|(tool_call_id, _)| tool_call_id.clone())
         .collect::<Vec<_>>();
-    for (tool_call_id, terminal_output) in active {
+    for (tool_call_id, active_call) in active {
         let fields = ToolCallUpdateFields::new()
             .status(Some(ToolCallStatus::Failed))
             .content(Some(vec![AcpContentBlock::Text(TextContent::new(
@@ -923,7 +918,7 @@ fn cancel_active_tool_calls(
             .into()]))
             .raw_output(Some(serde_json::json!({ "cancelled": true })));
         let mut update = ToolCallUpdate::new(tool_call_id.clone(), fields);
-        if terminal_output {
+        if active_call.terminal_output {
             update = update.meta(Meta::from_iter([(
                 "terminal_exit".to_string(),
                 serde_json::json!({
@@ -945,14 +940,7 @@ fn cleanup_cancelled_turn(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
 ) {
-    for resolution in handle.core.approvals.cancel_all("session_cancelled") {
-        let _ = handle.core.events.emit(CoreSessionEvent::ApprovalResolved {
-            approval_id: resolution.approval_id,
-            decision: resolution.decision,
-            resolved_by: resolution.resolved_by,
-        });
-    }
-    handle.core.tool_lifecycle.cancel_all();
+    handle.core.cleanup_cancelled_turn();
     cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
 }
 
@@ -1054,7 +1042,13 @@ fn build_before_tool_call_hook(
                 active_tool_calls
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(info.id.clone(), terminal_output && info.name == "exec");
+                    .insert(
+                        info.id.clone(),
+                        ActiveToolCall {
+                            terminal_output: terminal_output && info.name == "exec",
+                            raw_input: info.input.clone(),
+                        },
+                    );
             }
 
             let decision = tool_lifecycle.before(info).await;
@@ -1096,18 +1090,16 @@ fn build_before_tool_call_hook(
                 update = update.meta(terminal_exit_meta(info, None, Some("blocked".to_string())));
             }
             let blocked = matches!(decision, BeforeHookResult::Block(_));
-            let sent = match cx.as_ref() {
-                Some(cx) => send_active_tool_call_update(
+            if let Some(cx) = cx.as_ref() {
+                send_active_tool_call_update(
                     cx,
                     &session_id,
                     &active_tool_calls,
                     &info.id,
                     update,
                     blocked,
-                ),
-                None => false,
-            };
-            let _ = sent;
+                );
+            }
 
             decision
         })
@@ -1185,6 +1177,7 @@ fn route_acp_approval_request(
     cx: Option<ConnectionTo<AcpClientRole>>,
     session_id: SessionId,
     approvals: Arc<ApprovalBroker>,
+    active_tool_calls: ActiveToolCalls,
     request: CoreApprovalRequest,
 ) {
     let local_capabilities = [
@@ -1218,9 +1211,17 @@ fn route_acp_approval_request(
         "Reject",
         PermissionOptionKind::RejectOnce,
     ));
+    let raw_input = active_tool_calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&request.tool_call_id)
+        .map(|active| active.raw_input.clone());
     let acp_request = RequestPermissionRequest::new(
         session_id,
-        ToolCallUpdate::new(request.tool_call_id.clone(), ToolCallUpdateFields::new()),
+        ToolCallUpdate::new(
+            request.tool_call_id.clone(),
+            ToolCallUpdateFields::new().raw_input(raw_input),
+        ),
         options,
     );
     let approval_id = request.id;
@@ -1228,7 +1229,7 @@ fn route_acp_approval_request(
     let request_connection = cx.clone();
     let approvals_for_task = Arc::clone(&approvals);
     let spawn = cx.spawn(async move {
-        let decision = match request_connection
+        let (decision, resolved_by) = match request_connection
             .send_request(acp_request)
             .block_task()
             .await
@@ -1236,19 +1237,21 @@ fn route_acp_approval_request(
             Ok(response) => match response.outcome {
                 RequestPermissionOutcome::Selected(selected) => {
                     match selected.option_id.to_string().as_str() {
-                        "allow_once" => CoreApprovalDecision::AllowOnce,
-                        "allow_always" => CoreApprovalDecision::AllowAlways,
-                        _ => CoreApprovalDecision::Deny,
+                        "allow_once" => (CoreApprovalDecision::AllowOnce, "acp_local"),
+                        "allow_always" => (CoreApprovalDecision::AllowAlways, "acp_local"),
+                        _ => (CoreApprovalDecision::Deny, "acp_unrecognized"),
                     }
                 }
-                RequestPermissionOutcome::Cancelled => CoreApprovalDecision::Deny,
-                _ => CoreApprovalDecision::Deny,
+                RequestPermissionOutcome::Cancelled => {
+                    (CoreApprovalDecision::Deny, "acp_cancelled")
+                }
+                _ => (CoreApprovalDecision::Deny, "acp_unrecognized"),
             },
-            Err(_) => CoreApprovalDecision::Deny,
+            Err(_) => (CoreApprovalDecision::Deny, "acp_request_failed"),
         };
         let _ = approvals_for_task.resolve(
             &task_approval_id,
-            "acp_local",
+            resolved_by,
             &local_capabilities,
             decision,
         );
@@ -1268,6 +1271,7 @@ fn build_acp_event_handler(
     connection: CurrentConnection,
     session_id: SessionId,
     approvals: Arc<ApprovalBroker>,
+    active_tool_calls: ActiveToolCalls,
 ) -> SessionEventHandler {
     Arc::new(move |_sequence, event| {
         if let CoreSessionEvent::ApprovalRequested { request } = event {
@@ -1275,6 +1279,7 @@ fn build_acp_event_handler(
                 current_cx(&connection),
                 session_id.clone(),
                 Arc::clone(&approvals),
+                Arc::clone(&active_tool_calls),
                 request,
             );
             return;
@@ -1940,17 +1945,6 @@ fn message_has_images(message: &CoreMessage) -> bool {
         .any(|block| matches!(block, CoreBlock::Image { .. }))
 }
 
-fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
-    if ids.len() > user_turn_count {
-        let excess = ids.len() - user_turn_count;
-        ids.drain(..excess);
-    } else if ids.len() < user_turn_count {
-        let mut padding = vec![String::new(); user_turn_count - ids.len()];
-        padding.append(ids);
-        *ids = padding;
-    }
-}
-
 async fn run_acp_direct_command(
     handle: &SessionHandle,
     cx: &ConnectionTo<AcpClientRole>,
@@ -2329,12 +2323,13 @@ async fn build_session_handle(
         Arc::clone(&connection),
         session_id.clone(),
         Arc::clone(&approvals),
+        Arc::clone(&active_tool_calls),
     ))));
     let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
         Arc::clone(&events),
         Arc::clone(&approvals),
         safety,
-        cfg.process.max_cache_entries,
+        cfg.session.max_active_tool_calls,
     ));
     let config = build_agent_config(
         &session_workspace,
@@ -5699,6 +5694,11 @@ mod tests {
                 async move |request: agent_client_protocol::schema::v1::RequestPermissionRequest,
                              responder,
                              _cx| {
+                    assert_eq!(
+                        request.tool_call.fields.raw_input,
+                        Some(serde_json::json!({"command": "echo hi"})),
+                        "permission request must show the exact tool input"
+                    );
                     let option_id = request.options.first().map(|o| o.option_id.clone()).unwrap();
                     responder.respond(agent_client_protocol::schema::v1::RequestPermissionResponse::new(
                         RequestPermissionOutcome::Selected(
@@ -8198,7 +8198,13 @@ mod tests {
         assert!(!tool_call_update_is_live(&active, "t1", false));
         assert!(!tool_call_update_is_live(&active, "t1", true));
 
-        active.lock().unwrap().insert("t1".to_string(), false);
+        active.lock().unwrap().insert(
+            "t1".to_string(),
+            ActiveToolCall {
+                terminal_output: false,
+                raw_input: serde_json::json!({}),
+            },
+        );
         assert!(tool_call_update_is_live(&active, "t1", false));
         assert!(tool_call_update_is_live(&active, "t1", true));
         assert!(!tool_call_update_is_live(&active, "t1", false));

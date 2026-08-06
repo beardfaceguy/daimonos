@@ -185,8 +185,8 @@
     "semantic_hash": "879485d74ef92aa7ca5a32f01c9a0445"
   },
   "src/acp_cmd.rs": {
-    "mtime": 1785979279.0465329,
-    "ast_hash": "74bf5be31c5e72660d2e3a38b333b98f",
+    "mtime": 1786046149.6498559,
+    "ast_hash": "1f4a255fe8f5098007e2175ee333fbdc",
     "semantic_hash": ""
   },
   "src/agent.rs": {
@@ -220,8 +220,8 @@
     "semantic_hash": ""
   },
   "src/config.rs": {
-    "mtime": 1785975663.3648357,
-    "ast_hash": "855dd765fd3a942b7eff625672c02f9f",
+    "mtime": 1786046149.6968553,
+    "ast_hash": "3f450c7aacb479cdf89b65a6dd14373b",
     "semantic_hash": ""
   },
   "src/index.rs": {
@@ -750,8 +750,8 @@
     "semantic_hash": ""
   },
   "docs/configuration.md": {
-    "mtime": 1785975663.326836,
-    "ast_hash": "b545e56ca8e9b3e19cdea328e8534b06",
+    "mtime": 1786045906.230329,
+    "ast_hash": "4e8f3baadc2ad7609392068514093113",
     "semantic_hash": ""
   },
   "docs/copilot-setup.md": {
@@ -985,8 +985,8 @@
     "semantic_hash": ""
   },
   "src/session_core.rs": {
-    "mtime": 1785978977.9377224,
-    "ast_hash": "ecec5ebbcc287095b6411d618ab9e2d5",
+    "mtime": 1786046333.3419938,
+    "ast_hash": "95fd5d323e9fc610de8cadf779a35564",
     "semantic_hash": ""
   },
   "benchmarks/analyze.py": {
