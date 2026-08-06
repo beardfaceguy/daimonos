@@ -79,7 +79,16 @@ use crate::tool_facade;
 #[derive(Clone)]
 struct ActiveToolCall {
     terminal_output: bool,
-    raw_input: serde_json::Value,
+    raw_input: Option<serde_json::Value>,
+}
+
+impl ActiveToolCall {
+    fn new(info: &ToolCallInfo, terminal_output: bool, retain_raw_input: bool) -> Self {
+        Self {
+            terminal_output,
+            raw_input: retain_raw_input.then(|| info.input.clone()),
+        }
+    }
 }
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<String, ActiveToolCall>>>;
@@ -1024,6 +1033,7 @@ fn build_before_tool_call_hook(
                 return BeforeHookResult::Block(reason);
             }
             let cx = current_cx(&connection);
+            let retain_raw_input = tool_lifecycle.approval_required(&info.name);
 
             let title = if terminal_output {
                 tool_call_title(info)
@@ -1048,10 +1058,11 @@ fn build_before_tool_call_hook(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(
                         info.id.clone(),
-                        ActiveToolCall {
-                            terminal_output: terminal_output && info.name == "exec",
-                            raw_input: info.input.clone(),
-                        },
+                        ActiveToolCall::new(
+                            info,
+                            terminal_output && info.name == "exec",
+                            retain_raw_input,
+                        ),
                     );
             }
 
@@ -1220,8 +1231,8 @@ fn route_acp_approval_request(
     let raw_input = active_tool_calls
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&request.tool_call_id)
-        .map(|active| active.raw_input.clone());
+        .get_mut(&request.tool_call_id)
+        .and_then(|active| active.raw_input.take());
     let acp_request = RequestPermissionRequest::new(
         session_id,
         ToolCallUpdate::new(
@@ -8100,7 +8111,7 @@ mod tests {
             info.id.clone(),
             ActiveToolCall {
                 terminal_output: false,
-                raw_input: info.input.clone(),
+                raw_input: Some(info.input.clone()),
             },
         );
 
@@ -8404,13 +8415,27 @@ mod tests {
             "t1".to_string(),
             ActiveToolCall {
                 terminal_output: false,
-                raw_input: serde_json::json!({}),
+                raw_input: Some(serde_json::json!({})),
             },
         );
         assert!(tool_call_update_is_live(&active, "t1", false));
         assert!(tool_call_update_is_live(&active, "t1", true));
         assert!(!tool_call_update_is_live(&active, "t1", false));
         assert!(!tool_call_update_is_live(&active, "t1", true));
+    }
+
+    #[test]
+    fn active_tool_call_retains_input_only_for_permission_request() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "large.txt", "content": "x".repeat(10_000)}),
+        };
+        assert!(ActiveToolCall::new(&info, false, false).raw_input.is_none());
+        assert_eq!(
+            ActiveToolCall::new(&info, false, true).raw_input,
+            Some(info.input)
+        );
     }
 
     /// Run one scripted tool call through the full ACP flow and return the

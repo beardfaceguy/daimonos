@@ -813,7 +813,7 @@ impl ApprovalBroker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pending: Vec<_> = state.pending.drain().collect();
-        pending.sort_by(|left, right| left.0.cmp(&right.0));
+        pending.sort_by_key(|(approval_id, _)| approval_sequence(approval_id));
         let mut resolutions = Vec::with_capacity(pending.len());
         for (approval_id, pending) in pending {
             let resolution = ApprovalResolution {
@@ -826,7 +826,7 @@ impl ApprovalBroker {
             resolutions.push(resolution);
         }
         resolutions.extend(state.unemitted.drain().map(|(_, resolution)| resolution));
-        resolutions.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
+        resolutions.sort_by_key(|resolution| approval_sequence(&resolution.approval_id));
         resolutions
     }
 
@@ -837,6 +837,13 @@ impl ApprovalBroker {
             .unemitted
             .remove(approval_id)
     }
+}
+
+fn approval_sequence(approval_id: &str) -> u64 {
+    approval_id
+        .strip_prefix("approval-")
+        .and_then(|sequence| sequence.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 impl Drop for ApprovalBroker {
@@ -955,6 +962,10 @@ impl CanonicalToolLifecycle {
         self.authorize_reserved(info).await
     }
 
+    pub(crate) fn approval_required(&self, tool: &str) -> bool {
+        matches!(self.safety.gate(tool), crate::safety::Gate::NeedsApproval)
+    }
+
     /// Atomically admit one tool call before any frontend announces it.
     /// Structural duplicate/capacity failures therefore stay absent from both
     /// canonical and adapter projections.
@@ -976,11 +987,10 @@ impl CanonicalToolLifecycle {
             active.insert(info.id.clone());
         }
 
-        let title = tool_call_title(info);
         let _ = self.events.emit(SessionEvent::ToolCallStarted {
             id: info.id.clone(),
             name: info.name.clone(),
-            title: title.clone(),
+            title: info.name.clone(),
             input_summary: None,
         });
         Ok(())
@@ -1395,6 +1405,61 @@ mod tests {
         assert!(lifecycle.finish(&first, "done", false));
     }
 
+    #[tokio::test]
+    async fn canonical_exec_title_is_safe_while_approval_detail_is_specific() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new(false));
+        let broker_for_handler = std::sync::Arc::clone(&broker);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |_seq, event| {
+                if let SessionEvent::ApprovalRequested { request } = &event {
+                    broker_for_handler
+                        .resolve(
+                            &request.id,
+                            "test_client",
+                            &[ClientCapability::ApproveOnce],
+                            ApprovalDecision::Deny,
+                        )
+                        .unwrap();
+                }
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let lifecycle = CanonicalToolLifecycle::new(
+            events,
+            broker,
+            std::sync::Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            1,
+        );
+        let info = crate::agent::ToolCallInfo {
+            id: "tool-1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({"command": "printf sensitive-value"}),
+        };
+
+        assert!(matches!(
+            lifecycle.before(&info).await,
+            crate::agent::BeforeHookResult::Block(_)
+        ));
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolCallStarted { title, .. } if title == "exec"
+        )));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            SessionEvent::ApprovalRequested { request }
+                if request.detail == "printf sensitive-value"
+        )));
+    }
+
     #[test]
     fn canonical_reservation_rejects_before_emitting_a_second_start() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1675,6 +1740,27 @@ mod tests {
         assert_eq!(
             second.receiver.await.unwrap().decision,
             ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn cancel_all_preserves_numeric_approval_order() {
+        let broker = ApprovalBroker::new(false);
+        for index in 1..=12 {
+            let mut request = request();
+            request.tool_call_id = format!("tool-{index}");
+            broker.register(request).unwrap();
+        }
+        let ids = broker
+            .cancel_all("session_cancelled")
+            .into_iter()
+            .map(|resolution| resolution.approval_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (1..=12)
+                .map(|index| format!("approval-{index}"))
+                .collect::<Vec<_>>()
         );
     }
 
