@@ -173,6 +173,13 @@ Approvals are reliable requests with exactly one terminal resolution. An
 The local TUI retains unconditional revoke and stop authority. One remote
 controller is allowed in v1; additional remote clients are deferred.
 
+Implementation invariant: a broker resolution remains un-emitted until either
+the waiting turn or cancellation cleanup atomically claims it, so an approval
+racing `session/cancel` produces exactly one canonical `ApprovalResolved`
+event. Transport-sensitive detail such as ACP `raw_input` remains in adapter
+state and is reattached to that transport's permission request rather than
+entering the shared remote projection.
+
 ### D6 — Client concurrency is explicit
 
 Only one turn may run per session. A prompt received while the session is busy

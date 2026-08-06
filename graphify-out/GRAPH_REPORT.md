@@ -1,16 +1,16 @@
 # Graph Report - daimonos-remote-connect  (2026-08-06)
 
 ## Corpus Check
-- 230 files · ~303,242 words
+- 230 files · ~303,296 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5928 nodes · 13868 edges · 256 communities (238 shown, 18 thin omitted)
+- 5928 nodes · 13868 edges · 257 communities (238 shown, 19 thin omitted)
 - Extraction: 99% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 68 edges (avg confidence: 0.72)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `7f98aca3`
+- Built from commit: `ccd150b3`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -260,6 +260,7 @@
 - [[_COMMUNITY_Community 253|Community 253]]
 - [[_COMMUNITY_Community 254|Community 254]]
 - [[_COMMUNITY_Community 255|Community 255]]
+- [[_COMMUNITY_Community 256|Community 256]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `session_in()` - 62 edges
@@ -307,7 +308,7 @@
 - 1-file cycle: `src/kgl/demo.rs -> src/kgl/demo.rs`
 - 1-file cycle: `src/kgl/observe.rs -> src/kgl/observe.rs`
 
-## Communities (256 total, 18 thin omitted)
+## Communities (257 total, 19 thin omitted)
 
 ### Community 0 - "Community 0"
 Cohesion: 0.15
@@ -326,8 +327,8 @@ Cohesion: 0.07
 Nodes (32): a_fresh_tracker_starts_idle_and_unoccupied(), bound_call_tool_result(), BoundResultStats, build_instructions(), build_instructions_detects_cargo(), build_instructions_detects_git(), build_instructions_includes_workspace(), build_instructions_lists_dirs() (+24 more)
 
 ### Community 4 - "Community 4"
-Cohesion: 0.09
-Nodes (22): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+14 more)
+Cohesion: 0.10
+Nodes (17): acp_mcp_defaults_are_enabled_and_valid(), default_config_values(), default_verbosity_is_full(), discord_validation_rejects_invalid_allowlist_ids(), discord_validation_rejects_invalid_api_base_url(), discord_validation_rejects_zero_rate_limit_sleep_cap(), discord_validation_requires_token_when_enabled(), effective_full_tool_schemas_env_overrides_config() (+9 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.11
@@ -734,8 +735,8 @@ Cohesion: 0.39
 Nodes (7): fmt(), gated(), load_summaries(), main(), model_of(), Yield per-task summary dicts from run dirs, optionally filtered by tag., Counts toward aggregates unless it errored or its checks failed.
 
 ### Community 107 - "Community 107"
-Cohesion: 0.08
-Nodes (25): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig, SearchConfig, SessionRuntimeConfig, Config (+17 more)
+Cohesion: 0.09
+Nodes (23): AcpConfig, AnalyticsConfig, McpConfig, ProcessConfig, PromptsConfig, SearchConfig, SessionRuntimeConfig, Config (+15 more)
 
 ### Community 108 - "Community 108"
 Cohesion: 0.22
@@ -946,8 +947,8 @@ Cohesion: 0.09
 Nodes (27): ExporterBuildError, SdkTracerProvider, basic_auth_credentials_reject_ambiguous_non_ascii(), basic_auth_credentials_reject_control_characters(), basic_auth_username_rejects_colon(), basic_authorization_header(), build_exporter(), CoordinationOutcome (+19 more)
 
 ### Community 179 - "Community 179"
-Cohesion: 0.17
-Nodes (5): CoordinationNotificationsConfig, AnalyticsConfig, CoordinationConfig, dirs_next(), PathBuf
+Cohesion: 0.18
+Nodes (10): AnalyticsConfig, dirs_next(), load(), load_falls_back_to_defaults(), load_from_explicit_path(), load_from_workspace_file(), Path, PathBuf (+2 more)
 
 ### Community 181 - "Community 181"
 Cohesion: 0.09
@@ -1228,7 +1229,7 @@ Nodes (3): AcpPlan, AgentPlanEntry, to_acp_plan()
 ## Knowledge Gaps
 - **965 isolated node(s):** `bench-ab.sh script`, `bench-tool-output.sh script`, `Path`, `build.sh script`, `setup.sh script` (+960 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **18 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **19 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_

@@ -980,8 +980,8 @@
     "semantic_hash": ""
   },
   "docs/adr/010-session-daemon-remote-control.md": {
-    "mtime": 1785975663.3258362,
-    "ast_hash": "60fa66640f7244e3ade8c64eef93a0de",
+    "mtime": 1786047026.1839707,
+    "ast_hash": "d4a1ac0dcf25704b4f6b5527da418c35",
     "semantic_hash": ""
   },
   "src/session_core.rs": {
