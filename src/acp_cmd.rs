@@ -84,11 +84,11 @@ struct ActiveToolCall {
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<String, ActiveToolCall>>>;
 
-/// ACP presentation hooks read the current client connection for rich
-/// notifications. Canonical tool and approval lifecycles no longer require
-/// this handle; the ACP adapter observes their events and uses the fresh
-/// connection to present them. It is refreshed at the top of each prompt
-/// because ACP request responses are scoped to the current dispatch.
+/// ACP presentation hooks read the live client connection for rich
+/// notifications. In agent-client-protocol 1.2 every handler receives a clone
+/// of the same underlying connection; request UUIDs and oneshot channels route
+/// responses independently of the handler dispatch that supplied the clone.
+/// Canonical tool and approval lifecycles do not depend on this adapter handle.
 type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 
 /// The ACP JSON-RPC input descriptor. Named rather than inlined because it is
@@ -3316,10 +3316,17 @@ fn build_agent_with_state(
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clone();
-                                    let (turn_index, tools_exposed) = {
-                                        let session = handle.core.session.lock().await;
-                                        (session.user_turn_count(), session.tool_count())
-                                    };
+                                    // Observability must not wait behind the
+                                    // active turn's long-held session lock: the
+                                    // prompt path owns the atomic Busy check.
+                                    let (turn_index, tools_exposed) = handle
+                                        .core
+                                        .session
+                                        .try_lock()
+                                        .map(|session| {
+                                            (session.user_turn_count(), session.tool_count())
+                                        })
+                                        .unwrap_or((0, 0));
                                     let session_key = session_id.to_string();
                                     let prompt_span = PromptSpan::new(PromptMetadata {
                                         mode: "acp",
@@ -4073,6 +4080,12 @@ mod tests {
         responses: StdMutex<VecDeque<crate::providers::LlmResponse>>,
     }
 
+    struct GatedToolProvider {
+        calls: StdMutex<usize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
     struct ErrorReader;
 
     impl AsyncRead for ErrorReader {
@@ -4136,6 +4149,40 @@ mod tests {
                 }
             }
             response
+        }
+
+        async fn context_window(&self, _model: &str) -> Option<u64> {
+            Some(200_000)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for GatedToolProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            _opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            let call = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let call = *calls;
+                *calls += 1;
+                call
+            };
+            if call == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+                tool_call_resp(
+                    "gated-tool",
+                    "exec",
+                    serde_json::json!({"command": "printf approved"}),
+                )
+            } else {
+                end_turn_resp("done")
+            }
         }
 
         async fn context_window(&self, _model: &str) -> Option<u64> {
@@ -5246,6 +5293,108 @@ mod tests {
 
         assert_eq!(stop_a, AcpStopReason::EndTurn);
         assert_eq!(stop_b, AcpStopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn busy_prompt_does_not_break_active_turn_permission_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let make_provider: ProviderFactory = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                Ok(Box::new(GatedToolProvider {
+                    calls: StdMutex::new(0),
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }) as Box<dyn LlmProvider>)
+            })
+        };
+        let agent = build_agent(
+            make_provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let permission_seen = Arc::new(AtomicBool::new(false));
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.store(true, Ordering::Release);
+                    let option_id = request.options.first().unwrap().option_id.clone();
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
+                                    option_id,
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let first_prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("first"))],
+                    ))
+                    .block_task();
+
+                tokio::time::timeout(Duration::from_secs(2), started.notified())
+                    .await
+                    .expect("first prompt must enter the provider");
+                let second_prompt = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![AcpContentBlock::Text(TextContent::new("second"))],
+                        ))
+                        .block_task(),
+                )
+                .await;
+                release.notify_one();
+                let response = tokio::time::timeout(Duration::from_secs(5), first_prompt)
+                    .await
+                    .expect("first prompt must still complete after the busy rejection")?;
+                assert!(
+                    matches!(second_prompt, Ok(Err(_))),
+                    "overlapping prompt must be rejected promptly as busy: {second_prompt:?}"
+                );
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
+        assert!(
+            permission_seen.load(Ordering::Acquire),
+            "the active turn's permission request must still reach the client"
+        );
     }
 
     #[tokio::test]
