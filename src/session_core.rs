@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -7,7 +7,9 @@ use tokio::sync::oneshot;
 use crate::agent::AgentSession;
 use crate::compaction::CompactionPolicy;
 use crate::providers::Message;
-use crate::session_protocol::{ApprovalDecision, ApprovalRequest, ClientCapability, SessionEvent};
+use crate::session_protocol::{
+    ApprovalDecision, ApprovalRequest, ClientCapability, SessionEvent, TurnStatus,
+};
 use crate::session_store::SessionStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,38 @@ impl std::fmt::Display for TurnError {
 }
 
 impl std::error::Error for TurnError {}
+
+pub enum SessionPromptOutcome {
+    Completed(Box<crate::agent::TurnResult>),
+    Cancelled,
+}
+
+pub struct SessionPromptExecution {
+    pub outcome: SessionPromptOutcome,
+    pub context_window: Option<u64>,
+    pub cumulative_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPromptError {
+    Busy,
+    DuplicateRequest(String),
+    Model(String),
+}
+
+impl std::fmt::Display for SessionPromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("session is busy"),
+            Self::DuplicateRequest(id) => {
+                write!(formatter, "duplicate client user message id '{id}'")
+            }
+            Self::Model(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SessionPromptError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEventError {
@@ -174,6 +208,7 @@ pub struct SessionCore {
     pub(crate) compaction: SessionCompaction,
     pub(crate) context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
     pub(crate) events: Arc<SessionEventRouter>,
+    pub(crate) tool_lifecycle: Arc<CanonicalToolLifecycle>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -215,6 +250,7 @@ impl SessionCore {
         approvals: Arc<ApprovalBroker>,
         persistence: Option<SessionPersistence>,
         events: Arc<SessionEventRouter>,
+        tool_lifecycle: Arc<CanonicalToolLifecycle>,
     ) -> Self {
         Self {
             lifecycle: tokio::sync::Mutex::new(()),
@@ -227,6 +263,7 @@ impl SessionCore {
             compaction,
             context_windows: tokio::sync::Mutex::new(context_windows),
             events,
+            tool_lifecycle,
             persistence,
         }
     }
@@ -299,6 +336,134 @@ impl SessionCore {
         if let Some(persistence) = &self.persistence {
             persistence.save(model, messages, &self.cwd, client_user_message_ids);
         }
+    }
+
+    /// Execute one provider/tool turn without depending on any frontend
+    /// transport. Adapters supply only presentation cleanup and the canonical
+    /// terminal-outcome mapping; all state, cancellation, persistence, usage,
+    /// and event ordering remain daemon-owned.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prompt<C, M>(
+        &self,
+        user_message: Message,
+        canonical_user_text: String,
+        client_user_message_id: Option<String>,
+        assistant_prefix: Option<String>,
+        on_cancel: C,
+        outcome_mapper: M,
+    ) -> Result<SessionPromptExecution, SessionPromptError>
+    where
+        C: FnOnce(),
+        M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
+    {
+        let active_turn = self.begin_turn().map_err(|_| SessionPromptError::Busy)?;
+        let mut agent_session = self.session.lock().await;
+        {
+            let mut client_ids = self.client_user_message_ids.lock().await;
+            align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
+            if let Some(id) = client_user_message_id.as_deref() {
+                if client_ids.iter().any(|existing| existing == id) {
+                    return Err(SessionPromptError::DuplicateRequest(id.to_string()));
+                }
+            }
+        }
+
+        let model = self
+            .current_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let context_window = self
+            .prepare_model(&mut agent_session, &model)
+            .await
+            .map_err(SessionPromptError::Model)?;
+        let _ = self.events.emit(SessionEvent::UserMessage {
+            text: canonical_user_text,
+        });
+        if let Some(prefix) = assistant_prefix.as_ref() {
+            let _ = self.events.emit(SessionEvent::AssistantDelta {
+                text: prefix.clone(),
+            });
+        }
+
+        let turn = tokio::select! {
+            turn = agent_session.prompt_message(user_message) => Some(turn),
+            _ = active_turn.cancelled() => None,
+        };
+        if turn.is_some() {
+            active_turn.mark_completed();
+        } else {
+            for resolution in self.approvals.cancel_all("session_cancelled") {
+                let _ = self.events.emit(SessionEvent::ApprovalResolved {
+                    approval_id: resolution.approval_id,
+                    decision: resolution.decision,
+                    resolved_by: resolution.resolved_by,
+                });
+            }
+            self.tool_lifecycle.cancel_all();
+            on_cancel();
+        }
+        if turn.is_some() {
+            if let Some(prefix) = assistant_prefix {
+                if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
+                    tracing::error!(
+                        target: "daimonos::session_core",
+                        event = "assistant_turn_prefix_insert_failed",
+                        error = %error,
+                    );
+                }
+            }
+        }
+
+        let history_snapshot = turn.as_ref().map(|_| agent_session.history().to_vec());
+        let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
+        let client_ids_snapshot = if turn.is_some() {
+            let mut client_ids = self.client_user_message_ids.lock().await;
+            client_ids.push(client_user_message_id.unwrap_or_default());
+            align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
+            Some(client_ids.clone())
+        } else {
+            None
+        };
+        drop(agent_session);
+
+        if let Some(turn) = turn.as_ref() {
+            let used_tokens = turn
+                .last_call_usage
+                .prompt_tokens()
+                .saturating_add(turn.last_call_usage.output);
+            let _ = self.events.emit(SessionEvent::ContextUsageChanged {
+                usage: self.context_usage(used_tokens, context_window),
+            });
+            let _ = self.events.emit(SessionEvent::AssistantDone {
+                outcome: outcome_mapper(turn),
+            });
+        }
+        drop(active_turn);
+
+        if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
+            self.persist(&model, &messages, &client_ids);
+        }
+
+        Ok(SessionPromptExecution {
+            outcome: match turn {
+                Some(turn) => SessionPromptOutcome::Completed(Box::new(turn)),
+                None => SessionPromptOutcome::Cancelled,
+            },
+            context_window,
+            cumulative_cost_usd,
+        })
+    }
+}
+
+fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
+    if ids.len() > user_turn_count {
+        let excess = ids.len() - user_turn_count;
+        ids.drain(..excess);
+    } else if ids.len() < user_turn_count {
+        let mut padding = vec![String::new(); user_turn_count - ids.len()];
+        padding.append(ids);
+        *ids = padding;
     }
 }
 
@@ -653,6 +818,249 @@ impl Drop for ApprovalBroker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalRequestError {
+    Broker(ApprovalError),
+    Event(SessionEventError),
+    BrokerClosed,
+}
+
+/// Register one canonical approval, publish it to the active client adapter,
+/// and wait for that adapter to resolve it through [`ApprovalBroker`].
+///
+/// No transport handle crosses this boundary. ACP, a local UDS client, and a
+/// future Android client all observe the same `ApprovalRequested` event and
+/// answer through the same broker.
+pub async fn request_approval(
+    broker: &ApprovalBroker,
+    events: &SessionEventRouter,
+    request: ApprovalRequest,
+) -> Result<ApprovalResolution, ApprovalRequestError> {
+    let registered = broker
+        .register(request)
+        .map_err(ApprovalRequestError::Broker)?;
+    let approval_id = registered.request.id.clone();
+
+    if let Err(error) = events.emit(SessionEvent::TurnStatusChanged {
+        status: TurnStatus::WaitingForApproval,
+    }) {
+        deny_failed_approval(broker, events, &approval_id, "status_event_failed");
+        return Err(ApprovalRequestError::Event(error));
+    }
+    if let Err(error) = events.emit(SessionEvent::ApprovalRequested {
+        request: registered.request,
+    }) {
+        deny_failed_approval(broker, events, &approval_id, "request_event_failed");
+        return Err(ApprovalRequestError::Event(error));
+    }
+
+    let resolution = registered.receiver.await.map_err(|_| {
+        let _ = events.emit(SessionEvent::TurnStatusChanged {
+            status: TurnStatus::Running,
+        });
+        ApprovalRequestError::BrokerClosed
+    })?;
+    let _ = events.emit(SessionEvent::ApprovalResolved {
+        approval_id: resolution.approval_id.clone(),
+        decision: resolution.decision,
+        resolved_by: resolution.resolved_by.clone(),
+    });
+    let _ = events.emit(SessionEvent::TurnStatusChanged {
+        status: TurnStatus::Running,
+    });
+    Ok(resolution)
+}
+
+fn deny_failed_approval(
+    broker: &ApprovalBroker,
+    events: &SessionEventRouter,
+    approval_id: &str,
+    resolved_by: &str,
+) {
+    let _ = broker.resolve(
+        approval_id,
+        resolved_by,
+        &[ClientCapability::ApproveOnce],
+        ApprovalDecision::Deny,
+    );
+    let _ = events.emit(SessionEvent::TurnStatusChanged {
+        status: TurnStatus::Running,
+    });
+}
+
+/// Frontend-neutral tool lifecycle shared by ACP, the local daemon client, and
+/// future remote clients. Presentation adapters may add richer cards/diffs,
+/// but canonical execution and exactly-one terminal event live here.
+pub struct CanonicalToolLifecycle {
+    events: Arc<SessionEventRouter>,
+    approvals: Arc<ApprovalBroker>,
+    safety: Arc<crate::safety::SafetyPolicy>,
+    active: StdMutex<HashSet<String>>,
+    max_active_tools: usize,
+}
+
+impl CanonicalToolLifecycle {
+    pub fn new(
+        events: Arc<SessionEventRouter>,
+        approvals: Arc<ApprovalBroker>,
+        safety: Arc<crate::safety::SafetyPolicy>,
+        max_active_tools: usize,
+    ) -> Self {
+        Self {
+            events,
+            approvals,
+            safety,
+            active: StdMutex::new(HashSet::new()),
+            max_active_tools: max_active_tools.max(1),
+        }
+    }
+
+    pub async fn before(
+        &self,
+        info: &crate::agent::ToolCallInfo,
+    ) -> crate::agent::BeforeHookResult {
+        {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.contains(&info.id) {
+                return crate::agent::BeforeHookResult::Block(format!(
+                    "tool call '{}' is already active",
+                    info.id
+                ));
+            }
+            if active.len() >= self.max_active_tools {
+                return crate::agent::BeforeHookResult::Block(format!(
+                    "active tool-call limit ({}) reached",
+                    self.max_active_tools
+                ));
+            }
+            active.insert(info.id.clone());
+        }
+
+        let title = canonical_tool_title(info);
+        let _ = self.events.emit(SessionEvent::ToolCallStarted {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            title: title.clone(),
+            input_summary: None,
+        });
+        let decision = match self.safety.gate(&info.name) {
+            crate::safety::Gate::Block(reason) => crate::agent::BeforeHookResult::Block(reason),
+            crate::safety::Gate::Allow => crate::agent::BeforeHookResult::Allow,
+            crate::safety::Gate::NeedsApproval => {
+                match request_approval(
+                    &self.approvals,
+                    &self.events,
+                    ApprovalRequest::unassigned(info.id.clone(), info.name.clone(), title, true),
+                )
+                .await
+                {
+                    Ok(resolution) => match resolution.decision {
+                        ApprovalDecision::AllowOnce => crate::agent::BeforeHookResult::Allow,
+                        ApprovalDecision::AllowAlways => {
+                            self.safety.remember_always(&info.name);
+                            crate::agent::BeforeHookResult::Allow
+                        }
+                        ApprovalDecision::Deny => crate::agent::BeforeHookResult::Block(format!(
+                            "permission denied for '{}'",
+                            info.name
+                        )),
+                    },
+                    Err(_) => crate::agent::BeforeHookResult::Block(format!(
+                        "permission broker unavailable for '{}'",
+                        info.name
+                    )),
+                }
+            }
+        };
+
+        let (status, blocked) = match &decision {
+            crate::agent::BeforeHookResult::Allow => (
+                crate::session_protocol::ToolCallStateStatus::InProgress,
+                false,
+            ),
+            crate::agent::BeforeHookResult::Block(_) => {
+                (crate::session_protocol::ToolCallStateStatus::Failed, true)
+            }
+        };
+        let _ = self.events.emit(SessionEvent::ToolCallUpdated {
+            id: info.id.clone(),
+            status,
+        });
+        if blocked {
+            self.finish(info, "blocked", true);
+        }
+        decision
+    }
+
+    /// Claim and emit one terminal completion. Returns false for a duplicate or
+    /// late callback whose call was already completed/cancelled.
+    pub fn finish(&self, info: &crate::agent::ToolCallInfo, output: &str, is_error: bool) -> bool {
+        let was_active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&info.id);
+        if !was_active {
+            return false;
+        }
+        let _ = self.events.emit(SessionEvent::ToolCallFinished {
+            id: info.id.clone(),
+            ok: !is_error,
+            output: output.to_string(),
+        });
+        true
+    }
+
+    pub fn cancel_all(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect();
+        ids.sort();
+        for id in &ids {
+            let _ = self.events.emit(SessionEvent::ToolCallUpdated {
+                id: id.clone(),
+                status: crate::session_protocol::ToolCallStateStatus::Cancelled,
+            });
+            let _ = self.events.emit(SessionEvent::ToolCallFinished {
+                id: id.clone(),
+                ok: false,
+                output: "cancelled".to_string(),
+            });
+        }
+        ids
+    }
+
+    pub fn active_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+fn canonical_tool_title(info: &crate::agent::ToolCallInfo) -> String {
+    if info.name == "exec" {
+        info.input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| info.name.clone())
+    } else {
+        info.name.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +1134,209 @@ mod tests {
             .unwrap();
         assert_eq!(registered.receiver.await.unwrap(), resolution);
         assert!(broker.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_waits_for_transport_independent_broker_resolution() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new(false));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let broker_for_handler = std::sync::Arc::clone(&broker);
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = SessionEventRouter::new(Some(std::sync::Arc::new(move |_seq, event| {
+            seen_for_handler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.clone());
+            if let SessionEvent::ApprovalRequested { request } = event {
+                broker_for_handler
+                    .resolve(
+                        &request.id,
+                        "headless",
+                        &[ClientCapability::ApproveOnce],
+                        ApprovalDecision::AllowOnce,
+                    )
+                    .expect("headless client resolves approval");
+            }
+        })));
+
+        let resolution = request_approval(&broker, &events, request())
+            .await
+            .expect("approval resolves");
+        assert_eq!(resolution.decision, ApprovalDecision::AllowOnce);
+        assert_eq!(resolution.resolved_by, "headless");
+        assert!(broker.pending().is_empty());
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::WaitingForApproval
+                },
+                SessionEvent::ApprovalRequested { .. },
+                SessionEvent::ApprovalResolved { .. },
+                SessionEvent::TurnStatusChanged {
+                    status: TurnStatus::Running
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_tool_lifecycle_runs_without_any_frontend_connection() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |_seq, event| {
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let lifecycle = CanonicalToolLifecycle::new(
+            std::sync::Arc::clone(&events),
+            std::sync::Arc::new(ApprovalBroker::new(false)),
+            std::sync::Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        );
+        let info = crate::agent::ToolCallInfo {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "README.md"}),
+        };
+
+        assert!(matches!(
+            lifecycle.before(&info).await,
+            crate::agent::BeforeHookResult::Allow
+        ));
+        assert!(lifecycle.finish(&info, "contents", false));
+        assert!(!lifecycle.finish(&info, "duplicate", false));
+        assert!(lifecycle.active_ids().is_empty());
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                SessionEvent::ToolCallStarted { id, .. },
+                SessionEvent::ToolCallUpdated {
+                    id: updated_id,
+                    status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                },
+                SessionEvent::ToolCallFinished {
+                    id: finished_id,
+                    ok: true,
+                    output,
+                }
+            ] if id == "tool-1"
+                && updated_id == "tool-1"
+                && finished_id == "tool-1"
+                && output == "contents"
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompt_execution_is_transport_independent() {
+        struct StaticProvider;
+
+        #[async_trait::async_trait]
+        impl crate::providers::LlmProvider for StaticProvider {
+            async fn complete(
+                &self,
+                _context: &crate::providers::Context,
+                _options: &crate::providers::CompleteOpts,
+            ) -> crate::providers::LlmResponse {
+                crate::providers::LlmResponse {
+                    content: vec![crate::providers::ContentBlock::Text("pong".to_string())],
+                    stop_reason: crate::providers::StopReason::EndTurn,
+                    error_message: None,
+                    context_overflow: false,
+                    usage: crate::providers::Usage {
+                        input: 4,
+                        output: 2,
+                        ..crate::providers::Usage::default()
+                    },
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = std::sync::Arc::new(crate::config::Config::default());
+        let tool_session = crate::session::Session::new(dir.path().to_path_buf(), config);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |_sequence, event| {
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let approvals = std::sync::Arc::new(ApprovalBroker::new(false));
+        let lifecycle = std::sync::Arc::new(CanonicalToolLifecycle::new(
+            std::sync::Arc::clone(&events),
+            std::sync::Arc::clone(&approvals),
+            std::sync::Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        ));
+        let core = SessionCore::new(
+            crate::agent::AgentSession::new(
+                Box::new(StaticProvider),
+                tool_session,
+                crate::agent::AgentConfig {
+                    opts: crate::providers::CompleteOpts {
+                        model: "test-model".to_string(),
+                        ..crate::providers::CompleteOpts::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            ),
+            "test-model".to_string(),
+            dir.path().to_path_buf(),
+            SessionCompaction::new(None, false),
+            HashMap::new(),
+            approvals,
+            None,
+            std::sync::Arc::clone(&events),
+            lifecycle,
+        );
+        let message = crate::providers::Message {
+            role: crate::providers::Role::User,
+            content: vec![crate::providers::ContentBlock::Text("ping".to_string())],
+        };
+
+        let execution = core
+            .prompt(
+                message,
+                "ping".to_string(),
+                None,
+                None,
+                || {},
+                |_| crate::session_protocol::AssistantOutcome::Completed,
+            )
+            .await
+            .expect("prompt executes without a frontend connection");
+        assert!(matches!(
+            execution.outcome,
+            SessionPromptOutcome::Completed(_)
+        ));
+        let history = core.session.lock().await.history().to_vec();
+        assert!(history.iter().any(|message| {
+            message.content.iter().any(
+                |block| matches!(block, crate::providers::ContentBlock::Text(text) if text == "pong"),
+            )
+        }));
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(seen
+            .iter()
+            .any(|event| matches!(event, SessionEvent::UserMessage { text } if text == "ping")));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            SessionEvent::AssistantDone {
+                outcome: crate::session_protocol::AssistantOutcome::Completed
+            }
+        )));
     }
 
     #[test]
@@ -1133,24 +1744,15 @@ mod tests {
             .filter(|character| !character.is_whitespace())
             .collect();
         for (variant, marker) in [
-            ("UserMessage", "emit(CoreSessionEvent::UserMessage"),
-            ("AssistantDelta", "emit(CoreSessionEvent::AssistantDelta"),
+            ("UserMessage", "emit(SessionEvent::UserMessage"),
+            ("AssistantDelta", "emit(SessionEvent::AssistantDelta"),
             ("AssistantDone", "emit(CoreSessionEvent::AssistantDone"),
             ("ThoughtDelta", "emit(CoreSessionEvent::ThoughtDelta"),
-            ("ToolCallStarted", "emit(CoreSessionEvent::ToolCallStarted"),
-            ("ToolCallUpdated", "emit(CoreSessionEvent::ToolCallUpdated"),
-            (
-                "ToolCallFinished",
-                "emit(CoreSessionEvent::ToolCallFinished",
-            ),
-            (
-                "ApprovalRequested",
-                "emit(CoreSessionEvent::ApprovalRequested",
-            ),
-            (
-                "ApprovalResolved",
-                "emit(CoreSessionEvent::ApprovalResolved",
-            ),
+            ("ToolCallStarted", "emit(SessionEvent::ToolCallStarted"),
+            ("ToolCallUpdated", "emit(SessionEvent::ToolCallUpdated"),
+            ("ToolCallFinished", "emit(SessionEvent::ToolCallFinished"),
+            ("ApprovalRequested", "emit(SessionEvent::ApprovalRequested"),
+            ("ApprovalResolved", "emit(SessionEvent::ApprovalResolved"),
             (
                 "RuntimeOptionsChanged",
                 "emit(CoreSessionEvent::RuntimeOptionsChanged",
@@ -1186,20 +1788,25 @@ mod tests {
             .split("async fn truncate_session")
             .next()
             .unwrap();
-        assert!(prompt.contains("emit_assistant_done"));
+        assert!(prompt.contains(".prompt("));
         assert!(retry.contains("emit_assistant_done"));
-        assert!(prompt.contains("cleanup_cancelled_turn"));
         assert!(retry.contains("cleanup_cancelled_turn"));
-
-        let permission = source
-            .split("async fn request_permission")
-            .nth(1)
-            .unwrap()
-            .split("fn build_before_tool_call_hook")
+        let core_source = include_str!("session_core.rs")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert!(permission.contains("CoreTurnStatus::WaitingForApproval"));
-        assert!(permission.contains("CoreTurnStatus::Running"));
+        assert!(core_source.contains("emit(SessionEvent::AssistantDone"));
+        assert!(core_source.contains("self.tool_lifecycle.cancel_all()"));
+
+        let permission = core_source
+            .split("pub async fn request_approval")
+            .nth(1)
+            .unwrap()
+            .split("fn deny_failed_approval")
+            .next()
+            .unwrap();
+        assert!(permission.contains("TurnStatus::WaitingForApproval"));
+        assert!(permission.contains("TurnStatus::Running"));
 
         let delete = source
             .split("move |req: DeleteSessionRequest")
