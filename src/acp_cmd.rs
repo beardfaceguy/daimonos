@@ -1020,6 +1020,9 @@ fn build_before_tool_call_hook(
             if info.name == UPDATE_PLAN_TOOL && parse_plan_entries(&info.input).is_ok() {
                 return BeforeHookResult::Allow;
             }
+            if let Err(reason) = tool_lifecycle.reserve(info) {
+                return BeforeHookResult::Block(reason);
+            }
             let cx = current_cx(&connection);
 
             let title = if terminal_output {
@@ -1037,6 +1040,7 @@ fn build_before_tool_call_hook(
                     tool_call = tool_call.meta(terminal_info_meta(&workspace, info));
                 }
                 if !try_send_notification(cx, &session_id, SessionUpdate::ToolCall(tool_call)) {
+                    tool_lifecycle.finish(info, "failed to announce ACP tool call", true);
                     return BeforeHookResult::Block("failed to announce ACP tool call".to_string());
                 }
                 active_tool_calls
@@ -1051,7 +1055,7 @@ fn build_before_tool_call_hook(
                     );
             }
 
-            let decision = tool_lifecycle.before(info).await;
+            let decision = tool_lifecycle.authorize_reserved(info).await;
 
             // Capture the pre-edit file text so the after hook can render
             // the completion as a Diff (vikunja #983).
@@ -1125,13 +1129,15 @@ fn build_after_tool_call_hook(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&info.id)
             .flatten();
-        if !tool_lifecycle.finish(info, content, is_error) {
+        let canonical_finished = tool_lifecycle.finish(info, content, is_error);
+        let acp_finished = tool_call_update_is_live(&active_tool_calls, &info.id, true);
+        if !canonical_finished {
             return AfterHookResult::Continue;
         }
         let Some(cx) = current_cx(&connection) else {
             return AfterHookResult::Continue;
         };
-        if !tool_call_update_is_live(&active_tool_calls, &info.id, true) {
+        if !acp_finished {
             return AfterHookResult::Continue;
         }
         let status = if is_error {
@@ -8067,6 +8073,53 @@ mod tests {
                 }
             ] if id == "t1" && updated_id == "t1" && finished_id == "t1"
         ));
+    }
+
+    #[tokio::test]
+    async fn detached_after_hook_still_releases_acp_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection: CurrentConnection = Arc::new(StdMutex::new(None));
+        let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        let events = Arc::new(SessionEventRouter::default());
+        let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
+            events,
+            Arc::new(ApprovalBroker::new(false)),
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        ));
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "f.txt"}),
+        };
+        assert!(matches!(
+            tool_lifecycle.before(&info).await,
+            BeforeHookResult::Allow
+        ));
+        active_tool_calls.lock().unwrap().insert(
+            info.id.clone(),
+            ActiveToolCall {
+                terminal_output: false,
+                raw_input: info.input.clone(),
+            },
+        );
+
+        let after = build_after_tool_call_hook(
+            connection,
+            SessionId::new("session-1"),
+            Arc::clone(&active_tool_calls),
+            tool_lifecycle,
+            Arc::new(StdMutex::new(HashMap::new())),
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            after(&info, "ok", false),
+            AfterHookResult::Continue
+        ));
+        assert!(
+            active_tool_calls.lock().unwrap().is_empty(),
+            "detach must not leave a completed ACP tool id live"
+        );
     }
 
     #[test]

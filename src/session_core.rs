@@ -949,19 +949,26 @@ impl CanonicalToolLifecycle {
         &self,
         info: &crate::agent::ToolCallInfo,
     ) -> crate::agent::BeforeHookResult {
+        if let Err(reason) = self.reserve(info) {
+            return crate::agent::BeforeHookResult::Block(reason);
+        }
+        self.authorize_reserved(info).await
+    }
+
+    /// Atomically admit one tool call before any frontend announces it.
+    /// Structural duplicate/capacity failures therefore stay absent from both
+    /// canonical and adapter projections.
+    pub fn reserve(&self, info: &crate::agent::ToolCallInfo) -> Result<(), String> {
         {
             let mut active = self
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if active.contains(&info.id) {
-                return crate::agent::BeforeHookResult::Block(format!(
-                    "tool call '{}' is already active",
-                    info.id
-                ));
+                return Err(format!("tool call '{}' is already active", info.id));
             }
             if active.len() >= self.max_active_tools {
-                return crate::agent::BeforeHookResult::Block(format!(
+                return Err(format!(
                     "active tool-call limit ({}) reached",
                     self.max_active_tools
                 ));
@@ -976,6 +983,15 @@ impl CanonicalToolLifecycle {
             title: title.clone(),
             input_summary: None,
         });
+        Ok(())
+    }
+
+    /// Apply policy/approval to a call already admitted by [`Self::reserve`].
+    pub async fn authorize_reserved(
+        &self,
+        info: &crate::agent::ToolCallInfo,
+    ) -> crate::agent::BeforeHookResult {
+        let title = tool_call_title(info);
         let decision = match self.safety.gate(&info.name) {
             crate::safety::Gate::Block(reason) => crate::agent::BeforeHookResult::Block(reason),
             crate::safety::Gate::Allow => crate::agent::BeforeHookResult::Allow,
@@ -1377,6 +1393,48 @@ mod tests {
                 if reason.contains("active tool-call limit")
         ));
         assert!(lifecycle.finish(&first, "done", false));
+    }
+
+    #[test]
+    fn canonical_reservation_rejects_before_emitting_a_second_start() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let lifecycle = CanonicalToolLifecycle::new(
+            std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+                move |_seq, event| {
+                    seen_for_handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(event);
+                },
+            )))),
+            std::sync::Arc::new(ApprovalBroker::new(false)),
+            std::sync::Arc::new(crate::safety::SafetyPolicy::default()),
+            1,
+        );
+        let first = crate::agent::ToolCallInfo {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "README.md"}),
+        };
+        let second = crate::agent::ToolCallInfo {
+            id: "tool-2".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "AGENTS.md"}),
+        };
+
+        lifecycle.reserve(&first).expect("first reservation");
+        assert!(lifecycle.reserve(&first).is_err(), "duplicate id must fail");
+        assert!(lifecycle.reserve(&second).is_err(), "capacity must fail");
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            seen.iter()
+                .filter(|event| matches!(event, SessionEvent::ToolCallStarted { .. }))
+                .count(),
+            1,
+            "rejected reservations must not create canonical-only tool cards"
+        );
     }
 
     #[tokio::test]
