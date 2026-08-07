@@ -86,6 +86,12 @@ max_script_subcalls = 32
 # Max prompts a single llm_query_batched call may take.
 max_script_subcall_batch = 16
 
+[session]
+# Maximum in-flight tool calls tracked by one daemon-owned agent session.
+# Current execution is sequential; this bound also covers future parallel
+# tool batches without coupling lifecycle admission to cache sizing.
+max_active_tool_calls = 16
+
 [tool_output]
 # Optional directory for complete outputs replaced by bounded previews.
 # Default: ~/.daimonos/tool-output

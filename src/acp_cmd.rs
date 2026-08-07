@@ -59,14 +59,15 @@ use crate::providers::{
 };
 use crate::session::Session;
 use crate::session_core::{
-    ApprovalBroker, ApprovalError, SessionCompaction, SessionCore, SessionEventHandler,
-    SessionEventRouter, SessionPersistence, TurnError,
+    align_client_user_message_ids, tool_call_title, ApprovalBroker, CanonicalToolLifecycle,
+    SessionCompaction, SessionCore, SessionEventHandler, SessionEventRouter, SessionPersistence,
+    SessionPromptError, SessionPromptOutcome, TurnError,
 };
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
     AssistantOutcome as CoreAssistantOutcome, ClientCapability, RuntimeChoice as CoreRuntimeChoice,
     RuntimeOption as CoreRuntimeOption, RuntimeValue as CoreRuntimeValue,
-    SessionEvent as CoreSessionEvent, ToolCallStateStatus, TurnStatus as CoreTurnStatus,
+    SessionEvent as CoreSessionEvent,
 };
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::tool_facade;
@@ -75,18 +76,28 @@ use crate::tool_facade;
 /// `ToolCallUpdate` path consults this set so cancellation, replay anomalies,
 /// or a late progress callback cannot update an id the client does not know
 /// (or resurrect a call that already reached a terminal state).
-type ActiveToolCalls = Arc<StdMutex<HashMap<String, bool>>>;
+#[derive(Clone)]
+struct ActiveToolCall {
+    terminal_output: bool,
+    raw_input: Option<serde_json::Value>,
+}
 
-/// The tool-call hooks (baked into `AgentConfig` once, at `session/new`
-/// time) need a `ConnectionTo<Client>` to send notifications/requests on.
-/// Requests specifically (`session/request_permission`) only get their
-/// response routed correctly when sent via the `ConnectionTo` handle from
-/// the *current* dispatch — reusing the handle captured at `session/new`
-/// for a request made much later (during a subsequent `session/prompt`)
-/// causes the response to be misrouted. Notifications don't have this
-/// problem (they're fire-and-forget), so this only matters for
-/// `request_permission`. Updated at the top of every `session/prompt` call
-/// with that call's fresh handle; read fresh by the hooks on each use.
+impl ActiveToolCall {
+    fn new(info: &ToolCallInfo, terminal_output: bool, retain_raw_input: bool) -> Self {
+        Self {
+            terminal_output,
+            raw_input: retain_raw_input.then(|| info.input.clone()),
+        }
+    }
+}
+
+type ActiveToolCalls = Arc<StdMutex<HashMap<String, ActiveToolCall>>>;
+
+/// ACP presentation hooks read the live client connection for rich
+/// notifications. In agent-client-protocol 1.2 every handler receives a clone
+/// of the same underlying connection; request UUIDs and oneshot channels route
+/// responses independently of the handler dispatch that supplied the clone.
+/// Canonical tool and approval lifecycles do not depend on this adapter handle.
 type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 
 /// The ACP JSON-RPC input descriptor. Named rather than inlined because it is
@@ -847,18 +858,6 @@ fn terminal_info_meta(workspace: &Path, info: &ToolCallInfo) -> Option<Meta> {
     })
 }
 
-fn tool_call_title(info: &ToolCallInfo) -> String {
-    if info.name == "exec" {
-        info.input
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| info.name.clone())
-    } else {
-        info.name.clone()
-    }
-}
-
 fn terminal_exit_meta(info: &ToolCallInfo, code: Option<i32>, signal: Option<String>) -> Meta {
     Meta::from_iter([(
         "terminal_exit".to_string(),
@@ -919,7 +918,7 @@ fn cancel_active_tool_calls(
         .iter()
         .map(|(tool_call_id, _)| tool_call_id.clone())
         .collect::<Vec<_>>();
-    for (tool_call_id, terminal_output) in active {
+    for (tool_call_id, active_call) in active {
         let fields = ToolCallUpdateFields::new()
             .status(Some(ToolCallStatus::Failed))
             .content(Some(vec![AcpContentBlock::Text(TextContent::new(
@@ -928,7 +927,7 @@ fn cancel_active_tool_calls(
             .into()]))
             .raw_output(Some(serde_json::json!({ "cancelled": true })));
         let mut update = ToolCallUpdate::new(tool_call_id.clone(), fields);
-        if terminal_output {
+        if active_call.terminal_output {
             update = update.meta(Meta::from_iter([(
                 "terminal_exit".to_string(),
                 serde_json::json!({
@@ -950,20 +949,8 @@ fn cleanup_cancelled_turn(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
 ) {
-    for resolution in handle.core.approvals.cancel_all("session_cancelled") {
-        let _ = handle.core.events.emit(CoreSessionEvent::ApprovalResolved {
-            approval_id: resolution.approval_id,
-            decision: resolution.decision,
-            resolved_by: resolution.resolved_by,
-        });
-    }
-    for tool_call_id in cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls) {
-        let _ = handle.core.events.emit(CoreSessionEvent::ToolCallFinished {
-            id: tool_call_id,
-            ok: false,
-            output: "cancelled".to_string(),
-        });
-    }
+    handle.core.cleanup_cancelled_turn();
+    cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
 }
 
 fn build_tool_progress_hook(
@@ -1019,158 +1006,12 @@ fn build_tool_progress_hook(
     })
 }
 
-/// Send `session/request_permission` and await the client's answer,
-/// applying the operator's decision to `safety` (persisting an "always
-/// allow" choice the same way the stdin prompt does). Must be sent via the
-/// *current* dispatch's connection handle (see [`CurrentConnection`]) — a
-/// handle captured at `session/new` time and reused later for a request
-/// does not get its response routed back correctly by this SDK.
-async fn request_permission(
-    cx: &ConnectionTo<AcpClientRole>,
-    session_id: &SessionId,
-    info: &ToolCallInfo,
-    safety: &crate::safety::SafetyPolicy,
-    approvals: &ApprovalBroker,
-    events: &SessionEventRouter,
-) -> BeforeHookResult {
-    let registered = match approvals.register(CoreApprovalRequest::unassigned(
-        info.id.clone(),
-        info.name.clone(),
-        tool_call_title(info),
-        true,
-    )) {
-        Ok(registered) => registered,
-        Err(_) => {
-            return BeforeHookResult::Block(format!(
-                "permission broker unavailable for '{}'",
-                info.name
-            ))
-        }
-    };
-
-    let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
-        status: CoreTurnStatus::WaitingForApproval,
-    });
-    let _ = events.emit(CoreSessionEvent::ApprovalRequested {
-        request: registered.request.clone(),
-    });
-
-    let update = ToolCallUpdate::new(
-        info.id.clone(),
-        ToolCallUpdateFields::new().raw_input(Some(info.input.clone())),
-    );
-    let options = vec![
-        PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(
-            "allow_always",
-            "Always Allow",
-            PermissionOptionKind::AllowAlways,
-        ),
-        PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
-    ];
-    let request = RequestPermissionRequest::new(session_id.clone(), update, options);
-    let approval_id = registered.request.id.clone();
-    let broker_receiver = registered.receiver;
-
-    // ACP v1 has no server-to-client cancellation for an outstanding
-    // session/request_permission. Keep that request as the selected local
-    // approval target until it completes; dropping it after a peer answer would
-    // leave stale permission chrome in the ACP client. A future multi-client
-    // router selects exactly one approval-capable controller before this point.
-    let (decision, denied_reason) = match cx.send_request(request).block_task().await {
-        Ok(response) => match response.outcome {
-            RequestPermissionOutcome::Selected(sel) => match sel.option_id.to_string().as_str() {
-                "allow_once" => (CoreApprovalDecision::AllowOnce, None),
-                "allow_always" => (CoreApprovalDecision::AllowAlways, None),
-                _ => (
-                    CoreApprovalDecision::Deny,
-                    Some(format!("permission denied for '{}'", info.name)),
-                ),
-            },
-            RequestPermissionOutcome::Cancelled => (
-                CoreApprovalDecision::Deny,
-                Some(format!("permission request cancelled for '{}'", info.name)),
-            ),
-            _ => (
-                CoreApprovalDecision::Deny,
-                Some(format!(
-                    "unrecognized permission outcome for '{}'",
-                    info.name
-                )),
-            ),
-        },
-        Err(_) => (
-            CoreApprovalDecision::Deny,
-            Some(format!("permission request failed for '{}'", info.name)),
-        ),
-    };
-
-    let local_capabilities = [
-        ClientCapability::ApproveOnce,
-        ClientCapability::ApproveAlways,
-    ];
-    match approvals.resolve(&approval_id, "acp_local", &local_capabilities, decision) {
-        Ok(_) | Err(ApprovalError::NotPending) => {}
-        Err(_) => {
-            let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
-                status: CoreTurnStatus::Running,
-            });
-            return BeforeHookResult::Block(format!(
-                "permission resolution failed for '{}'",
-                info.name
-            ));
-        }
-    }
-    let resolution = match broker_receiver.await {
-        Ok(resolution) => resolution,
-        Err(_) => {
-            let _ = events.emit(CoreSessionEvent::ApprovalResolved {
-                approval_id: approval_id.clone(),
-                decision: CoreApprovalDecision::Deny,
-                resolved_by: "broker_closed".to_string(),
-            });
-            let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
-                status: CoreTurnStatus::Running,
-            });
-            return BeforeHookResult::Block(format!(
-                "permission broker closed for '{}'",
-                info.name
-            ));
-        }
-    };
-    let _ = events.emit(CoreSessionEvent::ApprovalResolved {
-        approval_id: resolution.approval_id.clone(),
-        decision: resolution.decision,
-        resolved_by: resolution.resolved_by.clone(),
-    });
-    let _ = events.emit(CoreSessionEvent::TurnStatusChanged {
-        status: CoreTurnStatus::Running,
-    });
-    match resolution.decision {
-        CoreApprovalDecision::AllowOnce => BeforeHookResult::Allow,
-        CoreApprovalDecision::AllowAlways => {
-            safety.remember_always(&info.name);
-            BeforeHookResult::Allow
-        }
-        CoreApprovalDecision::Deny => {
-            let reason = if resolution.resolved_by == "acp_local" {
-                denied_reason.unwrap_or_else(|| format!("permission denied for '{}'", info.name))
-            } else {
-                format!("permission denied for '{}'", info.name)
-            };
-            BeforeHookResult::Block(reason)
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_before_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
-    events: Arc<SessionEventRouter>,
-    approvals: Arc<ApprovalBroker>,
-    safety: Arc<crate::safety::SafetyPolicy>,
+    tool_lifecycle: Arc<CanonicalToolLifecycle>,
     diff_stash: DiffStash,
     workspace: PathBuf,
     terminal_output: bool,
@@ -1178,10 +1019,8 @@ fn build_before_tool_call_hook(
     Box::new(move |info: &ToolCallInfo| {
         let connection = Arc::clone(&connection);
         let session_id = session_id.clone();
-        let safety = Arc::clone(&safety);
         let active_tool_calls = Arc::clone(&active_tool_calls);
-        let approvals = Arc::clone(&approvals);
-        let events = Arc::clone(&events);
+        let tool_lifecycle = Arc::clone(&tool_lifecycle);
         let diff_stash = Arc::clone(&diff_stash);
         let workspace = workspace.clone();
         Box::pin(async move {
@@ -1190,52 +1029,44 @@ fn build_before_tool_call_hook(
             if info.name == UPDATE_PLAN_TOOL && parse_plan_entries(&info.input).is_ok() {
                 return BeforeHookResult::Allow;
             }
-            let Some(cx) = current_cx(&connection) else {
-                return BeforeHookResult::Block("no active ACP connection".to_string());
-            };
+            if let Err(reason) = tool_lifecycle.reserve(info) {
+                return BeforeHookResult::Block(reason);
+            }
+            let cx = current_cx(&connection);
+            let retain_raw_input = tool_lifecycle.approval_required(&info.name);
 
             let title = if terminal_output {
                 tool_call_title(info)
             } else {
                 info.name.clone()
             };
-            let mut tool_call = ToolCall::new(info.id.clone(), title.clone())
-                .kind(tool_kind_for(&info.name))
-                .status(ToolCallStatus::Pending)
-                .locations(tool_call_locations(&workspace, &info.name, &info.input))
-                .raw_input(Some(info.input.clone()));
-            if terminal_output {
-                tool_call = tool_call.meta(terminal_info_meta(&workspace, info));
-            }
-            // Only ids whose announcement reached the connection become live.
-            // Progress cannot start until this hook returns, so recording after
-            // the synchronous enqueue cannot race the first callback.
-            let announced =
-                try_send_notification(&cx, &session_id, SessionUpdate::ToolCall(tool_call));
-            if !announced {
-                return BeforeHookResult::Block("failed to announce ACP tool call".to_string());
-            }
-            active_tool_calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(info.id.clone(), terminal_output && info.name == "exec");
-            let _ = events.emit(CoreSessionEvent::ToolCallStarted {
-                id: info.id.clone(),
-                name: info.name.clone(),
-                title,
-                input_summary: None,
-            });
-
-            // Denylist/allowlist/approval-mode gating first (same policy
-            // `daimonos agent`/`daimonos chat` enforce) — only tools that
-            // actually need a prompt go through session/request_permission.
-            let decision = match safety.gate(&info.name) {
-                crate::safety::Gate::Block(reason) => BeforeHookResult::Block(reason),
-                crate::safety::Gate::Allow => BeforeHookResult::Allow,
-                crate::safety::Gate::NeedsApproval => {
-                    request_permission(&cx, &session_id, info, &safety, &approvals, &events).await
+            if let Some(cx) = cx.as_ref() {
+                let mut tool_call = ToolCall::new(info.id.clone(), title.clone())
+                    .kind(tool_kind_for(&info.name))
+                    .status(ToolCallStatus::Pending)
+                    .locations(tool_call_locations(&workspace, &info.name, &info.input))
+                    .raw_input(Some(info.input.clone()));
+                if terminal_output {
+                    tool_call = tool_call.meta(terminal_info_meta(&workspace, info));
                 }
-            };
+                if !try_send_notification(cx, &session_id, SessionUpdate::ToolCall(tool_call)) {
+                    tool_lifecycle.finish(info, "failed to announce ACP tool call", true);
+                    return BeforeHookResult::Block("failed to announce ACP tool call".to_string());
+                }
+                active_tool_calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        info.id.clone(),
+                        ActiveToolCall::new(
+                            info,
+                            terminal_output && info.name == "exec",
+                            retain_raw_input,
+                        ),
+                    );
+            }
+
+            let decision = tool_lifecycle.authorize_reserved(info).await;
 
             // Capture the pre-edit file text so the after hook can render
             // the completion as a Diff (vikunja #983).
@@ -1249,14 +1080,6 @@ fn build_before_tool_call_hook(
                 }
             }
 
-            let canonical_status = match &decision {
-                BeforeHookResult::Allow => ToolCallStateStatus::InProgress,
-                BeforeHookResult::Block(_) => ToolCallStateStatus::Failed,
-            };
-            let _ = events.emit(CoreSessionEvent::ToolCallUpdated {
-                id: info.id.clone(),
-                status: canonical_status,
-            });
             let fields = match &decision {
                 BeforeHookResult::Allow => {
                     ToolCallUpdateFields::new().status(Some(ToolCallStatus::InProgress))
@@ -1282,20 +1105,15 @@ fn build_before_tool_call_hook(
                 update = update.meta(terminal_exit_meta(info, None, Some("blocked".to_string())));
             }
             let blocked = matches!(decision, BeforeHookResult::Block(_));
-            let sent = send_active_tool_call_update(
-                &cx,
-                &session_id,
-                &active_tool_calls,
-                &info.id,
-                update,
-                blocked,
-            );
-            if blocked && sent {
-                let _ = events.emit(CoreSessionEvent::ToolCallFinished {
-                    id: info.id.clone(),
-                    ok: false,
-                    output: "blocked".to_string(),
-                });
+            if let Some(cx) = cx.as_ref() {
+                send_active_tool_call_update(
+                    cx,
+                    &session_id,
+                    &active_tool_calls,
+                    &info.id,
+                    update,
+                    blocked,
+                );
             }
 
             decision
@@ -1307,7 +1125,7 @@ fn build_after_tool_call_hook(
     connection: CurrentConnection,
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
-    events: Arc<SessionEventRouter>,
+    tool_lifecycle: Arc<CanonicalToolLifecycle>,
     diff_stash: DiffStash,
     workspace: PathBuf,
 ) -> AfterHook {
@@ -1322,20 +1140,17 @@ fn build_after_tool_call_hook(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&info.id)
             .flatten();
-        // Claim terminal ownership before emitting either canonical or ACP
-        // completion. Cancellation drains the same live-id map, so exactly one
-        // path can finish a tool call.
-        if !tool_call_update_is_live(&active_tool_calls, &info.id, true) {
+        let canonical_finished = tool_lifecycle.finish(info, content, is_error);
+        let acp_finished = tool_call_update_is_live(&active_tool_calls, &info.id, true);
+        if !canonical_finished {
             return AfterHookResult::Continue;
         }
-        let _ = events.emit(CoreSessionEvent::ToolCallFinished {
-            id: info.id.clone(),
-            ok: !is_error,
-            output: content.to_string(),
-        });
         let Some(cx) = current_cx(&connection) else {
             return AfterHookResult::Continue;
         };
+        if !acp_finished {
+            return AfterHookResult::Continue;
+        }
         let status = if is_error {
             ToolCallStatus::Failed
         } else {
@@ -1375,11 +1190,117 @@ fn build_stream_hook(events: Arc<SessionEventRouter>) -> crate::agent::StreamHoo
     })
 }
 
+fn route_acp_approval_request(
+    cx: Option<ConnectionTo<AcpClientRole>>,
+    session_id: SessionId,
+    approvals: Arc<ApprovalBroker>,
+    active_tool_calls: ActiveToolCalls,
+    request: CoreApprovalRequest,
+) {
+    let local_capabilities = [
+        ClientCapability::ApproveOnce,
+        ClientCapability::ApproveAlways,
+    ];
+    let Some(cx) = cx else {
+        let _ = approvals.resolve(
+            &request.id,
+            "acp_unavailable",
+            &local_capabilities,
+            CoreApprovalDecision::Deny,
+        );
+        return;
+    };
+
+    let mut options = vec![PermissionOption::new(
+        "allow_once",
+        "Allow",
+        PermissionOptionKind::AllowOnce,
+    )];
+    if request.allow_always_available {
+        options.push(PermissionOption::new(
+            "allow_always",
+            "Always Allow",
+            PermissionOptionKind::AllowAlways,
+        ));
+    }
+    options.push(PermissionOption::new(
+        "reject",
+        "Reject",
+        PermissionOptionKind::RejectOnce,
+    ));
+    let raw_input = active_tool_calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(&request.tool_call_id)
+        .and_then(|active| active.raw_input.take());
+    let acp_request = RequestPermissionRequest::new(
+        session_id,
+        ToolCallUpdate::new(
+            request.tool_call_id.clone(),
+            ToolCallUpdateFields::new().raw_input(raw_input),
+        ),
+        options,
+    );
+    let approval_id = request.id;
+    let task_approval_id = approval_id.clone();
+    let request_connection = cx.clone();
+    let approvals_for_task = Arc::clone(&approvals);
+    let spawn = cx.spawn(async move {
+        let (decision, resolved_by) = match request_connection
+            .send_request(acp_request)
+            .block_task()
+            .await
+        {
+            Ok(response) => match response.outcome {
+                RequestPermissionOutcome::Selected(selected) => {
+                    match selected.option_id.to_string().as_str() {
+                        "allow_once" => (CoreApprovalDecision::AllowOnce, "acp_local"),
+                        "allow_always" => (CoreApprovalDecision::AllowAlways, "acp_local"),
+                        _ => (CoreApprovalDecision::Deny, "acp_unrecognized"),
+                    }
+                }
+                RequestPermissionOutcome::Cancelled => {
+                    (CoreApprovalDecision::Deny, "acp_cancelled")
+                }
+                _ => (CoreApprovalDecision::Deny, "acp_unrecognized"),
+            },
+            Err(_) => (CoreApprovalDecision::Deny, "acp_request_failed"),
+        };
+        let _ = approvals_for_task.resolve(
+            &task_approval_id,
+            resolved_by,
+            &local_capabilities,
+            decision,
+        );
+        Ok(())
+    });
+    if spawn.is_err() {
+        let _ = approvals.resolve(
+            &approval_id,
+            "acp_spawn_failed",
+            &local_capabilities,
+            CoreApprovalDecision::Deny,
+        );
+    }
+}
+
 fn build_acp_event_handler(
     connection: CurrentConnection,
     session_id: SessionId,
+    approvals: Arc<ApprovalBroker>,
+    active_tool_calls: ActiveToolCalls,
 ) -> SessionEventHandler {
     Arc::new(move |_sequence, event| {
+        if let CoreSessionEvent::ApprovalRequested { request } = event {
+            route_acp_approval_request(
+                current_cx(&connection),
+                session_id.clone(),
+                Arc::clone(&approvals),
+                Arc::clone(&active_tool_calls),
+                request,
+            );
+            return;
+        }
         let Some(cx) = current_cx(&connection) else {
             return;
         };
@@ -1491,8 +1412,7 @@ fn build_agent_config(
     session_id: SessionId,
     active_tool_calls: ActiveToolCalls,
     events: Arc<SessionEventRouter>,
-    approvals: Arc<ApprovalBroker>,
-    safety: Arc<crate::safety::SafetyPolicy>,
+    tool_lifecycle: Arc<CanonicalToolLifecycle>,
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
     system_prompt: String,
@@ -1518,9 +1438,7 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             Arc::clone(&active_tool_calls),
-            Arc::clone(&events),
-            approvals,
-            safety,
+            Arc::clone(&tool_lifecycle),
             Arc::clone(&diff_stash),
             workspace.to_path_buf(),
             terminal_output,
@@ -1529,7 +1447,7 @@ fn build_agent_config(
             Arc::clone(&connection),
             session_id.clone(),
             Arc::clone(&active_tool_calls),
-            Arc::clone(&events),
+            tool_lifecycle,
             diff_stash,
             workspace.to_path_buf(),
         )),
@@ -1907,7 +1825,10 @@ fn canonical_assistant_outcome(turn: &TurnResult) -> CoreAssistantOutcome {
     }
 }
 
-fn emit_assistant_done(events: &SessionEventRouter, session_id: &SessionId, turn: &TurnResult) {
+fn canonical_assistant_outcome_with_logging(
+    session_id: &SessionId,
+    turn: &TurnResult,
+) -> CoreAssistantOutcome {
     let outcome = canonical_assistant_outcome(turn);
     if let CoreAssistantOutcome::Errored { message, .. } = &outcome {
         tracing::Span::current().record("error.type", "provider_error");
@@ -1921,6 +1842,11 @@ fn emit_assistant_done(events: &SessionEventRouter, session_id: &SessionId, turn
         // scrubbed, and is never included in the canonical event.
         log_raw_provider_error(session_id, message, turn.error_message.as_deref());
     }
+    outcome
+}
+
+fn emit_assistant_done(events: &SessionEventRouter, session_id: &SessionId, turn: &TurnResult) {
+    let outcome = canonical_assistant_outcome_with_logging(session_id, turn);
     let _ = events.emit(CoreSessionEvent::AssistantDone { outcome });
 }
 
@@ -2036,15 +1962,71 @@ fn message_has_images(message: &CoreMessage) -> bool {
         .any(|block| matches!(block, CoreBlock::Image { .. }))
 }
 
-fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
-    if ids.len() > user_turn_count {
-        let excess = ids.len() - user_turn_count;
-        ids.drain(..excess);
-    } else if ids.len() < user_turn_count {
-        let mut padding = vec![String::new(); user_turn_count - ids.len()];
-        padding.append(ids);
-        *ids = padding;
+async fn run_acp_direct_command(
+    handle: &SessionHandle,
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    command: AcpCommand,
+    client_user_message_id: Option<&str>,
+) -> Result<AcpStopReason, TurnError> {
+    let active_turn = handle.core.begin_turn()?;
+    let mut agent_session = handle.core.session.lock().await;
+    {
+        let mut client_ids = handle.core.client_user_message_ids.lock().await;
+        align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
+        if let Some(id) = client_user_message_id {
+            if client_ids.iter().any(|existing| existing == id) {
+                send_notification(
+                    cx,
+                    session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                        TextContent::new(format!("duplicate client user message id '{id}'")),
+                    ))),
+                );
+                return Ok(AcpStopReason::EndTurn);
+            }
+        }
     }
+    *handle
+        .connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cx.clone());
+    let model = handle
+        .core
+        .current_model
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Err(error) = handle.core.prepare_model(&mut agent_session, &model).await {
+        send_notification(
+            cx,
+            session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                TextContent::new(error),
+            ))),
+        );
+        return Ok(AcpStopReason::EndTurn);
+    }
+
+    let response = run_acp_command(command, &mut agent_session);
+    let cleared_history = (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
+    if command == AcpCommand::Clear {
+        handle.core.client_user_message_ids.lock().await.clear();
+    }
+    drop(agent_session);
+
+    if let Some(messages) = cleared_history {
+        handle.core.persist(&model, &messages, &[]);
+    }
+    send_notification(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+            TextContent::new(response),
+        ))),
+    );
+    drop(active_turn);
+    Ok(AcpStopReason::EndTurn)
 }
 
 /// Run one prompt turn against `handle`, racing it against `session/cancel`.
@@ -2058,47 +2040,50 @@ async fn run_prompt_turn(
     client_user_message_id: Option<String>,
     assistant_prefix: Option<String>,
 ) -> Result<AcpStopReason, TurnError> {
-    // Claim the transport-independent turn slot before waiting on session
-    // state. A second prompt for this session is rejected immediately instead
-    // of queueing behind the active provider/tool loop and running later with
-    // stale user intent.
-    let active_turn = match handle.core.begin_turn() {
-        Ok(active_turn) => active_turn,
-        Err(error) => return Err(error),
-    };
-    let mut agent_session = handle.core.session.lock().await;
-    {
-        let mut client_ids = handle.core.client_user_message_ids.lock().await;
-        align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
-        if let Some(id) = client_user_message_id.as_deref() {
-            if client_ids.iter().any(|existing| existing == id) {
-                let message = format!("duplicate client user message id '{id}'");
-                send_notification(
-                    cx,
-                    session_id,
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
-                        TextContent::new(message),
-                    ))),
-                );
-                return Ok(AcpStopReason::EndTurn);
-            }
-        }
+    if let Some(command) = direct_command_text(&user_message).and_then(parse_acp_command) {
+        return run_acp_direct_command(
+            handle,
+            cx,
+            session_id,
+            command,
+            client_user_message_id.as_deref(),
+        )
+        .await;
     }
-    // Now that we hold the lock, refresh the connection handle with *this*
-    // dispatch's cx — see `CurrentConnection`'s doc comment for why.
-    *handle.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.clone());
 
-    // Apply the picker's current model selection before the turn — a switch
-    // made via session/set_config_option takes effect on the next prompt.
-    let model = handle
-        .core
-        .current_model
+    *handle
+        .connection
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let context_window = match handle.core.prepare_model(&mut agent_session, &model).await {
-        Ok(window) => window,
-        Err(error) => {
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cx.clone());
+    let canonical_user_text = canonical_user_message_text(&user_message);
+
+    let execution = handle
+        .core
+        .prompt(
+            user_message,
+            canonical_user_text,
+            client_user_message_id,
+            assistant_prefix,
+            || {
+                cancel_active_tool_calls(cx, session_id, &handle.active_tool_calls);
+            },
+            |turn| canonical_assistant_outcome_with_logging(session_id, turn),
+        )
+        .await;
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(SessionPromptError::Busy) => return Err(TurnError::Busy),
+        Err(SessionPromptError::DuplicateRequest(id)) => {
+            send_notification(
+                cx,
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                    TextContent::new(format!("duplicate client user message id '{id}'")),
+                ))),
+            );
+            return Ok(AcpStopReason::EndTurn);
+        }
+        Err(SessionPromptError::Model(error)) => {
             send_notification(
                 cx,
                 session_id,
@@ -2110,113 +2095,14 @@ async fn run_prompt_turn(
         }
     };
 
-    if let Some(command) = direct_command_text(&user_message).and_then(parse_acp_command) {
-        let response = run_acp_command(command, &mut agent_session);
-        let cleared_history =
-            (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
-        if command == AcpCommand::Clear {
-            handle.core.client_user_message_ids.lock().await.clear();
-        }
-        drop(agent_session);
-
-        if let Some(messages) = cleared_history {
-            handle.core.persist(&model, &messages, &[]);
-        }
-        let chunk = ContentChunk::new(AcpContentBlock::Text(TextContent::new(response)));
-        send_notification(cx, session_id, SessionUpdate::AgentMessageChunk(chunk));
-        return Ok(AcpStopReason::EndTurn);
-    }
-
-    let user_text = canonical_user_message_text(&user_message);
-    let _ = handle
-        .core
-        .events
-        .emit(CoreSessionEvent::UserMessage { text: user_text });
-
-    // Stream the prefix at the start of the turn, but do not put it in the
-    // provider's input context. On successful completion below, it becomes a
-    // real leading assistant history message for persistence and replay.
-    // Direct commands returned above intentionally do not receive a prefix.
-    if let Some(prefix) = assistant_prefix.as_ref() {
-        let _ = handle.core.events.emit(CoreSessionEvent::AssistantDelta {
-            text: prefix.clone(),
-        });
-    }
-
-    let outcome = tokio::select! {
-        turn = agent_session.prompt_message(user_message) => Some(turn),
-        _ = active_turn.cancelled() => None,
-    };
-    if outcome.is_some() {
-        // Claim completion immediately: a cancel arriving during the
-        // bookkeeping below must not relabel a finished turn as cancelled
-        // (canonical `Cancelled` against an ACP `EndTurn`).
-        active_turn.mark_completed();
-    }
-    if outcome.is_none() {
-        // Dropping the prompt future skips normal approval/tool completion.
-        // Cleanup must precede `SessionTurn::drop`, the single terminal emitter.
-        cleanup_cancelled_turn(handle, cx, session_id);
-    }
-    if outcome.is_some() {
-        if let Some(prefix) = assistant_prefix {
-            if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
-                tracing::error!(
-                    target: "daimonos::acp",
-                    event = "assistant_turn_prefix_insert_failed",
-                    session_id = %session_id,
-                    error = %error,
-                );
-            }
-        }
-    }
-
-    // Snapshot the updated history while we still hold the session lock, so we
-    // can persist it after releasing the lock (cross-process session/load
-    // resume). A cancelled turn leaves history unchanged (prompt is
-    // cancel-safe), so we only persist on completion.
-    let history_snapshot = outcome.as_ref().map(|_| agent_session.history().to_vec());
-    let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
-    let client_ids_snapshot = if outcome.is_some() {
-        let mut client_ids = handle.core.client_user_message_ids.lock().await;
-        client_ids.push(client_user_message_id.unwrap_or_default());
-        let user_turn_count = agent_session.user_turn_count();
-        align_client_user_message_ids(&mut client_ids, user_turn_count);
-        Some(client_ids.clone())
-    } else {
-        None
-    };
-    drop(agent_session);
-    // Emit usage before dropping the turn: `SessionTurn::drop` writes the
-    // terminal status, and an event landing after it detaches from the turn for
-    // any consumer that frames turns by terminal status.
-    if let Some(turn) = outcome.as_ref() {
-        let used_tokens = turn
-            .last_call_usage
-            .prompt_tokens()
-            .saturating_add(turn.last_call_usage.output);
-        let _ = handle
-            .core
-            .events
-            .emit(CoreSessionEvent::ContextUsageChanged {
-                usage: handle.core.context_usage(used_tokens, context_window),
-            });
-        emit_assistant_done(&handle.core.events, session_id, turn);
-    }
-    drop(active_turn);
-
-    if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
-        handle.core.persist(&model, &messages, &client_ids);
-    }
-
-    Ok(match outcome {
-        Some(turn) => {
+    Ok(match execution.outcome {
+        SessionPromptOutcome::Completed(turn) => {
             emit_usage_update(
                 cx,
                 session_id,
-                context_window,
+                execution.context_window,
                 &turn.last_call_usage,
-                cumulative_cost_usd,
+                execution.cumulative_cost_usd,
             );
             // A turn that completes with `Aborted` was terminated by the
             // after-tool-call policy hook, not the client (ADR-006 D5).
@@ -2225,7 +2111,7 @@ async fn run_prompt_turn(
             }
             map_stop_reason(turn.stop_reason)
         }
-        None => {
+        SessionPromptOutcome::Cancelled => {
             // The prompt future lost the select to the `session/cancel`
             // notify: a client-initiated cancellation.
             tracing::Span::current().record("error.type", "client_cancelled");
@@ -2453,7 +2339,15 @@ async fn build_session_handle(
     let events = Arc::new(SessionEventRouter::new(Some(build_acp_event_handler(
         Arc::clone(&connection),
         session_id.clone(),
+        Arc::clone(&approvals),
+        Arc::clone(&active_tool_calls),
     ))));
+    let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
+        Arc::clone(&events),
+        Arc::clone(&approvals),
+        safety,
+        cfg.session.max_active_tool_calls,
+    ));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
@@ -2462,8 +2356,7 @@ async fn build_session_handle(
         session_id.clone(),
         Arc::clone(&active_tool_calls),
         Arc::clone(&events),
-        Arc::clone(&approvals),
-        safety,
+        Arc::clone(&tool_lifecycle),
         token_log,
         state.compaction.policy.clone(),
         crate::prompts::agent_system(cfg).await,
@@ -2496,9 +2389,10 @@ async fn build_session_handle(
         session_workspace,
         state.compaction.clone(),
         context_windows,
-        approvals,
+        Arc::clone(&approvals),
         persistence,
-        events,
+        Arc::clone(&events),
+        Arc::clone(&tool_lifecycle),
     );
     let handle = Arc::new(SessionHandle {
         core,
@@ -3439,10 +3333,17 @@ fn build_agent_with_state(
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clone();
-                                    let (turn_index, tools_exposed) = {
-                                        let session = handle.core.session.lock().await;
-                                        (session.user_turn_count(), session.tool_count())
-                                    };
+                                    // Observability must not wait behind the
+                                    // active turn's long-held session lock: the
+                                    // prompt path owns the atomic Busy check.
+                                    let (turn_index, tools_exposed) = handle
+                                        .core
+                                        .session
+                                        .try_lock()
+                                        .map(|session| {
+                                            (session.user_turn_count(), session.tool_count())
+                                        })
+                                        .unwrap_or((0, 0));
                                     let session_key = session_id.to_string();
                                     let prompt_span = PromptSpan::new(PromptMetadata {
                                         mode: "acp",
@@ -4196,6 +4097,12 @@ mod tests {
         responses: StdMutex<VecDeque<crate::providers::LlmResponse>>,
     }
 
+    struct GatedToolProvider {
+        calls: StdMutex<usize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
     struct ErrorReader;
 
     impl AsyncRead for ErrorReader {
@@ -4259,6 +4166,40 @@ mod tests {
                 }
             }
             response
+        }
+
+        async fn context_window(&self, _model: &str) -> Option<u64> {
+            Some(200_000)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for GatedToolProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            _opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            let call = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let call = *calls;
+                *calls += 1;
+                call
+            };
+            if call == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+                tool_call_resp(
+                    "gated-tool",
+                    "exec",
+                    serde_json::json!({"command": "printf approved"}),
+                )
+            } else {
+                end_turn_resp("done")
+            }
         }
 
         async fn context_window(&self, _model: &str) -> Option<u64> {
@@ -4652,16 +4593,12 @@ mod tests {
 
     #[test]
     fn assistant_prefix_flows_only_through_canonical_delta_event() {
-        let source = include_str!("acp_cmd.rs");
-        let prefix_path = source
-            .split("// Stream the prefix at the start of the turn")
-            .nth(1)
-            .expect("assistant prefix production path")
-            .split("let outcome = tokio::select!")
+        let prefix_path = include_str!("session_core.rs")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("assistant prefix block");
+            .expect("session core production source");
         assert!(
-            prefix_path.contains("emit(CoreSessionEvent::AssistantDelta"),
+            prefix_path.contains("emit(SessionEvent::AssistantDelta"),
             "assistant prefix must enter the canonical stream"
         );
         assert!(
@@ -5376,6 +5313,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_prompt_does_not_break_active_turn_permission_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let make_provider: ProviderFactory = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                Ok(Box::new(GatedToolProvider {
+                    calls: StdMutex::new(0),
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }) as Box<dyn LlmProvider>)
+            })
+        };
+        let agent = build_agent(
+            make_provider,
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy {
+                approval_mode: crate::safety::ApprovalMode::Interactive,
+                ..crate::safety::SafetyPolicy::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let permission_seen = Arc::new(AtomicBool::new(false));
+        let permission_seen_for_handler = Arc::clone(&permission_seen);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    permission_seen_for_handler.store(true, Ordering::Release);
+                    let option_id = request.options.first().unwrap().option_id.clone();
+                    responder.respond(
+                        agent_client_protocol::schema::v1::RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
+                                    option_id,
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let first_prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("first"))],
+                    ))
+                    .block_task();
+
+                tokio::time::timeout(Duration::from_secs(2), started.notified())
+                    .await
+                    .expect("first prompt must enter the provider");
+                let second_prompt = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![AcpContentBlock::Text(TextContent::new("second"))],
+                        ))
+                        .block_task(),
+                )
+                .await;
+                release.notify_one();
+                let response = tokio::time::timeout(Duration::from_secs(5), first_prompt)
+                    .await
+                    .expect("first prompt must still complete after the busy rejection")?;
+                assert!(
+                    matches!(second_prompt, Ok(Err(_))),
+                    "overlapping prompt must be rejected promptly as busy: {second_prompt:?}"
+                );
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
+        assert!(
+            permission_seen.load(Ordering::Acquire),
+            "the active turn's permission request must still reach the client"
+        );
+    }
+
+    #[tokio::test]
     async fn acp_session_cancel_aborts_inflight_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let make_provider: ProviderFactory = Arc::new(|| Ok(Box::new(SlowProvider)));
@@ -5821,6 +5860,11 @@ mod tests {
                 async move |request: agent_client_protocol::schema::v1::RequestPermissionRequest,
                              responder,
                              _cx| {
+                    assert_eq!(
+                        request.tool_call.fields.raw_input,
+                        Some(serde_json::json!({"command": "echo hi"})),
+                        "permission request must show the exact tool input"
+                    );
                     let option_id = request.options.first().map(|o| o.option_id.clone()).unwrap();
                     responder.respond(agent_client_protocol::schema::v1::RequestPermissionResponse::new(
                         RequestPermissionOutcome::Selected(
@@ -7972,6 +8016,123 @@ mod tests {
         assert_eq!(diff.new_text, "new text\n");
     }
 
+    #[tokio::test]
+    async fn canonical_tool_lifecycle_does_not_require_an_acp_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection: CurrentConnection = Arc::new(StdMutex::new(None));
+        let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_handler = Arc::clone(&seen);
+        let events = Arc::new(SessionEventRouter::new(Some(Arc::new(
+            move |_sequence, event| {
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let approvals = Arc::new(ApprovalBroker::new(false));
+        let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
+            Arc::clone(&events),
+            approvals,
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        ));
+        let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "f.txt"}),
+        };
+        let before = build_before_tool_call_hook(
+            Arc::clone(&connection),
+            SessionId::new("session-1"),
+            Arc::clone(&active_tool_calls),
+            Arc::clone(&tool_lifecycle),
+            Arc::clone(&diff_stash),
+            dir.path().to_path_buf(),
+            false,
+        );
+        assert!(matches!(before(&info).await, BeforeHookResult::Allow));
+
+        let after = build_after_tool_call_hook(
+            connection,
+            SessionId::new("session-1"),
+            active_tool_calls,
+            tool_lifecycle,
+            diff_stash,
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            after(&info, "ok", false),
+            AfterHookResult::Continue
+        ));
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                CoreSessionEvent::ToolCallStarted { id, .. },
+                CoreSessionEvent::ToolCallUpdated {
+                    id: updated_id,
+                    status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                },
+                CoreSessionEvent::ToolCallFinished {
+                    id: finished_id,
+                    ok: true,
+                    ..
+                }
+            ] if id == "t1" && updated_id == "t1" && finished_id == "t1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn detached_after_hook_still_releases_acp_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection: CurrentConnection = Arc::new(StdMutex::new(None));
+        let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        let events = Arc::new(SessionEventRouter::default());
+        let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
+            events,
+            Arc::new(ApprovalBroker::new(false)),
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        ));
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "f.txt"}),
+        };
+        assert!(matches!(
+            tool_lifecycle.before(&info).await,
+            BeforeHookResult::Allow
+        ));
+        active_tool_calls.lock().unwrap().insert(
+            info.id.clone(),
+            ActiveToolCall {
+                terminal_output: false,
+                raw_input: Some(info.input.clone()),
+            },
+        );
+
+        let after = build_after_tool_call_hook(
+            connection,
+            SessionId::new("session-1"),
+            Arc::clone(&active_tool_calls),
+            tool_lifecycle,
+            Arc::new(StdMutex::new(HashMap::new())),
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            after(&info, "ok", false),
+            AfterHookResult::Continue
+        ));
+        assert!(
+            active_tool_calls.lock().unwrap().is_empty(),
+            "detach must not leave a completed ACP tool id live"
+        );
+    }
+
     #[test]
     fn diff_for_write_file_new_file_has_no_old_text() {
         let info = ToolCallInfo {
@@ -8250,11 +8411,31 @@ mod tests {
         assert!(!tool_call_update_is_live(&active, "t1", false));
         assert!(!tool_call_update_is_live(&active, "t1", true));
 
-        active.lock().unwrap().insert("t1".to_string(), false);
+        active.lock().unwrap().insert(
+            "t1".to_string(),
+            ActiveToolCall {
+                terminal_output: false,
+                raw_input: Some(serde_json::json!({})),
+            },
+        );
         assert!(tool_call_update_is_live(&active, "t1", false));
         assert!(tool_call_update_is_live(&active, "t1", true));
         assert!(!tool_call_update_is_live(&active, "t1", false));
         assert!(!tool_call_update_is_live(&active, "t1", true));
+    }
+
+    #[test]
+    fn active_tool_call_retains_input_only_for_permission_request() {
+        let info = ToolCallInfo {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "large.txt", "content": "x".repeat(10_000)}),
+        };
+        assert!(ActiveToolCall::new(&info, false, false).raw_input.is_none());
+        assert_eq!(
+            ActiveToolCall::new(&info, false, true).raw_input,
+            Some(info.input)
+        );
     }
 
     /// Run one scripted tool call through the full ACP flow and return the

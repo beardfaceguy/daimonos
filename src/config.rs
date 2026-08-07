@@ -21,6 +21,7 @@ pub struct Config {
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
     pub acp: AcpConfig,
+    pub session: SessionRuntimeConfig,
     pub tui: TuiConfig,
     pub discord: DiscordConfig,
     pub kgl: KglConfig,
@@ -236,6 +237,31 @@ impl Default for LoopDetectorConfig {
 // LLM/provider connection config lives in the agent env file, loaded by the
 // `agent_env` module (vikunja #949). This TOML section contains only ACP
 // protocol-server operational limits.
+
+/// Transport-independent daemon-owned session limits (ADR-010).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SessionRuntimeConfig {
+    /// Maximum tool calls simultaneously tracked by one agent session.
+    pub max_active_tool_calls: usize,
+}
+
+impl Default for SessionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_active_tool_calls: 16,
+        }
+    }
+}
+
+impl SessionRuntimeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_active_tool_calls == 0 {
+            return Err("session.max_active_tool_calls must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
@@ -1099,6 +1125,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.index.validate()?;
         self.acp.validate()?;
+        self.session.validate()?;
         self.tui.validate()?;
         self.process.validate()?;
         self.tool_output.validate()?;
@@ -1378,6 +1405,7 @@ mod tests {
         assert_eq!(cfg.search.default_grep_max, 100);
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.acp.session_list_page_size, 50);
+        assert_eq!(cfg.session.max_active_tool_calls, 16);
         assert_eq!(cfg.tui.history_entries, DEFAULT_TUI_HISTORY_ENTRIES);
         assert_eq!(cfg.tui.scrollback_entries, DEFAULT_TUI_SCROLLBACK_ENTRIES);
         assert_eq!(cfg.process.poll_tail_lines, 20);
@@ -1651,6 +1679,19 @@ mod tests {
             .validate()
             .expect_err("zero page size must be rejected")
             .contains("acp.session_list_page_size"));
+    }
+
+    #[test]
+    fn session_active_tool_limit_parses_and_must_be_positive() {
+        let cfg: Config = toml::from_str("[session]\nmax_active_tool_calls = 8\n").unwrap();
+        assert_eq!(cfg.session.max_active_tool_calls, 8);
+        assert!(cfg.validate().is_ok());
+
+        let invalid: Config = toml::from_str("[session]\nmax_active_tool_calls = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero active tool limit must be rejected")
+            .contains("session.max_active_tool_calls"));
     }
 
     #[test]
