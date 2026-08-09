@@ -970,8 +970,8 @@
     "semantic_hash": ""
   },
   "src/session_protocol.rs": {
-    "mtime": 1786255862.7290797,
-    "ast_hash": "6061ac6b99b99d64124cc7acf5259adb",
+    "mtime": 1786300706.6440363,
+    "ast_hash": "a10ea704aa5fa110c985cf01720dba75",
     "semantic_hash": ""
   },
   "src/client_transport.rs": {
@@ -985,8 +985,8 @@
     "semantic_hash": ""
   },
   "src/session_core.rs": {
-    "mtime": 1786255820.72353,
-    "ast_hash": "f29f524641d73599933d594b6f850b99",
+    "mtime": 1786300688.4942346,
+    "ast_hash": "6caba114a4876af13fb02b8fb638d01d",
     "semantic_hash": ""
   },
   "benchmarks/analyze.py": {
@@ -1125,8 +1125,8 @@
     "semantic_hash": ""
   },
   "src/tui/state.rs": {
-    "mtime": 1786250964.4307792,
-    "ast_hash": "1616d4b5642d2af072b84a8a6e44fc6d",
+    "mtime": 1786300992.337915,
+    "ast_hash": "fa1c2cd8bb96baab746007d7b5166505",
     "semantic_hash": ""
   },
   "docs/adr/011-interactive-terminal-ui.md": {
@@ -1185,8 +1185,8 @@
     "semantic_hash": ""
   },
   "src/session_daemon.rs": {
-    "mtime": 1786256437.54592,
-    "ast_hash": "7eb4027b281ca108a5f2cc5d5349ee8d",
+    "mtime": 1786300758.5914688,
+    "ast_hash": "ea30d424ac79cea48acbc55ca37762b3",
     "semantic_hash": ""
   },
   "src/session_factory.rs": {

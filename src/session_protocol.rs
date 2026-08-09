@@ -285,6 +285,8 @@ pub struct SessionSnapshot {
     pub pending_approvals: Vec<ApprovalRequest>,
     pub runtime_options: Vec<RuntimeOption>,
     pub context_usage: Option<ContextUsage>,
+    #[serde(default)]
+    pub history_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,6 +876,7 @@ mod tests {
             pending_approvals: vec![],
             runtime_options: vec![],
             context_usage: Some(ContextUsage::new(50, Some(200), 0, None)),
+            history_truncated: false,
         };
         let message = ServerMessage::Snapshot {
             seq: snapshot.seq,

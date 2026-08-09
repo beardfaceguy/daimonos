@@ -483,6 +483,7 @@ impl SessionDaemon {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_some_and(|detached| now.duration_since(detached) >= retention)
+                && entry.active_prompt_tasks.load(Ordering::Acquire) == 0
                 && !entry.core.turn.is_active();
             if !still_idle {
                 continue;
@@ -1494,6 +1495,7 @@ impl SnapshotState {
                 pending_approvals: Vec::new(),
                 runtime_options: Vec::new(),
                 context_usage: None,
+                history_truncated: false,
             },
             max_entries,
             next_transcript_id: 1,
@@ -1709,11 +1711,15 @@ fn fit_snapshot_to_frame(
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
+    snapshot.history_truncated = true;
+    let mut stripped_output = false;
     for call in &mut snapshot.tool_calls {
         if tool_call_is_terminal(call) {
+            stripped_output |= call.output.is_some();
             call.output = None;
         }
     }
+    snapshot.history_truncated |= stripped_output;
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
@@ -1731,6 +1737,7 @@ fn fit_snapshot_to_frame(
         }
     }
     snapshot.transcript = transcript[low..].to_vec();
+    snapshot.history_truncated |= low > 0;
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
@@ -1752,6 +1759,7 @@ fn fit_snapshot_to_frame(
         }
     }
     snapshot.tool_calls = tool_calls_without_oldest_terminal(&tool_calls, low);
+    snapshot.history_truncated |= low > 0;
     if fits(&snapshot)? {
         Ok(snapshot)
     } else {
@@ -2708,6 +2716,7 @@ mod tests {
 
         assert!(encoded.len() <= 1_024);
         assert!(fitted.transcript.len() < 100);
+        assert!(fitted.history_truncated);
     }
 
     #[tokio::test]
@@ -3420,6 +3429,43 @@ mod tests {
         daemon.evict_idle_sessions().await;
 
         assert!(daemon.session("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_retention_preserves_pending_prompt_admission() {
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(10)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        );
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        *entry
+            .last_detached_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(20));
+        entry.active_prompt_tasks.store(1, Ordering::Release);
+
+        daemon.evict_idle_sessions().await;
+        assert!(daemon.session("session-1").is_some());
+
+        entry.active_prompt_tasks.store(0, Ordering::Release);
+        daemon.evict_idle_sessions().await;
+        assert!(daemon.session("session-1").is_none());
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ pub struct ViewState {
     pending_approvals: Vec<ApprovalRequest>,
     runtime_options: Vec<RuntimeOption>,
     context_usage: Option<ContextUsage>,
+    history_truncated: bool,
     max_scrollback_entries: usize,
     /// Set once a `SessionEnding` event arrives; a renderer can surface this
     /// and stop accepting input.
@@ -95,6 +96,7 @@ impl ViewState {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
             max_scrollback_entries: max_scrollback_entries.max(1),
             ending_reason: None,
         }
@@ -125,6 +127,9 @@ impl ViewState {
     }
     pub fn context_usage(&self) -> Option<&ContextUsage> {
         self.context_usage.as_ref()
+    }
+    pub fn history_truncated(&self) -> bool {
+        self.history_truncated
     }
     pub fn ending_reason(&self) -> Option<&str> {
         self.ending_reason.as_deref()
@@ -173,6 +178,7 @@ impl ViewState {
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
+        self.history_truncated = snapshot.history_truncated;
         self.trim_scrollback();
         // A snapshot is a full canonical resync of live session state, so any
         // `ending_reason` observed before a reconnect must clear: if the
@@ -710,11 +716,13 @@ mod tests {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: true,
         };
         s.apply_snapshot(snap);
         assert_eq!(s.session_id(), "sess-42");
         assert_eq!(s.last_seq(), 10);
         assert_eq!(s.transcript().len(), 2);
+        assert!(s.history_truncated());
 
         // A pre-snapshot sequence is now a duplicate.
         assert_eq!(
@@ -773,6 +781,7 @@ mod tests {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
         });
 
         assert_eq!(restored.transcript(), live.transcript());
@@ -807,6 +816,7 @@ mod tests {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
         });
         assert_eq!(restored.transcript(), live.transcript());
     }
@@ -834,6 +844,7 @@ mod tests {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
         };
         s.apply_snapshot(snap);
         assert_eq!(

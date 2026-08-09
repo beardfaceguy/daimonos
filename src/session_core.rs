@@ -772,6 +772,7 @@ impl SessionCore {
             pending_approvals: self.approvals.pending(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
         }
     }
 
