@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +10,7 @@ pub enum ClientCapability {
     Observe,
     Prompt,
     Interrupt,
+    Stop,
     ApproveOnce,
     ApproveAlways,
 }
@@ -48,6 +49,8 @@ pub enum ApprovalDecision {
 pub enum ClientMessage {
     Attach {
         protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         ticket: Option<String>,
         client: ClientInfo,
         requested_capabilities: Vec<ClientCapability>,
@@ -62,6 +65,13 @@ pub enum ClientMessage {
     },
     Interrupt {
         request_id: Option<String>,
+    },
+    StopSession {
+        request_id: String,
+    },
+    ListSessions {
+        request_id: String,
+        cursor: Option<String>,
     },
     SyncRequest {
         last_seen_seq: u64,
@@ -99,6 +109,16 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+    CommandResult {
+        request_id: String,
+        operation: String,
+        changed: bool,
+    },
+    SessionList {
+        request_id: String,
+        sessions: Vec<SessionListEntry>,
+        next_cursor: Option<String>,
+    },
     Pong,
     Revoked {
         reason: String,
@@ -132,6 +152,15 @@ pub struct TranscriptEntry {
     pub id: u64,
     pub role: TranscriptRole,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AssistantOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListEntry {
+    pub session_id: String,
+    pub active: bool,
+    pub attached_clients: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,7 +250,7 @@ pub enum SessionEvent {
     },
     ToolCallFinished {
         id: String,
-        ok: bool,
+        status: ToolCallStateStatus,
         output: String,
     },
     ApprovalRequested {
@@ -256,6 +285,8 @@ pub struct SessionSnapshot {
     pub pending_approvals: Vec<ApprovalRequest>,
     pub runtime_options: Vec<RuntimeOption>,
     pub context_usage: Option<ContextUsage>,
+    #[serde(default)]
+    pub history_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +467,7 @@ pub fn validate_next_sequence(previous: Option<u64>, next: u64) -> Result<(), Se
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolLimits {
+    pub max_frame_bytes: usize,
     /// UTF-8 byte cap. Validation rejects; it never truncates at this boundary.
     pub max_prompt_bytes: usize,
     /// UTF-8 byte cap. Validation rejects; it never truncates at this boundary.
@@ -457,6 +489,19 @@ pub enum ProtocolValidationError {
     },
 }
 
+impl std::fmt::Display for ProtocolValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FieldTooLarge { field, max_bytes } => {
+                write!(formatter, "{field} exceeds {max_bytes} bytes")
+            }
+            Self::TooManyCapabilities { max } => {
+                write!(formatter, "requested capabilities exceed limit {max}")
+            }
+        }
+    }
+}
+
 impl ProtocolLimits {
     pub fn validate_client_message(
         &self,
@@ -468,12 +513,18 @@ impl ProtocolLimits {
         };
         let error = match message {
             ClientMessage::Attach {
+                session_id,
                 ticket,
                 client,
                 requested_capabilities,
                 ..
             } => check("attach.client.id", &client.id, self.max_identifier_bytes)
                 .or_else(|| check("attach.client.label", &client.label, self.max_label_bytes))
+                .or_else(|| {
+                    session_id.as_deref().and_then(|session_id| {
+                        check("attach.session_id", session_id, self.max_identifier_bytes)
+                    })
+                })
                 .or_else(|| {
                     ticket
                         .as_deref()
@@ -498,6 +549,21 @@ impl ProtocolLimits {
             ClientMessage::Interrupt { request_id } => request_id
                 .as_deref()
                 .and_then(|id| check("interrupt.request_id", id, self.max_identifier_bytes)),
+            ClientMessage::StopSession { request_id } => check(
+                "stop_session.request_id",
+                request_id,
+                self.max_identifier_bytes,
+            ),
+            ClientMessage::ListSessions { request_id, cursor } => check(
+                "list_sessions.request_id",
+                request_id,
+                self.max_identifier_bytes,
+            )
+            .or_else(|| {
+                cursor.as_deref().and_then(|cursor| {
+                    check("list_sessions.cursor", cursor, self.max_identifier_bytes)
+                })
+            }),
             ClientMessage::SetConfig { config_id, value } => {
                 check("set_config.config_id", config_id, self.max_identifier_bytes).or_else(|| {
                     if let RuntimeValue::String(value) = value {
@@ -558,6 +624,7 @@ mod tests {
     fn attach_and_server_event_round_trip() {
         let attach = ClientMessage::Attach {
             protocol_version: PROTOCOL_VERSION,
+            session_id: None,
             ticket: Some("opaque-ticket".to_string()),
             client: client(),
             requested_capabilities: vec![
@@ -582,6 +649,70 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&encoded).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn attach_optionally_selects_a_persisted_session() {
+        let selected = ClientMessage::Attach {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: Some("session-42".to_string()),
+            ticket: None,
+            client: client(),
+            requested_capabilities: vec![ClientCapability::Observe],
+        };
+        assert_eq!(
+            serde_json::to_value(&selected).unwrap(),
+            json!({
+                "type": "attach",
+                "protocol_version": PROTOCOL_VERSION,
+                "session_id": "session-42",
+                "ticket": null,
+                "client": client(),
+                "requested_capabilities": ["observe"]
+            })
+        );
+
+        let create_new = json!({
+            "type": "attach",
+            "protocol_version": PROTOCOL_VERSION,
+            "ticket": null,
+            "client": client(),
+            "requested_capabilities": ["observe"]
+        });
+        assert!(matches!(
+            serde_json::from_value::<ClientMessage>(create_new).unwrap(),
+            ClientMessage::Attach {
+                session_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stop_session_has_stable_wire_shape_and_identifier_limit() {
+        let message = ClientMessage::StopSession {
+            request_id: "stop-1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            json!({"type": "stop_session", "request_id": "stop-1"})
+        );
+        let limits = ProtocolLimits {
+            max_frame_bytes: 1_024,
+            max_prompt_bytes: 64,
+            max_label_bytes: 64,
+            max_identifier_bytes: 4,
+            max_ticket_bytes: 64,
+            max_runtime_value_bytes: 64,
+            max_capabilities: 8,
+        };
+        assert_eq!(
+            limits.validate_client_message(&message),
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "stop_session.request_id",
+                max_bytes: 4,
+            })
         );
     }
 
@@ -635,6 +766,7 @@ mod tests {
         assert!(has_capability(&granted, ClientCapability::Observe));
         assert!(has_capability(&granted, ClientCapability::Prompt));
         assert!(!has_capability(&granted, ClientCapability::Interrupt));
+        assert!(!has_capability(&granted, ClientCapability::Stop));
         assert!(!has_capability(&granted, ClientCapability::ApproveOnce));
         assert!(!has_capability(&granted, ClientCapability::ApproveAlways));
     }
@@ -732,6 +864,7 @@ mod tests {
                 id: 1,
                 role: TranscriptRole::Assistant,
                 text: "done".to_string(),
+                outcome: Some(AssistantOutcome::Completed),
             }],
             tool_calls: vec![ToolCallState {
                 id: "t1".to_string(),
@@ -743,6 +876,7 @@ mod tests {
             pending_approvals: vec![],
             runtime_options: vec![],
             context_usage: Some(ContextUsage::new(50, Some(200), 0, None)),
+            history_truncated: false,
         };
         let message = ServerMessage::Snapshot {
             seq: snapshot.seq,
@@ -779,7 +913,7 @@ mod tests {
 
         let explicit_output = SessionEvent::ToolCallFinished {
             id: "t1".to_string(),
-            ok: true,
+            status: ToolCallStateStatus::Completed,
             output: "explicit tool output".to_string(),
         };
         assert!(serde_json::to_string(&explicit_output)
@@ -810,6 +944,7 @@ mod tests {
     #[test]
     fn protocol_limits_reject_oversized_untrusted_fields() {
         let limits = ProtocolLimits {
+            max_frame_bytes: 1_024,
             max_prompt_bytes: 8,
             max_label_bytes: 6,
             max_identifier_bytes: 4,
@@ -836,6 +971,7 @@ mod tests {
         assert_eq!(
             limits.validate_client_message(&ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
+                session_id: None,
                 ticket: None,
                 client: ClientInfo {
                     id: "id".to_string(),
@@ -854,6 +990,7 @@ mod tests {
     #[test]
     fn protocol_limits_cover_all_untrusted_identifiers_tickets_and_values() {
         let limits = ProtocolLimits {
+            max_frame_bytes: 1_024,
             max_prompt_bytes: 64,
             max_label_bytes: 64,
             max_identifier_bytes: 4,
@@ -906,6 +1043,7 @@ mod tests {
         assert_eq!(
             limits.validate_client_message(&ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
+                session_id: None,
                 ticket: Some("1234567".to_string()),
                 client: ClientInfo {
                     id: "id".to_string(),
@@ -922,6 +1060,21 @@ mod tests {
         assert_eq!(
             limits.validate_client_message(&ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
+                session_id: Some("12345".to_string()),
+                ticket: None,
+                client: ClientInfo {
+                    id: "id".to_string(),
+                    kind: ClientKind::Android,
+                    label: "phone".to_string(),
+                },
+                requested_capabilities: vec![ClientCapability::Observe],
+            }),
+            Err(too_large("attach.session_id"))
+        );
+        assert_eq!(
+            limits.validate_client_message(&ClientMessage::Attach {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: None,
                 ticket: None,
                 client: ClientInfo {
                     id: "12345".to_string(),
@@ -935,6 +1088,7 @@ mod tests {
         assert_eq!(
             limits.validate_client_message(&ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
+                session_id: None,
                 ticket: None,
                 client: ClientInfo {
                     id: "id".to_string(),

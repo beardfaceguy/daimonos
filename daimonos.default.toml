@@ -87,10 +87,43 @@ max_script_subcalls = 32
 max_script_subcall_batch = 16
 
 [session]
+# Optional local session-daemon socket override. By default the path is derived
+# from a stable hash of the canonical workspace so distinct projects can run
+# simultaneously. `~` expands to the current home.
+# socket_path = "~/.daimonos/custom-session.sock"
 # Maximum in-flight tool calls tracked by one daemon-owned agent session.
 # Current execution is sequential; this bound also covers future parallel
 # tool batches without coupling lifecycle admission to cache sizing.
 max_active_tool_calls = 16
+# Maximum live sessions retained by the interactive session daemon.
+max_sessions = 64
+# Maximum local/remote clients simultaneously attached to one session.
+max_clients_per_session = 4
+# Maximum canonical events waiting for each attached client.
+event_queue_capacity = 256
+# Maximum transcript entries and tool calls retained in a full attach snapshot.
+snapshot_entries = 2000
+# Maximum seconds a daemon approval can wait before safe denial.
+approval_timeout_secs = 30
+# Maximum UTF-8 bytes retained from one tool result in canonical events.
+max_tool_event_output_bytes = 65536
+# Backoff after a recoverable Unix listener accept failure.
+accept_error_backoff_ms = 100
+# Unload detached idle sessions from memory after this many seconds while
+# preserving their durable record for reattach. 0 keeps cores resident.
+idle_retention_secs = 300
+# Maximum entries returned by one daemon session-list page.
+session_list_page_size = 50
+# Grace period for daemon-owned prompt/client tasks during shutdown.
+shutdown_grace_secs = 5
+# Maximum newline-delimited JSON frame and untrusted protocol field sizes.
+max_frame_bytes = 1048576
+max_prompt_bytes = 131072
+max_label_bytes = 256
+max_identifier_bytes = 128
+max_ticket_bytes = 1024
+max_runtime_value_bytes = 4096
+max_capabilities = 16
 
 [tool_output]
 # Optional directory for complete outputs replaced by bounded previews.

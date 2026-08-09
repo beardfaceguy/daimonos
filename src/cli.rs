@@ -69,6 +69,22 @@ pub struct AcpArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SessionDaemonArgs {
+    /// Local Unix socket override (default: session.socket_path).
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Model override (default: from the agent env file).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// LLM provider override (default: from the agent env file).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Path to the agent env file.
+    #[arg(long)]
+    pub agent_env: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct McpArgs {
     /// Serve MCP over this Unix socket instead of stdio.
     #[arg(long, value_name = "PATH")]
@@ -83,6 +99,8 @@ pub enum Command {
     Chat(ChatArgs),
     /// Run a native Agent Client Protocol engine over stdio.
     Acp(AcpArgs),
+    /// Run the persistent local interactive-session daemon.
+    SessionDaemon(SessionDaemonArgs),
     /// Run the MCP tool server over stdio or a Unix socket.
     Mcp(McpArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
@@ -94,6 +112,7 @@ pub enum RuntimeMode {
     Agent,
     Chat,
     Acp,
+    SessionDaemon,
     McpStdio,
     McpSocket(PathBuf),
     Daemon,
@@ -106,6 +125,7 @@ impl RuntimeMode {
             Self::Agent => "agent",
             Self::Chat => "chat",
             Self::Acp => "acp",
+            Self::SessionDaemon => "session_daemon",
             Self::McpStdio => "mcp_stdio",
             Self::McpSocket(_) => "mcp_socket",
             Self::Daemon => "socket",
@@ -193,6 +213,7 @@ impl Cli {
             Some(Command::Agent(_)) => RuntimeMode::Agent,
             Some(Command::Chat(_)) => RuntimeMode::Chat,
             Some(Command::Acp(_)) => RuntimeMode::Acp,
+            Some(Command::SessionDaemon(_)) => RuntimeMode::SessionDaemon,
             Some(Command::Mcp(args)) => args
                 .socket
                 .clone()
@@ -251,6 +272,10 @@ mod tests {
         );
         assert_eq!(mode(&["daimonos", "chat", "--list"]), RuntimeMode::Chat);
         assert_eq!(mode(&["daimonos", "acp"]), RuntimeMode::Acp);
+        assert_eq!(
+            mode(&["daimonos", "session-daemon"]),
+            RuntimeMode::SessionDaemon
+        );
         assert_eq!(mode(&["daimonos", "--stats"]), RuntimeMode::Stats);
     }
 

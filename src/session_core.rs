@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
@@ -8,7 +8,7 @@ use crate::agent::AgentSession;
 use crate::compaction::CompactionPolicy;
 use crate::providers::Message;
 use crate::session_protocol::{
-    ApprovalDecision, ApprovalRequest, ClientCapability, SessionEvent, TurnStatus,
+    ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, SessionEvent, TurnStatus,
 };
 use crate::session_store::SessionStore;
 
@@ -41,6 +41,7 @@ pub struct SessionPromptExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPromptError {
     Busy,
+    Stopped,
     DuplicateRequest(String),
     Model(String),
 }
@@ -49,6 +50,7 @@ impl std::fmt::Display for SessionPromptError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => formatter.write_str("session is busy"),
+            Self::Stopped => formatter.write_str("session is stopped"),
             Self::DuplicateRequest(id) => {
                 write!(formatter, "duplicate client user message id '{id}'")
             }
@@ -59,10 +61,193 @@ impl std::fmt::Display for SessionPromptError {
 
 impl std::error::Error for SessionPromptError {}
 
+fn error_has_token(error: &str, token: &str) -> bool {
+    error
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+fn error_has_http_status(error: &str, status: &str) -> bool {
+    if error_has_token(error, status) {
+        return true;
+    }
+    let compact: String = error
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    ["http", "api", "status"].iter().any(|prefix| {
+        let needle = format!("{prefix}{status}");
+        compact.match_indices(&needle).any(|(index, _)| {
+            compact[index + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_digit())
+        })
+    })
+}
+
+pub(crate) fn safe_provider_error_message(
+    context_overflow: bool,
+    error: Option<&str>,
+) -> &'static str {
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    let normalized = error
+        .replace(['_', '-', '`'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let invalid_tool_history = error_has_http_status(&error, "400")
+        && normalized.contains("tool use ids were found without tool result blocks");
+    if context_overflow
+        || normalized.contains("prompt is too long")
+        || normalized.contains("exceed context limit")
+        || normalized.contains("maximum context length")
+        || normalized.contains("context overflow")
+        || normalized.contains("context length exceeded")
+        || normalized.contains("context window exceeded")
+        || normalized.contains("context window was exceeded")
+    {
+        "Provider rejected the prompt because the context window was exceeded."
+    } else if invalid_tool_history {
+        "Provider rejected invalid tool-call history. Restart/reload the session or use /clear."
+    } else if error_has_http_status(&error, "402")
+        || normalized.contains("insufficient credit")
+        || normalized.contains("payment required")
+    {
+        "Provider billing/credit issue (HTTP 402). Check the provider account balance."
+    } else if error_has_http_status(&error, "401")
+        || normalized.contains("authentication")
+        || normalized.contains("invalid api key")
+        || normalized.contains("unauthorized")
+        || normalized.contains("not authorized")
+    {
+        "Provider authentication failed (HTTP 401)."
+    } else if error_has_http_status(&error, "403")
+        || normalized.contains("permission denied")
+        || normalized.contains("forbidden")
+        || normalized.contains("authorization failed")
+        || normalized.contains("authorization error")
+    {
+        "Provider authorization failed (HTTP 403)."
+    } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
+        "Provider rate limit exceeded (HTTP 429)."
+    } else if normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("time out")
+    {
+        "Provider request timed out."
+    } else if normalized.contains("network")
+        || normalized.contains("connection")
+        || normalized.contains("upstream")
+    {
+        "Provider network request failed."
+    } else if normalized.contains("parse") || normalized.contains("decode") {
+        "Provider returned an invalid response."
+    } else if normalized.contains("stream error")
+        || normalized.contains("stream failed")
+        || normalized.contains("response stream")
+    {
+        "Provider response stream failed."
+    } else {
+        "Provider request failed."
+    }
+}
+
+pub(crate) fn canonical_assistant_outcome(turn: &crate::agent::TurnResult) -> AssistantOutcome {
+    match turn.stop_reason {
+        crate::providers::StopReason::Error => AssistantOutcome::Errored {
+            context_overflow: turn.context_overflow,
+            message: safe_provider_error_message(
+                turn.context_overflow,
+                turn.error_message.as_deref(),
+            )
+            .to_string(),
+        },
+        crate::providers::StopReason::Refusal => AssistantOutcome::Refused,
+        crate::providers::StopReason::Aborted => AssistantOutcome::Aborted,
+        crate::providers::StopReason::MaxTokens => AssistantOutcome::MaxTokens,
+        crate::providers::StopReason::EndTurn | crate::providers::StopReason::ToolUse => {
+            AssistantOutcome::Completed
+        }
+    }
+}
+
+pub(crate) const RAW_ERROR_LOG_CAP: usize = 500;
+
+pub(crate) fn sanitize_provider_error(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(RAW_ERROR_LOG_CAP) + 16);
+    let mut truncated = false;
+    for token in raw.split_inclusive(char::is_whitespace) {
+        let trimmed = token.trim_end();
+        let lower = trimmed.to_ascii_lowercase();
+        let looks_secret = lower.starts_with("bearer")
+            || lower.starts_with("authorization")
+            || lower.starts_with("sk-")
+            || lower.starts_with("or-")
+            || (trimmed.len() >= 20
+                && trimmed.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_".contains(character)
+                }));
+        if looks_secret {
+            out.push_str("[REDACTED]");
+            out.push_str(&token[trimmed.len()..]);
+        } else {
+            out.push_str(token);
+        }
+        if out.len() >= RAW_ERROR_LOG_CAP {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        while !out.is_char_boundary(RAW_ERROR_LOG_CAP.min(out.len())) {
+            out.pop();
+        }
+        out.truncate(RAW_ERROR_LOG_CAP.min(out.len()));
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+pub(crate) fn log_raw_provider_error(
+    session_id: impl std::fmt::Display,
+    class: &str,
+    error: Option<&str>,
+) {
+    if let Some(raw) = error {
+        tracing::debug!(
+            target: "daimonos::session_core",
+            event = "provider_request_raw",
+            session_id = %session_id,
+            class,
+            raw_error = sanitize_provider_error(raw),
+        );
+    }
+}
+
+pub(crate) fn canonical_assistant_outcome_with_logging(
+    session_id: impl std::fmt::Display,
+    turn: &crate::agent::TurnResult,
+) -> AssistantOutcome {
+    let outcome = canonical_assistant_outcome(turn);
+    if let AssistantOutcome::Errored { message, .. } = &outcome {
+        tracing::Span::current().record("error.type", "provider_error");
+        tracing::warn!(
+            target: "daimonos::session_core",
+            event = "provider_request_failed",
+            session_id = %session_id,
+            class = message,
+        );
+        log_raw_provider_error(session_id, message, turn.error_message.as_deref());
+    }
+    outcome
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEventError {
     SequenceExhausted,
     HandlerPanicked,
+    HandlerLimitReached { max: usize },
 }
 
 pub type SessionEventHandler = std::sync::Arc<dyn Fn(u64, SessionEvent) + Send + Sync + 'static>;
@@ -73,19 +258,45 @@ pub type SessionEventHandler = std::sync::Arc<dyn Fn(u64, SessionEvent) + Send +
 /// events to the configured adapter. Reliable replay/ring retention is layered
 /// on this sequence in Vikunja #1100; this layer owns only canonical ordering.
 pub struct SessionEventRouter {
+    dispatch: StdMutex<()>,
     sequence: StdMutex<u64>,
-    handler: Option<SessionEventHandler>,
+    handlers: StdMutex<SessionEventHandlers>,
+}
+
+struct SessionEventHandlers {
+    next_id: u64,
+    fixed_count: usize,
+    entries: HashMap<u64, SessionEventHandler>,
+}
+
+pub struct SessionEventSubscription {
+    router: std::sync::Weak<SessionEventRouter>,
+    handler_id: u64,
 }
 
 impl SessionEventRouter {
     pub fn new(handler: Option<SessionEventHandler>) -> Self {
+        let fixed_count = usize::from(handler.is_some());
+        let mut entries = HashMap::new();
+        if let Some(handler) = handler {
+            entries.insert(0, handler);
+        }
         Self {
+            dispatch: StdMutex::new(()),
             sequence: StdMutex::new(0),
-            handler,
+            handlers: StdMutex::new(SessionEventHandlers {
+                next_id: 1,
+                fixed_count,
+                entries,
+            }),
         }
     }
 
     pub fn emit(&self, event: SessionEvent) -> Result<u64, SessionEventError> {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sequence = {
             let mut current = self
                 .sequence
@@ -96,20 +307,94 @@ impl SessionEventRouter {
                 .ok_or(SessionEventError::SequenceExhausted)?;
             *current
         };
-        if let Some(handler) = &self.handler {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handlers: Vec<SessionEventHandler> = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .values()
+            .cloned()
+            .collect();
+        let mut handler_panicked = false;
+        for handler in handlers {
+            let event = event.clone();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler(sequence, event);
             }))
-            .map_err(|_| SessionEventError::HandlerPanicked)?;
+            .is_err()
+            {
+                handler_panicked = true;
+            }
+        }
+        if handler_panicked {
+            return Err(SessionEventError::HandlerPanicked);
         }
         Ok(sequence)
     }
 
+    pub fn subscribe(
+        self: &Arc<Self>,
+        max_handlers: usize,
+        handler: SessionEventHandler,
+    ) -> Result<SessionEventSubscription, SessionEventError> {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dynamic_count = handlers.entries.len().saturating_sub(handlers.fixed_count);
+        if dynamic_count >= max_handlers {
+            return Err(SessionEventError::HandlerLimitReached { max: max_handlers });
+        }
+        let handler_id = handlers.next_id;
+        handlers.next_id = handlers
+            .next_id
+            .checked_add(1)
+            .ok_or(SessionEventError::SequenceExhausted)?;
+        handlers.entries.insert(handler_id, handler);
+        Ok(SessionEventSubscription {
+            router: Arc::downgrade(self),
+            handler_id,
+        })
+    }
+
+    pub fn subscribe_and_capture<T>(
+        self: &Arc<Self>,
+        max_handlers: usize,
+        handler: SessionEventHandler,
+        capture: impl FnOnce() -> T,
+    ) -> Result<(SessionEventSubscription, T), SessionEventError> {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let subscription = self.subscribe(max_handlers, handler)?;
+        let captured = capture();
+        Ok((subscription, captured))
+    }
+
     pub fn latest_sequence(&self) -> u64 {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *self
             .sequence
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for SessionEventSubscription {
+    fn drop(&mut self) {
+        let Some(router) = self.router.upgrade() else {
+            return;
+        };
+        router
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .remove(&self.handler_id);
     }
 }
 
@@ -165,6 +450,12 @@ impl SessionCompaction {
 pub struct SessionPersistence {
     session_id: String,
     store: SessionStore,
+    state: Arc<StdMutex<SessionPersistenceState>>,
+}
+
+#[derive(Default)]
+struct SessionPersistenceState {
+    deleted: bool,
 }
 
 impl SessionPersistence {
@@ -172,6 +463,7 @@ impl SessionPersistence {
         Self {
             session_id: session_id.into(),
             store,
+            state: Arc::new(StdMutex::new(SessionPersistenceState::default())),
         }
     }
 
@@ -181,14 +473,32 @@ impl SessionPersistence {
         messages: &[Message],
         cwd: &Path,
         client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
     ) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.deleted {
+            return;
+        }
         self.store.save_acp(
             &self.session_id,
             model,
             messages,
             cwd,
             client_user_message_ids,
+            assistant_outcomes,
         );
+    }
+
+    fn delete(&self) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.deleted = true;
+        self.store.delete(&self.session_id)
     }
 }
 
@@ -205,6 +515,7 @@ pub struct SessionCore {
     pub(crate) current_model: StdMutex<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
+    pub(crate) assistant_outcomes: StdMutex<Vec<AssistantOutcome>>,
     pub(crate) compaction: SessionCompaction,
     pub(crate) context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
     pub(crate) events: Arc<SessionEventRouter>,
@@ -213,6 +524,14 @@ pub struct SessionCore {
 }
 
 impl SessionCore {
+    pub async fn has_completed_request(&self, request_id: &str) -> bool {
+        self.client_user_message_ids
+            .lock()
+            .await
+            .iter()
+            .any(|existing| existing == request_id)
+    }
+
     pub fn begin_turn(&self) -> Result<SessionTurn<'_>, TurnError> {
         let active = self.turn.begin()?;
         let _ = self.events.emit(SessionEvent::TurnStatusChanged {
@@ -260,6 +579,7 @@ impl SessionCore {
             current_model: StdMutex::new(current_model),
             cwd,
             client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
+            assistant_outcomes: StdMutex::new(Vec::new()),
             compaction,
             context_windows: tokio::sync::Mutex::new(context_windows),
             events,
@@ -334,7 +654,125 @@ impl SessionCore {
 
     pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
         if let Some(persistence) = &self.persistence {
-            persistence.save(model, messages, &self.cwd, client_user_message_ids);
+            let outcomes = self
+                .assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            persistence.save(
+                model,
+                messages,
+                &self.cwd,
+                client_user_message_ids,
+                &outcomes,
+            );
+        }
+    }
+
+    pub fn delete_persisted(&self) -> std::io::Result<bool> {
+        match &self.persistence {
+            Some(persistence) => persistence.delete(),
+            None => Ok(false),
+        }
+    }
+
+    pub async fn initial_snapshot(
+        &self,
+        session_id: String,
+        max_entries: usize,
+    ) -> crate::session_protocol::SessionSnapshot {
+        use crate::providers::{ContentBlock, Role};
+        use crate::session_protocol::{
+            ToolCallState, ToolCallStateStatus, TranscriptEntry, TranscriptRole,
+        };
+
+        let session = self.session.lock().await;
+        let mut transcript = Vec::new();
+        let mut tool_calls: Vec<ToolCallState> = Vec::new();
+        let mut next_transcript_id = 1_u64;
+        for message in session.history() {
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text(text) => {
+                        transcript.push(TranscriptEntry {
+                            id: next_transcript_id,
+                            role: match message.role {
+                                Role::User => TranscriptRole::User,
+                                Role::Assistant => TranscriptRole::Assistant,
+                            },
+                            text: text.clone(),
+                            outcome: None,
+                        });
+                        next_transcript_id = next_transcript_id.saturating_add(1);
+                    }
+                    ContentBlock::Thinking(text) => {
+                        transcript.push(TranscriptEntry {
+                            id: next_transcript_id,
+                            role: TranscriptRole::Thought,
+                            text: text.clone(),
+                            outcome: None,
+                        });
+                        next_transcript_id = next_transcript_id.saturating_add(1);
+                    }
+                    ContentBlock::ToolCall { id, name, .. } => {
+                        tool_calls.push(ToolCallState {
+                            id: id.clone(),
+                            name: name.clone(),
+                            title: name.clone(),
+                            status: ToolCallStateStatus::InProgress,
+                            output: None,
+                        });
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let status = if content == crate::agent::INTERRUPTED_TOOL_RESULT {
+                            ToolCallStateStatus::Cancelled
+                        } else if *is_error {
+                            ToolCallStateStatus::Failed
+                        } else {
+                            ToolCallStateStatus::Completed
+                        };
+                        apply_restored_tool_result(
+                            &mut tool_calls,
+                            tool_use_id,
+                            status,
+                            self.tool_lifecycle.project_output(content),
+                        );
+                    }
+                    ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {}
+                }
+            }
+        }
+        drop(session);
+        let outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        apply_persisted_outcomes(&mut transcript, &outcomes);
+        for call in &mut tool_calls {
+            if call.status == ToolCallStateStatus::InProgress {
+                call.status = ToolCallStateStatus::Cancelled;
+            }
+        }
+        trim_oldest(&mut transcript, max_entries.max(1));
+        trim_oldest(&mut tool_calls, max_entries.max(1));
+        crate::session_protocol::SessionSnapshot {
+            session_id,
+            seq: self.events.latest_sequence(),
+            turn_status: if self.turn.is_active() {
+                TurnStatus::Running
+            } else {
+                TurnStatus::Idle
+            },
+            transcript,
+            tool_calls,
+            pending_approvals: self.approvals.pending(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+            history_truncated: false,
         }
     }
 
@@ -371,6 +809,33 @@ impl SessionCore {
         M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
     {
         let active_turn = self.begin_turn().map_err(|_| SessionPromptError::Busy)?;
+        self.prompt_with_active_turn(
+            active_turn,
+            user_message,
+            canonical_user_text,
+            client_user_message_id,
+            assistant_prefix,
+            on_cancel,
+            outcome_mapper,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prompt_with_active_turn<C, M>(
+        &self,
+        active_turn: SessionTurn<'_>,
+        user_message: Message,
+        canonical_user_text: String,
+        client_user_message_id: Option<String>,
+        assistant_prefix: Option<String>,
+        on_cancel: C,
+        outcome_mapper: M,
+    ) -> Result<SessionPromptExecution, SessionPromptError>
+    where
+        C: FnOnce(),
+        M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
+    {
         let mut agent_session = self.session.lock().await;
         {
             let mut client_ids = self.client_user_message_ids.lock().await;
@@ -432,6 +897,17 @@ impl SessionCore {
         } else {
             None
         };
+        if turn.is_some() {
+            let completed_before_current = agent_session.user_turn_count().saturating_sub(1);
+            let mut outcomes = self
+                .assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if outcomes.len() > completed_before_current {
+                let excess = outcomes.len() - completed_before_current;
+                outcomes.drain(..excess);
+            }
+        }
         drop(agent_session);
 
         if let Some(turn) = turn.as_ref() {
@@ -442,9 +918,12 @@ impl SessionCore {
             let _ = self.events.emit(SessionEvent::ContextUsageChanged {
                 usage: self.context_usage(used_tokens, context_window),
             });
-            let _ = self.events.emit(SessionEvent::AssistantDone {
-                outcome: outcome_mapper(turn),
-            });
+            let outcome = outcome_mapper(turn);
+            self.assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(outcome.clone());
+            let _ = self.events.emit(SessionEvent::AssistantDone { outcome });
         }
         drop(active_turn);
 
@@ -460,6 +939,92 @@ impl SessionCore {
             context_window,
             cumulative_cost_usd,
         })
+    }
+}
+
+fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
+    let excess = entries.len().saturating_sub(max_entries);
+    if excess > 0 {
+        entries.drain(..excess);
+    }
+}
+
+fn apply_persisted_outcomes(
+    transcript: &mut Vec<crate::session_protocol::TranscriptEntry>,
+    outcomes: &[AssistantOutcome],
+) {
+    use crate::session_protocol::{TranscriptEntry, TranscriptRole};
+
+    let mut rebuilt = Vec::with_capacity(transcript.len() + outcomes.len());
+    let mut turn_start = None;
+    let mut outcome_index = 0;
+    let mut next_id = transcript
+        .iter()
+        .map(|entry| entry.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let finalize = |entries: &mut Vec<TranscriptEntry>,
+                    start: usize,
+                    outcome: Option<&AssistantOutcome>,
+                    next_id: &mut u64| {
+        let Some(outcome) = outcome else {
+            return;
+        };
+        if let Some(entry) = entries[start..]
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.role == TranscriptRole::Assistant)
+        {
+            entry.outcome = Some(outcome.clone());
+        } else {
+            entries.push(TranscriptEntry {
+                id: *next_id,
+                role: TranscriptRole::Assistant,
+                text: String::new(),
+                outcome: Some(outcome.clone()),
+            });
+            *next_id = next_id.saturating_add(1);
+        }
+    };
+    for entry in transcript.drain(..) {
+        if entry.role == TranscriptRole::User {
+            if let Some(start) = turn_start.take() {
+                finalize(
+                    &mut rebuilt,
+                    start,
+                    outcomes.get(outcome_index),
+                    &mut next_id,
+                );
+                outcome_index += 1;
+            }
+            turn_start = Some(rebuilt.len());
+        }
+        rebuilt.push(entry);
+    }
+    if let Some(start) = turn_start {
+        finalize(
+            &mut rebuilt,
+            start,
+            outcomes.get(outcome_index),
+            &mut next_id,
+        );
+    }
+    *transcript = rebuilt;
+}
+
+fn apply_restored_tool_result(
+    tool_calls: &mut [crate::session_protocol::ToolCallState],
+    tool_use_id: &str,
+    status: crate::session_protocol::ToolCallStateStatus,
+    output: String,
+) {
+    if let Some(call) = tool_calls.iter_mut().find(|call| {
+        call.id == tool_use_id
+            && call.status == crate::session_protocol::ToolCallStateStatus::InProgress
+    }) {
+        call.status = status;
+        call.output = Some(output);
     }
 }
 
@@ -591,6 +1156,7 @@ impl TurnController {
         })
     }
 
+    #[cfg(test)]
     pub fn cancel(&self) -> bool {
         self.cancel_with(|| {})
     }
@@ -689,6 +1255,7 @@ pub struct RegisteredApproval {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalError {
     NotPending,
+    AlreadyResolved,
     MissingCapability(ClientCapability),
     AllowAlwaysUnavailable,
     IdExhausted,
@@ -712,6 +1279,10 @@ struct ApprovalState {
 pub struct ApprovalBroker {
     state: StdMutex<ApprovalState>,
     allow_always: bool,
+    timeout: Option<std::time::Duration>,
+    approve_once_clients: AtomicUsize,
+    approve_always_clients: AtomicUsize,
+    eligibility_changed: tokio::sync::Notify,
 }
 
 impl ApprovalBroker {
@@ -719,7 +1290,43 @@ impl ApprovalBroker {
         Self {
             state: StdMutex::new(ApprovalState::default()),
             allow_always,
+            timeout: None,
+            approve_once_clients: AtomicUsize::new(0),
+            approve_always_clients: AtomicUsize::new(0),
+            eligibility_changed: tokio::sync::Notify::new(),
         }
+    }
+
+    pub fn new_with_timeout(allow_always: bool, timeout: std::time::Duration) -> Self {
+        Self {
+            state: StdMutex::new(ApprovalState::default()),
+            allow_always,
+            timeout: Some(timeout),
+            approve_once_clients: AtomicUsize::new(0),
+            approve_always_clients: AtomicUsize::new(0),
+            eligibility_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn set_eligible_client_counts(&self, approve_once: usize, approve_always: usize) {
+        self.approve_once_clients
+            .store(approve_once, Ordering::Release);
+        self.approve_always_clients
+            .store(approve_always, Ordering::Release);
+        self.eligibility_changed.notify_waiters();
+    }
+
+    pub(crate) fn has_eligible_client(&self, approval_id: &str) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = state.pending.get(approval_id) else {
+            return false;
+        };
+        self.approve_once_clients.load(Ordering::Acquire) > 0
+            || pending.request.allow_always_available
+                && self.approve_always_clients.load(Ordering::Acquire) > 0
     }
 
     /// Register one approval using a broker-generated, session-local monotonic
@@ -784,9 +1391,12 @@ impl ApprovalBroker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(pending) = state.pending.get(approval_id) else {
-            // Deliberately identical for unknown and already-resolved ids: both
-            // are safe no-ops, and the response does not disclose broker history.
-            return Err(ApprovalError::NotPending);
+            let known_sequence = approval_sequence(approval_id);
+            return Err(if known_sequence <= state.next_id {
+                ApprovalError::AlreadyResolved
+            } else {
+                ApprovalError::NotPending
+            });
         };
         if decision == ApprovalDecision::AllowAlways && !pending.request.allow_always_available {
             return Err(ApprovalError::AllowAlwaysUnavailable);
@@ -888,12 +1498,52 @@ pub async fn request_approval(
         return Err(ApprovalRequestError::Event(error));
     }
 
-    let resolution = registered.receiver.await.map_err(|_| {
+    let mut receiver = registered.receiver;
+    let broker_closed = || {
         let _ = events.emit(SessionEvent::TurnStatusChanged {
             status: TurnStatus::Running,
         });
         ApprovalRequestError::BrokerClosed
-    })?;
+    };
+    let resolution = if let Some(timeout) = broker.timeout {
+        let mut ineligible_deadline = None;
+        loop {
+            let eligibility_changed = broker.eligibility_changed.notified();
+            if broker.has_eligible_client(&approval_id) {
+                tokio::select! {
+                    resolution = &mut receiver => {
+                        break resolution.map_err(|_| broker_closed())?;
+                    }
+                    _ = eligibility_changed => continue,
+                }
+            } else {
+                let deadline = *ineligible_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + timeout);
+                tokio::select! {
+                    resolution = &mut receiver => {
+                        break resolution.map_err(|_| broker_closed())?;
+                    }
+                    _ = eligibility_changed => continue,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        match broker.resolve(
+                            &approval_id,
+                            "approval_timeout",
+                            &[ClientCapability::ApproveOnce],
+                            ApprovalDecision::Deny,
+                        ) {
+                            Ok(resolution) => break resolution,
+                            Err(ApprovalError::NotPending) => continue,
+                            Err(error) => {
+                                return Err(ApprovalRequestError::Broker(error));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        receiver.await.map_err(|_| broker_closed())?
+    };
     if let Some(unemitted) = broker.take_unemitted(&approval_id) {
         let _ = events.emit(SessionEvent::ApprovalResolved {
             approval_id: unemitted.approval_id,
@@ -934,9 +1584,11 @@ pub struct CanonicalToolLifecycle {
     safety: Arc<crate::safety::SafetyPolicy>,
     active: StdMutex<HashSet<String>>,
     max_active_tools: usize,
+    max_output_bytes: Option<usize>,
 }
 
 impl CanonicalToolLifecycle {
+    #[cfg(test)]
     pub fn new(
         events: Arc<SessionEventRouter>,
         approvals: Arc<ApprovalBroker>,
@@ -949,6 +1601,24 @@ impl CanonicalToolLifecycle {
             safety,
             active: StdMutex::new(HashSet::new()),
             max_active_tools: max_active_tools.max(1),
+            max_output_bytes: None,
+        }
+    }
+
+    pub fn new_with_output_limit(
+        events: Arc<SessionEventRouter>,
+        approvals: Arc<ApprovalBroker>,
+        safety: Arc<crate::safety::SafetyPolicy>,
+        max_active_tools: usize,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self {
+            events,
+            approvals,
+            safety,
+            active: StdMutex::new(HashSet::new()),
+            max_active_tools: max_active_tools.max(1),
+            max_output_bytes: Some(max_output_bytes.max(16)),
         }
     }
 
@@ -1061,12 +1731,24 @@ impl CanonicalToolLifecycle {
         if !was_active {
             return false;
         }
+        let output = self.project_output(output);
         let _ = self.events.emit(SessionEvent::ToolCallFinished {
             id: info.id.clone(),
-            ok: !is_error,
-            output: output.to_string(),
+            status: if is_error {
+                crate::session_protocol::ToolCallStateStatus::Failed
+            } else {
+                crate::session_protocol::ToolCallStateStatus::Completed
+            },
+            output,
         });
         true
+    }
+
+    fn project_output(&self, output: &str) -> String {
+        self.max_output_bytes.map_or_else(
+            || output.to_string(),
+            |max| bounded_tool_output(output, max),
+        )
     }
 
     pub fn cancel_all(&self) {
@@ -1084,7 +1766,7 @@ impl CanonicalToolLifecycle {
             });
             let _ = self.events.emit(SessionEvent::ToolCallFinished {
                 id: id.clone(),
-                ok: false,
+                status: crate::session_protocol::ToolCallStateStatus::Cancelled,
                 output: "cancelled".to_string(),
             });
         }
@@ -1108,6 +1790,25 @@ fn approval_denial_reason(tool: &str, resolution: &ApprovalResolution) -> String
         "resolution_failed" => format!("permission resolution failed for '{tool}'"),
         _ => format!("permission denied for '{tool}'"),
     }
+}
+
+fn bounded_tool_output(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    const MARKER: &str = "\n[tool output truncated]";
+    let prefix_budget = max_bytes.saturating_sub(MARKER.len());
+    let mut end = prefix_budget.min(output.len());
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = output[..end].to_string();
+    if max_bytes >= MARKER.len() {
+        bounded.push_str(MARKER);
+    } else {
+        bounded.push_str(&MARKER[..max_bytes]);
+    }
+    bounded
 }
 
 pub(crate) fn tool_call_title(info: &crate::agent::ToolCallInfo) -> String {
@@ -1182,12 +1883,13 @@ mod tests {
     async fn register_exposes_pending_and_resolution_wakes_waiter() {
         let broker = ApprovalBroker::new(false);
         let registered = broker.register(request()).unwrap();
+        let approval_id = registered.request.id.clone();
         assert_eq!(broker.pending(), vec![registered.request.clone()]);
         assert!(!registered.request.allow_always_available);
 
         let resolution = broker
             .resolve(
-                &registered.request.id,
+                &approval_id,
                 "local",
                 &[ClientCapability::ApproveOnce],
                 ApprovalDecision::AllowOnce,
@@ -1195,6 +1897,24 @@ mod tests {
             .unwrap();
         assert_eq!(registered.receiver.await.unwrap(), resolution);
         assert!(broker.pending().is_empty());
+        assert_eq!(
+            broker.resolve(
+                &approval_id,
+                "late",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::AllowOnce,
+            ),
+            Err(ApprovalError::AlreadyResolved)
+        );
+        assert_eq!(
+            broker.resolve(
+                "approval-999",
+                "unknown",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::AllowOnce,
+            ),
+            Err(ApprovalError::NotPending)
+        );
     }
 
     #[tokio::test]
@@ -1217,6 +1937,16 @@ mod tests {
         );
         assert!(broker.cancel_all("session_cancelled").is_empty());
         assert_eq!(registered.receiver.await.unwrap(), resolution);
+    }
+
+    #[test]
+    fn approve_always_only_client_is_eligible_for_available_request() {
+        let broker = ApprovalBroker::new(true);
+        let registered = broker.register(request()).unwrap();
+        broker.set_eligible_client_counts(0, 1);
+        assert!(broker.has_eligible_client(&registered.request.id));
+        broker.set_eligible_client_counts(0, 0);
+        assert!(!broker.has_eligible_client(&registered.request.id));
     }
 
     #[test]
@@ -1317,6 +2047,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_approval_timeout_denies_and_emits_once() {
+        let broker = ApprovalBroker::new_with_timeout(false, std::time::Duration::from_millis(10));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = SessionEventRouter::new(Some(std::sync::Arc::new(move |_seq, event| {
+            seen_for_handler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        })));
+
+        let resolution = request_approval(&broker, &events, request())
+            .await
+            .expect("timeout resolves safely");
+
+        assert_eq!(resolution.decision, ApprovalDecision::Deny);
+        assert_eq!(resolution.resolved_by, "approval_timeout");
+        assert!(broker.pending().is_empty());
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ApprovalResolved { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_timeout_pauses_for_eligible_client() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new_with_timeout(
+            false,
+            std::time::Duration::from_millis(10),
+        ));
+        broker.set_eligible_client_counts(1, 0);
+        let events = std::sync::Arc::new(SessionEventRouter::default());
+        let request_broker = std::sync::Arc::clone(&broker);
+        let request_events = std::sync::Arc::clone(&events);
+        let pending = tokio::spawn(async move {
+            request_approval(&request_broker, &request_events, request()).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let approval = broker.pending().pop().expect("approval remains pending");
+        broker
+            .resolve(
+                &approval.id,
+                "local",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::AllowOnce,
+            )
+            .unwrap();
+
+        assert_eq!(
+            pending.await.unwrap().unwrap().decision,
+            ApprovalDecision::AllowOnce
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_churn_does_not_extend_first_ineligible_deadline() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new_with_timeout(
+            false,
+            std::time::Duration::from_millis(30),
+        ));
+        let events = std::sync::Arc::new(SessionEventRouter::default());
+        let request_broker = std::sync::Arc::clone(&broker);
+        let request_events = std::sync::Arc::clone(&events);
+        let pending = tokio::spawn(async move {
+            request_approval(&request_broker, &request_events, request()).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        broker.set_eligible_client_counts(1, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        broker.set_eligible_client_counts(0, 0);
+
+        let resolution = tokio::time::timeout(std::time::Duration::from_millis(15), pending)
+            .await
+            .expect("expired original deadline denies immediately")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolution.decision, ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
     async fn canonical_tool_lifecycle_runs_without_any_frontend_connection() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_for_handler = std::sync::Arc::clone(&seen);
@@ -1358,7 +2174,7 @@ mod tests {
                 },
                 SessionEvent::ToolCallFinished {
                     id: finished_id,
-                    ok: true,
+                    status: crate::session_protocol::ToolCallStateStatus::Completed,
                     output,
                 }
             ] if id == "tool-1"
@@ -1366,6 +2182,48 @@ mod tests {
                 && finished_id == "tool-1"
                 && output == "contents"
         ));
+    }
+
+    #[tokio::test]
+    async fn canonical_tool_output_is_utf8_safe_and_bounded_before_emit() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let events = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |_seq, event| {
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        ))));
+        let lifecycle = CanonicalToolLifecycle::new_with_output_limit(
+            events,
+            std::sync::Arc::new(ApprovalBroker::new(false)),
+            std::sync::Arc::new(crate::safety::SafetyPolicy::default()),
+            1,
+            64,
+        );
+        let info = crate::agent::ToolCallInfo {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "large"}),
+        };
+        assert!(matches!(
+            lifecycle.before(&info).await,
+            crate::agent::BeforeHookResult::Allow
+        ));
+
+        lifecycle.finish(&info, &"🙂\0".repeat(100), false);
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let output = seen.iter().find_map(|event| match event {
+            SessionEvent::ToolCallFinished { output, .. } => Some(output),
+            _ => None,
+        });
+        let output = output.expect("terminal tool event");
+        assert!(output.len() <= 64);
+        assert!(output.contains("[tool output truncated]"));
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
     }
 
     #[tokio::test]
@@ -1675,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn first_resolution_wins_and_late_or_unknown_answers_are_safe_noops() {
+    fn first_resolution_wins_and_late_answers_are_classified() {
         let broker = ApprovalBroker::new(false);
         let registered = broker.register(request()).unwrap();
         broker
@@ -1693,7 +2551,7 @@ mod tests {
                 &[ClientCapability::ApproveOnce],
                 ApprovalDecision::AllowOnce,
             ),
-            Err(ApprovalError::NotPending)
+            Err(ApprovalError::AlreadyResolved)
         );
         assert_eq!(
             broker.resolve(
@@ -2142,6 +3000,40 @@ mod tests {
     }
 
     #[test]
+    fn restored_duplicate_tool_ids_pair_results_in_occurrence_order() {
+        let mut calls = vec![
+            crate::session_protocol::ToolCallState {
+                id: "duplicate".to_string(),
+                name: "first".to_string(),
+                title: "first".to_string(),
+                status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                output: None,
+            },
+            crate::session_protocol::ToolCallState {
+                id: "duplicate".to_string(),
+                name: "second".to_string(),
+                title: "second".to_string(),
+                status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                output: None,
+            },
+        ];
+        apply_restored_tool_result(
+            &mut calls,
+            "duplicate",
+            crate::session_protocol::ToolCallStateStatus::Completed,
+            "first output".to_string(),
+        );
+        apply_restored_tool_result(
+            &mut calls,
+            "duplicate",
+            crate::session_protocol::ToolCallStateStatus::Completed,
+            "second output".to_string(),
+        );
+        assert_eq!(calls[0].output.as_deref(), Some("first output"));
+        assert_eq!(calls[1].output.as_deref(), Some("second output"));
+    }
+
+    #[test]
     fn event_router_contains_adapter_panics() {
         let router = SessionEventRouter::new(Some(std::sync::Arc::new(|_, _| {
             panic!("adapter failed");
@@ -2153,6 +3045,128 @@ mod tests {
         }));
         assert_eq!(result.unwrap(), Err(SessionEventError::HandlerPanicked));
         assert_eq!(router.latest_sequence(), 1);
+    }
+
+    #[test]
+    fn event_router_subscription_stops_delivery_when_dropped() {
+        let router = std::sync::Arc::new(SessionEventRouter::default());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let subscription = router
+            .subscribe(
+                1,
+                std::sync::Arc::new(move |seq, event| {
+                    seen_for_handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((seq, event));
+                }),
+            )
+            .expect("first bounded subscriber");
+
+        router
+            .emit(SessionEvent::AssistantDelta {
+                text: "first".to_string(),
+            })
+            .unwrap();
+        drop(subscription);
+        router
+            .emit(SessionEvent::AssistantDelta {
+                text: "second".to_string(),
+            })
+            .unwrap();
+
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 1);
+    }
+
+    #[test]
+    fn event_router_publishes_concurrent_events_in_sequence_order() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+        let router = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |seq, _event| {
+                if seq == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                seen_for_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(seq);
+            },
+        ))));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for text in ["first", "second"] {
+            let router = std::sync::Arc::clone(&router);
+            let start = std::sync::Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                router
+                    .emit(SessionEvent::AssistantDelta {
+                        text: text.to_string(),
+                    })
+                    .unwrap();
+            }));
+        }
+        start.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn subscribe_and_capture_waits_for_in_flight_dispatch() {
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+        let handler_started = std::sync::Arc::clone(&started);
+        let handler_release = std::sync::Arc::clone(&release);
+        let handler_state = std::sync::Arc::clone(&state);
+        let router = std::sync::Arc::new(SessionEventRouter::new(Some(std::sync::Arc::new(
+            move |seq, _event| {
+                handler_started.wait();
+                handler_release.wait();
+                *handler_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = seq;
+            },
+        ))));
+        let emitter = {
+            let router = std::sync::Arc::clone(&router);
+            std::thread::spawn(move || {
+                router
+                    .emit(SessionEvent::AssistantDelta {
+                        text: "event".to_string(),
+                    })
+                    .unwrap();
+            })
+        };
+        started.wait();
+        let capture_router = std::sync::Arc::clone(&router);
+        let capture_state = std::sync::Arc::clone(&state);
+        let capture = std::thread::spawn(move || {
+            capture_router
+                .subscribe_and_capture(1, std::sync::Arc::new(|_, _| {}), || {
+                    *capture_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                })
+                .unwrap()
+                .1
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!capture.is_finished());
+        release.wait();
+
+        emitter.join().unwrap();
+        assert_eq!(capture.join().unwrap(), 1);
     }
 
     #[test]

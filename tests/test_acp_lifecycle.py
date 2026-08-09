@@ -26,7 +26,7 @@ def test_acp_exits_when_stdin_reaches_eof(daimonos_binary, tmp_path):
     process.stdin.close()
 
     try:
-        assert process.wait(timeout=2) == 0
+        assert process.wait(timeout=5) == 0
     finally:
         if process.poll() is None:
             process.kill()

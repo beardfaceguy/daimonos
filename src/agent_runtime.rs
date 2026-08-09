@@ -3,10 +3,10 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::cli::{AcpArgs, AgentArgs, ChatArgs};
+use crate::cli::{AcpArgs, AgentArgs, ChatArgs, SessionDaemonArgs};
 use crate::{
     acp_cmd, agent, agent_cmd, agent_env, analytics, chat_cmd, config, paths, prompts, providers,
-    safety, session_store, tui,
+    safety, session_daemon, session_factory, session_store, tui,
 };
 
 fn try_build_provider(
@@ -265,7 +265,7 @@ pub async fn run_acp(
         .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let safety = agent.to_safety_policy(None);
-    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("acp-sessions"));
+    let sessions_dir = paths::agent_sessions_dir();
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
@@ -293,6 +293,108 @@ pub async fn run_acp(
         agent.thinking.clone(),
     )
     .await
+}
+
+pub async fn run_session_daemon(
+    args: SessionDaemonArgs,
+    workspace: &Path,
+    cfg: Arc<config::Config>,
+    token_log: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let SessionDaemonArgs {
+        socket,
+        model,
+        provider,
+        agent_env,
+    } = args;
+    let agent = load_agent_env(agent_env)?;
+    let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+    let effective_model = model.unwrap_or_else(|| agent.model.clone());
+    let make_provider: session_factory::ProviderFactory = {
+        let provider = effective_provider.clone();
+        let api_key = agent.api_key.clone();
+        let base_url = agent.base_url.clone();
+        let prompt_cache = agent.prompt_cache;
+        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache))
+    };
+    let compaction_follows_model = matches!(
+        &agent.compaction,
+        agent_env::CompactionConfig::NeedsWindow(_)
+    );
+    let probe = make_provider().map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
+    let compaction = agent
+        .resolve_compaction(probe.as_ref(), &effective_model)
+        .await
+        .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
+    let compaction = prompts::apply_summary_override(compaction, &cfg).await;
+    let analytics_store = if cfg.analytics.enabled {
+        analytics::AnalyticsStore::new(
+            &cfg.analytics.resolved_db_path(),
+            cfg.analytics.retention_days,
+        )
+        .ok()
+        .map(Arc::new)
+    } else {
+        None
+    };
+    let sessions_dir = paths::daemon_sessions_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for session persistence"))?;
+    let services = Arc::new(
+        crate::provisioning::build_tool_services(
+            workspace,
+            &cfg,
+            true,
+            true,
+            analytics_store.clone(),
+        )
+        .await,
+    );
+    let factory = Arc::new(session_factory::AgentSessionFactory::new(
+        make_provider,
+        workspace.to_path_buf(),
+        Arc::clone(&cfg),
+        effective_model,
+        agent.thinking.clone(),
+        agent.to_safety_policy(None),
+        token_log,
+        session_store::SessionStore::new(sessions_dir),
+        crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
+        services,
+    ));
+    let daemon = Arc::new(session_daemon::SessionDaemon::with_factory(
+        cfg.session.max_sessions,
+        cfg.session.max_clients_per_session,
+        cfg.session.event_queue_capacity,
+        cfg.session.snapshot_entries,
+        (cfg.session.idle_retention_secs > 0)
+            .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
+        cfg.session.session_list_page_size,
+        std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
+        factory,
+    ));
+    let socket_path = socket.unwrap_or_else(|| cfg.session.resolved_socket_path(workspace));
+    eprintln!(
+        "daimonos session daemon listening on {}",
+        socket_path.display()
+    );
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let serve = Arc::clone(&daemon).serve_unix(
+        socket_path,
+        cfg.session.max_frame_bytes,
+        cfg.session.protocol_limits(),
+        std::time::Duration::from_millis(cfg.session.accept_error_backoff_ms),
+    );
+    tokio::pin!(serve);
+    let result = tokio::select! {
+        result = &mut serve => result.map_err(anyhow::Error::from),
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            Ok(())
+        }
+        _ = terminate.recv() => Ok(()),
+    };
+    daemon.shutdown().await;
+    result
 }
 
 fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {

@@ -621,7 +621,7 @@ fn build_before_tool_call_hook(
             if let BeforeHookResult::Block(reason) = &decision {
                 let _ = events.emit(SessionEvent::ToolCallFinished {
                     id,
-                    ok: false,
+                    status: ToolCallStateStatus::Failed,
                     output: reason.clone(),
                 });
             }
@@ -634,7 +634,11 @@ fn build_after_tool_call_hook(events: Arc<SessionEventRouter>) -> crate::agent::
     Box::new(move |info, output, is_error| {
         let _ = events.emit(SessionEvent::ToolCallFinished {
             id: info.id.clone(),
-            ok: !is_error,
+            status: if is_error {
+                ToolCallStateStatus::Failed
+            } else {
+                ToolCallStateStatus::Completed
+            },
             output: output.to_string(),
         });
         AfterHookResult::Continue
@@ -649,19 +653,7 @@ fn map_stream_event(event: StreamEvent) -> SessionEvent {
 }
 
 fn turn_outcome(turn: &TurnResult) -> AssistantOutcome {
-    match turn.stop_reason {
-        StopReason::EndTurn | StopReason::ToolUse => AssistantOutcome::Completed,
-        StopReason::Error => AssistantOutcome::Errored {
-            context_overflow: turn.context_overflow,
-            message: turn
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "provider error".to_string()),
-        },
-        StopReason::Refusal => AssistantOutcome::Refused,
-        StopReason::Aborted => AssistantOutcome::Aborted,
-        StopReason::MaxTokens => AssistantOutcome::MaxTokens,
-    }
+    crate::session_core::canonical_assistant_outcome_with_logging("tui", turn)
 }
 
 fn context_usage(turn: &TurnResult, compaction: Option<&CompactionPolicy>) -> ContextUsage {
@@ -763,7 +755,8 @@ mod tests {
             turn_outcome(&error),
             AssistantOutcome::Errored {
                 context_overflow: true,
-                message: "too large".to_string()
+                message: "Provider rejected the prompt because the context window was exceeded."
+                    .to_string()
             }
         );
     }

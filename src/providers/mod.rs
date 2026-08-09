@@ -347,16 +347,29 @@ pub trait LlmProvider: Send + Sync {
 
     /// Like `complete`, but invokes `on_event` with each `StreamEvent` as it
     /// arrives, before returning the same final `LlmResponse` `complete`
-    /// would produce. Default: no incremental events, just delegates to
-    /// `complete` — so providers (and test doubles) that don't override this
-    /// keep working unchanged.
+    /// would produce. Default: delegates to `complete`, then projects its final
+    /// text/thinking blocks as complete deltas so conforming non-streaming
+    /// providers still produce the canonical frontend transcript.
     async fn stream(
         &self,
         ctx: &Context,
         opts: &CompleteOpts,
-        _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> LlmResponse {
-        self.complete(ctx, opts).await
+        let response = self.complete(ctx, opts).await;
+        for block in &response.content {
+            match block {
+                ContentBlock::Text(text) => on_event(StreamEvent::TextDelta(text.clone())),
+                ContentBlock::Thinking(text) => {
+                    on_event(StreamEvent::ThinkingDelta(text.clone()));
+                }
+                ContentBlock::Image { .. }
+                | ContentBlock::ProviderState { .. }
+                | ContentBlock::ToolCall { .. }
+                | ContentBlock::ToolResult { .. } => {}
+            }
+        }
+        response
     }
 
     /// The maximum input/context window, in tokens, the provider reports for
@@ -440,10 +453,7 @@ mod tests {
             })
             .await;
         assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hi"));
-        assert!(
-            events.is_empty(),
-            "default stream() must not synthesize events"
-        );
+        assert_eq!(events, vec![StreamEvent::TextDelta("hi".to_string())]);
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ pub struct ViewState {
     pending_approvals: Vec<ApprovalRequest>,
     runtime_options: Vec<RuntimeOption>,
     context_usage: Option<ContextUsage>,
+    history_truncated: bool,
     max_scrollback_entries: usize,
     /// Set once a `SessionEnding` event arrives; a renderer can surface this
     /// and stop accepting input.
@@ -95,6 +96,7 @@ impl ViewState {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
             max_scrollback_entries: max_scrollback_entries.max(1),
             ending_reason: None,
         }
@@ -125,6 +127,9 @@ impl ViewState {
     }
     pub fn context_usage(&self) -> Option<&ContextUsage> {
         self.context_usage.as_ref()
+    }
+    pub fn history_truncated(&self) -> bool {
+        self.history_truncated
     }
     pub fn ending_reason(&self) -> Option<&str> {
         self.ending_reason.as_deref()
@@ -167,12 +172,13 @@ impl ViewState {
         self.transcript = snapshot
             .transcript
             .into_iter()
-            .map(transcript_entry_to_line)
+            .flat_map(transcript_entry_to_lines)
             .collect();
         self.tool_calls = snapshot.tool_calls;
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
+        self.history_truncated = snapshot.history_truncated;
         self.trim_scrollback();
         // A snapshot is a full canonical resync of live session state, so any
         // `ending_reason` observed before a reconnect must clear: if the
@@ -247,13 +253,9 @@ impl ViewState {
                     call.status = status;
                 }
             }
-            SessionEvent::ToolCallFinished { id, ok, output } => {
+            SessionEvent::ToolCallFinished { id, status, output } => {
                 if let Some(call) = self.tool_calls.iter_mut().find(|c| c.id == id) {
-                    call.status = if ok {
-                        ToolCallStateStatus::Completed
-                    } else {
-                        ToolCallStateStatus::Failed
-                    };
+                    call.status = status;
                     call.output = Some(output);
                 }
             }
@@ -319,8 +321,16 @@ fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
     }
 }
 
-fn transcript_entry_to_line(entry: TranscriptEntry) -> ViewLine {
-    ViewLine::committed(entry.role, entry.text)
+fn transcript_entry_to_lines(entry: TranscriptEntry) -> Vec<ViewLine> {
+    let mut lines = if entry.role == TranscriptRole::Assistant && entry.text.is_empty() {
+        Vec::new()
+    } else {
+        vec![ViewLine::committed(entry.role, entry.text)]
+    };
+    if let Some(note) = entry.outcome.as_ref().and_then(outcome_note) {
+        lines.push(ViewLine::committed(TranscriptRole::System, note));
+    }
+    lines
 }
 
 /// A privacy-safe system note appended to the transcript when a turn ends in a
@@ -527,7 +537,7 @@ mod tests {
             3,
             SessionEvent::ToolCallFinished {
                 id: "t1".into(),
-                ok: true,
+                status: ToolCallStateStatus::Completed,
                 output: "done".into(),
             },
         );
@@ -553,11 +563,36 @@ mod tests {
             2,
             SessionEvent::ToolCallFinished {
                 id: "t1".into(),
-                ok: false,
+                status: ToolCallStateStatus::Failed,
                 output: "boom".into(),
             },
         );
         assert_eq!(s.tool_calls()[0].status, ToolCallStateStatus::Failed);
+    }
+
+    #[test]
+    fn cancelled_tool_finish_remains_cancelled() {
+        let mut state = ViewState::new("sess-1");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::ToolCallStarted {
+                id: "t1".into(),
+                name: "exec".into(),
+                title: "Run".into(),
+                input_summary: None,
+            },
+        );
+        ev(
+            &mut state,
+            2,
+            SessionEvent::ToolCallFinished {
+                id: "t1".into(),
+                status: ToolCallStateStatus::Cancelled,
+                output: "cancelled".into(),
+            },
+        );
+        assert_eq!(state.tool_calls()[0].status, ToolCallStateStatus::Cancelled);
     }
 
     #[test]
@@ -668,22 +703,26 @@ mod tests {
                     id: 1,
                     role: TranscriptRole::User,
                     text: "question".into(),
+                    outcome: None,
                 },
                 TranscriptEntry {
                     id: 2,
                     role: TranscriptRole::Assistant,
                     text: "answer".into(),
+                    outcome: None,
                 },
             ],
             tool_calls: Vec::new(),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: true,
         };
         s.apply_snapshot(snap);
         assert_eq!(s.session_id(), "sess-42");
         assert_eq!(s.last_seq(), 10);
         assert_eq!(s.transcript().len(), 2);
+        assert!(s.history_truncated());
 
         // A pre-snapshot sequence is now a duplicate.
         assert_eq!(
@@ -703,6 +742,83 @@ mod tests {
         );
         assert_eq!(s.transcript().len(), 3);
         assert_eq!(s.last_seq(), 11);
+    }
+
+    #[test]
+    fn snapshot_preserves_non_clean_terminal_outcome_note() {
+        let outcome = AssistantOutcome::Errored {
+            context_overflow: false,
+            message: "provider unavailable".to_string(),
+        };
+        let mut live = ViewState::new("session");
+        ev(
+            &mut live,
+            1,
+            SessionEvent::AssistantDelta {
+                text: "partial".to_string(),
+            },
+        );
+        ev(
+            &mut live,
+            2,
+            SessionEvent::AssistantDone {
+                outcome: outcome.clone(),
+            },
+        );
+
+        let mut restored = ViewState::new("session");
+        restored.apply_snapshot(SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 2,
+            turn_status: TurnStatus::Idle,
+            transcript: vec![TranscriptEntry {
+                id: 1,
+                role: TranscriptRole::Assistant,
+                text: "partial".to_string(),
+                outcome: Some(outcome),
+            }],
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+            history_truncated: false,
+        });
+
+        assert_eq!(restored.transcript(), live.transcript());
+    }
+
+    #[test]
+    fn textless_outcomes_do_not_render_blank_assistant_rows() {
+        let outcome = AssistantOutcome::Aborted;
+        let mut live = ViewState::new("session");
+        ev(
+            &mut live,
+            1,
+            SessionEvent::AssistantDone {
+                outcome: outcome.clone(),
+            },
+        );
+        assert_eq!(live.transcript().len(), 1);
+        assert_eq!(live.transcript()[0].role, TranscriptRole::System);
+
+        let mut restored = ViewState::new("session");
+        restored.apply_snapshot(SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 1,
+            turn_status: TurnStatus::Idle,
+            transcript: vec![TranscriptEntry {
+                id: 1,
+                role: TranscriptRole::Assistant,
+                text: String::new(),
+                outcome: Some(outcome),
+            }],
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+            history_truncated: false,
+        });
+        assert_eq!(restored.transcript(), live.transcript());
     }
 
     #[test]
@@ -728,6 +844,7 @@ mod tests {
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
+            history_truncated: false,
         };
         s.apply_snapshot(snap);
         assert_eq!(

@@ -24,6 +24,16 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Canonical durable store shared by ACP and daemon-owned agent sessions.
+pub(crate) fn agent_sessions_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".daimonos").join("acp-sessions"))
+}
+
+/// Durable store owned exclusively by the interactive session daemon.
+pub(crate) fn daemon_sessions_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".daimonos").join("daemon-sessions"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,6 +51,27 @@ mod tests {
     fn tilde_path_uses_shared_home() {
         if let Some(home) = home_dir() {
             assert_eq!(expand_tilde("~/file"), home.join("file"));
+        }
+    }
+
+    #[test]
+    fn agent_sessions_share_one_canonical_store() {
+        if let Some(home) = home_dir() {
+            assert_eq!(
+                agent_sessions_dir(),
+                Some(home.join(".daimonos").join("acp-sessions"))
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_sessions_use_an_exclusive_store() {
+        if let Some(home) = home_dir() {
+            assert_eq!(
+                daemon_sessions_dir(),
+                Some(home.join(".daimonos").join("daemon-sessions"))
+            );
+            assert_ne!(daemon_sessions_dir(), agent_sessions_dir());
         }
     }
 }

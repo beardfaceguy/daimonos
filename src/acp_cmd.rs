@@ -59,9 +59,14 @@ use crate::providers::{
 };
 use crate::session::Session;
 use crate::session_core::{
-    align_client_user_message_ids, tool_call_title, ApprovalBroker, CanonicalToolLifecycle,
-    SessionCompaction, SessionCore, SessionEventHandler, SessionEventRouter, SessionPersistence,
-    SessionPromptError, SessionPromptOutcome, TurnError,
+    align_client_user_message_ids, canonical_assistant_outcome_with_logging, tool_call_title,
+    ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventHandler,
+    SessionEventRouter, SessionPersistence, SessionPromptError, SessionPromptOutcome, TurnError,
+};
+#[cfg(test)]
+use crate::session_core::{
+    canonical_assistant_outcome, log_raw_provider_error, safe_provider_error_message,
+    sanitize_provider_error, RAW_ERROR_LOG_CAP,
 };
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
@@ -1615,100 +1620,6 @@ fn acp_stop_reason_name(stop_reason: &AcpStopReason) -> &'static str {
     }
 }
 
-fn error_has_token(error: &str, token: &str) -> bool {
-    error
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|part| part == token)
-}
-
-fn error_has_http_status(error: &str, status: &str) -> bool {
-    if error_has_token(error, status) {
-        return true;
-    }
-    let compact: String = error
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect();
-    ["http", "api", "status"].iter().any(|prefix| {
-        let needle = format!("{prefix}{status}");
-        compact.match_indices(&needle).any(|(index, _)| {
-            compact[index + needle.len()..]
-                .chars()
-                .next()
-                .is_none_or(|character| !character.is_ascii_digit())
-        })
-    })
-}
-
-fn safe_provider_error_message(context_overflow: bool, error: Option<&str>) -> &'static str {
-    let error = error.unwrap_or_default().to_ascii_lowercase();
-    let normalized = error
-        .replace(['_', '-', '`'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let invalid_tool_history = error_has_http_status(&error, "400")
-        && normalized.contains("tool use ids were found without tool result blocks");
-    // An explicit/strong context-overflow signal takes precedence because the
-    // caller can recover through compaction; other classes are informational.
-    if context_overflow
-        || normalized.contains("prompt is too long")
-        || normalized.contains("exceed context limit")
-        || normalized.contains("maximum context length")
-        || normalized.contains("context overflow")
-        || normalized.contains("context length exceeded")
-        || normalized.contains("context window exceeded")
-        || normalized.contains("context window was exceeded")
-    {
-        "Provider rejected the prompt because the context window was exceeded."
-    } else if invalid_tool_history {
-        "Provider rejected invalid tool-call history. Restart/reload the session or use /clear."
-    } else if error_has_http_status(&error, "402")
-        || normalized.contains("insufficient credit")
-        || normalized.contains("payment required")
-    {
-        // Billing/credit is checked before the auth classes: a provider
-        // message can carry both an auth-ish word and a payment signal, and
-        // the billing cause is the more actionable one to surface.
-        "Provider billing/credit issue (HTTP 402). Check the provider account balance."
-    } else if error_has_http_status(&error, "401")
-        || normalized.contains("authentication")
-        || normalized.contains("invalid api key")
-        || normalized.contains("unauthorized")
-        || normalized.contains("not authorized")
-    {
-        "Provider authentication failed (HTTP 401)."
-    } else if error_has_http_status(&error, "403")
-        || normalized.contains("permission denied")
-        || normalized.contains("forbidden")
-        || normalized.contains("authorization failed")
-        || normalized.contains("authorization error")
-    {
-        "Provider authorization failed (HTTP 403)."
-    } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
-        "Provider rate limit exceeded (HTTP 429)."
-    } else if normalized.contains("timeout")
-        || normalized.contains("timed out")
-        || normalized.contains("time out")
-    {
-        "Provider request timed out."
-    } else if normalized.contains("network")
-        || normalized.contains("connection")
-        || normalized.contains("upstream")
-    {
-        "Provider network request failed."
-    } else if normalized.contains("parse") || normalized.contains("decode") {
-        "Provider returned an invalid response."
-    } else if normalized.contains("stream error")
-        || normalized.contains("stream failed")
-        || normalized.contains("response stream")
-    {
-        "Provider response stream failed."
-    } else {
-        "Provider request failed."
-    }
-}
-
 /// Format the per-turn timestamp line shown at the top of an agent turn when
 /// `DAIMONOS_AGENT_TIMESTAMP_TURNS` is on (#1070). Sourced from the OS clock
 /// by the caller (never the model). Generic over the timezone so tests can
@@ -1733,116 +1644,6 @@ fn send_provider_error_diagnostic(
             TextContent::new(message),
         ))),
     );
-}
-
-/// Max characters of the raw provider error we ever emit. Bounds accidental
-/// dumping of a large payload (prompt/tool echo) into logs (codeJung finding).
-const RAW_ERROR_LOG_CAP: usize = 500;
-
-/// Best-effort scrub of obvious secret shapes from a provider error body
-/// before it is logged, then a hard length cap. This is defense-in-depth for a
-/// DEBUG-only diagnostic: providers occasionally echo an `Authorization`
-/// header, a bearer token, or an `sk-`/`or-` API key into their error text,
-/// and enabling debug logging must not ship those into a log collector
-/// (codeJung finding, impact 7). Not a guarantee — the length cap is the
-/// backstop for anything the patterns miss.
-fn sanitize_provider_error(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(RAW_ERROR_LOG_CAP) + 16);
-    let mut truncated = false;
-    for token in raw.split_inclusive(char::is_whitespace) {
-        let trimmed = token.trim_end();
-        let lower = trimmed.to_ascii_lowercase();
-        // Mask a token that looks like a secret: a bearer/authorization value,
-        // or a long key-ish run (sk-..., or-..., or any >=20-char alnum/_/-
-        // blob). Keep short/ordinary words so the message stays useful.
-        let looks_secret = lower.starts_with("bearer")
-            || lower.starts_with("authorization")
-            || lower.starts_with("sk-")
-            || lower.starts_with("or-")
-            || (trimmed.len() >= 20
-                && trimmed
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        if looks_secret {
-            out.push_str("[REDACTED]");
-            // Preserve the original trailing whitespace so words stay separated.
-            out.push_str(&token[trimmed.len()..]);
-        } else {
-            out.push_str(token);
-        }
-        if out.len() >= RAW_ERROR_LOG_CAP {
-            truncated = true;
-            break;
-        }
-    }
-    if truncated {
-        // Truncate on a char boundary at/below the cap, then flag it.
-        while !out.is_char_boundary(RAW_ERROR_LOG_CAP.min(out.len())) {
-            out.pop();
-        }
-        out.truncate(RAW_ERROR_LOG_CAP.min(out.len()));
-        out.push_str("…[truncated]");
-    }
-    out
-}
-
-/// Emit the provider's raw error at DEBUG on `daimonos::acp` — off by default,
-/// one env var away (`RUST_LOG=daimonos::acp=debug`). This is the only place
-/// the provider error text is surfaced: it is never sent to the client (which
-/// sees the friendly `class`) and never recorded on an OTel span (ADR-006
-/// privacy-first). The body is passed through [`sanitize_provider_error`]
-/// (secret-shape scrub + length cap) before logging. No-op when there is no
-/// raw error. Factored out of canonical outcome emission so it can be
-/// unit-tested without a live ACP connection (#1062).
-fn log_raw_provider_error(session_id: impl std::fmt::Display, class: &str, error: Option<&str>) {
-    if let Some(raw) = error {
-        tracing::debug!(
-            target: "daimonos::acp",
-            event = "provider_request_raw",
-            session_id = %session_id,
-            class = class,
-            raw_error = sanitize_provider_error(raw),
-        );
-    }
-}
-
-fn canonical_assistant_outcome(turn: &TurnResult) -> CoreAssistantOutcome {
-    match turn.stop_reason {
-        crate::providers::StopReason::Error => CoreAssistantOutcome::Errored {
-            context_overflow: turn.context_overflow,
-            message: safe_provider_error_message(
-                turn.context_overflow,
-                turn.error_message.as_deref(),
-            )
-            .to_string(),
-        },
-        crate::providers::StopReason::Refusal => CoreAssistantOutcome::Refused,
-        crate::providers::StopReason::Aborted => CoreAssistantOutcome::Aborted,
-        crate::providers::StopReason::MaxTokens => CoreAssistantOutcome::MaxTokens,
-        crate::providers::StopReason::EndTurn | crate::providers::StopReason::ToolUse => {
-            CoreAssistantOutcome::Completed
-        }
-    }
-}
-
-fn canonical_assistant_outcome_with_logging(
-    session_id: &SessionId,
-    turn: &TurnResult,
-) -> CoreAssistantOutcome {
-    let outcome = canonical_assistant_outcome(turn);
-    if let CoreAssistantOutcome::Errored { message, .. } = &outcome {
-        tracing::Span::current().record("error.type", "provider_error");
-        tracing::warn!(
-            target: "daimonos::acp",
-            event = "provider_request_failed",
-            session_id = %session_id,
-            class = message,
-        );
-        // The warning is privacy-safe. Raw provider text remains DEBUG-only,
-        // scrubbed, and is never included in the canonical event.
-        log_raw_provider_error(session_id, message, turn.error_message.as_deref());
-    }
-    outcome
 }
 
 fn emit_assistant_done(events: &SessionEventRouter, session_id: &SessionId, turn: &TurnResult) {
@@ -2072,7 +1873,9 @@ async fn run_prompt_turn(
         .await;
     let execution = match execution {
         Ok(execution) => execution,
-        Err(SessionPromptError::Busy) => return Err(TurnError::Busy),
+        Err(SessionPromptError::Busy | SessionPromptError::Stopped) => {
+            return Err(TurnError::Busy);
+        }
         Err(SessionPromptError::DuplicateRequest(id)) => {
             send_notification(
                 cx,
@@ -2216,6 +2019,12 @@ async fn truncate_session(
     };
     agent_session.truncate_from_user_turn(turn_index)?;
     client_ids.truncate(turn_index);
+    let mut outcomes = handle
+        .core
+        .assistant_outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    outcomes.truncate(turn_index);
 
     if let Some(store) = store {
         let model = handle
@@ -2230,6 +2039,7 @@ async fn truncate_session(
             agent_session.history(),
             &handle.core.cwd,
             &client_ids,
+            &outcomes,
         );
     }
     Ok(())
@@ -2342,11 +2152,12 @@ async fn build_session_handle(
         Arc::clone(&approvals),
         Arc::clone(&active_tool_calls),
     ))));
-    let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
+    let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new_with_output_limit(
         Arc::clone(&events),
         Arc::clone(&approvals),
         safety,
         cfg.session.max_active_tool_calls,
+        cfg.session.max_tool_event_output_bytes,
     ));
     let config = build_agent_config(
         &session_workspace,
@@ -3076,6 +2887,7 @@ fn build_agent_with_state(
                                 &state.default_model,
                                 &[],
                                 &handle.core.cwd,
+                                &[],
                                 &[],
                             );
                         }
@@ -4717,6 +4529,7 @@ mod tests {
             "test-model",
             &[],
             workspace.path(),
+            &[],
             &[],
         );
 
@@ -7204,6 +7017,7 @@ mod tests {
             }],
             workspace.path(),
             &[],
+            &[],
         );
         let agent = build_agent(
             mock_factory(vec![]),
@@ -7759,7 +7573,7 @@ mod tests {
     // --- raw provider-error debug logging (#1062) ---
 
     // Minimal in-memory tracing layer that records events on the
-    // `daimonos::acp` target whose `event` field == "provider_request_raw",
+    // shared session-core target whose `event` field == "provider_request_raw",
     // capturing their `raw_error` field. Used to assert the DEBUG gate without
     // adding a test-only dependency.
     #[derive(Clone, Default)]
@@ -7782,7 +7596,7 @@ mod tests {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if event.metadata().target() != "daimonos::acp" {
+            if event.metadata().target() != "daimonos::session_core" {
                 return;
             }
             struct Visitor {
@@ -8079,7 +7893,7 @@ mod tests {
                 },
                 CoreSessionEvent::ToolCallFinished {
                     id: finished_id,
-                    ok: true,
+                    status: crate::session_protocol::ToolCallStateStatus::Completed,
                     ..
                 }
             ] if id == "t1" && updated_id == "t1" && finished_id == "t1"
