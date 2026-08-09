@@ -219,16 +219,6 @@ impl ViewState {
             }
             SessionEvent::AssistantDone { outcome } => {
                 self.close_open_line();
-                if self
-                    .transcript
-                    .last()
-                    .is_none_or(|line| line.role != TranscriptRole::Assistant)
-                {
-                    self.transcript.push(ViewLine::committed(
-                        TranscriptRole::Assistant,
-                        String::new(),
-                    ));
-                }
                 if let Some(note) = outcome_note(&outcome) {
                     self.transcript
                         .push(ViewLine::committed(TranscriptRole::System, note));
@@ -326,7 +316,11 @@ fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
 }
 
 fn transcript_entry_to_lines(entry: TranscriptEntry) -> Vec<ViewLine> {
-    let mut lines = vec![ViewLine::committed(entry.role, entry.text)];
+    let mut lines = if entry.role == TranscriptRole::Assistant && entry.text.is_empty() {
+        Vec::new()
+    } else {
+        vec![ViewLine::committed(entry.role, entry.text)]
+    };
     if let Some(note) = entry.outcome.as_ref().and_then(outcome_note) {
         lines.push(ViewLine::committed(TranscriptRole::System, note));
     }
@@ -781,6 +775,39 @@ mod tests {
             context_usage: None,
         });
 
+        assert_eq!(restored.transcript(), live.transcript());
+    }
+
+    #[test]
+    fn textless_outcomes_do_not_render_blank_assistant_rows() {
+        let outcome = AssistantOutcome::Aborted;
+        let mut live = ViewState::new("session");
+        ev(
+            &mut live,
+            1,
+            SessionEvent::AssistantDone {
+                outcome: outcome.clone(),
+            },
+        );
+        assert_eq!(live.transcript().len(), 1);
+        assert_eq!(live.transcript()[0].role, TranscriptRole::System);
+
+        let mut restored = ViewState::new("session");
+        restored.apply_snapshot(SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 1,
+            turn_status: TurnStatus::Idle,
+            transcript: vec![TranscriptEntry {
+                id: 1,
+                role: TranscriptRole::Assistant,
+                text: String::new(),
+                outcome: Some(outcome),
+            }],
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+        });
         assert_eq!(restored.transcript(), live.transcript());
     }
 

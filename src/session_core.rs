@@ -727,20 +727,19 @@ impl SessionCore {
                         content,
                         is_error,
                     } => {
-                        if let Some(call) = tool_calls
-                            .iter_mut()
-                            .rev()
-                            .find(|call| call.id == *tool_use_id)
-                        {
-                            call.status = if content == crate::agent::INTERRUPTED_TOOL_RESULT {
-                                ToolCallStateStatus::Cancelled
-                            } else if *is_error {
-                                ToolCallStateStatus::Failed
-                            } else {
-                                ToolCallStateStatus::Completed
-                            };
-                            call.output = Some(self.tool_lifecycle.project_output(content));
-                        }
+                        let status = if content == crate::agent::INTERRUPTED_TOOL_RESULT {
+                            ToolCallStateStatus::Cancelled
+                        } else if *is_error {
+                            ToolCallStateStatus::Failed
+                        } else {
+                            ToolCallStateStatus::Completed
+                        };
+                        apply_restored_tool_result(
+                            &mut tool_calls,
+                            tool_use_id,
+                            status,
+                            self.tool_lifecycle.project_output(content),
+                        );
                     }
                     ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {}
                 }
@@ -1011,6 +1010,21 @@ fn apply_persisted_outcomes(
         );
     }
     *transcript = rebuilt;
+}
+
+fn apply_restored_tool_result(
+    tool_calls: &mut [crate::session_protocol::ToolCallState],
+    tool_use_id: &str,
+    status: crate::session_protocol::ToolCallStateStatus,
+    output: String,
+) {
+    if let Some(call) = tool_calls.iter_mut().find(|call| {
+        call.id == tool_use_id
+            && call.status == crate::session_protocol::ToolCallStateStatus::InProgress
+    }) {
+        call.status = status;
+        call.output = Some(output);
+    }
 }
 
 pub(crate) fn align_client_user_message_ids(ids: &mut Vec<String>, user_turn_count: usize) {
@@ -2982,6 +2996,40 @@ mod tests {
         );
         assert_eq!(router.latest_sequence(), 2);
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn restored_duplicate_tool_ids_pair_results_in_occurrence_order() {
+        let mut calls = vec![
+            crate::session_protocol::ToolCallState {
+                id: "duplicate".to_string(),
+                name: "first".to_string(),
+                title: "first".to_string(),
+                status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                output: None,
+            },
+            crate::session_protocol::ToolCallState {
+                id: "duplicate".to_string(),
+                name: "second".to_string(),
+                title: "second".to_string(),
+                status: crate::session_protocol::ToolCallStateStatus::InProgress,
+                output: None,
+            },
+        ];
+        apply_restored_tool_result(
+            &mut calls,
+            "duplicate",
+            crate::session_protocol::ToolCallStateStatus::Completed,
+            "first output".to_string(),
+        );
+        apply_restored_tool_result(
+            &mut calls,
+            "duplicate",
+            crate::session_protocol::ToolCallStateStatus::Completed,
+            "second output".to_string(),
+        );
+        assert_eq!(calls[0].output.as_deref(), Some("first output"));
+        assert_eq!(calls[1].output.as_deref(), Some("second output"));
     }
 
     #[test]

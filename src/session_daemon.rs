@@ -669,7 +669,7 @@ impl SessionDaemon {
         limits: &ProtocolLimits,
         capability_policy: &CapabilityPolicy,
     ) -> Result<(), TransportError> {
-        let Some(first) = recv_with_timeout(&transport, self.idle_retention).await? else {
+        let Some(first) = transport.recv().await? else {
             return Ok(());
         };
         if let Err(error) = limits.validate_client_message(&first) {
@@ -830,7 +830,7 @@ impl SessionDaemon {
         let mut stop_receiver = attachment.entry.stop_notifier.subscribe();
         loop {
             tokio::select! {
-                incoming = recv_with_timeout(&transport, self.idle_retention) => match incoming? {
+                incoming = transport.recv() => match incoming? {
                     Some(_) if attachment.entry.stopped.load(Ordering::Acquire) => {
                         while let Ok(outgoing) = event_rx.try_recv() {
                             transport.send(&outgoing).await?;
@@ -1473,23 +1473,6 @@ fn accept_error_is_recoverable(error: &std::io::Error) -> bool {
     ) || error
         .raw_os_error()
         .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
-}
-
-async fn recv_with_timeout<T: ClientTransport>(
-    transport: &T,
-    timeout: Option<std::time::Duration>,
-) -> Result<Option<ClientMessage>, TransportError> {
-    match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, transport.recv())
-            .await
-            .map_err(|_| {
-                TransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "session client idle timeout",
-                ))
-            })?,
-        None => transport.recv().await,
-    }
 }
 
 struct SnapshotState {
@@ -3437,6 +3420,53 @@ mod tests {
         daemon.evict_idle_sessions().await;
 
         assert!(daemon.session("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn detached_retention_does_not_timeout_attached_client() {
+        let daemon = Arc::new(SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(10)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        ));
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let (transport, mut client) = in_memory_transport_pair(8, "test client");
+        let serve_daemon = Arc::clone(&daemon);
+        let serving = tokio::spawn(async move {
+            serve_daemon
+                .serve_client(transport, &protocol_limits())
+                .await
+        });
+        client
+            .send(ClientMessage::Attach {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: Some("session-1".to_string()),
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![ClientCapability::Observe],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::AttachOk { .. })
+        ));
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Snapshot { .. })
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        client.send(ClientMessage::Ping).await.unwrap();
+        assert_eq!(client.recv().await, Some(ServerMessage::Pong));
+        client.send(ClientMessage::Detach).await.unwrap();
+        serving.await.unwrap().unwrap();
     }
 
     #[test]
