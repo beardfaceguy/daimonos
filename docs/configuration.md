@@ -309,11 +309,47 @@ the local TUI/UDS client, and future remote clients.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `socket_path` | workspace-derived | Optional local Unix socket override; by default a stable canonical-workspace hash allows distinct projects to run simultaneously. |
 | `max_active_tool_calls` | `16` | Maximum in-flight tool calls tracked by one session. Must be greater than zero. |
+| `max_sessions` | `64` | Maximum live sessions retained by one interactive session daemon. Must be greater than zero. |
+| `max_clients_per_session` | `4` | Maximum clients simultaneously attached to one session. Must be greater than zero. |
+| `event_queue_capacity` | `256` | Maximum canonical events queued per attached client. Must be greater than zero. |
+| `snapshot_entries` | `2000` | Maximum transcript entries and tool calls retained independently in a full attach snapshot. Must be greater than zero. |
+| `approval_timeout_secs` | `30` | Maximum seconds a daemon approval may wait before it is denied safely. |
+| `max_tool_event_output_bytes` | `65536` | Maximum UTF-8 bytes retained from one tool result in canonical events; range: 32 through one eighth of `max_frame_bytes`. |
+| `accept_error_backoff_ms` | `100` | Delay before retrying a recoverable local Unix listener accept failure. |
+| `idle_retention_secs` | `300` | Seconds before unloading a detached idle core while preserving its durable record for reattach; `0` keeps cores resident. |
+| `session_list_page_size` | `50` | Maximum entries returned by one daemon session-list page. |
+| `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
+| `max_frame_bytes` | `1048576` | Maximum newline-delimited JSON frame size. |
+| `max_prompt_bytes` | `131072` | Maximum UTF-8 bytes in one prompt; its worst-case JSON-escaped event must fit within `max_frame_bytes`. |
+| `max_label_bytes` | `256` | Maximum UTF-8 bytes in a client label. |
+| `max_identifier_bytes` | `128` | Maximum UTF-8 bytes in session, client, request, approval, and option identifiers. |
+| `max_ticket_bytes` | `1024` | Maximum authentication ticket bytes. |
+| `max_runtime_value_bytes` | `4096` | Maximum UTF-8 bytes in a string runtime-option value. |
+| `max_capabilities` | `16` | Maximum requested capabilities in one attach. |
 
 ```toml
 [session]
+# socket_path = "~/.daimonos/custom-session.sock"
 max_active_tool_calls = 16
+max_sessions = 64
+max_clients_per_session = 4
+event_queue_capacity = 256
+snapshot_entries = 2000
+approval_timeout_secs = 30
+max_tool_event_output_bytes = 65536
+accept_error_backoff_ms = 100
+idle_retention_secs = 0
+session_list_page_size = 50
+shutdown_grace_secs = 5
+max_frame_bytes = 1048576
+max_prompt_bytes = 131072
+max_label_bytes = 256
+max_identifier_bytes = 128
+max_ticket_bytes = 1024
+max_runtime_value_bytes = 4096
+max_capabilities = 16
 ```
 
 ### `[tui]` — Interactive terminal frontend

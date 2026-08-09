@@ -242,14 +242,62 @@ impl Default for LoopDetectorConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct SessionRuntimeConfig {
+    /// Local session-daemon Unix socket.
+    pub socket_path: Option<String>,
     /// Maximum tool calls simultaneously tracked by one agent session.
     pub max_active_tool_calls: usize,
+    /// Maximum live daemon-owned sessions.
+    pub max_sessions: usize,
+    /// Maximum clients simultaneously attached to one session.
+    pub max_clients_per_session: usize,
+    /// Bounded canonical-event queue per attached client.
+    pub event_queue_capacity: usize,
+    /// Maximum transcript and tool entries retained in an attach snapshot.
+    pub snapshot_entries: usize,
+    /// Seconds an unresolved daemon approval may wait before safe denial.
+    pub approval_timeout_secs: u64,
+    /// Maximum UTF-8 bytes projected from one tool result into session events.
+    pub max_tool_event_output_bytes: usize,
+    /// Backoff after a recoverable Unix listener accept failure.
+    pub accept_error_backoff_ms: u64,
+    /// Idle detached-session retention; zero keeps sessions until explicit stop.
+    pub idle_retention_secs: u64,
+    /// Maximum sessions returned by one daemon list page.
+    pub session_list_page_size: usize,
+    /// Grace period for daemon-owned prompt/client tasks during shutdown.
+    pub shutdown_grace_secs: u64,
+    /// Maximum newline-delimited JSON frame size.
+    pub max_frame_bytes: usize,
+    pub max_prompt_bytes: usize,
+    pub max_label_bytes: usize,
+    pub max_identifier_bytes: usize,
+    pub max_ticket_bytes: usize,
+    pub max_runtime_value_bytes: usize,
+    pub max_capabilities: usize,
 }
 
 impl Default for SessionRuntimeConfig {
     fn default() -> Self {
         Self {
+            socket_path: None,
             max_active_tool_calls: 16,
+            max_sessions: 64,
+            max_clients_per_session: 4,
+            event_queue_capacity: 256,
+            snapshot_entries: 2_000,
+            approval_timeout_secs: 30,
+            max_tool_event_output_bytes: 65_536,
+            accept_error_backoff_ms: 100,
+            idle_retention_secs: 300,
+            session_list_page_size: 50,
+            shutdown_grace_secs: 5,
+            max_frame_bytes: 1_048_576,
+            max_prompt_bytes: 131_072,
+            max_label_bytes: 256,
+            max_identifier_bytes: 128,
+            max_ticket_bytes: 1_024,
+            max_runtime_value_bytes: 4_096,
+            max_capabilities: 16,
         }
     }
 }
@@ -259,7 +307,100 @@ impl SessionRuntimeConfig {
         if self.max_active_tool_calls == 0 {
             return Err("session.max_active_tool_calls must be greater than zero".to_string());
         }
+        if self.max_sessions == 0 {
+            return Err("session.max_sessions must be greater than zero".to_string());
+        }
+        if self.max_clients_per_session == 0 {
+            return Err("session.max_clients_per_session must be greater than zero".to_string());
+        }
+        if self.event_queue_capacity == 0 {
+            return Err("session.event_queue_capacity must be greater than zero".to_string());
+        }
+        if self.snapshot_entries == 0 {
+            return Err("session.snapshot_entries must be greater than zero".to_string());
+        }
+        if self.approval_timeout_secs == 0 {
+            return Err("session.approval_timeout_secs must be greater than zero".to_string());
+        }
+        if self.max_tool_event_output_bytes < 32 {
+            return Err("session.max_tool_event_output_bytes must be at least 32".to_string());
+        }
+        if self.accept_error_backoff_ms == 0 {
+            return Err("session.accept_error_backoff_ms must be greater than zero".to_string());
+        }
+        if self.session_list_page_size == 0 {
+            return Err("session.session_list_page_size must be greater than zero".to_string());
+        }
+        if self.shutdown_grace_secs == 0 {
+            return Err("session.shutdown_grace_secs must be greater than zero".to_string());
+        }
+        if self.max_tool_event_output_bytes > self.max_frame_bytes / 8 {
+            return Err(
+                "session.max_tool_event_output_bytes must be at most one eighth of \
+                 session.max_frame_bytes"
+                    .to_string(),
+            );
+        }
+        let prompt_event_envelope =
+            serde_json::to_vec(&crate::session_protocol::ServerMessage::Event {
+                seq: u64::MAX,
+                event: crate::session_protocol::SessionEvent::UserMessage {
+                    text: String::new(),
+                },
+            })
+            .map_err(|error| format!("failed to size session prompt event: {error}"))?
+            .len();
+        let worst_case_prompt_event = self
+            .max_prompt_bytes
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(prompt_event_envelope))
+            .ok_or_else(|| "session.max_prompt_bytes is too large".to_string())?;
+        if worst_case_prompt_event > self.max_frame_bytes {
+            return Err("session.max_prompt_bytes worst-case event must fit within \
+                 session.max_frame_bytes"
+                .to_string());
+        }
+        for (name, value) in [
+            ("max_frame_bytes", self.max_frame_bytes),
+            ("max_prompt_bytes", self.max_prompt_bytes),
+            ("max_label_bytes", self.max_label_bytes),
+            ("max_identifier_bytes", self.max_identifier_bytes),
+            ("max_ticket_bytes", self.max_ticket_bytes),
+            ("max_runtime_value_bytes", self.max_runtime_value_bytes),
+            ("max_capabilities", self.max_capabilities),
+        ] {
+            if value == 0 {
+                return Err(format!("session.{name} must be greater than zero"));
+            }
+        }
         Ok(())
+    }
+
+    pub fn resolved_socket_path(&self, workspace: &std::path::Path) -> std::path::PathBuf {
+        if let Some(path) = self.socket_path.as_deref() {
+            return crate::paths::expand_tilde(path);
+        }
+        use sha2::{Digest, Sha256};
+        let canonical =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+        let suffix = hex::encode(&digest[..8]);
+        crate::paths::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".daimonos")
+            .join(format!("session-{suffix}.sock"))
+    }
+
+    pub fn protocol_limits(&self) -> crate::session_protocol::ProtocolLimits {
+        crate::session_protocol::ProtocolLimits {
+            max_frame_bytes: self.max_frame_bytes,
+            max_prompt_bytes: self.max_prompt_bytes,
+            max_label_bytes: self.max_label_bytes,
+            max_identifier_bytes: self.max_identifier_bytes,
+            max_ticket_bytes: self.max_ticket_bytes,
+            max_runtime_value_bytes: self.max_runtime_value_bytes,
+            max_capabilities: self.max_capabilities,
+        }
     }
 }
 
@@ -1406,6 +1547,20 @@ mod tests {
         assert_eq!(cfg.search.default_find_max, 20);
         assert_eq!(cfg.acp.session_list_page_size, 50);
         assert_eq!(cfg.session.max_active_tool_calls, 16);
+        assert_eq!(cfg.session.max_sessions, 64);
+        assert_eq!(cfg.session.max_clients_per_session, 4);
+        assert_eq!(cfg.session.event_queue_capacity, 256);
+        assert_eq!(cfg.session.snapshot_entries, 2_000);
+        assert_eq!(cfg.session.approval_timeout_secs, 30);
+        assert_eq!(cfg.session.max_tool_event_output_bytes, 65_536);
+        assert_eq!(cfg.session.accept_error_backoff_ms, 100);
+        assert_eq!(cfg.session.idle_retention_secs, 300);
+        assert_eq!(cfg.session.session_list_page_size, 50);
+        assert_eq!(cfg.session.shutdown_grace_secs, 5);
+        assert_eq!(cfg.session.max_frame_bytes, 1_048_576);
+        assert_eq!(cfg.session.max_prompt_bytes, 131_072);
+        assert_eq!(cfg.session.max_identifier_bytes, 128);
+        assert_eq!(cfg.session.max_capabilities, 16);
         assert_eq!(cfg.tui.history_entries, DEFAULT_TUI_HISTORY_ENTRIES);
         assert_eq!(cfg.tui.scrollback_entries, DEFAULT_TUI_SCROLLBACK_ENTRIES);
         assert_eq!(cfg.process.poll_tail_lines, 20);
@@ -1692,6 +1847,80 @@ mod tests {
             .validate()
             .expect_err("zero active tool limit must be rejected")
             .contains("session.max_active_tool_calls"));
+
+        for field in [
+            "max_sessions",
+            "max_clients_per_session",
+            "event_queue_capacity",
+            "snapshot_entries",
+            "max_frame_bytes",
+            "max_prompt_bytes",
+            "max_label_bytes",
+            "max_identifier_bytes",
+            "max_ticket_bytes",
+            "max_runtime_value_bytes",
+            "max_capabilities",
+        ] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero session limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
+        let invalid: Config = toml::from_str("[session]\napproval_timeout_secs = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero approval timeout must be rejected")
+            .contains("session.approval_timeout_secs"));
+        let invalid: Config =
+            toml::from_str("[session]\nmax_tool_event_output_bytes = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero tool event output limit must be rejected")
+            .contains("session.max_tool_event_output_bytes"));
+        let invalid: Config = toml::from_str("[session]\naccept_error_backoff_ms = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero listener backoff must be rejected")
+            .contains("session.accept_error_backoff_ms"));
+        let invalid: Config = toml::from_str("[session]\nsession_list_page_size = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero session list page size must be rejected")
+            .contains("session.session_list_page_size"));
+        let invalid: Config = toml::from_str(
+            "[session]\nmax_frame_bytes = 256\nmax_prompt_bytes = 32\n\
+             max_tool_event_output_bytes = 32\n",
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("prompt event must fit transport frame")
+            .contains("session.max_prompt_bytes"));
+    }
+
+    #[test]
+    fn default_session_socket_is_stable_per_canonical_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let cfg = SessionRuntimeConfig::default();
+        assert_ne!(
+            cfg.resolved_socket_path(&first),
+            cfg.resolved_socket_path(&second)
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&first, &alias).unwrap();
+            assert_eq!(
+                cfg.resolved_socket_path(&first),
+                cfg.resolved_socket_path(&alias)
+            );
+        }
     }
 
     #[test]

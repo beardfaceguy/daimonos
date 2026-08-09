@@ -167,7 +167,7 @@ impl ViewState {
         self.transcript = snapshot
             .transcript
             .into_iter()
-            .map(transcript_entry_to_line)
+            .flat_map(transcript_entry_to_lines)
             .collect();
         self.tool_calls = snapshot.tool_calls;
         self.pending_approvals = snapshot.pending_approvals;
@@ -219,6 +219,16 @@ impl ViewState {
             }
             SessionEvent::AssistantDone { outcome } => {
                 self.close_open_line();
+                if self
+                    .transcript
+                    .last()
+                    .is_none_or(|line| line.role != TranscriptRole::Assistant)
+                {
+                    self.transcript.push(ViewLine::committed(
+                        TranscriptRole::Assistant,
+                        String::new(),
+                    ));
+                }
                 if let Some(note) = outcome_note(&outcome) {
                     self.transcript
                         .push(ViewLine::committed(TranscriptRole::System, note));
@@ -247,13 +257,9 @@ impl ViewState {
                     call.status = status;
                 }
             }
-            SessionEvent::ToolCallFinished { id, ok, output } => {
+            SessionEvent::ToolCallFinished { id, status, output } => {
                 if let Some(call) = self.tool_calls.iter_mut().find(|c| c.id == id) {
-                    call.status = if ok {
-                        ToolCallStateStatus::Completed
-                    } else {
-                        ToolCallStateStatus::Failed
-                    };
+                    call.status = status;
                     call.output = Some(output);
                 }
             }
@@ -319,8 +325,12 @@ fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
     }
 }
 
-fn transcript_entry_to_line(entry: TranscriptEntry) -> ViewLine {
-    ViewLine::committed(entry.role, entry.text)
+fn transcript_entry_to_lines(entry: TranscriptEntry) -> Vec<ViewLine> {
+    let mut lines = vec![ViewLine::committed(entry.role, entry.text)];
+    if let Some(note) = entry.outcome.as_ref().and_then(outcome_note) {
+        lines.push(ViewLine::committed(TranscriptRole::System, note));
+    }
+    lines
 }
 
 /// A privacy-safe system note appended to the transcript when a turn ends in a
@@ -527,7 +537,7 @@ mod tests {
             3,
             SessionEvent::ToolCallFinished {
                 id: "t1".into(),
-                ok: true,
+                status: ToolCallStateStatus::Completed,
                 output: "done".into(),
             },
         );
@@ -553,11 +563,36 @@ mod tests {
             2,
             SessionEvent::ToolCallFinished {
                 id: "t1".into(),
-                ok: false,
+                status: ToolCallStateStatus::Failed,
                 output: "boom".into(),
             },
         );
         assert_eq!(s.tool_calls()[0].status, ToolCallStateStatus::Failed);
+    }
+
+    #[test]
+    fn cancelled_tool_finish_remains_cancelled() {
+        let mut state = ViewState::new("sess-1");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::ToolCallStarted {
+                id: "t1".into(),
+                name: "exec".into(),
+                title: "Run".into(),
+                input_summary: None,
+            },
+        );
+        ev(
+            &mut state,
+            2,
+            SessionEvent::ToolCallFinished {
+                id: "t1".into(),
+                status: ToolCallStateStatus::Cancelled,
+                output: "cancelled".into(),
+            },
+        );
+        assert_eq!(state.tool_calls()[0].status, ToolCallStateStatus::Cancelled);
     }
 
     #[test]
@@ -668,11 +703,13 @@ mod tests {
                     id: 1,
                     role: TranscriptRole::User,
                     text: "question".into(),
+                    outcome: None,
                 },
                 TranscriptEntry {
                     id: 2,
                     role: TranscriptRole::Assistant,
                     text: "answer".into(),
+                    outcome: None,
                 },
             ],
             tool_calls: Vec::new(),
@@ -703,6 +740,48 @@ mod tests {
         );
         assert_eq!(s.transcript().len(), 3);
         assert_eq!(s.last_seq(), 11);
+    }
+
+    #[test]
+    fn snapshot_preserves_non_clean_terminal_outcome_note() {
+        let outcome = AssistantOutcome::Errored {
+            context_overflow: false,
+            message: "provider unavailable".to_string(),
+        };
+        let mut live = ViewState::new("session");
+        ev(
+            &mut live,
+            1,
+            SessionEvent::AssistantDelta {
+                text: "partial".to_string(),
+            },
+        );
+        ev(
+            &mut live,
+            2,
+            SessionEvent::AssistantDone {
+                outcome: outcome.clone(),
+            },
+        );
+
+        let mut restored = ViewState::new("session");
+        restored.apply_snapshot(SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 2,
+            turn_status: TurnStatus::Idle,
+            transcript: vec![TranscriptEntry {
+                id: 1,
+                role: TranscriptRole::Assistant,
+                text: "partial".to_string(),
+                outcome: Some(outcome),
+            }],
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+        });
+
+        assert_eq!(restored.transcript(), live.transcript());
     }
 
     #[test]

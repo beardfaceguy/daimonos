@@ -30,8 +30,9 @@ mod provisioning;
 mod safety;
 mod script;
 mod session;
-#[allow(dead_code)] // ApprovalBroker is wired into ACP/daemon in the next slice.
 mod session_core;
+mod session_daemon;
+mod session_factory;
 mod session_protocol;
 mod session_store;
 mod snapshot;
@@ -228,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
     let uses_agent_prompt = match &cli.command {
         Some(Command::Agent(args)) => !args.dry_run,
         Some(Command::Chat(args)) => !args.list,
-        Some(Command::Acp(_)) => true,
+        Some(Command::Acp(_) | Command::SessionDaemon(_)) => true,
         Some(Command::Mcp(_) | Command::Daemon) | None => false,
     };
     if uses_agent_prompt {
@@ -309,6 +310,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Acp(args)) => {
             agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await
+        }
+        Some(Command::SessionDaemon(args)) => {
+            agent_runtime::run_session_daemon(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
@@ -450,7 +454,11 @@ async fn run_tool_service(
         RuntimeMode::Daemon => {
             run_socket_server(DaemonOptions { socket, debug }, workspace, cfg, services).await
         }
-        RuntimeMode::Agent | RuntimeMode::Chat | RuntimeMode::Acp | RuntimeMode::Stats => {
+        RuntimeMode::Agent
+        | RuntimeMode::Chat
+        | RuntimeMode::Acp
+        | RuntimeMode::SessionDaemon
+        | RuntimeMode::Stats => {
             unreachable!("early-return runtime reached service dispatch")
         }
     }

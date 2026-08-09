@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{ContentBlock, Message, Role};
+use crate::session_protocol::AssistantOutcome;
 
 /// Version tag on the persisted-session JSON, so a future on-disk format
 /// change can be detected and old files ignored rather than mis-parsed.
@@ -26,6 +27,8 @@ pub struct PersistedSession {
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_user_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assistant_outcomes: Vec<AssistantOutcome>,
     pub messages: Vec<Message>,
 }
 
@@ -68,7 +71,7 @@ impl SessionStore {
     /// Persist a session's history. Best-effort: a write failure is logged to
     /// stderr and never fails the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
-        self.save_record(id, model, messages, None, &[]);
+        self.save_record(id, model, messages, None, &[], &[]);
     }
 
     /// Persist a session and the working directory needed by ACP session/list.
@@ -76,7 +79,7 @@ impl SessionStore {
     /// readable and the chat store can continue using [`Self::save`].
     #[cfg(test)]
     pub fn save_with_cwd(&self, id: &str, model: &str, messages: &[Message], cwd: &Path) {
-        self.save_record(id, model, messages, Some(cwd.to_path_buf()), &[]);
+        self.save_record(id, model, messages, Some(cwd.to_path_buf()), &[], &[]);
     }
 
     pub fn save_acp(
@@ -86,6 +89,7 @@ impl SessionStore {
         messages: &[Message],
         cwd: &Path,
         client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
     ) {
         self.save_record(
             id,
@@ -93,6 +97,7 @@ impl SessionStore {
             messages,
             Some(cwd.to_path_buf()),
             client_user_message_ids,
+            assistant_outcomes,
         );
     }
 
@@ -103,6 +108,7 @@ impl SessionStore {
         messages: &[Message],
         cwd: Option<PathBuf>,
         client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
     ) {
         let Some(name) = Self::file_name(id) else {
             return;
@@ -113,6 +119,7 @@ impl SessionStore {
             model: model.to_string(),
             cwd,
             client_user_message_ids: client_user_message_ids.to_vec(),
+            assistant_outcomes: assistant_outcomes.to_vec(),
             messages: messages.to_vec(),
         };
         if let Err(e) = self.write_atomic(&name, &record) {
@@ -268,6 +275,7 @@ mod tests {
             &msgs(),
             workspace.path(),
             &["user-1".to_string()],
+            &[],
         );
 
         let loaded = store.load("acp-ids").expect("saved session should load");
