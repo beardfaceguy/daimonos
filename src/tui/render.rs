@@ -284,9 +284,13 @@ fn composer_viewport(composer: &str, inner: Rect) -> Option<ComposerViewport> {
         return None;
     }
     let (_, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    Some(viewport_from_cursor(logical_row, column, inner))
+}
+
+fn viewport_from_cursor(logical_row: usize, column: usize, inner: Rect) -> ComposerViewport {
     let viewport_height = usize::from(inner.height);
     let scroll = logical_row.saturating_sub(viewport_height.saturating_sub(1));
-    Some(ComposerViewport {
+    ComposerViewport {
         scroll,
         cursor_column: u16::try_from(column)
             .unwrap_or(u16::MAX)
@@ -294,15 +298,18 @@ fn composer_viewport(composer: &str, inner: Rect) -> Option<ComposerViewport> {
         cursor_row: u16::try_from(logical_row.saturating_sub(scroll))
             .unwrap_or(u16::MAX)
             .min(inner.height.saturating_sub(1)),
-    })
+    }
 }
 
 fn wrapped_composer(composer: &str, inner: Rect) -> (String, Option<ComposerViewport>) {
     if inner.width == 0 || inner.height == 0 {
         return (String::new(), None);
     }
-    let (wrapped, _, _) = wrap_composer(composer, usize::from(inner.width));
-    (wrapped, composer_viewport(composer, inner))
+    let (wrapped, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    (
+        wrapped,
+        Some(viewport_from_cursor(logical_row, column, inner)),
+    )
 }
 
 fn wrap_composer(composer: &str, width: usize) -> (String, usize, usize) {
@@ -855,6 +862,14 @@ mod tests {
             composer_cursor_position("abcd\u{200b}\nq", area),
             Some((2, 9)),
         );
+    }
+
+    #[test]
+    fn newline_after_exact_width_starts_one_empty_logical_line() {
+        let area = Rect::new(0, 0, 6, 12);
+        // The hard-wrap and explicit newline identify the same next row; they
+        // must not create a second blank row.
+        assert_eq!(composer_cursor_position("abcd\n", area), Some((1, 8)),);
     }
 
     #[test]
