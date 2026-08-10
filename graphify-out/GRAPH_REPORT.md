@@ -1,7 +1,7 @@
 # Graph Report - daimonos-reconnect  (2026-08-09)
 
 ## Corpus Check
-- 239 files · ~319,659 words
+- 239 files · ~319,671 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `8529f2e3`
+- Built from commit: `c8b1904f`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -333,7 +333,7 @@ Nodes (74): agent_runs_summary_aggregates_correctly(), agent_runs_summary_empty_
 
 ### Community 2 - "Community 2"
 Cohesion: 0.10
-Nodes (32): execute(), execute_captures_print(), execute_dict_result_variable(), execute_double_colon_in_string_literal_succeeds(), execute_exec_accepts_positional_and_keyword_args(), execute_exec_command(), execute_ls_accepts_documented_glob_and_type_filters(), execute_multi_step_script() (+24 more)
+Nodes (31): GlobalsBuilder, builtin_functions(), execute(), execute_captures_print(), execute_dict_result_variable(), execute_double_colon_in_string_literal_succeeds(), execute_exec_accepts_positional_and_keyword_args(), execute_exec_command() (+23 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.07
@@ -756,8 +756,8 @@ Cohesion: 0.22
 Nodes (9): E, build_provider(), generation_span_is_child_and_exports_usage_without_content(), prompt_root_omits_absent_session_id(), prompt_roots_export_safe_metadata_and_distinct_traces(), PromptSpan, RemoteToolSpan, saturated_queue_drops_spans_without_blocking_producer() (+1 more)
 
 ### Community 109 - "Community 109"
-Cohesion: 0.15
-Nodes (13): accept_error_is_recoverable(), cancelling_unix_server_removes_owned_socket(), ClientTaskGuard, Drop, Duration, Error, File, PathBuf (+5 more)
+Cohesion: 0.09
+Nodes (27): SessionPromptError, accept_error_is_recoverable(), bind_local_socket(), cancelling_unix_server_removes_owned_socket(), client_request_key(), ClientTaskGuard, explicit_stop_cannot_race_persistence_recreation(), explicit_stop_deletes_persisted_session() (+19 more)
 
 ### Community 110 - "Community 110"
 Cohesion: 0.70
@@ -1108,8 +1108,8 @@ Cohesion: 0.27
 Nodes (9): daimonos_binary(), daimonos_factory(), _find_binary(), _handshake(), Return path to daimonos binary, building if necessary., Build the daimonos binary once per test session., Spawn one *or more* daimonos MCP subprocesses within a single test.      Yields, Wrap a spawned daimonos process in a client and run the MCP handshake. (+1 more)
 
 ### Community 222 - "Community 222"
-Cohesion: 0.50
-Nodes (4): GlobalsBuilder, builtin_functions(), subcall_functions(), tool_functions()
+Cohesion: 0.38
+Nodes (5): BlockingProvider, CompleteOpts, Context, LlmResponse, StaticProvider
 
 ### Community 223 - "Community 223"
 Cohesion: 0.50
@@ -1120,8 +1120,8 @@ Cohesion: 0.11
 Nodes (15): Span, CompactionMetadata, CompactionOutcome, CompactionSpan, CoordinationSpan, GenerationMetadata, GenerationSpan, AtomicBool (+7 more)
 
 ### Community 225 - "Community 225"
-Cohesion: 0.19
-Nodes (19): agent_system.md (Agent System Prompt), Claude Code Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Agent Environment File, Anthropic tool-prefix caching (`DAIMONOS_AGENT_PROMPT_CACHE`), Config File Location, Configuration Reference (+11 more)
+Cohesion: 0.25
+Nodes (16): agent_system.md (Agent System Prompt), Claude Code Setup Guide, Cursor IDE Setup Guide, daimonos.default.toml (reference config), Config File Location, Configuration Reference, Environment Variables, Performance Tuning Tips (+8 more)
 
 ### Community 226 - "Community 226"
 Cohesion: 0.50
@@ -1184,8 +1184,8 @@ Cohesion: 0.11
 Nodes (28): C, M, SessionPersistenceState, SessionTurn, align_client_user_message_ids(), AgentSession, ApprovalBroker, CanonicalToolLifecycle (+20 more)
 
 ### Community 243 - "Community 243"
-Cohesion: 0.14
-Nodes (18): SessionPromptError, bind_local_socket(), client_request_key(), explicit_stop_cannot_race_persistence_recreation(), explicit_stop_deletes_persisted_session(), fit_snapshot_to_frame(), oversized_snapshot_is_trimmed_to_transport_frame(), prompt_error() (+10 more)
+Cohesion: 0.40
+Nodes (5): normalize_double_quoted_multiline_becomes_triple(), normalize_escaped_quote_in_string_preserved(), normalize_preserves_surrounding_code(), normalize_single_quoted_multiline_becomes_triple(), normalize_string_literals()
 
 ### Community 245 - "Community 245"
 Cohesion: 0.20
@@ -1220,12 +1220,12 @@ Cohesion: 0.20
 Nodes (10): AnthropicBlock, AnthropicMessage, AnthropicResponseBlock, AnthropicThinking, AnthropicTool, AnthropicUsage, AnthropicMessage, AnthropicRequest (+2 more)
 
 ### Community 254 - "Community 254"
-Cohesion: 0.29
-Nodes (5): CapabilityPolicy, HashSet, IntoIterator, Item, Self
+Cohesion: 0.67
+Nodes (3): Agent Environment File, Anthropic tool-prefix caching (`DAIMONOS_AGENT_PROMPT_CACHE`), Reasoning effort (`DAIMONOS_AGENT_THINKING`)
 
 ### Community 255 - "Community 255"
-Cohesion: 0.18
-Nodes (17): SessionPersistence, BlockingOpenFactory, BlockingProvider, CountingSessionFactory, Arc, Box, CompleteOpts, Context (+9 more)
+Cohesion: 0.22
+Nodes (16): SessionPersistence, BlockingOpenFactory, CountingSessionFactory, Arc, Box, LlmProvider, Send, SessionCore (+8 more)
 
 ### Community 256 - "Community 256"
 Cohesion: 0.67
@@ -1244,8 +1244,8 @@ Cohesion: 0.40
 Nodes (5): _is_error(), docker ps returns structured container list., docker images returns structured image list., test_docker_images(), test_docker_ps()
 
 ### Community 262 - "Community 262"
-Cohesion: 0.35
-Nodes (6): SessionEvent, SessionSnapshot, T, TranscriptRole, SnapshotState, trim_oldest()
+Cohesion: 0.16
+Nodes (11): CapabilityPolicy, HashSet, IntoIterator, Item, Self, SessionEvent, SessionSnapshot, T (+3 more)
 
 ### Community 263 - "Community 263"
 Cohesion: 0.18

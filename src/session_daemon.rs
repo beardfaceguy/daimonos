@@ -903,6 +903,7 @@ impl SessionDaemon {
         let prompt_in_flight = Arc::new(AtomicBool::new(false));
         let mut stop_receiver = attachment.entry.stop_notifier.subscribe();
         let mut replacement_receiver = attachment.replacement_receiver.clone();
+        let mut replacement_open = true;
         loop {
             tokio::select! {
                 incoming = transport.recv() => match incoming? {
@@ -1333,14 +1334,17 @@ impl SessionDaemon {
                         break;
                     }
                 }
-                changed = replacement_receiver.changed() => {
-                    if changed.is_err() || *replacement_receiver.borrow() {
+                changed = replacement_receiver.changed(), if replacement_open => {
+                    if *replacement_receiver.borrow() {
                         transport
                             .send(&ServerMessage::Revoked {
                                 reason: "attachment replaced by reconnect".to_string(),
                             })
                             .await?;
                         break;
+                    }
+                    if changed.is_err() {
+                        replacement_open = false;
                     }
                 }
             }
