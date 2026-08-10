@@ -1,0 +1,3 @@
+# Android launchers must be exported when they have a MAIN/LAUNCHER filter.
+# MainActivity itself is non-exported and Android lint validates this manifest.
+android/app/src/main/AndroidManifest.xml
