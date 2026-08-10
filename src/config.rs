@@ -254,6 +254,8 @@ pub struct SessionRuntimeConfig {
     pub event_queue_capacity: usize,
     /// Maximum transcript and tool entries retained in an attach snapshot.
     pub snapshot_entries: usize,
+    /// Maximum canonical session events retained for reconnect delta replay.
+    pub replay_events: usize,
     /// Seconds an unresolved daemon approval may wait before safe denial.
     pub approval_timeout_secs: u64,
     /// Maximum UTF-8 bytes projected from one tool result into session events.
@@ -285,6 +287,7 @@ impl Default for SessionRuntimeConfig {
             max_clients_per_session: 4,
             event_queue_capacity: 256,
             snapshot_entries: 2_000,
+            replay_events: 512,
             approval_timeout_secs: 30,
             max_tool_event_output_bytes: 65_536,
             accept_error_backoff_ms: 100,
@@ -318,6 +321,9 @@ impl SessionRuntimeConfig {
         }
         if self.snapshot_entries == 0 {
             return Err("session.snapshot_entries must be greater than zero".to_string());
+        }
+        if self.replay_events == 0 {
+            return Err("session.replay_events must be greater than zero".to_string());
         }
         if self.approval_timeout_secs == 0 {
             return Err("session.approval_timeout_secs must be greater than zero".to_string());
@@ -1551,6 +1557,7 @@ mod tests {
         assert_eq!(cfg.session.max_clients_per_session, 4);
         assert_eq!(cfg.session.event_queue_capacity, 256);
         assert_eq!(cfg.session.snapshot_entries, 2_000);
+        assert_eq!(cfg.session.replay_events, 512);
         assert_eq!(cfg.session.approval_timeout_secs, 30);
         assert_eq!(cfg.session.max_tool_event_output_bytes, 65_536);
         assert_eq!(cfg.session.accept_error_backoff_ms, 100);
@@ -1853,6 +1860,7 @@ mod tests {
             "max_clients_per_session",
             "event_queue_capacity",
             "snapshot_entries",
+            "replay_events",
             "max_frame_bytes",
             "max_prompt_bytes",
             "max_label_bytes",

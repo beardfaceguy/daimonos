@@ -111,6 +111,11 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
         self.transport.peer_label()
     }
 
+    pub fn replace_transport(&mut self, transport: T) {
+        self.transport = transport;
+        self.clear_attachment();
+    }
+
     pub async fn attach(&mut self, session_id: Option<String>) -> Result<(), HeadlessError> {
         self.clear_attachment();
         let result = self.attach_inner(session_id).await;
@@ -121,15 +126,28 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
     }
 
     async fn attach_inner(&mut self, session_id: Option<String>) -> Result<(), HeadlessError> {
-        self.transport
-            .send(ClientMessage::Attach {
+        let can_resume = session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id == self.state.session_id());
+        let attach_message = if can_resume {
+            ClientMessage::Resume {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: session_id.clone().expect("resume session id"),
+                last_seen_seq: self.state.last_seq(),
+                ticket: None,
+                client: self.client.clone(),
+                requested_capabilities: self.requested_capabilities.clone(),
+            }
+        } else {
+            ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
                 session_id,
                 ticket: None,
                 client: self.client.clone(),
                 requested_capabilities: self.requested_capabilities.clone(),
-            })
-            .await?;
+            }
+        };
+        self.transport.send(attach_message).await?;
 
         let mut attach_session_id = None;
         loop {
@@ -146,13 +164,40 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
                             "server protocol {protocol_version} does not match {PROTOCOL_VERSION}"
                         )));
                     }
+                    if can_resume && self.state.session_id() != session_id {
+                        return Err(HeadlessError::Protocol(
+                            "resume AttachOk session does not match requested session".to_string(),
+                        ));
+                    }
                     self.granted_capabilities = granted_capabilities;
                     self.attached = true;
                     if !has_capability(&self.granted_capabilities, ClientCapability::Observe) {
                         self.state.apply_attach_watermark(session_id, seq);
                         return Ok(());
                     }
+                    if can_resume
+                        && self.state.session_id() == session_id
+                        && self.state.last_seq() == seq
+                    {
+                        return Ok(());
+                    }
                     attach_session_id = Some((session_id, seq));
+                }
+                ServerMessage::Event { seq, event } => {
+                    let (_, expected_seq) = attach_session_id.as_ref().ok_or_else(|| {
+                        HeadlessError::Protocol("replay event arrived before AttachOk".to_string())
+                    })?;
+                    match self.state.apply_event(seq, event) {
+                        ApplyOutcome::Applied | ApplyOutcome::Duplicate => {}
+                        ApplyOutcome::Gap { .. } => {
+                            return Err(HeadlessError::Protocol(
+                                "reconnect replay contains a sequence gap".to_string(),
+                            ));
+                        }
+                    }
+                    if self.state.last_seq() == *expected_seq {
+                        return Ok(());
+                    }
                 }
                 ServerMessage::Snapshot { seq, state } => {
                     let (expected_session, expected_seq) =
@@ -499,6 +544,151 @@ mod tests {
         );
         assert_eq!(frontend.state().last_seq(), 0);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_resumes_from_last_seen_sequence_without_snapshot() {
+        let (first_server, first_transport) = in_memory_transport_pair(8, "daemon-1");
+        let first_task = tokio::spawn(async move {
+            let _ = first_server.recv().await.unwrap();
+            first_server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 1,
+                })
+                .await
+                .unwrap();
+            first_server
+                .send(&ServerMessage::Snapshot {
+                    seq: 1,
+                    state: snapshot("session-1", 1),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = HeadlessFrontend::new(
+            first_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+        first_task.await.unwrap();
+
+        let (second_server, second_transport) = in_memory_transport_pair(8, "daemon-2");
+        let second_task = tokio::spawn(async move {
+            assert!(matches!(
+                second_server.recv().await.unwrap(),
+                Some(ClientMessage::Resume {
+                    session_id,
+                    last_seen_seq: 1,
+                    ..
+                }) if session_id == "session-1"
+            ));
+            second_server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 3,
+                })
+                .await
+                .unwrap();
+            second_server
+                .send(&ServerMessage::Event {
+                    seq: 2,
+                    event: SessionEvent::AssistantDelta {
+                        text: "resumed".to_string(),
+                    },
+                })
+                .await
+                .unwrap();
+            second_server
+                .send(&ServerMessage::Event {
+                    seq: 3,
+                    event: SessionEvent::AssistantDone {
+                        outcome: crate::session_protocol::AssistantOutcome::Completed,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+        frontend.replace_transport(second_transport);
+
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(frontend.state().last_seq(), 3);
+        assert_eq!(frontend.state().transcript()[0].text, "resumed");
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_attach_ok_for_different_session() {
+        let (first_server, first_transport) = in_memory_transport_pair(4, "daemon-1");
+        let first_task = tokio::spawn(async move {
+            let _ = first_server.recv().await.unwrap();
+            first_server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            first_server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("session-1", 0),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = HeadlessFrontend::new(
+            first_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+        first_task.await.unwrap();
+
+        let (second_server, second_transport) = in_memory_transport_pair(4, "daemon-2");
+        let second_task = tokio::spawn(async move {
+            assert!(matches!(
+                second_server.recv().await.unwrap(),
+                Some(ClientMessage::Resume { .. })
+            ));
+            second_server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-2".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+        });
+        frontend.replace_transport(second_transport);
+
+        assert!(matches!(
+            frontend.attach(Some("session-1".to_string())).await,
+            Err(HeadlessError::Protocol(_))
+        ));
+        assert_eq!(frontend.state().session_id(), "session-1");
+        assert!(!frontend.is_attached());
+        second_task.await.unwrap();
     }
 
     #[tokio::test]

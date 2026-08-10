@@ -103,6 +103,8 @@ max_clients_per_session = 4
 event_queue_capacity = 256
 # Maximum transcript entries and tool calls retained in a full attach snapshot.
 snapshot_entries = 2000
+# Maximum canonical events retained for reconnect delta replay.
+replay_events = 512
 # Maximum seconds a daemon approval can wait before safe denial.
 approval_timeout_secs = 30
 # Maximum UTF-8 bytes retained from one tool result in canonical events.

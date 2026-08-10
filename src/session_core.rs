@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -261,6 +261,19 @@ pub struct SessionEventRouter {
     dispatch: StdMutex<()>,
     sequence: StdMutex<u64>,
     handlers: StdMutex<SessionEventHandlers>,
+    replay: StdMutex<VecDeque<(u64, SessionEvent)>>,
+    max_replay_events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReplay {
+    Available {
+        events: Vec<(u64, SessionEvent)>,
+        latest_seq: u64,
+    },
+    SnapshotRequired {
+        latest_seq: u64,
+    },
 }
 
 struct SessionEventHandlers {
@@ -276,6 +289,10 @@ pub struct SessionEventSubscription {
 
 impl SessionEventRouter {
     pub fn new(handler: Option<SessionEventHandler>) -> Self {
+        Self::new_with_replay(handler, 0)
+    }
+
+    pub fn new_with_replay(handler: Option<SessionEventHandler>, max_replay_events: usize) -> Self {
         let fixed_count = usize::from(handler.is_some());
         let mut entries = HashMap::new();
         if let Some(handler) = handler {
@@ -289,6 +306,8 @@ impl SessionEventRouter {
                 fixed_count,
                 entries,
             }),
+            replay: StdMutex::new(VecDeque::new()),
+            max_replay_events,
         }
     }
 
@@ -307,6 +326,16 @@ impl SessionEventRouter {
                 .ok_or(SessionEventError::SequenceExhausted)?;
             *current
         };
+        if self.max_replay_events > 0 {
+            let mut replay = self
+                .replay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            replay.push_back((sequence, event.clone()));
+            while replay.len() > self.max_replay_events {
+                replay.pop_front();
+            }
+        }
         let handlers: Vec<SessionEventHandler> = self
             .handlers
             .lock()
@@ -381,6 +410,44 @@ impl SessionEventRouter {
             .sequence
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn replay_since(&self, last_seen_seq: u64) -> SessionReplay {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let latest_seq = *self
+            .sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_seen_seq > latest_seq {
+            return SessionReplay::SnapshotRequired { latest_seq };
+        }
+        if last_seen_seq == latest_seq {
+            return SessionReplay::Available {
+                events: Vec::new(),
+                latest_seq,
+            };
+        }
+        let replay = self
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((earliest_seq, _)) = replay.front() else {
+            return SessionReplay::SnapshotRequired { latest_seq };
+        };
+        if last_seen_seq.saturating_add(1) < *earliest_seq {
+            return SessionReplay::SnapshotRequired { latest_seq };
+        }
+        SessionReplay::Available {
+            events: replay
+                .iter()
+                .filter(|(seq, _)| *seq > last_seen_seq)
+                .cloned()
+                .collect(),
+            latest_seq,
+        }
     }
 }
 
@@ -3118,6 +3185,41 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn event_router_replays_retained_suffix_and_marks_evicted_gaps() {
+        let router = SessionEventRouter::new_with_replay(None, 2);
+        for text in ["one", "two", "three"] {
+            router
+                .emit(SessionEvent::AssistantDelta {
+                    text: text.to_string(),
+                })
+                .unwrap();
+        }
+
+        assert!(matches!(
+            router.replay_since(1),
+            SessionReplay::Available {
+                events,
+                latest_seq: 3,
+            } if events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>() == vec![2, 3]
+        ));
+        assert_eq!(
+            router.replay_since(0),
+            SessionReplay::SnapshotRequired { latest_seq: 3 }
+        );
+        assert_eq!(
+            router.replay_since(3),
+            SessionReplay::Available {
+                events: Vec::new(),
+                latest_seq: 3,
+            }
+        );
+        assert_eq!(
+            router.replay_since(4),
+            SessionReplay::SnapshotRequired { latest_seq: 3 }
         );
     }
 

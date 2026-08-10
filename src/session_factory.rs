@@ -91,7 +91,10 @@ impl SessionFactory for AgentSessionFactory {
             .map(|record| record.model.clone())
             .unwrap_or_else(|| self.default_model.clone());
         let provider = (self.make_provider)()?;
-        let events = Arc::new(SessionEventRouter::default());
+        let events = Arc::new(SessionEventRouter::new_with_replay(
+            None,
+            self.config.session.replay_events,
+        ));
         let approvals = Arc::new(ApprovalBroker::new_with_timeout(
             true,
             std::time::Duration::from_secs(self.config.session.approval_timeout_secs),

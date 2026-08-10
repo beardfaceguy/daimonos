@@ -5,11 +5,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::client_transport::{ClientTransport, TransportError, UnixSocketTransport};
-use crate::session_core::{SessionCore, SessionEventSubscription};
+use crate::session_core::{SessionCore, SessionEventSubscription, SessionReplay};
 use crate::session_protocol::{
     ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage, SessionEvent,
     SessionListEntry, SessionSnapshot, ToolCallState, ToolCallStateStatus, TranscriptEntry,
@@ -91,6 +91,7 @@ impl CapabilityPolicy {
 struct ClientAttachment {
     _info: ClientInfo,
     capabilities: Vec<ClientCapability>,
+    attachment_id: u64,
 }
 
 struct SessionEntry {
@@ -122,6 +123,7 @@ pub struct SessionDaemon {
     shutdown_grace: std::time::Duration,
     active_client_tasks: AtomicUsize,
     client_tasks_changed: tokio::sync::Notify,
+    next_attachment_id: AtomicU64,
 }
 
 impl SessionDaemon {
@@ -147,6 +149,7 @@ impl SessionDaemon {
             shutdown_grace: std::time::Duration::from_secs(5),
             active_client_tasks: AtomicUsize::new(0),
             client_tasks_changed: tokio::sync::Notify::new(),
+            next_attachment_id: AtomicU64::new(1),
         }
     }
 
@@ -176,6 +179,7 @@ impl SessionDaemon {
             shutdown_grace,
             active_client_tasks: AtomicUsize::new(0),
             client_tasks_changed: tokio::sync::Notify::new(),
+            next_attachment_id: AtomicU64::new(1),
         }
     }
 
@@ -320,11 +324,23 @@ impl SessionDaemon {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn attach(
         &self,
         session_id: &str,
         client: ClientInfo,
         capabilities: Vec<ClientCapability>,
+    ) -> Result<AttachedSession, SessionDaemonError> {
+        self.attach_internal(session_id, client, capabilities, false)
+            .await
+    }
+
+    async fn attach_internal(
+        &self,
+        session_id: &str,
+        client: ClientInfo,
+        capabilities: Vec<ClientCapability>,
+        replace_existing: bool,
     ) -> Result<AttachedSession, SessionDaemonError> {
         let entry = self
             .sessions
@@ -334,6 +350,7 @@ impl SessionDaemon {
             .cloned()
             .ok_or_else(|| SessionDaemonError::SessionNotFound(session_id.to_string()))?;
         let handshake_admission = Arc::clone(&entry.admission).lock_owned().await;
+        let attachment_id;
         {
             let mut clients = entry
                 .clients
@@ -342,19 +359,21 @@ impl SessionDaemon {
             if entry.stopped.load(Ordering::Acquire) {
                 return Err(SessionDaemonError::SessionStopped(session_id.to_string()));
             }
-            if clients.contains_key(&client.id) {
+            if clients.contains_key(&client.id) && !replace_existing {
                 return Err(SessionDaemonError::DuplicateClient(client.id));
             }
-            if clients.len() >= entry.max_clients {
+            if !clients.contains_key(&client.id) && clients.len() >= entry.max_clients {
                 return Err(SessionDaemonError::ClientLimitReached {
                     max: entry.max_clients,
                 });
             }
+            attachment_id = self.next_attachment_id.fetch_add(1, Ordering::AcqRel);
             clients.insert(
                 client.id.clone(),
                 ClientAttachment {
                     _info: client.clone(),
                     capabilities: capabilities.clone(),
+                    attachment_id,
                 },
             );
             let approve_once = clients
@@ -382,6 +401,7 @@ impl SessionDaemon {
             entry,
             client_id: client.id,
             capabilities,
+            attachment_id,
             handshake_admission: Some(handshake_admission),
         })
     }
@@ -681,20 +701,43 @@ impl SessionDaemon {
                 .await?;
             return Ok(());
         }
-        let ClientMessage::Attach {
-            protocol_version,
-            session_id,
-            client,
-            requested_capabilities,
-            ..
-        } = first
-        else {
-            transport
-                .send(&ServerMessage::AttachDenied {
-                    reason: "first message must be attach".to_string(),
-                })
-                .await?;
-            return Ok(());
+        let (protocol_version, session_id, resume_seq, client, requested_capabilities) = match first
+        {
+            ClientMessage::Attach {
+                protocol_version,
+                session_id,
+                client,
+                requested_capabilities,
+                ..
+            } => (
+                protocol_version,
+                session_id,
+                None,
+                client,
+                requested_capabilities,
+            ),
+            ClientMessage::Resume {
+                protocol_version,
+                session_id,
+                last_seen_seq,
+                client,
+                requested_capabilities,
+                ..
+            } => (
+                protocol_version,
+                Some(session_id),
+                Some(last_seen_seq),
+                client,
+                requested_capabilities,
+            ),
+            _ => {
+                transport
+                    .send(&ServerMessage::AttachDenied {
+                        reason: "first message must be attach or resume".to_string(),
+                    })
+                    .await?;
+                return Ok(());
+            }
         };
         if protocol_version != crate::session_protocol::PROTOCOL_VERSION {
             transport
@@ -721,7 +764,12 @@ impl SessionDaemon {
         let mut handshake_session =
             HandshakeSessionGuard::new(self, generated_session.then(|| session_id.clone()));
         let mut attachment = match self
-            .attach(&session_id, client, granted_capabilities.clone())
+            .attach_internal(
+                &session_id,
+                client,
+                granted_capabilities.clone(),
+                resume_seq.is_some(),
+            )
             .await
         {
             Ok(attachment) => attachment,
@@ -738,7 +786,7 @@ impl SessionDaemon {
         let event_lagged = Arc::new(AtomicBool::new(false));
         let handler_lagged = Arc::clone(&event_lagged);
         let observes = attachment.has_capability(ClientCapability::Observe);
-        let (event_subscription, snapshot) = if observes {
+        let (event_subscription, captured_snapshot) = if observes {
             let snapshot_state = Arc::clone(&attachment.entry.snapshot);
             let (subscription, snapshot) = attachment
                 .core()
@@ -770,7 +818,13 @@ impl SessionDaemon {
         } else {
             (None, None)
         };
-        let snapshot = if let Some(snapshot) = snapshot {
+        let resume_replay = if observes {
+            resume_seq.map(|last_seen_seq| attachment.core().events.replay_since(last_seen_seq))
+        } else {
+            None
+        };
+        let replay_is_available = matches!(resume_replay, Some(SessionReplay::Available { .. }));
+        let snapshot = if let Some(snapshot) = captured_snapshot.filter(|_| !replay_is_available) {
             attachment.finish_handshake();
             let max_frame_bytes = limits.max_frame_bytes;
             let fitted = tokio::task::spawn_blocking(move || {
@@ -804,10 +858,13 @@ impl SessionDaemon {
         } else {
             None
         };
-        let attach_sequence = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.seq)
-            .unwrap_or_else(|| attachment.core().events.latest_sequence());
+        let attach_sequence = match resume_replay.as_ref() {
+            Some(SessionReplay::Available { latest_seq, .. }) => *latest_seq,
+            Some(SessionReplay::SnapshotRequired { .. }) | None => snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.seq)
+                .unwrap_or_else(|| attachment.core().events.latest_sequence()),
+        };
         transport
             .send(&ServerMessage::AttachOk {
                 protocol_version: crate::session_protocol::PROTOCOL_VERSION,
@@ -819,7 +876,12 @@ impl SessionDaemon {
         attachment.finish_handshake();
         handshake_session.commit();
         let mut snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.seq);
-        if let Some(snapshot) = snapshot {
+        if let Some(SessionReplay::Available { events, latest_seq }) = resume_replay {
+            for (seq, event) in events {
+                transport.send(&ServerMessage::Event { seq, event }).await?;
+            }
+            snapshot_sequence = Some(latest_seq);
+        } else if let Some(snapshot) = snapshot {
             transport
                 .send(&ServerMessage::Snapshot {
                     seq: snapshot.seq,
@@ -1073,7 +1135,7 @@ impl SessionDaemon {
                                 .await?;
                         }
                     }
-                    Some(ClientMessage::SyncRequest { .. }) => {
+                    Some(ClientMessage::SyncRequest { last_seen_seq }) => {
                         if !attachment.has_capability(ClientCapability::Observe) {
                             transport
                                 .send(&ServerMessage::Error {
@@ -1084,43 +1146,58 @@ impl SessionDaemon {
                                 .await?;
                             continue;
                         }
-                        let snapshot = attachment
-                            .entry
-                            .snapshot
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .snapshot
-                            .clone();
-                        let max_frame_bytes = limits.max_frame_bytes;
-                        let fitted = tokio::task::spawn_blocking(move || {
-                            fit_snapshot_to_frame(snapshot, max_frame_bytes)
-                        })
-                        .await
-                        .map_err(|error| {
-                            TransportError::Io(std::io::Error::other(format!(
-                                "snapshot fitting task failed: {error}"
-                            )))
-                        })?;
-                        let snapshot = match fitted {
-                            Ok(snapshot) => snapshot,
-                            Err(message) => {
+                        match attachment.core().events.replay_since(last_seen_seq) {
+                            SessionReplay::Available {
+                                events,
+                                latest_seq,
+                            } => {
+                                for (seq, event) in events {
+                                    transport
+                                        .send(&ServerMessage::Event { seq, event })
+                                        .await?;
+                                }
+                                snapshot_sequence = Some(latest_seq);
+                            }
+                            SessionReplay::SnapshotRequired { .. } => {
+                                let snapshot = attachment
+                                    .entry
+                                    .snapshot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .snapshot
+                                    .clone();
+                                let max_frame_bytes = limits.max_frame_bytes;
+                                let fitted = tokio::task::spawn_blocking(move || {
+                                    fit_snapshot_to_frame(snapshot, max_frame_bytes)
+                                })
+                                .await
+                                .map_err(|error| {
+                                    TransportError::Io(std::io::Error::other(format!(
+                                        "snapshot fitting task failed: {error}"
+                                    )))
+                                })?;
+                                let snapshot = match fitted {
+                                    Ok(snapshot) => snapshot,
+                                    Err(message) => {
+                                        transport
+                                            .send(&ServerMessage::Error {
+                                                request_id: None,
+                                                code: "snapshot_too_large".to_string(),
+                                                message,
+                                            })
+                                            .await?;
+                                        continue;
+                                    }
+                                };
+                                snapshot_sequence = Some(snapshot.seq);
                                 transport
-                                    .send(&ServerMessage::Error {
-                                        request_id: None,
-                                        code: "snapshot_too_large".to_string(),
-                                        message,
+                                    .send(&ServerMessage::Snapshot {
+                                        seq: snapshot.seq,
+                                        state: snapshot,
                                     })
                                     .await?;
-                                continue;
                             }
-                        };
-                        snapshot_sequence = Some(snapshot.seq);
-                        transport
-                            .send(&ServerMessage::Snapshot {
-                                seq: snapshot.seq,
-                                state: snapshot,
-                            })
-                            .await?;
+                        }
                     }
                     Some(message @ ClientMessage::ListSessions { .. }) => {
                         if let Err(error) = limits.validate_client_message(&message) {
@@ -1830,6 +1907,7 @@ fn request_id(message: &ClientMessage) -> Option<String> {
         ClientMessage::StopSession { request_id } => Some(request_id.clone()),
         ClientMessage::ListSessions { request_id, .. } => Some(request_id.clone()),
         ClientMessage::Attach { .. }
+        | ClientMessage::Resume { .. }
         | ClientMessage::ApprovalResponse { .. }
         | ClientMessage::SyncRequest { .. }
         | ClientMessage::SetConfig { .. }
@@ -1862,6 +1940,7 @@ pub struct AttachedSession {
     entry: Arc<SessionEntry>,
     client_id: String,
     capabilities: Vec<ClientCapability>,
+    attachment_id: u64,
     handshake_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -1894,6 +1973,12 @@ impl Drop for AttachedSession {
             .clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if clients
+            .get(&self.client_id)
+            .is_none_or(|client| client.attachment_id != self.attachment_id)
+        {
+            return;
+        }
         clients.remove(&self.client_id);
         let approve_once_count = clients
             .values()
@@ -2024,16 +2109,28 @@ mod tests {
     }
 
     fn test_core_with_provider(provider: Box<dyn LlmProvider>) -> Arc<SessionCore> {
-        test_core_with_persistence(provider, None)
+        test_core_with_options(provider, None, 0)
     }
 
     fn test_core_with_persistence(
         provider: Box<dyn LlmProvider>,
         persistence: Option<crate::session_core::SessionPersistence>,
     ) -> Arc<SessionCore> {
+        test_core_with_options(provider, persistence, 0)
+    }
+
+    fn test_core_with_replay(max_replay_events: usize) -> Arc<SessionCore> {
+        test_core_with_options(Box::new(StaticProvider), None, max_replay_events)
+    }
+
+    fn test_core_with_options(
+        provider: Box<dyn LlmProvider>,
+        persistence: Option<crate::session_core::SessionPersistence>,
+        max_replay_events: usize,
+    ) -> Arc<SessionCore> {
         let config = Arc::new(crate::config::Config::default());
         let workspace = std::env::temp_dir();
-        let events = Arc::new(SessionEventRouter::default());
+        let events = Arc::new(SessionEventRouter::new_with_replay(None, max_replay_events));
         let approvals = Arc::new(ApprovalBroker::new(false));
         let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new(
             Arc::clone(&events),
@@ -2484,6 +2581,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_replaces_same_client_without_old_drop_removing_new_attachment() {
+        let daemon = SessionDaemon::new(1, 1, 8, 32);
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let mut first = daemon
+            .attach(
+                "session-1",
+                terminal_client(),
+                vec![ClientCapability::Observe],
+            )
+            .await
+            .unwrap();
+        first.finish_handshake();
+        let mut replacement = daemon
+            .attach_internal(
+                "session-1",
+                terminal_client(),
+                vec![ClientCapability::Observe],
+                true,
+            )
+            .await
+            .unwrap();
+        replacement.finish_handshake();
+
+        drop(first);
+        assert_eq!(daemon.attached_client_count("session-1"), Some(1));
+        drop(replacement);
+        assert_eq!(daemon.attached_client_count("session-1"), Some(0));
+    }
+
+    #[tokio::test]
     async fn detach_and_reattach_updates_approval_eligibility_without_denial() {
         let daemon = SessionDaemon::new(1, 1, 8, 32);
         let core = test_core();
@@ -2780,6 +2909,116 @@ mod tests {
 
         client.send(ClientMessage::Detach).await.unwrap();
         serve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_replays_retained_event_suffix_without_snapshot() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 16, 32));
+        let core = test_core_with_replay(4);
+        daemon
+            .create_session("session-1".to_string(), Arc::clone(&core))
+            .unwrap();
+        let (transport, mut client) = in_memory_transport_pair(16, "test client");
+        let client_daemon = Arc::clone(&daemon);
+        let serve = tokio::spawn(async move {
+            client_daemon
+                .serve_client(transport, &protocol_limits())
+                .await
+        });
+        client
+            .send(ClientMessage::Attach {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: Some("session-1".to_string()),
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![ClientCapability::Observe],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::AttachOk { .. })
+        ));
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Snapshot { .. })
+        ));
+        for text in ["one", "two"] {
+            core.events
+                .emit(SessionEvent::AssistantDelta {
+                    text: text.to_string(),
+                })
+                .unwrap();
+        }
+        for expected in [1, 2] {
+            assert!(matches!(
+                client.recv().await,
+                Some(ServerMessage::Event { seq, .. }) if seq == expected
+            ));
+        }
+
+        client
+            .send(ClientMessage::SyncRequest { last_seen_seq: 0 })
+            .await
+            .unwrap();
+        for expected in [1, 2] {
+            assert!(matches!(
+                client.recv().await,
+                Some(ServerMessage::Event { seq, .. }) if seq == expected
+            ));
+        }
+
+        client.send(ClientMessage::Detach).await.unwrap();
+        serve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_handshake_replays_from_client_watermark() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 16, 32));
+        let core = test_core_with_replay(4);
+        daemon
+            .create_session("session-1".to_string(), Arc::clone(&core))
+            .unwrap();
+        for text in ["one", "two", "three"] {
+            core.events
+                .emit(SessionEvent::AssistantDelta {
+                    text: text.to_string(),
+                })
+                .unwrap();
+        }
+        let (transport, mut client) = in_memory_transport_pair(16, "test client");
+        client
+            .send(ClientMessage::Resume {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: "session-1".to_string(),
+                last_seen_seq: 1,
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![ClientCapability::Observe],
+            })
+            .await
+            .unwrap();
+        client.send(ClientMessage::Detach).await.unwrap();
+
+        daemon
+            .serve_client(transport, &protocol_limits())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::AttachOk { seq: 3, .. })
+        ));
+        for expected in [2, 3] {
+            assert!(matches!(
+                client.recv().await,
+                Some(ServerMessage::Event { seq, .. }) if seq == expected
+            ));
+        }
+        assert!(!matches!(
+            client.recv().await,
+            Some(ServerMessage::Snapshot { .. })
+        ));
     }
 
     #[tokio::test]
