@@ -1,0 +1,53 @@
+{
+  "type": "snapshot",
+  "seq": 4,
+  "state": {
+    "session_id": "session-fixture",
+    "seq": 4,
+    "turn_status": "waiting_for_approval",
+    "transcript": [
+      {
+        "id": 1,
+        "role": "user",
+        "text": "Run the tests"
+      },
+      {
+        "id": 2,
+        "role": "assistant",
+        "text": "I will run them.",
+        "outcome": {
+          "type": "completed"
+        }
+      }
+    ],
+    "tool_calls": [
+      {
+        "id": "tool-1",
+        "name": "exec",
+        "title": "exec",
+        "status": "pending",
+        "output": null
+      }
+    ],
+    "pending_approvals": [
+      {
+        "id": "approval-1",
+        "tool_call_id": "tool-1",
+        "tool": "exec",
+        "detail": "cargo test",
+        "allow_always_available": false
+      }
+    ],
+    "runtime_options": [],
+    "context_usage": {
+      "prompt_tokens": 25,
+      "model_context_window": 100,
+      "output_reservation": 0,
+      "effective_input_budget": 100,
+      "utilization_basis_points": 2500,
+      "compaction_high_water_tokens": null,
+      "budget_error": null
+    },
+    "history_truncated": false
+  }
+}

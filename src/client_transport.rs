@@ -71,6 +71,13 @@ pub trait ClientTransport: Send + Sync {
     fn peer_label(&self) -> &str;
 }
 
+#[async_trait]
+pub trait FrontendTransport: Send {
+    async fn send(&mut self, message: ClientMessage) -> Result<(), TransportError>;
+    async fn recv(&mut self) -> Result<Option<ServerMessage>, TransportError>;
+    fn peer_label(&self) -> &str;
+}
+
 pub struct InMemoryTransport {
     inbound: Mutex<mpsc::Receiver<ClientMessage>>,
     outbound: mpsc::Sender<ServerMessage>,
@@ -80,6 +87,7 @@ pub struct InMemoryTransport {
 pub struct InMemoryClient {
     outbound: mpsc::Sender<ClientMessage>,
     inbound: mpsc::Receiver<ServerMessage>,
+    peer_label: String,
 }
 
 pub fn in_memory_transport_pair(
@@ -87,19 +95,36 @@ pub fn in_memory_transport_pair(
     peer_label: impl Into<String>,
 ) -> (InMemoryTransport, InMemoryClient) {
     let capacity = capacity.max(1);
+    let peer_label = peer_label.into();
     let (client_tx, server_rx) = mpsc::channel(capacity);
     let (server_tx, client_rx) = mpsc::channel(capacity);
     (
         InMemoryTransport {
             inbound: Mutex::new(server_rx),
             outbound: server_tx,
-            peer_label: peer_label.into(),
+            peer_label: peer_label.clone(),
         },
         InMemoryClient {
             outbound: client_tx,
             inbound: client_rx,
+            peer_label,
         },
     )
+}
+
+#[async_trait]
+impl FrontendTransport for InMemoryClient {
+    async fn send(&mut self, message: ClientMessage) -> Result<(), TransportError> {
+        InMemoryClient::send(self, message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<ServerMessage>, TransportError> {
+        Ok(InMemoryClient::recv(self).await)
+    }
+
+    fn peer_label(&self) -> &str {
+        &self.peer_label
+    }
 }
 
 impl InMemoryClient {
