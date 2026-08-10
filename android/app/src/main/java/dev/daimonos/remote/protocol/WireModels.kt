@@ -292,7 +292,10 @@ sealed interface AssistantOutcome {
 sealed interface SessionEvent {
     @Serializable
     @SerialName("user_message")
-    data class UserMessage(val text: String) : SessionEvent
+    data class UserMessage(
+        val text: String,
+        @SerialName("request_id") val requestId: String? = null,
+    ) : SessionEvent
 
     @Serializable
     @SerialName("assistant_delta")

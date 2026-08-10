@@ -228,7 +228,7 @@ impl ViewState {
 
     fn apply_event_body(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::UserMessage { text } => {
+            SessionEvent::UserMessage { text, .. } => {
                 self.close_open_line();
                 self.transcript
                     .push(ViewLine::committed(TranscriptRole::User, text));
@@ -384,7 +384,14 @@ mod tests {
     fn assembles_user_and_streamed_assistant_turn() {
         let mut s = ViewState::new("sess-1");
         assert_eq!(
-            ev(&mut s, 1, SessionEvent::UserMessage { text: "hi".into() }),
+            ev(
+                &mut s,
+                1,
+                SessionEvent::UserMessage {
+                    text: "hi".into(),
+                    request_id: None,
+                },
+            ),
             ApplyOutcome::Applied
         );
         ev(
@@ -440,7 +447,10 @@ mod tests {
             ev(
                 &mut state,
                 seq,
-                SessionEvent::UserMessage { text: text.into() },
+                SessionEvent::UserMessage {
+                    text: text.into(),
+                    request_id: None,
+                },
             );
         }
         for (seq, id) in [(4, "t1"), (5, "t2"), (6, "t3")] {
@@ -467,10 +477,24 @@ mod tests {
     #[test]
     fn duplicate_sequence_is_ignored() {
         let mut s = ViewState::new("sess-1");
-        ev(&mut s, 1, SessionEvent::UserMessage { text: "a".into() });
+        ev(
+            &mut s,
+            1,
+            SessionEvent::UserMessage {
+                text: "a".into(),
+                request_id: None,
+            },
+        );
         // Replayed frame.
         assert_eq!(
-            ev(&mut s, 1, SessionEvent::UserMessage { text: "a".into() }),
+            ev(
+                &mut s,
+                1,
+                SessionEvent::UserMessage {
+                    text: "a".into(),
+                    request_id: None,
+                },
+            ),
             ApplyOutcome::Duplicate
         );
         assert_eq!(s.transcript().len(), 1);
@@ -480,7 +504,14 @@ mod tests {
     #[test]
     fn forward_gap_is_reported_and_not_applied() {
         let mut s = ViewState::new("sess-1");
-        ev(&mut s, 1, SessionEvent::UserMessage { text: "a".into() });
+        ev(
+            &mut s,
+            1,
+            SessionEvent::UserMessage {
+                text: "a".into(),
+                request_id: None,
+            },
+        );
         // seq 3 arrives before seq 2.
         assert_eq!(
             ev(&mut s, 3, SessionEvent::AssistantDelta { text: "x".into() }),
@@ -707,6 +738,7 @@ mod tests {
             1,
             SessionEvent::UserMessage {
                 text: "stale".into(),
+                request_id: None,
             },
         );
 
@@ -742,7 +774,14 @@ mod tests {
 
         // A pre-snapshot sequence is now a duplicate.
         assert_eq!(
-            ev(&mut s, 5, SessionEvent::UserMessage { text: "x".into() }),
+            ev(
+                &mut s,
+                5,
+                SessionEvent::UserMessage {
+                    text: "x".into(),
+                    request_id: None,
+                },
+            ),
             ApplyOutcome::Duplicate
         );
         // The next in-order event (seq 11) applies on top of the snapshot.
@@ -751,7 +790,8 @@ mod tests {
                 &mut s,
                 11,
                 SessionEvent::UserMessage {
-                    text: "follow-up".into()
+                    text: "follow-up".into(),
+                    request_id: None,
                 }
             ),
             ApplyOutcome::Applied

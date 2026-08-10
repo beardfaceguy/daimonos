@@ -236,6 +236,8 @@ pub enum AssistantOutcome {
 pub enum SessionEvent {
     UserMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     AssistantDelta {
         text: String,

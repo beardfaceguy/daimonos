@@ -364,6 +364,7 @@ mod tests {
             1,
             SessionEvent::UserMessage {
                 text: "hello".into(),
+                request_id: None,
             },
         );
         state.apply_event(
@@ -483,6 +484,7 @@ mod tests {
             1,
             SessionEvent::UserMessage {
                 text: "hello".into(),
+                request_id: None,
             },
         );
         let area = Rect::new(0, 0, 80, 8);
@@ -513,6 +515,7 @@ mod tests {
                 index,
                 SessionEvent::UserMessage {
                     text: format!("message-{index}"),
+                    request_id: None,
                 },
             );
         }
@@ -546,12 +549,14 @@ mod tests {
             1,
             SessionEvent::UserMessage {
                 text: "FIRST-START 111111111111111111111111 FIRST-END".into(),
+                request_id: None,
             },
         );
         state.apply_event(
             2,
             SessionEvent::UserMessage {
                 text: "SECOND-START 222222222222222222222 SECOND-END".into(),
+                request_id: None,
             },
         );
         let area = Rect::new(0, 0, 20, 8);

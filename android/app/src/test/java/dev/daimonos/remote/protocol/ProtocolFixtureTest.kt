@@ -70,6 +70,16 @@ class ProtocolFixtureTest {
     }
 
     @Test
+    fun userMessageCarriesOptionalPromptCorrelationId() {
+        val message = ProtocolCodec.decodeServer(
+            """{"type":"event","seq":1,"event":{"type":"user_message","text":"hi","request_id":"prompt-1"}}""",
+        ) as ServerMessage.Event
+        val event = message.event as SessionEvent.UserMessage
+
+        assertEquals("prompt-1", event.requestId)
+    }
+
+    @Test
     fun remoteAuthFixtureIncludesValidRustCompatibleEd25519Vector() {
         val fixture = ProtocolCodec.json
             .parseToJsonElement(fixture("remote_auth.json"))

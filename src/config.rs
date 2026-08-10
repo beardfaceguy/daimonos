@@ -429,6 +429,7 @@ impl SessionRuntimeConfig {
                 seq: u64::MAX,
                 event: crate::session_protocol::SessionEvent::UserMessage {
                     text: String::new(),
+                    request_id: Some("\0".repeat(self.max_identifier_bytes)),
                 },
             })
             .map_err(|error| format!("failed to size session prompt event: {error}"))?

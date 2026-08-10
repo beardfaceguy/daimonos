@@ -521,6 +521,7 @@ mod tests {
                     seq: 2,
                     event: SessionEvent::UserMessage {
                         text: "gap".to_string(),
+                        request_id: None,
                     },
                 })
                 .await

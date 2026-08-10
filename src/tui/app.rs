@@ -454,6 +454,7 @@ fn start_turn(
     streamed_text.store(false, Ordering::Relaxed);
     let _ = events.emit(SessionEvent::UserMessage {
         text: prompt.clone(),
+        request_id: None,
     });
     let _ = events.emit(SessionEvent::TurnStatusChanged {
         status: TurnStatus::Running,
