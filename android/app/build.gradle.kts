@@ -1,3 +1,8 @@
+import org.gradle.api.DefaultTask
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -8,6 +13,34 @@ val protocolFixturesDir = layout.buildDirectory.dir("generated/protocolFixtures"
 val syncProtocolFixtures by tasks.registering(Sync::class) {
     from(rootProject.layout.projectDirectory.dir("../contracts/android/v2"))
     into(protocolFixturesDir)
+}
+val releaseKeystore = providers.environmentVariable("DAIMONOS_ANDROID_KEYSTORE").orNull
+val releaseStorePassword = providers.environmentVariable("DAIMONOS_ANDROID_STORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("DAIMONOS_ANDROID_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("DAIMONOS_ANDROID_KEY_PASSWORD").orNull
+val releaseSigningValues = mapOf(
+    "DAIMONOS_ANDROID_KEYSTORE" to releaseKeystore,
+    "DAIMONOS_ANDROID_STORE_PASSWORD" to releaseStorePassword,
+    "DAIMONOS_ANDROID_KEY_ALIAS" to releaseKeyAlias,
+    "DAIMONOS_ANDROID_KEY_PASSWORD" to releaseKeyPassword,
+)
+val hasReleaseSigning = releaseSigningValues.values.all { it != null }
+
+abstract class VerifyReleaseSigning : DefaultTask() {
+    @get:Input
+    abstract val variableNames: ListProperty<String>
+
+    @TaskAction
+    fun verify() {
+        val missing = variableNames.get().filter { System.getenv(it).isNullOrEmpty() }
+        if (missing.isNotEmpty()) {
+            throw GradleException("Release signing variables are missing: ${missing.joinToString()}")
+        }
+    }
+}
+
+val verifyReleaseSigning by tasks.registering(VerifyReleaseSigning::class) {
+    variableNames.set(releaseSigningValues.keys.toList())
 }
 
 android {
@@ -23,8 +56,20 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(checkNotNull(releaseKeystore))
+                storePassword = checkNotNull(releaseStorePassword)
+                keyAlias = checkNotNull(releaseKeyAlias)
+                keyPassword = checkNotNull(releaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -78,5 +123,8 @@ dependencies {
 tasks.configureEach {
     if (name.startsWith("process") && name.endsWith("UnitTestJavaRes")) {
         dependsOn(syncProtocolFixtures)
+    }
+    if (name == "packageRelease" || name == "bundleRelease") {
+        dependsOn(verifyReleaseSigning)
     }
 }
