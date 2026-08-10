@@ -112,6 +112,15 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
     }
 
     pub async fn attach(&mut self, session_id: Option<String>) -> Result<(), HeadlessError> {
+        self.clear_attachment();
+        let result = self.attach_inner(session_id).await;
+        if result.is_err() {
+            self.clear_attachment();
+        }
+        result
+    }
+
+    async fn attach_inner(&mut self, session_id: Option<String>) -> Result<(), HeadlessError> {
         self.transport
             .send(ClientMessage::Attach {
                 protocol_version: PROTOCOL_VERSION,
@@ -202,8 +211,15 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
             },
             ServerMessage::Snapshot { seq, state } => {
                 if seq != state.seq {
+                    self.clear_attachment();
                     return Err(HeadlessError::Protocol(
                         "snapshot envelope sequence does not match state".to_string(),
+                    ));
+                }
+                if state.session_id != self.state.session_id() {
+                    self.clear_attachment();
+                    return Err(HeadlessError::Protocol(
+                        "snapshot session does not match attached session".to_string(),
                     ));
                 }
                 self.state.apply_snapshot(state);
@@ -579,5 +595,93 @@ mod tests {
         ));
         assert!(!frontend.is_attached());
         assert!(frontend.granted_capabilities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_attach_after_attach_ok_rolls_back_local_state() {
+        let (server, client_transport) = in_memory_transport_pair(4, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe, ClientCapability::Prompt],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Error {
+                    request_id: None,
+                    code: "snapshot_failed".to_string(),
+                    message: "snapshot unavailable".to_string(),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = HeadlessFrontend::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe, ClientCapability::Prompt],
+            100,
+        );
+
+        assert!(matches!(
+            frontend.attach(Some("session-1".to_string())).await,
+            Err(HeadlessError::Server { .. })
+        ));
+        assert!(!frontend.is_attached());
+        assert!(frontend.granted_capabilities().is_empty());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn midstream_snapshot_cannot_change_attached_session() {
+        let (server, client_transport) = in_memory_transport_pair(8, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("session-1", 0),
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 1,
+                    state: snapshot("session-2", 1),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = HeadlessFrontend::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            frontend.receive().await,
+            Err(HeadlessError::Protocol(_))
+        ));
+        assert_eq!(frontend.state().session_id(), "session-1");
+        assert!(!frontend.is_attached());
+        server_task.await.unwrap();
     }
 }
