@@ -1185,8 +1185,8 @@
     "semantic_hash": ""
   },
   "src/session_daemon.rs": {
-    "mtime": 1786326090.6533406,
-    "ast_hash": "634e6add19bb8aec32fcf1e87388213d",
+    "mtime": 1786326760.3509452,
+    "ast_hash": "98e6bbe455ecc4649a69f32a827fad0b",
     "semantic_hash": ""
   },
   "src/session_factory.rs": {

@@ -92,6 +92,7 @@ struct ClientAttachment {
     _info: ClientInfo,
     capabilities: Vec<ClientCapability>,
     attachment_id: u64,
+    replacement_notifier: tokio::sync::watch::Sender<bool>,
 }
 
 struct SessionEntry {
@@ -351,6 +352,7 @@ impl SessionDaemon {
             .ok_or_else(|| SessionDaemonError::SessionNotFound(session_id.to_string()))?;
         let handshake_admission = Arc::clone(&entry.admission).lock_owned().await;
         let attachment_id;
+        let replacement_receiver;
         {
             let mut clients = entry
                 .clients
@@ -367,13 +369,21 @@ impl SessionDaemon {
                     max: entry.max_clients,
                 });
             }
+            if replace_existing {
+                if let Some(previous) = clients.remove(&client.id) {
+                    previous.replacement_notifier.send_replace(true);
+                }
+            }
             attachment_id = self.next_attachment_id.fetch_add(1, Ordering::AcqRel);
+            let (replacement_notifier, receiver) = tokio::sync::watch::channel(false);
+            replacement_receiver = receiver;
             clients.insert(
                 client.id.clone(),
                 ClientAttachment {
                     _info: client.clone(),
                     capabilities: capabilities.clone(),
                     attachment_id,
+                    replacement_notifier,
                 },
             );
             let approve_once = clients
@@ -402,6 +412,7 @@ impl SessionDaemon {
             client_id: client.id,
             capabilities,
             attachment_id,
+            replacement_receiver,
             handshake_admission: Some(handshake_admission),
         })
     }
@@ -891,11 +902,20 @@ impl SessionDaemon {
         }
         let prompt_in_flight = Arc::new(AtomicBool::new(false));
         let mut stop_receiver = attachment.entry.stop_notifier.subscribe();
+        let mut replacement_receiver = attachment.replacement_receiver.clone();
         loop {
             tokio::select! {
                 incoming = transport.recv() => match incoming? {
                     Some(_) if attachment.entry.stopped.load(Ordering::Acquire) => {
                         while let Ok(outgoing) = event_rx.try_recv() {
+                            if matches!(
+                                &outgoing,
+                                ServerMessage::Event { seq, .. }
+                                    if snapshot_sequence
+                                        .is_some_and(|snapshot_seq| *seq <= snapshot_seq)
+                            ) {
+                                continue;
+                            }
                             transport.send(&outgoing).await?;
                         }
                         transport
@@ -1295,11 +1315,29 @@ impl SessionDaemon {
                 changed = stop_receiver.changed() => {
                     if changed.is_err() || *stop_receiver.borrow() {
                         while let Ok(outgoing) = event_rx.try_recv() {
+                            if matches!(
+                                &outgoing,
+                                ServerMessage::Event { seq, .. }
+                                    if snapshot_sequence
+                                        .is_some_and(|snapshot_seq| *seq <= snapshot_seq)
+                            ) {
+                                continue;
+                            }
                             transport.send(&outgoing).await?;
                         }
                         transport
                             .send(&ServerMessage::Revoked {
                                 reason: "session stopped".to_string(),
+                            })
+                            .await?;
+                        break;
+                    }
+                }
+                changed = replacement_receiver.changed() => {
+                    if changed.is_err() || *replacement_receiver.borrow() {
+                        transport
+                            .send(&ServerMessage::Revoked {
+                                reason: "attachment replaced by reconnect".to_string(),
                             })
                             .await?;
                         break;
@@ -1941,6 +1979,7 @@ pub struct AttachedSession {
     client_id: String,
     capabilities: Vec<ClientCapability>,
     attachment_id: u64,
+    replacement_receiver: tokio::sync::watch::Receiver<bool>,
     handshake_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -2606,6 +2645,7 @@ mod tests {
             .unwrap();
         replacement.finish_handshake();
 
+        assert!(*first.replacement_receiver.borrow());
         drop(first);
         assert_eq!(daemon.attached_client_count("session-1"), Some(1));
         drop(replacement);
