@@ -62,7 +62,10 @@ struct ClaimState {
 #[derive(Debug)]
 enum PairingResolution {
     Pending,
-    Approved(TicketGrant),
+    Approved {
+        grant: TicketGrant,
+        ticket: Box<TicketState>,
+    },
     Denied,
 }
 
@@ -217,9 +220,16 @@ impl PairingAuthority {
             .request
             .device_id
             .clone();
-        if !state.device_notifiers.contains_key(&device_id)
-            && state.device_notifiers.len() >= self.max_devices
-        {
+        let mut known_devices: std::collections::HashSet<_> =
+            state.device_notifiers.keys().cloned().collect();
+        known_devices.extend(
+            state
+                .pending
+                .values()
+                .filter(|pending| matches!(pending.resolution, PairingResolution::Approved { .. }))
+                .map(|pending| pending.request.device_id.clone()),
+        );
+        if !known_devices.contains(&device_id) && known_devices.len() >= self.max_devices {
             return Err(AuthError::DeviceLimitReached);
         }
         let pending = state
@@ -247,12 +257,10 @@ impl PairingAuthority {
             verifying_key: pending.verifying_key,
             capabilities,
         };
-        pending.resolution = PairingResolution::Approved(grant.clone());
-        state.tickets.insert(grant.ticket.clone(), ticket_state);
-        state
-            .device_notifiers
-            .entry(grant.device_id.clone())
-            .or_insert_with(|| tokio::sync::watch::channel(false).0);
+        pending.resolution = PairingResolution::Approved {
+            grant: grant.clone(),
+            ticket: Box::new(ticket_state),
+        };
         Ok(grant)
     }
 
@@ -283,7 +291,7 @@ impl PairingAuthority {
             .ok_or(AuthError::PairingNotFound)?;
         match &pending.resolution {
             PairingResolution::Pending => Ok(None),
-            PairingResolution::Approved(grant) => Ok(Some(grant.clone())),
+            PairingResolution::Approved { grant, .. } => Ok(Some(grant.clone())),
             PairingResolution::Denied => Err(AuthError::PairingAlreadyResolved),
         }
     }
@@ -296,7 +304,7 @@ impl PairingAuthority {
         let Some(pending) = state.pending.remove(pairing_id) else {
             return;
         };
-        let PairingResolution::Approved(grant) = pending.resolution else {
+        let PairingResolution::Approved { grant, ticket } = pending.resolution else {
             return;
         };
         let replaces_existing = state
@@ -307,13 +315,20 @@ impl PairingAuthority {
             if let Some(notifier) = state.device_notifiers.remove(&grant.device_id) {
                 notifier.send_replace(true);
             }
-            state.tickets.retain(|ticket, state| {
-                ticket == &grant.ticket || state.device_id != grant.device_id
-            });
+            state
+                .tickets
+                .retain(|_, state| state.device_id != grant.device_id);
+            state.device_notifiers.insert(
+                grant.device_id.clone(),
+                tokio::sync::watch::channel(false).0,
+            );
+        } else {
             state
                 .device_notifiers
-                .insert(grant.device_id, tokio::sync::watch::channel(false).0);
+                .entry(grant.device_id.clone())
+                .or_insert_with(|| tokio::sync::watch::channel(false).0);
         }
+        state.tickets.insert(grant.ticket, *ticket);
     }
 
     pub fn abort_pairing(&self, pairing_id: &str) {
@@ -321,19 +336,7 @@ impl PairingAuthority {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(pending) = state.pending.remove(pairing_id) else {
-            return;
-        };
-        if let PairingResolution::Approved(grant) = pending.resolution {
-            state.tickets.remove(&grant.ticket);
-            if !state
-                .tickets
-                .values()
-                .any(|ticket| ticket.device_id == grant.device_id)
-            {
-                state.device_notifiers.remove(&grant.device_id);
-            }
-        }
+        state.pending.remove(pairing_id);
     }
 
     pub fn authenticate(

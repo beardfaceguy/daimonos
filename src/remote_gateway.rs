@@ -63,6 +63,9 @@ enum RemoteServerFrame {
     PairingApproved {
         grant: TicketGrant,
     },
+    PairingCommitted {
+        device_id: String,
+    },
     Authenticated {
         device_id: String,
         capabilities: Vec<ClientCapability>,
@@ -512,6 +515,11 @@ async fn serve_pairing(
                     .await;
                 if sent.is_ok() {
                     state.authenticator.finish_pairing(&pending.id);
+                    let _ = transport
+                        .send_frame(&RemoteServerFrame::PairingCommitted {
+                            device_id: pending.device_id.clone(),
+                        })
+                        .await;
                 } else {
                     state.authenticator.abort_pairing(&pending.id);
                 }
@@ -1036,6 +1044,7 @@ mod tests {
             "server_challenge",
             "pairing_pending",
             "pairing_approved",
+            "pairing_committed",
             "authenticated",
         ] {
             serde_json::from_value::<RemoteServerFrame>(fixture[field].clone()).unwrap();
@@ -1116,6 +1125,10 @@ mod tests {
             recv_server_frame(&mut pairing_socket).await,
             RemoteServerFrame::PairingApproved { .. }
         ));
+        assert!(matches!(
+            recv_server_frame(&mut pairing_socket).await,
+            RemoteServerFrame::PairingCommitted { .. }
+        ));
         pairing_socket.close(None).await.unwrap();
 
         let (mut remote_socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -1185,6 +1198,7 @@ mod tests {
         let grant = authenticator
             .approve(&pending.id, vec![ClientCapability::Observe])
             .unwrap();
+        authenticator.finish_pairing(&pending.id);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let gateway = RemoteGateway::new(

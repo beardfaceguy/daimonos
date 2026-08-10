@@ -373,19 +373,49 @@ impl SessionRuntimeConfig {
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
         }
-        if self.remote_pairing_ttl_secs == 0
-            || self.remote_pairing_wait_secs == 0
-            || self.remote_auth_timeout_secs == 0
-            || self.remote_heartbeat_interval_secs == 0
-            || self.remote_heartbeat_timeout_secs == 0
-            || self.remote_max_messages_per_second == 0
-            || self.remote_max_connections == 0
-            || self.remote_admission_attempts_per_minute == 0
-            || self.remote_max_unauthenticated_per_ip == 0
-            || self.remote_max_admission_peers == 0
-            || self.remote_max_paired_devices == 0
-        {
-            return Err("session remote gateway limits must be greater than zero".to_string());
+        for (field, is_zero) in [
+            ("remote_pairing_ttl_secs", self.remote_pairing_ttl_secs == 0),
+            (
+                "remote_pairing_wait_secs",
+                self.remote_pairing_wait_secs == 0,
+            ),
+            (
+                "remote_auth_timeout_secs",
+                self.remote_auth_timeout_secs == 0,
+            ),
+            (
+                "remote_heartbeat_interval_secs",
+                self.remote_heartbeat_interval_secs == 0,
+            ),
+            (
+                "remote_heartbeat_timeout_secs",
+                self.remote_heartbeat_timeout_secs == 0,
+            ),
+            (
+                "remote_max_messages_per_second",
+                self.remote_max_messages_per_second == 0,
+            ),
+            ("remote_max_connections", self.remote_max_connections == 0),
+            (
+                "remote_admission_attempts_per_minute",
+                self.remote_admission_attempts_per_minute == 0,
+            ),
+            (
+                "remote_max_unauthenticated_per_ip",
+                self.remote_max_unauthenticated_per_ip == 0,
+            ),
+            (
+                "remote_max_admission_peers",
+                self.remote_max_admission_peers == 0,
+            ),
+            (
+                "remote_max_paired_devices",
+                self.remote_max_paired_devices == 0,
+            ),
+        ] {
+            if is_zero {
+                return Err(format!("session.{field} must be greater than zero"));
+            }
         }
         if self.max_tool_event_output_bytes > self.max_frame_bytes / 8 {
             return Err(

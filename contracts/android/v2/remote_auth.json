@@ -43,6 +43,10 @@
       ]
     }
   },
+  "pairing_committed": {
+    "type": "pairing_committed",
+    "device_id": "b600306cfa76723fdec395e53a9b3d9fdb78b1e2d7a23c32fcbcd2dc6d0c4092"
+  },
   "authenticated": {
     "type": "authenticated",
     "device_id": "b600306cfa76723fdec395e53a9b3d9fdb78b1e2d7a23c32fcbcd2dc6d0c4092",
