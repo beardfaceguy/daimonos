@@ -876,11 +876,13 @@ impl SessionCore {
         M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
     {
         let active_turn = self.begin_turn().map_err(|_| SessionPromptError::Busy)?;
+        let event_request_id = client_user_message_id.clone();
         self.prompt_with_active_turn(
             active_turn,
             user_message,
             canonical_user_text,
             client_user_message_id,
+            event_request_id,
             assistant_prefix,
             on_cancel,
             outcome_mapper,
@@ -895,6 +897,7 @@ impl SessionCore {
         user_message: Message,
         canonical_user_text: String,
         client_user_message_id: Option<String>,
+        event_request_id: Option<String>,
         assistant_prefix: Option<String>,
         on_cancel: C,
         outcome_mapper: M,
@@ -925,6 +928,7 @@ impl SessionCore {
             .map_err(SessionPromptError::Model)?;
         let _ = self.events.emit(SessionEvent::UserMessage {
             text: canonical_user_text,
+            request_id: event_request_id,
         });
         if let Some(prefix) = assistant_prefix.as_ref() {
             let _ = self.events.emit(SessionEvent::AssistantDelta {
@@ -2502,7 +2506,7 @@ mod tests {
             .prompt(
                 message,
                 "ping".to_string(),
-                None,
+                Some("request-1".to_string()),
                 None,
                 || {},
                 |_| crate::session_protocol::AssistantOutcome::Completed,
@@ -2520,9 +2524,13 @@ mod tests {
             )
         }));
         let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(seen
-            .iter()
-            .any(|event| matches!(event, SessionEvent::UserMessage { text } if text == "ping")));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            SessionEvent::UserMessage {
+                text,
+                request_id: Some(request_id),
+            } if text == "ping" && request_id == "request-1"
+        )));
         assert!(seen.iter().any(|event| matches!(
             event,
             SessionEvent::AssistantDone {

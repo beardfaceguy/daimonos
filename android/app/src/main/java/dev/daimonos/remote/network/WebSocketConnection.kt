@@ -14,10 +14,12 @@ import okhttp3.WebSocketListener
 class WebSocketConnection private constructor(
     private val socket: WebSocket,
     private val channel: Channel<WebSocketEvent>,
-) : Closeable {
+) : RemoteSocket {
     val events: Flow<WebSocketEvent> = channel.receiveAsFlow()
 
-    fun send(text: String): Boolean = socket.send(text)
+    override fun send(text: String): Boolean = socket.send(text)
+
+    override suspend fun receive(): WebSocketEvent = channel.receive()
 
     override fun close() {
         socket.close(NORMAL_CLOSURE, "client closing")
@@ -79,7 +81,12 @@ class WebSocketConnection private constructor(
 }
 
 class WebSocketBackpressureException :
-    IllegalStateException("WebSocket event consumer exceeded the bounded queue")
+    RemoteTransportException("WebSocket event consumer exceeded the bounded queue")
+
+interface RemoteSocket : Closeable {
+    fun send(text: String): Boolean
+    suspend fun receive(): WebSocketEvent
+}
 
 sealed interface WebSocketEvent {
     data object Open : WebSocketEvent

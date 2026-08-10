@@ -20,7 +20,16 @@ TLS; Daimonos itself remains bound to loopback. Protocol contract tests read
 the canonical fixtures from `contracts/android/v2` directly so Rust and Kotlin
 wire models cannot drift independently.
 
-This first slice contains the Compose shell, complete protocol-v2 models,
-remote-auth models, Ed25519 known-answer verification, and the bounded OkHttp
-WebSocket seam. Pairing, secure device-key persistence, and controller screens
-are implemented in the next slice.
+The controller includes:
+
+- single-use claim pairing with local fingerprint approval;
+- an Ed25519 device identity encrypted by an Android Keystore AES-GCM key;
+- encrypted ticket storage, WSS authentication, reconnect, replay, and snapshot
+  recovery;
+- session switching, transcript/tool rendering, prompts, interrupt, stop, and
+  approval controls with capability gating;
+- cross-language protocol fixtures and Ed25519 known-answer tests.
+
+Runtime/model controls remain hidden until the daemon implements the existing
+`set_config` wire command. Release signing, CI APK artifacts, and an
+instrumented host/device end-to-end test are the next release slice.

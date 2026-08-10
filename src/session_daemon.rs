@@ -1018,6 +1018,7 @@ impl SessionDaemon {
                                         crate::providers::Message::user(text.clone()),
                                         text,
                                         Some(client_request_key),
+                                        Some(request_id.clone()),
                                         None,
                                         || {},
                                         move |turn| {
@@ -1656,7 +1657,7 @@ impl SnapshotState {
     fn apply(&mut self, seq: u64, event: SessionEvent) {
         self.snapshot.seq = seq;
         match event {
-            SessionEvent::UserMessage { text } => {
+            SessionEvent::UserMessage { text, .. } => {
                 self.push_transcript(TranscriptRole::User, text);
             }
             SessionEvent::AssistantDelta { text } => {
@@ -2940,6 +2941,7 @@ mod tests {
             core.events
                 .emit(SessionEvent::UserMessage {
                     text: format!("message-{index}-{}", "x".repeat(100)),
+                    request_id: None,
                 })
                 .unwrap();
         }
@@ -3225,7 +3227,10 @@ mod tests {
         }
         assert!(events.iter().any(|event| matches!(
             event,
-            crate::session_protocol::SessionEvent::UserMessage { text } if text == "ping"
+            crate::session_protocol::SessionEvent::UserMessage {
+                text,
+                request_id: Some(request_id),
+            } if text == "ping" && request_id == "prompt-1"
         )));
         assert!(events.iter().any(|event| matches!(
             event,
@@ -3392,6 +3397,7 @@ mod tests {
         core.events
             .emit(crate::session_protocol::SessionEvent::UserMessage {
                 text: "ping".to_string(),
+                request_id: None,
             })
             .unwrap();
         core.events

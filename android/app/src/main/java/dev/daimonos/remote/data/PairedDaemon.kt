@@ -1,7 +1,9 @@
 package dev.daimonos.remote.data
 
 import dev.daimonos.remote.protocol.ClientCapability
+import kotlinx.serialization.Serializable
 
+@Serializable
 data class PairedDaemon(
     val endpoint: String,
     val deviceId: String,
