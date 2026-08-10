@@ -168,7 +168,12 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
     fun switchSession(sessionId: String?) {
         desiredSessionId = sessionId
         reducer = SessionReducer()
-        mutableState.value = mutableState.value.copy(session = reducer.state)
+        pendingPrompt = null
+        replayTargetSeq = null
+        mutableState.value = mutableState.value.copy(
+            session = reducer.state,
+            promptPending = false,
+        )
         activeConnection?.close()
     }
 
@@ -223,6 +228,16 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                         mutableState.value = ControllerUiState(
                             mode = AppMode.PAIRING,
                             error = "Stored device access is no longer valid; pair again",
+                        )
+                        return@launch
+                    }
+                    if (error is RemoteAttachDeniedException) {
+                        secureStore.clear()
+                        daemon = null
+                        reducer = SessionReducer()
+                        mutableState.value = ControllerUiState(
+                            mode = AppMode.PAIRING,
+                            error = "Session attachment was denied: ${error.message}",
                         )
                         return@launch
                     }
@@ -299,7 +314,10 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                     message.nextCursor?.let(connection::listSessions)
                 }
                 is ServerMessage.Revoked -> {
-                    if (message.reason.contains("stopped", ignoreCase = true)) {
+                    if (
+                        reducer.state.endingReason != null ||
+                        message.reason.contains("stopped", ignoreCase = true)
+                    ) {
                         desiredSessionId = null
                         reducer = SessionReducer()
                         releasePendingPrompt(accepted = false)
@@ -314,8 +332,9 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                     if (desiredSessionId != null || reducer.state.sessionId != null) {
                         desiredSessionId = null
                         reducer = SessionReducer()
+                        error(message.reason)
                     }
-                    error(message.reason)
+                    throw RemoteAttachDeniedException(message.reason)
                 }
                 is ServerMessage.Error -> {
                     if (message.requestId == pendingPrompt?.requestId) {
@@ -400,6 +419,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
 
     override fun onCleared() {
         pairingJob?.cancel()
+        sessionJob?.cancel()
         activeConnection?.close()
         httpClient.dispatcher.executorService.shutdown()
         httpClient.connectionPool.evictAll()
@@ -423,4 +443,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         val text: String,
         val sentAtSeq: Long,
     )
+
+    private class RemoteAttachDeniedException(message: String) :
+        IllegalStateException(message)
 }

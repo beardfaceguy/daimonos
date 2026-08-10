@@ -51,6 +51,9 @@ class SecureDeviceStore(
         mutex.withLock {
             val encrypted = preferences.getString(IDENTITY_KEY, null)
             val seed = if (encrypted == null) {
+                check(!preferences.contains(CREDENTIAL_KEY)) {
+                    "paired credentials exist without their device identity"
+                }
                 ByteArray(Ed25519.SECRET_KEY_SIZE).also(SecureRandom()::nextBytes).also {
                     check(preferences.edit().putString(IDENTITY_KEY, encrypt(it)).commit()) {
                         "unable to persist device identity"
