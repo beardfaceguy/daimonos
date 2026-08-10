@@ -315,6 +315,7 @@ the local TUI/UDS client, and future remote clients.
 | `max_clients_per_session` | `4` | Maximum clients simultaneously attached to one session. Must be greater than zero. |
 | `event_queue_capacity` | `256` | Maximum canonical events queued per attached client. Must be greater than zero. |
 | `snapshot_entries` | `2000` | Maximum transcript entries and tool calls retained independently in a full attach snapshot. Must be greater than zero. |
+| `replay_events` | `512` | Maximum canonical session events retained for reconnect delta replay. |
 | `approval_timeout_secs` | `30` | Maximum seconds a daemon approval may wait before it is denied safely. |
 | `max_tool_event_output_bytes` | `65536` | Maximum UTF-8 bytes retained from one tool result in canonical events; range: 32 through one eighth of `max_frame_bytes`. |
 | `accept_error_backoff_ms` | `100` | Delay before retrying a recoverable local Unix listener accept failure. |
@@ -337,6 +338,7 @@ max_sessions = 64
 max_clients_per_session = 4
 event_queue_capacity = 256
 snapshot_entries = 2000
+replay_events = 512
 approval_timeout_secs = 30
 max_tool_event_output_bytes = 65536
 accept_error_backoff_ms = 100

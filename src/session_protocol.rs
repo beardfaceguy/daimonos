@@ -55,6 +55,14 @@ pub enum ClientMessage {
         client: ClientInfo,
         requested_capabilities: Vec<ClientCapability>,
     },
+    Resume {
+        protocol_version: u16,
+        session_id: String,
+        last_seen_seq: u64,
+        ticket: Option<String>,
+        client: ClientInfo,
+        requested_capabilities: Vec<ClientCapability>,
+    },
     Prompt {
         request_id: String,
         text: String,
@@ -529,6 +537,27 @@ impl ProtocolLimits {
                     ticket
                         .as_deref()
                         .and_then(|ticket| check("attach.ticket", ticket, self.max_ticket_bytes))
+                })
+                .or_else(|| {
+                    (requested_capabilities.len() > self.max_capabilities).then_some(
+                        ProtocolValidationError::TooManyCapabilities {
+                            max: self.max_capabilities,
+                        },
+                    )
+                }),
+            ClientMessage::Resume {
+                session_id,
+                ticket,
+                client,
+                requested_capabilities,
+                ..
+            } => check("resume.client.id", &client.id, self.max_identifier_bytes)
+                .or_else(|| check("resume.client.label", &client.label, self.max_label_bytes))
+                .or_else(|| check("resume.session_id", session_id, self.max_identifier_bytes))
+                .or_else(|| {
+                    ticket
+                        .as_deref()
+                        .and_then(|ticket| check("resume.ticket", ticket, self.max_ticket_bytes))
                 })
                 .or_else(|| {
                     (requested_capabilities.len() > self.max_capabilities).then_some(
@@ -1162,7 +1191,7 @@ mod tests {
         let commands: Vec<ClientMessage> =
             serde_json::from_str(include_str!("../contracts/android/v2/client_commands.json"))
                 .unwrap();
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 6);
         assert!(matches!(commands.last(), Some(ClientMessage::Detach)));
     }
 }
