@@ -71,6 +71,8 @@ base64 = "0.22.1"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 axum = { version = "0.8.9", features = ["ws"] }
 ed25519-dalek = "3.0.0"
+unicode-width = "=0.2.0"
+unicode-segmentation = "1.13.3"
 
 # Only for fcntl(F_GETFL/F_SETFL) on the ACP stdin descriptor, to clear an
 # O_NONBLOCK flag a child process left behind on the shared file description.

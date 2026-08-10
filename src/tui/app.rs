@@ -230,6 +230,12 @@ async fn run_event_loop(
                         scroll_from_bottom: scroll.bottom_offset(),
                     },
                 );
+                if view.active_approval().is_none() {
+                    if let Some(position) = super::composer_cursor_position(composer, frame.area())
+                    {
+                        frame.set_cursor_position(position);
+                    }
+                }
             })?;
         }
 

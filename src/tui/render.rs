@@ -15,6 +15,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::session_protocol::{
     RuntimeOption, RuntimeOptionSpec, RuntimeValue, ToolCallStateStatus, TranscriptRole, TurnStatus,
@@ -22,7 +24,8 @@ use crate::session_protocol::{
 use crate::tui::state::ViewState;
 
 pub const STATUS_HEIGHT: u16 = 1;
-pub const COMPOSER_HEIGHT: u16 = 3;
+pub const COMPOSER_TEXT_HEIGHT: u16 = 4;
+pub const COMPOSER_HEIGHT: u16 = COMPOSER_TEXT_HEIGHT + 2;
 pub const TUI_CHROME_HEIGHT: u16 = STATUS_HEIGHT + COMPOSER_HEIGHT;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,7 +38,7 @@ pub struct RenderOptions {
 ///
 /// `composer` is the UI-local input buffer (not part of canonical session
 /// state). Layout top-to-bottom: transcript (flex) / status bar (1 row) /
-/// composer (3 rows, bordered).
+/// composer (4 text rows plus a border).
 pub fn render(state: &ViewState, composer: &str, area: Rect, buf: &mut Buffer) {
     render_with_options(state, composer, area, buf, RenderOptions::default());
 }
@@ -47,14 +50,7 @@ pub fn render_with_options(
     buf: &mut Buffer,
     options: RenderOptions,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(STATUS_HEIGHT),
-            Constraint::Length(COMPOSER_HEIGHT),
-        ])
-        .split(area);
+    let chunks = tui_layout(area);
     render_transcript(state, chunks[0], buf, options.scroll_from_bottom);
     render_status(state, chunks[1], buf);
     render_composer(composer, chunks[2], buf);
@@ -67,6 +63,17 @@ pub fn render_with_options(
             cell.set_fg(Color::Reset).set_bg(Color::Reset);
         }
     }
+}
+
+fn tui_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(STATUS_HEIGHT),
+            Constraint::Length(COMPOSER_HEIGHT),
+        ])
+        .split(area)
 }
 
 fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_from_bottom: usize) {
@@ -235,10 +242,124 @@ fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("message (Enter to send · Ctrl-C interrupts · /help for help)");
-    Paragraph::new(Line::from(sanitize(composer)))
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .render(area, buf);
+    let inner = block.inner(area);
+    let (wrapped, viewport) = wrapped_composer(composer, inner);
+    let visible = viewport
+        .map(|view| {
+            wrapped
+                .split('\n')
+                .skip(view.scroll)
+                .take(usize::from(inner.height))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Paragraph::new(visible).block(block).render(area, buf);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerViewport {
+    scroll: usize,
+    cursor_column: u16,
+    cursor_row: u16,
+}
+
+/// Terminal cursor position for the insertion point at the end of `composer`.
+///
+/// The current editor is append/backspace based, so the insertion point is
+/// always the end of the buffer. The viewport follows wrapped and explicit
+/// lines, keeping that point inside the four-row composer.
+pub fn composer_cursor_position(composer: &str, area: Rect) -> Option<(u16, u16)> {
+    let composer_area = *tui_layout(area).get(2)?;
+    let inner = Block::default().borders(Borders::ALL).inner(composer_area);
+    let viewport = composer_viewport(composer, inner)?;
+    Some((
+        inner.x.saturating_add(viewport.cursor_column),
+        inner.y.saturating_add(viewport.cursor_row),
+    ))
+}
+
+fn composer_viewport(composer: &str, inner: Rect) -> Option<ComposerViewport> {
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let (_, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    Some(viewport_from_cursor(logical_row, column, inner))
+}
+
+fn viewport_from_cursor(logical_row: usize, column: usize, inner: Rect) -> ComposerViewport {
+    let viewport_height = usize::from(inner.height);
+    let scroll = logical_row.saturating_sub(viewport_height.saturating_sub(1));
+    ComposerViewport {
+        scroll,
+        cursor_column: u16::try_from(column)
+            .unwrap_or(u16::MAX)
+            .min(inner.width.saturating_sub(1)),
+        cursor_row: u16::try_from(logical_row.saturating_sub(scroll))
+            .unwrap_or(u16::MAX)
+            .min(inner.height.saturating_sub(1)),
+    }
+}
+
+fn wrapped_composer(composer: &str, inner: Rect) -> (String, Option<ComposerViewport>) {
+    if inner.width == 0 || inner.height == 0 {
+        return (String::new(), None);
+    }
+    let (wrapped, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    (
+        wrapped,
+        Some(viewport_from_cursor(logical_row, column, inner)),
+    )
+}
+
+fn wrap_composer(composer: &str, width: usize) -> (String, usize, usize) {
+    debug_assert!(width > 0);
+    let text = sanitize(composer);
+    let mut wrapped = String::with_capacity(text.len());
+    let mut logical_row = 0usize;
+    let mut column = 0usize;
+    let mut wrapped_at_boundary = false;
+
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
+            if !wrapped_at_boundary {
+                wrapped.push('\n');
+                logical_row = logical_row.saturating_add(1);
+            }
+            column = 0;
+            wrapped_at_boundary = false;
+            continue;
+        }
+
+        let mut grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width == 0 {
+            wrapped.push_str(grapheme);
+            wrapped_at_boundary = false;
+            continue;
+        }
+        let rendered_grapheme = if grapheme_width > width {
+            grapheme_width = 1;
+            "\u{fffd}"
+        } else {
+            grapheme
+        };
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            wrapped.push('\n');
+            logical_row = logical_row.saturating_add(1);
+            column = 0;
+        }
+        wrapped.push_str(rendered_grapheme);
+        column = column.saturating_add(grapheme_width).min(width);
+        if column == width {
+            wrapped.push('\n');
+            logical_row = logical_row.saturating_add(1);
+            column = 0;
+            wrapped_at_boundary = true;
+        } else {
+            wrapped_at_boundary = false;
+        }
+    }
+    (wrapped, logical_row, column)
 }
 
 fn role_prefix(role: TranscriptRole) -> (&'static str, Style) {
@@ -478,6 +599,70 @@ mod tests {
     }
 
     #[test]
+    fn composer_reserves_four_visible_text_rows() {
+        assert_eq!(COMPOSER_TEXT_HEIGHT, 4);
+        assert_eq!(COMPOSER_HEIGHT, 6);
+    }
+
+    #[test]
+    fn composer_scrolls_to_keep_latest_input_visible() {
+        let state = ViewState::new("sess-1");
+        let out = render_to_string(&state, "first\nsecond\nthird\nfourth\nfifth", 40, 12);
+
+        assert!(
+            !out.contains("first"),
+            "oldest row should scroll out:\n{out}"
+        );
+        for visible in ["second", "third", "fourth", "fifth"] {
+            assert!(
+                out.contains(visible),
+                "{visible} should remain visible:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_cursor_follows_wrapped_text_at_viewport_bottom() {
+        let area = Rect::new(0, 0, 12, 12);
+        let position =
+            composer_cursor_position("1111111111\n2\n3\n4\n5", area).expect("composer cursor");
+
+        // Four text rows inside a six-row bordered composer. The fifth logical
+        // row scrolls, leaving the insertion cursor on the last visible row.
+        assert_eq!(position, (2, 10));
+    }
+
+    #[test]
+    fn composer_scrolls_a_single_continuously_wrapped_line() {
+        let state = ViewState::new("sess-1");
+        let composer = concat!(
+            "FIRST11111",
+            "SECOND2222",
+            "THIRD33333",
+            "FOURTH4444",
+            "FIFTH55555",
+        );
+        let out = render_to_string(&state, composer, 12, 12);
+
+        assert!(
+            !out.contains("FIRST"),
+            "wrapped head should scroll out:\n{out}"
+        );
+        assert!(
+            out.contains("FIFTH"),
+            "wrapped tail should stay visible:\n{out}"
+        );
+    }
+
+    #[test]
+    fn composer_cursor_uses_display_width_for_wide_unicode() {
+        let area = Rect::new(0, 0, 12, 12);
+        // Five double-width glyphs exactly fill the ten-cell inner width,
+        // placing the insertion cursor at column zero of the next row.
+        assert_eq!(composer_cursor_position("界界界界界", area), Some((1, 8)),);
+    }
+
+    #[test]
     fn no_color_mode_resets_every_rendered_cell_color() {
         let mut state = ViewState::new("sess-1");
         state.apply_event(
@@ -559,7 +744,7 @@ mod tests {
                 request_id: None,
             },
         );
-        let area = Rect::new(0, 0, 20, 8);
+        let area = Rect::new(0, 0, 20, 11);
         let mut latest = Buffer::empty(area);
         render_with_options(&state, "", area, &mut latest, RenderOptions::default());
         let mut earlier = Buffer::empty(area);
@@ -622,6 +807,69 @@ mod tests {
             !out.contains("[a]"),
             "allow-always must be hidden when host-gated:\n{out}"
         );
+    }
+
+    #[test]
+    fn composer_wraps_emoji_graphemes_as_single_display_units() {
+        let area = Rect::new(0, 0, 6, 12);
+        assert_eq!(composer_cursor_position("👩‍🔬👩‍🔬", area), Some((1, 8)),);
+    }
+
+    #[test]
+    fn composer_keeps_combining_marks_with_their_base_character() {
+        let area = Rect::new(0, 0, 6, 12);
+        assert_eq!(composer_cursor_position("abc\u{301}d", area), Some((1, 8)),);
+    }
+
+    #[test]
+    fn composer_scroll_does_not_stop_after_u16_max_rows() {
+        let area = Rect::new(0, 0, 12, 12);
+        let composer = "x".repeat(700_000);
+        assert_eq!(composer_cursor_position(&composer, area), Some((1, 10)));
+    }
+
+    #[test]
+    fn composer_cursor_is_absent_when_no_inner_cells_exist() {
+        assert_eq!(
+            composer_cursor_position("draft", Rect::new(0, 0, 1, 4)),
+            None,
+        );
+    }
+
+    #[test]
+    fn composer_replaces_graphemes_wider_than_a_tiny_viewport() {
+        let state = ViewState::new("sess-1");
+        let out = render_to_string(&state, "界a", 3, 12);
+
+        assert!(
+            out.contains('\u{fffd}'),
+            "replacement should be visible:\n{out}"
+        );
+        assert!(
+            !out.contains('界'),
+            "unrenderable glyph should be replaced:\n{out}"
+        );
+        assert_eq!(
+            composer_cursor_position("界a", Rect::new(0, 0, 3, 12)),
+            Some((1, 9)),
+        );
+    }
+
+    #[test]
+    fn newline_after_standalone_zero_width_grapheme_is_preserved() {
+        let area = Rect::new(0, 0, 6, 12);
+        assert_eq!(
+            composer_cursor_position("abcd\u{200b}\nq", area),
+            Some((2, 9)),
+        );
+    }
+
+    #[test]
+    fn newline_after_exact_width_starts_one_empty_logical_line() {
+        let area = Rect::new(0, 0, 6, 12);
+        // The hard-wrap and explicit newline identify the same next row; they
+        // must not create a second blank row.
+        assert_eq!(composer_cursor_position("abcd\n", area), Some((1, 8)),);
     }
 
     #[test]
