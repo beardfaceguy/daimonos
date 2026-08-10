@@ -40,3 +40,9 @@ bench/bin/
 # Local dotenv-style secrets/config loaded by daimonos at startup
 agent.env
 
+# Android/Gradle local state
+/android/.gradle/
+/android/.idea/
+/android/local.properties
+/android/**/build/
+
