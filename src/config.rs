@@ -268,6 +268,28 @@ pub struct SessionRuntimeConfig {
     pub session_list_page_size: usize,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
+    /// Lifetime of a single-use remote pairing claim.
+    pub remote_pairing_ttl_secs: u64,
+    /// Maximum time a remote pairing socket waits for local consent.
+    pub remote_pairing_wait_secs: u64,
+    /// Maximum time to receive the first remote authentication frame.
+    pub remote_auth_timeout_secs: u64,
+    /// Idle interval before a remote WebSocket heartbeat ping.
+    pub remote_heartbeat_interval_secs: u64,
+    /// Maximum time to answer a remote heartbeat.
+    pub remote_heartbeat_timeout_secs: u64,
+    /// Maximum remote WebSocket messages per second per connection.
+    pub remote_max_messages_per_second: u32,
+    /// Maximum concurrent remote WebSocket connections.
+    pub remote_max_connections: usize,
+    /// Maximum remote upgrade attempts per minute per source address.
+    pub remote_admission_attempts_per_minute: u32,
+    /// Maximum unauthenticated remote sockets per source address.
+    pub remote_max_unauthenticated_per_ip: usize,
+    /// Maximum source addresses retained by remote admission accounting.
+    pub remote_max_admission_peers: usize,
+    /// Maximum paired remote devices retained for this daemon lifetime.
+    pub remote_max_paired_devices: usize,
     /// Maximum newline-delimited JSON frame size.
     pub max_frame_bytes: usize,
     pub max_prompt_bytes: usize,
@@ -294,6 +316,17 @@ impl Default for SessionRuntimeConfig {
             idle_retention_secs: 300,
             session_list_page_size: 50,
             shutdown_grace_secs: 5,
+            remote_pairing_ttl_secs: 300,
+            remote_pairing_wait_secs: 300,
+            remote_auth_timeout_secs: 10,
+            remote_heartbeat_interval_secs: 30,
+            remote_heartbeat_timeout_secs: 10,
+            remote_max_messages_per_second: 30,
+            remote_max_connections: 4,
+            remote_admission_attempts_per_minute: 6,
+            remote_max_unauthenticated_per_ip: 2,
+            remote_max_admission_peers: 4_096,
+            remote_max_paired_devices: 64,
             max_frame_bytes: 1_048_576,
             max_prompt_bytes: 131_072,
             max_label_bytes: 256,
@@ -339,6 +372,50 @@ impl SessionRuntimeConfig {
         }
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
+        }
+        for (field, is_zero) in [
+            ("remote_pairing_ttl_secs", self.remote_pairing_ttl_secs == 0),
+            (
+                "remote_pairing_wait_secs",
+                self.remote_pairing_wait_secs == 0,
+            ),
+            (
+                "remote_auth_timeout_secs",
+                self.remote_auth_timeout_secs == 0,
+            ),
+            (
+                "remote_heartbeat_interval_secs",
+                self.remote_heartbeat_interval_secs == 0,
+            ),
+            (
+                "remote_heartbeat_timeout_secs",
+                self.remote_heartbeat_timeout_secs == 0,
+            ),
+            (
+                "remote_max_messages_per_second",
+                self.remote_max_messages_per_second == 0,
+            ),
+            ("remote_max_connections", self.remote_max_connections == 0),
+            (
+                "remote_admission_attempts_per_minute",
+                self.remote_admission_attempts_per_minute == 0,
+            ),
+            (
+                "remote_max_unauthenticated_per_ip",
+                self.remote_max_unauthenticated_per_ip == 0,
+            ),
+            (
+                "remote_max_admission_peers",
+                self.remote_max_admission_peers == 0,
+            ),
+            (
+                "remote_max_paired_devices",
+                self.remote_max_paired_devices == 0,
+            ),
+        ] {
+            if is_zero {
+                return Err(format!("session.{field} must be greater than zero"));
+            }
         }
         if self.max_tool_event_output_bytes > self.max_frame_bytes / 8 {
             return Err(

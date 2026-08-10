@@ -46,6 +46,31 @@ the daemon, preventing concurrent whole-history writers. Explicit
 `stop_session` deletes the daemon-owned saved conversation; daemon shutdown
 preserves it for restart.
 
+Remote Android access is explicit opt-in:
+
+```bash
+daimonos --workspace /path/to/project session-daemon \
+  --remote-listen 127.0.0.1:9470 \
+  --remote-origin https://remote.example
+```
+
+The gateway is loopback-only and must be published through a TLS reverse proxy
+to provide WSS. It prints one single-use five-minute pairing claim. After the
+phone submits its Ed25519 public key, the daemon prints the device fingerprint
+and requested capabilities; type
+`approve <pairing-id> <capability>...` with the exact subset to grant, or
+`deny <pairing-id>` on the daemon's local stdin. Claims renew before expiry and
+after each submission. Type `revoke <device-id>` to invalidate every
+in-memory ticket and disconnect that device. Remote `approve_always` is removed
+unless `--remote-allow-always` is explicitly set. Browser Origins require an
+exact `--remote-origin`; native Android clients omit Origin.
+
+When the loopback reverse proxy overwrites `X-Forwarded-For`, pass
+`--remote-trust-proxy-headers` so admission limits are keyed by the originating
+client rather than the proxy. The flag is rejected for non-loopback peers and
+must not be used with a proxy that appends to an untrusted client-supplied
+header.
+
 Inspection operations (`--stats`, `--print-config-path`, `--print-prompt`, and
 `--dump-prompts`) remain top-level flags because they do not launch a persistent
 runtime.

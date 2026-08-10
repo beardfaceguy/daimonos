@@ -118,6 +118,18 @@ idle_retention_secs = 300
 session_list_page_size = 50
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
+# Remote gateway security and liveness limits.
+remote_pairing_ttl_secs = 300
+remote_pairing_wait_secs = 300
+remote_auth_timeout_secs = 10
+remote_heartbeat_interval_secs = 30
+remote_heartbeat_timeout_secs = 10
+remote_max_messages_per_second = 30
+remote_max_connections = 4
+remote_admission_attempts_per_minute = 6
+remote_max_unauthenticated_per_ip = 2
+remote_max_admission_peers = 4096
+remote_max_paired_devices = 64
 # Maximum newline-delimited JSON frame and untrusted protocol field sizes.
 max_frame_bytes = 1048576
 max_prompt_bytes = 131072

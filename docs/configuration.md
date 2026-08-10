@@ -322,6 +322,17 @@ the local TUI/UDS client, and future remote clients.
 | `idle_retention_secs` | `300` | Seconds before unloading a detached idle core while preserving its durable record for reattach; `0` keeps cores resident. |
 | `session_list_page_size` | `50` | Maximum entries returned by one daemon session-list page. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
+| `remote_pairing_ttl_secs` | `300` | Lifetime of one single-use remote pairing claim. |
+| `remote_pairing_wait_secs` | `300` | Maximum wait for local approval of a pairing request. |
+| `remote_auth_timeout_secs` | `10` | Maximum time for the first remote authentication frame. |
+| `remote_heartbeat_interval_secs` | `30` | Idle interval before sending a WebSocket ping. |
+| `remote_heartbeat_timeout_secs` | `10` | Maximum wait for activity after a heartbeat ping. |
+| `remote_max_messages_per_second` | `30` | Per-connection WebSocket text/control-frame rate limit. |
+| `remote_max_connections` | `4` | Global concurrent remote WebSocket limit. |
+| `remote_admission_attempts_per_minute` | `6` | WebSocket upgrade limit per source IP. |
+| `remote_max_unauthenticated_per_ip` | `2` | Concurrent pre-authentication sockets allowed per source IP. |
+| `remote_max_admission_peers` | `4096` | Maximum source addresses retained by remote admission accounting. |
+| `remote_max_paired_devices` | `64` | Maximum paired devices retained during one daemon lifetime. Re-pairing replaces that device's previous ticket. |
 | `max_frame_bytes` | `1048576` | Maximum newline-delimited JSON frame size. |
 | `max_prompt_bytes` | `131072` | Maximum UTF-8 bytes in one prompt; its worst-case JSON-escaped event must fit within `max_frame_bytes`. |
 | `max_label_bytes` | `256` | Maximum UTF-8 bytes in a client label. |
@@ -345,6 +356,17 @@ accept_error_backoff_ms = 100
 idle_retention_secs = 0
 session_list_page_size = 50
 shutdown_grace_secs = 5
+remote_pairing_ttl_secs = 300
+remote_pairing_wait_secs = 300
+remote_auth_timeout_secs = 10
+remote_heartbeat_interval_secs = 30
+remote_heartbeat_timeout_secs = 10
+remote_max_messages_per_second = 30
+remote_max_connections = 4
+remote_admission_attempts_per_minute = 6
+remote_max_unauthenticated_per_ip = 2
+remote_max_admission_peers = 4096
+remote_max_paired_devices = 64
 max_frame_bytes = 1048576
 max_prompt_bytes = 131072
 max_label_bytes = 256

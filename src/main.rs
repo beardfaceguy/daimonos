@@ -29,6 +29,8 @@ mod prompts;
 mod protocol;
 mod providers;
 mod provisioning;
+mod remote_auth;
+mod remote_gateway;
 mod safety;
 mod script;
 mod session;

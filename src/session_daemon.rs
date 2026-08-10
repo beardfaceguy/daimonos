@@ -695,6 +695,19 @@ impl SessionDaemon {
             .await
     }
 
+    pub async fn serve_client_with_capabilities<T: ClientTransport>(
+        &self,
+        transport: T,
+        limits: &ProtocolLimits,
+        allowed_capabilities: Vec<ClientCapability>,
+    ) -> Result<(), TransportError> {
+        let capability_policy = CapabilityPolicy {
+            allowed: allowed_capabilities.into_iter().collect(),
+        };
+        self.serve_client_with_policy(transport, limits, &capability_policy)
+            .await
+    }
+
     async fn serve_client_with_policy<T: ClientTransport>(
         &self,
         transport: T,
