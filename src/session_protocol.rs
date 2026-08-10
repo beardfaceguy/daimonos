@@ -1104,4 +1104,65 @@ mod tests {
             Err(ProtocolValidationError::TooManyCapabilities { max: 2 })
         );
     }
+
+    #[test]
+    fn android_v2_contract_fixtures_match_canonical_wire_types() {
+        let attach: ClientMessage =
+            serde_json::from_str(include_str!("../contracts/android/v2/attach_request.json"))
+                .unwrap();
+        assert!(matches!(
+            attach,
+            ClientMessage::Attach {
+                protocol_version: PROTOCOL_VERSION,
+                client: ClientInfo {
+                    kind: ClientKind::Android,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let snapshot: ServerMessage =
+            serde_json::from_str(include_str!("../contracts/android/v2/snapshot.json")).unwrap();
+        assert!(matches!(
+            &snapshot,
+            ServerMessage::Snapshot {
+                seq: 4,
+                state: SessionSnapshot {
+                    turn_status: TurnStatus::WaitingForApproval,
+                    ..
+                }
+            }
+        ));
+
+        let events: Vec<ServerMessage> =
+            serde_json::from_str(include_str!("../contracts/android/v2/event_stream.json"))
+                .unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(events
+            .iter()
+            .all(|message| matches!(message, ServerMessage::Event { .. })));
+        let ServerMessage::Snapshot { state, .. } = snapshot else {
+            unreachable!("snapshot fixture");
+        };
+        let mut view = crate::frontend_state::ViewState::new("fixture");
+        view.apply_snapshot(state);
+        for message in events {
+            let ServerMessage::Event { seq, event } = message else {
+                unreachable!("event fixture");
+            };
+            assert_eq!(
+                view.apply_event(seq, event),
+                crate::frontend_state::ApplyOutcome::Applied
+            );
+        }
+        assert!(view.pending_approvals().is_empty());
+        assert_eq!(view.tool_calls()[0].status, ToolCallStateStatus::Completed);
+
+        let commands: Vec<ClientMessage> =
+            serde_json::from_str(include_str!("../contracts/android/v2/client_commands.json"))
+                .unwrap();
+        assert_eq!(commands.len(), 5);
+        assert!(matches!(commands.last(), Some(ClientMessage::Detach)));
+    }
 }

@@ -1,0 +1,49 @@
+[
+  {
+    "type": "event",
+    "seq": 5,
+    "event": {
+      "type": "approval_resolved",
+      "approval_id": "approval-1",
+      "decision": "allow_once",
+      "resolved_by": "android-fixture"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 6,
+    "event": {
+      "type": "turn_status_changed",
+      "status": "running"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 7,
+    "event": {
+      "type": "tool_call_updated",
+      "id": "tool-1",
+      "status": "in_progress"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 8,
+    "event": {
+      "type": "tool_call_finished",
+      "id": "tool-1",
+      "status": "completed",
+      "output": "ok"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 9,
+    "event": {
+      "type": "assistant_done",
+      "outcome": {
+        "type": "completed"
+      }
+    }
+  }
+]

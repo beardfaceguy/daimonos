@@ -1,0 +1,23 @@
+[
+  {
+    "type": "prompt",
+    "request_id": "prompt-1",
+    "text": "Continue"
+  },
+  {
+    "type": "interrupt",
+    "request_id": "interrupt-2"
+  },
+  {
+    "type": "approval_response",
+    "approval_id": "approval-1",
+    "decision": "allow_once"
+  },
+  {
+    "type": "sync_request",
+    "last_seen_seq": 8
+  },
+  {
+    "type": "detach"
+  }
+]
