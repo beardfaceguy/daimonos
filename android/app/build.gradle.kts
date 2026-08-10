@@ -1,3 +1,8 @@
+import org.gradle.api.DefaultTask
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -13,19 +18,30 @@ val releaseKeystore = providers.environmentVariable("DAIMONOS_ANDROID_KEYSTORE")
 val releaseStorePassword = providers.environmentVariable("DAIMONOS_ANDROID_STORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("DAIMONOS_ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("DAIMONOS_ANDROID_KEY_PASSWORD").orNull
-val releaseSigningValues = listOf(
-    releaseKeystore,
-    releaseStorePassword,
-    releaseKeyAlias,
-    releaseKeyPassword,
+val releaseSigningValues = mapOf(
+    "DAIMONOS_ANDROID_KEYSTORE" to releaseKeystore,
+    "DAIMONOS_ANDROID_STORE_PASSWORD" to releaseStorePassword,
+    "DAIMONOS_ANDROID_KEY_ALIAS" to releaseKeyAlias,
+    "DAIMONOS_ANDROID_KEY_PASSWORD" to releaseKeyPassword,
 )
-require(
-    releaseSigningValues.all { it == null } ||
-        releaseSigningValues.all { it != null },
-) {
-    "Release signing requires all DAIMONOS_ANDROID_* signing variables"
+val hasReleaseSigning = releaseSigningValues.values.all { it != null }
+
+abstract class VerifyReleaseSigning : DefaultTask() {
+    @get:Input
+    abstract val variableNames: ListProperty<String>
+
+    @TaskAction
+    fun verify() {
+        val missing = variableNames.get().filter { System.getenv(it).isNullOrEmpty() }
+        if (missing.isNotEmpty()) {
+            throw GradleException("Release signing variables are missing: ${missing.joinToString()}")
+        }
+    }
 }
-val hasReleaseSigning = releaseSigningValues.all { it != null }
+
+val verifyReleaseSigning by tasks.registering(VerifyReleaseSigning::class) {
+    variableNames.set(releaseSigningValues.keys.toList())
+}
 
 android {
     namespace = "dev.daimonos.remote"
@@ -107,5 +123,8 @@ dependencies {
 tasks.configureEach {
     if (name.startsWith("process") && name.endsWith("UnitTestJavaRes")) {
         dependsOn(syncProtocolFixtures)
+    }
+    if (name == "packageRelease" || name == "bundleRelease") {
+        dependsOn(verifyReleaseSigning)
     }
 }

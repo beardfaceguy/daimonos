@@ -49,6 +49,9 @@ cd android
 ./gradlew clean testDebugUnitTest lintDebug assembleRelease
 ```
 
+Release packaging fails closed if any signing variable is absent. Debug builds,
+unit tests, lint, and IDE synchronization do not require release credentials.
+
 The signed APK is written to:
 
 ```text
