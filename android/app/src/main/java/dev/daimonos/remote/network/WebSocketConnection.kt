@@ -35,6 +35,7 @@ class WebSocketConnection private constructor(
             val listener = object : WebSocketListener() {
                 private fun emit(webSocket: WebSocket, event: WebSocketEvent) {
                     if (channel.trySend(event).isFailure) {
+                        channel.close(WebSocketBackpressureException())
                         webSocket.close(1011, "client backpressure")
                     }
                 }
@@ -76,6 +77,9 @@ class WebSocketConnection private constructor(
         }
     }
 }
+
+class WebSocketBackpressureException :
+    IllegalStateException("WebSocket event consumer exceeded the bounded queue")
 
 sealed interface WebSocketEvent {
     data object Open : WebSocketEvent
