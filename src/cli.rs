@@ -82,6 +82,18 @@ pub struct SessionDaemonArgs {
     /// Path to the agent env file.
     #[arg(long)]
     pub agent_env: Option<PathBuf>,
+    /// Explicitly enable the remote WebSocket gateway on this loopback address.
+    #[arg(long, value_name = "IP:PORT")]
+    pub remote_listen: Option<std::net::SocketAddr>,
+    /// Browser Origin allowed to open the remote WebSocket. Repeat as needed.
+    #[arg(long = "remote-origin", value_name = "ORIGIN")]
+    pub remote_origins: Vec<String>,
+    /// Permit local consent to grant remote AllowAlways.
+    #[arg(long, default_value_t = false)]
+    pub remote_allow_always: bool,
+    /// Trust X-Forwarded-For only from the loopback reverse proxy.
+    #[arg(long, default_value_t = false)]
+    pub remote_trust_proxy_headers: bool,
 }
 
 #[derive(Debug, Args)]

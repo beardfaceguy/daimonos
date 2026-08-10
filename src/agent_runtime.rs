@@ -306,6 +306,10 @@ pub async fn run_session_daemon(
         model,
         provider,
         agent_env,
+        remote_listen,
+        remote_origins,
+        remote_allow_always,
+        remote_trust_proxy_headers,
     } = args;
     let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
@@ -377,7 +381,6 @@ pub async fn run_session_daemon(
         "daimonos session daemon listening on {}",
         socket_path.display()
     );
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let serve = Arc::clone(&daemon).serve_unix(
         socket_path,
         cfg.session.max_frame_bytes,
@@ -385,16 +388,223 @@ pub async fn run_session_daemon(
         std::time::Duration::from_millis(cfg.session.accept_error_backoff_ms),
     );
     tokio::pin!(serve);
-    let result = tokio::select! {
-        result = &mut serve => result.map_err(anyhow::Error::from),
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            Ok(())
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let result = if let Some(remote_listen) = remote_listen {
+        if !remote_listen.ip().is_loopback() {
+            anyhow::bail!(
+                "--remote-listen must use a loopback address; publish it through a TLS reverse proxy"
+            );
         }
-        _ = terminate.recv() => Ok(()),
+        let listener = tokio::net::TcpListener::bind(remote_listen).await?;
+        let authenticator = Arc::new(crate::remote_auth::PairingAuthority::new(
+            std::time::Duration::from_secs(cfg.session.remote_pairing_ttl_secs),
+            cfg.session.remote_max_paired_devices,
+        ));
+        let claim = authenticator.create_claim();
+        eprintln!(
+            "daimonos remote gateway listening on loopback {remote_listen}, WebSocket path /v2/ws"
+        );
+        print_remote_pairing_claim(&claim);
+        let consent_task = tokio::spawn(remote_pairing_consent_loop(
+            Arc::clone(&authenticator),
+            remote_allow_always,
+            std::time::Duration::from_secs(cfg.session.remote_pairing_ttl_secs),
+        ));
+        let gateway = crate::remote_gateway::RemoteGateway::new(
+            Arc::clone(&daemon),
+            authenticator,
+            cfg.session.protocol_limits(),
+            crate::remote_gateway::RemoteGatewayConfig {
+                allowed_origins: remote_origins.into_iter().collect(),
+                max_frame_bytes: cfg.session.max_frame_bytes,
+                pairing_wait: std::time::Duration::from_secs(cfg.session.remote_pairing_wait_secs),
+                auth_timeout: std::time::Duration::from_secs(cfg.session.remote_auth_timeout_secs),
+                heartbeat_interval: std::time::Duration::from_secs(
+                    cfg.session.remote_heartbeat_interval_secs,
+                ),
+                heartbeat_timeout: std::time::Duration::from_secs(
+                    cfg.session.remote_heartbeat_timeout_secs,
+                ),
+                max_messages_per_second: cfg.session.remote_max_messages_per_second,
+                max_connections: cfg.session.remote_max_connections,
+                admission_attempts_per_minute: cfg.session.remote_admission_attempts_per_minute,
+                max_unauthenticated_per_ip: cfg.session.remote_max_unauthenticated_per_ip,
+                trust_proxy_headers: remote_trust_proxy_headers,
+                max_admission_peers: cfg.session.remote_max_admission_peers,
+            },
+        );
+        let gateway_serve = gateway.serve(listener);
+        tokio::pin!(gateway_serve);
+        let result = tokio::select! {
+            result = &mut serve => result.map_err(anyhow::Error::from),
+            result = &mut gateway_serve => result.map_err(anyhow::Error::from),
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                Ok(())
+            }
+            _ = terminate.recv() => Ok(()),
+        };
+        consent_task.abort();
+        result
+    } else {
+        tokio::select! {
+            result = &mut serve => result.map_err(anyhow::Error::from),
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                Ok(())
+            }
+            _ = terminate.recv() => Ok(()),
+        }
     };
     daemon.shutdown().await;
     result
+}
+
+async fn remote_pairing_consent_loop(
+    authenticator: Arc<crate::remote_auth::PairingAuthority>,
+    allow_always: bool,
+    claim_ttl: std::time::Duration,
+) {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut announced = std::collections::HashSet::new();
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    let renewal_interval = claim_ttl
+        .checked_div(2)
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .max(std::time::Duration::from_secs(1));
+    let mut next_claim_at = tokio::time::Instant::now() + renewal_interval;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mut submitted = false;
+                let pending_pairings = authenticator.pending_pairings();
+                let pending_ids: std::collections::HashSet<_> = pending_pairings
+                    .iter()
+                    .map(|pending| pending.id.clone())
+                    .collect();
+                announced.retain(|pairing_id| pending_ids.contains(pairing_id));
+                for pending in pending_pairings {
+                    if announced.insert(pending.id.clone()) {
+                        submitted = true;
+                        let capability_names = pending
+                            .requested_capabilities
+                            .iter()
+                            .map(remote_capability_name)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "remote pairing request\n  id: {}\n  label: {}\n  fingerprint: {}\n  capabilities: {:?}\n\
+                             Type `approve {} {}` with the subset to grant, or `deny {}`.",
+                            pending.id,
+                            pending.label,
+                            pending.fingerprint,
+                            pending.requested_capabilities,
+                            pending.id,
+                            capability_names,
+                            pending.id,
+                        );
+                    }
+                }
+                if submitted || tokio::time::Instant::now() >= next_claim_at {
+                    print_remote_pairing_claim(&authenticator.create_claim());
+                    next_claim_at = tokio::time::Instant::now() + renewal_interval;
+                }
+            }
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else {
+                    return;
+                };
+                let words: Vec<_> = line.split_whitespace().collect();
+                match words.as_slice() {
+                    ["approve", pairing_id, capability_names @ ..]
+                        if !capability_names.is_empty() =>
+                    {
+                        let pending = authenticator
+                            .pending_pairings()
+                            .into_iter()
+                            .find(|pending| pending.id == *pairing_id);
+                        let Some(pending) = pending else {
+                            eprintln!("remote pairing not found: {pairing_id}");
+                            continue;
+                        };
+                        let capabilities: Result<Vec<_>, _> = capability_names
+                            .iter()
+                            .map(|name| parse_remote_capability(name))
+                            .collect();
+                        let Ok(capabilities) = capabilities else {
+                            eprintln!("remote approval contains an unknown capability");
+                            continue;
+                        };
+                        if !allow_always
+                            && capabilities.contains(
+                                &crate::session_protocol::ClientCapability::ApproveAlways,
+                            )
+                        {
+                            eprintln!("remote approve_always is disabled by host policy");
+                            continue;
+                        }
+                        match authenticator.approve(pairing_id, capabilities) {
+                            Ok(_) => eprintln!("remote device approved: {}", pending.fingerprint),
+                            Err(error) => eprintln!("remote approval failed: {error:?}"),
+                        }
+                    }
+                    ["deny", pairing_id] => {
+                        match authenticator.deny(pairing_id) {
+                            Ok(()) => eprintln!("remote pairing denied: {pairing_id}"),
+                            Err(error) => eprintln!("remote denial failed: {error:?}"),
+                        }
+                    }
+                    ["revoke", device_id] => {
+                        if authenticator.revoke_device(device_id) {
+                            eprintln!("remote device revoked: {device_id}");
+                        } else {
+                            eprintln!("remote device not found: {device_id}");
+                        }
+                    }
+                    _ => eprintln!(
+                        "remote command must be `approve <pairing-id> <capability>...`, \
+                         `deny <pairing-id>`, or `revoke <device-id>`"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn print_remote_pairing_claim(claim: &crate::remote_auth::PairingClaim) {
+    eprintln!(
+        "pairing claim (single-use, {}s): {}",
+        claim.expires_in_secs, claim.secret
+    );
+}
+
+fn parse_remote_capability(name: &str) -> Result<crate::session_protocol::ClientCapability, ()> {
+    use crate::session_protocol::ClientCapability;
+
+    match name {
+        "observe" => Ok(ClientCapability::Observe),
+        "prompt" => Ok(ClientCapability::Prompt),
+        "interrupt" => Ok(ClientCapability::Interrupt),
+        "stop" => Ok(ClientCapability::Stop),
+        "approve_once" => Ok(ClientCapability::ApproveOnce),
+        "approve_always" => Ok(ClientCapability::ApproveAlways),
+        _ => Err(()),
+    }
+}
+
+fn remote_capability_name(capability: &crate::session_protocol::ClientCapability) -> &'static str {
+    use crate::session_protocol::ClientCapability;
+
+    match capability {
+        ClientCapability::Observe => "observe",
+        ClientCapability::Prompt => "prompt",
+        ClientCapability::Interrupt => "interrupt",
+        ClientCapability::Stop => "stop",
+        ClientCapability::ApproveOnce => "approve_once",
+        ClientCapability::ApproveAlways => "approve_always",
+    }
 }
 
 fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {

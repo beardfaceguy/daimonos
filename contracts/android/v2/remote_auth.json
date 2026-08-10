@@ -1,0 +1,62 @@
+{
+  "server_challenge": {
+    "type": "challenge",
+    "challenge": "fixture-challenge"
+  },
+  "pair_request": {
+    "type": "pair",
+    "claim": "fixture-claim",
+    "device_public_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+    "label": "Fixture phone",
+    "requested_capabilities": [
+      "observe",
+      "prompt",
+      "interrupt",
+      "approve_once"
+    ]
+  },
+  "pairing_pending": {
+    "type": "pairing_pending",
+    "pairing": {
+      "id": "pairing-fixture",
+      "device_id": "b600306cfa76723fdec395e53a9b3d9fdb78b1e2d7a23c32fcbcd2dc6d0c4092",
+      "fingerprint": "b600:306c:fa76:723f:dec3:95e5:3a9b:3d9f",
+      "label": "Fixture phone",
+      "requested_capabilities": [
+        "observe",
+        "prompt",
+        "interrupt",
+        "approve_once"
+      ]
+    }
+  },
+  "pairing_approved": {
+    "type": "pairing_approved",
+    "grant": {
+      "ticket": "fixture-ticket",
+      "device_id": "b600306cfa76723fdec395e53a9b3d9fdb78b1e2d7a23c32fcbcd2dc6d0c4092",
+      "capabilities": [
+        "observe",
+        "prompt",
+        "interrupt",
+        "approve_once"
+      ]
+    }
+  },
+  "authenticated": {
+    "type": "authenticated",
+    "device_id": "b600306cfa76723fdec395e53a9b3d9fdb78b1e2d7a23c32fcbcd2dc6d0c4092",
+    "capabilities": [
+      "observe",
+      "prompt",
+      "interrupt",
+      "approve_once"
+    ]
+  },
+  "authenticate_request": {
+    "type": "authenticate",
+    "ticket": "fixture-ticket",
+    "device_public_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+    "signature": "y9SPDpaLah9vyhD1FRJ9cp0hL3deHu-_-AYHNLa99bWGeP1BH0qyFd14vFkY4VMnkOkfLsR1oIippOr3J7o9Dg"
+  }
+}
