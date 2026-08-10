@@ -20,6 +20,9 @@ TLS; Daimonos itself remains bound to loopback. Protocol contract tests read
 the canonical fixtures from `contracts/android/v2` directly so Rust and Kotlin
 wire models cannot drift independently.
 
+See [RELEASE.md](RELEASE.md) for CI artifacts, release signing, verification,
+and sideloading instructions.
+
 The controller includes:
 
 - single-use claim pairing with local fingerprint approval;
@@ -31,5 +34,5 @@ The controller includes:
 - cross-language protocol fixtures and Ed25519 known-answer tests.
 
 Runtime/model controls remain hidden until the daemon implements the existing
-`set_config` wire command. Release signing, CI APK artifacts, and an
-instrumented host/device end-to-end test are the next release slice.
+`set_config` wire command. QR claim scanning and an instrumented
+host/device end-to-end test remain follow-up work.

@@ -9,6 +9,23 @@ val syncProtocolFixtures by tasks.registering(Sync::class) {
     from(rootProject.layout.projectDirectory.dir("../contracts/android/v2"))
     into(protocolFixturesDir)
 }
+val releaseKeystore = providers.environmentVariable("DAIMONOS_ANDROID_KEYSTORE").orNull
+val releaseStorePassword = providers.environmentVariable("DAIMONOS_ANDROID_STORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("DAIMONOS_ANDROID_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("DAIMONOS_ANDROID_KEY_PASSWORD").orNull
+val releaseSigningValues = listOf(
+    releaseKeystore,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+)
+require(
+    releaseSigningValues.all { it == null } ||
+        releaseSigningValues.all { it != null },
+) {
+    "Release signing requires all DAIMONOS_ANDROID_* signing variables"
+}
+val hasReleaseSigning = releaseSigningValues.all { it != null }
 
 android {
     namespace = "dev.daimonos.remote"
@@ -23,8 +40,20 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(checkNotNull(releaseKeystore))
+                storePassword = checkNotNull(releaseStorePassword)
+                keyAlias = checkNotNull(releaseKeyAlias)
+                keyPassword = checkNotNull(releaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

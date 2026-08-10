@@ -45,4 +45,6 @@ agent.env
 /android/.idea/
 /android/local.properties
 /android/**/build/
+*.jks
+*.keystore
 
