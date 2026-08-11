@@ -74,6 +74,80 @@ pub enum ToolTier {
     McpOnly,
 }
 
+/// Tier policy (vikunja #1113).
+///
+/// Every exposure decision lives here as an exhaustive `match`, so **adding a
+/// variant is a compile error at each decision point** rather than a silent
+/// default. Before this, the same decisions were hand-enumerated `matches!` and
+/// `!=` predicates spread across `tools.rs` and `tool_facade.rs` — three
+/// allowlists and two denylists that disagreed by default. Adding `McpOnly`
+/// (#1112) silently dropped `batch` out of MCP exposure and broke the handshake;
+/// the tier's invisibility to the agent catalog later cost real benchmark runs
+/// in #1129.
+///
+/// **Do not add a `_ =>` arm to any of these.** A catch-all reintroduces exactly
+/// the silent default this exists to remove — the compile error *is* the feature.
+/// `tier_exposure_policy_matrix` pins the current table as a runtime guard.
+impl ToolTier {
+    /// Present in the MCP tool catalog at all (`tools/list` definitions and
+    /// name lookups), whether or not it is exposed initially.
+    pub fn defined_for_mcp(self) -> bool {
+        match self {
+            Self::Full | Self::Terse | Self::OnDemand | Self::McpOnly => true,
+            Self::AgentOnly => false,
+        }
+    }
+
+    /// In the *initial* `list_tools` exposure set. Distinct from
+    /// [`Self::defined_for_mcp`]: `OnDemand` is defined so it can be activated,
+    /// but withheld until `list_all_tools` or first use.
+    pub fn exposed_initially_over_mcp(self) -> bool {
+        match self {
+            Self::Full | Self::Terse | Self::McpOnly => true,
+            Self::OnDemand | Self::AgentOnly => false,
+        }
+    }
+
+    /// In the catalog handed to the built-in agent/chat/ACP loop.
+    ///
+    /// `OnDemand` is excluded and, unlike the MCP path, there is currently no
+    /// activation mechanism on the agent side — `AgentConfig::tools` is fixed
+    /// for the run. So an `OnDemand` tool is unreachable from the agent loop,
+    /// not merely deferred. See the #1113 note before changing this.
+    pub fn exposed_to_agent(self) -> bool {
+        match self {
+            Self::Full | Self::Terse | Self::AgentOnly => true,
+            Self::OnDemand | Self::McpOnly => false,
+        }
+    }
+
+    /// Carries a full `inputSchema` in `list_tools` under normal verbosity.
+    pub fn full_schema_by_default(self) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Terse | Self::OnDemand | Self::AgentOnly | Self::McpOnly => false,
+        }
+    }
+
+    /// Carries a full `inputSchema` when `full_tool_schemas` is set (needed by
+    /// introspecting directories such as Glama). `McpOnly` is Terse-equivalent
+    /// for MCP schema exposure.
+    pub fn full_schema_when_forced(self) -> bool {
+        match self {
+            Self::Full | Self::Terse | Self::McpOnly => true,
+            Self::OnDemand | Self::AgentOnly => false,
+        }
+    }
+
+    /// Withheld from initial MCP exposure until `list_all_tools` activates it.
+    pub fn activated_on_demand(self) -> bool {
+        match self {
+            Self::OnDemand => true,
+            Self::Full | Self::Terse | Self::AgentOnly | Self::McpOnly => false,
+        }
+    }
+}
+
 pub const LIST_ALL_TOOLS_TOOL: &str = "list_all_tools";
 
 // --- Tool definition ---
@@ -986,7 +1060,7 @@ pub fn all_tools() -> Vec<ToolDef> {
 pub fn initial_exposed_tools() -> HashSet<String> {
     all_tools()
         .iter()
-        .filter(|t| matches!(t.tier, ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly))
+        .filter(|t| t.tier.exposed_initially_over_mcp())
         .map(|t| t.name.to_string())
         .collect()
 }
@@ -995,29 +1069,24 @@ pub fn initial_exposed_tools() -> HashSet<String> {
 pub fn on_demand_names() -> Vec<&'static str> {
     all_tools()
         .iter()
-        .filter(|t| t.tier == ToolTier::OnDemand)
+        .filter(|t| t.tier.activated_on_demand())
         .map(|t| t.name)
         .collect()
 }
 
-/// Returns true if this tool is Full-tier (always gets schema in list_tools).
+/// Returns true if this tool carries a full schema in `list_tools` by default.
 pub fn has_full_schema(name: &str) -> bool {
     all_tools()
         .iter()
-        .any(|t| t.name == name && t.tier == ToolTier::Full)
+        .any(|t| t.name == name && t.tier.full_schema_by_default())
 }
 
 /// Whether `list_tools` should include the full inputSchema for this tool.
 pub fn expose_full_schema_in_list(name: &str, full_tool_schemas: bool, already_used: bool) -> bool {
     if full_tool_schemas {
-        return all_tools().iter().any(|t| {
-            t.name == name
-                && matches!(
-                    t.tier,
-                    // `McpOnly` is Terse-equivalent for MCP schema exposure.
-                    ToolTier::Full | ToolTier::Terse | ToolTier::McpOnly
-                )
-        });
+        return all_tools()
+            .iter()
+            .any(|t| t.name == name && t.tier.full_schema_when_forced());
     }
     has_full_schema(name) && !already_used
 }
@@ -1089,7 +1158,7 @@ pub fn tool_definitions(
 ) -> Vec<rust_mcp_sdk::schema::Tool> {
     all_tools()
         .into_iter()
-        .filter(|tool| tool.tier != ToolTier::AgentOnly)
+        .filter(|tool| tool.tier.defined_for_mcp())
         .map(|td| {
             let input_schema = descriptions.schema_with_parameters(td.name, &td.schema);
             serde_json::from_value(json!({
@@ -1106,7 +1175,7 @@ pub fn tool_definitions(
 pub fn mcp_tool_names() -> Vec<&'static str> {
     all_tools()
         .iter()
-        .filter(|tool| tool.tier != ToolTier::AgentOnly)
+        .filter(|tool| tool.tier.defined_for_mcp())
         .map(|tool| tool.name)
         .collect()
 }
@@ -1194,6 +1263,71 @@ mod tests {
             crate::tool_descriptions::MCP_PARAMETER_DESCRIPTION_COUNT,
             "MCP schemas must restore every non-agent-only description"
         );
+    }
+
+    /// vikunja #1113: the whole exposure policy, one row per tier.
+    ///
+    /// Every tier decision is a method with an exhaustive `match`, so adding a
+    /// variant is a compile error at each decision point rather than a silent
+    /// default. This table is the paired runtime guard: it pins what each tier
+    /// currently means, so a refactor cannot quietly change one.
+    ///
+    /// Columns are deliberately independent even where two agree today —
+    /// `exposed_initially_over_mcp` and `full_schema_when_forced` share a body
+    /// but answer different questions and may diverge.
+    #[test]
+    fn tier_exposure_policy_matrix() {
+        //                     tier,        mcp,   init,  agent, dflt,  forced, ondemand
+        let expected = [
+            (ToolTier::Full, true, true, true, true, true, false),
+            (ToolTier::Terse, true, true, true, false, true, false),
+            (ToolTier::OnDemand, true, false, false, false, false, true),
+            (ToolTier::AgentOnly, false, false, true, false, false, false),
+            (ToolTier::McpOnly, true, true, false, false, true, false),
+        ];
+
+        for (tier, mcp, init, agent, dflt, forced, ondemand) in expected {
+            assert_eq!(tier.defined_for_mcp(), mcp, "defined_for_mcp {tier:?}");
+            assert_eq!(
+                tier.exposed_initially_over_mcp(),
+                init,
+                "exposed_initially_over_mcp {tier:?}"
+            );
+            assert_eq!(tier.exposed_to_agent(), agent, "exposed_to_agent {tier:?}");
+            assert_eq!(
+                tier.full_schema_by_default(),
+                dflt,
+                "full_schema_by_default {tier:?}"
+            );
+            assert_eq!(
+                tier.full_schema_when_forced(),
+                forced,
+                "full_schema_when_forced {tier:?}"
+            );
+            assert_eq!(
+                tier.activated_on_demand(),
+                ondemand,
+                "activated_on_demand {tier:?}"
+            );
+        }
+    }
+
+    /// A tier that reaches neither catalog is almost certainly a mistake: the
+    /// tool would be defined and dispatchable but advertised nowhere.
+    #[test]
+    fn every_tier_reaches_at_least_one_catalog() {
+        for tier in [
+            ToolTier::Full,
+            ToolTier::Terse,
+            ToolTier::OnDemand,
+            ToolTier::AgentOnly,
+            ToolTier::McpOnly,
+        ] {
+            assert!(
+                tier.defined_for_mcp() || tier.exposed_to_agent(),
+                "{tier:?} is invisible to both MCP and the agent loop"
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::path::Path;
 use crate::ops;
 use crate::protocol::Response;
 use crate::session::Session;
-use crate::tools::{self, ToolTier};
+// Tier *policy* now lives entirely on `ToolTier` in `tools.rs` (#1113), so this
+// module no longer enumerates variants outside of its tests.
+use crate::tools;
 
 /// Provider-neutral tool schema — what the agent loop hands to the LLM.
 #[allow(dead_code)]
@@ -25,12 +27,7 @@ pub fn active_schemas(
 ) -> Vec<NeutralToolSchema> {
     tools::all_tools()
         .into_iter()
-        .filter(|t| {
-            matches!(
-                t.tier,
-                ToolTier::Full | ToolTier::Terse | ToolTier::AgentOnly
-            )
-        })
+        .filter(|t| t.tier.exposed_to_agent())
         .filter(|t| tools::passes_context_check(t.name, workspace))
         .map(|t| {
             let mut description = descriptions.full_or_name(t.name).to_string();
@@ -74,6 +71,7 @@ pub async fn invoke_with_progress(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::tools::ToolTier;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -189,6 +187,72 @@ mod tests {
                 exposed.contains(tool.name),
                 "{} is McpOnly but missing from the default MCP-exposed set",
                 tool.name
+            );
+        }
+    }
+
+    /// The mirror of the `McpOnly` pair above, for `AgentOnly` (#1113 test
+    /// plan). The two tiers are opposites, so each needs a guard in both
+    /// directions — otherwise a policy edit can silently swap them.
+    #[test]
+    fn agent_only_tools_reach_the_agent_but_not_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let advertised: Vec<String> = default_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let exposed = tools::initial_exposed_tools();
+        let mcp_names = tools::mcp_tool_names();
+
+        let agent_only: Vec<&str> = tools::all_tools()
+            .into_iter()
+            .filter(|t| t.tier == ToolTier::AgentOnly)
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !agent_only.is_empty(),
+            "no AgentOnly tools left; this test is now vacuous and should be removed"
+        );
+
+        for name in agent_only {
+            assert!(
+                advertised.contains(&name.to_string()),
+                "{name} is AgentOnly but was withheld from the agent catalog"
+            );
+            assert!(
+                !exposed.contains(name),
+                "{name} is AgentOnly but is in the default MCP-exposed set"
+            );
+            assert!(
+                !mcp_names.contains(&name),
+                "{name} is AgentOnly but appears in the MCP tool catalog"
+            );
+        }
+    }
+
+    /// A tool must not fall out of *both* catalogs. The #1112 regression was a
+    /// tool defined over MCP but never exposed; this asserts the general shape
+    /// so no tier can end up advertised nowhere (#1113 test plan).
+    #[test]
+    fn every_tool_is_advertised_somewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let advertised: Vec<String> = default_schemas(dir.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let exposed = tools::initial_exposed_tools();
+
+        for tool in tools::all_tools() {
+            // OnDemand is the one deliberate exception: withheld from both
+            // until `list_all_tools` activates it on the MCP side.
+            if tool.tier.activated_on_demand() {
+                continue;
+            }
+            assert!(
+                advertised.contains(&tool.name.to_string()) || exposed.contains(tool.name),
+                "{} ({:?}) is advertised to neither the agent nor MCP",
+                tool.name,
+                tool.tier
             );
         }
     }
