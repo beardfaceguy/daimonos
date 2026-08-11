@@ -39,6 +39,7 @@ CONTEXT_BYTE_FIELDS = [
     "tool_result_error_bytes",
     "image_bytes",
 ]
+BATCH_ADOPTION_MIN_ARGUMENT_BYTES = 700
 
 
 def read_lines(path):
@@ -118,6 +119,9 @@ def main(argv):
     is_error = True
     cost = None  # null = unknown (Cursor: comes from admin CSV later)
     context_estimates = []
+    execute_script_counts = []
+    execute_script_max_argument_bytes = []
+    execute_script_error_counts = []
     context_component_bytes = defaultdict(int)
     context_component_tokens = defaultdict(int)
     tool_loop_calls = 0
@@ -234,6 +238,20 @@ def main(argv):
                     if isinstance(value, (int, float)):
                         context_component_bytes[field] += value
                         context_component_tokens[field] += (int(value) + 3) // 4
+                for field, target in [
+                    ("execute_script_calls", execute_script_counts),
+                    (
+                        "execute_script_max_argument_bytes",
+                        execute_script_max_argument_bytes,
+                    ),
+                    (
+                        "execute_script_result_errors",
+                        execute_script_error_counts,
+                    ),
+                ]:
+                    value = context.get(field)
+                    if isinstance(value, (int, float)):
+                        target.append(int(value))
             calls += 1
             saw_line = True
         cost = m["cost"]  # OpenRouter path often reports 0; tokens are primary
@@ -314,6 +332,30 @@ def main(argv):
         "tool_loop_calls": tool_loop_calls,
         "final_calls": final_calls,
         "failed_calls": failed_calls,
+        "execute_script_calls": (
+            max(execute_script_counts) if execute_script_counts else None
+        ),
+        "max_execute_script_argument_bytes": (
+            max(execute_script_max_argument_bytes)
+            if execute_script_max_argument_bytes
+            else None
+        ),
+        "execute_script_result_errors": (
+            max(execute_script_error_counts)
+            if execute_script_error_counts
+            else None
+        ),
+        "batch_adopted": (
+            max(execute_script_max_argument_bytes)
+            >= BATCH_ADOPTION_MIN_ARGUMENT_BYTES
+            if execute_script_max_argument_bytes
+            else None
+        ),
+        "batch_adoption_min_argument_bytes": (
+            BATCH_ADOPTION_MIN_ARGUMENT_BYTES
+            if execute_script_max_argument_bytes
+            else None
+        ),
         "cost_usd": cost,
         "tool_calls": tool_calls,
         "llm_calls": llm_calls,

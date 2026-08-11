@@ -889,6 +889,161 @@
           "kind": "comparison"
         }
       ]
+    },
+    {
+      "id": "B0",
+      "parent": null,
+      "feature": "Current execute_script batch-adoption baseline",
+      "scope_fingerprint": "batch-adoption-02-03-07-v1|anthropic|claude-opus-4-8|medium|compaction-off|prompt-cache-off|fixture-600221c",
+      "task_set_fingerprint": "1c5984aebc8455d99fc222fcddacc70b9e5cec2124ed4cac8dcad991fdda52c7",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "02-search-usages",
+        "03-edit-rename",
+        "07-snapshot-rollback"
+      ],
+      "binary_sha256": "d5ad86f25829b6cff169426d9eb2fde48315e9abcdee6e80a570c7681bb3d796",
+      "git_commit": "2bb1c86d92444d64a51ce89b52e7209b3b0c987f",
+      "fixture_commit": "600221ccae548a57ac3c4542966431243bd43c6a",
+      "created_at": "2026-08-11T00:08:23Z",
+      "run_dirs": [
+        "20260810-170124-agent-1230-baseline-r1-task02",
+        "20260810-170458-agent-1230-baseline-r1-task03",
+        "20260810-170512-agent-1230-baseline-r1-task07",
+        "20260810-170531-agent-1230-baseline-r2-task02",
+        "20260810-170543-agent-1230-baseline-r2-task03",
+        "20260810-170559-agent-1230-baseline-r2-task07",
+        "20260810-170616-agent-1230-baseline-r3-task02",
+        "20260810-170625-agent-1230-baseline-r3-task03",
+        "20260810-170638-agent-1230-baseline-r3-task07"
+      ],
+      "metrics": {
+        "batch_adoption_rate": [
+          0.0,
+          "percent"
+        ],
+        "mean_llm_calls": [
+          4.6666666667,
+          "count"
+        ],
+        "mean_total_tokens": [
+          61303.0,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.3201905556,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          13000.0,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          9,
+          "count"
+        ],
+        "execute_script_error_runs": [
+          0,
+          "count"
+        ]
+      },
+      "report_path": "benchmarks/results/2026-08-10-batch-adoption-targeted.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-10-batch-adoption-targeted.md",
+          "sha256": "2363b8d5b2ea314a6c5392251b45ed0ded33567bb951179b22c6a36b31f19116",
+          "kind": "report"
+        }
+      ]
+    },
+    {
+      "id": "B1",
+      "parent": "B0",
+      "feature": "Restrict first generation to execute_script",
+      "scope_fingerprint": "batch-adoption-02-03-07-v1|anthropic|claude-opus-4-8|medium|compaction-off|prompt-cache-off|fixture-600221c",
+      "task_set_fingerprint": "1c5984aebc8455d99fc222fcddacc70b9e5cec2124ed4cac8dcad991fdda52c7",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "02-search-usages",
+        "03-edit-rename",
+        "07-snapshot-rollback"
+      ],
+      "binary_sha256": "60d42f79e0235c98b86947a3b68530b8ed329489b80b297f2e3bc5162f732b25",
+      "git_commit": "2bb1c86d92444d64a51ce89b52e7209b3b0c987f",
+      "fixture_commit": "600221ccae548a57ac3c4542966431243bd43c6a",
+      "created_at": "2026-08-11T02:15:13Z",
+      "run_dirs": [
+        "20260810-191129-agent-1230-script-first-r1-task02",
+        "20260810-191139-agent-1230-script-first-r1-task03",
+        "20260810-191155-agent-1230-script-first-r1-task07",
+        "20260810-191213-agent-1230-script-first-r2-task02",
+        "20260810-191225-agent-1230-script-first-r2-task03",
+        "20260810-191236-agent-1230-script-first-r2-task07",
+        "20260810-191254-agent-1230-script-first-r3-task02",
+        "20260810-191304-agent-1230-script-first-r3-task03",
+        "20260810-191320-agent-1230-script-first-r3-task07"
+      ],
+      "metrics": {
+        "batch_adoption_rate": [
+          0.0,
+          "percent"
+        ],
+        "mean_llm_calls": [
+          4.1111111111,
+          "count"
+        ],
+        "mean_total_tokens": [
+          47531.5555555556,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.2513377778,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          13222.2222222222,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          9,
+          "count"
+        ],
+        "execute_script_error_runs": [
+          0,
+          "count"
+        ]
+      },
+      "deltas": {
+        "immediate": {
+          "mean_llm_calls_pct": -11.9047619048,
+          "mean_total_tokens_pct": -22.4639153114,
+          "mean_cost_usd_pct": -21.5037077493,
+          "mean_wall_ms_pct": 1.7094017094,
+          "batch_adoption_rate_points": 0.0
+        },
+        "cumulative_from_B0": {
+          "mean_llm_calls_pct": -11.9047619048,
+          "mean_total_tokens_pct": -22.4639153114,
+          "mean_cost_usd_pct": -21.5037077493,
+          "mean_wall_ms_pct": 1.7094017094,
+          "batch_adoption_rate_points": 0.0
+        }
+      },
+      "notes": "Negative adoption result: first-call restriction caused small inspection scripts but no qualifying batched calls. Cost/token deltas are not attributed to adoption.",
+      "report_path": "benchmarks/results/2026-08-10-batch-adoption-targeted.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-10-batch-adoption-targeted.md",
+          "sha256": "894005c77bc8c844dd2e94078754e98b0430da52fe4989491191b158c61b9d42",
+          "kind": "report"
+        }
+      ]
     }
   ]
 }

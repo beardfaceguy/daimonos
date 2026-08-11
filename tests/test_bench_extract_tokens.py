@@ -165,6 +165,9 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
                 "system_bytes": 40,
                 "tool_schema_bytes": 80,
                 "tool_result_ok_bytes": 0,
+                "execute_script_calls": 0,
+                "execute_script_max_argument_bytes": 0,
+                "execute_script_result_errors": 0,
             },
         }),
         json.dumps({
@@ -179,6 +182,9 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
                 "system_bytes": 40,
                 "tool_schema_bytes": 80,
                 "tool_result_ok_bytes": 120,
+                "execute_script_calls": 1,
+                "execute_script_max_argument_bytes": 1100,
+                "execute_script_result_errors": 0,
             },
         }),
         # Legacy call line: usage still counts, context coverage does not.
@@ -213,6 +219,11 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
     assert s["tool_loop_calls"] == 1
     assert s["final_calls"] == 1
     assert s["failed_calls"] == 0
+    assert s["execute_script_calls"] == 1
+    assert s["max_execute_script_argument_bytes"] == 1100
+    assert s["execute_script_result_errors"] == 0
+    assert s["batch_adopted"] is True
+    assert s["batch_adoption_min_argument_bytes"] == 700
     assert s["context_component_bytes_total"] == {
         "system_bytes": 80,
         "tool_result_ok_bytes": 120,
