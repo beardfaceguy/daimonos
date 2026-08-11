@@ -161,6 +161,11 @@ struct GenerationLogMetadata<'a> {
 pub struct AgentConfig {
     pub system: Option<String>,
     pub tools: Vec<ToolSchema>,
+    /// Optional restricted tool set for the first provider generations of a
+    /// turn. `initial_tool_generations` controls how many successful provider
+    /// responses see this set; later generations regain `tools`.
+    pub initial_tools: Option<Vec<ToolSchema>>,
+    pub initial_tool_generations: usize,
     pub opts: CompleteOpts,
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
@@ -534,6 +539,65 @@ async fn record_agent_tool_output_savings(
     }
 }
 
+/// Record one agent-loop tool call in analytics (vikunja #1232).
+///
+/// Direct tool calls used to be invisible: only `script.rs` (as `script:*`) and
+/// `mcp_bridge.rs` wrote per-tool rows, so scripted work was counted while
+/// direct work was not. That gap is *biased* rather than merely incomplete — it
+/// makes an agent look as though it always batches, which is precisely the
+/// signal #1230 measures.
+///
+/// Mirrors `mcp::dispatch_tool` so the two frontends cannot drift: the row is
+/// keyed by the plain tool name and carries the same fields. Two callers are
+/// deliberately excluded, matching the MCP path:
+///
+/// - `execute_script`, which `handle_call_tool_request` returns early for
+///   before reaching `dispatch_tool`; its sandbox ops are recorded individually
+///   as `script:*`, and a parent row here would double-count them.
+/// - remote MCP tools (`mcp__…`), already recorded by the bridge.
+async fn record_agent_tool_call(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    tool_name: &str,
+    input: &Value,
+    outcome: &crate::observability::ToolOutcome,
+    exec_time_ms: u64,
+) {
+    if tool_name == EXECUTE_SCRIPT_TOOL || tool_name.starts_with(REMOTE_TOOL_PREFIX) {
+        return;
+    }
+    let (analytics, external_session_id) = {
+        let guard = session.lock().await;
+        (guard.analytics.clone(), guard.external_session_id.clone())
+    };
+    let Some(analytics) = analytics else {
+        return;
+    };
+    // `outcome` carries token estimates rather than the raw char counts
+    // `compute_savings` takes, so derive the percentage from the same two
+    // quantities it would have used: saved, and the pre-trim total.
+    let saved = outcome.saved_tokens_est.max(0);
+    let raw_tokens = outcome.response_tokens_est.saturating_add(saved as u64);
+    let savings_pct = if saved > 0 && raw_tokens > 0 {
+        saved as f64 / raw_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    analytics.record_async(crate::analytics::ToolCallRecord {
+        tool_name: tool_name.to_string(),
+        command: crate::mcp::analytics_command(tool_name, input),
+        request_tokens: outcome.request_tokens_est,
+        response_tokens: outcome.response_tokens_est,
+        saved_tokens: outcome.saved_tokens_est,
+        savings_pct,
+        exec_time_ms,
+        was_redirect: outcome.redirect,
+        was_filtered: outcome.filtered,
+        read_dedup: outcome.read_dedup,
+        batch_size: outcome.batch_size.min(u32::MAX as u64) as u32,
+        external_session_id,
+    });
+}
+
 /// Default cap on automatic continuations after a `max_tokens` stop within a
 /// single user turn. `0` keeps the historical behavior (return terminal
 /// `MaxTokens`); operators opt in via `DAIMONOS_AGENT_AUTO_CONTINUE` or
@@ -604,6 +668,7 @@ pub async fn run(
     // continuation; consumed each iteration so later non-continuation
     // generations in the same turn regain the caller's thinking level.
     let mut force_thinking_off = false;
+    let mut initial_tool_generations = config.initial_tool_generations;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -640,7 +705,14 @@ pub async fn run(
         let ctx = Context {
             messages: messages.clone(),
             system,
-            tools: config.tools.clone(),
+            tools: if initial_tool_generations > 0 {
+                config
+                    .initial_tools
+                    .clone()
+                    .unwrap_or_else(|| config.tools.clone())
+            } else {
+                config.tools.clone()
+            },
             stable_prefix_len: 0,
         };
         // On a continuation after a `max_tokens` stop, reissue with thinking
@@ -692,6 +764,7 @@ pub async fn run(
             }
         };
         generation.finish(&resp);
+        initial_tool_generations = initial_tool_generations.saturating_sub(1);
         // Two-phase notice delivery: only advance the watermark after a real
         // provider response consumed the notice. Provider Error/Aborted leaves
         // it pending so the next generation retries it (#1063/codeJung).
@@ -837,6 +910,9 @@ pub async fn run(
                         .as_ref()
                         .map(|_| &on_progress as &crate::ops::ExecProgressCallback<'_>);
                     let request_chars = serde_json::to_string(&input).map(|s| s.len()).unwrap_or(0);
+                    // Wall time for this call's analytics row (vikunja #1232),
+                    // matching what `mcp::dispatch_tool` measures on the MCP path.
+                    let tool_started = std::time::Instant::now();
                     // Native/opcode tools and the plan tool run through the
                     // facade; open a `tool.call` span around them so latency is
                     // measured. Remote MCP tools are spanned as `mcp.remote_tool`
@@ -1152,6 +1228,22 @@ pub async fn run(
                         outcome.filtered |= was_offloaded;
                     }
                     content = bounded.content;
+
+                    // Analytics row for this call (vikunja #1232). Emitted here,
+                    // after output-bounding has finalized `outcome`, so every
+                    // dispatch branch — facade, local MCP dispatch, plan tool,
+                    // remote — converges on one record and the numbers match
+                    // what the model actually saw.
+                    if let Some(outcome) = outcome.as_ref() {
+                        record_agent_tool_call(
+                            &session,
+                            &name,
+                            &input,
+                            outcome,
+                            tool_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                    }
 
                     if let Some(tool_span) = tool_span {
                         let status = if is_error {
@@ -2861,6 +2953,105 @@ mod tests {
         assert!(content.contains("full output saved to") || content.contains("full_output_path"));
     }
 
+    /// vikunja #1232: direct tool calls made in agent mode were never written
+    /// to analytics. Only `script.rs` (`script:*`) and `mcp_bridge.rs` recorded
+    /// per-tool rows, so scripted work was counted while direct work was
+    /// invisible — a *biased* gap that made agents look like they always batch
+    /// and produced a retracted adoption analysis on #1230.
+    #[tokio::test]
+    async fn agent_loop_records_direct_tool_calls_in_analytics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello analytics").unwrap();
+
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = session_in(dir.path());
+        session.analytics = Some(Arc::clone(&analytics));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp("c1", "read_file", json!({"path": "note.txt"})),
+            end_turn_resp(),
+        ]);
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("read the note")],
+            &AgentConfig {
+                tools: vec![ToolSchema {
+                    name: "read_file".into(),
+                    description: "read".into(),
+                    input_schema: json!({"type": "object"}),
+                }],
+                ..AgentConfig::default()
+            },
+        )
+        .await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+        assert!(
+            analytics
+                .wait_until_quiet(std::time::Duration::from_secs(2))
+                .await
+        );
+        let per_tool = analytics.session_summary().per_tool;
+        assert!(
+            per_tool.contains_key("read_file"),
+            "direct read_file call was not recorded; per_tool = {:?}",
+            per_tool.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// vikunja #1232 companion: instrumenting direct calls must not start
+    /// double-counting scripted ones. `script.rs` already records each sandbox
+    /// op as `script:*`, and the MCP path returns early for `execute_script`
+    /// before `dispatch_tool`, so the agent loop must not add a parent row.
+    #[tokio::test]
+    async fn agent_loop_does_not_double_count_execute_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello analytics").unwrap();
+
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = session_in(dir.path());
+        session.analytics = Some(Arc::clone(&analytics));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp(
+                "c1",
+                "execute_script",
+                json!({"code": "result = read_file(\"note.txt\")[\"content\"]"}),
+            ),
+            end_turn_resp(),
+        ]);
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("read via script")],
+            &AgentConfig::default(),
+        )
+        .await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+        assert!(
+            analytics
+                .wait_until_quiet(std::time::Duration::from_secs(2))
+                .await
+        );
+        let per_tool = analytics.session_summary().per_tool;
+        assert!(
+            per_tool.contains_key("script:read_file"),
+            "sandbox op should still be recorded; per_tool = {:?}",
+            per_tool.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !per_tool.contains_key("execute_script"),
+            "execute_script must not get a parent row; per_tool = {:?}",
+            per_tool.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn execute_script_runs_in_the_agent_loop() {
         // vikunja #1050 phase (a): execute_script is now dispatchable inside
@@ -4144,6 +4335,86 @@ mod tests {
         let assistant = &result.messages[1];
         assert_eq!(assistant.content.len(), 2);
         assert!(matches!(&assistant.content[0], ContentBlock::Thinking(t) if t == "my reasoning"));
+    }
+
+    #[tokio::test]
+    async fn initial_tool_restriction_restores_full_catalog_after_configured_generations() {
+        struct ToolRecordingProvider {
+            calls: Arc<Mutex<Vec<Vec<String>>>>,
+            responses: Mutex<VecDeque<LlmResponse>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for ToolRecordingProvider {
+            async fn complete(&self, context: &Context, _: &CompleteOpts) -> LlmResponse {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(context.tools.iter().map(|tool| tool.name.clone()).collect());
+                self.responses.lock().unwrap().pop_front().unwrap()
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = ToolRecordingProvider {
+            calls: Arc::clone(&calls),
+            responses: Mutex::new(VecDeque::from(vec![
+                LlmResponse {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "script".into(),
+                        name: "execute_script".into(),
+                        input: serde_json::json!({"code":"result = \"ok\""}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error_message: None,
+                    context_overflow: false,
+                },
+                LlmResponse {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "script-2".into(),
+                        name: "execute_script".into(),
+                        input: serde_json::json!({"code":"result = \"ok\""}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error_message: None,
+                    context_overflow: false,
+                },
+                end_turn_resp(),
+            ])),
+        };
+        let execute_script = ToolSchema {
+            name: "execute_script".into(),
+            description: "batch".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        };
+        let read_file = ToolSchema {
+            name: "read_file".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            tools: vec![read_file, execute_script.clone()],
+            initial_tools: Some(vec![execute_script]),
+            initial_tool_generations: 2,
+            ..AgentConfig::default()
+        };
+
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("work")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], vec!["execute_script"]);
+        assert_eq!(calls[1], vec!["execute_script"]);
+        assert_eq!(calls[2], vec!["read_file", "execute_script"]);
     }
 
     // --- context compaction (ADR-002, vikunja #962) ---

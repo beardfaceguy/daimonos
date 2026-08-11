@@ -22,11 +22,6 @@ reason = "No fix available; transitively pulled by notify crate."
 id = "RUSTSEC-2024-0436"
 reason = "No fix available; proc-macro only, not present in final binary."
 
-# lru 0.12.5 (via ratatui 0.29 layout cache): fix is in lru 0.16.3, which is
-# outside ratatui's `lru = "0.12"` requirement, so it is unreachable without
-# dropping the ADR-011-mandated TUI stack. Low severity (CVSS 2.7); the cache
-# keys are internal layout geometry, not attacker-controlled. Revisit when
-# ratatui bumps its lru dependency.
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0002"
-reason = "No reachable fix; transitively pulled by ratatui 0.29, low severity, internal layout-cache keys only."
+# (RUSTSEC-2026-0002 / RUSTSEC-2026-0253, lru: removed 2026-08-11. The ratatui
+# 0.30 upgrade moved the layout cache onto lru 0.18.2, which carries the fix for
+# both advisories, so neither needs suppressing — see vikunja #1226.)

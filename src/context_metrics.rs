@@ -1,5 +1,7 @@
 //! Metadata-only context composition measurement for agent generations.
 
+use std::collections::HashSet;
+
 use crate::providers::{ContentBlock, Context, Role};
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -16,6 +18,10 @@ pub struct ContextComposition {
     pub thinking_bytes: usize,
     pub provider_state_bytes: usize,
     pub tool_call_argument_bytes: usize,
+    pub execute_script_calls: usize,
+    pub execute_script_argument_bytes: usize,
+    pub execute_script_max_argument_bytes: usize,
+    pub execute_script_result_errors: usize,
     pub tool_result_ok_bytes: usize,
     pub tool_result_error_bytes: usize,
     /// Base64-encoded payload bytes, matching what the provider request carries.
@@ -58,6 +64,7 @@ pub fn measure_context(context: &Context) -> ContextComposition {
         system_bytes: context.system.as_ref().map_or(0, String::len),
         ..ContextComposition::default()
     };
+    let mut execute_script_ids = HashSet::new();
 
     for tool in &context.tools {
         composition.tool_name_bytes = composition.tool_name_bytes.saturating_add(tool.name.len());
@@ -100,16 +107,29 @@ pub fn measure_context(context: &Context) -> ContextComposition {
                                 .unwrap_or(0),
                         );
                 }
-                ContentBlock::ToolCall { input, .. } => {
-                    composition.tool_call_argument_bytes =
-                        composition.tool_call_argument_bytes.saturating_add(
-                            serde_json::to_vec(input)
-                                .map(|serialized| serialized.len())
-                                .unwrap_or(0),
-                        );
+                ContentBlock::ToolCall { id, name, input } => {
+                    let argument_bytes = serde_json::to_vec(input)
+                        .map(|serialized| serialized.len())
+                        .unwrap_or(0);
+                    composition.tool_call_argument_bytes = composition
+                        .tool_call_argument_bytes
+                        .saturating_add(argument_bytes);
+                    if name == "execute_script" {
+                        execute_script_ids.insert(id.as_str());
+                        composition.execute_script_calls =
+                            composition.execute_script_calls.saturating_add(1);
+                        composition.execute_script_argument_bytes = composition
+                            .execute_script_argument_bytes
+                            .saturating_add(argument_bytes);
+                        composition.execute_script_max_argument_bytes = composition
+                            .execute_script_max_argument_bytes
+                            .max(argument_bytes);
+                    }
                 }
                 ContentBlock::ToolResult {
-                    content, is_error, ..
+                    tool_use_id,
+                    content,
+                    is_error,
                 } => {
                     let target = if *is_error {
                         &mut composition.tool_result_error_bytes
@@ -117,6 +137,10 @@ pub fn measure_context(context: &Context) -> ContextComposition {
                         &mut composition.tool_result_ok_bytes
                     };
                     *target = target.saturating_add(content.len());
+                    if *is_error && execute_script_ids.contains(tool_use_id.as_str()) {
+                        composition.execute_script_result_errors =
+                            composition.execute_script_result_errors.saturating_add(1);
+                    }
                 }
             }
         }
@@ -224,5 +248,47 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn composition_reports_execute_script_adoption_without_script_content() {
+        let input = json!({"script":"SCRIPT_SECRET"});
+        let argument_bytes = serde_json::to_vec(&input).unwrap().len();
+        let context = Context {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "script-call".into(),
+                        name: "execute_script".into(),
+                        input,
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "script-call".into(),
+                        content: "failed".into(),
+                        is_error: true,
+                    }],
+                },
+            ],
+            system: None,
+            tools: Vec::new(),
+            stable_prefix_len: 0,
+        };
+
+        let composition = measure_context(&context);
+
+        assert_eq!(composition.execute_script_calls, 1);
+        assert_eq!(composition.execute_script_argument_bytes, argument_bytes);
+        assert_eq!(
+            composition.execute_script_max_argument_bytes,
+            argument_bytes
+        );
+        assert_eq!(composition.execute_script_result_errors, 1);
+        assert!(!serde_json::to_string(&composition)
+            .unwrap()
+            .contains("SCRIPT_SECRET"));
     }
 }
