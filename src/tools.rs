@@ -110,10 +110,30 @@ impl ToolTier {
 
     /// In the catalog handed to the built-in agent/chat/ACP loop.
     ///
-    /// `OnDemand` is excluded and, unlike the MCP path, there is currently no
-    /// activation mechanism on the agent side — `AgentConfig::tools` is fixed
-    /// for the run. So an `OnDemand` tool is unreachable from the agent loop,
-    /// not merely deferred. See the #1113 note before changing this.
+    /// `OnDemand` is excluded, and unlike the MCP path there is no activation
+    /// mechanism on the agent side — `AgentConfig::tools` is fixed for the run.
+    /// An `OnDemand` tool is therefore unreachable from the agent loop, not
+    /// merely deferred.
+    ///
+    /// **Settled (#1284, 2026-08-11): this is intentional, not a gap.** Two
+    /// alternatives were considered and rejected:
+    ///
+    /// - *Grow `AgentConfig::tools` mid-run to mirror MCP activation.* The tool
+    ///   list is part of the cached prompt prefix, so growing it invalidates the
+    ///   cache and costs tokens on every subsequent call. `execute_script`
+    ///   already supersedes `tool_pipeline` and `tool_repair` for the agent, the
+    ///   same way it supersedes `batch`, so the capability gained is close to
+    ///   nil. `diff_files` is the only real gap, and `exec` covers it.
+    /// - *Re-tier `list_tool_signatures` so the agent can call it.* Its
+    ///   signatures are already inlined into `execute_script`'s description by
+    ///   `tool_facade::active_schemas`, which is strictly better: inline content
+    ///   is free, a tool call costs a round-trip. #1230 measured that directly —
+    ///   exposing it as a callable tool regressed task 03 to 10 calls.
+    ///
+    /// The invariant to preserve is that the agent's catalog and its callable
+    /// set are the same, which `agent::append_remote_tools_to_catalog` enforces.
+    /// Give the agent capability through *description content*, not through
+    /// mid-run tool activation.
     pub fn exposed_to_agent(self) -> bool {
         match self {
             Self::Full | Self::Terse | Self::AgentOnly => true,
@@ -140,6 +160,9 @@ impl ToolTier {
     }
 
     /// Withheld from initial MCP exposure until `list_all_tools` activates it.
+    ///
+    /// Lazy exposure is an **MCP-side mechanism only**; it has no agent-side
+    /// meaning (#1284). See [`Self::exposed_to_agent`].
     pub fn activated_on_demand(self) -> bool {
         match self {
             Self::OnDemand => true,
