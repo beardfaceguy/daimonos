@@ -250,11 +250,40 @@ fn retry_error_type(result: &AgentResult) -> Option<&'static str> {
     }
 }
 
+/// Reconcile a `list_all_tools` catalog with what the agent can actually call.
+///
+/// `list_all_tools` is served from the **MCP** catalog — `tool_definitions`,
+/// i.e. every tier that is `defined_for_mcp` — but the agent's own tool list is
+/// `exposed_to_agent`. Those sets differ, and reporting the difference tells the
+/// model about tools it cannot use (vikunja #1284):
+///
+/// - `McpOnly` (`batch`) is intercepted in the MCP request handler and has no
+///   agent-side implementation, so it fails on every call. This is precisely the
+///   defect #1112 fixed for the schema list, arriving through the catalog.
+/// - `OnDemand` tools are dispatchable but carry no schema the model can call,
+///   and there is no agent-side activation path (see `ToolTier::exposed_to_agent`).
+///
+/// Remote MCP bridge tools are not in the local registry and are always kept —
+/// they are real entries in `config.tools`, which is what makes them callable.
 fn append_remote_tools_to_catalog(content: String, tools: &[ToolSchema]) -> String {
-    let Ok(Value::Array(mut entries)) = serde_json::from_str(&content) else {
+    let Ok(Value::Array(entries)) = serde_json::from_str(&content) else {
         eprintln!("agent: list_all_tools returned a non-array catalog; remote tools omitted");
         return content;
     };
+    let mut entries: Vec<Value> = entries
+        .into_iter()
+        .filter(|entry| {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            match crate::tools::all_tools().iter().find(|t| t.name == name) {
+                Some(tool) => tool.tier.exposed_to_agent(),
+                // Not a local registry tool (e.g. an already-listed remote
+                // tool): the registry has no opinion, so keep it.
+                None => true,
+            }
+        })
+        .collect();
     let mut names: std::collections::HashSet<String> = entries
         .iter()
         .filter_map(|entry| entry.get("name")?.as_str().map(str::to_string))
@@ -3556,6 +3585,49 @@ mod tests {
     fn content_falls_back_to_message() {
         let resp = Response::err(3, "tool failed");
         assert_eq!(response_to_content(resp), "tool failed");
+    }
+
+    /// vikunja #1284: `list_all_tools` is served from the *MCP* catalog
+    /// (`tool_definitions`, i.e. everything `defined_for_mcp`), but the agent's
+    /// own tool list is `exposed_to_agent`. Reporting the difference tells the
+    /// model about tools it cannot call — `batch` in particular is intercepted
+    /// in the MCP request handler and has no agent-side implementation at all,
+    /// so it fails on every call. That is the #1112 defect arriving through the
+    /// catalog instead of the schema list.
+    #[test]
+    fn list_all_tools_catalog_omits_tools_the_agent_cannot_call() {
+        let native = serde_json::to_string(
+            &crate::tools::all_tools()
+                .iter()
+                .filter(|t| t.tier.defined_for_mcp())
+                .map(|t| serde_json::json!({"name": t.name, "description": "d"}))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let catalog = append_remote_tools_to_catalog(native, &[]);
+        let entries: Vec<Value> = serde_json::from_str(&catalog).unwrap();
+        let listed: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
+
+        let unreachable: Vec<&str> = crate::tools::all_tools()
+            .iter()
+            .filter(|t| !t.tier.exposed_to_agent())
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !unreachable.is_empty(),
+            "no agent-unreachable tiers left; this test is now vacuous"
+        );
+
+        for name in unreachable {
+            assert!(
+                !listed.contains(&name),
+                "{name} is not exposed to the agent but was listed in its catalog"
+            );
+        }
+        // The reachable ones must survive the filter.
+        assert!(listed.contains(&"read_file"));
+        assert!(listed.contains(&"execute_script"));
     }
 
     #[test]
