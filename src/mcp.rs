@@ -256,7 +256,10 @@ async fn bound_call_tool_result(
     stats
 }
 
-fn analytics_command(name: &str, args: &Value) -> Option<String> {
+/// Extract the analytics `command` sub-field for a tool call. Shared with the
+/// agent loop (`agent::record_agent_tool_call`, vikunja #1232) so both
+/// frontends label rows identically.
+pub(crate) fn analytics_command(name: &str, args: &Value) -> Option<String> {
     match name {
         "exec" | "git" | "cargo" | "gh" | "docker" => tools::get_str(args, "command"),
         "kgl_query" => tools::get_str(args, "query"),
