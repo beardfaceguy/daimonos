@@ -161,11 +161,6 @@ struct GenerationLogMetadata<'a> {
 pub struct AgentConfig {
     pub system: Option<String>,
     pub tools: Vec<ToolSchema>,
-    /// Optional restricted tool set for the first provider generations of a
-    /// turn. `initial_tool_generations` controls how many successful provider
-    /// responses see this set; later generations regain `tools`.
-    pub initial_tools: Option<Vec<ToolSchema>>,
-    pub initial_tool_generations: usize,
     pub opts: CompleteOpts,
     pub before_tool_call: Option<BeforeHook>,
     pub after_tool_call: Option<AfterHook>,
@@ -668,7 +663,6 @@ pub async fn run(
     // continuation; consumed each iteration so later non-continuation
     // generations in the same turn regain the caller's thinking level.
     let mut force_thinking_off = false;
-    let mut initial_tool_generations = config.initial_tool_generations;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -705,14 +699,7 @@ pub async fn run(
         let ctx = Context {
             messages: messages.clone(),
             system,
-            tools: if initial_tool_generations > 0 {
-                config
-                    .initial_tools
-                    .clone()
-                    .unwrap_or_else(|| config.tools.clone())
-            } else {
-                config.tools.clone()
-            },
+            tools: config.tools.clone(),
             stable_prefix_len: 0,
         };
         // On a continuation after a `max_tokens` stop, reissue with thinking
@@ -764,7 +751,6 @@ pub async fn run(
             }
         };
         generation.finish(&resp);
-        initial_tool_generations = initial_tool_generations.saturating_sub(1);
         // Two-phase notice delivery: only advance the watermark after a real
         // provider response consumed the notice. Provider Error/Aborted leaves
         // it pending so the next generation retries it (#1063/codeJung).
@@ -4335,86 +4321,6 @@ mod tests {
         let assistant = &result.messages[1];
         assert_eq!(assistant.content.len(), 2);
         assert!(matches!(&assistant.content[0], ContentBlock::Thinking(t) if t == "my reasoning"));
-    }
-
-    #[tokio::test]
-    async fn initial_tool_restriction_restores_full_catalog_after_configured_generations() {
-        struct ToolRecordingProvider {
-            calls: Arc<Mutex<Vec<Vec<String>>>>,
-            responses: Mutex<VecDeque<LlmResponse>>,
-        }
-
-        #[async_trait]
-        impl LlmProvider for ToolRecordingProvider {
-            async fn complete(&self, context: &Context, _: &CompleteOpts) -> LlmResponse {
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .push(context.tools.iter().map(|tool| tool.name.clone()).collect());
-                self.responses.lock().unwrap().pop_front().unwrap()
-            }
-        }
-
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = ToolRecordingProvider {
-            calls: Arc::clone(&calls),
-            responses: Mutex::new(VecDeque::from(vec![
-                LlmResponse {
-                    content: vec![ContentBlock::ToolCall {
-                        id: "script".into(),
-                        name: "execute_script".into(),
-                        input: serde_json::json!({"code":"result = \"ok\""}),
-                    }],
-                    stop_reason: StopReason::ToolUse,
-                    usage: Usage::default(),
-                    error_message: None,
-                    context_overflow: false,
-                },
-                LlmResponse {
-                    content: vec![ContentBlock::ToolCall {
-                        id: "script-2".into(),
-                        name: "execute_script".into(),
-                        input: serde_json::json!({"code":"result = \"ok\""}),
-                    }],
-                    stop_reason: StopReason::ToolUse,
-                    usage: Usage::default(),
-                    error_message: None,
-                    context_overflow: false,
-                },
-                end_turn_resp(),
-            ])),
-        };
-        let execute_script = ToolSchema {
-            name: "execute_script".into(),
-            description: "batch".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-        };
-        let read_file = ToolSchema {
-            name: "read_file".into(),
-            description: "read".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let config = AgentConfig {
-            tools: vec![read_file, execute_script.clone()],
-            initial_tools: Some(vec![execute_script]),
-            initial_tool_generations: 2,
-            ..AgentConfig::default()
-        };
-
-        let result = run(
-            &provider,
-            shared(session_in(dir.path())),
-            vec![Message::user("work")],
-            &config,
-        )
-        .await;
-
-        assert_eq!(result.stop_reason, StopReason::EndTurn);
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls[0], vec!["execute_script"]);
-        assert_eq!(calls[1], vec!["execute_script"]);
-        assert_eq!(calls[2], vec!["read_file", "execute_script"]);
     }
 
     // --- context compaction (ADR-002, vikunja #962) ---

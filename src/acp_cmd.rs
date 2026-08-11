@@ -1431,8 +1431,6 @@ fn build_agent_config(
     AgentConfig {
         system: Some(system_prompt),
         tools,
-        initial_tools: None,
-        initial_tool_generations: 0,
         opts: CompleteOpts {
             model,
             thinking,

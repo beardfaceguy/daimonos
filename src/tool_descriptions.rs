@@ -23,7 +23,6 @@ pub(crate) const MCP_PARAMETER_DESCRIPTION_COUNT: usize =
 struct DescriptionEntry {
     full: Option<String>,
     terse: Option<String>,
-    batch_first: Option<String>,
     parameters: HashMap<String, String>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
@@ -50,10 +49,6 @@ impl ToolDescriptions {
 
     pub fn terse(&self, name: &str) -> Option<&str> {
         self.entries.get(name)?.terse.as_deref()
-    }
-
-    pub fn batch_first(&self, name: &str) -> Option<&str> {
-        self.entries.get(name)?.batch_first.as_deref()
     }
 
     #[cfg(test)]
@@ -153,12 +148,6 @@ impl ToolDescriptions {
             }
             merge_value(&name, "full", &mut default.full, entry.full);
             merge_value(&name, "terse", &mut default.terse, entry.terse);
-            merge_value(
-                &name,
-                "batch_first",
-                &mut default.batch_first,
-                entry.batch_first,
-            );
             for (parameter, value) in entry.parameters {
                 let Some(target) = default.parameters.get_mut(&parameter) else {
                     eprintln!(
@@ -257,18 +246,6 @@ mod tests {
         assert!(description.contains("top-level `for`"));
         assert!(description.contains("def main()"));
         assert!(description.contains("list_tool_signatures"));
-    }
-
-    #[test]
-    fn execute_script_has_a_batch_first_description() {
-        let catalog = ToolDescriptions::default();
-        let description = catalog
-            .batch_first("execute_script")
-            .expect("execute_script batch-first description");
-
-        assert!(description.contains("one invocation"));
-        assert!(description.contains("inspect"));
-        assert!(description.contains("verify"));
     }
 
     #[tokio::test]

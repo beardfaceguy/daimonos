@@ -56,7 +56,6 @@ tools = "Tool name(s)"
 [execute_script]
 full = """Run a Starlark script with all tools as built-in functions. Starlark is Python-like, not Python: there is no `import`, and top-level `for`, `while`, `if`, and `try` statements are rejected. Put control flow inside `def main(): ...` and finish with `result = main()`. Use `list_tool_signatures` before unfamiliar calls for the exact built-in signatures. Intermediate results stay in the sandbox; only the `result` variable is returned, making one script much cheaper than sequential tool calls."""
 terse = """Run Starlark (no `import` or top-level `for`/control flow); use `def main()` and `result = main()`. Tools are built-ins; see `list_tool_signatures`."""
-batch_first = """Complete the requested inspect, mutate, verify, and cleanup workflow in one invocation whenever its operations can be sequenced in Starlark. Do not spend this invocation only inspecting and defer obvious follow-up work. Keep intermediate results in variables, put control flow inside `def main():`, perform every requested operation, and return compact verification evidence through `result`. Starlark is Python-like, not Python: no imports or top-level control flow. Use the built-in tool functions directly, and only the exact names and signatures listed below; never guess or invent a built-in name."""
 
 [execute_script.parameters]
 code = "Starlark source (not Python): no imports or top-level control flow. Set `result`; wrap loops/conditionals in a function."
