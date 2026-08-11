@@ -396,6 +396,24 @@ fn normalize_string_literals(code: &str) -> String {
     out
 }
 
+/// Recover Python-shaped scripts that put control flow at module scope.
+///
+/// Standard Starlark rejects top-level `for`/`if` statements, but models
+/// routinely emit them despite prompt guidance. Wrap only after that specific
+/// parser error so valid scripts and unrelated syntax errors retain their
+/// original semantics and diagnostics.
+fn wrap_top_level_control_flow(code: &str) -> String {
+    let mut wrapped = String::with_capacity(code.len() + 64);
+    wrapped.push_str("def __daimonos_main__():\n");
+    for line in code.lines() {
+        wrapped.push_str("    ");
+        wrapped.push_str(line);
+        wrapped.push('\n');
+    }
+    wrapped.push_str("    return result\nresult = __daimonos_main__()\n");
+    wrapped
+}
+
 fn run_starlark(
     code: &str,
     session: Arc<Mutex<Session>>,
@@ -405,8 +423,18 @@ fn run_starlark(
     subcall: Option<SubcallEnv>,
 ) -> Result<ScriptResult, String> {
     let code = normalize_string_literals(code);
-    let ast = AstModule::parse("script", code, &Dialect::Standard)
-        .map_err(|e| format!("parse error: {e}"))?;
+    let ast = match AstModule::parse("script", code.clone(), &Dialect::Standard) {
+        Ok(ast) => ast,
+        Err(error) if error.to_string().contains("cannot be used outside `def`") => {
+            AstModule::parse(
+                "script",
+                wrap_top_level_control_flow(&code),
+                &Dialect::Standard,
+            )
+            .map_err(|retry_error| format!("parse error: {retry_error}"))?
+        }
+        Err(error) => return Err(format!("parse error: {error}")),
+    };
 
     let globals = build_globals(session, handle, cancel, op_count, subcall);
     let module = Module::new();
@@ -1644,6 +1672,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn execute_normalizes_model_generated_top_level_control_flow() {
+        let session = test_session();
+        let code = r#"values = []
+for value in range(3):
+    values.append(value)
+result = values"#;
+
+        let result = execute(code, session, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(result.value, serde_json::json!([0, 1, 2]));
     }
 
     #[tokio::test]
