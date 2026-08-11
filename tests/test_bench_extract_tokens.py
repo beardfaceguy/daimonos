@@ -160,6 +160,8 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
             "cache_write": 1,
             "cache_read": 2,
             "stop_reason": "tool_use",
+            "script_ops_total": 0,
+            "script_ops_max": 0,
             "context": {
                 "payload_tokens_est": 100,
                 "system_bytes": 40,
@@ -177,6 +179,8 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
             "cache_write": 0,
             "cache_read": 4,
             "stop_reason": "end_turn",
+            "script_ops_total": 3,
+            "script_ops_max": 3,
             "context": {
                 "payload_tokens_est": 150,
                 "system_bytes": 40,
@@ -222,8 +226,13 @@ def test_daimonos_aggregates_additive_context_composition(tmp_path):
     assert s["execute_script_calls"] == 1
     assert s["max_execute_script_argument_bytes"] == 1100
     assert s["execute_script_result_errors"] == 0
+    # Adoption is now ops-based (#1230): one script dispatched 3 ops.
+    assert s["max_script_ops"] == 3
+    assert s["script_ops_total"] == 3
     assert s["batch_adopted"] is True
-    assert s["batch_adoption_min_argument_bytes"] == 700
+    assert s["batch_adoption_min_script_ops"] == 2
+    # The byte figure survives only as a diagnostic.
+    assert s["batch_adopted_by_argument_bytes"] is True
     assert s["context_component_bytes_total"] == {
         "system_bytes": 80,
         "tool_result_ok_bytes": 120,
