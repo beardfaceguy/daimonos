@@ -153,6 +153,31 @@ struct GenerationLogMetadata<'a> {
     stop_reason: &'a StopReason,
     response_tool_calls: usize,
     context: &'a crate::context_metrics::ContextComposition,
+    /// Tool ops dispatched inside `execute_script` so far this run, summed
+    /// across every script. Run state, not context state — deliberately not on
+    /// `ContextComposition`, which is contractually derived from `Context`
+    /// alone (vikunja #1230).
+    script_ops_total: usize,
+    /// Ops dispatched by the *largest single* script so far. This is the batch
+    /// adoption discriminator: see [`is_batch_adoption`].
+    script_ops_max: usize,
+}
+
+/// Did this run batch? Measured by ops collapsed into one round-trip, not by
+/// script size (vikunja #1230).
+///
+/// A 1-op script is **not** adoption — it is a single tool call in a costume,
+/// which is what forcing `execute_script` produced in the B1 arm (a 71-byte
+/// inspection script) and what a byte threshold cannot distinguish from real
+/// multi-op work. Two or more ops in one script means N round-trips became 1,
+/// which is the cost lever this task exists to move.
+///
+/// Deliberately not a size test: the verified-optimal solution to bench task 03
+/// serializes to ~250-550 bytes and would score zero against the old 700-byte
+/// threshold, while a 1701-byte forced script that errored twice would score as
+/// adoption. Size rewards verbosity; op count measures the lever.
+pub fn is_batch_adoption(script_ops_max: usize) -> bool {
+    script_ops_max >= 2
 }
 
 // --- Config and Result ---
@@ -329,6 +354,10 @@ fn token_log_line(
         line["ordinal"] = serde_json::json!(metadata.ordinal);
         line["stop_reason"] = serde_json::json!(metadata.stop_reason.as_str());
         line["response_tool_calls"] = serde_json::json!(metadata.response_tool_calls);
+        // Batch-adoption signal (#1230): ops collapsed into a single script,
+        // which is the lever. Counts only — no script source, per ADR-006 D6.
+        line["script_ops_total"] = serde_json::json!(metadata.script_ops_total);
+        line["script_ops_max"] = serde_json::json!(metadata.script_ops_max);
         line["context"] = serde_json::to_value(metadata.context).unwrap_or(serde_json::Value::Null);
     }
     line.to_string()
@@ -692,6 +721,12 @@ pub async fn run(
     // continuation; consumed each iteration so later non-continuation
     // generations in the same turn regain the caller's thinking level.
     let mut force_thinking_off = false;
+    // Batch-adoption accounting (#1230). `script_ops_max` — the ops dispatched
+    // by the largest single script — is the discriminator: >= 2 means a script
+    // collapsed N round-trips into 1. Accumulated across the run so each token
+    // log line carries the totals as of that generation.
+    let mut script_ops_total = 0usize;
+    let mut script_ops_max = 0usize;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -806,6 +841,8 @@ pub async fn run(
                     stop_reason: &resp.stop_reason,
                     response_tool_calls,
                     context: &context_composition,
+                    script_ops_total,
+                    script_ops_max,
                 }),
             );
         }
@@ -1031,6 +1068,13 @@ pub async fn run(
                             batch_size: op_count.load(std::sync::atomic::Ordering::Relaxed) as u64,
                             ..ToolOutcome::default()
                         };
+                        // Batch-adoption accounting (#1230). Read after the run
+                        // so a script that errored mid-way still contributes the
+                        // ops it completed — a partially-successful batch is
+                        // still evidence the model attempted one.
+                        let ops = op_count.load(std::sync::atomic::Ordering::Relaxed);
+                        script_ops_total = script_ops_total.saturating_add(ops);
+                        script_ops_max = script_ops_max.max(ops);
                         (content, is_error, Some(outcome))
                     } else if name == UPDATE_PLAN_TOOL {
                         let (content, is_error) = match parse_plan_entries(&input) {
@@ -1737,6 +1781,9 @@ impl AgentSession {
                             stop_reason: &resp.stop_reason,
                             response_tool_calls: 0,
                             context: &context_composition,
+                            // Compaction issues no tool calls, so no script ops.
+                            script_ops_total: 0,
+                            script_ops_max: 0,
                         }),
                     );
                 }
@@ -3337,6 +3384,153 @@ mod tests {
 
     // --- token_log (vikunja: --debug-tokens) ---
 
+    /// vikunja #1230: batch adoption is measured by how many tool ops a single
+    /// script dispatched, not by how many bytes the script was.
+    ///
+    /// Script *size* was a proxy for "did real multi-op work happen", and a bad
+    /// one: the verified-optimal solution to bench task 03 (read, string
+    /// replace, write, cargo test) serializes to ~250-550 bytes and scored zero
+    /// against the 700-byte threshold, while a forced pilot that produced a
+    /// 1701-byte script scored as adoption despite erroring twice. The proxy
+    /// rewarded verbosity; ops-per-script measures the lever directly.
+    ///
+    /// `op_count` is already tracked (`agent.rs` execute_script branch, feeding
+    /// `ToolOutcome::batch_size` per ADR-006 D5) — it just never reached the
+    /// token log the benchmark reads.
+    #[test]
+    fn token_log_line_reports_script_ops_for_batch_adoption() {
+        let composition = crate::context_metrics::ContextComposition::default();
+        let metadata = GenerationLogMetadata {
+            kind: "agent",
+            ordinal: 2,
+            stop_reason: &StopReason::ToolUse,
+            response_tool_calls: 1,
+            context: &composition,
+            script_ops_total: 5,
+            script_ops_max: 3,
+        };
+
+        let line = token_log_line("agent", "m", &Usage::default(), Some(&metadata));
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(parsed["script_ops_total"], 5);
+        assert_eq!(parsed["script_ops_max"], 3);
+    }
+
+    /// End-to-end: a real script dispatching two ops must show up as adoption in
+    /// the token log the benchmark reads (#1230). The unit tests above only pin
+    /// the log shape and the rule; this proves the counter is actually wired to
+    /// `op_count` in the dispatch path.
+    #[tokio::test]
+    async fn run_records_script_ops_from_a_real_multi_op_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+        let log = dir.path().join("tokens.jsonl");
+
+        // Two dispatched ops inside one script — the batching case.
+        let code = r#"result = read_file("a.txt")["content"] + read_file("b.txt")["content"]"#;
+        let provider = MockProvider::new(vec![
+            tool_call_resp("c1", "execute_script", json!({"code": code})),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            token_log: Some(TokenLogConfig {
+                path: log.clone(),
+                label: "agent".into(),
+            }),
+            ..AgentConfig::default()
+        };
+
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("concat")],
+            &config,
+        )
+        .await;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let last = lines.last().expect("at least one token log line");
+
+        assert_eq!(last["script_ops_max"], 2, "two reads in one script");
+        assert_eq!(last["script_ops_total"], 2);
+        assert!(is_batch_adoption(
+            last["script_ops_max"].as_u64().unwrap() as usize
+        ));
+    }
+
+    /// The discriminating case, and the reason the byte threshold was wrong: a
+    /// script that dispatches a single op is not batching. This is exactly what
+    /// the #1230 B1 arm produced — forced to use `execute_script` for its first
+    /// generation, the model emitted a 71-byte script that did one read, then
+    /// reverted to sequential tool calls once the full catalog returned.
+    #[tokio::test]
+    async fn a_single_op_script_is_not_batch_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let log = dir.path().join("tokens.jsonl");
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp(
+                "c1",
+                "execute_script",
+                json!({"code": r#"result = read_file("a.txt")["content"]"#}),
+            ),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            token_log: Some(TokenLogConfig {
+                path: log.clone(),
+                label: "agent".into(),
+            }),
+            ..AgentConfig::default()
+        };
+        run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("peek")],
+            &config,
+        )
+        .await;
+
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(last["script_ops_max"], 1);
+        assert!(
+            !is_batch_adoption(last["script_ops_max"].as_u64().unwrap() as usize),
+            "a one-op script is a single tool call in a costume, not a batch"
+        );
+    }
+
+    /// The classification rule itself. A 1-op script is *not* batch adoption —
+    /// it is a single tool call in a costume, which is exactly what the #1230
+    /// B1 arm produced (a 71-byte inspection script) and what the byte
+    /// threshold could not distinguish from a real batch.
+    #[test]
+    fn batch_adoption_requires_a_script_that_dispatched_multiple_ops() {
+        assert!(!is_batch_adoption(0), "no script at all");
+        assert!(!is_batch_adoption(1), "single op wrapped in a script");
+        assert!(
+            is_batch_adoption(2),
+            "two ops collapsed into one round-trip"
+        );
+        assert!(is_batch_adoption(9));
+    }
+
     #[test]
     fn token_log_line_has_expected_fields() {
         let usage = Usage {
@@ -3365,6 +3559,8 @@ mod tests {
             stop_reason: &StopReason::ToolUse,
             response_tool_calls: 2,
             context: &composition,
+            script_ops_total: 0,
+            script_ops_max: 0,
         };
         let line = token_log_line("chat", "claude-haiku-4-5", &usage, Some(&metadata));
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();

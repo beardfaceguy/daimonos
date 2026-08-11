@@ -39,6 +39,13 @@ CONTEXT_BYTE_FIELDS = [
     "tool_result_error_bytes",
     "image_bytes",
 ]
+# Batch adoption is measured by ops collapsed into a single script, not by
+# script size (vikunja #1230). A 1-op script is a single tool call in a costume;
+# >= 2 ops means N round-trips became 1. The old 700-byte threshold scored the
+# verified-optimal task-03 solution (~250-550 bytes) as zero adoption while a
+# 1701-byte script that errored twice counted, so size rewarded verbosity.
+BATCH_ADOPTION_MIN_SCRIPT_OPS = 2
+# Retained as a diagnostic only, so old runs stay interpretable.
 BATCH_ADOPTION_MIN_ARGUMENT_BYTES = 700
 
 
@@ -122,6 +129,8 @@ def main(argv):
     execute_script_counts = []
     execute_script_max_argument_bytes = []
     execute_script_error_counts = []
+    script_ops_totals = []
+    script_ops_maxes = []
     context_component_bytes = defaultdict(int)
     context_component_tokens = defaultdict(int)
     tool_loop_calls = 0
@@ -252,6 +261,15 @@ def main(argv):
                     value = context.get(field)
                     if isinstance(value, (int, float)):
                         target.append(int(value))
+            # script_ops_* are top-level, not under "context": they are run
+            # state rather than context composition (#1230).
+            for field, target in [
+                ("script_ops_total", script_ops_totals),
+                ("script_ops_max", script_ops_maxes),
+            ]:
+                value = ev.get(field)
+                if isinstance(value, (int, float)):
+                    target.append(int(value))
             calls += 1
             saw_line = True
         cost = m["cost"]  # OpenRouter path often reports 0; tokens are primary
@@ -345,14 +363,20 @@ def main(argv):
             if execute_script_error_counts
             else None
         ),
+        "script_ops_total": (max(script_ops_totals) if script_ops_totals else None),
+        "max_script_ops": (max(script_ops_maxes) if script_ops_maxes else None),
         "batch_adopted": (
-            max(execute_script_max_argument_bytes)
-            >= BATCH_ADOPTION_MIN_ARGUMENT_BYTES
-            if execute_script_max_argument_bytes
+            max(script_ops_maxes) >= BATCH_ADOPTION_MIN_SCRIPT_OPS
+            if script_ops_maxes
             else None
         ),
-        "batch_adoption_min_argument_bytes": (
-            BATCH_ADOPTION_MIN_ARGUMENT_BYTES
+        "batch_adoption_min_script_ops": (
+            BATCH_ADOPTION_MIN_SCRIPT_OPS if script_ops_maxes else None
+        ),
+        # Diagnostic only — superseded as the adoption rule (#1230).
+        "batch_adopted_by_argument_bytes": (
+            max(execute_script_max_argument_bytes)
+            >= BATCH_ADOPTION_MIN_ARGUMENT_BYTES
             if execute_script_max_argument_bytes
             else None
         ),
