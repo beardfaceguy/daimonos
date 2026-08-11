@@ -31,64 +31,6 @@ pub struct AgentCmdArgs {
     pub thinking: crate::providers::ThinkingLevel,
 }
 
-fn task_prefers_script_first(task: &str) -> bool {
-    let task = task.to_ascii_lowercase();
-    let mutates = [
-        " add ",
-        " change ",
-        " create ",
-        " edit ",
-        " fix ",
-        " modify ",
-        " remove ",
-        " rename ",
-        " restore ",
-    ]
-    .iter()
-    .any(|cue| format!(" {task} ").contains(cue));
-    let verifies = [" test", " verify", " check", " build", " lint"]
-        .iter()
-        .any(|cue| task.contains(cue));
-    let sequenced = task.contains(" then ") || task.matches('.').count() >= 2;
-    mutates && (verifies || sequenced)
-}
-
-fn script_first_toolset(
-    task: &str,
-    tools: &[ToolSchema],
-    batch_first_description: &str,
-) -> Option<Vec<ToolSchema>> {
-    if !task_prefers_script_first(task) {
-        return None;
-    }
-    let mut selected: Vec<_> = tools
-        .iter()
-        .filter(|tool| {
-            matches!(
-                tool.name.as_str(),
-                "execute_script" | "list_tool_signatures"
-            )
-        })
-        .cloned()
-        .collect();
-    if let Some(tool) = selected
-        .iter_mut()
-        .find(|tool| tool.name == "execute_script")
-    {
-        // Keep the exact builtin signatures that `tool_facade::active_schemas`
-        // appended. `list_tool_signatures` is `ToolTier::OnDemand` and so is
-        // absent from the agent catalog entirely, which makes this inline block
-        // the only signature source a restricted generation has (#1129).
-        tool.description = format!(
-            "{batch_first_description}\n\nExact Starlark tool signatures:\n{}",
-            crate::script::tool_signatures()
-        );
-    } else {
-        return None;
-    }
-    Some(selected)
-}
-
 // NOTE: no compaction policy here — ADR-002 compaction operates BETWEEN
 // turns of a multi-turn AgentSession, and a one-shot `daimonos agent` run is
 // a single turn (there is never an older turn to evict). Intra-run
@@ -135,17 +77,9 @@ pub async fn run_agent(
 
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
-    let initial_tools = cfg
-        .prompts
-        .resolved_tool_descriptions
-        .batch_first("execute_script")
-        .and_then(|description| script_first_toolset(&args.task, &tools, description));
-    let initial_tool_generations = usize::from(initial_tools.is_some()) * 2;
     let config = AgentConfig {
         system: Some(crate::prompts::agent_system(&cfg).await),
         tools,
-        initial_tools,
-        initial_tool_generations,
         opts: CompleteOpts {
             model,
             thinking: args.thinking,
@@ -298,101 +232,6 @@ mod tests {
 
     fn default_cfg() -> Arc<Config> {
         Arc::new(Config::default())
-    }
-
-    /// Regression probe for the #1129 spike.
-    ///
-    /// The restricted first-generation toolset is built from
-    /// `tool_facade::active_schemas`, which (a) appends the exact Starlark
-    /// builtin signatures to `execute_script`'s description and (b) excludes
-    /// every `OnDemand` tool — `list_tool_signatures` among them. So the
-    /// appended block is the *only* signature source a restricted generation
-    /// has, and overwriting the description removes it while the replacement
-    /// text still tells the model to call an unreachable lookup tool. That is
-    /// how forced-script pilots produced `create_snapshot()` instead of the
-    /// real `snapshot(action=...)`.
-    #[test]
-    fn script_first_toolset_preserves_starlark_signatures() {
-        let dir = tempfile::tempdir().unwrap();
-        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
-        let tools: Vec<ToolSchema> = tool_facade::active_schemas(dir.path(), &descriptions)
-            .into_iter()
-            .map(|schema| ToolSchema {
-                name: schema.name,
-                description: schema.description,
-                input_schema: schema.input_schema,
-            })
-            .collect();
-
-        assert!(
-            !tools.iter().any(|tool| tool.name == "list_tool_signatures"),
-            "list_tool_signatures is OnDemand, so a restricted generation cannot reach it"
-        );
-
-        let batch_first = descriptions.batch_first("execute_script").unwrap();
-        let selected =
-            script_first_toolset("Edit the file and run the tests", &tools, batch_first).unwrap();
-        let execute_script = selected
-            .iter()
-            .find(|tool| tool.name == "execute_script")
-            .unwrap();
-
-        assert!(
-            execute_script.description.contains("def snapshot(action"),
-            "restricted execute_script description dropped the Starlark signatures"
-        );
-    }
-
-    #[test]
-    fn script_first_classifier_targets_mutation_plus_verification() {
-        assert!(task_prefers_script_first(
-            "Rename the field throughout the file and make sure the tests pass."
-        ));
-        assert!(task_prefers_script_first(
-            "Create a snapshot. Then modify the config, verify it, restore it, and verify again."
-        ));
-        assert!(!task_prefers_script_first(
-            "Find all usages of total_value and report their line numbers."
-        ));
-        assert!(!task_prefers_script_first(
-            "Read src/config.rs and summarize it."
-        ));
-    }
-
-    #[test]
-    fn script_first_toolset_exposes_only_execute_script() {
-        let tools = vec![
-            ToolSchema {
-                name: "read_file".into(),
-                description: "read".into(),
-                input_schema: serde_json::json!({}),
-            },
-            ToolSchema {
-                name: "execute_script".into(),
-                description: "batch".into(),
-                input_schema: serde_json::json!({}),
-            },
-            ToolSchema {
-                name: "list_tool_signatures".into(),
-                description: "signatures".into(),
-                input_schema: serde_json::json!({}),
-            },
-        ];
-
-        let selected =
-            script_first_toolset("Edit the file and run tests", &tools, "batch everything")
-                .unwrap();
-        assert_eq!(selected.len(), 2);
-        let execute_script = selected
-            .iter()
-            .find(|tool| tool.name == "execute_script")
-            .unwrap();
-        assert!(execute_script.description.starts_with("batch everything"));
-        assert!(execute_script.description.contains("def snapshot(action"));
-        assert!(selected
-            .iter()
-            .any(|tool| tool.name == "list_tool_signatures"));
-        assert!(script_first_toolset("Read the file", &tools, "batch everything").is_none());
     }
 
     // --- dry-run ---
