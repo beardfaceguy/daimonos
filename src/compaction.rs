@@ -551,3 +551,594 @@ mod tests {
         assert_eq!(CompactionStrategy::Summarize.as_str(), "summarize");
     }
 }
+
+/// Measurement harness for vikunja #1236: how much durable knowledge survives
+/// repeated compaction?
+///
+/// Compaction replaces history with `[summary] + tail` (`agent.rs`), and
+/// [`choose_cut`] gives the summary message no protection — it is an ordinary
+/// user-role turn start, so the *next* compaction evicts and re-summarizes it.
+/// Summaries therefore compound: generation N summarizes generation N-1's
+/// summary. This measures whether that actually loses facts, which is the
+/// go/no-go evidence for building a durable working-memory store.
+#[cfg(test)]
+mod memory_loss_1236 {
+    use super::*;
+    use crate::providers::{ContentBlock, LlmProvider, Message};
+
+    /// Distinct, checkable facts planted early and never repeated. Each is the
+    /// kind of thing a durable memory store would exist to retain: a decision,
+    /// a location, a constraint.
+    /// `(id, statement, needle)`. The needle is stated explicitly rather than
+    /// derived: an earlier version guessed it heuristically and, for the rate
+    /// limit, found no distinctive token — so it silently fell back to matching
+    /// the whole sentence verbatim and scored a surviving fact as lost. A
+    /// faithful summary is allowed to reword, so the needle must be the one
+    /// token a correct summary cannot paraphrase away.
+    const FACTS: &[(&str, &str, &str)] = &[
+        (
+            "build-feature",
+            "the build requires the `zeta-codec` feature flag",
+            "zeta-codec",
+        ),
+        (
+            "failing-test",
+            "the failing test is at crates/parser/src/lex.rs:412",
+            "lex.rs:412",
+        ),
+        (
+            "decision",
+            "we chose the ring-buffer approach over a channel because of backpressure",
+            "ring-buffer",
+        ),
+        (
+            "constraint",
+            "the API rate limit is 40 requests per minute (the RPM_CEILING_40 budget)",
+            "rpm_ceiling_40",
+        ),
+        (
+            "gotcha",
+            "tests must run with --test-threads=1 or the fixture races",
+            "--test-threads=1",
+        ),
+    ];
+
+    fn noise_turn(i: usize) -> Vec<Message> {
+        vec![
+            Message::user(format!(
+                "Please look at module {i} and describe what it does. {}",
+                "Some additional detail about unrelated refactoring work. ".repeat(12)
+            )),
+            Message::assistant(format!(
+                "Module {i} handles routing. {}",
+                "It delegates to helpers and returns a result struct. ".repeat(12)
+            )),
+        ]
+    }
+
+    /// Build a history whose first turns establish every fact, followed by
+    /// `noise` turns of unrelated work.
+    fn seeded_history(noise: usize) -> Vec<Message> {
+        let mut messages = Vec::new();
+        for (id, text, _) in FACTS {
+            messages.push(Message::user(format!("Note this: {text}")));
+            messages.push(Message::assistant(format!(
+                "Understood — recorded that {text} (ref {id})."
+            )));
+        }
+        for i in 0..noise {
+            messages.extend(noise_turn(i));
+        }
+        messages
+    }
+
+    /// Ask the real summarizer to compact `messages`, returning the new history.
+    async fn compact_once(
+        provider: &dyn LlmProvider,
+        model: &str,
+        messages: Vec<Message>,
+        target_tokens: u64,
+    ) -> (Vec<Message>, usize) {
+        let Some(cut) = choose_cut(&messages, target_tokens) else {
+            return (messages, 0);
+        };
+        let transcript = transcript_for_summary(&messages[..cut]);
+        let response = provider
+            .complete(
+                &crate::providers::Context {
+                    messages: vec![Message::user(format!(
+                        "{}\n\n{transcript}",
+                        default_summary_prompt()
+                    ))],
+                    system: None,
+                    tools: vec![],
+                    stable_prefix_len: 0,
+                },
+                &crate::providers::CompleteOpts {
+                    model: model.to_string(),
+                    thinking: crate::providers::ThinkingLevel::Off,
+                    temperature: Some(0.0),
+                    ..crate::providers::CompleteOpts::default()
+                },
+            )
+            .await;
+        let text: String = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.trim().is_empty(),
+            "summarizer returned nothing: {:?}",
+            response.error_message
+        );
+        let mut out = vec![summary_message(&text)];
+        out.extend_from_slice(&messages[cut..]);
+        (out, cut)
+    }
+
+    fn surviving_facts(messages: &[Message]) -> Vec<&'static str> {
+        let haystack = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.to_lowercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        FACTS
+            .iter()
+            .filter(|(_, _, needle)| haystack.contains(&needle.to_lowercase()))
+            .map(|(id, _, _)| *id)
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "spends real API tokens on summarization; run with --ignored (vikunja #1236)"]
+    async fn measure_fact_survival_across_compaction_generations() {
+        let key = std::env::var("DAIMONOS_AGENT_API_KEY")
+            .expect("set DAIMONOS_AGENT_API_KEY (see ~/.config/daimonos/agent.env)");
+        let model = std::env::var("DAIMONOS_MEMORY_PROBE_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        let provider = crate::providers::anthropic::AnthropicProvider::new(key);
+
+        let generations: usize = std::env::var("DAIMONOS_MEMORY_PROBE_GENERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+
+        let mut history = seeded_history(30);
+        println!(
+            "\n=== #1236 fact survival under repeated compaction (model {model}) ===\ngen 0: {} messages, ~{} est tokens, facts present: {:?}",
+            history.len(),
+            estimate_tokens(&history),
+            surviving_facts(&history)
+        );
+
+        for gen in 1..=generations {
+            // Aggressive: keep roughly a quarter of the current history.
+            let target = (estimate_tokens(&history) / 4).max(200);
+            let (next, cut) = compact_once(&provider, &model, history, target).await;
+            history = next;
+            let alive = surviving_facts(&history);
+            println!(
+                "gen {gen}: evicted {cut} msgs -> {} messages, ~{} est tokens, {}/{} facts survive: {:?}",
+                history.len(),
+                estimate_tokens(&history),
+                alive.len(),
+                FACTS.len(),
+                alive
+            );
+            // Grow the conversation again so the next generation has something
+            // new to compact, mirroring a real long-running session.
+            for i in 0..20 {
+                history.extend(noise_turn(1000 + gen * 100 + i));
+            }
+        }
+
+        let survivors = surviving_facts(&history);
+        println!(
+            "\nRESULT: {}/{} planted facts survived {generations} compaction generations: {:?}\n",
+            survivors.len(),
+            FACTS.len(),
+            survivors
+        );
+    }
+}
+
+/// Stress variants for #1236: the two loss channels the primary measurement
+/// does not exercise — scale (many competing facts) and burial (a fact that
+/// exists only inside a long tool result, where [`SUMMARY_TOOL_RESULT_CAP`]
+/// truncates it out of the summarizer's input before the model ever sees it).
+#[cfg(test)]
+mod memory_loss_stress_1236 {
+    use super::*;
+    use crate::providers::{ContentBlock, LlmProvider, Message};
+
+    fn provider_and_model() -> (crate::providers::anthropic::AnthropicProvider, String) {
+        let key = std::env::var("DAIMONOS_AGENT_API_KEY").expect("DAIMONOS_AGENT_API_KEY");
+        let model = std::env::var("DAIMONOS_MEMORY_PROBE_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        (
+            crate::providers::anthropic::AnthropicProvider::new(key),
+            model,
+        )
+    }
+
+    async fn summarize(
+        provider: &dyn LlmProvider,
+        model: &str,
+        messages: &[Message],
+        cut: usize,
+    ) -> String {
+        let transcript = transcript_for_summary(&messages[..cut]);
+        let response = provider
+            .complete(
+                &crate::providers::Context {
+                    messages: vec![Message::user(format!(
+                        "{}\n\n{transcript}",
+                        default_summary_prompt()
+                    ))],
+                    system: None,
+                    tools: vec![],
+                    stable_prefix_len: 0,
+                },
+                &crate::providers::CompleteOpts {
+                    model: model.to_string(),
+                    thinking: crate::providers::ThinkingLevel::Off,
+                    temperature: Some(0.0),
+                    ..crate::providers::CompleteOpts::default()
+                },
+            )
+            .await;
+        response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Does the summarizer still retain facts when many compete for space?
+    #[tokio::test]
+    #[ignore = "spends real API tokens; run with --ignored (vikunja #1236)"]
+    async fn measure_fact_survival_at_scale() {
+        let (provider, model) = provider_and_model();
+        let n: usize = std::env::var("DAIMONOS_MEMORY_PROBE_FACTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+
+        let mut messages = Vec::new();
+        for i in 0..n {
+            messages.push(Message::user(format!(
+                "Note this: subsystem {i} uses the KEYTOKEN_{i:03} adapter."
+            )));
+            messages.push(Message::assistant(format!(
+                "Understood — subsystem {i} uses KEYTOKEN_{i:03}."
+            )));
+        }
+        for i in 0..40 {
+            messages.push(Message::user(format!(
+                "Unrelated question {i}. {}",
+                "Context padding about refactoring. ".repeat(14)
+            )));
+            messages.push(Message::assistant(format!(
+                "Unrelated answer {i}. {}",
+                "It delegates to helpers and returns a struct. ".repeat(14)
+            )));
+        }
+
+        let cut = choose_cut(&messages, estimate_tokens(&messages) / 5).expect("cut");
+        let summary = summarize(&provider, &model, &messages, cut).await;
+        let lower = summary.to_lowercase();
+        let survived = (0..n)
+            .filter(|i| lower.contains(&format!("keytoken_{i:03}")))
+            .count();
+        println!(
+            "\n=== #1236 scale: {survived}/{n} distinct facts retained in one summary \
+             (evicted {cut} msgs, summary {} chars) ===\n",
+            summary.len()
+        );
+    }
+
+    /// A fact that exists ONLY inside a long tool result. `transcript_for_summary`
+    /// caps each tool result at `SUMMARY_TOOL_RESULT_CAP` (500) chars, so a fact
+    /// past that cap never reaches the summarizer at all — a deterministic loss
+    /// channel that no amount of summarizer quality can recover.
+    #[tokio::test]
+    #[ignore = "spends real API tokens; run with --ignored (vikunja #1236)"]
+    async fn measure_fact_buried_in_a_long_tool_result() {
+        let (provider, model) = provider_and_model();
+
+        // The needle sits well past the 500-char cap.
+        let buried = format!(
+            "{}\nCRITICAL: the deploy key lives at BURIED_TOKEN_XYZ\n{}",
+            "routine log line\n".repeat(80),
+            "more routine output\n".repeat(80)
+        );
+        let mut messages = vec![
+            Message::user("Run the diagnostic and tell me what you find."),
+            Message {
+                role: crate::providers::Role::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "t1".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": "diagnose"}),
+                }],
+            },
+            Message {
+                role: crate::providers::Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: buried.clone(),
+                    is_error: false,
+                }],
+            },
+        ];
+        for i in 0..40 {
+            messages.push(Message::user(format!(
+                "Next task {i}. {}",
+                "Padding. ".repeat(20)
+            )));
+            messages.push(Message::assistant(format!(
+                "Done {i}. {}",
+                "More padding. ".repeat(20)
+            )));
+        }
+
+        let cut = choose_cut(&messages, estimate_tokens(&messages) / 5).expect("cut");
+        let transcript = transcript_for_summary(&messages[..cut]);
+        let reached_summarizer = transcript.contains("BURIED_TOKEN_XYZ");
+        let summary = summarize(&provider, &model, &messages, cut).await;
+        let in_summary = summary.contains("BURIED_TOKEN_XYZ");
+        println!(
+            "\n=== #1236 burial: fact reached summarizer input: {reached_summarizer}; \
+             present in summary: {in_summary} (tool-result cap = {SUMMARY_TOOL_RESULT_CAP} chars) ===\n"
+        );
+    }
+}
+
+/// Is the #1236 "lost knowledge" problem actually a *prompt* problem?
+///
+/// The scale measurement showed 2/40 distinct facts retained, in a 323-char
+/// summary of 142 evicted messages. `prompts/summary.md` says "be dense and
+/// factual" but gives no completeness requirement and no signal that output
+/// length should scale with the material — so the model is free to write three
+/// sentences regardless of how much there was to keep.
+///
+/// This compares the shipped prompt against one that states the completeness
+/// obligation explicitly, on byte-identical input. If the gap is large, #1236's
+/// premise is a prompt defect, not a missing subsystem.
+#[cfg(test)]
+mod summary_prompt_ab_1236 {
+    use super::*;
+    use crate::providers::{ContentBlock, LlmProvider, Message};
+
+    pub(super) const COMPLETENESS_PROMPT: &str = "You are summarizing the earlier part of a conversation between a user and a coding agent so the conversation can continue with the summary in place of the original messages. \
+Preserve: the user's overall goal; key decisions and their rationale; files, commands, and resources touched and their current state; important facts learned from tool results; and open threads or next steps. \
+COMPLETENESS IS THE PRIMARY REQUIREMENT: every distinct concrete fact — identifiers, paths, versions, flags, numeric limits, decisions — must appear in the summary. \
+Losing one is a failure; being long is not. Scale your length to the material: if the conversation established fifty facts, the summary must contain fifty facts. \
+Use a terse bulleted list, one fact per line, rather than prose. \
+Drop verbatim file contents, command output, and pleasantries. Reply with the summary only.";
+
+    #[tokio::test]
+    #[ignore = "spends real API tokens; run with --ignored (vikunja #1236)"]
+    async fn compare_shipped_prompt_against_a_completeness_prompt() {
+        let key = std::env::var("DAIMONOS_AGENT_API_KEY").expect("DAIMONOS_AGENT_API_KEY");
+        let model = std::env::var("DAIMONOS_MEMORY_PROBE_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        let provider = crate::providers::anthropic::AnthropicProvider::new(key);
+        let n: usize = 40;
+
+        let mut messages = Vec::new();
+        for i in 0..n {
+            messages.push(Message::user(format!(
+                "Note this: subsystem {i} uses the KEYTOKEN_{i:03} adapter."
+            )));
+            messages.push(Message::assistant(format!(
+                "Understood — subsystem {i} uses KEYTOKEN_{i:03}."
+            )));
+        }
+        for i in 0..40 {
+            messages.push(Message::user(format!(
+                "Unrelated question {i}. {}",
+                "Context padding about refactoring. ".repeat(14)
+            )));
+            messages.push(Message::assistant(format!(
+                "Unrelated answer {i}. {}",
+                "It delegates to helpers and returns a struct. ".repeat(14)
+            )));
+        }
+        let cut = choose_cut(&messages, estimate_tokens(&messages) / 5).expect("cut");
+        let transcript = transcript_for_summary(&messages[..cut]);
+
+        for (label, prompt) in [
+            ("shipped ", default_summary_prompt()),
+            ("complete", COMPLETENESS_PROMPT.to_string()),
+        ] {
+            let response = provider
+                .complete(
+                    &crate::providers::Context {
+                        messages: vec![Message::user(format!("{prompt}\n\n{transcript}"))],
+                        system: None,
+                        tools: vec![],
+                        stable_prefix_len: 0,
+                    },
+                    &crate::providers::CompleteOpts {
+                        model: model.clone(),
+                        thinking: crate::providers::ThinkingLevel::Off,
+                        temperature: Some(0.0),
+                        // Generous: the point is to see how much the model
+                        // *chooses* to write, not to cap it.
+                        max_tokens: 8192,
+                    },
+                )
+                .await;
+            let text: String = response
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
+            let kept = (0..n)
+                .filter(|i| text.contains(&format!("keytoken_{i:03}")))
+                .count();
+            println!(
+                "=== #1236 A/B [{label}] retained {kept}/{n} facts in {} chars ({} est tokens) ===",
+                text.len(),
+                text.len() / 4
+            );
+        }
+    }
+}
+
+/// Realistic-material A/B for #1236.
+///
+/// The synthetic A/B used `KEYTOKEN_NNN` markers, which are unusually easy for a
+/// model to enumerate — a summarizer can pattern-match and list them without
+/// understanding anything. That risks overstating the fix. This repeats the
+/// comparison on facts phrased the way they actually arise in a coding session:
+/// embedded in explanation and tool output, never announced as "note this", and
+/// with needles that a faithful summary cannot paraphrase away (identifiers,
+/// paths, versions, numbers).
+#[cfg(test)]
+mod realistic_retention_1236 {
+    use super::*;
+    use crate::providers::{ContentBlock, LlmProvider, Message, Role};
+
+    /// `(needle, user_turn, assistant_turn)` — facts emerge from ordinary
+    /// dialogue rather than being dictated.
+    const EXCHANGES: &[(&str, &str, &str)] = &[
+        ("tokio-console",
+         "The async tasks are stalling somewhere and I can't tell where.",
+         "I compared the options and went with tokio-console over tracing-flame here — tracing-flame needs a full rebuild with a custom subscriber, and tokio-console attaches to the running process, which matters because the stall only shows up under real load."),
+        ("crates/ingest/src/batch.rs",
+         "Where is the batching actually happening?",
+         "It's in crates/ingest/src/batch.rs — the flush path there collects up to the window size before handing off. That file is the one to change if you want different batching behaviour."),
+        ("0.14.2",
+         "Did you pin the dependency?",
+         "Yes — I pinned rdkafka to 0.14.2 rather than taking 0.15, because 0.15 changed the consumer rebalance callback signature and our shutdown path depends on the old behaviour."),
+        ("512",
+         "What did we settle on for the queue?",
+         "We settled on a bounded queue of 512 entries. Unbounded caused the OOM you saw on Tuesday, and anything under about 256 made the producer block during normal bursts."),
+        ("--no-default-features",
+         "The CI build keeps failing but it works locally.",
+         "CI builds with --no-default-features, which drops the `compat` shim that your local build picks up by default. That's why the symbol resolves for you and not in CI."),
+        ("PG_STATEMENT_TIMEOUT",
+         "Queries are dying after a while in staging.",
+         "Staging sets PG_STATEMENT_TIMEOUT to 30s at the connection-pool level, so anything longer gets killed server-side regardless of what the client asks for."),
+        ("read-through",
+         "How should the cache behave on a miss?",
+         "We decided on a read-through cache rather than cache-aside, because cache-aside let two workers both miss and both hit the database for the same key during the morning spike."),
+        ("legacy_ids",
+         "Anything else I should know before touching the migration?",
+         "The legacy_ids table is still referenced by the reporting job even though nothing writes to it any more. Dropping it will break the nightly report, so it has to outlive this migration."),
+    ];
+
+    fn realistic_history() -> Vec<Message> {
+        let mut messages = Vec::new();
+        for (_, user, assistant) in EXCHANGES {
+            messages.push(Message::user((*user).to_string()));
+            messages.push(Message::assistant((*assistant).to_string()));
+        }
+        // Ordinary follow-on work that pushes the above out of the window.
+        for i in 0..45 {
+            messages.push(Message::user(format!(
+                "Now rename the helper in module {i} and run the tests."
+            )));
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text(format!(
+                    "Renamed it in module {i} and the suite passes. {}",
+                    "The change was mechanical: update the definition, the two call sites, and the doc comment. ".repeat(6)
+                ))],
+            });
+        }
+        messages
+    }
+
+    async fn retention(
+        provider: &dyn LlmProvider,
+        model: &str,
+        transcript: &str,
+        prompt: &str,
+    ) -> (usize, usize) {
+        let response = provider
+            .complete(
+                &crate::providers::Context {
+                    messages: vec![Message::user(format!("{prompt}\n\n{transcript}"))],
+                    system: None,
+                    tools: vec![],
+                    stable_prefix_len: 0,
+                },
+                &crate::providers::CompleteOpts {
+                    model: model.to_string(),
+                    thinking: crate::providers::ThinkingLevel::Off,
+                    temperature: Some(0.0),
+                    max_tokens: 8192,
+                },
+            )
+            .await;
+        let text = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        let kept = EXCHANGES
+            .iter()
+            .filter(|(needle, _, _)| text.contains(&needle.to_lowercase()))
+            .count();
+        (kept, text.len())
+    }
+
+    #[tokio::test]
+    #[ignore = "spends real API tokens; run with --ignored (vikunja #1236)"]
+    async fn realistic_facts_shipped_prompt_versus_completeness_prompt() {
+        let key = std::env::var("DAIMONOS_AGENT_API_KEY").expect("DAIMONOS_AGENT_API_KEY");
+        let model = std::env::var("DAIMONOS_MEMORY_PROBE_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        let provider = crate::providers::anthropic::AnthropicProvider::new(key);
+
+        let messages = realistic_history();
+        let cut = choose_cut(&messages, estimate_tokens(&messages) / 5).expect("cut");
+        let transcript = transcript_for_summary(&messages[..cut]);
+        let n = EXCHANGES.len();
+        println!(
+            "\n=== #1236 realistic A/B: {n} facts, evicted {cut} of {} messages ===",
+            messages.len()
+        );
+
+        for (label, prompt) in [
+            ("shipped ", default_summary_prompt()),
+            (
+                "complete",
+                super::summary_prompt_ab_1236::COMPLETENESS_PROMPT.to_string(),
+            ),
+        ] {
+            let (kept, chars) = retention(&provider, &model, &transcript, &prompt).await;
+            println!(
+                "[{label}] retained {kept}/{n} facts in {chars} chars (~{} tokens)",
+                chars / 4
+            );
+        }
+        println!();
+    }
+}
