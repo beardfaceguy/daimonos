@@ -15,6 +15,8 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    /// Bounded HTTP/SSE deadlines (#1107).
+    timeouts: crate::providers::ProviderTimeouts,
 }
 
 impl OpenAiProvider {
@@ -24,14 +26,23 @@ impl OpenAiProvider {
         } else {
             base_url
         };
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("build http client: {e}"))?;
+        // #1107: built through ProviderTimeouts so no client exists without a
+        // connect deadline.
+        let timeouts = crate::providers::ProviderTimeouts::default();
+        let client = timeouts.client();
         Ok(Self {
             api_key,
             base_url,
             client,
+            timeouts,
         })
+    }
+
+    /// Override the bounded HTTP/SSE deadlines (#1107).
+    pub fn with_timeouts(mut self, timeouts: crate::providers::ProviderTimeouts) -> Self {
+        self.client = timeouts.client();
+        self.timeouts = timeouts;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -57,14 +68,23 @@ impl LlmProvider for OpenAiProvider {
         if let Some(error) = Self::reject_images(ctx) {
             return error;
         }
-        let response = match self
+        // #1107: bound the wait for response headers. connect_timeout only
+        // covers TCP/TLS; a server that accepts and then never answers is
+        // exactly the reported incident, and it hit this adapter.
+        let sent = self
             .client
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
             .json(&self.request_body(ctx, opts, false))
-            .send()
-            .await
-        {
+            .send();
+        let sent =
+            match crate::providers::with_deadline("response headers", self.timeouts.headers, sent)
+                .await
+            {
+                Ok(sent) => sent,
+                Err(timeout) => return timeout,
+            };
+        let response = match sent {
             Ok(response) => response,
             Err(error) => {
                 return LlmResponse::retryable_error(format!("openai request failed: {error}"))
@@ -93,14 +113,21 @@ impl LlmProvider for OpenAiProvider {
         if let Some(error) = Self::reject_images(ctx) {
             return error;
         }
-        let response = match self
+        // #1107: bound the wait for response headers (see complete()).
+        let sent = self
             .client
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
             .json(&self.request_body(ctx, opts, true))
-            .send()
-            .await
-        {
+            .send();
+        let sent =
+            match crate::providers::with_deadline("response headers", self.timeouts.headers, sent)
+                .await
+            {
+                Ok(sent) => sent,
+                Err(timeout) => return timeout,
+            };
+        let response = match sent {
             Ok(response) => response,
             Err(error) => {
                 return LlmResponse::retryable_error(format!("openai request failed: {error}"))
@@ -116,7 +143,26 @@ impl LlmProvider for OpenAiProvider {
 
         let mut stream = response.bytes_stream().eventsource();
         let mut state = StreamState::new(opts.model.clone());
-        while let Some(event) = stream.next().await {
+        // #1107: first-event allowance, then a resetting idle deadline. This is
+        // the adapter the reported incident hit.
+        let mut first = true;
+        loop {
+            let limit = if first {
+                self.timeouts.first_event
+            } else {
+                self.timeouts.idle
+            };
+            let phase = if first {
+                "first stream event"
+            } else {
+                "stream idle"
+            };
+            let next = match crate::providers::with_deadline(phase, limit, stream.next()).await {
+                Ok(next) => next,
+                Err(timeout) => return timeout,
+            };
+            first = false;
+            let Some(event) = next else { break };
             let event = match event {
                 Ok(event) => event,
                 Err(error) => return LlmResponse::error(format!("openai stream error: {error}")),
@@ -664,6 +710,56 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// vikunja #1107, on the adapter the reported incident actually hit: a
+    /// server that accepts the connection and never sends response headers
+    /// must not hold the turn open forever.
+    ///
+    /// `connect_timeout` alone does not cover this - the TCP/TLS handshake
+    /// completes fine; it is the wait for headers that hung. The outer
+    /// `tokio::time::timeout` is a test guard: before the fix this call never
+    /// returns, and a hanging test is worse than a failing one.
+    #[tokio::test]
+    async fn a_server_that_never_sends_headers_is_bounded_not_infinite() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+                drop(stream);
+            }
+        });
+
+        let secret = "sk-do-not-leak-me";
+        let provider = OpenAiProvider::new(secret.to_string(), format!("http://127.0.0.1:{port}"))
+            .expect("provider builds")
+            .with_timeouts(crate::providers::ProviderTimeouts {
+                headers: std::time::Duration::from_millis(150),
+                ..crate::providers::ProviderTimeouts::default()
+            });
+        let ctx = Context {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.complete(&ctx, &CompleteOpts::default()),
+        )
+        .await
+        .expect("must not hang - this is the #1107 defect");
+
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable, "a stalled connection is transient");
+        let msg = resp.error_message.unwrap_or_default();
+        assert!(msg.contains("timed out"), "got: {msg}");
+        // The task requires timeout errors carry no credentials or payload.
+        assert!(!msg.contains(secret), "must not leak the api key: {msg}");
+    }
 
     /// vikunja #1240: OpenAI-format adapters funnel every non-success HTTP
     /// response through `error_response`, so classification happens once, with

@@ -17,6 +17,8 @@ pub struct Config {
     pub loop_detector: LoopDetectorConfig,
     /// Automatic per-turn workspace checkpoints (#1239). Off by default.
     pub checkpoint: CheckpointConfig,
+    /// Bounded provider HTTP/SSE deadlines (#1107).
+    pub provider_timeouts: ProviderTimeoutConfig,
     pub logging: LoggingConfig,
     pub observability: ObservabilityConfig,
     pub analytics: AnalyticsConfig,
@@ -245,6 +247,51 @@ impl Default for ToolOutputConfig {
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
             reformat: ReformatConfig::default(),
+        }
+    }
+}
+
+/// Bounded deadlines for provider HTTP/SSE work (vikunja #1107).
+///
+/// A stalled upstream connection previously held a turn open indefinitely: an
+/// ACP prompt ran ~46 minutes, ~41 of them after the client's stdio pipe had
+/// already broken, because none of the three provider adapters set any timeout
+/// and every streaming loop awaited the next SSE event forever.
+///
+/// Phases are separate on purpose. One catch-all request timeout cannot tell a
+/// legitimately long generation (events still arriving) from a dead socket
+/// (nothing arriving) — capping total duration would kill the former to catch
+/// the latter. The idle timeout resets on every received event, so a long
+/// generation survives indefinitely while a stalled stream dies quickly.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ProviderTimeoutConfig {
+    /// TCP/TLS establishment.
+    pub connect_secs: u64,
+    /// From request sent to response headers received.
+    pub headers_secs: u64,
+    /// From response headers to the first SSE event. Generous: this covers
+    /// prompt processing and reasoning before any token is emitted.
+    pub first_event_secs: u64,
+    /// Between consecutive SSE events; reset by every event received. This is
+    /// the one that catches a stalled stream.
+    pub idle_secs: u64,
+    /// Optional hard ceiling on one generation regardless of activity.
+    /// `0` disables it — the default, because a healthy long generation
+    /// should not be killed by wall-clock alone.
+    pub generation_secs: u64,
+}
+
+impl Default for ProviderTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: 30,
+            headers_secs: 120,
+            // Reasoning models can think for minutes before the first token.
+            first_event_secs: 300,
+            // No healthy stream goes this long between events.
+            idle_secs: 120,
+            generation_secs: 0,
         }
     }
 }
