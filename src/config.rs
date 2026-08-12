@@ -186,6 +186,50 @@ pub struct ToolOutputConfig {
     pub intra_turn_keep_recent_results: usize,
     /// Maximum retained string argument size for old edit/write tool calls.
     pub old_argument_max_chars: usize,
+    /// Opt-in LLM reformatting of noisy verifier-tool output (vikunja #1235).
+    pub reformat: ReformatConfig,
+}
+
+/// Opt-in LLM reformatting of high-volume, low-signal tool output — test
+/// runners, linters, coverage (vikunja #1235, adapted from Kwaak's
+/// `tool_summarizer`).
+///
+/// This is the deliberate exception to daimonos' deterministic-first context
+/// philosophy (#1193 bounding, #1194 pruning make no model calls). It trades a
+/// cheap-model call for a denser, *actionable* result: a 500-line pytest dump
+/// becomes a short repair plan phrased in terms of tools the agent can actually
+/// invoke. Because it costs money per matched tool call, it is off by default
+/// and gated to an explicit allowlist — never "enabled implies everything".
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReformatConfig {
+    /// Master switch. `false` removes the pass entirely — no call, no cost.
+    pub enabled: bool,
+    /// Tool names eligible for reformatting. Empty matches nothing, so
+    /// enabling without naming tools is a no-op rather than a surprise bill.
+    pub tools: Vec<String>,
+    /// Skip outputs below this size: small results are already actionable, so
+    /// a model call would cost more than it saves.
+    pub min_chars: usize,
+    /// Model for the pass. `None` falls back to the compaction summary model,
+    /// which is already the configured "cheap model" for harness-internal work.
+    pub model: Option<String>,
+    /// Hard cap on output fed to the reformatter, so one enormous result cannot
+    /// produce an enormous bill. Excess is head/tail trimmed before the call.
+    pub max_input_chars: usize,
+}
+
+impl Default for ReformatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tools: Vec::new(),
+            // ~1k chars is roughly where a test dump stops being scannable.
+            min_chars: 1_000,
+            model: None,
+            max_input_chars: 60_000,
+        }
+    }
 }
 
 impl Default for ToolOutputConfig {
@@ -198,6 +242,7 @@ impl Default for ToolOutputConfig {
             intra_turn_result_budget_tokens: 40_000,
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
+            reformat: ReformatConfig::default(),
         }
     }
 }
