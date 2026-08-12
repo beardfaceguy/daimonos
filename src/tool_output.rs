@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use crate::config::{ReformatConfig, ToolOutputConfig};
 use crate::providers::{ContentBlock, Message};
 
-const TRUNCATED_MARKER: &str = "truncated; full output saved to";
+pub(crate) const TRUNCATED_MARKER: &str = "truncated; full output saved to";
 const PRUNED_MARKER: &str = "old tool result pruned; full output saved to";
 const ARGUMENT_MARKER: &str = "...(argument truncated)";
 
@@ -225,7 +225,7 @@ fn structured_preview(
     (fallback.len() <= max_bytes).then_some(fallback)
 }
 
-fn marker_output_path(text: &str) -> Option<PathBuf> {
+pub(crate) fn marker_output_path(text: &str) -> Option<PathBuf> {
     let (_, suffix) = text.split_once(TRUNCATED_MARKER)?;
     let path = suffix.trim_start();
     let end = path.rfind(" ...").unwrap_or(path.len());
