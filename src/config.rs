@@ -15,6 +15,8 @@ pub struct Config {
     pub process: ProcessConfig,
     pub tool_output: ToolOutputConfig,
     pub loop_detector: LoopDetectorConfig,
+    /// Automatic per-turn workspace checkpoints (#1239). Off by default.
+    pub checkpoint: CheckpointConfig,
     pub logging: LoggingConfig,
     pub observability: ObservabilityConfig,
     pub analytics: AnalyticsConfig,
@@ -243,6 +245,35 @@ impl Default for ToolOutputConfig {
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
             reformat: ReformatConfig::default(),
+        }
+    }
+}
+
+/// Automatic per-turn workspace checkpoints backed by a shadow git repository
+/// (vikunja #1239, adapted from Cline). Off by default.
+///
+/// Measured on daimonos itself: 20 per-turn checkpoints cost 257 MB as full
+/// workspace copies (the `snapshot.rs` strategy) versus 12 MB in a shadow git
+/// repo, because git stores an unchanged file once however many checkpoints
+/// reference it. Latency was never the constraint — a full copy is ~13 ms —
+/// disk was.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CheckpointConfig {
+    /// Master switch. `false` means no shadow repo is ever created.
+    pub enabled: bool,
+    /// Checkpoints retained per workspace; older ones are pruned after each
+    /// turn. `0` disables pruning.
+    pub keep: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // ~50 turns of undo. At shadow-git's storage cost this is a few MB
+            // on a medium repo, so the default favours recoverability.
+            keep: 50,
         }
     }
 }

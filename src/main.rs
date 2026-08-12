@@ -5,6 +5,7 @@ mod agent_env;
 mod agent_runtime;
 mod analytics;
 mod chat_cmd;
+mod checkpoint;
 mod cli;
 mod client_transport;
 mod compaction;
