@@ -635,6 +635,8 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     prompt_cache: bool,
+    /// Bounded HTTP/SSE deadlines (#1107).
+    timeouts: super::ProviderTimeouts,
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -648,12 +650,22 @@ impl std::fmt::Debug for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        let timeouts = super::ProviderTimeouts::default();
         AnthropicProvider {
-            client: reqwest::Client::new(),
+            // Built through `ProviderTimeouts` so a client can never be
+            // constructed without a connect deadline (#1107).
+            client: timeouts.client(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             prompt_cache: false,
+            timeouts,
         }
+    }
+
+    pub fn with_timeouts(mut self, timeouts: super::ProviderTimeouts) -> Self {
+        self.client = timeouts.client();
+        self.timeouts = timeouts;
+        self
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -689,8 +701,15 @@ impl LlmProvider for AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&request)
-            .send()
-            .await;
+            .send();
+        // #1107: bound the wait for response headers. Without this a server
+        // that accepts the connection and never answers holds the turn open
+        // indefinitely.
+        let result =
+            match super::with_deadline("response headers", self.timeouts.headers, result).await {
+                Ok(r) => r,
+                Err(timeout) => return timeout,
+            };
 
         let resp = match result {
             Err(e) => return LlmResponse::retryable_error(format!("network error: {e}")),
@@ -754,8 +773,15 @@ impl LlmProvider for AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&request)
-            .send()
-            .await;
+            .send();
+        // #1107: bound the wait for response headers. Without this a server
+        // that accepts the connection and never answers holds the turn open
+        // indefinitely.
+        let result =
+            match super::with_deadline("response headers", self.timeouts.headers, result).await {
+                Ok(r) => r,
+                Err(timeout) => return timeout,
+            };
 
         let resp = match result {
             Err(e) => return LlmResponse::retryable_error(format!("network error: {e}")),
@@ -780,7 +806,29 @@ impl LlmProvider for AnthropicProvider {
         let mut events = resp.bytes_stream().eventsource();
         let mut state = StreamState::default();
 
-        while let Some(event) = events.next().await {
+        // #1107: the first event may be preceded by minutes of reasoning, so it
+        // gets its own generous allowance; every event after resets a much
+        // shorter idle deadline. That distinction is the whole point — a
+        // single total-duration cap cannot tell a slow-but-alive generation
+        // from a dead socket.
+        let mut first = true;
+        loop {
+            let limit = if first {
+                self.timeouts.first_event
+            } else {
+                self.timeouts.idle
+            };
+            let phase = if first {
+                "first stream event"
+            } else {
+                "stream idle"
+            };
+            let next = match super::with_deadline(phase, limit, events.next()).await {
+                Ok(next) => next,
+                Err(timeout) => return timeout,
+            };
+            first = false;
+            let Some(event) = next else { break };
             let event = match event {
                 Ok(e) => e,
                 Err(e) => return LlmResponse::error(format!("stream error: {e}")),
@@ -1006,6 +1054,181 @@ mod tests {
             provider.context_window("claude-opus-5").await,
             Some(200_000)
         );
+    }
+
+    /// The acceptance criterion that keeps the fix honest: a slow but *active*
+    /// generation must survive many idle windows. If this ever fails, the idle
+    /// deadline has stopped resetting and #1107's fix has become a regression
+    /// that kills long reasoning turns.
+    #[tokio::test]
+    async fn a_slow_but_active_stream_survives_many_idle_windows() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+                stream.write_all(head.as_bytes()).await.ok();
+                // A text block must be opened before deltas for it parse.
+                let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+                stream.write_all(start.as_bytes()).await.ok();
+                stream.flush().await.ok();
+                // 10 events, each arriving at ~60% of the idle deadline: total
+                // elapsed far exceeds one window, but no single gap does.
+                for i in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    let ev = format!(
+                        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{i}\"}}}}\n\n"
+                    );
+                    if stream.write_all(ev.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    stream.flush().await.ok();
+                }
+                let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+                stream.write_all(stop.as_bytes()).await.ok();
+                stream.flush().await.ok();
+                stream.shutdown().await.ok();
+            }
+        });
+
+        let provider = AnthropicProvider::new("k")
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .with_timeouts(crate::providers::ProviderTimeouts {
+                first_event: std::time::Duration::from_millis(500),
+                idle: std::time::Duration::from_millis(100),
+                ..crate::providers::ProviderTimeouts::default()
+            });
+        let ctx = Context {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let mut deltas = 0usize;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.stream(&ctx, &CompleteOpts::default(), &mut |_| deltas += 1),
+        )
+        .await
+        .expect("must not hang");
+
+        // Assert on the deadline specifically, not on stop_reason: this
+        // synthetic stream does not emit a `message_delta` carrying a real
+        // stop_reason, so `StopReason::Error` here would be a fixture artifact
+        // rather than the behaviour under test.
+        let msg = resp.error_message.clone().unwrap_or_default();
+        assert!(
+            !msg.contains("timed out"),
+            "an active stream must not hit any deadline, got: {msg}"
+        );
+        assert!(
+            deltas >= 5,
+            "deltas kept arriving across many idle windows, got {deltas}"
+        );
+    }
+
+    /// The stall a header deadline cannot catch: headers arrive, one event
+    /// arrives, then the stream goes silent forever. Only a per-event idle
+    /// deadline that resets on activity distinguishes this from a healthy slow
+    /// generation.
+    #[tokio::test]
+    async fn a_stream_that_stalls_mid_generation_hits_the_idle_deadline() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+                stream.write_all(head.as_bytes()).await.ok();
+                // One well-formed event, then silence — connection stays open.
+                let ev = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+                stream.write_all(ev.as_bytes()).await.ok();
+                stream.flush().await.ok();
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let provider = AnthropicProvider::new("k")
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .with_timeouts(crate::providers::ProviderTimeouts {
+                first_event: std::time::Duration::from_millis(500),
+                idle: std::time::Duration::from_millis(150),
+                ..crate::providers::ProviderTimeouts::default()
+            });
+        let ctx = Context {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.stream(&ctx, &CompleteOpts::default(), &mut |_| {}),
+        )
+        .await
+        .expect("must not hang");
+
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable);
+        let msg = resp.error_message.unwrap_or_default();
+        assert!(
+            msg.contains("stream idle"),
+            "must be attributed to the idle deadline, not the first-event one: {msg}"
+        );
+    }
+
+    /// vikunja #1107: the actual incident. A server that accepts the connection
+    /// and then never responds previously held the turn open forever — the
+    /// reported prompt ran ~46 minutes, ~41 of them after the client's pipe had
+    /// already broken.
+    ///
+    /// The outer `tokio::time::timeout` is a test guard, not the thing under
+    /// test: without the fix this call never returns, and a hanging test is
+    /// worse than a failing one.
+    #[tokio::test]
+    async fn a_server_that_never_responds_is_bounded_not_infinite() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the accepted connection open and never write a byte.
+        let _held = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+                drop(stream);
+            }
+        });
+
+        let provider = AnthropicProvider::new("k")
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .with_timeouts(crate::providers::ProviderTimeouts {
+                headers: std::time::Duration::from_millis(150),
+                ..crate::providers::ProviderTimeouts::default()
+            });
+        let ctx = Context {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.complete(&ctx, &CompleteOpts::default()),
+        )
+        .await
+        .expect("must not hang — this is the #1107 defect");
+
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable, "a stalled connection is transient");
+        assert!(resp.error_message.unwrap_or_default().contains("timed out"));
     }
 
     /// vikunja #1240: transient upstream failures must be classified at the

@@ -10,18 +10,29 @@ pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    /// Bounded HTTP/SSE deadlines (#1107).
+    timeouts: super::ProviderTimeouts,
 }
 
 impl OpenRouterProvider {
     pub fn new(api_key: String, base_url: String) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("build http client: {e}"))?;
+        // #1107: built through ProviderTimeouts so no client exists without a
+        // connect deadline.
+        let timeouts = super::ProviderTimeouts::default();
+        let client = timeouts.client();
         Ok(Self {
             api_key,
             base_url,
             client,
+            timeouts,
         })
+    }
+
+    /// Override the bounded HTTP/SSE deadlines (#1107).
+    pub fn with_timeouts(mut self, timeouts: crate::providers::ProviderTimeouts) -> Self {
+        self.client = timeouts.client();
+        self.timeouts = timeouts;
+        self
     }
 }
 
@@ -51,14 +62,20 @@ impl LlmProvider for OpenRouterProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = match self
+        // #1107: bound the wait for response headers; connect_timeout only
+        // covers TCP/TLS establishment, not a server that accepts and stalls.
+        let sent = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send()
-            .await
+            .send();
+        let sent = match super::with_deadline("response headers", self.timeouts.headers, sent).await
         {
+            Ok(sent) => sent,
+            Err(timeout) => return timeout,
+        };
+        let resp = match sent {
             Ok(r) => r,
             Err(e) => {
                 return LlmResponse::retryable_error(format!("openrouter request failed: {e}"))
@@ -120,14 +137,20 @@ impl LlmProvider for OpenRouterProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = match self
+        // #1107: bound the wait for response headers; connect_timeout only
+        // covers TCP/TLS establishment, not a server that accepts and stalls.
+        let sent = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send()
-            .await
+            .send();
+        let sent = match super::with_deadline("response headers", self.timeouts.headers, sent).await
         {
+            Ok(sent) => sent,
+            Err(timeout) => return timeout,
+        };
+        let resp = match sent {
             Ok(r) => r,
             Err(e) => {
                 return LlmResponse::retryable_error(format!("openrouter request failed: {e}"))
@@ -151,7 +174,26 @@ impl LlmProvider for OpenRouterProvider {
         let mut events = resp.bytes_stream().eventsource();
         let mut state = StreamState::default();
 
-        while let Some(event) = events.next().await {
+        // #1107: see the anthropic adapter — first-event allowance, then a
+        // resetting idle deadline.
+        let mut first = true;
+        loop {
+            let limit = if first {
+                self.timeouts.first_event
+            } else {
+                self.timeouts.idle
+            };
+            let phase = if first {
+                "first stream event"
+            } else {
+                "stream idle"
+            };
+            let next = match super::with_deadline(phase, limit, events.next()).await {
+                Ok(next) => next,
+                Err(timeout) => return timeout,
+            };
+            first = false;
+            let Some(event) = next else { break };
             let event = match event {
                 Ok(e) => e,
                 Err(e) => return LlmResponse::error(format!("openrouter stream error: {e}")),

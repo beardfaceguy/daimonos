@@ -14,21 +14,26 @@ fn try_build_provider(
     api_key: &str,
     base_url: &str,
     prompt_cache: bool,
+    // #1107: bounded HTTP/SSE deadlines. Passed in rather than defaulted inside
+    // each adapter so `[provider_timeouts]` in config.toml actually applies —
+    // config that silently does nothing is worse than no config.
+    timeouts: providers::ProviderTimeouts,
 ) -> Result<Box<dyn providers::LlmProvider>, String> {
     match provider {
         "openrouter" => providers::openrouter::OpenRouterProvider::new(
             api_key.to_string(),
             base_url.to_string(),
         )
-        .map(|provider| Box::new(provider) as Box<dyn providers::LlmProvider>),
+        .map(|p| Box::new(p.with_timeouts(timeouts)) as Box<dyn providers::LlmProvider>),
         "anthropic" => Ok(Box::new(
             providers::anthropic::AnthropicProvider::new(api_key.to_string())
                 .with_base_url(base_url.to_string())
-                .with_prompt_cache(prompt_cache),
+                .with_prompt_cache(prompt_cache)
+                .with_timeouts(timeouts),
         )),
         "openai" => {
             providers::openai::OpenAiProvider::new(api_key.to_string(), base_url.to_string())
-                .map(|provider| Box::new(provider) as Box<dyn providers::LlmProvider>)
+                .map(|p| Box::new(p.with_timeouts(timeouts)) as Box<dyn providers::LlmProvider>)
         }
         other => Err(format!(
             "unsupported provider: {other} (valid: openrouter, anthropic, openai)"
@@ -39,12 +44,14 @@ fn try_build_provider(
 fn build_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
+    timeouts: providers::ProviderTimeouts,
 ) -> anyhow::Result<Box<dyn providers::LlmProvider>> {
     try_build_provider(
         effective_provider,
         &agent.api_key,
         &agent.base_url,
         agent.prompt_cache,
+        timeouts,
     )
     .map_err(anyhow::Error::msg)
 }
@@ -117,7 +124,11 @@ pub async fn run_agent(
     let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(&effective_provider, &agent)?;
+    let llm = build_provider(
+        &effective_provider,
+        &agent,
+        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+    )?;
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
@@ -202,7 +213,11 @@ pub async fn run_chat(
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let model_explicit = model.is_some();
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(&effective_provider, &agent)?;
+    let llm = build_provider(
+        &effective_provider,
+        &agent,
+        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+    )?;
     let compaction = agent
         .resolve_compaction(llm.as_ref(), &effective_model)
         .await
@@ -252,7 +267,8 @@ pub async fn run_acp(
         let api_key = agent.api_key.clone();
         let base_url = agent.base_url.clone();
         let prompt_cache = agent.prompt_cache;
-        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache))
+        let timeouts = providers::ProviderTimeouts::from_config(&cfg.provider_timeouts);
+        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache, timeouts))
     };
     let compaction_follows_model = matches!(
         &agent.compaction,
@@ -319,7 +335,8 @@ pub async fn run_session_daemon(
         let api_key = agent.api_key.clone();
         let base_url = agent.base_url.clone();
         let prompt_cache = agent.prompt_cache;
-        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache))
+        let timeouts = providers::ProviderTimeouts::from_config(&cfg.provider_timeouts);
+        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache, timeouts))
     };
     let compaction_follows_model = matches!(
         &agent.compaction,
@@ -642,8 +659,14 @@ mod tests {
 
     #[tokio::test]
     async fn native_openai_provider_builds_and_reports_known_window() {
-        let provider = try_build_provider("openai", "key", "https://api.openai.com/v1", false)
-            .expect("native OpenAI provider");
+        let provider = try_build_provider(
+            "openai",
+            "key",
+            "https://api.openai.com/v1",
+            false,
+            providers::ProviderTimeouts::default(),
+        )
+        .expect("native OpenAI provider");
         assert_eq!(
             provider.context_window("gpt-5.6-sol").await,
             Some(1_050_000)
@@ -653,9 +676,15 @@ mod tests {
 
     #[test]
     fn unsupported_provider_names_openai_in_valid_set() {
-        let error = try_build_provider("ollama", "key", "http://localhost", false)
-            .err()
-            .expect("unsupported provider error");
+        let error = try_build_provider(
+            "ollama",
+            "key",
+            "http://localhost",
+            false,
+            providers::ProviderTimeouts::default(),
+        )
+        .err()
+        .expect("unsupported provider error");
         assert!(error.contains("openai"));
     }
 

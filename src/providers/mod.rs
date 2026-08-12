@@ -251,6 +251,73 @@ impl LlmResponse {
     }
 }
 
+/// Resolved provider deadlines, in the form the adapters need (vikunja #1107).
+///
+/// Lives in the provider layer and is shared by all three adapters for the same
+/// reason as [`is_retryable_status`]: these are transport properties, not
+/// provider phrasing, so one implementation cannot drift into three.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderTimeouts {
+    pub connect: std::time::Duration,
+    pub headers: std::time::Duration,
+    pub first_event: std::time::Duration,
+    pub idle: std::time::Duration,
+    /// `None` when no hard generation ceiling is configured.
+    pub generation: Option<std::time::Duration>,
+}
+
+impl Default for ProviderTimeouts {
+    fn default() -> Self {
+        Self::from_config(&crate::config::ProviderTimeoutConfig::default())
+    }
+}
+
+impl ProviderTimeouts {
+    pub fn from_config(cfg: &crate::config::ProviderTimeoutConfig) -> Self {
+        let secs = std::time::Duration::from_secs;
+        Self {
+            connect: secs(cfg.connect_secs),
+            headers: secs(cfg.headers_secs),
+            first_event: secs(cfg.first_event_secs),
+            idle: secs(cfg.idle_secs),
+            generation: (cfg.generation_secs > 0).then(|| secs(cfg.generation_secs)),
+        }
+    }
+
+    /// An HTTP client carrying the connect deadline. Every adapter builds its
+    /// client through here so none can be constructed without one.
+    pub fn client(&self) -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect)
+            .build()
+            // A builder failure here means TLS backend init failed; the
+            // default client is still better than refusing to run, and the
+            // request-level deadlines below still apply.
+            .unwrap_or_default()
+    }
+}
+
+/// Await `fut` with a deadline, mapping expiry to a **retryable** provider
+/// error (#1107 + #1240).
+///
+/// Retryable is the correct classification: a stalled socket is transient, so
+/// the retry/failover path added in #1240 will re-issue the request or move to
+/// the next model instead of surfacing a dead turn to the user. The message
+/// names only the phase and the limit — never the request body, headers or key.
+pub async fn with_deadline<T>(
+    phase: &str,
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, LlmResponse> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(value) => Ok(value),
+        Err(_) => Err(LlmResponse::retryable_error(format!(
+            "provider {phase} timed out after {}s",
+            limit.as_secs()
+        ))),
+    }
+}
+
 /// Whether an HTTP status from a provider indicates a *transient* failure worth
 /// retrying (vikunja #1240).
 ///
@@ -433,6 +500,41 @@ mod tests {
     /// reading provider phrasing (ADR-001). Status codes are a standard, not
     /// phrasing, so the classifier is shared by all three adapters rather than
     /// triplicated.
+    /// vikunja #1107: a timed-out phase must be classified *retryable*, so the
+    /// #1240 retry/failover path re-issues it instead of surfacing a dead turn.
+    #[tokio::test]
+    async fn a_deadline_expiry_is_a_retryable_provider_error() {
+        let never = std::future::pending::<()>();
+        let err = with_deadline("first event", std::time::Duration::from_millis(20), never)
+            .await
+            .expect_err("must time out");
+        assert!(err.retryable, "a stalled stream is transient");
+        assert_eq!(err.stop_reason, StopReason::Error);
+        let msg = err.error_message.unwrap_or_default();
+        assert!(msg.contains("first event"), "names the phase that stalled");
+        assert!(!err.context_overflow);
+    }
+
+    #[tokio::test]
+    async fn a_deadline_that_is_met_passes_the_value_through() {
+        let ok = with_deadline("headers", std::time::Duration::from_secs(5), async { 7 })
+            .await
+            .expect("well within the limit");
+        assert_eq!(ok, 7);
+    }
+
+    #[test]
+    fn generation_ceiling_is_opt_in() {
+        let d = ProviderTimeouts::default();
+        assert!(
+            d.generation.is_none(),
+            "a healthy long generation must not be killed by wall-clock alone"
+        );
+        // The idle deadline is what catches a stall, and it must be shorter
+        // than the first-event allowance, which covers pre-token reasoning.
+        assert!(d.idle < d.first_event);
+    }
+
     #[test]
     fn http_status_classifies_transient_versus_fatal_provider_failures() {
         // Transient: rate limits, overload, gateway and upstream faults.
