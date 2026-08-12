@@ -1425,6 +1425,10 @@ fn build_agent_config(
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     bridge: Arc<McpBridge>,
     bridge_slot: BridgeSlot,
+    // Ordered failover chain (#1240). This is `AgentEnv::models`, which is
+    // `[active_model]` when `DAIMONOS_AGENT_MODELS` is unset — so failover is
+    // naturally opt-in: a single-entry chain has no successor to advance to.
+    failover_models: Vec<String>,
 ) -> AgentConfig {
     let tools = agent_tools(workspace, descriptions, &bridge);
     let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
@@ -1439,10 +1443,14 @@ fn build_agent_config(
         // Item 3: leave unset so `run()` resolves it from
         // `DAIMONOS_AGENT_AUTO_CONTINUE` (off unless the operator opts in).
         auto_continue_budget: None,
-        // #1240: bounded retry of transient provider failures. An ACP client
-        // (Zed) surfaces a provider blip as a failed turn the user must redo,
-        // so absorbing it is exactly where this pays off.
-        provider_retry: crate::agent::ProviderRetryConfig::default(),
+        // #1240: bounded retry of transient provider failures, then failover
+        // along the configured chain. An ACP client (Zed) surfaces a provider
+        // blip as a failed turn the user must redo, so absorbing it is exactly
+        // where this pays off.
+        provider_retry: crate::agent::ProviderRetryConfig {
+            failover_models,
+            ..crate::agent::ProviderRetryConfig::default()
+        },
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
@@ -2179,6 +2187,7 @@ async fn build_session_handle(
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
         Arc::clone(&bridge_slot),
+        state.models.clone(),
     );
     let acp_session_key = session_id.to_string();
     let tool_session = build_acp_tool_session(
