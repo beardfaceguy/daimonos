@@ -724,6 +724,24 @@ async fn record_agent_tool_call(
 /// [`AgentConfig::auto_continue_budget`].
 pub const DEFAULT_AUTO_CONTINUE_BUDGET: u32 = 0;
 
+/// Label a checkpoint with the tools that produced it, so `list` reads as a
+/// history of what happened rather than a column of hashes.
+fn tool_names_for_checkpoint(content: &[ContentBlock]) -> String {
+    let mut names: Vec<&str> = content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    names.dedup();
+    if names.is_empty() {
+        "turn".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Cap on the working-tree diff injected into the #1235 reformatter prompt.
 /// Enough to correlate a failure with a recent edit; not so much that a large
 /// refactor makes the summarisation call expensive.
@@ -803,6 +821,22 @@ pub async fn run(
     // advanced along `provider_retry.failover_models`. Sticky for the rest of
     // the turn.
     let mut failover_model: Option<String> = None;
+    // #1239: per-turn workspace checkpoints. Built once per run; `None` keeps
+    // the loop free of any checkpoint work at all when disabled.
+    let (checkpoints, checkpoint_keep) = {
+        let guard = session.lock().await;
+        let cfg = &guard.cfg.checkpoint;
+        if cfg.enabled {
+            (
+                Some(crate::checkpoint::CheckpointStore::new(
+                    guard.workspace.clone(),
+                )),
+                cfg.keep,
+            )
+        } else {
+            (None, 0)
+        }
+    };
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -1532,6 +1566,44 @@ pub async fn run(
                         role: Role::User,
                         content: tool_results,
                     });
+                }
+
+                // #1239: record the workspace after this turn's tools ran.
+                //
+                // Deliberately NOT gated on a list of "mutating" tools. Such a
+                // list is exactly the enumeration that drifted in #1113, and it
+                // would have to guess about `exec` and `execute_script`, which
+                // can mutate anything. Instead every turn attempts a checkpoint
+                // and git decides: `create` returns None when the tree is
+                // unchanged, and that check is ~0 ms because the index makes it
+                // incremental. Read-only turns therefore record nothing without
+                // anyone having to classify them.
+                if checkpoints.is_some() {
+                    let label = tool_names_for_checkpoint(&resp.content);
+                    if let Some(store) = &checkpoints {
+                        match store.create(&label).await {
+                            Ok(Some(cp)) => {
+                                tracing::debug!(
+                                    target: "daimonos::checkpoint",
+                                    id = %cp.id, label = %cp.label,
+                                    "recorded workspace checkpoint"
+                                );
+                                if checkpoint_keep > 0 {
+                                    // Prune inline: a long session would
+                                    // otherwise accumulate unbounded history.
+                                    let _ = store.gc(checkpoint_keep).await;
+                                }
+                            }
+                            Ok(None) => {}
+                            // A checkpoint failure must never fail the turn —
+                            // this is a safety net, not a dependency.
+                            Err(e) => tracing::warn!(
+                                target: "daimonos::checkpoint",
+                                error = %e,
+                                "could not record workspace checkpoint"
+                            ),
+                        }
+                    }
                 }
 
                 if terminate {
@@ -2396,6 +2468,76 @@ mod tests {
             called.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "disabled reformatter must cost nothing"
+        );
+    }
+
+    /// vikunja #1239 end to end: with checkpoints enabled, a turn that changes
+    /// the workspace records one, and the change is recoverable.
+    #[tokio::test]
+    async fn enabled_checkpoints_record_a_turn_that_changed_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.checkpoint.enabled = true;
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "after\n"}),
+            ),
+            end_turn_resp(),
+        ]);
+        run(
+            &provider,
+            shared(session),
+            vec![Message::user("edit it")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        let store = crate::checkpoint::CheckpointStore::new(dir.path());
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 1, "one checkpoint for the mutating turn");
+        assert_eq!(all[0].label, "write_file", "labelled by the tool that ran");
+
+        // The edit is real, and rolling back to the checkpoint is not what we
+        // want here — the checkpoint captured the state *after* the tool ran,
+        // which is what makes the NEXT turn's mistake undoable.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "after\n"
+        );
+    }
+
+    /// Disabled is the default and must cost nothing — no shadow repo at all.
+    #[tokio::test]
+    async fn disabled_checkpoints_create_no_shadow_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "after\n"}),
+            ),
+            end_turn_resp(),
+        ]);
+        run(
+            &provider,
+            shared(session),
+            vec![Message::user("edit it")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        assert!(
+            !dir.path().join(".daimonos/checkpoints.git").exists(),
+            "no shadow repo when disabled"
         );
     }
 
