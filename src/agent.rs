@@ -230,6 +230,20 @@ pub struct ProviderRetryConfig {
     /// First backoff interval; doubles per attempt (see [`retry_backoff`]).
     /// `Duration::ZERO` makes retries immediate, which is what tests want.
     pub base_delay: std::time::Duration,
+    /// Ordered failover chain. When `max_attempts` same-model retries are
+    /// exhausted and the failure is still transient, the loop advances to the
+    /// next entry *after the active model* and retries there with a fresh
+    /// budget.
+    ///
+    /// **Opt-in: empty disables failover entirely.** Populate from
+    /// `AgentEnv::models`, which already yields a deduped ordered list with the
+    /// active model guaranteed present — so "the next one after the active
+    /// model" is always well defined.
+    ///
+    /// Only transient failures advance the chain. Failing over on a fatal error
+    /// would multiply one misconfiguration (bad key, malformed request) across
+    /// every model in the list.
+    pub failover_models: Vec<String>,
 }
 
 impl Default for ProviderRetryConfig {
@@ -240,8 +254,21 @@ impl Default for ProviderRetryConfig {
         ProviderRetryConfig {
             max_attempts: 2,
             base_delay: std::time::Duration::from_millis(500),
+            // Opt-in: no chain means no failover.
+            failover_models: Vec::new(),
         }
     }
+}
+
+/// The next model to try after `active` in an ordered failover chain, or `None`
+/// when `active` is the last entry (or absent from the chain).
+///
+/// Position-based rather than round-robin: once a model has failed for this
+/// generation, cycling back to it would spend the whole budget on a provider
+/// already known to be degraded.
+fn next_failover_model<'a>(chain: &'a [String], active: &str) -> Option<&'a str> {
+    let at = chain.iter().position(|m| m == active)?;
+    chain.get(at + 1).map(String::as_str)
 }
 
 /// Exponential backoff for retry `attempt` (1-based): `base * 2^(attempt-1)`.
@@ -767,6 +794,10 @@ pub async fn run(
     // log line carries the totals as of that generation.
     let mut script_ops_total = 0usize;
     let mut script_ops_max = 0usize;
+    // #1240: `Some` once a transient failure exhausted its retries and the loop
+    // advanced along `provider_retry.failover_models`. Sticky for the rest of
+    // the turn.
+    let mut failover_model: Option<String> = None;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -810,9 +841,19 @@ pub async fn run(
         // forced off so reasoning cannot re-consume the output budget and stall
         // progress; otherwise use the caller's opts unchanged (item 3).
         let continuation_opts;
-        let opts: &CompleteOpts = if force_thinking_off {
+        let opts: &CompleteOpts = if force_thinking_off || failover_model.is_some() {
             continuation_opts = CompleteOpts {
-                thinking: ThinkingLevel::Off,
+                thinking: if force_thinking_off {
+                    ThinkingLevel::Off
+                } else {
+                    config.opts.thinking.clone()
+                },
+                // #1240: once failed over, every later generation in this turn
+                // stays on the substitute model. Switching back mid-turn would
+                // re-enter a provider already known to be degraded.
+                model: failover_model
+                    .clone()
+                    .unwrap_or_else(|| config.opts.model.clone()),
                 ..config.opts.clone()
             };
             &continuation_opts
@@ -953,6 +994,38 @@ pub async fn run(
                 if text_only_truncation {
                     messages.push(Message::user(AUTO_CONTINUE_NUDGE));
                 }
+                continue;
+            }
+            // #1240: same-model retries are spent and the failure is still
+            // transient — advance the chain rather than surfacing the error.
+            // Placed before the terminal arm so only transient failures with a
+            // configured next model divert; everything else falls through
+            // unchanged.
+            StopReason::Error
+                if resp.retryable
+                    && next_failover_model(&config.provider_retry.failover_models, &opts.model)
+                        .is_some() =>
+            {
+                let from = opts.model.clone();
+                // Safe: the guard above proved a next model exists.
+                let to = next_failover_model(&config.provider_retry.failover_models, &from)
+                    .expect("guard proved a next model exists")
+                    .to_string();
+                tracing::warn!(
+                    target: "daimonos::agent",
+                    event = "provider_failover",
+                    from = %from,
+                    to = %to,
+                    error = resp.error_message.as_deref().unwrap_or("unknown"),
+                    "provider retries exhausted; failing over to the next model"
+                );
+                // Never silent: the `provider_failover` event above is the
+                // durable record. A *frontend-visible* notice (ACP/TUI card
+                // saying the turn continued on a substitute model, and that the
+                // switch invalidated prompt cache) needs a new hook threaded
+                // through every frontend, so it is deliberately deferred rather
+                // than half-wired here — see #1240.
+                failover_model = Some(to);
                 continue;
             }
             StopReason::EndTurn
@@ -2140,6 +2213,165 @@ mod tests {
     // --- MockProvider ---
 
     #[test]
+    fn next_failover_model_walks_forward_and_stops_at_the_end() {
+        let chain: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(next_failover_model(&chain, "a"), Some("b"));
+        assert_eq!(next_failover_model(&chain, "b"), Some("c"));
+        // Last entry: chain exhausted, so the error must surface.
+        assert_eq!(next_failover_model(&chain, "c"), None);
+        // A model outside the chain has no defined successor — better to
+        // surface the error than to guess an entry point.
+        assert_eq!(next_failover_model(&chain, "unlisted"), None);
+        assert_eq!(next_failover_model(&[], "a"), None);
+    }
+
+    /// Records every model it was asked for, and fails everything except one.
+    /// Lets a test prove *which* model each attempt used, not merely that the
+    /// turn eventually succeeded.
+    struct FailoverProbe {
+        healthy_model: &'static str,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailoverProbe {
+        async fn complete(&self, _ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+            self.seen.lock().unwrap().push(opts.model.clone());
+            if opts.model == self.healthy_model {
+                end_turn_resp()
+            } else {
+                LlmResponse::retryable_error(format!("API 529: {} overloaded", opts.model))
+            }
+        }
+    }
+
+    /// vikunja #1240: when same-model retries are exhausted on a transient
+    /// failure, advance to the next model in the configured chain rather than
+    /// surfacing the error.
+    #[tokio::test]
+    async fn exhausted_retries_fail_over_to_the_next_model_in_the_chain() {
+        let provider = FailoverProbe {
+            healthy_model: "model-c",
+            seen: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig {
+            opts: CompleteOpts {
+                model: "model-a".into(),
+                ..CompleteOpts::default()
+            },
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec!["model-a".into(), "model-b".into(), "model-c".into()],
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let seen = provider.seen.lock().unwrap().clone();
+        // a twice (initial + 1 retry), b twice, then c succeeds first try.
+        assert_eq!(
+            seen,
+            vec!["model-a", "model-a", "model-b", "model-b", "model-c"],
+            "should exhaust each model's retries before advancing"
+        );
+    }
+
+    /// Failover is opt-in: with no chain configured, behaviour is exactly the
+    /// pre-#1240 surface — the transient error is returned after retries.
+    #[tokio::test]
+    async fn no_chain_configured_means_no_failover() {
+        let provider = FailoverProbe {
+            healthy_model: "model-c",
+            seen: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig {
+            opts: CompleteOpts {
+                model: "model-a".into(),
+                ..CompleteOpts::default()
+            },
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            provider.seen.lock().unwrap().clone(),
+            vec!["model-a", "model-a"],
+            "only the active model, initial + one retry"
+        );
+    }
+
+    /// A fatal error must not consume the chain — failing over with the same
+    /// bad request just multiplies one misconfiguration across every model.
+    #[tokio::test]
+    async fn fatal_errors_do_not_trigger_failover() {
+        struct AlwaysFatal {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl LlmProvider for AlwaysFatal {
+            async fn complete(&self, _ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+                self.seen.lock().unwrap().push(opts.model.clone());
+                LlmResponse::error("API 401: invalid api key")
+            }
+        }
+        let provider = AlwaysFatal {
+            seen: Mutex::new(Vec::new()),
+        };
+        let config = AgentConfig {
+            opts: CompleteOpts {
+                model: "model-a".into(),
+                ..CompleteOpts::default()
+            },
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec!["model-a".into(), "model-b".into()],
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            provider.seen.lock().unwrap().clone(),
+            vec!["model-a"],
+            "one call only: no retry and no failover on a fatal error"
+        );
+    }
+
+    #[test]
     fn retry_backoff_doubles_and_stays_bounded() {
         use std::time::Duration;
         let base = Duration::from_millis(500);
@@ -2168,6 +2400,7 @@ mod tests {
             provider_retry: ProviderRetryConfig {
                 max_attempts: 2,
                 base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
             },
             ..AgentConfig::default()
         };
@@ -2205,6 +2438,7 @@ mod tests {
             provider_retry: ProviderRetryConfig {
                 max_attempts: 3,
                 base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
             },
             ..AgentConfig::default()
         };
@@ -2240,6 +2474,7 @@ mod tests {
             provider_retry: ProviderRetryConfig {
                 max_attempts: 2,
                 base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
             },
             ..AgentConfig::default()
         };
