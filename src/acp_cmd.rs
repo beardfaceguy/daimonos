@@ -1439,6 +1439,10 @@ fn build_agent_config(
         // Item 3: leave unset so `run()` resolves it from
         // `DAIMONOS_AGENT_AUTO_CONTINUE` (off unless the operator opts in).
         auto_continue_budget: None,
+        // #1240: bounded retry of transient provider failures. An ACP client
+        // (Zed) surfaces a provider blip as a failed turn the user must redo,
+        // so absorbing it is exactly where this pays off.
+        provider_retry: crate::agent::ProviderRetryConfig::default(),
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
@@ -4042,6 +4046,7 @@ mod tests {
 
     fn end_turn_resp(text: &str) -> crate::providers::LlmResponse {
         crate::providers::LlmResponse {
+            retryable: false,
             content: vec![crate::providers::ContentBlock::Text(text.to_string())],
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
@@ -4056,6 +4061,7 @@ mod tests {
 
     fn thinking_resp(thinking: &str, text: &str) -> crate::providers::LlmResponse {
         crate::providers::LlmResponse {
+            retryable: false,
             content: vec![
                 crate::providers::ContentBlock::Thinking(thinking.to_string()),
                 crate::providers::ContentBlock::Text(text.to_string()),
@@ -4073,6 +4079,7 @@ mod tests {
         input: serde_json::Value,
     ) -> crate::providers::LlmResponse {
         crate::providers::LlmResponse {
+            retryable: false,
             content: vec![crate::providers::ContentBlock::ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -4728,6 +4735,7 @@ mod tests {
                     "network error: Authorization: Bearer secret-token",
                 ),
                 crate::providers::LlmResponse {
+                    retryable: false,
                     content: Vec::new(),
                     stop_reason: crate::providers::StopReason::Refusal,
                     error_message: None,

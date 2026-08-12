@@ -1280,6 +1280,7 @@ mod tests {
             // The first observed token records time-to-first-token (ADR-006).
             generation.mark_first_token();
             generation.finish(&crate::providers::LlmResponse {
+                retryable: false,
                 content: vec![],
                 stop_reason: crate::providers::StopReason::EndTurn,
                 error_message: None,
@@ -1379,6 +1380,7 @@ mod tests {
                 });
                 generation.mark_first_token();
                 generation.finish(&LlmResponse {
+                    retryable: false,
                     content: Vec::new(),
                     stop_reason: StopReason::EndTurn,
                     error_message: None,
@@ -1839,6 +1841,7 @@ mod tests {
                         stable_prefix_len: 0,
                     });
                     generation.finish(&LlmResponse {
+                        retryable: false,
                         content: Vec::new(),
                         stop_reason: StopReason::EndTurn,
                         error_message: None,
@@ -2025,6 +2028,7 @@ mod tests {
 
     fn sample_response() -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: Vec::new(),
             stop_reason: StopReason::EndTurn,
             error_message: None,

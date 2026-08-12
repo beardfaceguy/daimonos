@@ -66,7 +66,9 @@ impl LlmProvider for OpenAiProvider {
             .await
         {
             Ok(response) => response,
-            Err(error) => return LlmResponse::error(format!("openai request failed: {error}")),
+            Err(error) => {
+                return LlmResponse::retryable_error(format!("openai request failed: {error}"))
+            }
         };
         let status = response.status();
         let body: Value = match response.json().await {
@@ -100,7 +102,9 @@ impl LlmProvider for OpenAiProvider {
             .await
         {
             Ok(response) => response,
-            Err(error) => return LlmResponse::error(format!("openai request failed: {error}")),
+            Err(error) => {
+                return LlmResponse::retryable_error(format!("openai request failed: {error}"))
+            }
         };
         let status = response.status();
         if !status.is_success() {
@@ -352,6 +356,7 @@ pub(crate) fn parse_response(body: &Value, model: &str) -> LlmResponse {
         .as_deref()
         .is_some_and(is_context_overflow_error);
     LlmResponse {
+        retryable: false,
         content,
         stop_reason,
         error_message,
@@ -521,6 +526,10 @@ fn error_response(status: u16, body: &Value) -> LlmResponse {
     let full = format!("openai {status}: {}", bounded(message, 500));
     if is_context_overflow_error(message) {
         LlmResponse::context_overflow_error(full)
+    } else if super::is_retryable_status(status) {
+        // #1240: transient upstream failure, classified provider-side so core
+        // never reads provider phrasing (ADR-001).
+        LlmResponse::retryable_error(full)
     } else {
         LlmResponse::error(full)
     }
@@ -655,6 +664,33 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// vikunja #1240: OpenAI-format adapters funnel every non-success HTTP
+    /// response through `error_response`, so classification happens once, with
+    /// the status already in hand.
+    #[test]
+    fn error_response_classifies_transient_versus_fatal() {
+        let body = serde_json::json!({"error": {"message": "upstream is busy"}});
+        for status in [429, 500, 503] {
+            assert!(
+                error_response(status, &body).retryable,
+                "{status} should be retryable"
+            );
+        }
+        for status in [400, 401, 403, 404] {
+            assert!(
+                !error_response(status, &body).retryable,
+                "{status} must not be retryable"
+            );
+        }
+
+        // Context overflow stays fatal even on a status that would otherwise
+        // be retryable: resending the same oversized prompt cannot succeed.
+        let overflow = serde_json::json!({"error": {"message": "maximum context length exceeded"}});
+        let r = error_response(429, &overflow);
+        assert!(r.context_overflow);
+        assert!(!r.retryable, "overflow must not be retried blindly");
+    }
 
     async fn mock_server(
         status: &str,

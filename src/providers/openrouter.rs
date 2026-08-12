@@ -60,7 +60,9 @@ impl LlmProvider for OpenRouterProvider {
             .await
         {
             Ok(r) => r,
-            Err(e) => return LlmResponse::error(format!("openrouter request failed: {e}")),
+            Err(e) => {
+                return LlmResponse::retryable_error(format!("openrouter request failed: {e}"))
+            }
         };
 
         let status = resp.status();
@@ -77,6 +79,10 @@ impl LlmProvider for OpenRouterProvider {
             let full = format!("openrouter {status}: {msg}");
             if is_context_overflow_error(&msg) {
                 return LlmResponse::context_overflow_error(full);
+            }
+            // #1240: transient upstream failure, classified provider-side.
+            if super::is_retryable_status(status.as_u16()) {
+                return LlmResponse::retryable_error(full);
             }
             return LlmResponse::error(full);
         }
@@ -123,7 +129,9 @@ impl LlmProvider for OpenRouterProvider {
             .await
         {
             Ok(r) => r,
-            Err(e) => return LlmResponse::error(format!("openrouter request failed: {e}")),
+            Err(e) => {
+                return LlmResponse::retryable_error(format!("openrouter request failed: {e}"))
+            }
         };
 
         let status = resp.status();
@@ -132,6 +140,10 @@ impl LlmProvider for OpenRouterProvider {
             let full = format!("openrouter {status}: {body_text}");
             if is_context_overflow_error(&body_text) {
                 return LlmResponse::context_overflow_error(full);
+            }
+            // #1240: transient upstream failure, classified provider-side.
+            if super::is_retryable_status(status.as_u16()) {
+                return LlmResponse::retryable_error(full);
             }
             return LlmResponse::error(full);
         }
@@ -259,6 +271,7 @@ impl StreamState {
         let stop_reason = map_finish_reason(self.finish_reason.as_deref());
         let usage = parse_usage(&self.usage);
         LlmResponse {
+            retryable: false,
             content,
             stop_reason,
             error_message: None,
@@ -444,6 +457,7 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
     });
 
     LlmResponse {
+        retryable: false,
         content,
         stop_reason,
         error_message,
