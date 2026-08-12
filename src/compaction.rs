@@ -205,6 +205,51 @@ pub fn choose_cut(messages: &[Message], target_tokens: u64) -> Option<usize> {
 /// summarization call itself; the head is where errors/answers usually are.
 const SUMMARY_TOOL_RESULT_CAP: usize = 500;
 
+/// Fit one tool result into [`SUMMARY_TOOL_RESULT_CAP`], keeping **both ends**
+/// (vikunja #1288).
+///
+/// Head-only truncation fought the layer above it. By the time compaction runs,
+/// `tool_output::bound_text` (#1193) has already reduced a large result to
+/// `head + "...full output saved to <path>..." + tail`, keeping the tail
+/// deliberately because that is where a verifier's errors and closing counts
+/// live. Taking the first N chars of that discarded the tail #1193 preserved
+/// *and* the recovery pointer, so the summarizer saw the head of the head and
+/// the summary could not say where the full output went.
+///
+/// Same budget, different slice: no extra summarization tokens.
+fn cap_tool_result(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= SUMMARY_TOOL_RESULT_CAP {
+        return content.to_string();
+    }
+    // Split the budget, leaving room for the elision marker itself.
+    const ELISION: &str = " …[elided]… ";
+    let budget = SUMMARY_TOOL_RESULT_CAP.saturating_sub(ELISION.chars().count());
+    let head_len = budget.div_ceil(2);
+    let tail_len = budget / 2;
+    let head: String = content.chars().take(head_len).collect();
+    let tail: String = content
+        .chars()
+        .skip(total.saturating_sub(tail_len))
+        .collect();
+    let mut out = format!("{head}{ELISION}{tail}");
+
+    // `bound_text` puts its recovery pointer *between* head and tail, so
+    // eliding the middle drops it. Re-attach it: without the path the summary
+    // cannot tell the agent where the full output went, which defeats the
+    // offload (#1193) the pointer exists to advertise.
+    if let Some(path) = crate::tool_output::marker_output_path(content) {
+        if !out.contains(crate::tool_output::TRUNCATED_MARKER) {
+            out.push_str(&format!(
+                " [{} {}]",
+                crate::tool_output::TRUNCATED_MARKER,
+                path.display()
+            ));
+        }
+    }
+    out
+}
+
 /// Render evicted turns as a plain-text transcript for the summarization
 /// call. Text-in/text-out deliberately: passing the real `Message` structs
 /// would make the summarization request itself subject to tool-pair/schema
@@ -238,18 +283,13 @@ pub fn transcript_for_summary(messages: &[Message]) -> String {
                 ContentBlock::ToolResult {
                     content, is_error, ..
                 } => {
-                    let capped: String = content.chars().take(SUMMARY_TOOL_RESULT_CAP).collect();
-                    let ellipsis = if content.chars().count() > SUMMARY_TOOL_RESULT_CAP {
-                        "…"
-                    } else {
-                        ""
-                    };
+                    let capped = cap_tool_result(content);
                     let tag = if *is_error {
                         "tool error"
                     } else {
                         "tool result"
                     };
-                    out.push_str(&format!("[{tag}: {capped}{ellipsis}]\n"));
+                    out.push_str(&format!("[{tag}: {capped}]\n"));
                 }
                 // Thinking/provider continuation state is internal; visible
                 // assistant text restates anything that mattered.
@@ -276,6 +316,101 @@ pub fn drop_marker_message() -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_tool_result_keeps_both_ends_within_budget() {
+        let short = "small output";
+        assert_eq!(cap_tool_result(short), short, "under budget: untouched");
+
+        let long: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        let capped = cap_tool_result(&long);
+        assert!(capped.chars().count() <= SUMMARY_TOOL_RESULT_CAP);
+        assert!(capped.contains("line 0"), "head kept");
+        assert!(
+            capped.contains("line 399"),
+            "tail kept — the point of #1288"
+        );
+        assert!(
+            capped.contains("elided"),
+            "the elision is marked, not silent"
+        );
+    }
+
+    /// A #1235-reformatted result is already dense and already carries the
+    /// pointer. Capping must not mangle it.
+    #[test]
+    fn cap_tool_result_preserves_a_reformatted_results_pointer() {
+        let reformatted = format!(
+            "3 distinct failures: parse error at lex.rs:412, timeout in net.rs:88, \
+             oom in alloc.rs:9\n\n[reformatted from 84000 chars; {} /tmp/out/x.txt]",
+            crate::tool_output::TRUNCATED_MARKER
+        );
+        let capped = cap_tool_result(&reformatted);
+        assert!(capped.contains("lex.rs:412"));
+        assert!(
+            capped.contains(crate::tool_output::TRUNCATED_MARKER),
+            "recovery pointer must survive"
+        );
+    }
+
+    /// vikunja #1288: the two output-bounding layers fight each other.
+    ///
+    /// By the time compaction sees a tool result, #1193's `bound_text` has
+    /// already reduced it to `head + "...full output saved to <path>..." + tail`
+    /// — the tail kept deliberately, because that is where a verifier's errors
+    /// and closing counts live. `transcript_for_summary` then took the first
+    /// `SUMMARY_TOOL_RESULT_CAP` chars of that, discarding both the tail #1193
+    /// preserved and the recovery pointer.
+    ///
+    /// Net effect: the summarizer saw the head of the head, and the summary
+    /// could not even say where the full output went.
+    #[tokio::test]
+    async fn summary_transcript_keeps_what_output_bounding_deliberately_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // Production defaults (50 KiB / 2000 lines): a bounded result is
+        // routinely far larger than SUMMARY_TOOL_RESULT_CAP, which is exactly
+        // why the second truncation loses so much.
+        let cfg = crate::config::ToolOutputConfig {
+            directory: Some(dir.path().to_string_lossy().to_string()),
+            ..crate::config::ToolOutputConfig::default()
+        };
+
+        // A verifier-shaped result: banner, then noise, then the finding.
+        let raw = format!(
+            "running 240 tests\n{}MIDDLE_MARKER only appears mid-output\n{}\nTAIL_MARKER: 3 failed, 237 passed\n",
+            "ok test_filler ... ok\n".repeat(3_000),
+            "ok more_filler ... ok\n".repeat(3_000)
+        );
+
+        let bounded = crate::tool_output::bound_text(&cfg, "cargo", raw).await;
+        // Precondition: #1193 kept the tail and left a recovery pointer.
+        assert!(
+            bounded.content.contains("TAIL_MARKER"),
+            "precondition: bound_text preserves the tail"
+        );
+        assert!(bounded.content.contains("full output saved to"));
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: bounded.content.clone(),
+                is_error: false,
+            }],
+        }];
+        let transcript = transcript_for_summary(&messages);
+
+        assert!(
+            transcript.contains("TAIL_MARKER"),
+            "the tail bound_text preserved must reach the summarizer"
+        );
+        assert!(
+            transcript.contains("full output saved to"),
+            "the recovery pointer must survive, or the summary cannot say \
+             where the full output went"
+        );
+    }
+
     use serde_json::json;
 
     fn policy() -> CompactionPolicy {
@@ -859,9 +994,10 @@ mod memory_loss_stress_1236 {
     async fn measure_fact_buried_in_a_long_tool_result() {
         let (provider, model) = provider_and_model();
 
-        // The needle sits well past the 500-char cap.
+        // Two needles: one mid-output (unreachable by any end-preserving
+        // scheme) and one at the tail, where a verifier's real finding sits.
         let buried = format!(
-            "{}\nCRITICAL: the deploy key lives at BURIED_TOKEN_XYZ\n{}",
+            "{}\nCRITICAL: the deploy key lives at BURIED_TOKEN_XYZ\n{}\nTAIL_TOKEN_ABC: 3 failed\n",
             "routine log line\n".repeat(80),
             "more routine output\n".repeat(80)
         );
@@ -897,12 +1033,15 @@ mod memory_loss_stress_1236 {
 
         let cut = choose_cut(&messages, estimate_tokens(&messages) / 5).expect("cut");
         let transcript = transcript_for_summary(&messages[..cut]);
-        let reached_summarizer = transcript.contains("BURIED_TOKEN_XYZ");
+        let mid_reached = transcript.contains("BURIED_TOKEN_XYZ");
+        let tail_reached = transcript.contains("TAIL_TOKEN_ABC");
         let summary = summarize(&provider, &model, &messages, cut).await;
-        let in_summary = summary.contains("BURIED_TOKEN_XYZ");
         println!(
-            "\n=== #1236 burial: fact reached summarizer input: {reached_summarizer}; \
-             present in summary: {in_summary} (tool-result cap = {SUMMARY_TOOL_RESULT_CAP} chars) ===\n"
+            "\n=== #1288 burial (cap = {SUMMARY_TOOL_RESULT_CAP} chars) ===\n\
+             mid-output fact  -> reached summarizer: {mid_reached}, in summary: {}\n\
+             tail fact        -> reached summarizer: {tail_reached}, in summary: {}\n",
+            summary.contains("BURIED_TOKEN_XYZ"),
+            summary.contains("TAIL_TOKEN_ABC")
         );
     }
 }
