@@ -453,6 +453,40 @@ mod tests {
         assert!(SUMMARY_DEFAULT.to_lowercase().contains("summar"));
     }
 
+    /// vikunja #1236: the summary prompt's *wording* is load-bearing, and it is
+    /// a plain text file with nothing else guarding it.
+    ///
+    /// Measured on real summarization calls (see the `#[ignore]`d harnesses in
+    /// `compaction.rs`): the previous wording — "be dense and factual", with no
+    /// completeness obligation — retained **0 of 8** concrete facts on
+    /// realistic material and 2 of 40 on synthetic, producing ~330-char
+    /// summaries of ~90 evicted messages. Stating the completeness requirement
+    /// and asking for a list instead of prose took both to 100%.
+    ///
+    /// These asserts pin the two levers that produced that change, so an edit
+    /// that reads better but summarizes worse fails here rather than silently
+    /// losing user knowledge in production.
+    #[test]
+    fn summary_default_demands_completeness_and_a_list() {
+        let p = SUMMARY_DEFAULT.to_lowercase();
+        assert!(
+            p.contains("completeness"),
+            "the completeness obligation is what makes facts survive"
+        );
+        assert!(
+            p.contains("losing one is a failure") || p.contains("never drop a fact"),
+            "the prompt must say that dropping a fact is a failure, not a trade-off"
+        );
+        assert!(
+            p.contains("scale your length") || p.contains("scale its length"),
+            "output length must be tied to how much there is to keep"
+        );
+        assert!(
+            p.contains("list") && p.contains("prose"),
+            "list-not-prose is the second measured lever"
+        );
+    }
+
     #[test]
     fn defaults_are_non_empty() {
         for s in [
