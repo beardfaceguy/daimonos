@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::io::AsyncWriteExt;
 
-use crate::config::ToolOutputConfig;
+use crate::config::{ReformatConfig, ToolOutputConfig};
 use crate::providers::{ContentBlock, Message};
 
 const TRUNCATED_MARKER: &str = "truncated; full output saved to";
@@ -319,6 +319,228 @@ async fn store_full(
     Ok(path)
 }
 
+/// Whether this tool result is eligible for the paid LLM reformatting pass
+/// (vikunja #1235). Pure and cheap so the decision is testable and can be made
+/// before anything is allocated or sent anywhere.
+///
+/// Every gate here exists to stop money being spent:
+/// - `enabled` is the master switch.
+/// - The allowlist is explicit; an empty list matches nothing, so enabling
+///   without naming tools is a no-op rather than a surprise bill.
+/// - Small outputs are already actionable, so a call would cost more than it
+///   saves.
+/// - **Errors pass through verbatim.** A rewrite could soften or bury the
+///   failure, and the raw failure text is precisely what the agent must react
+///   to. This is the one gate that is about correctness rather than cost.
+pub fn should_reformat(
+    cfg: &ReformatConfig,
+    tool_name: &str,
+    is_error: bool,
+    content_chars: usize,
+) -> bool {
+    cfg.enabled
+        && !is_error
+        && content_chars >= cfg.min_chars
+        && cfg.tools.iter().any(|t| t == tool_name)
+}
+
+/// The working tree's uncommitted diff, for the reformatter prompt (#1235).
+///
+/// Best-effort and always bounded: any failure — not a repo, git missing,
+/// non-zero exit — yields `None`, because a missing diff only makes the summary
+/// slightly less specific, while blocking on git would make a *tool result*
+/// depend on VCS state.
+///
+/// `--stat`-style full diffs can be enormous, so the output is capped; the
+/// prompt only needs enough to correlate a failure with a recent edit.
+pub(crate) async fn working_tree_diff(workspace: &Path, max_chars: usize) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["diff", "--no-color"])
+        .current_dir(workspace)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(max_chars).collect())
+}
+
+/// Build the reformatter prompt (vikunja #1235, adapted from Kwaak's
+/// `templates/tool_summarizer.md`).
+///
+/// Three ingredients carry the value, and each is why the result is
+/// *actionable* rather than merely shorter:
+///
+/// 1. **The working-tree diff.** Lets the summary say "your own edit to X
+///    likely caused this failure" and cite real paths, instead of describing
+///    the failure in the abstract. Omitted entirely when there is none — an
+///    empty diff section reads as "nothing changed" and would mislead.
+/// 2. **The live tool catalog.** Every proposed fix must be phrased in terms of
+///    a tool the agent can actually call, so recovery paths survive
+///    compression instead of being summarised into unusable prose. The model is
+///    told explicitly not to invent tools.
+/// 3. **Reformat, do not drop.** Repeats collapse to one instance plus a count.
+///    That is the difference between this and truncation: no information is
+///    discarded, it is restructured.
+pub fn build_reformat_prompt(
+    tool_name: &str,
+    args: &serde_json::Value,
+    output: &str,
+    diff: Option<&str>,
+    tool_catalog: &[(&str, &str)],
+) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "You are reformatting the output of a developer tool for another AI agent.\n\
+         Reformat it — do NOT drop information. Collapse repeating patterns to ONE \
+         instance plus a count (e.g. \"37 more identical failures\"). Keep every \
+         distinct error, file path and line number.\n\
+         Be concise and actionable: lead with what broke and the most likely cause.\n\n",
+    );
+    if !tool_catalog.is_empty() {
+        p.push_str(
+            "Tools the agent can call. Phrase any suggested next step using ONLY \
+             these — never invent a tool:\n",
+        );
+        for (name, desc) in tool_catalog {
+            // First line only: the catalog is context, not documentation.
+            let first = desc.lines().next().unwrap_or("").trim();
+            p.push_str(&format!("- {name}: {first}\n"));
+        }
+        p.push('\n');
+    }
+    if let Some(diff) = diff.map(str::trim).filter(|d| !d.is_empty()) {
+        p.push_str(
+            "Uncommitted changes in the working tree. If the failure is plausibly \
+             caused by one of these edits, say so and name the file:\n```diff\n",
+        );
+        p.push_str(diff);
+        p.push_str("\n```\n\n");
+    }
+    p.push_str(&format!(
+        "Tool: {tool_name}\nArguments: {args}\n\nOutput:\n"
+    ));
+    p.push_str(output);
+    p
+}
+
+/// Replace a noisy tool result with an LLM reformatting, keeping the raw output
+/// recoverable on disk (vikunja #1235).
+///
+/// Call only when [`should_reformat`] returned true — this function assumes the
+/// decision to spend a model call has already been made.
+///
+/// Degradation is the important property: this is a *paid optional
+/// enhancement*, so any failure — storage, provider error, empty reply — falls
+/// back to [`bound_text`], producing exactly the output the deterministic path
+/// would have produced without the feature. A reformatter outage must never
+/// destroy or truncate a successful tool result.
+#[allow(clippy::too_many_arguments)]
+pub async fn reformat_text(
+    cfg: &ToolOutputConfig,
+    tool_name: &str,
+    content: String,
+    provider: &dyn crate::providers::LlmProvider,
+    model: &str,
+    args: &serde_json::Value,
+    diff: Option<&str>,
+    tool_catalog: &[(&str, &str)],
+) -> BoundText {
+    let original_chars = content.chars().count();
+
+    // Cap what we pay to summarise. Head and tail are kept because a test run's
+    // signal clusters at both ends: the first failures and the final summary
+    // line. The middle is the repetitive part the reformatter would collapse
+    // anyway.
+    let capped = head_tail(&content, cfg.reformat.max_input_chars);
+    let prompt = build_reformat_prompt(tool_name, args, &capped, diff, tool_catalog);
+
+    let response = provider
+        .complete(
+            &crate::providers::Context {
+                messages: vec![Message::user(prompt)],
+                system: None,
+                tools: vec![],
+                stable_prefix_len: 0,
+            },
+            &crate::providers::CompleteOpts {
+                model: model.to_string(),
+                // No reasoning: this is a mechanical restructuring, and thinking
+                // tokens on a cheap model are pure cost here.
+                thinking: crate::providers::ThinkingLevel::Off,
+                ..crate::providers::CompleteOpts::default()
+            },
+        )
+        .await;
+
+    let summary: String = response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if response.error_message.is_some() || summary.trim().is_empty() {
+        tracing::warn!(
+            target: "daimonos::tool_output",
+            tool = tool_name,
+            error = response.error_message.as_deref().unwrap_or("empty reply"),
+            "tool-output reformat failed; falling back to deterministic bounding"
+        );
+        return bound_text(cfg, tool_name, content).await;
+    }
+
+    // Only now preserve the raw output: storing before the call would write the
+    // file twice whenever we fall back, since `bound_text` stores it too.
+    // If storage fails the reformatting would be lossy — there would be nowhere
+    // to recover the detail from — so degrade to the deterministic path.
+    let Ok(path) = store_full(cfg, tool_name, &content).await else {
+        tracing::warn!(
+            target: "daimonos::tool_output",
+            tool = tool_name,
+            "reformat succeeded but the raw output could not be stored; \
+             falling back so no detail is lost"
+        );
+        return bound_text(cfg, tool_name, content).await;
+    };
+
+    let visible = format!(
+        "{summary}\n\n[reformatted from {original_chars} chars; {TRUNCATED_MARKER} {}]",
+        path.display()
+    );
+    BoundText {
+        visible_chars: visible.chars().count(),
+        content: visible,
+        output_path: Some(path),
+        original_chars,
+    }
+}
+
+/// Keep the first and last `cap/2` chars, marking the elision. A verifier's
+/// signal clusters at both ends — the first failures and the closing summary —
+/// so a plain head truncation would routinely discard the count line.
+fn head_tail(content: &str, cap: usize) -> String {
+    if content.chars().count() <= cap {
+        return content.to_string();
+    }
+    let half = cap / 2;
+    let head: String = content.chars().take(half).collect();
+    let tail: String = content
+        .chars()
+        .skip(content.chars().count().saturating_sub(half))
+        .collect();
+    format!("{head}\n...(middle elided for the reformatter)...\n{tail}")
+}
+
 pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String) -> BoundText {
     let original_chars = content.chars().count();
     if content.len() <= cfg.max_bytes && line_count(&content) <= cfg.max_lines {
@@ -580,6 +802,223 @@ mod tests {
     use crate::providers::{ContentBlock, Message, Role};
     use serde_json::json;
 
+    /// vikunja #1235 (adapted from Kwaak): the reformatter is a *paid* LLM pass,
+    /// so every gate that keeps it from firing is load-bearing. Daimonos'
+    /// context philosophy is deterministic-first (#1193 bounding, #1194
+    /// pruning); this is the deliberate opt-in exception for noisy verifier
+    /// tools, and must stay opt-in.
+    #[test]
+    fn reformat_gating_is_opt_in_and_narrow() {
+        let base = ReformatConfig {
+            enabled: true,
+            tools: vec!["pytest".into(), "cargo".into()],
+            min_chars: 100,
+            model: None,
+            max_input_chars: 100_000,
+        };
+        let big = 500;
+        let ok = false; // is_error
+
+        assert!(should_reformat(&base, "pytest", ok, big));
+        assert!(should_reformat(&base, "cargo", ok, big));
+
+        // Not on the allowlist: a cheap `ls` must never cost a model call.
+        assert!(!should_reformat(&base, "ls", ok, big));
+
+        // Small output is already actionable; reformatting would cost more
+        // than it saves.
+        assert!(!should_reformat(&base, "pytest", ok, 99));
+
+        // Errors pass through verbatim. An LLM rewrite could soften or bury the
+        // failure, and the failure text is exactly what the agent must react to.
+        assert!(!should_reformat(&base, "pytest", true, big));
+
+        // Master switch.
+        let off = ReformatConfig {
+            enabled: false,
+            ..base.clone()
+        };
+        assert!(!should_reformat(&off, "pytest", ok, big));
+
+        // Empty allowlist means nothing matches, even enabled — no accidental
+        // "enabled implies everything".
+        let no_tools = ReformatConfig {
+            tools: vec![],
+            ..base.clone()
+        };
+        assert!(!should_reformat(&no_tools, "pytest", ok, big));
+    }
+
+    struct StubModel {
+        reply: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for StubModel {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            _opts: &crate::providers::CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            match self.reply {
+                Some(text) => crate::providers::LlmResponse {
+                    content: vec![ContentBlock::Text(text.to_string())],
+                    stop_reason: crate::providers::StopReason::EndTurn,
+                    error_message: None,
+                    context_overflow: false,
+                    retryable: false,
+                    usage: crate::providers::Usage::default(),
+                },
+                None => crate::providers::LlmResponse::error("reformatter unavailable"),
+            }
+        }
+    }
+
+    /// The happy path: the model-visible text becomes the reformatting, while
+    /// the raw output stays recoverable on disk via the #1193 offload.
+    #[tokio::test]
+    async fn reformat_replaces_visible_text_and_preserves_the_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "FAILED tests/test_a.py::test_x - AssertionError\n".repeat(200);
+        let model = StubModel {
+            reply: Some("1 distinct failure (x200): test_x AssertionError in tests/test_a.py"),
+        };
+
+        let out = reformat_text(
+            &cfg(dir.path()),
+            "pytest",
+            raw.clone(),
+            &model,
+            "cheap-model",
+            &json!({}),
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(
+            out.content.contains("1 distinct failure"),
+            "reformatted text should be what the model sees"
+        );
+        let path = out.output_path.expect("raw output must be offloaded");
+        let stored = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(stored, raw, "the full raw output must be recoverable");
+        // The pointer has to be in the visible text or the agent cannot find it.
+        assert!(out.content.contains(&path.to_string_lossy().to_string()));
+        assert_eq!(out.original_chars, raw.chars().count());
+    }
+
+    /// A reformatter failure must never destroy or truncate a successful tool
+    /// result. This is a *paid optional enhancement*; if it cannot run, the
+    /// deterministic path must carry the output exactly as it would have
+    /// without the feature.
+    #[tokio::test]
+    async fn a_failed_reformat_falls_back_to_deterministic_bounding() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "line of real output\n".repeat(200);
+        let model = StubModel { reply: None };
+
+        let out = reformat_text(
+            &cfg(dir.path()),
+            "pytest",
+            raw.clone(),
+            &model,
+            "cheap-model",
+            &json!({}),
+            None,
+            &[],
+        )
+        .await;
+
+        let deterministic = bound_text(&cfg(dir.path()), "pytest", raw.clone()).await;
+        // Compare shape, not the stored file's random name: the two calls store
+        // to different UUIDs by design.
+        let strip = |s: &str| {
+            s.split(TRUNCATED_MARKER)
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            strip(&out.content),
+            strip(&deterministic.content),
+            "must degrade to exactly the deterministic bounding"
+        );
+        assert!(
+            out.content.contains(TRUNCATED_MARKER),
+            "fallback still points at the stored output"
+        );
+        let path = out.output_path.expect("raw still recoverable");
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), raw);
+
+        // The fallback must not have written the raw output twice.
+        let mut stored = tokio::fs::read_dir(dir.path()).await.unwrap();
+        let mut files = 0;
+        while stored.next_entry().await.unwrap().is_some() {
+            files += 1;
+        }
+        assert_eq!(files, 2, "one file per bound_text call, none orphaned");
+    }
+
+    /// The prompt is the whole value of this feature. Kwaak's version carries
+    /// three ingredients most reformatters omit, and each one is why the output
+    /// is *actionable* rather than merely shorter (#1235 / catalog #1178).
+    #[test]
+    fn reformat_prompt_carries_diff_catalog_and_no_drop_instruction() {
+        let catalog = [
+            ("edit_file", "Apply string-replace edits to a file"),
+            ("exec", "Run a command"),
+        ];
+        let prompt = build_reformat_prompt(
+            "pytest",
+            &json!({"args": ["-q"]}),
+            "FAILED tests/test_a.py::test_x - AssertionError\n"
+                .repeat(40)
+                .as_str(),
+            Some("diff --git a/src/config.rs b/src/config.rs\n+broken line\n"),
+            &catalog,
+        );
+
+        // 1. The diff: lets the summary say "your own edit likely caused this".
+        assert!(prompt.contains("src/config.rs"), "diff must be present");
+        assert!(prompt.contains("+broken line"));
+
+        // 2. The catalog: every proposed fix must name a tool the agent can
+        //    actually call, so recovery paths survive compression instead of
+        //    being summarised away into prose.
+        assert!(prompt.contains("edit_file"), "tool catalog must be present");
+        assert!(prompt.contains("Apply string-replace edits"));
+
+        // 3. Reformat, don't drop — with repeats collapsed to one + a count.
+        let lower = prompt.to_lowercase();
+        assert!(lower.contains("do not drop") || lower.contains("not drop"));
+        assert!(lower.contains("count"));
+
+        // The tool being summarised, and its arguments, are identified.
+        assert!(prompt.contains("pytest"));
+        assert!(prompt.contains("-q"));
+        // And the actual output.
+        assert!(prompt.contains("AssertionError"));
+    }
+
+    /// With no diff available (no VCS, or nothing changed yet) the prompt must
+    /// still be well-formed rather than carrying an empty section that reads as
+    /// "nothing changed" and misleads the summary.
+    #[test]
+    fn reformat_prompt_omits_the_diff_section_when_there_is_none() {
+        let prompt = build_reformat_prompt("cargo", &json!({}), "output", None, &[]);
+        assert!(!prompt.to_lowercase().contains("diff --git"));
+        assert!(prompt.contains("output"));
+    }
+
+    #[test]
+    fn reformat_is_disabled_by_default() {
+        let d = ReformatConfig::default();
+        assert!(!d.enabled);
+        assert!(d.tools.is_empty());
+        assert!(!should_reformat(&d, "pytest", false, 1_000_000));
+    }
+
     fn cfg(dir: &std::path::Path) -> ToolOutputConfig {
         ToolOutputConfig {
             directory: Some(dir.to_string_lossy().to_string()),
@@ -589,6 +1028,7 @@ mod tests {
             intra_turn_result_budget_tokens: 12,
             intra_turn_keep_recent_results: 1,
             old_argument_max_chars: 24,
+            reformat: ReformatConfig::default(),
         }
     }
 

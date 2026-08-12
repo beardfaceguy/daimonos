@@ -724,6 +724,11 @@ async fn record_agent_tool_call(
 /// [`AgentConfig::auto_continue_budget`].
 pub const DEFAULT_AUTO_CONTINUE_BUDGET: u32 = 0;
 
+/// Cap on the working-tree diff injected into the #1235 reformatter prompt.
+/// Enough to correlate a failure with a recent edit; not so much that a large
+/// refactor makes the summarisation call expensive.
+const REFORMAT_DIFF_MAX_CHARS: usize = 8_000;
+
 /// Injected as a trailing user turn when a *plain-text* turn is auto-continued
 /// after a `max_tokens` stop. Without it the partial assistant turn would be
 /// followed by another assistant turn on the next generation, and providers such
@@ -1394,7 +1399,62 @@ pub async fn run(
                     // Every agent-visible text result crosses one shared
                     // boundary after UI hooks inspect the complete output but
                     // before model history retains it (vikunja #1193).
-                    let bounded = crate::tool_output::bound_text(&output_cfg, &name, content).await;
+                    //
+                    // #1235: for allowlisted noisy verifier tools, an opt-in
+                    // paid LLM pass replaces that bounding with an actionable
+                    // reformatting. Off by default; `reformat_text` degrades to
+                    // `bound_text` on any failure, so this can only ever change
+                    // the *shape* of a successful result, never lose one.
+                    let reformatter = config.subcall_provider.as_ref().filter(|_| {
+                        crate::tool_output::should_reformat(
+                            &output_cfg.reformat,
+                            &name,
+                            is_error,
+                            content.chars().count(),
+                        )
+                    });
+                    let bounded = match reformatter {
+                        Some(provider) => {
+                            let model = output_cfg
+                                .reformat
+                                .model
+                                .clone()
+                                .or_else(|| {
+                                    config
+                                        .compaction
+                                        .as_ref()
+                                        .and_then(|c| c.summary_model.clone())
+                                })
+                                .unwrap_or_else(|| config.opts.model.clone());
+                            let workspace = { session.lock().await.workspace.clone() };
+                            // Bounded and best-effort: a missing diff only makes
+                            // the summary less specific.
+                            let diff = crate::tool_output::working_tree_diff(
+                                &workspace,
+                                REFORMAT_DIFF_MAX_CHARS,
+                            )
+                            .await;
+                            // Name + first description line only: the catalog is
+                            // context for phrasing next steps, not documentation.
+                            let catalog: Vec<(&str, &str)> = config
+                                .tools
+                                .iter()
+                                .map(|t| (t.name.as_str(), t.description.as_str()))
+                                .collect();
+                            crate::tool_output::reformat_text(
+                                &output_cfg,
+                                &name,
+                                content,
+                                provider.as_ref(),
+                                &model,
+                                &info.input,
+                                diff.as_deref(),
+                                &catalog,
+                            )
+                            .await
+                        }
+                        None => crate::tool_output::bound_text(&output_cfg, &name, content).await,
+                    };
                     let was_offloaded = bounded.output_path.is_some();
                     if was_offloaded && name == "read_file" {
                         let mut guard = session.lock().await;
@@ -2211,6 +2271,133 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     // --- MockProvider ---
+
+    /// vikunja #1235 end to end: with the reformatter enabled and a matched
+    /// tool, the *model-visible* result in history is the reformatting — not
+    /// the raw output and not a head/tail truncation. Proves the pass is
+    /// actually reachable through `run()`, not just unit-testable.
+    #[tokio::test]
+    async fn enabled_reformatter_replaces_a_matched_tools_output_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let noisy = "FAILED tests/test_x.py - AssertionError\n".repeat(300);
+        std::fs::write(dir.path().join("big.txt"), &noisy).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.tool_output.directory =
+            Some(dir.path().join("tool-output").to_string_lossy().to_string());
+        cfg.tool_output.reformat = crate::config::ReformatConfig {
+            enabled: true,
+            tools: vec!["read_file".into()],
+            min_chars: 100,
+            model: Some("cheap".into()),
+            max_input_chars: 10_000,
+        };
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+
+        struct Reformatter;
+        #[async_trait]
+        impl LlmProvider for Reformatter {
+            async fn complete(&self, _c: &Context, _o: &CompleteOpts) -> LlmResponse {
+                end_turn_resp_with_text("300 identical failures: test_x AssertionError")
+            }
+        }
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "read_file", json!({"path": "big.txt"})),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            subcall_provider: Some(Arc::new(Reformatter)),
+            ..AgentConfig::default()
+        };
+
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("run the tests")],
+            &config,
+        )
+        .await;
+
+        let tool_results: Vec<String> = result
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        let joined = tool_results.join("\n");
+
+        assert!(
+            joined.contains("300 identical failures"),
+            "history should carry the reformatting, got: {}",
+            &joined[..joined.len().min(300)]
+        );
+        assert!(
+            !joined.contains(&noisy),
+            "the raw dump must not be in model history"
+        );
+        // Raw stays recoverable on disk.
+        assert!(joined.contains("full output saved to"));
+    }
+
+    /// The same run with the reformatter disabled must not call the sub-model at
+    /// all — this is the "zero cost when off" guarantee.
+    #[tokio::test]
+    async fn disabled_reformatter_never_calls_the_sub_model() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.txt"),
+            "FAILED\n".repeat(300).as_bytes(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.tool_output.directory =
+            Some(dir.path().join("tool-output").to_string_lossy().to_string());
+        // reformat left at its default: disabled.
+        let session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+
+        struct MustNotBeCalled {
+            called: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for MustNotBeCalled {
+            async fn complete(&self, _c: &Context, _o: &CompleteOpts) -> LlmResponse {
+                self.called
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                end_turn_resp_with_text("should never happen")
+            }
+        }
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "read_file", json!({"path": "big.txt"})),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            subcall_provider: Some(Arc::new(MustNotBeCalled {
+                called: Arc::clone(&called),
+            })),
+            ..AgentConfig::default()
+        };
+
+        run(
+            &provider,
+            shared(session),
+            vec![Message::user("go")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "disabled reformatter must cost nothing"
+        );
+    }
 
     #[test]
     fn next_failover_model_walks_forward_and_stops_at_the_end() {
