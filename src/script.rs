@@ -2377,6 +2377,7 @@ result = {"lines": lines, "status": "ok"}
                 return LlmResponse::error("boom");
             }
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::Text(format!("echo:{prompt}"))],
                 stop_reason: StopReason::EndTurn,
                 error_message: None,
@@ -2511,6 +2512,7 @@ result = {"lines": lines, "status": "ok"}
         impl LlmProvider for RefusingProvider {
             async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
                 LlmResponse {
+                    retryable: false,
                     content: vec![ContentBlock::Text("partial".into())],
                     stop_reason: StopReason::Refusal,
                     error_message: None,

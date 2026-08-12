@@ -2443,6 +2443,7 @@ mod tests {
                 _options: &crate::providers::CompleteOpts,
             ) -> crate::providers::LlmResponse {
                 crate::providers::LlmResponse {
+                    retryable: false,
                     content: vec![crate::providers::ContentBlock::Text("pong".to_string())],
                     stop_reason: crate::providers::StopReason::EndTurn,
                     error_message: None,

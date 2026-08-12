@@ -210,6 +210,7 @@ mod tests {
 
     fn end_turn_with_text(text: &str) -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: crate::providers::StopReason::EndTurn,
             error_message: None,
@@ -343,6 +344,7 @@ mod tests {
     async fn run_does_not_print_thinking_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![LlmResponse {
+            retryable: false,
             content: vec![
                 ContentBlock::Thinking("internal thoughts".into()),
                 ContentBlock::Text("visible answer".into()),
@@ -617,6 +619,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::ToolCall {
                     id: "t1".into(),
                     name: "execute_script".into(),
@@ -686,6 +689,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::ToolCall {
                     id: "t1".into(),
                     name: "exec".into(),

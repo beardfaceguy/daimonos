@@ -618,6 +618,7 @@ impl StreamState {
         let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         let usage = map_usage(self.usage, model);
         LlmResponse {
+            retryable: false,
             content,
             stop_reason,
             error_message: None,
@@ -692,7 +693,7 @@ impl LlmProvider for AnthropicProvider {
             .await;
 
         let resp = match result {
-            Err(e) => return LlmResponse::error(format!("network error: {e}")),
+            Err(e) => return LlmResponse::retryable_error(format!("network error: {e}")),
             Ok(r) => r,
         };
 
@@ -702,6 +703,11 @@ impl LlmProvider for AnthropicProvider {
             let full = format!("API {status}: {body}");
             if is_context_overflow_error(&body) {
                 return LlmResponse::context_overflow_error(full);
+            }
+            // #1240: classify transient upstream failures here so core can
+            // retry without inspecting provider phrasing (ADR-001).
+            if super::is_retryable_status(status.as_u16()) {
+                return LlmResponse::retryable_error(full);
             }
             return LlmResponse::error(full);
         }
@@ -720,6 +726,7 @@ impl LlmProvider for AnthropicProvider {
         let usage = map_usage(raw.usage, &opts.model);
 
         LlmResponse {
+            retryable: false,
             content,
             stop_reason,
             error_message: None,
@@ -751,7 +758,7 @@ impl LlmProvider for AnthropicProvider {
             .await;
 
         let resp = match result {
-            Err(e) => return LlmResponse::error(format!("network error: {e}")),
+            Err(e) => return LlmResponse::retryable_error(format!("network error: {e}")),
             Ok(r) => r,
         };
 
@@ -761,6 +768,11 @@ impl LlmProvider for AnthropicProvider {
             let full = format!("API {status}: {body}");
             if is_context_overflow_error(&body) {
                 return LlmResponse::context_overflow_error(full);
+            }
+            // #1240: classify transient upstream failures here so core can
+            // retry without inspecting provider phrasing (ADR-001).
+            if super::is_retryable_status(status.as_u16()) {
+                return LlmResponse::retryable_error(full);
             }
             return LlmResponse::error(full);
         }
@@ -994,6 +1006,65 @@ mod tests {
             provider.context_window("claude-opus-5").await,
             Some(200_000)
         );
+    }
+
+    /// vikunja #1240: transient upstream failures must be classified at the
+    /// provider boundary so core can retry without reading provider phrasing.
+    #[tokio::test]
+    async fn complete_classifies_transient_and_fatal_http_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn respond_with(status_line: &'static str) -> LlmResponse {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let mut head = Vec::new();
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"error":{"message":"upstream"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).await.ok();
+                }
+            });
+            let provider =
+                AnthropicProvider::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+            let ctx = Context {
+                messages: vec![Message::user("hi")],
+                system: None,
+                tools: vec![],
+                stable_prefix_len: 0,
+            };
+            provider.complete(&ctx, &CompleteOpts::default()).await
+        }
+
+        let overloaded = respond_with("529 Overloaded").await;
+        assert_eq!(overloaded.stop_reason, StopReason::Error);
+        assert!(overloaded.retryable, "5xx overload is transient");
+
+        let rate_limited = respond_with("429 Too Many Requests").await;
+        assert!(rate_limited.retryable, "429 is transient");
+
+        // A bad key is fatal: retrying — or failing over to another model with
+        // the same credentials — would only hide the misconfiguration.
+        let unauthorized = respond_with("401 Unauthorized").await;
+        assert!(!unauthorized.retryable, "401 must not be retryable");
+
+        let bad_request = respond_with("400 Bad Request").await;
+        assert!(!bad_request.retryable, "400 must not be retryable");
     }
 
     #[tokio::test]

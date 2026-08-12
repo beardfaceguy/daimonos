@@ -212,6 +212,46 @@ pub struct AgentConfig {
     /// reissues the truncated turn with thinking forced off so reasoning cannot
     /// re-consume the output budget and stall progress.
     pub auto_continue_budget: Option<u32>,
+    /// Bounded retry for *transient* provider failures (vikunja #1240).
+    pub provider_retry: ProviderRetryConfig,
+}
+
+/// How hard to retry a provider failure the adapter classified as transient
+/// (`LlmResponse::retryable`), before surfacing it to the caller.
+///
+/// Only transient failures are retried; see [`crate::providers::is_retryable_status`]
+/// for what qualifies. Retrying a fatal error would mask a real
+/// misconfiguration behind latency and burned tokens.
+#[derive(Debug, Clone)]
+pub struct ProviderRetryConfig {
+    /// Extra attempts *after* the first. `0` disables retry entirely, restoring
+    /// the pre-#1240 behaviour of surfacing the first transient error.
+    pub max_attempts: u32,
+    /// First backoff interval; doubles per attempt (see [`retry_backoff`]).
+    /// `Duration::ZERO` makes retries immediate, which is what tests want.
+    pub base_delay: std::time::Duration,
+}
+
+impl Default for ProviderRetryConfig {
+    fn default() -> Self {
+        // Two retries at 500ms/1s covers the overwhelming majority of 429s and
+        // 5xx blips without making a genuinely-down provider feel hung: worst
+        // case adds ~1.5s before the error surfaces.
+        ProviderRetryConfig {
+            max_attempts: 2,
+            base_delay: std::time::Duration::from_millis(500),
+        }
+    }
+}
+
+/// Exponential backoff for retry `attempt` (1-based): `base * 2^(attempt-1)`.
+///
+/// No jitter: daimonos runs one agent loop per process against a per-user rate
+/// limit, so there is no thundering herd to de-correlate — jitter would only
+/// make the delay untestable. Revisit if a single process ever fans out
+/// concurrent generations against one provider.
+fn retry_backoff(base: std::time::Duration, attempt: u32) -> std::time::Duration {
+    base.saturating_mul(1u32 << attempt.saturating_sub(1).min(6))
 }
 
 pub struct AgentResult {
@@ -795,23 +835,48 @@ pub async fn run(
                 tools_exposed: ctx.tools.len(),
                 stable_prefix_len: ctx.stable_prefix_len,
             });
-        let resp = match &config.on_stream_event {
-            Some(hook) => {
-                provider
-                    .stream(&ctx, opts, &mut |ev| {
-                        generation.mark_first_token();
-                        hook(ev);
-                    })
-                    .instrument(generation.span().clone())
-                    .await
+        // Transient failures are retried in place with bounded backoff (#1240).
+        // The retry sits inside the generation so one logical model turn stays
+        // one generation: a 5xx bills no tokens, so there is nothing to
+        // attribute to a separate attempt.
+        let mut retries = 0u32;
+        let resp = loop {
+            let attempt = match &config.on_stream_event {
+                Some(hook) => {
+                    provider
+                        .stream(&ctx, opts, &mut |ev| {
+                            generation.mark_first_token();
+                            hook(ev);
+                        })
+                        .instrument(generation.span().clone())
+                        .await
+                }
+                None => {
+                    provider
+                        .stream(&ctx, opts, &mut |_| {
+                            generation.mark_first_token();
+                        })
+                        .instrument(generation.span().clone())
+                        .await
+                }
+            };
+            if !attempt.retryable || retries >= config.provider_retry.max_attempts {
+                break attempt;
             }
-            None => {
-                provider
-                    .stream(&ctx, opts, &mut |_| {
-                        generation.mark_first_token();
-                    })
-                    .instrument(generation.span().clone())
-                    .await
+            retries += 1;
+            let delay = retry_backoff(config.provider_retry.base_delay, retries);
+            tracing::warn!(
+                target: "daimonos::agent",
+                attempt = retries,
+                max_attempts = config.provider_retry.max_attempts,
+                delay_ms = delay.as_millis() as u64,
+                // Provider-authored text, already bounded by the adapter. Logged
+                // so an operator can tell a rate limit from an outage.
+                error = attempt.error_message.as_deref().unwrap_or("unknown"),
+                "transient provider error; retrying after backoff"
+            );
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
         };
         generation.finish(&resp);
@@ -2074,6 +2139,125 @@ mod tests {
 
     // --- MockProvider ---
 
+    #[test]
+    fn retry_backoff_doubles_and_stays_bounded() {
+        use std::time::Duration;
+        let base = Duration::from_millis(500);
+        assert_eq!(retry_backoff(base, 1), Duration::from_millis(500));
+        assert_eq!(retry_backoff(base, 2), Duration::from_secs(1));
+        assert_eq!(retry_backoff(base, 3), Duration::from_secs(2));
+        // The shift is clamped so a misconfigured max_attempts cannot overflow
+        // into an effectively-infinite sleep.
+        assert_eq!(retry_backoff(base, 7), Duration::from_secs(32));
+        assert_eq!(retry_backoff(base, 99), Duration::from_secs(32));
+        // Zero base stays zero at every attempt (what tests rely on).
+        assert!(retry_backoff(Duration::ZERO, 4).is_zero());
+    }
+
+    /// vikunja #1240: a transient provider failure must not abort the turn.
+    /// The loop retries the same request with bounded backoff; the mock's queue
+    /// is drained only if every attempt actually happened.
+    #[tokio::test]
+    async fn transient_provider_errors_are_retried_until_one_succeeds() {
+        let provider = MockProvider::new(vec![
+            LlmResponse::retryable_error("API 529: overloaded"),
+            LlmResponse::retryable_error("API 503: upstream"),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::ZERO,
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            result.stop_reason,
+            StopReason::EndTurn,
+            "two transient failures should have been absorbed"
+        );
+        assert!(
+            provider.responses.lock().unwrap().is_empty(),
+            "all three attempts should have been consumed"
+        );
+    }
+
+    /// The other half of the rule: a fatal error is surfaced immediately. If it
+    /// retried, it would mask a real misconfiguration (bad key, bad request)
+    /// behind latency and burned tokens.
+    #[tokio::test]
+    async fn fatal_provider_errors_are_not_retried() {
+        let provider = MockProvider::new(vec![
+            LlmResponse::error("API 401: invalid api key"),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 3,
+                base_delay: std::time::Duration::ZERO,
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            provider.responses.lock().unwrap().len(),
+            1,
+            "the success response must remain unconsumed — no retry happened"
+        );
+    }
+
+    /// Retries are bounded: an endlessly-failing provider surfaces the error
+    /// rather than looping forever.
+    #[tokio::test]
+    async fn retries_are_capped_and_then_surface_the_error() {
+        let provider = MockProvider::new(vec![
+            LlmResponse::retryable_error("API 503: a"),
+            LlmResponse::retryable_error("API 503: b"),
+            LlmResponse::retryable_error("API 503: c"),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::ZERO,
+            },
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        // 1 initial + 2 retries = 3 consumed; the success response is never reached.
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+    }
+
     struct MockProvider {
         responses: Mutex<VecDeque<LlmResponse>>,
     }
@@ -2153,6 +2337,7 @@ mod tests {
 
     fn end_turn_resp_with_text(text: &str) -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: StopReason::EndTurn,
             error_message: None,
@@ -2163,6 +2348,7 @@ mod tests {
 
     fn tool_call_resp(id: &str, name: &str, input: Value) -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -2320,6 +2506,7 @@ mod tests {
         let session = shared(session);
 
         let first_response = LlmResponse {
+            retryable: false,
             content: controlled_tool_calls(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -3883,6 +4070,7 @@ mod tests {
                 on_event(ev);
             }
             LlmResponse {
+                retryable: false,
                 content: self.response.content.clone(),
                 stop_reason: self.response.stop_reason.clone(),
                 error_message: self.response.error_message.clone(),
@@ -4104,6 +4292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse {
+            retryable: false,
             content: vec![],
             stop_reason: StopReason::MaxTokens,
             error_message: None,
@@ -4122,6 +4311,7 @@ mod tests {
 
     fn max_tokens_text_resp() -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::Text("partial output".to_string())],
             stop_reason: StopReason::MaxTokens,
             error_message: None,
@@ -4265,6 +4455,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = BenchmarkCaptureProvider::new(vec![
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::ToolCall {
                     id: "cut-off-call".into(),
                     name: "write_file".into(),
@@ -4303,6 +4494,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::ToolCall {
                 id: "cut-off-call".into(),
                 name: "write_file".into(),
@@ -4343,6 +4535,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = BenchmarkCaptureProvider::new(vec![
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::ToolCall {
                     id: "cut-off-call".into(),
                     name: "write_file".into(),
@@ -4380,6 +4573,7 @@ mod tests {
         let provider = MockProvider::new(vec![
             tool_call_resp("t1", "nonexistent_tool", json!({})),
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::Text("done".into())],
                 stop_reason: StopReason::EndTurn,
                 error_message: None,
@@ -4570,6 +4764,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         let provider = MockProvider::new(vec![LlmResponse {
+            retryable: false,
             content: vec![
                 ContentBlock::Thinking("my reasoning".into()),
                 ContentBlock::Text("my answer".into()),
@@ -4658,6 +4853,7 @@ mod tests {
 
     fn end_turn_with_usage(text: &str, input: u64) -> LlmResponse {
         LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: StopReason::EndTurn,
             error_message: None,

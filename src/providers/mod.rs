@@ -205,6 +205,17 @@ pub struct LlmResponse {
     /// crosses into core — so the compaction reactive path (ADR-002) can
     /// know that compacting and retrying will help.
     pub context_overflow: bool,
+    /// True when the failure looks *transient* — a rate limit, overload, or
+    /// upstream/network fault — so retrying the same request may succeed
+    /// (vikunja #1240). Classified by each provider at its own boundary for the
+    /// same reason as `context_overflow`: per ADR-001 no provider phrasing
+    /// crosses into core, so core decides *whether* to retry but never *what
+    /// counts* as retryable.
+    ///
+    /// Independent of `context_overflow`: an oversized prompt is fatal for
+    /// retry purposes (ADR-002's reactive compaction handles it, and resending
+    /// the same prompt would fail identically).
+    pub retryable: bool,
     pub usage: Usage,
 }
 
@@ -215,6 +226,10 @@ impl LlmResponse {
             stop_reason: StopReason::Error,
             error_message: Some(msg.into()),
             context_overflow: false,
+            // Unclassified errors (parse failures, unknown response shapes) are
+            // deliberately NOT retryable: retrying a deterministic failure just
+            // burns tokens and latency.
+            retryable: false,
             usage: Usage::default(),
         }
     }
@@ -226,6 +241,30 @@ impl LlmResponse {
             ..Self::error(msg)
         }
     }
+
+    /// An error response classified as transient — safe to retry (#1240).
+    pub fn retryable_error(msg: impl Into<String>) -> Self {
+        LlmResponse {
+            retryable: true,
+            ..Self::error(msg)
+        }
+    }
+}
+
+/// Whether an HTTP status from a provider indicates a *transient* failure worth
+/// retrying (vikunja #1240).
+///
+/// Lives in the provider layer and is shared by all three adapters: HTTP status
+/// semantics are a standard rather than provider phrasing, so classifying here
+/// respects ADR-001 while avoiding a triplicated table that would drift.
+///
+/// Retryable: 408 request timeout, 429 rate limit, and any 5xx — including
+/// Cloudflare's 52x family, which providers behind a CDN return during
+/// overload. Everything else is fatal: 4xx means the request itself is wrong,
+/// so retrying it — or failing over to another model with the same bad request
+/// — would only mask the bug.
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429) || (500..600).contains(&status)
 }
 
 pub struct Context {
@@ -389,6 +428,45 @@ pub trait LlmProvider: Send + Sync {
 mod tests {
     use super::*;
 
+    /// vikunja #1240: a transient provider failure must be distinguishable from
+    /// a fatal one *at the provider boundary*, so core can retry without ever
+    /// reading provider phrasing (ADR-001). Status codes are a standard, not
+    /// phrasing, so the classifier is shared by all three adapters rather than
+    /// triplicated.
+    #[test]
+    fn http_status_classifies_transient_versus_fatal_provider_failures() {
+        // Transient: rate limits, overload, gateway and upstream faults.
+        for status in [429, 500, 502, 503, 504, 408, 522, 524] {
+            assert!(is_retryable_status(status), "{status} should be retryable");
+        }
+        // Fatal: retrying cannot help, and failover would mask a real bug.
+        for status in [400, 401, 403, 404, 405, 409, 413, 422] {
+            assert!(
+                !is_retryable_status(status),
+                "{status} must not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_error_marks_the_response_and_leaves_overflow_alone() {
+        let r = LlmResponse::retryable_error("API 503: overloaded");
+        assert!(r.retryable);
+        assert!(!r.context_overflow);
+        assert_eq!(r.stop_reason, StopReason::Error);
+
+        // The two classifications are independent: a context overflow is fatal
+        // for retry purposes — ADR-002's reactive compaction path handles it,
+        // and retrying the same oversized prompt would just fail again.
+        let o = LlmResponse::context_overflow_error("prompt is too long");
+        assert!(o.context_overflow);
+        assert!(!o.retryable);
+
+        // Default construction stays non-retryable so unclassified errors
+        // (parse failures, unknown shapes) never trigger a retry loop.
+        assert!(!LlmResponse::error("parse error").retryable);
+    }
+
     #[test]
     fn thinking_level_parses_every_known_level_case_insensitively() {
         let cases = [
@@ -440,6 +518,7 @@ mod tests {
     #[tokio::test]
     async fn default_stream_delegates_to_complete() {
         let provider = StaticProvider(LlmResponse {
+            retryable: false,
             content: vec![ContentBlock::Text("hi".into())],
             stop_reason: StopReason::EndTurn,
             error_message: None,

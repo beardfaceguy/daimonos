@@ -2100,6 +2100,7 @@ mod tests {
     impl LlmProvider for StaticProvider {
         async fn complete(&self, _context: &Context, _options: &CompleteOpts) -> LlmResponse {
             LlmResponse {
+                retryable: false,
                 content: vec![ContentBlock::Text("pong".to_string())],
                 stop_reason: StopReason::EndTurn,
                 error_message: None,
