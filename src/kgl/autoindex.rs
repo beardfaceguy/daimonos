@@ -11,6 +11,7 @@ use crate::config::KglConfig;
 use crate::kgl::store::KglStore;
 use crate::kgl::substrate::{filtered_walk_builder, Substrate};
 use crate::kgl::substrate_graphify::GraphifySubstrate;
+use crate::kgl::substrate_repowise::{repowise_has_code_nodes, RepowiseSubstrate};
 use crate::kgl::substrate_x07::X07Substrate;
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -36,6 +37,13 @@ pub fn detect(workspace: &Path, cfg: &KglConfig) -> Option<(&'static str, Box<dy
     // Only choose graphify when its graph actually has code content. A missing,
     // empty, or stub graph.json must fall through to x07 — otherwise an empty
     // graphify index would prune a usable graph built from *.x07.json sources.
+    // repowise first: it carries call edges, precise line spans and qualified
+    // names, and on this repo indexes 16,045 nodes against graphify's 6,050.
+    // graphify stays as a fallback until ADR 012 is superseded, so a workspace
+    // that has only the older index keeps working.
+    if repowise_has_code_nodes(workspace) {
+        return Some(("repowise", Box::new(RepowiseSubstrate)));
+    }
     if graphify_has_code_nodes(&workspace.join("graphify-out").join("graph.json")) {
         return Some(("graphify", Box::new(GraphifySubstrate)));
     }
