@@ -773,7 +773,49 @@ fn auto_continue_budget_from_env() -> Option<u32> {
     }
 }
 
+/// Run the agent tool loop, then flush analytics before returning.
+///
+/// `Analytics::record_async` performs its SQLite write on the blocking pool, so
+/// records still in flight when the process exits are silently lost. MCP mode
+/// drains at its idle-shutdown gate (see `mcp.rs`), but agent mode had no
+/// equivalent: `wait_until_quiet` appeared only in this file's `#[cfg(test)]`
+/// block. The result was under-recorded `tool_calls`, which silently corrupts
+/// any analysis built on those counts.
+///
+/// This is a thin wrapper so the drain runs on every exit path of the loop,
+/// which has several early returns.
 pub async fn run(
+    provider: &dyn LlmProvider,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    initial_messages: Vec<Message>,
+    config: &AgentConfig,
+) -> AgentResult {
+    let drain_session = std::sync::Arc::clone(&session);
+    let result = run_inner(provider, session, initial_messages, config).await;
+    drain_analytics(&drain_session).await;
+    result
+}
+
+/// Block until queued analytics writes reach disk.
+///
+/// Warns instead of failing: losing telemetry must never turn an otherwise
+/// successful agent run into an error. Returns immediately when the queue is
+/// already empty, so the common case costs nothing.
+async fn drain_analytics(session: &std::sync::Arc<tokio::sync::Mutex<Session>>) {
+    let analytics = { session.lock().await.analytics.clone() };
+    if let Some(analytics) = analytics {
+        if !analytics
+            .wait_until_quiet(std::time::Duration::from_secs(5))
+            .await
+        {
+            eprintln!(
+                "warning: analytics did not drain within 5s; some tool-call records were lost"
+            );
+        }
+    }
+}
+
+async fn run_inner(
     provider: &dyn LlmProvider,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
     initial_messages: Vec<Message>,
@@ -3514,6 +3556,50 @@ mod tests {
     }
 
     // --- AgentSession (multi-turn, project #183) ---
+
+    /// `run` must drain queued analytics writes before it returns.
+    ///
+    /// `record_async` performs its SQLite write on the blocking pool, so any
+    /// record still queued when the process exits is lost. MCP mode drains at
+    /// its idle-shutdown gate; agent mode previously had no equivalent, so
+    /// `tool_calls` was silently under-recorded and any analysis built on those
+    /// counts was corrupted (a real run created a snapshot yet logged zero
+    /// snapshot ops). This test deliberately does NOT call `wait_until_quiet` --
+    /// that drain is the behaviour under test.
+    #[tokio::test]
+    async fn run_drains_analytics_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let analytics = Arc::new(
+            crate::analytics::AnalyticsStore::new(&dir.path().join("analytics.db"), 90).unwrap(),
+        );
+        let mut session = session_in(dir.path());
+        session.analytics = Some(Arc::clone(&analytics));
+        let session = shared(session);
+
+        let provider = MockProvider::new(vec![
+            tool_call_resp("c1", "read_file", json!({"path": "a.txt"})),
+            end_turn_resp(),
+        ]);
+
+        let _ = run(
+            &provider,
+            Arc::clone(&session),
+            vec![Message::user("read a.txt")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        assert_eq!(
+            analytics.pending_writes(),
+            0,
+            "run() must drain queued analytics writes before returning"
+        );
+        assert!(
+            !analytics.session_summary().per_tool.is_empty(),
+            "the dispatched tool call must be durably recorded, not lost on exit"
+        );
+    }
 
     #[tokio::test]
     async fn session_prompt_returns_assistant_text_and_history() {
