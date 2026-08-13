@@ -64,68 +64,18 @@ fi
 
 echo "pre-commit: lint gate passed."
 
-# ── Update knowledge graph (graphify) ────────────────────────────────────────
-# Re-extract the full code corpus with graphify's canonical update path, then
-# stage the regenerated graph so graphify-out/ stays in lockstep with source.
-# A staged-file build_merge is not equivalent to a full extraction: global
-# dedup can drop nodes, trip the shrink guard, and leave report/labels out of
-# sync with graph.json (Vikunja #981). Best-effort and self-skipping — never
-# blocks a commit on graph tooling. Bypass with SKIP_GRAPHIFY=1.
-if [[ "${SKIP_GRAPHIFY:-0}" == "1" ]]; then
-  echo "pre-commit: graphify update skipped (SKIP_GRAPHIFY=1)."
-elif [[ ! -f "$REPO_ROOT/graphify-out/graph.json" ]]; then
-  echo "pre-commit: graphify-out/graph.json not found — run /graphify to build initial graph."
-elif [[ ! -f "$REPO_ROOT/graphify-out/.graphify_python" ]]; then
-  echo "pre-commit: .graphify_python missing — skipping graph update." >&2
-else
-  echo "pre-commit: updating knowledge graph..."
-  GRAPHIFY_PYTHON="$(cat "$REPO_ROOT/graphify-out/.graphify_python")"
-
-  # Code files staged for this commit (added/copied/modified/renamed).
-  STAGED_CODE="$(git diff --cached --name-only --diff-filter=ACMR \
-    | grep -E '\.(py|sh|ts|js|go|rs|java|rb|cs|cpp|c)$' || true)"
-
-  if [[ -z "$STAGED_CODE" ]]; then
-    echo "pre-commit: no code file changes — skipping graph update."
-  else
-    FILE_COUNT=$(echo "$STAGED_CODE" | wc -l | tr -d ' ')
-    echo "pre-commit: $FILE_COUNT changed code file(s); rebuilding full code graph..."
-
-    cd "$REPO_ROOT"
-
-    # Capture graphify's status via a sentinel so the formatting pipe cannot
-    # swallow failures. Do not use --force: graphify itself decides whether a
-    # shrink corresponds to explicit source deletion.
-    GRAPHIFY_OK_FILE="$(mktemp)"
-    trap 'rm -f "$GRAPHIFY_OK_FILE"' EXIT
-    {
-      if GRAPHIFY_NO_TIPS=1 "$GRAPHIFY_PYTHON" -m graphify update .; then
-        echo "0" > "$GRAPHIFY_OK_FILE"
-      else
-        echo "$?" > "$GRAPHIFY_OK_FILE"
-      fi
-    } 2>&1 | sed 's/^/  /'
-    GRAPHIFY_OK="$(cat "$GRAPHIFY_OK_FILE")"
-
-    if [[ "$GRAPHIFY_OK" -ne 0 ]]; then
-      echo "pre-commit: graphify update failed — skipping graph staging." >&2
-    else
-      # update generates graph.html even when this repository does not track
-      # it. Avoid leaving an unrelated multi-megabyte untracked file behind.
-      if git ls-files --error-unmatch graphify-out/graph.html >/dev/null 2>&1; then
-        git add "$REPO_ROOT/graphify-out/graph.html"
-      else
-        rm -f "$REPO_ROOT/graphify-out/graph.html"
-      fi
-
-      # Stage every tracked artifact the canonical update can modify, but only
-      # after it succeeds so graph.json/report/labels cannot drift apart.
-      git add "$REPO_ROOT/graphify-out/graph.json" \
-              "$REPO_ROOT/graphify-out/GRAPH_REPORT.md" \
-              "$REPO_ROOT/graphify-out/.graphify_labels.json" \
-              "$REPO_ROOT/graphify-out/.graphify_root" \
-              "$REPO_ROOT/graphify-out/manifest.json" 2>/dev/null || true
-      echo "pre-commit: graphify-out/ changes staged."
-    fi
-  fi
-fi
+# ── Knowledge graph ──────────────────────────────────────────────────────────
+# The graphify update block that used to live here is gone. It regenerated a
+# 6 MB graph.json and `git add`-ed it into every commit, which meant:
+#   - the generated artifact was tracked, so routine `git checkout` failed with
+#     "local changes would be overwritten" on a file no human had edited;
+#   - it gated on graphify-out/.graphify_python, which is untracked and so
+#     absent in every worktree — every commit made from a worktree printed
+#     "skipping graph update" and nobody read it. The graph silently went
+#     7 days and 61 commits stale while still being queried as authoritative.
+#
+# Replaced by repowise, whose index resyncs from .git-hooks/post-commit:
+# machine-local (.repowise/, gitignored), nothing staged, cannot block a
+# commit, and ~1.5s incrementally. Every repowise response also carries the
+# indexed commit and warns when it diverges from HEAD, so a stale index
+# announces itself instead of being trusted.
