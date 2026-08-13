@@ -9,6 +9,13 @@
 //! inferred) and intent/provenance are agent-declared via the metadata channel.
 //! Node identity is graphify's stable node `id` (not a content hash) — a Tacit
 //! backend would instead supply BLAKE3 definition hashes.
+//!
+//! Context: docs/adr/012-graphify-as-kgl-substrate.md. graphify was removed as
+//! this repo's doc tool in #168 (replaced by repowise) and is retained *only*
+//! to produce the `graph.json` this backend reads — deleting `graphify-out/`
+//! left KGL unable to re-index. `.git-hooks/_index-sync` keeps it current. The
+//! intended end state is a repowise-backed substrate and no graphify at all,
+//! at which point this module and that ADR are superseded together.
 
 use crate::kgl::model::{DefNode, Derivation, Edge, EdgeKind, NodeKind, SubstrateKind};
 use crate::kgl::substrate::{IndexResult, Substrate};
