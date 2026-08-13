@@ -14,7 +14,7 @@ Cross-tool guidance for AI coding agents working in this repository.
    Understand the project state before touching the codebase.
 3. Check `.cursor/rules/` — scoped rule files (bounded collections,
    configurable limits, env inheritance, no thread-spawn in callbacks,
-   resource lifecycle, full-lifecycle tests, graphify).
+   resource lifecycle, full-lifecycle tests, repowise).
 4. Check `.cursor/strategies/` — Rust collection patterns, memory-safety
    checklist, testing strategies.
 5. Check `docs/` for technical specs, and `docs/adr/` for the accepted
@@ -135,14 +135,16 @@ daimonos/
 │   ├── rules/                     # Scoped rule files (bounded collections,
 │   │                              #   configurable limits, env inheritance,
 │   │                              #   no thread-spawn in callbacks, resource
-│   │                              #   lifecycle, full-lifecycle tests, graphify)
+│   │                              #   lifecycle, full-lifecycle tests, repowise)
 │   └── strategies/                # Rust collection patterns, memory-safety
 │                                  #   checklist, testing strategies
-├── .git-hooks/                    # Repo hooks (incl. graphify rebuild)
+├── .git-hooks/                    # Repo hooks (_index-sync refreshes
+│                                  #   repowise + the graphify KGL substrate)
 ├── .github/
 │   ├── RELEASE_TEMPLATE.md
 │   └── workflows/                 # ci.yml, deploy.yml, distro.yml, release.yml
-├── graphify-out/                  # Committed knowledge graph (graph.json via Git LFS)
+├── graphify-out/                  # Local KGL substrate, gitignored (ADR 012)
+├── .repowise/                     # Local repowise index, gitignored
 ├── mcpb/manifest.json             # MCPB bundle manifest template
 ├── prompts/                       # Model-facing text, embedded via include_str!
 │   ├── README.md                  # How overrides work
