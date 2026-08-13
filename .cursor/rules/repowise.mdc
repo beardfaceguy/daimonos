@@ -1,0 +1,64 @@
+---
+description: repowise codebase intelligence — prefer it over grep for orientation
+alwaysApply: true
+---
+
+This project is indexed by repowise, exposed as MCP tools. Prefer them over
+grep/read for orienting in unfamiliar code; fall back to reading source when the
+answer needs a body repowise did not retrieve.
+
+## Which tool
+
+- **`get_overview`** — first call in an unfamiliar area. Architecture, module map,
+  entry points.
+- **`get_symbol("src/file.rs::Name")`** — the most reliable tool here. Returns the
+  exact body with line bounds, marked `verified` because it re-checks stored
+  bounds against the live file. Use it instead of Read + offset math whenever you
+  know the symbol name.
+- **`get_context(targets)`** — triage card for several files/symbols in **one**
+  call. Batch them; comparing three files in one call is how you spot that two
+  were changed and the third was missed.
+- **`get_answer(question)`** — natural-language question over the index. Good at
+  locating the right files. Read the prose, then verify before acting on it.
+- **`get_why(query)`** — architectural decisions and their evidence. Strong on
+  rationale recorded in module docstrings and ADRs.
+- **`search_codebase(query, kind?)`** — semantic search, filterable by
+  implementation / test / config / doc.
+- **`get_risk` / `get_change_risk` / `get_health` / `get_dead_code` /
+  `get_blast_radius`** — hotspots, co-change partners, defect scoring on a diff,
+  unreachable code.
+
+## Trusting the output
+
+- **The answer prints first, metadata after.** Read from the top. Piping through
+  `tail` shows a later section and reads as an answer to a different question.
+- **`confidence: high` is not a guarantee.** It reflects retrieval dominance, not
+  correctness. Cross-check anything load-bearing against the source.
+- **Private function bodies and dispatch functions do not reliably surface.** If a
+  question turns on the internals of a non-public fn, or on "which function
+  decides X", expect a miss and go read the file.
+- **When it cannot answer it says so** — "the excerpts don't include…". Treat that
+  as reliable and read the source rather than re-prompting.
+- **Every response carries the indexed commit** and warns when the index is behind
+  HEAD (`Index is behind HEAD: indexed X, now Y`). If you see that, run
+  `repowise update` (~1.5s incremental) before trusting the answer.
+
+`get_answer` synthesis costs roughly $0.05 per question (Claude Opus 5). Use it
+for real questions, not to look up a symbol you could fetch with `get_symbol`.
+
+## Keeping the index current
+
+Automatic: `.git-hooks/_index-sync` refreshes on post-commit, post-merge and
+post-checkout. Run `repowise update` by hand only if a response reports staleness.
+
+Commits made from a **worktree** do not refresh the index — this checkout is the
+indexed tree. A worktree branch reaches the index when it merges and this
+checkout pulls.
+
+## Not to be confused with graphify
+
+graphify is still installed, but **only** as the substrate for the KGL graph
+(`graphify-out/graph.json` → `kgl_query` / `kgl_assert`). It is no longer this
+project's documentation or search tool and should not be queried for
+architecture questions — use repowise. See
+`docs/adr/012-graphify-as-kgl-substrate.md`.
