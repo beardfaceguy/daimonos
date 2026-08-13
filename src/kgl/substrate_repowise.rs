@@ -102,6 +102,7 @@ impl Substrate for RepowiseSubstrate {
             ids.insert(node_id);
         }
 
+        let mut dangling = 0usize;
         let mut edge_stmt = conn.prepare(
             "SELECT source_node_id, target_node_id, edge_type, confidence FROM graph_edges",
         )?;
@@ -122,6 +123,7 @@ impl Substrate for RepowiseSubstrate {
             // external systems (`file:external:...`) and to non-code pages;
             // an edge to a node KGL never stored is a dangling reference.
             if !ids.contains(&from) || !ids.contains(&to) {
+                dangling += 1;
                 continue;
             }
             let Some(kind) = map_relation(edge_type.as_deref().unwrap_or("")) else {
@@ -134,6 +136,20 @@ impl Substrate for RepowiseSubstrate {
                 derivation: Derivation::Derived,
                 confidence: confidence.unwrap_or(1.0) as f32,
             });
+        }
+
+        // A few dangling endpoints are expected: repowise records edges to
+        // external systems (`file:external:serde`) that KGL never stores. Every
+        // edge dangling is not — that is an id-shape mismatch after a repowise
+        // schema change, and it yields a node-only graph that looks correct
+        // while `blast_radius` silently returns nothing. Say so.
+        if !out.nodes.is_empty() && out.edges.is_empty() && dangling > 0 {
+            tracing::warn!(
+                dangling,
+                nodes = out.nodes.len(),
+                "repowise substrate: every edge referenced an unknown node id; \
+                 the index schema may have changed and the graph has no edges"
+            );
         }
 
         Ok(out)
@@ -159,17 +175,24 @@ fn classify(kind: Option<&str>, node_type: Option<&str>) -> NodeKind {
 
 /// Map repowise relations onto KGL edge kinds.
 ///
-/// `co_changes` and `framework` are deliberately dropped. The first is derived
-/// from git history rather than structure — two files changing together is a
-/// correlation, not a dependency — and the second is a heuristic guess about
-/// framework wiring. Admitting either would put edges into the graph that no
-/// read of the source can justify, which is the thing KGL's `Derived`
-/// derivation is asserting.
+/// `co_changes`, `framework` and `dynamic_uses` are deliberately dropped. The
+/// first is derived from git history rather than structure — two files changing
+/// together is a correlation, not a dependency; the second is a heuristic guess
+/// about framework wiring; and the third is inferred dynamic dispatch, which is
+/// a guess about what *might* be called rather than an AST-proven fact.
+///
+/// Admitting any of them would put edges into the graph that no read of the
+/// source can justify, which is exactly what KGL's `Derived` derivation
+/// asserts. `dynamic_uses` was kept in the first draft of this backend and is
+/// the inconsistency that argument catches: it is no more structural than the
+/// other two, and shipping it as `Derived` would have let speculative edges
+/// into `blast_radius` under a label claiming they were proven.
 fn map_relation(rel: &str) -> Option<EdgeKind> {
     match rel {
         "calls" => Some(EdgeKind::Calls),
-        "defines" | "has_method" | "imports" | "implements" | "extends" | "type_use"
-        | "dynamic_uses" => Some(EdgeKind::DependsOn),
+        "defines" | "has_method" | "imports" | "implements" | "extends" | "type_use" => {
+            Some(EdgeKind::DependsOn)
+        }
         _ => None,
     }
 }
@@ -198,9 +221,18 @@ pub(crate) fn repowise_has_code_nodes(root: &Path) -> bool {
     let Ok(conn) = open_readonly(&path) else {
         return false;
     };
-    conn.query_row("SELECT COUNT(*) FROM graph_nodes", [], |r| {
-        r.get::<_, i64>(0)
-    })
+    // Symbols specifically, not rows. `graph_nodes` also holds one `file` row
+    // per indexed file including pure-documentation files, so a docs-only or
+    // still-building index has a non-zero row count while containing no code.
+    // Returning true there would let detect() displace a valid graphify/x07
+    // graph and let populate's prune take its agent-declared metadata with it.
+    // A `symbol` row only exists where repowise actually parsed code, which is
+    // the same thing graphify's guard means by `file_type == "code"`.
+    conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes WHERE node_type = 'symbol'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
     .map(|n| n > 0)
     .unwrap_or(false)
 }
@@ -310,6 +342,61 @@ mod tests {
             &[],
         );
         assert!(repowise_has_code_nodes(tmp.path()));
+    }
+
+    /// A docs-only index has rows in `graph_nodes` but no parsed code, and must
+    /// not read as a usable substrate. Counting rows rather than symbols let
+    /// such an index win `detect()` and displace a valid graphify/x07 graph —
+    /// taking its agent-declared metadata with it when populate pruned.
+    #[test]
+    fn docs_only_index_is_not_a_usable_substrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_db(
+            tmp.path(),
+            &[
+                ("README.md", None, "file", "README.md", 1, 40),
+                ("docs/adr/012.md", None, "file", "012.md", 1, 90),
+            ],
+            &[],
+        );
+        assert!(
+            !repowise_has_code_nodes(tmp.path()),
+            "file rows alone must not count as code"
+        );
+
+        // One parsed symbol is enough to make it usable.
+        write_db(
+            tmp.path(),
+            &[("src/a.rs::foo", Some("function"), "symbol", "foo", 1, 2)],
+            &[],
+        );
+        assert!(repowise_has_code_nodes(tmp.path()));
+    }
+
+    /// `dynamic_uses` is inferred dynamic dispatch, not an AST-proven fact. It
+    /// is dropped for the same reason as `co_changes` and `framework`: shipping
+    /// a guess under `Derivation::Derived` claims a proof KGL does not have.
+    #[test]
+    fn heuristic_relations_are_not_admitted_as_derived() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_db(
+            tmp.path(),
+            &[
+                ("src/a.rs::foo", Some("function"), "symbol", "foo", 1, 9),
+                ("src/a.rs::bar", Some("function"), "symbol", "bar", 11, 20),
+            ],
+            &[
+                ("src/a.rs::foo", "src/a.rs::bar", "dynamic_uses"),
+                ("src/a.rs::foo", "src/a.rs::bar", "co_changes"),
+                ("src/a.rs::foo", "src/a.rs::bar", "framework"),
+            ],
+        );
+        let out = RepowiseSubstrate.index(tmp.path()).unwrap();
+        assert!(
+            out.edges.is_empty(),
+            "no heuristic relation may enter the graph as Derived, got {:?}",
+            out.edges
+        );
     }
 
     /// Identity must be the path::name id, because KGL's agent-declared intent
