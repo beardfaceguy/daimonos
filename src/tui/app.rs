@@ -402,12 +402,13 @@ async fn run_event_loop(
 fn transcript_page_height(
     terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> anyhow::Result<usize> {
+    // Derived from the real layout, not from a constant describing it. Those
+    // were two independent descriptions of one split, and only one of them
+    // moved when the panes became proportional.
+    let size = terminal.size()?;
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     Ok(usize::from(
-        terminal
-            .size()?
-            .height
-            .saturating_sub(super::TUI_CHROME_HEIGHT)
-            .max(1),
+        super::render::tui_layout(area)[0].height.max(1),
     ))
 }
 

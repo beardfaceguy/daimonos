@@ -24,9 +24,15 @@ use crate::session_protocol::{
 use crate::tui::state::ViewState;
 
 pub const STATUS_HEIGHT: u16 = 1;
-pub const COMPOSER_TEXT_HEIGHT: u16 = 4;
-pub const COMPOSER_HEIGHT: u16 = COMPOSER_TEXT_HEIGHT + 2;
-pub const TUI_CHROME_HEIGHT: u16 = STATUS_HEIGHT + COMPOSER_HEIGHT;
+
+/// Share of the non-status area given to the composer; the transcript takes
+/// the rest. The composer used to be a fixed six rows, which meant a tall
+/// terminal grew the transcript and left the input a stub.
+pub const COMPOSER_DENOMINATOR: u16 = 3;
+
+/// Smallest composer that can still show anything: two border rows plus one
+/// row of text. Below this the pane is decoration, so the split gives way.
+pub const MIN_COMPOSER_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -57,7 +63,11 @@ pub fn render_with_options(
     // Overlay last so it sits above every base layer. It is the one thing a
     // human must act on, and ADR-011 keeps approval authority with the local
     // TUI regardless of which client ultimately answers.
-    render_approval_modal(state, area, buf);
+    // Over the transcript, not `area`: a modal centred on the whole screen
+    // lands on the status line at common terminal heights, and the status is
+    // meant to stay readable while an approval is pending. Keeping it inside
+    // the transcript also leaves the composer visible.
+    render_approval_modal(state, chunks[0], buf);
     if options.no_color {
         for cell in &mut buf.content {
             cell.set_fg(Color::Reset).set_bg(Color::Reset);
@@ -65,13 +75,37 @@ pub fn render_with_options(
     }
 }
 
-fn tui_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+/// Split `area` into transcript / status / composer.
+///
+/// The composer takes one third of everything below the status line and the
+/// transcript the other two thirds, so both panes track the terminal instead
+/// of the composer sitting at a fixed six rows.
+///
+/// Rounding favours the composer: it spends two of its rows on a border, so an
+/// odd row buys a whole text line there, while the transcript merely shows one
+/// line fewer. On a terminal too short to give the composer even
+/// [`MIN_COMPOSER_HEIGHT`], the transcript yields rather than the composer
+/// collapsing into pure border.
+///
+/// This is the single source of truth for pane heights. `transcript_page_height`
+/// in `app.rs` calls it rather than recomputing from constants — the previous
+/// `TUI_CHROME_HEIGHT` was a second, independent description of the same split,
+/// and a layout change would silently desync PageUp/PageDown from what is drawn.
+pub fn tui_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    let body = area.height.saturating_sub(STATUS_HEIGHT);
+    let composer = if body <= MIN_COMPOSER_HEIGHT {
+        body
+    } else {
+        // Round up, so 1/3 of 23 is 8 rather than 7.
+        body.div_ceil(COMPOSER_DENOMINATOR).max(MIN_COMPOSER_HEIGHT)
+    };
+
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
+            Constraint::Min(0),
             Constraint::Length(STATUS_HEIGHT),
-            Constraint::Length(COMPOSER_HEIGHT),
+            Constraint::Length(composer),
         ])
         .split(area)
 }
@@ -462,6 +496,16 @@ mod tests {
         buffer_to_string(&buf)
     }
 
+    /// Screen row of the composer's Nth text row, derived from the live layout.
+    ///
+    /// These cursor tests assert an absolute screen position, which depends on
+    /// where the composer sits. That is now proportional to terminal height, so
+    /// computing it here keeps them testing grapheme handling rather than
+    /// silently re-testing the layout constants.
+    fn composer_text_row(area: Rect, row: u16) -> u16 {
+        tui_layout(area)[2].y + 1 + row
+    }
+
     #[test]
     fn sanitize_strips_escape_sequences() {
         // A classic hostile OSC that would set the terminal title, plus a CSI
@@ -598,16 +642,54 @@ mod tests {
         assert!(out.contains("/help for help"), "help hint missing:\n{out}");
     }
 
+    /// The composer is one third of the space below the status line, and both
+    /// panes scale with the terminal. Fixed heights are what this replaced.
     #[test]
-    fn composer_reserves_four_visible_text_rows() {
-        assert_eq!(COMPOSER_TEXT_HEIGHT, 4);
-        assert_eq!(COMPOSER_HEIGHT, 6);
+    fn panes_split_two_thirds_transcript_one_third_composer() {
+        for height in [24u16, 30, 50, 60] {
+            let chunks = tui_layout(Rect::new(0, 0, 80, height));
+            let (transcript, status, composer) = (chunks[0], chunks[1], chunks[2]);
+
+            assert_eq!(status.height, STATUS_HEIGHT, "status is a single row");
+            assert_eq!(
+                transcript.height + status.height + composer.height,
+                height,
+                "panes must tile the full area at height {height}"
+            );
+
+            let body = height - STATUS_HEIGHT;
+            // Integer rounding, so allow the odd row either way.
+            assert!(
+                composer.height.abs_diff(body / 3) <= 1,
+                "composer {} is not ~1/3 of {body} at height {height}",
+                composer.height
+            );
+            assert!(
+                transcript.height > composer.height,
+                "transcript {} should exceed composer {} at height {height}",
+                transcript.height,
+                composer.height
+            );
+        }
+    }
+
+    /// A composer shorter than its own border is worse than a short transcript:
+    /// it shows nothing at all. The transcript gives way first.
+    #[test]
+    fn tiny_terminal_keeps_the_composer_usable() {
+        let chunks = tui_layout(Rect::new(0, 0, 40, 6));
+        assert!(
+            chunks[2].height >= MIN_COMPOSER_HEIGHT,
+            "composer collapsed to {} rows",
+            chunks[2].height
+        );
+        assert_eq!(chunks[0].height + chunks[1].height + chunks[2].height, 6);
     }
 
     #[test]
     fn composer_scrolls_to_keep_latest_input_visible() {
         let state = ViewState::new("sess-1");
-        let out = render_to_string(&state, "first\nsecond\nthird\nfourth\nfifth", 40, 12);
+        let out = render_to_string(&state, "first\nsecond\nthird\nfourth\nfifth", 40, 19);
 
         assert!(
             !out.contains("first"),
@@ -656,10 +738,13 @@ mod tests {
 
     #[test]
     fn composer_cursor_uses_display_width_for_wide_unicode() {
-        let area = Rect::new(0, 0, 12, 12);
+        let area = Rect::new(0, 0, 12, 19);
         // Five double-width glyphs exactly fill the ten-cell inner width,
         // placing the insertion cursor at column zero of the next row.
-        assert_eq!(composer_cursor_position("界界界界界", area), Some((1, 8)),);
+        assert_eq!(
+            composer_cursor_position("界界界界界", area),
+            Some((1, composer_text_row(area, 1))),
+        );
     }
 
     #[test]
@@ -744,7 +829,7 @@ mod tests {
                 request_id: None,
             },
         );
-        let area = Rect::new(0, 0, 20, 11);
+        let area = Rect::new(0, 0, 20, 9);
         let mut latest = Buffer::empty(area);
         render_with_options(&state, "", area, &mut latest, RenderOptions::default());
         let mut earlier = Buffer::empty(area);
@@ -811,21 +896,30 @@ mod tests {
 
     #[test]
     fn composer_wraps_emoji_graphemes_as_single_display_units() {
-        let area = Rect::new(0, 0, 6, 12);
-        assert_eq!(composer_cursor_position("👩‍🔬👩‍🔬", area), Some((1, 8)),);
+        let area = Rect::new(0, 0, 6, 19);
+        assert_eq!(
+            composer_cursor_position("👩‍🔬👩‍🔬", area),
+            Some((1, composer_text_row(area, 1))),
+        );
     }
 
     #[test]
     fn composer_keeps_combining_marks_with_their_base_character() {
-        let area = Rect::new(0, 0, 6, 12);
-        assert_eq!(composer_cursor_position("abc\u{301}d", area), Some((1, 8)),);
+        let area = Rect::new(0, 0, 6, 19);
+        assert_eq!(
+            composer_cursor_position("abc\u{301}d", area),
+            Some((1, composer_text_row(area, 1))),
+        );
     }
 
     #[test]
     fn composer_scroll_does_not_stop_after_u16_max_rows() {
-        let area = Rect::new(0, 0, 12, 12);
+        let area = Rect::new(0, 0, 12, 19);
         let composer = "x".repeat(700_000);
-        assert_eq!(composer_cursor_position(&composer, area), Some((1, 10)));
+        assert_eq!(
+            composer_cursor_position(&composer, area),
+            Some((1, composer_text_row(area, 3)))
+        );
     }
 
     #[test]
@@ -839,7 +933,7 @@ mod tests {
     #[test]
     fn composer_replaces_graphemes_wider_than_a_tiny_viewport() {
         let state = ViewState::new("sess-1");
-        let out = render_to_string(&state, "界a", 3, 12);
+        let out = render_to_string(&state, "界a", 3, 19);
 
         assert!(
             out.contains('\u{fffd}'),
@@ -849,27 +943,34 @@ mod tests {
             !out.contains('界'),
             "unrenderable glyph should be replaced:\n{out}"
         );
+        // Height 19 reproduces the four-row composer interior this was written
+        // against; the row is derived so a future layout change cannot silently
+        // turn this grapheme test into a layout test.
+        let area = Rect::new(0, 0, 3, 19);
         assert_eq!(
-            composer_cursor_position("界a", Rect::new(0, 0, 3, 12)),
-            Some((1, 9)),
+            composer_cursor_position("界a", area),
+            Some((1, composer_text_row(area, 2))),
         );
     }
 
     #[test]
     fn newline_after_standalone_zero_width_grapheme_is_preserved() {
-        let area = Rect::new(0, 0, 6, 12);
+        let area = Rect::new(0, 0, 6, 19);
         assert_eq!(
             composer_cursor_position("abcd\u{200b}\nq", area),
-            Some((2, 9)),
+            Some((2, composer_text_row(area, 2))),
         );
     }
 
     #[test]
     fn newline_after_exact_width_starts_one_empty_logical_line() {
-        let area = Rect::new(0, 0, 6, 12);
+        let area = Rect::new(0, 0, 6, 19);
         // The hard-wrap and explicit newline identify the same next row; they
         // must not create a second blank row.
-        assert_eq!(composer_cursor_position("abcd\n", area), Some((1, 8)),);
+        assert_eq!(
+            composer_cursor_position("abcd\n", area),
+            Some((1, composer_text_row(area, 1))),
+        );
     }
 
     #[test]
