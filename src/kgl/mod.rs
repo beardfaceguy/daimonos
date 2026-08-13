@@ -18,6 +18,7 @@ pub mod query;
 pub mod store;
 pub mod substrate;
 pub mod substrate_graphify;
+pub mod substrate_repowise;
 pub mod substrate_x07;
 
 #[cfg(test)]

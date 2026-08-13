@@ -8,6 +8,7 @@ use crate::kgl::model::{DefNode, Edge, EdgeKind};
 use crate::kgl::store::{Direction, KglStore, NodeRecord, Violation};
 use crate::kgl::substrate::Substrate;
 use crate::kgl::substrate_graphify::GraphifySubstrate;
+use crate::kgl::substrate_repowise::{repowise_has_code_nodes, RepowiseSubstrate};
 use crate::kgl::substrate_x07::X07Substrate;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -54,6 +55,24 @@ pub fn run(
                         }));
                     }
                     ("graphify", Box::new(GraphifySubstrate))
+                }
+                Some("repowise") => {
+                    // Same guard as graphify: an index that is missing, empty
+                    // or mid-build must not be indexed, because populate's
+                    // prune reads zero nodes as "everything was deleted".
+                    if !repowise_has_code_nodes(workspace) {
+                        return Ok(json!({
+                            "indexed": false,
+                            "substrate": "repowise",
+                            "nodes": 0,
+                            "edges": 0,
+                            "reason": "repowise substrate requested but .repowise/wiki.db is missing or has no graph nodes — refusing to index (would prune the existing graph)",
+                        }));
+                    }
+                    (
+                        "repowise",
+                        Box::new(RepowiseSubstrate) as Box<dyn Substrate>,
+                    )
                 }
                 Some("x07") => {
                     // Symmetric to the graphify guard: an explicit x07 request
