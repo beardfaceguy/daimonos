@@ -28,6 +28,22 @@ instance_contents_log.txt
 .repowise-workspace.yaml
 graphify-out/
 
+# Editor/agent config that repowise regenerates on every `repowise update`.
+# .mcp.json and .vscode/mcp.json hardcode an absolute workspace path, so they
+# are per-machine by construction: committing them ships one developer's home
+# directory to everyone else and leaves the tree dirty after every commit.
+# `repowise init` regenerates both. The lock file is per-process runtime state.
+#
+# .claude/CLAUDE.md is 84/89 lines auto-generated, and its generated block
+# embeds the indexed commit plus drifting health scores -- a 3-line diff after
+# every commit. Nothing was written above the marker, and AGENTS.md already is
+# this repo's tracked, hand-written agent instruction file, so there is nothing
+# to preserve. .vscode/extensions.json IS tracked: portable and stable.
+.mcp.json
+.vscode/mcp.json
+.claude/scheduled_tasks.lock
+.claude/CLAUDE.md
+
 # KGL session state (per-machine SQLite database)
 .kgl/
 
