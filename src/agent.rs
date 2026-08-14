@@ -4953,10 +4953,25 @@ mod tests {
             &provider,
             shared(s),
             vec![Message::user("go")],
-            &AgentConfig::default(),
+            &config_without_auto_continue(),
         )
         .await;
         assert_eq!(result.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// An `AgentConfig` with auto-continue pinned off.
+    ///
+    /// `AgentConfig::default()` leaves `auto_continue_budget` as `None`, and
+    /// `run` then falls back to `DAIMONOS_AGENT_AUTO_CONTINUE` (see
+    /// `auto_continue_budget_from_env`). A test asserting that max-tokens
+    /// *stops* the loop is only meaningful with auto-continue off, so leaving
+    /// it unset makes the test pass or fail depending on the shell it runs in:
+    /// green in CI, red for any developer who actually uses the agent. Pin it.
+    fn config_without_auto_continue() -> AgentConfig {
+        AgentConfig {
+            auto_continue_budget: Some(0),
+            ..AgentConfig::default()
+        }
     }
 
     fn max_tokens_text_resp() -> LlmResponse {
@@ -5163,7 +5178,7 @@ mod tests {
             &provider,
             shared(s),
             vec![Message::user("go")],
-            &AgentConfig::default(),
+            &config_without_auto_continue(),
         )
         .await;
 
@@ -5202,7 +5217,7 @@ mod tests {
         let mut session = AgentSession::new(
             Box::new(provider),
             session_in(dir.path()),
-            AgentConfig::default(),
+            config_without_auto_continue(),
         );
 
         let first = session.prompt("start").await;
