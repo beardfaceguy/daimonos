@@ -1,6 +1,10 @@
 //! Repowise substrate backend: builds a KGL graph from repowise's index
-//! (`.repowise/wiki.db`), replacing the graphify backend this repo carried
-//! only to feed KGL (see `docs/adr/012-graphify-as-kgl-substrate.md`).
+//! (`.repowise/wiki.db`). This is the default substrate; graphify is kept as a
+//! manual fallback. Context: docs/adr/013-repowise-as-kgl-substrate.md.
+//!
+//! Note this reads seven column names out of repowise's private index schema,
+//! which carries no compatibility promise. That is the reason ADR 013 keeps the
+//! graphify backend alive rather than deleting it.
 //!
 //! Like graphify this is a DERIVED, AST-level graph: structure only. Effects
 //! stay empty and intent/provenance remain agent-declared through the metadata

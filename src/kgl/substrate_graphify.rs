@@ -10,12 +10,13 @@
 //! Node identity is graphify's stable node `id` (not a content hash) — a Tacit
 //! backend would instead supply BLAKE3 definition hashes.
 //!
-//! Context: docs/adr/012-graphify-as-kgl-substrate.md. graphify was removed as
-//! this repo's doc tool in #168 (replaced by repowise) and is retained *only*
-//! to produce the `graph.json` this backend reads — deleting `graphify-out/`
-//! left KGL unable to re-index. `.git-hooks/_index-sync` keeps it current. The
-//! intended end state is a repowise-backed substrate and no graphify at all,
-//! at which point this module and that ADR are superseded together.
+//! Context: docs/adr/013-repowise-as-kgl-substrate.md. KGL now indexes
+//! [`crate::kgl::substrate_repowise`]; this backend is a **supported fallback**,
+//! not the default, and is no longer refreshed automatically. It earns its keep
+//! because the repowise substrate reads that tool's private SQLite schema with
+//! no compatibility promise, whereas `graph.json` is networkx node-link — so if
+//! repowise renames a column, this is the recovery path. Waking it is one
+//! command: `graphify update .`, then request `substrate:"graphify"`.
 
 use crate::kgl::model::{DefNode, Derivation, Edge, EdgeKind, NodeKind, SubstrateKind};
 use crate::kgl::substrate::{IndexResult, Substrate};
