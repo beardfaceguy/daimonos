@@ -6,8 +6,13 @@ _Anchors: `src/kgl/substrate_graphify.rs::GraphifySubstrate`, `src/kgl/autoindex
 
 ## Status
 
-Accepted. Intended to be superseded by a repowise-backed substrate (see
-_Intended end state_).
+**Superseded by [ADR 013](013-repowise-as-kgl-substrate.md)** (2026-08-13).
+
+The repowise substrate this ADR anticipated now exists, so graphify is no
+longer what KGL indexes. 013 departs from the end state named below: graphify
+is *retained* as a manual fallback rather than removed, because the new
+substrate depends on repowise's private index schema and wants a second
+source that does not. Only graphify's automatic refresh was removed.
 
 ## Context
 

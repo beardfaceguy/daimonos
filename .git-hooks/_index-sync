@@ -2,25 +2,21 @@
 # Resync derived indexes. Called by post-commit, post-merge and post-checkout —
 # the three points at which this checkout's content changes.
 #
-# Two consumers, one trigger:
+# One consumer:
 #
-#   repowise  -> .repowise/    docs, search, git signals (MCP: the repowise tools)
-#   graphify  -> graphify-out/ graph.json ONLY, as the substrate KGL indexes
+#   repowise -> .repowise/   docs, search, git signals, and the graph KGL indexes
 #
-# Why graphify is still here after being removed in #168: `graph.json` has a
-# second consumer beyond the wiki it was removed for. `src/kgl/substrate_
-# graphify.rs` builds the KGL graph from it, and KGL is user-facing through the
-# kgl_query / kgl_assert MCP tools. Deleting graphify-out left KGL unable to
-# re-index — it fails safely (refuses rather than pruning) but is frozen. See
-# docs/adr/012-graphify-as-kgl-substrate.md; the intended end state is a
-# repowise-backed substrate and no graphify at all.
+# graphify used to be refreshed here too, because KGL read its graph.json. #1291
+# moved KGL onto a repowise-backed substrate, so nothing consumes graphify's
+# output automatically any more. It remains a *supported* substrate — the code
+# and the `substrate:"graphify"` request path are intact — but refreshing it on
+# every commit was pure cost once KGL stopped reading it: ~5s per commit, 16 MB
+# on disk, and a shrink guard that refuses to rebuild whenever a commit deletes
+# a public symbol, silently, until someone runs `graphify update . --force` by
+# hand. Anyone who wants the fallback runs that one command. See
+# docs/adr/013-repowise-as-kgl-substrate.md.
 #
-# The chain is source -> graphify update -> graph.json -> KGL -> kgl.db. KGL
-# owns the second arrow (startup autoindex + file watcher, gated by
-# DAIMONOS_KGL_AUTOINDEX). This script owns the first: without it graph.json
-# goes stale silently, and unlike repowise, KGL does not announce staleness.
-#
-# Both outputs are gitignored, so nothing here is ever staged — that was the
+# The index is gitignored, so nothing here is ever staged — that was the
 # defect in the pre-commit block this replaces, which `git add`-ed a 6 MB
 # graph.json into every commit and broke `git checkout`.
 #
@@ -33,14 +29,13 @@
 index_sync() {
   ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
 
-  # Worktrees have neither directory, so they skip both. That is correct, not a
-  # gap: this checkout is the indexed tree. A worktree branch reaches the
-  # indexes when it merges and this checkout pulls, which post-merge covers.
-  [ -d "$ROOT/.repowise" ] || [ -d "$ROOT/graphify-out" ] || return 0
+  # Worktrees have no .repowise/, so they skip. That is correct, not a gap:
+  # this checkout is the indexed tree. A worktree branch reaches the index when
+  # it merges and this checkout pulls, which post-merge covers.
+  [ -d "$ROOT/.repowise" ] || return 0
 
   TRIGGER="${1:-unknown}"
   LOG="$ROOT/.repowise/.update.log"
-  [ -d "$ROOT/.repowise" ] || LOG="$ROOT/graphify-out/.update.log"
 
   HEAD_SHA=$(git rev-parse HEAD 2>/dev/null) || HEAD_SHA=""
   {
@@ -59,14 +54,6 @@ index_sync() {
       fi
     fi
 
-    # KGL substrate. Deliberately no --no-viz: that flag does not exist on
-    # `update` (graphify's own over-limit warning suggests it, but for a
-    # different entry point) and passing it exits 2 without rebuilding, which
-    # fails silently here. graphify skips the HTML view by itself past ~5000
-    # nodes; this repo is well over, so it only prints a note.
-    if [ -d "$ROOT/graphify-out" ] && command -v graphify >/dev/null 2>&1; then
-      GRAPHIFY_NO_TIPS=1 graphify update . >> "$LOG" 2>&1
-    fi
   ) &
 
   return 0

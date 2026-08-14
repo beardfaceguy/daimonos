@@ -57,8 +57,11 @@ checkout pulls.
 
 ## Not to be confused with graphify
 
-graphify is still installed, but **only** as the substrate for the KGL graph
-(`graphify-out/graph.json` → `kgl_query` / `kgl_assert`). It is no longer this
-project's documentation or search tool and should not be queried for
-architecture questions — use repowise. See
-`docs/adr/012-graphify-as-kgl-substrate.md`.
+graphify is still installed, but nothing reads it automatically. KGL now
+indexes repowise's own index (`kgl_query` / `kgl_assert`), and graphify is a
+**manual fallback substrate** kept in case repowise's private index schema
+changes under us. It is not this project's documentation or search tool and
+should not be queried for architecture questions — use repowise.
+
+`graphify-out/` is deliberately stale; `graphify update .` wakes it. See
+`docs/adr/013-repowise-as-kgl-substrate.md`.
