@@ -103,6 +103,17 @@ type ActiveToolCalls = Arc<StdMutex<HashMap<String, ActiveToolCall>>>;
 /// of the same underlying connection; request UUIDs and oneshot channels route
 /// responses independently of the handler dispatch that supplied the clone.
 /// Canonical tool and approval lifecycles do not depend on this adapter handle.
+///
+/// **Invariant: the `Option` is never `None` in practice.** It is written
+/// `Some(..)` when the session is built and re-armed `Some(..)` at the top of
+/// every prompt dispatch; no code path clears it. #1107 fix #2 kept it that way
+/// on purpose when it coupled prompt lifetime to transport lifetime — teardown
+/// cancels turns and retires approvals/tool calls but leaves this slot armed,
+/// so notifications to the dead pipe just fail and are discarded.
+///
+/// Do not clear it to `None` without first reading the `current_cx` early
+/// return in `build_after_tool_call_hook`: that branch is unreachable only
+/// because of this invariant, and it is not safe if the invariant is dropped.
 type CurrentConnection = Arc<StdMutex<Option<ConnectionTo<AcpClientRole>>>>;
 
 /// The ACP JSON-RPC input descriptor. Named rather than inlined because it is
@@ -1150,6 +1161,20 @@ fn build_after_tool_call_hook(
         if !canonical_finished {
             return AfterHookResult::Continue;
         }
+        // Unreachable while `CurrentConnection` holds its never-`None`
+        // invariant (see the type's docs). Left as a total match rather than an
+        // unwrap because making it reachable is an open design question, not an
+        // impossibility — but it is NOT safe to reach as written:
+        //
+        // `acp_finished` above has already removed the id from
+        // `active_tool_calls` (the terminal claim) and the canonical
+        // `ToolCallFinished` has already been emitted. With the id gone, no
+        // later path can deliver the terminal ACP update —
+        // `cancel_active_tool_calls` drains that same map — so a still-connected
+        // client would sit on Pending/InProgress chrome for that tool call
+        // forever. Whether to keep the id claimable or skip the canonical event
+        // depends on how canonical events are consumed on reconnect (#1097).
+        // Full analysis: vikunja #1107, first comment.
         let Some(cx) = current_cx(&connection) else {
             return AfterHookResult::Continue;
         };
@@ -3499,6 +3524,16 @@ async fn shutdown_all_bridges(state: &AcpState) {
         map.drain().map(|(_, handle)| handle).collect()
     };
     for handle in handles {
+        // vikunja #1107 fix #2: retire the work this transport owned before
+        // tearing its bridge down. Signalling cancel here is what stops an
+        // in-flight prompt from running on detached from the client that asked
+        // for it — the incident's orphaned turn outlived its dead pipe by ~41
+        // minutes because teardown drained bridges and nothing else.
+        request_session_cancel(&handle);
+        // Signalling alone only asks the turn to stop; a turn parked on an
+        // approval never observes it. Resolve approvals and close canonical
+        // tool calls here so nothing is left waiting on a client that is gone.
+        handle.core.cleanup_cancelled_turn();
         let _ = handle.core.events.emit(CoreSessionEvent::SessionEnding {
             reason: SESSION_END_REASON_ENGINE_SHUTDOWN.to_string(),
         });
@@ -4602,6 +4637,128 @@ mod tests {
 
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(state.sessions.lock().await.len(), 1);
+    }
+
+    /// Build an ACP engine with one live session, driven the way a client
+    /// would. The workspace is returned so it outlives the state.
+    async fn state_with_live_session() -> (Arc<AcpState>, Arc<SessionHandle>, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut state_out = None;
+        let agent = build_agent_with_state(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            SessionCompaction::new(None, false),
+            None,
+            false,
+            crate::providers::ThinkingLevel::default(),
+            &mut state_out,
+        );
+        let state = state_out.expect("ACP state");
+        let cwd = workspace.path().to_path_buf();
+
+        AcpClientRole
+            .builder()
+            .connect_with(
+                agent,
+                move |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let handle = state
+            .sessions
+            .lock()
+            .await
+            .values()
+            .next()
+            .cloned()
+            .expect("one live session");
+        (state, handle, workspace)
+    }
+
+    /// vikunja #1107 fix #2: a prompt parked on an approval when the transport
+    /// dies must have that approval resolved. Left pending, the turn can never
+    /// unwind and the cancel signal alone does not reach it.
+    #[tokio::test]
+    async fn transport_teardown_resolves_pending_approvals() {
+        let (state, handle, _workspace) = state_with_live_session().await;
+        let approval = handle
+            .core
+            .approvals
+            .register(CoreApprovalRequest::unassigned(
+                "tool-1",
+                "exec",
+                "run tests",
+                false,
+            ))
+            .expect("register approval");
+        assert_eq!(handle.core.approvals.pending().len(), 1);
+
+        shutdown_all_bridges(&state).await;
+
+        assert!(
+            handle.core.approvals.pending().is_empty(),
+            "transport teardown must resolve pending approvals",
+        );
+        assert_eq!(
+            approval.receiver.await.expect("resolution").decision,
+            CoreApprovalDecision::Deny,
+        );
+    }
+
+    /// vikunja #1107 fix #2: when the ACP transport disappears, every prompt it
+    /// owned must be signalled cancelled. Engine teardown previously drained
+    /// only MCP bridges, so an in-flight turn kept running detached from its
+    /// client — the incident's ~41-minute orphaned prompt.
+    #[tokio::test]
+    async fn transport_teardown_cancels_in_flight_turns() {
+        let (state, handle, _workspace) = state_with_live_session().await;
+
+        let statuses: Arc<StdMutex<Vec<crate::session_protocol::TurnStatus>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let statuses_for_handler = Arc::clone(&statuses);
+        let _subscription = handle
+            .core
+            .events
+            .subscribe(
+                4,
+                Arc::new(move |_seq, event| {
+                    if let CoreSessionEvent::TurnStatusChanged { status } = event {
+                        statuses_for_handler
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(status);
+                    }
+                }),
+            )
+            .expect("subscribe");
+
+        // A turn is in flight at the moment the transport dies.
+        let _turn = handle.core.begin_turn().expect("begin turn");
+
+        shutdown_all_bridges(&state).await;
+
+        let seen = statuses.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            seen.contains(&crate::session_protocol::TurnStatus::Cancelling),
+            "transport teardown must signal the in-flight turn cancelled; saw {seen:?}",
+        );
     }
 
     #[tokio::test]
