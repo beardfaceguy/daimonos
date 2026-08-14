@@ -1106,16 +1106,33 @@ mod tests {
             "bg subprocess did not see op.kv env var (got: {written:?})"
         );
 
-        let poll_resp = poll(
-            &mut s,
-            &Op {
-                c: 10,
-                n: Some(pid),
-                ..Op::default()
-            },
-        )
-        .await;
-        assert!(poll_resp.ok);
+        // Wait for the child to actually exit, rather than treating "out.txt
+        // appeared" as proof that it did. Writing the file and exiting are two
+        // events: the shell still has to close the redirect and return, and
+        // under parallel test load that gap is wide enough to observe. `poll`
+        // is also what reaps a finished child, so calling it too early both
+        // reports running=true and leaves the process in the map -- which is
+        // why this failed roughly one full-suite run in three while passing
+        // every time in isolation.
+        let mut poll_resp = None;
+        for _ in 0..100 {
+            let resp = poll(
+                &mut s,
+                &Op {
+                    c: 10,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(resp.ok, "poll failed: {:?}", resp.m);
+            if resp.d.as_ref().unwrap()["running"] == false {
+                poll_resp = Some(resp);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let poll_resp = poll_resp.expect("bg child never reported exit within 2s");
         assert_eq!(poll_resp.d.as_ref().unwrap()["running"], false);
 
         assert!(
@@ -1126,6 +1143,94 @@ mod tests {
             !log_path.exists(),
             "bg log file at {} should be deleted after poll() reap",
             log_path.display()
+        );
+    }
+
+    /// The gap the test above used to assume away, made deterministic.
+    ///
+    /// `bg_passes_op_kv_to_subprocess` polled once, immediately after its
+    /// output file appeared, and asserted the child had exited. A file
+    /// appearing does not mean the process is gone, and that race only showed
+    /// up under parallel load -- it passed 12/12 in isolation and failed about
+    /// one full-suite run in three.
+    ///
+    /// Here the child writes its file and *then* lingers, so the window is
+    /// always open rather than sometimes. A single poll at the moment the file
+    /// appears observes `running: true`; only waiting for the real exit gives
+    /// `false` and reaps the entry.
+    #[tokio::test]
+    async fn poll_reports_running_until_the_child_actually_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_in(dir.path());
+
+        let bg_resp = bg(
+            &mut s,
+            &Op {
+                c: 9,
+                s: Some("sh".into()),
+                a: Some(vec!["-c".into(), "echo done > out.txt; sleep 0.5".into()]),
+                q: Some(dir.path().to_string_lossy().into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(bg_resp.ok, "bg failed: {:?}", bg_resp.m);
+        let pid = bg_resp.d.unwrap()["pid"].as_u64().unwrap() as i64;
+
+        let out_file = dir.path().join("out.txt");
+        for _ in 0..100 {
+            if out_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(out_file.exists(), "child never wrote its output file");
+
+        // The file is there and the child is definitely still alive. This is
+        // exactly the state the old assertion mistook for "finished".
+        let early = poll(
+            &mut s,
+            &Op {
+                c: 10,
+                n: Some(pid),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(early.ok);
+        assert_eq!(
+            early.d.as_ref().unwrap()["running"],
+            true,
+            "output file appearing must not be read as process exit"
+        );
+        assert!(
+            !s.bg_processes.is_empty(),
+            "a still-running child must not be reaped"
+        );
+
+        // Now wait for the real exit.
+        let mut final_resp = None;
+        for _ in 0..150 {
+            let resp = poll(
+                &mut s,
+                &Op {
+                    c: 10,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(resp.ok);
+            if resp.d.as_ref().unwrap()["running"] == false {
+                final_resp = Some(resp);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(final_resp.is_some(), "child never reported exit within 3s");
+        assert!(
+            s.bg_processes.is_empty(),
+            "poll() should reap once the child has actually exited"
         );
     }
 
