@@ -281,6 +281,10 @@ call_timeout_secs = 60
 # Maximum time to wait for an MCP runtime and its child process to shut down.
 # Expiry is logged and ACP teardown continues instead of orphaning daimonos.
 shutdown_timeout_secs = 5
+# Overall budget for concurrently shutting down every live session's MCP
+# bridge after the ACP transport ends. This exceeds the per-runtime budget so
+# responsive bridge shutdowns can finish without racing the outer deadline.
+teardown_timeout_secs = 10
 # Upper bound on forwarded servers connected per session (bounds spawned
 # processes / connections). Extra servers are ignored.
 max_servers = 32

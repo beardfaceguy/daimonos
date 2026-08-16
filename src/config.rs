@@ -713,6 +713,9 @@ pub struct AcpMcpConfig {
     /// Maximum time to wait for an MCP client runtime/child to shut down.
     /// Teardown continues after the deadline so ACP itself can exit.
     pub shutdown_timeout_secs: u64,
+    /// Overall budget for concurrently shutting down every live session's MCP
+    /// bridge when the ACP transport ends.
+    pub teardown_timeout_secs: u64,
     /// Upper bound on forwarded servers connected per session (bounds spawned
     /// processes / connections). Extra servers are ignored.
     pub max_servers: usize,
@@ -750,6 +753,7 @@ impl Default for AcpMcpConfig {
             init_timeout_secs: 10,
             call_timeout_secs: 60,
             shutdown_timeout_secs: 5,
+            teardown_timeout_secs: 10,
             max_servers: 32,
             max_concurrent_connects: 8,
             max_tools_per_server: 128,
@@ -772,6 +776,9 @@ impl AcpMcpConfig {
         }
         if self.shutdown_timeout_secs == 0 {
             return Err("acp.mcp.shutdown_timeout_secs must be greater than zero".to_string());
+        }
+        if self.teardown_timeout_secs == 0 {
+            return Err("acp.mcp.teardown_timeout_secs must be greater than zero".to_string());
         }
         if self.max_servers == 0 {
             return Err("acp.mcp.max_servers must be greater than zero".to_string());
@@ -2169,6 +2176,7 @@ mod tests {
         assert_eq!(cfg.acp.mcp.init_timeout_secs, 10);
         assert_eq!(cfg.acp.mcp.call_timeout_secs, 60);
         assert_eq!(cfg.acp.mcp.shutdown_timeout_secs, 5);
+        assert_eq!(cfg.acp.mcp.teardown_timeout_secs, 10);
         assert!(cfg.acp.mcp.max_servers > 0);
         assert_eq!(cfg.acp.mcp.max_concurrent_connects, 8);
         assert!(cfg.acp.mcp.max_tools_per_server > 0);
@@ -2178,7 +2186,7 @@ mod tests {
     #[test]
     fn acp_mcp_parses_overrides() {
         let cfg: Config = toml::from_str(
-            "[acp.mcp]\nenabled = false\nallow_http = false\nshared_pool_enabled = false\ninit_timeout_secs = 3\nshutdown_timeout_secs = 2\nmax_servers = 4\nmax_concurrent_connects = 2\n",
+            "[acp.mcp]\nenabled = false\nallow_http = false\nshared_pool_enabled = false\ninit_timeout_secs = 3\nshutdown_timeout_secs = 2\nteardown_timeout_secs = 4\nmax_servers = 4\nmax_concurrent_connects = 2\n",
         )
         .unwrap();
         assert!(!cfg.acp.mcp.enabled);
@@ -2187,6 +2195,7 @@ mod tests {
         assert!(cfg.acp.mcp.allow_stdio);
         assert_eq!(cfg.acp.mcp.init_timeout_secs, 3);
         assert_eq!(cfg.acp.mcp.shutdown_timeout_secs, 2);
+        assert_eq!(cfg.acp.mcp.teardown_timeout_secs, 4);
         assert_eq!(cfg.acp.mcp.max_servers, 4);
         assert_eq!(cfg.acp.mcp.max_concurrent_connects, 2);
         assert!(cfg.validate().is_ok());
@@ -2206,6 +2215,10 @@ mod tests {
             (
                 "acp.mcp.shutdown_timeout_secs",
                 "[acp.mcp]\nshutdown_timeout_secs = 0\n",
+            ),
+            (
+                "acp.mcp.teardown_timeout_secs",
+                "[acp.mcp]\nteardown_timeout_secs = 0\n",
             ),
             ("acp.mcp.max_servers", "[acp.mcp]\nmax_servers = 0\n"),
             (

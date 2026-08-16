@@ -431,6 +431,7 @@ pooling for context servers whose internal state must be isolated per chat.
 | `init_timeout_secs` | `10` | Per-server budget for the `initialize` + `tools/list` handshake. Exceeding it skips that server. Must be > 0 when enabled. |
 | `call_timeout_secs` | `60` | Per remote `tools/call` budget. On timeout the model gets an error tool result and the turn continues. Must be > 0 when enabled. |
 | `shutdown_timeout_secs` | `5` | Maximum MCP runtime/child shutdown wait. Expiry is logged and ACP teardown continues. Must be > 0 when enabled. |
+| `teardown_timeout_secs` | `10` | Overall budget for concurrently shutting down every session bridge after ACP transport loss. Must be > 0 when enabled. |
 | `max_servers` | `32` | Upper bound on forwarded servers connected per session. Must be > 0 when enabled. |
 | `max_concurrent_connects` | `8` | Maximum server handshakes in flight at once. Results are registered in forwarded order for deterministic tool names. Must be > 0 when enabled. |
 | `max_tools_per_server` | `128` | Upper bound on tools registered from any single server. Must be > 0 when enabled. |
@@ -444,6 +445,7 @@ shared_pool_enabled = true
 init_timeout_secs = 10
 call_timeout_secs = 60
 shutdown_timeout_secs = 5
+teardown_timeout_secs = 10
 max_servers = 32
 max_concurrent_connects = 8
 max_tools_per_server = 128
