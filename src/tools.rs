@@ -121,7 +121,7 @@ impl ToolTier {
     /// - *Grow `AgentConfig::tools` mid-run to mirror MCP activation.* The tool
     ///   list is part of the cached prompt prefix, so growing it invalidates the
     ///   cache and costs tokens on every subsequent call. `execute_script`
-    ///   already supersedes `tool_pipeline` and `tool_repair` for the agent, the
+    ///   already supersedes `tool_pipeline` and `lint_repair` for the agent, the
     ///   same way it supersedes `batch`, so the capability gained is close to
     ///   nil. `diff_files` is the only real gap, and `exec` covers it.
     /// - *Re-tier `list_tool_signatures` so the agent can call it.* Its
@@ -1049,7 +1049,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             context_check: None,
         },
         ToolDef {
-            name: "tool_repair",
+            name: "lint_repair",
             tier: ToolTier::OnDemand,
             schema: json!({
                 "type": "object",
@@ -1062,7 +1062,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             to_request: Some(|args| {
                 Ok(Request::Single(Op {
-                    c: protocol::op::TOOL_REPAIR,
+                    c: protocol::op::LINT_REPAIR,
                     p: get_str(args, "tool_id"),
                     n: get_i64(args, "max_iterations"),
                     q: get_str(args, "cwd"),
