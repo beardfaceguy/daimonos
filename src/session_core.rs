@@ -3038,6 +3038,14 @@ mod tests {
             .next()
             .unwrap();
         assert!(delete.contains("SESSION_END_REASON_DELETED"));
+        let shutdown_handles = source
+            .split("async fn shutdown_session_handles_with")
+            .nth(1)
+            .unwrap()
+            .split("async fn shutdown_all_bridges")
+            .next()
+            .unwrap();
+        assert!(shutdown_handles.contains("SESSION_END_REASON_ENGINE_SHUTDOWN"));
         let shutdown = source
             .split("async fn shutdown_all_bridges")
             .nth(1)
@@ -3045,7 +3053,7 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert!(shutdown.contains("SESSION_END_REASON_ENGINE_SHUTDOWN"));
+        assert!(shutdown.contains("shutdown_session_handles_with"));
     }
 
     #[test]

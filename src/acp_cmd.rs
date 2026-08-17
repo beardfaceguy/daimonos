@@ -13,9 +13,10 @@
 //! its own file/exec tools and doesn't need to shell out through the client.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context as TaskContext, Poll};
 
@@ -459,6 +460,9 @@ struct AcpState {
     /// Process-wide pool for deduplicating identical forwarded MCP server
     /// configs across ACP sessions (#1008). Bridges retain explicit leases.
     mcp_pool: McpClientPool,
+    /// Overall deadline for concurrently draining every session's MCP bridge
+    /// after the ACP transport disappears (#1293).
+    mcp_teardown_timeout: std::time::Duration,
 }
 
 async fn session_operation_lock(
@@ -2578,6 +2582,7 @@ fn build_agent_with_state(
         timestamp_turns,
         thinking,
         mcp_pool: McpClientPool::new(),
+        mcp_teardown_timeout: std::time::Duration::from_secs(cfg.acp.mcp.teardown_timeout_secs),
     });
     *state_out = Some(Arc::clone(&state));
 
@@ -3518,27 +3523,92 @@ pub async fn run_acp(
 /// Shut down the MCP bridge of every live session. Called on ACP engine
 /// teardown; `session/delete` already tears down a single session's bridge, so
 /// this handles the process-exit path where handles are otherwise just dropped.
-async fn shutdown_all_bridges(state: &AcpState) {
-    let handles: Vec<Arc<SessionHandle>> = {
-        let mut map = state.sessions.lock().await;
-        map.drain().map(|(_, handle)| handle).collect()
-    };
-    for handle in handles {
+#[derive(Debug, PartialEq, Eq)]
+struct BridgeShutdownSummary {
+    sessions: usize,
+    completed: usize,
+    remaining: usize,
+    timed_out: bool,
+    duration_ms: u64,
+}
+
+async fn shutdown_session_handles_with<F, Fut>(
+    handles: Vec<Arc<SessionHandle>>,
+    timeout: std::time::Duration,
+    shutdown: F,
+) -> BridgeShutdownSummary
+where
+    F: Fn(Arc<SessionHandle>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let started = std::time::Instant::now();
+    let sessions = handles.len();
+    for handle in &handles {
         // vikunja #1107 fix #2: retire the work this transport owned before
         // tearing its bridge down. Signalling cancel here is what stops an
-        // in-flight prompt from running on detached from the client that asked
-        // for it — the incident's orphaned turn outlived its dead pipe by ~41
-        // minutes because teardown drained bridges and nothing else.
-        request_session_cancel(&handle);
-        // Signalling alone only asks the turn to stop; a turn parked on an
-        // approval never observes it. Resolve approvals and close canonical
-        // tool calls here so nothing is left waiting on a client that is gone.
+        // in-flight prompt from running detached from the client that asked
+        // for it.
+        request_session_cancel(handle);
+        // A turn parked on an approval never observes cancellation. Resolve
+        // approvals and close canonical tool calls before awaiting teardown.
         handle.core.cleanup_cancelled_turn();
         let _ = handle.core.events.emit(CoreSessionEvent::SessionEnding {
             reason: SESSION_END_REASON_ENGINE_SHUTDOWN.to_string(),
         });
-        shutdown_session_bridge(&handle).await;
     }
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let shutdowns = handles.into_iter().map(|handle| {
+        let completed = Arc::clone(&completed);
+        let shutdown = shutdown(handle);
+        async move {
+            shutdown.await;
+            completed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let timed_out = tokio::time::timeout(timeout, futures_util::future::join_all(shutdowns))
+        .await
+        .is_err();
+    let completed = completed.load(Ordering::Relaxed);
+
+    BridgeShutdownSummary {
+        sessions,
+        completed,
+        remaining: sessions.saturating_sub(completed),
+        timed_out,
+        duration_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+async fn shutdown_all_bridges(state: &AcpState) -> BridgeShutdownSummary {
+    let handles: Vec<Arc<SessionHandle>> = {
+        let mut map = state.sessions.lock().await;
+        map.drain().map(|(_, handle)| handle).collect()
+    };
+    let timeout = state.mcp_teardown_timeout;
+    let summary = shutdown_session_handles_with(handles, timeout, |handle| async move {
+        shutdown_session_bridge(&handle).await;
+    })
+    .await;
+    if summary.timed_out {
+        tracing::warn!(
+            target: "daimonos::acp",
+            event = "bridge_shutdown_deadline_expired",
+            sessions = summary.sessions,
+            completed = summary.completed,
+            remaining = summary.remaining,
+            timeout_ms = timeout.as_millis() as u64,
+            duration_ms = summary.duration_ms,
+        );
+    } else {
+        tracing::info!(
+            target: "daimonos::acp",
+            event = "bridge_shutdown_batch_completed",
+            sessions = summary.sessions,
+            duration_ms = summary.duration_ms,
+        );
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -4710,7 +4780,7 @@ mod tests {
             .expect("register approval");
         assert_eq!(handle.core.approvals.pending().len(), 1);
 
-        shutdown_all_bridges(&state).await;
+        let summary = shutdown_all_bridges(&state).await;
 
         assert!(
             handle.core.approvals.pending().is_empty(),
@@ -4720,6 +4790,9 @@ mod tests {
             approval.receiver.await.expect("resolution").decision,
             CoreApprovalDecision::Deny,
         );
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.completed, 1);
+        assert!(!summary.timed_out);
     }
 
     /// vikunja #1107 fix #2: when the ACP transport disappears, every prompt it
@@ -4752,13 +4825,51 @@ mod tests {
         // A turn is in flight at the moment the transport dies.
         let _turn = handle.core.begin_turn().expect("begin turn");
 
-        shutdown_all_bridges(&state).await;
+        let summary = shutdown_all_bridges(&state).await;
 
         let seen = statuses.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert!(
             seen.contains(&crate::session_protocol::TurnStatus::Cancelling),
             "transport teardown must signal the in-flight turn cancelled; saw {seen:?}",
         );
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.completed, 1);
+        assert!(!summary.timed_out);
+    }
+
+    /// vikunja #1293: all session bridges must begin shutdown concurrently,
+    /// and a bridge that never returns must not hold ACP teardown forever.
+    #[tokio::test]
+    async fn transport_teardown_bounds_and_concurrently_starts_hung_bridges() {
+        let (_state_a, handle_a, _workspace_a) = state_with_live_session().await;
+        let (_state_b, handle_b, _workspace_b) = state_with_live_session().await;
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started_for_shutdown = Arc::clone(&started);
+
+        let summary = shutdown_session_handles_with(
+            vec![handle_a, handle_b],
+            Duration::from_millis(25),
+            move |_handle| {
+                let started = Arc::clone(&started_for_shutdown);
+                async move {
+                    let index = started.fetch_add(1, Ordering::SeqCst);
+                    if index > 0 {
+                        futures_util::future::pending::<()>().await;
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "every bridge shutdown must start before waiting for any one bridge",
+        );
+        assert_eq!(summary.sessions, 2);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.remaining, 1);
+        assert!(summary.timed_out);
     }
 
     #[tokio::test]
