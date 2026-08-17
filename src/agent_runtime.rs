@@ -41,6 +41,62 @@ fn try_build_provider(
     }
 }
 
+/// Startup model discovery (operator request 2026-08-17): ask the configured
+/// provider for its live model catalog instead of trusting a static snapshot.
+/// Precedence: live catalog > configured `DAIMONOS_AGENT_MODELS` (the
+/// fallback when the fetch fails, times out, or is disabled via
+/// `DAIMONOS_AGENT_MODELS_DISCOVER=off`). The active model is always present
+/// (prepended if missing) because the #1240 failover chain anchors on it.
+/// Bounded at 5s so a slow provider can never stall startup.
+async fn discover_models(
+    llm: Option<&dyn providers::LlmProvider>,
+    configured: &[String],
+    effective_model: &str,
+) -> Vec<String> {
+    let mut models = match llm {
+        Some(llm) if !models_discovery_disabled() => {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), llm.list_models()).await {
+                Ok(Some(live)) => {
+                    tracing::info!(
+                        target: "daimonos::agent_runtime",
+                        event = "models_discovered",
+                        count = live.len(),
+                        "populated model list from the provider's live catalog"
+                    );
+                    live
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "daimonos::agent_runtime",
+                        event = "models_discovery_unavailable",
+                        "provider model catalog unavailable; using configured DAIMONOS_AGENT_MODELS"
+                    );
+                    configured.to_vec()
+                }
+            }
+        }
+        _ => configured.to_vec(),
+    };
+    if !models.iter().any(|model| model == effective_model) {
+        models.insert(0, effective_model.to_string());
+    }
+    models
+}
+
+/// `DAIMONOS_AGENT_MODELS_DISCOVER=off|false|no|0` skips the startup catalog
+/// fetch (air-gapped setups, deterministic tests).
+fn models_discovery_disabled() -> bool {
+    std::env::var("DAIMONOS_AGENT_MODELS_DISCOVER")
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v == "0"
+        })
+        .unwrap_or(false)
+}
+
 fn build_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
@@ -170,10 +226,7 @@ pub async fn run_agent(
             .await
             .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
         let compaction = prompts::apply_summary_override(compaction, &cfg).await;
-        let mut models = agent.models.clone();
-        if !models.iter().any(|model| model == &effective_model) {
-            models.insert(0, effective_model.clone());
-        }
+        let models = discover_models(Some(llm.as_ref()), &agent.models, &effective_model).await;
         return tui::run_tui(
             llm,
             workspace,
@@ -285,10 +338,6 @@ pub async fn run_acp(
     let agent = load_agent_env(agent_env)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let mut models = agent.models.clone();
-    if !models.iter().any(|model| model == &effective_model) {
-        models.insert(0, effective_model.clone());
-    }
     let make_provider: acp_cmd::ProviderFactory = {
         let provider = effective_provider.clone();
         let api_key = agent.api_key.clone();
@@ -307,6 +356,9 @@ pub async fn run_acp(
         .await
         .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
+    // The probe instance already exists for compaction resolution; reuse it
+    // for live model discovery.
+    let models = discover_models(Some(probe.as_ref()), &agent.models, &effective_model).await;
     let safety = agent.to_safety_policy(None);
     let sessions_dir = paths::agent_sessions_dir();
     let analytics_store = if cfg.analytics.enabled {
@@ -397,10 +449,7 @@ pub async fn run_session_daemon(
         )
         .await,
     );
-    let mut models = agent.models.clone();
-    if !models.iter().any(|candidate| candidate == &effective_model) {
-        models.insert(0, effective_model.clone());
-    }
+    let models = discover_models(Some(probe.as_ref()), &agent.models, &effective_model).await;
     let factory = Arc::new(session_factory::AgentSessionFactory::new(
         make_provider,
         workspace.to_path_buf(),
@@ -690,6 +739,45 @@ fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stub provider whose `list_models` answer is scripted.
+    struct CatalogStub(Option<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl providers::LlmProvider for CatalogStub {
+        async fn complete(
+            &self,
+            _ctx: &providers::Context,
+            _opts: &providers::CompleteOpts,
+        ) -> providers::LlmResponse {
+            providers::LlmResponse::error("unused")
+        }
+
+        async fn list_models(&self) -> Option<Vec<String>> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_prefers_the_live_catalog_and_anchors_the_active_model() {
+        let stub = CatalogStub(Some(vec!["new-model".into(), "old-model".into()]));
+        let configured = vec!["stale-a".into(), "stale-b".into()];
+        let models = discover_models(Some(&stub), &configured, "active-model").await;
+        // Live catalog replaces the static snapshot; the active model is
+        // prepended because the failover chain anchors on it.
+        assert_eq!(models, vec!["active-model", "new-model", "old-model"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_configured_models_when_catalog_unavailable() {
+        let stub = CatalogStub(None);
+        let configured = vec!["cfg-a".into(), "cfg-b".into()];
+        let models = discover_models(Some(&stub), &configured, "cfg-a").await;
+        assert_eq!(models, vec!["cfg-a", "cfg-b"]);
+        // No provider at all (factory failed): same fallback.
+        let models = discover_models(None, &configured, "other").await;
+        assert_eq!(models, vec!["other", "cfg-a", "cfg-b"]);
+    }
 
     #[tokio::test]
     async fn native_openai_provider_builds_and_reports_known_window() {
