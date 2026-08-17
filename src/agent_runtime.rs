@@ -68,7 +68,9 @@ fn resolve_thought_log_path(
         Some(path) => path,
         None => home
             .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for thought log"))?
-            .join(".config/daimonos/thought-debug.log"),
+            .join(".config")
+            .join("daimonos")
+            .join("thought-debug.log"),
     }))
 }
 

@@ -205,9 +205,10 @@ pub async fn run_agent(
     let result = crate::agent::run(provider, session, initial, &config)
         .instrument(prompt_span.span().clone())
         .await;
-    if let Some(capture) = thought_capture {
-        capture.finish()?;
-    }
+    let thought_capture_result = match thought_capture {
+        Some(capture) => capture.finish(),
+        None => Ok(()),
+    };
     let error_type = match result.stop_reason {
         crate::providers::StopReason::Error => Some("provider_error"),
         crate::providers::StopReason::Refusal => Some("refusal"),
@@ -232,6 +233,10 @@ pub async fn run_agent(
             turns,
         });
     }
+
+    // A local debug-artifact failure must be reported, but only after the
+    // completed provider run has closed its span and reached analytics.
+    thought_capture_result?;
 
     for msg in &result.messages {
         if matches!(msg.role, Role::Assistant) {
@@ -394,6 +399,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn thought_capture_failure_is_checked_after_run_observability() {
+        let source = include_str!("agent_cmd.rs");
+        let span = source
+            .find("prompt_span.finish(result.stop_reason.as_str(), error_type);")
+            .unwrap();
+        let analytics = source
+            .find("store.record_agent_run(&AgentRunRecord")
+            .unwrap();
+        let capture = source.find("thought_capture_result?;").unwrap();
+        assert!(span < capture);
+        assert!(analytics < capture);
     }
 
     fn default_cfg() -> Arc<Config> {
