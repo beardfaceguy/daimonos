@@ -1,6 +1,7 @@
 # #1230 Phase 2 — read → transform → write intervention
 
-Date: 2026-08-14 · Commit: `50b0c86` · Model: `claude-opus-4-8` · Prompt caching: OFF
+Date: 2026-08-14 · Commit: `50b0c86425c6f3f51f3aef54a34866d0f5a5b14c`
+· Provider: Anthropic · Model: `claude-opus-4-8` · Thinking: medium · Prompt caching: OFF
 
 ## Design
 
@@ -32,6 +33,18 @@ Task 03 gets n=3 (deterministic), task 07 n=5 (historically noisy).
 - Task 07: **−33.3% calls**, −28.3% cost
 - Correctness **16/16**, no regression in either arm
 - Total spend: $5.18 over 16 runs
+
+Across the deliberately uneven 3+5 task repetitions, the run-weighted mean
+moved from 5.625 to 3.375 calls (**−40.0%**), 76,282.9 to 46,241.8 tokens
+(**−39.4%**), and $0.3976 to $0.2501 (**−37.1%**) per run. Batch adoption moved
+from 1/8 to 8/8 runs.
+
+### Retained per-task regressions
+
+Task 07's mean output tokens increased **47.9%** (893.0 → 1,320.4) and mean
+wall time increased **17.3%** (16.2s → 19.0s), despite its total-token, call,
+and cost improvements. Task 03 had no upward metric movement. These regressions
+remain part of the result; the aggregate cost/call win does not erase them.
 
 ## Why small n is sufficient here
 
@@ -83,3 +96,11 @@ cd benchmarks
 ./run-1230-phase2.sh 07 5     # both arms, n=5
 python3 /tmp/analyze_1230.py  # or re-derive from results/*1230p2*/**.json
 ```
+
+The first accepted task-03 baseline run is the directory tagged
+`20260814-143911-agent-1230p2-smoke`; it was retained as base repetition 1
+because it used the same base binary/config and passed the same correctness
+gate. The machine-readable `R0`/`R1` stages in
+`benchmarks/optimization-lineage.json` enumerate all 16 accepted raw run
+directories, binary hashes, fixture commit, task-set fingerprint, and
+immediate/cumulative deltas.

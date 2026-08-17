@@ -1044,6 +1044,213 @@
           "kind": "report"
         }
       ]
+    },
+    {
+      "id": "R0",
+      "parent": null,
+      "feature": "Read-transform-write targeted baseline",
+      "scope_fingerprint": "read-transform-write-03-07-v1|anthropic|claude-opus-4-8|medium|compaction-off|prompt-cache-off|fixture-bda5798",
+      "task_set_fingerprint": "cdeabf5a644b33bd7461bd6296aafc67da6c68c7071a07c59bf71a7d9495dc6b",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "03-edit-rename",
+        "07-snapshot-rollback"
+      ],
+      "repetitions_by_task": {
+        "03-edit-rename": 3,
+        "07-snapshot-rollback": 5
+      },
+      "binary_sha256": "59d329f188070536756a75580f377df51592cda5042d8acfe196966ce5446871",
+      "git_commit": "50b0c86425c6f3f51f3aef54a34866d0f5a5b14c",
+      "fixture_commit": "bda579841da18cecf8eaa5833ae9fc9fe070e207",
+      "created_at": "2026-08-14T21:39:11Z",
+      "run_dirs": [
+        "20260814-143911-agent-1230p2-smoke",
+        "20260814-144220-agent-1230p2-base-t03-r2",
+        "20260814-144234-agent-1230p2-base-t03-r3",
+        "20260814-144054-agent-1230p2-base-t07-r1",
+        "20260814-144310-agent-1230p2-base-t07-r2",
+        "20260814-144328-agent-1230p2-base-t07-r3",
+        "20260814-144344-agent-1230p2-base-t07-r4",
+        "20260814-144402-agent-1230p2-base-t07-r5"
+      ],
+      "metrics": {
+        "batch_adoption_rate": [
+          12.5,
+          "percent"
+        ],
+        "mean_llm_calls": [
+          5.625,
+          "count"
+        ],
+        "mean_total_tokens": [
+          76282.875,
+          "tokens"
+        ],
+        "mean_fresh_input_tokens": [
+          75473.25,
+          "tokens"
+        ],
+        "mean_cache_read_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_cache_write_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_output_tokens": [
+          809.625,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.397606875,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          14875.0,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          8,
+          "count"
+        ],
+        "execute_script_error_runs": [
+          0,
+          "count"
+        ]
+      },
+      "report_path": "benchmarks/results/2026-08-14-1230-phase2-read-transform-write.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-14-1230-phase2-read-transform-write.md",
+          "sha256": "a44483566119146b37da8fe3070167ee7c9a679211d6f578972bba0e25074d2c",
+          "kind": "report"
+        }
+      ]
+    },
+    {
+      "id": "R1",
+      "parent": "R0",
+      "feature": "Teach read-transform-write inside execute_script",
+      "scope_fingerprint": "read-transform-write-03-07-v1|anthropic|claude-opus-4-8|medium|compaction-off|prompt-cache-off|fixture-bda5798",
+      "task_set_fingerprint": "cdeabf5a644b33bd7461bd6296aafc67da6c68c7071a07c59bf71a7d9495dc6b",
+      "benchmark_kind": "targeted",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "thinking": "medium",
+      "task_ids": [
+        "03-edit-rename",
+        "07-snapshot-rollback"
+      ],
+      "repetitions_by_task": {
+        "03-edit-rename": 3,
+        "07-snapshot-rollback": 5
+      },
+      "binary_sha256": "2057f84b8507c7504923305b08e1dbcef4f755f64631f8c46ae8d2282551f039",
+      "git_commit": "50b0c86425c6f3f51f3aef54a34866d0f5a5b14c",
+      "fixture_commit": "bda579841da18cecf8eaa5833ae9fc9fe070e207",
+      "created_at": "2026-08-14T21:42:47Z",
+      "run_dirs": [
+        "20260814-144247-agent-1230p2-rtw-t03-r1",
+        "20260814-144257-agent-1230p2-rtw-t03-r2",
+        "20260814-144304-agent-1230p2-rtw-t03-r3",
+        "20260814-144418-agent-1230p2-rtw-t07-r1",
+        "20260814-144437-agent-1230p2-rtw-t07-r2",
+        "20260814-144459-agent-1230p2-rtw-t07-r3",
+        "20260814-144510-agent-1230p2-rtw-t07-r4",
+        "20260814-144530-agent-1230p2-rtw-t07-r5"
+      ],
+      "metrics": {
+        "batch_adoption_rate": [
+          100.0,
+          "percent"
+        ],
+        "mean_llm_calls": [
+          3.375,
+          "count"
+        ],
+        "mean_total_tokens": [
+          46241.75,
+          "tokens"
+        ],
+        "mean_fresh_input_tokens": [
+          45297.375,
+          "tokens"
+        ],
+        "mean_cache_read_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_cache_write_tokens": [
+          0.0,
+          "tokens"
+        ],
+        "mean_output_tokens": [
+          944.375,
+          "tokens"
+        ],
+        "mean_cost_usd": [
+          0.25009625,
+          "usd"
+        ],
+        "mean_wall_ms": [
+          14500.0,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          8,
+          "count"
+        ],
+        "execute_script_error_runs": [
+          0,
+          "count"
+        ]
+      },
+      "deltas": {
+        "immediate": {
+          "mean_llm_calls_pct": -40.0,
+          "mean_total_tokens_pct": -39.3812176062,
+          "mean_cost_usd_pct": -37.0996162981,
+          "mean_wall_ms_pct": -2.5210084034,
+          "batch_adoption_rate_points": 87.5
+        },
+        "cumulative_from_R0": {
+          "mean_llm_calls_pct": -40.0,
+          "mean_total_tokens_pct": -39.3812176062,
+          "mean_cost_usd_pct": -37.0996162981,
+          "mean_wall_ms_pct": -2.5210084034,
+          "batch_adoption_rate_points": 87.5
+        }
+      },
+      "per_task_regressions": [
+        {
+          "task_id": "07-snapshot-rollback",
+          "metric": "mean_output_tokens",
+          "baseline": 893.0,
+          "candidate": 1320.4,
+          "delta_pct": 47.8611422172
+        },
+        {
+          "task_id": "07-snapshot-rollback",
+          "metric": "mean_wall_ms",
+          "baseline": 16200.0,
+          "candidate": 19000.0,
+          "delta_pct": 17.2839506173
+        }
+      ],
+      "notes": "Correctness-gated 16/16. Targeted scope excludes task 02 because it was already at the two-call floor. Task 07 output-token and wall-time regressions are retained explicitly.",
+      "report_path": "benchmarks/results/2026-08-14-1230-phase2-read-transform-write.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-08-14-1230-phase2-read-transform-write.md",
+          "sha256": "a44483566119146b37da8fe3070167ee7c9a679211d6f578972bba0e25074d2c",
+          "kind": "report"
+        }
+      ]
     }
   ]
 }

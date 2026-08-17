@@ -149,3 +149,34 @@ I3 keeps startup within ±0.5% of I0 on all fixtures and restores deterministic
 filename correctness under partial coverage. The retained upward blip is a
 second recursive watcher set on warm projects (21 → 42 watches in this
 fixture); follow-up Vikunja task 1210 tracks watcher sharing.
+
+## Read-transform-write targeted lineage
+
+Scope fingerprint: `read-transform-write-03-07-v1 / direct Anthropic /
+claude-opus-4-8 / thinking=medium / compaction=off / prompt-cache=off /
+fixture=bda5798`.
+
+This is a separate lineage from B0/B1 because task 02 was removed after it was
+shown to be at the two-call floor. Comparing R0/R1 to B0/B1 as one aggregate
+would mix task scopes.
+
+| Stage | Parent | Change | Runs | Batch adoption | Mean calls | Mean tokens | Mean cost | Mean wall | Correct | Immediate delta | Cumulative vs R0 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| R0 | — | Same-commit base prompt | 8 | 12.5% | 5.625 | 76,282.9 | $0.3976 | 14.875s | 8/8 | baseline | baseline |
+| R1 | R0 | Teach read → transform → write inside `execute_script` | 8 | 100% | 3.375 | 46,241.8 | $0.2501 | 14.500s | 8/8 | calls -40.0%; tokens -39.4%; cost -37.1%; wall -2.5%; adoption +87.5pp | same |
+
+Repetitions are task 03 n=3 and task 07 n=5 in each arm. Both binaries were
+built from `50b0c86425c6f3f51f3aef54a34866d0f5a5b14c` and differ only in
+`prompts/agent_system.md`. Binary SHA-256:
+
+- R0: `59d329f188070536756a75580f377df51592cda5042d8acfe196966ce5446871`
+- R1: `2057f84b8507c7504923305b08e1dbcef4f755f64631f8c46ae8d2282551f039`
+
+Retained regressions: task 07 mean output increased **47.9%** (893.0 →
+1,320.4 tokens) and mean wall time increased **17.3%** (16.2s → 19.0s).
+Task 03 had no upward metric movement. The machine-readable R0/R1 stages record
+all 16 raw run directories, the task-set fingerprint, fixture commit, exact
+metrics, and deltas.
+
+Report:
+[`2026-08-14-1230-phase2-read-transform-write.md`](2026-08-14-1230-phase2-read-transform-write.md).
