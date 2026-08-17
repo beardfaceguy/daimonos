@@ -60,6 +60,8 @@ def test_agent_help_lists_explicit_interactive_and_print_modes(daimonos_binary):
     assert "--interactive" in completed.stdout
     assert "--no-color" in completed.stdout
     assert "--print" in completed.stdout
+    assert "--debug-thoughts" in completed.stdout
+    assert "--debug-thoughts-path" in completed.stdout
 
 
 def test_session_daemon_serves_local_attach_and_cleans_socket(

@@ -56,6 +56,22 @@ fn build_provider(
     .map_err(anyhow::Error::msg)
 }
 
+fn resolve_thought_log_path(
+    enabled: bool,
+    override_path: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(match override_path {
+        Some(path) => path,
+        None => home
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for thought log"))?
+            .join(".config/daimonos/thought-debug.log"),
+    }))
+}
+
 pub async fn run_agent(
     args: AgentArgs,
     workspace: &Path,
@@ -71,6 +87,8 @@ pub async fn run_agent(
         provider,
         dry_run,
         agent_env,
+        debug_thoughts,
+        debug_thoughts_path,
     } = args;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
@@ -78,6 +96,11 @@ pub async fn run_agent(
     // text consumes this, to explain why a task argument became mandatory.
     let interactive_fell_back = interactive && !print && !dry_run && !tty;
     let mode = tui::resolve_agent_mode(interactive, print, dry_run, tty);
+    let thought_log = resolve_thought_log_path(
+        debug_thoughts,
+        debug_thoughts_path,
+        crate::paths::home_dir(),
+    )?;
 
     struct DryRunProvider;
     #[async_trait]
@@ -100,6 +123,7 @@ pub async fn run_agent(
             safety: None,
             analytics: None,
             token_log,
+            thought_log: None,
             // Dry-run never calls the provider and does not load the agent env,
             // so effort is immaterial here; use the default.
             thinking: providers::ThinkingLevel::default(),
@@ -180,6 +204,7 @@ pub async fn run_agent(
         safety: Some(agent.to_safety_policy(approve_fn)),
         analytics: analytics_store,
         token_log,
+        thought_log,
         thinking: agent.thinking.clone(),
     };
     let result =
@@ -693,6 +718,22 @@ mod tests {
         .err()
         .expect("unsupported provider error");
         assert!(error.contains("openai"));
+    }
+
+    #[test]
+    fn thought_log_path_uses_private_default_or_exact_override() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            resolve_thought_log_path(true, None, Some(home.clone())).unwrap(),
+            Some(home.join(".config/daimonos/thought-debug.log"))
+        );
+        assert_eq!(
+            resolve_thought_log_path(true, Some(PathBuf::from("/tmp/custom-thoughts")), None)
+                .unwrap(),
+            Some(PathBuf::from("/tmp/custom-thoughts"))
+        );
+        assert_eq!(resolve_thought_log_path(false, None, None).unwrap(), None);
+        assert!(resolve_thought_log_path(true, None, None).is_err());
     }
 
     #[test]

@@ -154,6 +154,15 @@ privacy tests; thinking and credential material will remain excluded even then.
 Until that ships, no configuration can cause Daimonos to export conversation
 content.
 
+For local debugging only, one-shot `daimonos agent` supports
+`--debug-thoughts`. It writes streamed thinking text to
+`~/.config/daimonos/thought-debug.log`, or to
+`--debug-thoughts-path PATH` when explicitly supplied. Capture is off by
+default, the file is truncated for each run and forced to mode `0600`, and its
+content is never copied into token logs, SQLite analytics, or OpenTelemetry.
+Treat the file as sensitive because model thinking can contain user or source
+context.
+
 ## Retention
 
 Retention is a **backend** concern, independent of Daimonos' local SQLite
