@@ -771,11 +771,16 @@ impl SessionCore {
                 .runtime_options
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let option = options
-                .iter_mut()
-                .find(|option| option.id == config_id)
-                .ok_or(RuntimeConfigError::UnknownOption)?;
-            option.value = value;
+            if let Some(current) = options.iter_mut().find(|current| current.id == config_id) {
+                current.value = value;
+            } else {
+                // A concurrent catalog refresh may replace this option after
+                // validation. The provider mutation has already succeeded, so
+                // restore the validated option instead of reporting failure.
+                let mut applied = option;
+                applied.value = value;
+                options.push(applied);
+            }
             options.clone()
         };
         let _ = self.events.emit(SessionEvent::RuntimeOptionsChanged {
