@@ -14,7 +14,7 @@ use crate::session_core::{
     SessionPersistence,
 };
 use crate::session_daemon::{SessionFactory, SessionOpenMode};
-use crate::session_protocol::SessionEvent;
+use crate::session_protocol::{RuntimeChoice, RuntimeOption, RuntimeValue, SessionEvent};
 use crate::session_store::SessionStore;
 
 pub type ProviderFactory =
@@ -25,6 +25,7 @@ pub struct AgentSessionFactory {
     workspace: PathBuf,
     config: Arc<Config>,
     default_model: String,
+    models: Vec<String>,
     thinking: ThinkingLevel,
     safety: Arc<SafetyPolicy>,
     token_log: Option<PathBuf>,
@@ -40,6 +41,7 @@ impl AgentSessionFactory {
         workspace: PathBuf,
         config: Arc<Config>,
         default_model: String,
+        models: Vec<String>,
         thinking: ThinkingLevel,
         safety: SafetyPolicy,
         token_log: Option<PathBuf>,
@@ -52,6 +54,7 @@ impl AgentSessionFactory {
             workspace,
             config,
             default_model,
+            models,
             thinking,
             safety: Arc::new(safety),
             token_log,
@@ -90,6 +93,22 @@ impl SessionFactory for AgentSessionFactory {
             .as_ref()
             .map(|record| record.model.clone())
             .unwrap_or_else(|| self.default_model.clone());
+        let thinking = persisted
+            .as_ref()
+            .and_then(|record| record.thinking.as_deref())
+            .and_then(|raw| match ThinkingLevel::from_input(raw) {
+                Ok(thinking) => Some(thinking),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "daimonos::session_factory",
+                        event = "persisted_thinking_invalid",
+                        session_id,
+                        "falling back to configured thinking level",
+                    );
+                    None
+                }
+            })
+            .unwrap_or_else(|| self.thinking.clone());
         let provider = (self.make_provider)()?;
         let events = Arc::new(SessionEventRouter::new_with_replay(
             None,
@@ -125,7 +144,7 @@ impl SessionFactory for AgentSessionFactory {
             tools,
             opts: CompleteOpts {
                 model: model.clone(),
-                thinking: self.thinking.clone(),
+                thinking: thinking.clone(),
                 ..CompleteOpts::default()
             },
             before_tool_call: Some(Box::new(move |info| {
@@ -164,7 +183,7 @@ impl SessionFactory for AgentSessionFactory {
         let persisted_model = model.clone();
         let core = Arc::new(SessionCore::new(
             agent_session,
-            model,
+            model.clone(),
             workspace,
             self.compaction.clone(),
             context_windows,
@@ -175,6 +194,11 @@ impl SessionFactory for AgentSessionFactory {
             )),
             events,
             tool_lifecycle,
+        ));
+        core.set_runtime_options(runtime_options(
+            &self.models,
+            &core.current_model(),
+            &thinking,
         ));
         if let Some(record) = persisted {
             *core.client_user_message_ids.lock().await = record.client_user_message_ids;
@@ -196,6 +220,39 @@ impl SessionFactory for AgentSessionFactory {
             .map(|summary| summary.id)
             .collect()
     }
+}
+
+fn runtime_options(
+    models: &[String],
+    current_model: &str,
+    thinking: &ThinkingLevel,
+) -> Vec<RuntimeOption> {
+    let mut candidates = vec![current_model.to_string()];
+    for model in models {
+        if !candidates.contains(model) {
+            candidates.push(model.clone());
+        }
+    }
+    vec![
+        RuntimeOption::select(
+            "model",
+            "Model",
+            RuntimeValue::String(current_model.to_string()),
+            candidates
+                .into_iter()
+                .map(|model| RuntimeChoice::new(model.clone(), model))
+                .collect(),
+        ),
+        RuntimeOption::select(
+            "thinking",
+            "Thinking",
+            RuntimeValue::String(thinking.as_str().to_string()),
+            ThinkingLevel::ALL
+                .iter()
+                .map(|level| RuntimeChoice::new(level.as_str(), level.as_str()))
+                .collect(),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -233,6 +290,7 @@ mod tests {
             directory.path().to_path_buf(),
             config,
             "test-model".to_string(),
+            vec!["test-model".to_string()],
             ThinkingLevel::default(),
             SafetyPolicy::default(),
             None,
@@ -258,6 +316,7 @@ mod tests {
 
         let persisted = store.load("session-1").expect("completed turn persisted");
         assert_eq!(persisted.model, "test-model");
+        assert_eq!(persisted.thinking.as_deref(), Some("medium"));
         assert_eq!(persisted.messages.len(), 2);
     }
 
@@ -268,6 +327,7 @@ mod tests {
         store.save_acp(
             "session-1",
             "saved-model",
+            "high",
             &[
                 crate::providers::Message::user("first"),
                 crate::providers::Message::assistant("second"),
@@ -292,6 +352,7 @@ mod tests {
         store.save_acp(
             "foreign-session",
             "saved-model",
+            "medium",
             &[crate::providers::Message::user("foreign")],
             &foreign,
             &[],
@@ -307,10 +368,11 @@ mod tests {
             directory.path().to_path_buf(),
             config,
             "default-model".to_string(),
+            vec!["default-model".to_string(), "saved-model".to_string()],
             ThinkingLevel::default(),
             SafetyPolicy::default(),
             None,
-            store,
+            store.clone(),
             SessionCompaction::new(None, false),
             services,
         );
@@ -326,6 +388,9 @@ mod tests {
         let snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
 
         assert_eq!(snapshot.transcript.len(), 2);
+        assert!(snapshot.runtime_options.iter().any(|option| {
+            option.id == "thinking" && option.value == RuntimeValue::String("high".to_string())
+        }));
         assert_eq!(snapshot.transcript[0].text, "first");
         assert_eq!(snapshot.transcript[1].text, "second");
         assert!(matches!(
@@ -347,5 +412,25 @@ mod tests {
                 .as_str(),
             "saved-model"
         );
+
+        store.save_acp(
+            "invalid-thinking",
+            "saved-model",
+            "removed-level",
+            &[crate::providers::Message::user("still loadable")],
+            directory.path(),
+            &[],
+            &[],
+        );
+        let invalid = factory
+            .open("invalid-thinking", SessionOpenMode::Load)
+            .await
+            .expect("invalid persisted thinking falls back");
+        let snapshot = invalid
+            .initial_snapshot("invalid-thinking".to_string(), 32)
+            .await;
+        assert!(snapshot.runtime_options.iter().any(|option| {
+            option.id == "thinking" && option.value == RuntimeValue::String("medium".to_string())
+        }));
     }
 }

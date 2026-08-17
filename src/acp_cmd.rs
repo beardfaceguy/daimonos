@@ -2077,6 +2077,7 @@ async fn truncate_session(
         store.save_acp(
             &session_id.to_string(),
             &model,
+            agent_session.thinking().as_str(),
             agent_session.history(),
             &handle.core.cwd,
             &client_ids,
@@ -2928,6 +2929,7 @@ fn build_agent_with_state(
                             store.save_acp(
                                 &session_id.to_string(),
                                 &state.default_model,
+                                state.thinking.as_str(),
                                 &[],
                                 &handle.core.cwd,
                                 &[],
@@ -4648,6 +4650,7 @@ mod tests {
         SessionStore::new(sessions.path().to_path_buf()).save_acp(
             &session_id.to_string(),
             "test-model",
+            "medium",
             &[],
             workspace.path(),
             &[],
@@ -7292,6 +7295,7 @@ mod tests {
         SessionStore::new(sessions.path().to_path_buf()).save_acp(
             session_id,
             "test-model",
+            "medium",
             &[crate::providers::Message {
                 role: crate::providers::Role::User,
                 content: vec![crate::providers::ContentBlock::ToolResult {

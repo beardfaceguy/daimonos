@@ -25,6 +25,7 @@ const val PROTOCOL_VERSION: Int = 2
 enum class ClientCapability {
     @SerialName("observe") OBSERVE,
     @SerialName("prompt") PROMPT,
+    @SerialName("configure") CONFIGURE,
     @SerialName("interrupt") INTERRUPT,
     @SerialName("stop") STOP,
     @SerialName("approve_once") APPROVE_ONCE,
@@ -124,6 +125,7 @@ sealed interface ClientMessage {
     @Serializable
     @SerialName("set_config")
     data class SetConfig(
+        @SerialName("request_id") val requestId: String? = null,
         @SerialName("config_id") val configId: String,
         val value: RuntimeValue,
     ) : ClientMessage
@@ -457,6 +459,7 @@ enum class ContextBudgetError {
 @Serializable
 data class ContextUsage(
     @SerialName("prompt_tokens") val promptTokens: Long,
+    val estimated: Boolean = false,
     @SerialName("model_context_window") val modelContextWindow: Long? = null,
     @SerialName("output_reservation") val outputReservation: Long,
     @SerialName("effective_input_budget") val effectiveInputBudget: Long? = null,

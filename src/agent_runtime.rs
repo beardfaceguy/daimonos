@@ -370,11 +370,16 @@ pub async fn run_session_daemon(
         )
         .await,
     );
+    let mut models = agent.models.clone();
+    if !models.iter().any(|candidate| candidate == &effective_model) {
+        models.insert(0, effective_model.clone());
+    }
     let factory = Arc::new(session_factory::AgentSessionFactory::new(
         make_provider,
         workspace.to_path_buf(),
         Arc::clone(&cfg),
         effective_model,
+        models,
         agent.thinking.clone(),
         agent.to_safety_policy(None),
         token_log,
@@ -603,6 +608,7 @@ fn parse_remote_capability(name: &str) -> Result<crate::session_protocol::Client
     match name {
         "observe" => Ok(ClientCapability::Observe),
         "prompt" => Ok(ClientCapability::Prompt),
+        "configure" => Ok(ClientCapability::Configure),
         "interrupt" => Ok(ClientCapability::Interrupt),
         "stop" => Ok(ClientCapability::Stop),
         "approve_once" => Ok(ClientCapability::ApproveOnce),
@@ -617,6 +623,7 @@ fn remote_capability_name(capability: &crate::session_protocol::ClientCapability
     match capability {
         ClientCapability::Observe => "observe",
         ClientCapability::Prompt => "prompt",
+        ClientCapability::Configure => "configure",
         ClientCapability::Interrupt => "interrupt",
         ClientCapability::Stop => "stop",
         ClientCapability::ApproveOnce => "approve_once",

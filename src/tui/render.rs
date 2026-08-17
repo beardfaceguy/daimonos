@@ -162,8 +162,12 @@ fn render_status(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let turn = turn_label(state.turn_status());
     let usage = state
         .context_usage()
-        .and_then(|u| u.utilization_basis_points)
-        .map(|bp| format!("ctx {}%", bp / 100))
+        .and_then(|usage| {
+            usage.utilization_basis_points.map(|basis_points| {
+                let estimate = if usage.estimated { "~" } else { "" };
+                format!("ctx {estimate}{}%", basis_points / 100)
+            })
+        })
         .unwrap_or_else(|| "ctx --".to_string());
     let session = state.session_id();
     let model = current_model(state)
@@ -592,6 +596,20 @@ mod tests {
         assert!(out.contains("running"), "turn label missing:\n{out}");
         assert!(out.contains("ctx"), "ctx usage missing:\n{out}");
         assert!(out.contains("sess-xyz"), "session id missing:\n{out}");
+    }
+
+    #[test]
+    fn status_bar_marks_cross_model_context_estimates() {
+        let mut state = ViewState::new("sess");
+        state.apply_event(
+            1,
+            SessionEvent::ContextUsageChanged {
+                usage: ContextUsage::new(50, Some(100), 0, None).mark_estimated(),
+            },
+        );
+
+        let out = render_to_string(&state, "", 60, 12);
+        assert!(out.contains("ctx ~50%"), "estimate marker missing:\n{out}");
     }
 
     #[test]

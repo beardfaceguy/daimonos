@@ -430,6 +430,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         val DEFAULT_CAPABILITIES = listOf(
             ClientCapability.OBSERVE,
             ClientCapability.PROMPT,
+            ClientCapability.CONFIGURE,
             ClientCapability.INTERRUPT,
             ClientCapability.STOP,
             ClientCapability.APPROVE_ONCE,

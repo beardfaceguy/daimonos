@@ -24,6 +24,8 @@ pub struct PersistedSession {
     pub session_id: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_user_message_ids: Vec<String>,
@@ -71,7 +73,7 @@ impl SessionStore {
     /// Persist a session's history. Best-effort: a write failure is logged to
     /// stderr and never fails the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
-        self.save_record(id, model, messages, None, &[], &[]);
+        self.save_record(id, model, None, messages, None, &[], &[]);
     }
 
     /// Persist a session and the working directory needed by ACP session/list.
@@ -79,13 +81,17 @@ impl SessionStore {
     /// readable and the chat store can continue using [`Self::save`].
     #[cfg(test)]
     pub fn save_with_cwd(&self, id: &str, model: &str, messages: &[Message], cwd: &Path) {
-        self.save_record(id, model, messages, Some(cwd.to_path_buf()), &[], &[]);
+        self.save_record(id, model, None, messages, Some(cwd.to_path_buf()), &[], &[]);
     }
 
+    /// Persist an ACP/daemon session including its provider-neutral effort
+    /// level so every caller makes runtime-state ownership explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_acp(
         &self,
         id: &str,
         model: &str,
+        thinking: &str,
         messages: &[Message],
         cwd: &Path,
         client_user_message_ids: &[String],
@@ -94,6 +100,7 @@ impl SessionStore {
         self.save_record(
             id,
             model,
+            Some(thinking.to_string()),
             messages,
             Some(cwd.to_path_buf()),
             client_user_message_ids,
@@ -101,10 +108,12 @@ impl SessionStore {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_record(
         &self,
         id: &str,
         model: &str,
+        thinking: Option<String>,
         messages: &[Message],
         cwd: Option<PathBuf>,
         client_user_message_ids: &[String],
@@ -117,6 +126,7 @@ impl SessionStore {
             version: SESSION_PERSIST_VERSION,
             session_id: id.to_string(),
             model: model.to_string(),
+            thinking,
             cwd,
             client_user_message_ids: client_user_message_ids.to_vec(),
             assistant_outcomes: assistant_outcomes.to_vec(),
@@ -272,6 +282,7 @@ mod tests {
         store.save_acp(
             "acp-ids",
             "test-model",
+            "medium",
             &msgs(),
             workspace.path(),
             &["user-1".to_string()],

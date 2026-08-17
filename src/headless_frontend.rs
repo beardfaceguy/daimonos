@@ -356,8 +356,10 @@ impl<T: FrontendTransport> HeadlessFrontend<T> {
         config_id: impl Into<String>,
         value: RuntimeValue,
     ) -> Result<(), HeadlessError> {
+        self.require(ClientCapability::Configure)?;
         self.transport
             .send(ClientMessage::SetConfig {
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
                 config_id: config_id.into(),
                 value,
             })
