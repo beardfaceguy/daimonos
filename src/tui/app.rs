@@ -109,6 +109,18 @@ pub async fn run(
             thinking: options.thinking,
             ..CompleteOpts::default()
         },
+        // #1240 parity with the ACP frontend: the failover chain IS the
+        // operator's ordered model list (`DAIMONOS_AGENT_MODELS`, the same
+        // list `/model` shows, best-first). Provider-agnostic by
+        // construction — there is no cross-provider "older sibling" API, so
+        // the operator's own preference order is the only sound generic
+        // rule. When the env var is unset this list is `[active_model]` and
+        // `next_failover_model` finds no successor, so failover stays
+        // effectively opt-in.
+        provider_retry: crate::agent::ProviderRetryConfig {
+            failover_models: options.models.clone(),
+            ..crate::agent::ProviderRetryConfig::default()
+        },
         before_tool_call: Some(before_tool_call),
         after_tool_call: Some(after_tool_call),
         on_stream_event: Some(Box::new(move |event| {
