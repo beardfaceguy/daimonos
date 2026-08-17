@@ -9,11 +9,12 @@
 # Task 07 is noisy (4-7 calls) so it gets n=5. Task 02 is dropped: already at
 # the 2-call floor, contributes only noise (PR #159 finding).
 #
-# Usage: ./run-1230-phase2.sh <task-id> <reps>
+# Usage: ./run-1230-phase2.sh <task-id-prefix> <reps>
 set -eu
 cd "$(dirname "$0")" || exit 1
 
 TASK="${1:?task id prefix required}"
+TASK_TAG="${TASK%%-*}"
 REPS="${2:?rep count required}"
 SHA=50b0c86
 
@@ -23,7 +24,7 @@ for arm in base rtw; do
   i=1
   while [ "$i" -le "$REPS" ]; do
     echo "=== task $TASK | arm $arm | rep $i/$REPS ==="
-    DAIMONOS_BIN="$bin" BENCH_TAG="1230p2-$arm-t$TASK-r$i" ./bench-agent.sh "$TASK"
+    DAIMONOS_BIN="$bin" BENCH_TAG="1230p2-$arm-t$TASK_TAG-r$i" ./bench-agent.sh "$TASK"
     i=$((i + 1))
   done
 done

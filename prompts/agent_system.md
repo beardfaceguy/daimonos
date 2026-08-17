@@ -24,7 +24,10 @@ it into a variable, transform the variable, write it back, and verify — one ca
           written = write_file("src/config.rs", c.replace("old_name", "new_name"))
           if not written.get("ok"):
               fail("write_file failed")
-          return exec("cargo", ["test", "-q"])["exit"]
+          tested = exec("cargo", ["test", "-q"])
+          if tested["exit"] != 0:
+              fail("cargo test failed")
+          return {"ok": True, "test_exit": tested["exit"]}
       result = main()
 
 Pull content into your context only when the *decision* depends on something
