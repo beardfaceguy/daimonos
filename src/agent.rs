@@ -301,7 +301,15 @@ pub fn accumulate_usage(acc: Usage, turn: Usage) -> Usage {
     Usage {
         input: acc.input + turn.input,
         output: acc.output + turn.output,
-        reasoning_output: acc.reasoning_output + turn.reasoning_output,
+        // Aggregates carry the subtotal of provider-reported details. `None`
+        // survives only when no call reported the field; mixed-provider
+        // failover therefore remains visibly partial instead of fabricating a
+        // token count for the unreported call.
+        reasoning_output: match (acc.reasoning_output, turn.reasoning_output) {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+        },
+        thinking_bytes: acc.thinking_bytes.saturating_add(turn.thinking_bytes),
         cache_read: acc.cache_read + turn.cache_read,
         cache_write: acc.cache_write + turn.cache_write,
         cost: Cost {
@@ -408,6 +416,7 @@ fn token_log_line(
         "input": usage.input,
         "output": usage.output,
         "reasoning_output": usage.reasoning_output,
+        "thinking_bytes": usage.thinking_bytes,
         "cache_read": usage.cache_read,
         "cache_write": usage.cache_write,
         // Fixed-decimal string, not a bare f64: serde_json renders small floats
@@ -962,12 +971,16 @@ async fn run_inner(
         // one generation: a 5xx bills no tokens, so there is nothing to
         // attribute to a separate attempt.
         let mut retries = 0u32;
-        let resp = loop {
+        let mut thinking_bytes = 0u64;
+        let mut resp = loop {
             let attempt = match &config.on_stream_event {
                 Some(hook) => {
                     provider
                         .stream(&ctx, opts, &mut |ev| {
                             generation.mark_first_token();
+                            if let StreamEvent::ThinkingDelta(text) = &ev {
+                                thinking_bytes = thinking_bytes.saturating_add(text.len() as u64);
+                            }
                             hook(ev);
                         })
                         .instrument(generation.span().clone())
@@ -975,8 +988,11 @@ async fn run_inner(
                 }
                 None => {
                     provider
-                        .stream(&ctx, opts, &mut |_| {
+                        .stream(&ctx, opts, &mut |ev| {
                             generation.mark_first_token();
+                            if let StreamEvent::ThinkingDelta(text) = &ev {
+                                thinking_bytes = thinking_bytes.saturating_add(text.len() as u64);
+                            }
                         })
                         .instrument(generation.span().clone())
                         .await
@@ -1001,6 +1017,10 @@ async fn run_inner(
                 tokio::time::sleep(delay).await;
             }
         };
+        // Providers report reasoning tokens inconsistently, but every adapter
+        // crosses this shared stream boundary. Count exact UTF-8 bytes here so
+        // the metric is provider-neutral and never guessed from token ratios.
+        resp.usage.thinking_bytes = thinking_bytes;
         generation.finish(&resp);
         // Two-phase notice delivery: only advance the watermark after a real
         // provider response consumed the notice. Provider Error/Aborted leaves
@@ -4383,7 +4403,8 @@ mod tests {
         let usage = Usage {
             input: 120,
             output: 45,
-            reasoning_output: 11,
+            reasoning_output: Some(11),
+            thinking_bytes: 17,
             cache_read: 3,
             cache_write: 7,
             cost: Cost {
@@ -4416,6 +4437,7 @@ mod tests {
         assert_eq!(parsed["input"], 120);
         assert_eq!(parsed["output"], 45);
         assert_eq!(parsed["reasoning_output"], 11);
+        assert_eq!(parsed["thinking_bytes"], 17);
         assert_eq!(parsed["cache_read"], 3);
         assert_eq!(parsed["cache_write"], 7);
         assert_eq!(parsed["cost_usd"], "0.001200");
@@ -4428,6 +4450,16 @@ mod tests {
         assert_eq!(parsed["context"]["tool_result_ok_bytes"], 200);
         assert_eq!(parsed["context"]["payload_tokens_est"], 75);
         assert!(parsed["ts"].is_string(), "must include a timestamp");
+
+        let unavailable: serde_json::Value = serde_json::from_str(&token_log_line(
+            "chat",
+            "anthropic",
+            &Usage::default(),
+            None,
+        ))
+        .unwrap();
+        assert!(unavailable["reasoning_output"].is_null());
+        assert_eq!(unavailable["thinking_bytes"], 0);
     }
 
     #[test]
@@ -4616,6 +4648,27 @@ mod tests {
         assert_eq!(total.output, 250);
     }
 
+    #[test]
+    fn accumulate_preserves_reasoning_availability_and_exact_thinking_bytes() {
+        let reported = Usage {
+            reasoning_output: Some(0),
+            thinking_bytes: 4,
+            ..Usage::default()
+        };
+        let unreported = Usage {
+            reasoning_output: None,
+            thinking_bytes: 5,
+            ..Usage::default()
+        };
+        let total = accumulate_usage(reported, unreported);
+        assert_eq!(total.reasoning_output, Some(0));
+        assert_eq!(total.thinking_bytes, 9);
+        assert_eq!(
+            accumulate_usage(Usage::default(), Usage::default()).reasoning_output,
+            None
+        );
+    }
+
     // --- response_to_content ---
 
     #[test]
@@ -4752,6 +4805,7 @@ mod tests {
         let provider = StreamingMockProvider {
             events: vec![
                 StreamEvent::TextDelta("hel".into()),
+                StreamEvent::ThinkingDelta("éλ".into()),
                 StreamEvent::TextDelta("lo".into()),
             ],
             response: end_turn_resp(),
@@ -4764,11 +4818,13 @@ mod tests {
         };
         let result = run(&provider, shared(s), vec![Message::user("hi")], &config).await;
         assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.usage.thinking_bytes, 4);
         let seen = seen.lock().unwrap();
         assert_eq!(
             *seen,
             vec![
                 StreamEvent::TextDelta("hel".into()),
+                StreamEvent::ThinkingDelta("éλ".into()),
                 StreamEvent::TextDelta("lo".into())
             ]
         );
@@ -4779,7 +4835,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());
         let provider = StreamingMockProvider {
-            events: vec![StreamEvent::TextDelta("x".into())],
+            events: vec![
+                StreamEvent::TextDelta("x".into()),
+                StreamEvent::ThinkingDelta("💡".into()),
+            ],
             response: end_turn_resp(),
         };
         let result = run(
@@ -4790,6 +4849,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.usage.thinking_bytes, 4);
     }
 
     // --- run loop ---

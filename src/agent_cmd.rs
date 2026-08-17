@@ -132,6 +132,8 @@ pub async fn run_agent(
             task_prefix,
             input_tokens: result.usage.input,
             output_tokens: result.usage.output,
+            reasoning_output_tokens: result.usage.reasoning_output,
+            thinking_bytes: result.usage.thinking_bytes,
             cache_read_tokens: result.usage.cache_read,
             cache_write_tokens: result.usage.cache_write,
             cost_usd: result.usage.cost.total_usd,

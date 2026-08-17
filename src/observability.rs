@@ -80,6 +80,7 @@ impl GenerationSpan {
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "daimonos.usage.reasoning_output" = tracing::field::Empty,
+            "daimonos.usage.thinking_bytes" = tracing::field::Empty,
             "daimonos.usage.cache_read" = tracing::field::Empty,
             "daimonos.usage.cache_write" = tracing::field::Empty,
             "langfuse.observation.usage_details" = tracing::field::Empty,
@@ -122,8 +123,12 @@ impl GenerationSpan {
         let usage = &response.usage;
         self.span.record("gen_ai.usage.input_tokens", usage.input);
         self.span.record("gen_ai.usage.output_tokens", usage.output);
+        if let Some(reasoning_output) = usage.reasoning_output {
+            self.span
+                .record("daimonos.usage.reasoning_output", reasoning_output);
+        }
         self.span
-            .record("daimonos.usage.reasoning_output", usage.reasoning_output);
+            .record("daimonos.usage.thinking_bytes", usage.thinking_bytes);
         self.span
             .record("daimonos.usage.cache_read", usage.cache_read);
         self.span
@@ -135,6 +140,8 @@ impl GenerationSpan {
                 // reasoning_output is already included in output. Keep it as
                 // a dedicated span attribute, not in this additive map.
                 "output": usage.output,
+                "reasoning_output": usage.reasoning_output,
+                "thinking_bytes": usage.thinking_bytes,
                 "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write,
             })
@@ -1388,7 +1395,8 @@ mod tests {
                     usage: Usage {
                         input: 100,
                         output: 20,
-                        reasoning_output: 0,
+                        reasoning_output: None,
+                        thinking_bytes: 7,
                         cache_read: 30,
                         cache_write: 10,
                         cost: Cost {
@@ -1432,6 +1440,16 @@ mod tests {
                 .get("daimonos.usage.cache_read")
                 .map(String::as_str),
             Some("30")
+        );
+        assert!(
+            !attributes.contains_key("daimonos.usage.reasoning_output"),
+            "an unavailable provider detail must remain absent"
+        );
+        assert_eq!(
+            attributes
+                .get("daimonos.usage.thinking_bytes")
+                .map(String::as_str),
+            Some("7")
         );
         assert!(attributes["langfuse.observation.model.parameters"].contains("\"max_tokens\":4096"));
         assert!(!attributes.contains_key("langfuse.observation.input"));
@@ -1849,7 +1867,8 @@ mod tests {
                         usage: Usage {
                             input: 10,
                             output: 5,
-                            reasoning_output: 0,
+                            reasoning_output: None,
+                            thinking_bytes: 0,
                             cache_read: 0,
                             cache_write: 0,
                             cost: Cost::default(),
@@ -2036,7 +2055,8 @@ mod tests {
             usage: Usage {
                 input: 100,
                 output: 20,
-                reasoning_output: 0,
+                reasoning_output: None,
+                thinking_bytes: 0,
                 cache_read: 0,
                 cache_write: 0,
                 cost: Cost {
