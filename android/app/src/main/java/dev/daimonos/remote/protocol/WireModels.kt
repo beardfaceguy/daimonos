@@ -457,6 +457,7 @@ enum class ContextBudgetError {
 @Serializable
 data class ContextUsage(
     @SerialName("prompt_tokens") val promptTokens: Long,
+    val estimated: Boolean = false,
     @SerialName("model_context_window") val modelContextWindow: Long? = null,
     @SerialName("output_reservation") val outputReservation: Long,
     @SerialName("effective_input_budget") val effectiveInputBudget: Long? = null,

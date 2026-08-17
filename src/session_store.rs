@@ -84,31 +84,10 @@ impl SessionStore {
         self.save_record(id, model, None, messages, Some(cwd.to_path_buf()), &[], &[]);
     }
 
-    /// Persist an ACP/chat session that has no daemon-owned runtime options.
-    /// Session-daemon callers must use [`Self::save_acp_with_thinking`] so a
-    /// user-selected effort level survives reconnect.
-    pub fn save_acp(
-        &self,
-        id: &str,
-        model: &str,
-        messages: &[Message],
-        cwd: &Path,
-        client_user_message_ids: &[String],
-        assistant_outcomes: &[AssistantOutcome],
-    ) {
-        self.save_record(
-            id,
-            model,
-            None,
-            messages,
-            Some(cwd.to_path_buf()),
-            client_user_message_ids,
-            assistant_outcomes,
-        );
-    }
-
+    /// Persist an ACP/daemon session including its provider-neutral effort
+    /// level so every caller makes runtime-state ownership explicit.
     #[allow(clippy::too_many_arguments)]
-    pub fn save_acp_with_thinking(
+    pub fn save_acp(
         &self,
         id: &str,
         model: &str,
@@ -303,6 +282,7 @@ mod tests {
         store.save_acp(
             "acp-ids",
             "test-model",
+            "medium",
             &msgs(),
             workspace.path(),
             &["user-1".to_string()],

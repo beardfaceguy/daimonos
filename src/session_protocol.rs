@@ -424,12 +424,20 @@ pub enum ContextBudgetError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsage {
     pub prompt_tokens: u64,
+    /// True when prompt_tokens came from the previous model's last observed
+    /// occupancy and is being projected onto a newly selected model window.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub estimated: bool,
     pub model_context_window: Option<u64>,
     pub output_reservation: u64,
     pub effective_input_budget: Option<u64>,
     pub utilization_basis_points: Option<u16>,
     pub compaction_high_water_tokens: Option<u64>,
     pub budget_error: Option<ContextBudgetError>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ContextUsage {
@@ -451,6 +459,7 @@ impl ContextUsage {
         });
         Self {
             prompt_tokens,
+            estimated: false,
             model_context_window,
             output_reservation,
             effective_input_budget,
@@ -458,6 +467,11 @@ impl ContextUsage {
             compaction_high_water_tokens,
             budget_error,
         }
+    }
+
+    pub fn mark_estimated(mut self) -> Self {
+        self.estimated = true;
+        self
     }
 }
 
@@ -808,6 +822,14 @@ mod tests {
         assert_eq!(usage.effective_input_budget, Some(180));
         assert_eq!(usage.utilization_basis_points, Some(5_555));
         assert_eq!(usage.compaction_high_water_tokens, Some(160));
+        assert!(!usage.estimated);
+        let estimated = usage.clone().mark_estimated();
+        assert!(estimated.estimated);
+        assert_eq!(
+            serde_json::from_value::<ContextUsage>(serde_json::to_value(&estimated).unwrap())
+                .unwrap(),
+            estimated
+        );
 
         let over = ContextUsage::new(300, Some(200), 20, None);
         assert_eq!(over.utilization_basis_points, Some(10_000));

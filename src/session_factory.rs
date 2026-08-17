@@ -324,7 +324,7 @@ mod tests {
     async fn loaded_core_seeds_reconnect_snapshot_from_persisted_history() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions"));
-        store.save_acp_with_thinking(
+        store.save_acp(
             "session-1",
             "saved-model",
             "high",
@@ -352,6 +352,7 @@ mod tests {
         store.save_acp(
             "foreign-session",
             "saved-model",
+            "medium",
             &[crate::providers::Message::user("foreign")],
             &foreign,
             &[],
@@ -412,7 +413,7 @@ mod tests {
             "saved-model"
         );
 
-        store.save_acp_with_thinking(
+        store.save_acp(
             "invalid-thinking",
             "saved-model",
             "removed-level",

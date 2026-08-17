@@ -560,7 +560,7 @@ impl SessionPersistence {
         if state.deleted {
             return;
         }
-        self.store.save_acp_with_thinking(
+        self.store.save_acp(
             &self.session_id,
             model,
             thinking,
@@ -743,7 +743,10 @@ impl SessionCore {
                     .as_ref()
                     .map(|usage| usage.prompt_tokens)
                     .unwrap_or(0);
-                self.publish_context_usage(self.context_usage(used_tokens, context_window));
+                self.publish_context_usage(
+                    self.context_usage(used_tokens, context_window)
+                        .mark_estimated(),
+                );
             }
             ("thinking", RuntimeValue::String(level)) => {
                 let thinking =

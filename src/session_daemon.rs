@@ -3006,7 +3006,9 @@ mod tests {
             Some(ServerMessage::Event {
                 event: SessionEvent::ContextUsageChanged { usage },
                 ..
-            }) if usage.prompt_tokens == 50 && usage.model_context_window == Some(200)
+            }) if usage.prompt_tokens == 50
+                && usage.model_context_window == Some(200)
+                && usage.estimated
         ));
         assert!(matches!(
             client.recv().await,
