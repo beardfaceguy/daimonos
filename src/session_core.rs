@@ -6,9 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::agent::AgentSession;
 use crate::compaction::CompactionPolicy;
-use crate::providers::Message;
+use crate::providers::{Message, ThinkingLevel};
 use crate::session_protocol::{
-    ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, SessionEvent, TurnStatus,
+    ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, RuntimeOption,
+    RuntimeValue, SessionEvent, TurnStatus,
 };
 use crate::session_store::SessionStore;
 
@@ -26,6 +27,15 @@ impl std::fmt::Display for TurnError {
 }
 
 impl std::error::Error for TurnError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeConfigError {
+    Busy,
+    UnknownOption,
+    InvalidValue,
+    UnsupportedOption,
+    ApplyFailed(String),
+}
 
 pub enum SessionPromptOutcome {
     Completed(Box<crate::agent::TurnResult>),
@@ -537,6 +547,7 @@ impl SessionPersistence {
     fn save(
         &self,
         model: &str,
+        thinking: &str,
         messages: &[Message],
         cwd: &Path,
         client_user_message_ids: &[String],
@@ -549,9 +560,10 @@ impl SessionPersistence {
         if state.deleted {
             return;
         }
-        self.store.save_acp(
+        self.store.save_acp_with_thinking(
             &self.session_id,
             model,
+            thinking,
             messages,
             cwd,
             client_user_message_ids,
@@ -580,6 +592,7 @@ pub struct SessionCore {
     pub(crate) turn: TurnController,
     pub(crate) approvals: Arc<ApprovalBroker>,
     pub(crate) current_model: StdMutex<String>,
+    current_thinking: StdMutex<ThinkingLevel>,
     pub(crate) cwd: PathBuf,
     pub(crate) client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
     pub(crate) assistant_outcomes: StdMutex<Vec<AssistantOutcome>>,
@@ -587,6 +600,7 @@ pub struct SessionCore {
     pub(crate) context_windows: tokio::sync::Mutex<HashMap<String, u64>>,
     pub(crate) events: Arc<SessionEventRouter>,
     pub(crate) tool_lifecycle: Arc<CanonicalToolLifecycle>,
+    runtime_options: StdMutex<Vec<RuntimeOption>>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -638,12 +652,14 @@ impl SessionCore {
         events: Arc<SessionEventRouter>,
         tool_lifecycle: Arc<CanonicalToolLifecycle>,
     ) -> Self {
+        let current_thinking = session.thinking().clone();
         Self {
             lifecycle: tokio::sync::Mutex::new(()),
             session: tokio::sync::Mutex::new(session),
             turn: TurnController::default(),
             approvals,
             current_model: StdMutex::new(current_model),
+            current_thinking: StdMutex::new(current_thinking),
             cwd,
             client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
             assistant_outcomes: StdMutex::new(Vec::new()),
@@ -651,8 +667,102 @@ impl SessionCore {
             context_windows: tokio::sync::Mutex::new(context_windows),
             events,
             tool_lifecycle,
+            runtime_options: StdMutex::new(Vec::new()),
             persistence,
         }
+    }
+
+    pub fn set_runtime_options(&self, options: Vec<RuntimeOption>) {
+        *self
+            .runtime_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = options;
+    }
+
+    pub fn runtime_options(&self) -> Vec<RuntimeOption> {
+        self.runtime_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn current_model(&self) -> String {
+        self.current_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub async fn apply_runtime_option(
+        &self,
+        config_id: &str,
+        value: RuntimeValue,
+    ) -> Result<Vec<RuntimeOption>, RuntimeConfigError> {
+        let option = self
+            .runtime_options()
+            .into_iter()
+            .find(|option| option.id == config_id)
+            .ok_or(RuntimeConfigError::UnknownOption)?;
+        if !option.accepts(&value) {
+            return Err(RuntimeConfigError::InvalidValue);
+        }
+        if self.turn.is_active() && !option.mutable_while_running {
+            return Err(RuntimeConfigError::Busy);
+        }
+
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.turn.is_active() && !option.mutable_while_running {
+            return Err(RuntimeConfigError::Busy);
+        }
+        match (config_id, &value) {
+            ("model", RuntimeValue::String(model)) => {
+                let mut session = self.session.lock().await;
+                self.prepare_model(&mut session, model)
+                    .await
+                    .map_err(RuntimeConfigError::ApplyFailed)?;
+                let history = session.history().to_vec();
+                *self
+                    .current_model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = model.clone();
+                drop(session);
+                let client_ids = self.client_user_message_ids.lock().await.clone();
+                self.persist(model, &history, &client_ids);
+            }
+            ("thinking", RuntimeValue::String(level)) => {
+                let thinking =
+                    ThinkingLevel::from_input(level).map_err(RuntimeConfigError::ApplyFailed)?;
+                let mut session = self.session.lock().await;
+                session.set_thinking(thinking.clone());
+                let model = session.model().to_string();
+                let history = session.history().to_vec();
+                *self
+                    .current_thinking
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = thinking;
+                drop(session);
+                let client_ids = self.client_user_message_ids.lock().await.clone();
+                self.persist(&model, &history, &client_ids);
+            }
+            _ => return Err(RuntimeConfigError::UnsupportedOption),
+        }
+
+        let options = {
+            let mut options = self
+                .runtime_options
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let option = options
+                .iter_mut()
+                .find(|option| option.id == config_id)
+                .ok_or(RuntimeConfigError::UnknownOption)?;
+            option.value = value;
+            options.clone()
+        };
+        let _ = self.events.emit(SessionEvent::RuntimeOptionsChanged {
+            options: options.clone(),
+        });
+        Ok(options)
     }
 
     pub async fn prepare_model(
@@ -721,12 +831,17 @@ impl SessionCore {
 
     pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
         if let Some(persistence) = &self.persistence {
+            let thinking = self
+                .current_thinking
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let outcomes = self
                 .assistant_outcomes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             persistence.save(
                 model,
+                thinking.as_str(),
                 messages,
                 &self.cwd,
                 client_user_message_ids,
@@ -837,7 +952,7 @@ impl SessionCore {
             transcript,
             tool_calls,
             pending_approvals: self.approvals.pending(),
-            runtime_options: Vec::new(),
+            runtime_options: self.runtime_options(),
             context_usage: None,
             history_truncated: false,
         }

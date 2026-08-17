@@ -2209,6 +2209,12 @@ impl AgentSession {
         self.config.opts.model = model.into();
     }
 
+    /// Switch reasoning effort for subsequent provider calls. Existing
+    /// history and usage remain unchanged.
+    pub fn set_thinking(&mut self, thinking: ThinkingLevel) {
+        self.config.opts.thinking = thinking;
+    }
+
     /// Replace the policy used for subsequent turns. ACP uses this when its
     /// model picker switches between models with different context windows.
     pub fn set_compaction(&mut self, policy: Option<CompactionPolicy>) {
@@ -2229,6 +2235,10 @@ impl AgentSession {
     /// The model currently configured for this session.
     pub fn model(&self) -> &str {
         &self.config.opts.model
+    }
+
+    pub fn thinking(&self) -> &ThinkingLevel {
+        &self.config.opts.thinking
     }
 
     pub fn tool_count(&self) -> usize {

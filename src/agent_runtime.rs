@@ -370,11 +370,16 @@ pub async fn run_session_daemon(
         )
         .await,
     );
+    let mut models = agent.models.clone();
+    if !models.iter().any(|candidate| candidate == &effective_model) {
+        models.insert(0, effective_model.clone());
+    }
     let factory = Arc::new(session_factory::AgentSessionFactory::new(
         make_provider,
         workspace.to_path_buf(),
         Arc::clone(&cfg),
         effective_model,
+        models,
         agent.thinking.clone(),
         agent.to_safety_policy(None),
         token_log,

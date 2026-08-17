@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::client_transport::{ClientTransport, TransportError, UnixSocketTransport};
-use crate::session_core::{SessionCore, SessionEventSubscription, SessionReplay};
+use crate::session_core::{
+    RuntimeConfigError, SessionCore, SessionEventSubscription, SessionReplay,
+};
 use crate::session_protocol::{
     ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage, SessionEvent,
     SessionListEntry, SessionSnapshot, ToolCallState, ToolCallStateStatus, TranscriptEntry,
@@ -266,7 +268,9 @@ impl SessionDaemon {
         session_id: String,
         core: Arc<SessionCore>,
     ) -> Result<(), SessionDaemonError> {
-        let snapshot = SnapshotState::new(session_id.clone(), self.max_snapshot_entries).snapshot;
+        let mut snapshot =
+            SnapshotState::new(session_id.clone(), self.max_snapshot_entries).snapshot;
+        snapshot.runtime_options = core.runtime_options();
         self.create_session_with_snapshot(session_id, core, snapshot)
     }
 
@@ -1232,6 +1236,74 @@ impl SessionDaemon {
                                     })
                                     .await?;
                             }
+                        }
+                    }
+                    Some(message @ ClientMessage::SetConfig { .. }) => {
+                        if let Err(error) = limits.validate_client_message(&message) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: None,
+                                    code: "invalid_message".to_string(),
+                                    message: format!("{error:?}"),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        if !attachment.has_capability(ClientCapability::Prompt) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: None,
+                                    code: "capability_denied".to_string(),
+                                    message: "prompt capability was not granted".to_string(),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let ClientMessage::SetConfig { config_id, value } = message else {
+                            unreachable!("matched set config");
+                        };
+                        if let Err(error) = attachment
+                            .core()
+                            .apply_runtime_option(&config_id, value)
+                            .await
+                        {
+                            let (code, message) = match error {
+                                RuntimeConfigError::Busy => (
+                                    "config_locked",
+                                    "configuration cannot change while a turn is running",
+                                ),
+                                RuntimeConfigError::UnknownOption => (
+                                    "unknown_config",
+                                    "runtime configuration option is unknown",
+                                ),
+                                RuntimeConfigError::InvalidValue => (
+                                    "invalid_config",
+                                    "runtime configuration value is invalid",
+                                ),
+                                RuntimeConfigError::UnsupportedOption => (
+                                    "unsupported_config",
+                                    "runtime configuration option is not implemented",
+                                ),
+                                RuntimeConfigError::ApplyFailed(ref detail) => {
+                                    tracing::warn!(
+                                        target: "daimonos::session_daemon",
+                                        event = "runtime_config_apply_failed",
+                                        config_id,
+                                        error = %detail,
+                                    );
+                                    (
+                                        "config_apply_failed",
+                                        "runtime configuration could not be applied",
+                                    )
+                                }
+                            };
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: None,
+                                    code: code.to_string(),
+                                    message: message.to_string(),
+                                })
+                                .await?;
                         }
                     }
                     Some(message @ ClientMessage::ListSessions { .. }) => {
@@ -2818,6 +2890,13 @@ mod tests {
             })
             .await
             .unwrap();
+        client
+            .send(ClientMessage::SetConfig {
+                config_id: "model".to_string(),
+                value: crate::session_protocol::RuntimeValue::String("forged".to_string()),
+            })
+            .await
+            .unwrap();
         client.send(ClientMessage::Detach).await.unwrap();
 
         daemon
@@ -2843,6 +2922,136 @@ mod tests {
         assert!(matches!(
             client.recv().await,
             Some(ServerMessage::Error { code, .. }) if code == "capability_denied"
+        ));
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Error { code, .. }) if code == "capability_denied"
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_config_applies_model_and_projects_runtime_options() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 8, 32));
+        let core = test_core();
+        core.set_runtime_options(vec![
+            crate::session_protocol::RuntimeOption::select(
+                "model",
+                "Model",
+                crate::session_protocol::RuntimeValue::String("test-model".to_string()),
+                vec![
+                    crate::session_protocol::RuntimeChoice::new("test-model", "test-model"),
+                    crate::session_protocol::RuntimeChoice::new("model-b", "model-b"),
+                ],
+            ),
+            crate::session_protocol::RuntimeOption::select(
+                "thinking",
+                "Thinking",
+                crate::session_protocol::RuntimeValue::String("medium".to_string()),
+                vec![
+                    crate::session_protocol::RuntimeChoice::new("medium", "medium"),
+                    crate::session_protocol::RuntimeChoice::new("high", "high"),
+                ],
+            ),
+        ]);
+        daemon
+            .create_session("session-1".to_string(), Arc::clone(&core))
+            .unwrap();
+        let (transport, mut client) = in_memory_transport_pair(8, "test client");
+        let serve_daemon = Arc::clone(&daemon);
+        let serve = tokio::spawn(async move {
+            serve_daemon
+                .serve_client(transport, &protocol_limits())
+                .await
+        });
+        client
+            .send(ClientMessage::Attach {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: Some("session-1".to_string()),
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![ClientCapability::Observe, ClientCapability::Prompt],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::AttachOk { .. })
+        ));
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Snapshot { state, .. })
+                if state.runtime_options[0].value
+                    == crate::session_protocol::RuntimeValue::String("test-model".to_string())
+        ));
+
+        client
+            .send(ClientMessage::SetConfig {
+                config_id: "model".to_string(),
+                value: crate::session_protocol::RuntimeValue::String("model-b".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Event {
+                event: SessionEvent::RuntimeOptionsChanged { options },
+                ..
+            }) if options[0].value
+                == crate::session_protocol::RuntimeValue::String("model-b".to_string())
+        ));
+        client
+            .send(ClientMessage::SetConfig {
+                config_id: "thinking".to_string(),
+                value: crate::session_protocol::RuntimeValue::String("high".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Event {
+                event: SessionEvent::RuntimeOptionsChanged { options },
+                ..
+            }) if options.iter().any(|option|
+                option.id == "thinking"
+                    && option.value
+                        == crate::session_protocol::RuntimeValue::String("high".to_string())
+            )
+        ));
+
+        client.send(ClientMessage::Detach).await.unwrap();
+        serve.await.unwrap().unwrap();
+        assert_eq!(core.current_model(), "model-b");
+    }
+
+    #[tokio::test]
+    async fn runtime_config_rejects_invalid_values_and_active_turn_changes() {
+        let core = test_core();
+        core.set_runtime_options(vec![crate::session_protocol::RuntimeOption::select(
+            "model",
+            "Model",
+            crate::session_protocol::RuntimeValue::String("test-model".to_string()),
+            vec![
+                crate::session_protocol::RuntimeChoice::new("test-model", "test-model"),
+                crate::session_protocol::RuntimeChoice::new("model-b", "model-b"),
+            ],
+        )]);
+        assert!(matches!(
+            core.apply_runtime_option(
+                "model",
+                crate::session_protocol::RuntimeValue::String("not-listed".to_string()),
+            )
+            .await,
+            Err(RuntimeConfigError::InvalidValue)
+        ));
+
+        let _turn = core.begin_turn().expect("begin turn");
+        assert!(matches!(
+            core.apply_runtime_option(
+                "model",
+                crate::session_protocol::RuntimeValue::String("model-b".to_string()),
+            )
+            .await,
+            Err(RuntimeConfigError::Busy)
         ));
     }
 
