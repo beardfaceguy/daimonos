@@ -122,6 +122,16 @@ pub async fn run(
             label: "tui".to_string(),
         }),
         compaction: options.compaction,
+        // Provider recovery (transient-error resume, failover) surfaces in the
+        // transcript as a system entry: visible, but the turn keeps running.
+        on_provider_notice: Some(Box::new({
+            let view = Arc::clone(&view);
+            move |notice: &str| {
+                view.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_system_message(format!("[{notice}]"));
+            }
+        })),
         ..AgentConfig::default()
     };
 
