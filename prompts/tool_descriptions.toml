@@ -351,8 +351,8 @@ content_b = "Alt: diff against string"
 [tool_pipeline]
 full = """Run tool stages sequentially, abort on failure."""
 
-[tool_repair]
+[lint_repair]
 full = """Auto lint-fix loop until clean."""
 
-[tool_repair.parameters]
+[lint_repair.parameters]
 max_iterations = "Default: 3"

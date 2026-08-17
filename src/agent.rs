@@ -114,6 +114,11 @@ pub fn parse_plan_entries(input: &Value) -> Result<Vec<PlanEntry>, String> {
 /// Receives each complete normalized plan replacement.
 pub type PlanHook = Box<dyn Fn(&[PlanEntry]) + Send + Sync>;
 
+/// Receives human-readable notices about provider-level recovery actions
+/// (transient-error resume, model failover) so frontends can surface them
+/// without parsing logs. Un-defers the frontend notice noted in #1240.
+pub type ProviderNoticeHook = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Provider-neutral outcome of a tool served outside the opcode facade (e.g. a
 /// remote MCP server bridged into an ACP session — ADR-003).
 pub struct RemoteToolResult {
@@ -212,6 +217,15 @@ pub struct AgentConfig {
     /// reissues the truncated turn with thinking forced off so reasoning cannot
     /// re-consume the output budget and stall progress.
     pub auto_continue_budget: Option<u32>,
+    /// Turn-level resumes after a transient provider failure (in-generation
+    /// retries and failover already spent). `None` falls back to the
+    /// `DAIMONOS_AGENT_ERROR_RESUME` env var, then to
+    /// [`DEFAULT_ERROR_RESUME_BUDGET`]. `Some(0)` disables it, restoring the
+    /// dead-stop-on-error behaviour.
+    pub error_resume_budget: Option<u32>,
+    /// Frontend-visible notices for provider recovery actions. `None` = logs
+    /// only.
+    pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
 }
@@ -763,6 +777,39 @@ const REFORMAT_DIFF_MAX_CHARS: usize = 8_000;
 /// tokens.
 const AUTO_CONTINUE_NUDGE: &str = "Continue exactly where the previous message was cut off. Do not repeat earlier output; if the remaining work is large, continue in smaller steps.";
 
+/// Default turn-level resumes after a transient provider failure. Non-zero by
+/// default (operator request 2026-08-17): unlike auto-continue, which spends
+/// tokens to produce *more* output, error resume only recovers work already in
+/// flight, fires exclusively on provider-classified transient failures (never
+/// 4xx auth/validation), and is bounded per user turn. Disable with
+/// `DAIMONOS_AGENT_ERROR_RESUME=0` or `AgentConfig::error_resume_budget`.
+pub const DEFAULT_ERROR_RESUME_BUDGET: u32 = 2;
+
+/// Nudge appended when a transient error interrupted plain text: the partial
+/// assistant message stays as context (the user already saw it stream), and
+/// roles must alternate, so a terse user turn both restores alternation and
+/// tells the model what happened.
+const ERROR_RESUME_NUDGE: &str = "The previous response was interrupted by a transient provider error. Continue exactly where you left off; do not repeat earlier output.";
+
+/// Parse `DAIMONOS_AGENT_ERROR_RESUME` as the error-resume cap. Absent or
+/// unparseable yields `None`, leaving the config field / built-in default to
+/// decide. Mirrors [`auto_continue_budget_from_env`].
+fn error_resume_budget_from_env() -> Option<u32> {
+    let raw = std::env::var("DAIMONOS_AGENT_ERROR_RESUME").ok()?;
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(budget) => Some(budget),
+        Err(_) => {
+            tracing::warn!(
+                target: "daimonos::agent",
+                value = %trimmed,
+                "ignoring unparseable DAIMONOS_AGENT_ERROR_RESUME (want a non-negative integer); using config/default"
+            );
+            None
+        }
+    }
+}
+
 /// Parse `DAIMONOS_AGENT_AUTO_CONTINUE` as the auto-continue cap. Absent or
 /// unparseable yields `None`, leaving the config field / built-in default to
 /// decide.
@@ -841,6 +888,13 @@ async fn run_inner(
         .or_else(auto_continue_budget_from_env)
         .unwrap_or(DEFAULT_AUTO_CONTINUE_BUDGET);
     let mut auto_continues_used: u32 = 0;
+    // Turn-level transient-error resume (operator request 2026-08-17): same
+    // precedence chain as auto-continue — explicit config, env, default.
+    let error_resume_budget = config
+        .error_resume_budget
+        .or_else(error_resume_budget_from_env)
+        .unwrap_or(DEFAULT_ERROR_RESUME_BUDGET);
+    let mut error_resumes_used: u32 = 0;
     // Deterministic retry-storm detection (vikunja #1197). Detector state is
     // scoped to this `run` call, so a new user task starts with fresh windows.
     let mut loop_detector = {
@@ -1121,12 +1175,75 @@ async fn run_inner(
                     "provider retries exhausted; failing over to the next model"
                 );
                 // Never silent: the `provider_failover` event above is the
-                // durable record. A *frontend-visible* notice (ACP/TUI card
-                // saying the turn continued on a substitute model, and that the
-                // switch invalidated prompt cache) needs a new hook threaded
-                // through every frontend, so it is deliberately deferred rather
-                // than half-wired here — see #1240.
+                // durable record, and `on_provider_notice` (the hook #1240
+                // deferred) tells attached frontends the turn continued on a
+                // substitute model.
+                if let Some(notice) = &config.on_provider_notice {
+                    notice(&format!(
+                        "transient provider error \u{2014} failing over to {to}: {}",
+                        resp.error_message.as_deref().unwrap_or("unknown")
+                    ));
+                }
                 failover_model = Some(to);
+                continue;
+            }
+            // Turn-level transient-error resume (operator request 2026-08-17):
+            // in-generation retries are spent and no failover chain applies,
+            // but the failure is still provider-classified transient. Rather
+            // than dead-stopping the whole agent loop and handing the prompt
+            // back to the user, pause with a longer backoff and continue the
+            // same turn. Bounded by `error_resume_budget`; once exhausted the
+            // next error falls through to the terminal arm and surfaces
+            // exactly as before. Fatal errors (`retryable == false`) never
+            // enter this arm.
+            StopReason::Error if resp.retryable && error_resumes_used < error_resume_budget => {
+                error_resumes_used += 1;
+                // Reuse the provider-retry base so tests with a zero base stay
+                // instant; the 4x factor makes turn-level pauses (2s, 4s at
+                // the 500ms default) meaningfully longer than the in-generation
+                // retries that already failed at 500ms/1s.
+                let delay = retry_backoff(
+                    config.provider_retry.base_delay.saturating_mul(4),
+                    error_resumes_used,
+                );
+                tracing::warn!(
+                    target: "daimonos::agent",
+                    event = "transient_error_resume",
+                    resume = error_resumes_used,
+                    budget = error_resume_budget,
+                    delay_ms = delay.as_millis() as u64,
+                    error = resp.error_message.as_deref().unwrap_or("unknown"),
+                    "transient provider error; resuming the turn after backoff"
+                );
+                if let Some(notice) = &config.on_provider_notice {
+                    notice(&format!(
+                        "transient provider error \u{2014} resuming ({error_resumes_used}/{error_resume_budget}): {}",
+                        resp.error_message.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                // The errored attempt's assistant message was pushed above.
+                // Keep partial content — it is a valid continuation seed and
+                // the user already watched it stream — but drop an empty husk:
+                // providers reject empty assistant content.
+                if messages
+                    .last()
+                    .is_some_and(|m| m.role == Role::Assistant && m.content.is_empty())
+                {
+                    messages.pop();
+                }
+                // Restore role alternation: a truncated tool call gets its
+                // synthetic tool_result from `close_orphan_tool_calls`; a
+                // trailing partial text turn gets the resume nudge. Either way
+                // the history ends on a user turn, so thinking/prefill
+                // constraints are untouched.
+                let text_only = !has_orphan_tool_calls(&messages);
+                messages = close_orphan_tool_calls(messages);
+                if text_only && messages.last().is_some_and(|m| m.role == Role::Assistant) {
+                    messages.push(Message::user(ERROR_RESUME_NUDGE));
+                }
                 continue;
             }
             StopReason::EndTurn
@@ -2687,8 +2804,187 @@ mod tests {
         );
     }
 
+    /// Fails the first `failures` calls with a transient error, then succeeds.
+    struct FlakyProvider {
+        failures: Mutex<u32>,
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            *self.calls.lock().unwrap() += 1;
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                LlmResponse::retryable_error("API 529: overloaded")
+            } else {
+                end_turn_resp()
+            }
+        }
+    }
+
+    /// Operator request 2026-08-17: a transient provider failure must not
+    /// dead-stop the agent loop — the turn resumes and completes, the failed
+    /// attempt's empty assistant husk is not committed, and the notice hook
+    /// surfaces what happened.
+    #[tokio::test]
+    async fn transient_error_resumes_the_turn_and_completes() {
+        let provider = FlakyProvider {
+            failures: Mutex::new(2),
+            calls: Mutex::new(0),
+        };
+        let notices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notices);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                // Isolate the turn-level arm: no in-generation retries.
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            error_resume_budget: Some(2),
+            on_provider_notice: Some(Box::new(move |n| {
+                sink.lock().unwrap().push(n.to_string());
+            })),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert!(result.error_message.is_none(), "recovered, not surfaced");
+        assert_eq!(*provider.calls.lock().unwrap(), 3, "2 failures + success");
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.is_empty()),
+            "failed attempts must not commit empty assistant husks: {:?}",
+            result.messages
+        );
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices[0].contains("resuming (1/2)"), "{notices:?}");
+        assert!(notices[1].contains("resuming (2/2)"), "{notices:?}");
+    }
+
+    /// The budget is a hard bound: once spent, the transient error surfaces
+    /// exactly as before.
+    #[tokio::test]
+    async fn error_resume_budget_exhausts_and_surfaces() {
+        let provider = FlakyProvider {
+            failures: Mutex::new(u32::MAX),
+            calls: Mutex::new(0),
+        };
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            error_resume_budget: Some(1),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(result.error_message.is_some());
+        assert_eq!(*provider.calls.lock().unwrap(), 2, "initial + 1 resume");
+    }
+
+    /// A mid-stream failure that already produced text keeps the partial
+    /// content as context (the user watched it stream) and restores role
+    /// alternation with the resume nudge.
+    #[tokio::test]
+    async fn resume_after_partial_text_keeps_content_and_nudges() {
+        struct PartialThenOk {
+            calls: Mutex<u32>,
+        }
+        #[async_trait]
+        impl LlmProvider for PartialThenOk {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    LlmResponse {
+                        content: vec![ContentBlock::Text("PAGE 1 of lorem".to_string())],
+                        ..LlmResponse::retryable_error("network error: stream cut")
+                    }
+                } else {
+                    end_turn_resp_with_text("PAGE 2 onward")
+                }
+            }
+        }
+        let provider = PartialThenOk {
+            calls: Mutex::new(0),
+        };
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            error_resume_budget: Some(1),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("5 pages please")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let texts: Vec<String> = result
+            .messages
+            .iter()
+            .map(|m| {
+                format!(
+                    "{:?}:{}",
+                    m.role,
+                    m.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>()
+                )
+            })
+            .collect();
+        // user prompt, partial assistant, resume nudge, final assistant.
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(texts[1].contains("PAGE 1"), "partial kept: {texts:?}");
+        assert!(
+            texts[2].contains("interrupted by a transient provider error"),
+            "nudge restores alternation: {texts:?}"
+        );
+        assert!(texts[3].contains("PAGE 2"), "{texts:?}");
+    }
+
     /// Failover is opt-in: with no chain configured, behaviour is exactly the
     /// pre-#1240 surface — the transient error is returned after retries.
+    /// (Turn-level resume is disabled here to isolate the failover contract;
+    /// its interplay is covered by the resume tests above.)
     #[tokio::test]
     async fn no_chain_configured_means_no_failover() {
         let provider = FailoverProbe {
@@ -2705,6 +3001,7 @@ mod tests {
                 base_delay: std::time::Duration::ZERO,
                 failover_models: vec![],
             },
+            error_resume_budget: Some(0),
             ..AgentConfig::default()
         };
 
@@ -2861,8 +3158,10 @@ mod tests {
         );
     }
 
-    /// Retries are bounded: an endlessly-failing provider surfaces the error
-    /// rather than looping forever.
+    /// In-generation retries are bounded: an endlessly-failing provider
+    /// surfaces the error rather than looping forever. (Turn-level resume is
+    /// disabled to isolate the in-generation cap; with it enabled the same
+    /// failure would resume — covered by the error-resume tests.)
     #[tokio::test]
     async fn retries_are_capped_and_then_surface_the_error() {
         let provider = MockProvider::new(vec![
@@ -2877,6 +3176,7 @@ mod tests {
                 base_delay: std::time::Duration::ZERO,
                 failover_models: vec![],
             },
+            error_resume_budget: Some(0),
             ..AgentConfig::default()
         };
 

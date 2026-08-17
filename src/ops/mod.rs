@@ -76,7 +76,7 @@ async fn dispatch_op(
         protocol::op::DIFF => diff_ops::diff(session, &op).await,
         protocol::op::FIND => find(session, &op).await,
         protocol::op::TOOL_RUN => tool_ops::tool_run(session, &op).await,
-        protocol::op::TOOL_REPAIR => tool_ops::tool_repair(session, &op).await,
+        protocol::op::LINT_REPAIR => tool_ops::lint_repair(session, &op).await,
         protocol::op::TOOL_PIPELINE => tool_ops::tool_pipeline(session, &op).await,
         protocol::op::TOOL_REGISTER => tool_ops::tool_register(session, &op).await,
         protocol::op::TOOL_LIST => tool_ops::tool_list(session, &op).await,

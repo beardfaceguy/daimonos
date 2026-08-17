@@ -288,7 +288,7 @@ pub mod op {
     /// compact positional `Op` fields are too narrow for rich mail payloads.
     pub const COORD: u8 = 19;
     pub const TOOL_RUN: u8 = 20;
-    pub const TOOL_REPAIR: u8 = 21;
+    pub const LINT_REPAIR: u8 = 21;
     pub const TOOL_PIPELINE: u8 = 22;
     pub const TOOL_REGISTER: u8 = 23;
     pub const TOOL_LIST: u8 = 24;

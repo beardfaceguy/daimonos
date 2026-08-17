@@ -38,6 +38,9 @@ pub const MIN_COMPOSER_HEIGHT: u16 = 3;
 pub struct RenderOptions {
     pub no_color: bool,
     pub scroll_from_bottom: usize,
+    /// True while the TUI is in vim-style scroll mode; draws the `-- SCROLL --`
+    /// indicator over the right edge of the status line.
+    pub scroll_mode: bool,
 }
 
 /// Render the whole TUI frame for `state` into `area` of `buf`.
@@ -59,6 +62,9 @@ pub fn render_with_options(
     let chunks = tui_layout(area);
     render_transcript(state, chunks[0], buf, options.scroll_from_bottom);
     render_status(state, chunks[1], buf);
+    if options.scroll_mode {
+        render_scroll_mode_indicator(chunks[1], buf);
+    }
     render_composer(composer, chunks[2], buf);
     // Overlay last so it sits above every base layer. It is the one thing a
     // human must act on, and ADR-011 keeps approval authority with the local
@@ -154,6 +160,30 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_fro
     paragraph
         .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
         .render(area, buf);
+}
+
+/// Vim's `-- MODE --` habit: a right-aligned indicator on the status line
+/// while scroll mode owns the keyboard, doubling as the key cheat-sheet. Drawn
+/// after [`render_status`] so it overlays the info text on narrow terminals
+/// (the mode is the thing the user must know to get their keys back).
+fn render_scroll_mode_indicator(area: Rect, buf: &mut Buffer) {
+    const LABEL: &str =
+        " -- SCROLL --  j/k \u{b7} C-d/C-u \u{b7} C-f/C-b \u{b7} gg/G \u{b7} Esc/i to type ";
+    let width = u16::try_from(LABEL.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    if width == 0 || area.height == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - width),
+        y: area.y,
+        width,
+        height: 1,
+    };
+    Paragraph::new(Line::from(LABEL))
+        .style(Style::default().fg(Color::Black).bg(Color::Yellow))
+        .render(rect, buf);
 }
 
 fn render_status(state: &ViewState, area: Rect, buf: &mut Buffer) {
@@ -793,6 +823,27 @@ mod tests {
             .content
             .iter()
             .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn scroll_mode_indicator_appears_only_in_scroll_mode() {
+        let state = ViewState::new("sess-1");
+        let area = Rect::new(0, 0, 80, 12);
+        let mut plain = Buffer::empty(area);
+        render_with_options(&state, "", area, &mut plain, RenderOptions::default());
+        let mut scrolling = Buffer::empty(area);
+        render_with_options(
+            &state,
+            "",
+            area,
+            &mut scrolling,
+            RenderOptions {
+                scroll_mode: true,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(!buffer_to_string(&plain).contains("-- SCROLL --"));
+        assert!(buffer_to_string(&scrolling).contains("-- SCROLL --"));
     }
 
     #[test]

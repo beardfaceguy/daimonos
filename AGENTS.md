@@ -364,7 +364,7 @@ file — see `src/agent_env.rs` for the recognized keys. A CLI `--provider` /
     promotes them to full schemas (needed by introspecting directories such
     as Glama).
   - `OnDemand` — hidden until activated: `list_tool_signatures`,
-    `diff_files`, `tool_pipeline`, `tool_repair`.
+    `diff_files`, `tool_pipeline`, `lint_repair`.
   - `AgentOnly` — see the next bullet.
 - **Lazy tool exposure**: the initial `list_tools` response contains every
   `Full` and `Terse` tool (`tools::initial_exposed_tools()`); only

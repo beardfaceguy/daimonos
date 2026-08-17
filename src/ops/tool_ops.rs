@@ -67,10 +67,10 @@ fn build_tool_args(op: &Op) -> serde_json::Value {
 
 /// Opcode 21: Run repair loop (lint -> fix -> re-lint).
 /// p = tool_id, n = max_iterations (default 3), q = cwd override
-pub async fn tool_repair(session: &Session, op: &Op) -> Response {
+pub async fn lint_repair(session: &Session, op: &Op) -> Response {
     let tool_id = match &op.p {
         Some(t) => t.as_str(),
-        None => return Response::err(3, "tool_repair requires tool id in 'p'"),
+        None => return Response::err(3, "lint_repair requires tool id in 'p'"),
     };
 
     let registry = match &session.tool_registry {
@@ -276,26 +276,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_repair_missing_tool_id() {
+    async fn lint_repair_missing_tool_id() {
         let (_dir, session) = test_session_with_registry();
         let op = Op {
             c: 21,
             ..Default::default()
         };
-        let resp = tool_repair(&session, &op).await;
+        let resp = lint_repair(&session, &op).await;
         assert!(!resp.ok);
         assert!(resp.m.unwrap().contains("tool id"));
     }
 
     #[tokio::test]
-    async fn tool_repair_no_registry() {
+    async fn lint_repair_no_registry() {
         let (_dir, session) = test_session_no_registry();
         let op = Op {
             c: 21,
             p: Some("x07".into()),
             ..Default::default()
         };
-        let resp = tool_repair(&session, &op).await;
+        let resp = lint_repair(&session, &op).await;
         assert!(!resp.ok);
     }
 

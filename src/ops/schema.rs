@@ -122,7 +122,7 @@ pub fn schema(op: &Op) -> Response {
         ),
         op_schema(
             21,
-            "tool_repair",
+            "lint_repair",
             "Repair loop: lint, fix, re-lint",
             &[
                 ("p", "tool_id", true),

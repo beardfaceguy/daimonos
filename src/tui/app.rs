@@ -34,7 +34,9 @@ use crate::session_protocol::{
 use crate::tool_facade;
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
-use super::input::{ComposerHistory, TranscriptScroll};
+use super::input::{
+    apply_scroll_action, ComposerHistory, InputMode, TranscriptScroll, VimScrollKeys,
+};
 use super::state::ViewState;
 use super::terminal::{install_panic_hook, TerminalGuard};
 
@@ -107,6 +109,18 @@ pub async fn run(
             thinking: options.thinking,
             ..CompleteOpts::default()
         },
+        // #1240 parity with the ACP frontend: the failover chain IS the
+        // operator's ordered model list (`DAIMONOS_AGENT_MODELS`, the same
+        // list `/model` shows, best-first). Provider-agnostic by
+        // construction — there is no cross-provider "older sibling" API, so
+        // the operator's own preference order is the only sound generic
+        // rule. When the env var is unset this list is `[active_model]` and
+        // `next_failover_model` finds no successor, so failover stays
+        // effectively opt-in.
+        provider_retry: crate::agent::ProviderRetryConfig {
+            failover_models: options.models.clone(),
+            ..crate::agent::ProviderRetryConfig::default()
+        },
         before_tool_call: Some(before_tool_call),
         after_tool_call: Some(after_tool_call),
         on_stream_event: Some(Box::new(move |event| {
@@ -120,6 +134,16 @@ pub async fn run(
             label: "tui".to_string(),
         }),
         compaction: options.compaction,
+        // Provider recovery (transient-error resume, failover) surfaces in the
+        // transcript as a system entry: visible, but the turn keeps running.
+        on_provider_notice: Some(Box::new({
+            let view = Arc::clone(&view);
+            move |notice: &str| {
+                view.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_system_message(format!("[{notice}]"));
+            }
+        })),
         ..AgentConfig::default()
     };
 
@@ -207,6 +231,10 @@ async fn run_event_loop(
     turn: &mut Option<tokio::task::JoinHandle<()>>,
     models: &[String],
 ) -> anyhow::Result<()> {
+    // Vim-style modality (process-local, never part of session state): Insert
+    // feeds the composer, Scroll hands keys to the transcript. Esc toggles.
+    let mut mode = InputMode::Insert;
+    let mut vim_keys = VimScrollKeys::default();
     loop {
         if turn
             .as_ref()
@@ -228,6 +256,7 @@ async fn run_event_loop(
                     super::RenderOptions {
                         no_color,
                         scroll_from_bottom: scroll.bottom_offset(),
+                        scroll_mode: mode == InputMode::Scroll,
                     },
                 );
                 if view.active_approval().is_none() {
@@ -249,6 +278,44 @@ async fn run_event_loop(
                     continue;
                 }
                 if resolve_approval_key(key, view, pending_approval) {
+                    continue;
+                }
+                if key.code == KeyCode::Esc {
+                    // Insert -> Scroll copies vim's Esc-to-normal; Scroll ->
+                    // Insert is the pragmatic escape hatch (vim's `i` also
+                    // works via ScrollAction::ExitScroll).
+                    mode = match mode {
+                        InputMode::Insert => InputMode::Scroll,
+                        InputMode::Scroll => InputMode::Insert,
+                    };
+                    vim_keys.reset();
+                    continue;
+                }
+                if mode == InputMode::Scroll {
+                    match key.code {
+                        KeyCode::Char(ch) => {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            if let Some(action) = vim_keys.interpret(ch, ctrl) {
+                                let page = transcript_page_height(terminal)?;
+                                if apply_scroll_action(scroll, action, page) {
+                                    mode = InputMode::Insert;
+                                }
+                            }
+                        }
+                        // Arrows and the classic keys keep working so scroll
+                        // mode never traps a non-vim user.
+                        KeyCode::Up => scroll.line_up(),
+                        KeyCode::Down => scroll.line_down(),
+                        KeyCode::PageUp => {
+                            scroll.page_up(transcript_page_height(terminal)?);
+                        }
+                        KeyCode::PageDown => {
+                            scroll.page_down(transcript_page_height(terminal)?);
+                        }
+                        KeyCode::Home => scroll.jump_to_start(),
+                        KeyCode::End => scroll.jump_to_end(),
+                        _ => {}
+                    }
                     continue;
                 }
                 match key.code {

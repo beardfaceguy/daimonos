@@ -1472,6 +1472,12 @@ fn build_agent_config(
         // Item 3: leave unset so `run()` resolves it from
         // `DAIMONOS_AGENT_AUTO_CONTINUE` (off unless the operator opts in).
         auto_continue_budget: None,
+        // Leave unset: `run()` resolves DAIMONOS_AGENT_ERROR_RESUME, then the
+        // on-by-default budget. The resume itself is what an ACP client needs
+        // most (a blip no longer fails the turn); a client-visible notice via
+        // session updates is a follow-up.
+        error_resume_budget: None,
+        on_provider_notice: None,
         // #1240: bounded retry of transient provider failures, then failover
         // along the configured chain. An ACP client (Zed) surfaces a provider
         // blip as a failed turn the user must redo, so absorbing it is exactly
