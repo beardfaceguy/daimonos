@@ -124,6 +124,7 @@ sealed interface ClientMessage {
     @Serializable
     @SerialName("set_config")
     data class SetConfig(
+        @SerialName("request_id") val requestId: String? = null,
         @SerialName("config_id") val configId: String,
         val value: RuntimeValue,
     ) : ClientMessage

@@ -742,7 +742,7 @@ impl SessionCore {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .as_ref()
                     .map(|usage| usage.prompt_tokens)
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| crate::compaction::estimate_tokens(&history));
                 self.publish_context_usage(
                     self.context_usage(used_tokens, context_window)
                         .mark_estimated(),

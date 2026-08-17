@@ -1242,7 +1242,7 @@ impl SessionDaemon {
                         if let Err(error) = limits.validate_client_message(&message) {
                             transport
                                 .send(&ServerMessage::Error {
-                                    request_id: None,
+                                    request_id: request_id(&message),
                                     code: "invalid_message".to_string(),
                                     message: format!("{error:?}"),
                                 })
@@ -1252,14 +1252,19 @@ impl SessionDaemon {
                         if !attachment.has_capability(ClientCapability::Prompt) {
                             transport
                                 .send(&ServerMessage::Error {
-                                    request_id: None,
+                                    request_id: request_id(&message),
                                     code: "capability_denied".to_string(),
                                     message: "prompt capability was not granted".to_string(),
                                 })
                                 .await?;
                             continue;
                         }
-                        let ClientMessage::SetConfig { config_id, value } = message else {
+                        let ClientMessage::SetConfig {
+                            request_id,
+                            config_id,
+                            value,
+                        } = message
+                        else {
                             unreachable!("matched set config");
                         };
                         if let Err(error) = attachment
@@ -1299,7 +1304,7 @@ impl SessionDaemon {
                             };
                             transport
                                 .send(&ServerMessage::Error {
-                                    request_id: None,
+                                    request_id,
                                     code: code.to_string(),
                                     message: message.to_string(),
                                 })
@@ -2034,11 +2039,11 @@ fn request_id(message: &ClientMessage) -> Option<String> {
         ClientMessage::Interrupt { request_id } => request_id.clone(),
         ClientMessage::StopSession { request_id } => Some(request_id.clone()),
         ClientMessage::ListSessions { request_id, .. } => Some(request_id.clone()),
+        ClientMessage::SetConfig { request_id, .. } => request_id.clone(),
         ClientMessage::Attach { .. }
         | ClientMessage::Resume { .. }
         | ClientMessage::ApprovalResponse { .. }
         | ClientMessage::SyncRequest { .. }
-        | ClientMessage::SetConfig { .. }
         | ClientMessage::Ping
         | ClientMessage::Detach => None,
     }
@@ -2892,6 +2897,7 @@ mod tests {
             .unwrap();
         client
             .send(ClientMessage::SetConfig {
+                request_id: Some("forged-config".to_string()),
                 config_id: "model".to_string(),
                 value: crate::session_protocol::RuntimeValue::String("forged".to_string()),
             })
@@ -2921,11 +2927,14 @@ mod tests {
         ));
         assert!(matches!(
             client.recv().await,
-            Some(ServerMessage::Error { code, .. }) if code == "capability_denied"
+            Some(ServerMessage::Error { request_id, code, .. })
+                if code == "capability_denied" && request_id.as_deref() == Some("forged")
         ));
         assert!(matches!(
             client.recv().await,
-            Some(ServerMessage::Error { code, .. }) if code == "capability_denied"
+            Some(ServerMessage::Error { request_id, code, .. })
+                if code == "capability_denied"
+                    && request_id.as_deref() == Some("forged-config")
         ));
     }
 
@@ -2996,6 +3005,7 @@ mod tests {
 
         client
             .send(ClientMessage::SetConfig {
+                request_id: Some("model-change".to_string()),
                 config_id: "model".to_string(),
                 value: crate::session_protocol::RuntimeValue::String("model-b".to_string()),
             })
@@ -3020,6 +3030,7 @@ mod tests {
         ));
         client
             .send(ClientMessage::SetConfig {
+                request_id: Some("thinking-change".to_string()),
                 config_id: "thinking".to_string(),
                 value: crate::session_protocol::RuntimeValue::String("high".to_string()),
             })
@@ -3063,11 +3074,31 @@ mod tests {
             Err(RuntimeConfigError::InvalidValue)
         ));
 
+        core.session
+            .lock()
+            .await
+            .set_history(vec![crate::providers::Message::user(
+                "restored conversation content",
+            )]);
+        core.apply_runtime_option(
+            "model",
+            crate::session_protocol::RuntimeValue::String("model-b".to_string()),
+        )
+        .await
+        .expect("idle model change");
+        let snapshot = core.initial_snapshot("session".to_string(), 32).await;
+        let usage = snapshot.context_usage.expect("estimated context usage");
+        assert!(usage.estimated);
+        assert!(
+            usage.prompt_tokens > 0,
+            "restored history must not render as empty"
+        );
+
         let _turn = core.begin_turn().expect("begin turn");
         assert!(matches!(
             core.apply_runtime_option(
                 "model",
-                crate::session_protocol::RuntimeValue::String("model-b".to_string()),
+                crate::session_protocol::RuntimeValue::String("test-model".to_string()),
             )
             .await,
             Err(RuntimeConfigError::Busy)

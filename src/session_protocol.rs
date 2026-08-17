@@ -85,6 +85,8 @@ pub enum ClientMessage {
         last_seen_seq: u64,
     },
     SetConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         config_id: String,
         value: RuntimeValue,
     },
@@ -609,15 +611,21 @@ impl ProtocolLimits {
                     check("list_sessions.cursor", cursor, self.max_identifier_bytes)
                 })
             }),
-            ClientMessage::SetConfig { config_id, value } => {
-                check("set_config.config_id", config_id, self.max_identifier_bytes).or_else(|| {
+            ClientMessage::SetConfig {
+                request_id,
+                config_id,
+                value,
+            } => request_id
+                .as_deref()
+                .and_then(|id| check("set_config.request_id", id, self.max_identifier_bytes))
+                .or_else(|| check("set_config.config_id", config_id, self.max_identifier_bytes))
+                .or_else(|| {
                     if let RuntimeValue::String(value) = value {
                         check("set_config.value", value, self.max_runtime_value_bytes)
                     } else {
                         None
                     }
-                })
-            }
+                }),
             ClientMessage::SyncRequest { .. } | ClientMessage::Ping | ClientMessage::Detach => None,
         };
         error.map_or(Ok(()), Err)
@@ -1078,6 +1086,7 @@ mod tests {
         );
         assert_eq!(
             limits.validate_client_message(&ClientMessage::SetConfig {
+                request_id: None,
                 config_id: "12345".to_string(),
                 value: RuntimeValue::Bool(true),
             }),
@@ -1085,6 +1094,7 @@ mod tests {
         );
         assert_eq!(
             limits.validate_client_message(&ClientMessage::SetConfig {
+                request_id: None,
                 config_id: "mode".to_string(),
                 value: RuntimeValue::String("123456".to_string()),
             }),
