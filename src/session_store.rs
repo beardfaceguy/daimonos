@@ -84,6 +84,9 @@ impl SessionStore {
         self.save_record(id, model, None, messages, Some(cwd.to_path_buf()), &[], &[]);
     }
 
+    /// Persist an ACP/chat session that has no daemon-owned runtime options.
+    /// Session-daemon callers must use [`Self::save_acp_with_thinking`] so a
+    /// user-selected effort level survives reconnect.
     pub fn save_acp(
         &self,
         id: &str,
@@ -140,10 +143,6 @@ impl SessionStore {
         let Some(name) = Self::file_name(id) else {
             return;
         };
-        // Callers predating runtime-config persistence do not know the current
-        // thinking level. Preserve an existing value instead of silently
-        // resetting it to the configured default on the next load.
-        let thinking = thinking.or_else(|| self.load(id).and_then(|record| record.thinking));
         let record = PersistedSession {
             version: SESSION_PERSIST_VERSION,
             session_id: id.to_string(),
@@ -312,39 +311,6 @@ mod tests {
 
         let loaded = store.load("acp-ids").expect("saved session should load");
         assert_eq!(loaded.client_user_message_ids, vec!["user-1"]);
-    }
-
-    #[test]
-    fn legacy_acp_save_preserves_existing_thinking_level() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf());
-        store.save_acp_with_thinking(
-            "thinking",
-            "test-model",
-            "high",
-            &msgs(),
-            workspace.path(),
-            &[],
-            &[],
-        );
-
-        store.save_acp(
-            "thinking",
-            "test-model",
-            &msgs(),
-            workspace.path(),
-            &[],
-            &[],
-        );
-
-        assert_eq!(
-            store
-                .load("thinking")
-                .and_then(|record| record.thinking)
-                .as_deref(),
-            Some("high")
-        );
     }
 
     #[test]

@@ -731,6 +731,11 @@ impl SessionCore {
                 drop(session);
                 let client_ids = self.client_user_message_ids.lock().await.clone();
                 self.persist(model, &history, &client_ids);
+                // Changing models does not change the conversation bytes. Keep
+                // the last provider-observed occupancy as the best available
+                // count, but recompute reservation/utilization against the new
+                // model window. The next provider response replaces this with
+                // that model's exact token count.
                 let used_tokens = self
                     .current_context_usage
                     .lock()
