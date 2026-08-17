@@ -2082,6 +2082,42 @@ result = data["content"]
     }
 
     #[tokio::test]
+    async fn execute_prompt_read_transform_write_idiom_is_runnable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.txt"), "old_name").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(
+            dir.path().to_path_buf(),
+            Arc::new(Config::default()),
+        )));
+        let code = r#"
+def main():
+    c = read_file("config.txt")["content"]
+    written = write_file("config.txt", c.replace("old_name", "new_name"))
+    if not written.get("ok"):
+        fail("write_file failed")
+    tested = exec("true")
+    if tested["exit"] != 0:
+        fail("command failed")
+    return {"ok": True, "test_exit": tested["exit"]}
+
+result = main()
+"#;
+
+        let result = execute(code, session, Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value,
+            serde_json::json!({"ok": true, "test_exit": 0})
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.txt")).unwrap(),
+            "new_name"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_ls_accepts_documented_glob_and_type_filters() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("keep.rs"), "fn main() {}\n").unwrap();

@@ -13,6 +13,27 @@ Use individual tools only when you need exactly one operation.
 
 Each round-trip is a full inference against growing context — minimize them.
 
+**You do not need to read a file into your context to change it.** The most
+common way the rule above gets broken is: read the file, look at the text, then
+edit it — three round-trips to apply one transformation you already knew how to
+make. Inside a script the content never has to reach your context at all. Read
+it into a variable, transform the variable, write it back, and verify — one call:
+
+      def main():
+          c = read_file("src/config.rs")["content"]
+          written = write_file("src/config.rs", c.replace("old_name", "new_name"))
+          if not written.get("ok"):
+              fail("write_file failed")
+          tested = exec("cargo", ["test", "-q"])
+          if tested["exit"] != 0:
+              fail("cargo test failed")
+          return {"ok": True, "test_exit": tested["exit"]}
+      result = main()
+
+Pull content into your context only when the *decision* depends on something
+you have not seen. When you already know the transformation, express it in the
+script and let the sandbox do the reading.
+
 ## Keep the context lean (offload large data)
 
 When a tool would return a large payload (whole-file reads, long command
