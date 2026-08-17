@@ -31,7 +31,14 @@ impl TerminalGuard {
     /// On any failure the partial state is rolled back before returning the
     /// error, so a failed `enter` never leaves the terminal half-configured.
     pub fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
+        // Gate stderr diagnostics first: from this point raw log lines would
+        // be drawn over the UI. A failed enter rolls back through
+        // `restore_terminal`, which lifts the gate again.
+        crate::logging::suppress_stderr_logs();
+        if let Err(err) = enable_raw_mode() {
+            crate::logging::restore_stderr_logs();
+            return Err(err);
+        }
         let mut out = io::stdout();
         if let Err(err) = execute!(out, EnterAlternateScreen, EnableBracketedPaste) {
             // `execute!` may have applied EnterAlternateScreen before failing
@@ -70,6 +77,11 @@ fn restore_terminal(out: &mut Stdout) {
     let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     let _ = out.flush();
+    // Lift the stderr-log gate last, once the terminal is back in canonical
+    // mode: every restore path funnels through here (explicit restore, Drop,
+    // panic hook), so a post-panic backtrace and later diagnostics print
+    // normally instead of vanishing into the sink.
+    crate::logging::restore_stderr_logs();
 }
 
 /// Install a panic hook that restores the terminal *before* delegating to the

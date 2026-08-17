@@ -14,6 +14,71 @@ use tracing_subscriber::Layer;
 use crate::config::LoggingConfig;
 use crate::observability::TRACE_TARGET;
 
+/// True while a full-screen TUI owns the terminal (raw mode + alternate
+/// screen). While set, the stderr diagnostic layer writes to a sink instead:
+/// raw log lines drawn over the TUI corrupt the display, and every event is
+/// still captured by the secure file layer, so nothing is lost — only the
+/// duplicate terminal echo is dropped. Flipped by the TUI's `TerminalGuard`,
+/// including on panic, so a post-restore backtrace still prints normally.
+static STDERR_LOGS_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Route stderr diagnostics to a sink while a TUI owns the terminal.
+pub fn suppress_stderr_logs() {
+    STDERR_LOGS_SUPPRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resume writing diagnostics to stderr (terminal back in canonical mode).
+pub fn restore_stderr_logs() {
+    STDERR_LOGS_SUPPRESSED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `MakeWriter` that consults [`STDERR_LOGS_SUPPRESSED`] per event, so the
+/// gate takes effect immediately without rebuilding the subscriber.
+#[derive(Clone, Copy, Default)]
+struct GatedStderr;
+
+enum GatedStderrWriter {
+    Stderr(std::io::Stderr),
+    Sink,
+}
+
+impl GatedStderrWriter {
+    #[cfg(test)]
+    fn is_sink(&self) -> bool {
+        matches!(self, Self::Sink)
+    }
+}
+
+impl Write for GatedStderrWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stderr(w) => w.write(buf),
+            // Report the full length so tracing never sees a short write.
+            Self::Sink => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stderr(w) => w.flush(),
+            Self::Sink => Ok(()),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GatedStderr {
+    type Writer = GatedStderrWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        if STDERR_LOGS_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
+            GatedStderrWriter::Sink
+        } else {
+            GatedStderrWriter::Stderr(std::io::stderr())
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LogRotation {
     Hourly,
@@ -149,7 +214,7 @@ pub fn init(
         fmt::layer()
             .compact()
             .with_ansi(false)
-            .with_writer(std::io::stderr)
+            .with_writer(GatedStderr)
             .with_filter(daimonos_filter(&config.stderr_level))
     });
     // Only dedicated observability spans cross the OTLP boundary. Existing
@@ -370,6 +435,22 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn stderr_gate_switches_writer_to_sink_and_back() {
+        // Serialize against any other test touching the global gate.
+        restore_stderr_logs();
+        assert!(!GatedStderr.make_writer().is_sink());
+        suppress_stderr_logs();
+        assert!(GatedStderr.make_writer().is_sink());
+        // The sink must claim the full buffer so tracing never sees a short
+        // write and never errors mid-event.
+        let mut sink = GatedStderr.make_writer();
+        assert_eq!(sink.write(b"warn line").unwrap(), 9);
+        assert!(sink.flush().is_ok());
+        restore_stderr_logs();
+        assert!(!GatedStderr.make_writer().is_sink());
+    }
 
     #[derive(Clone, Default)]
     struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
