@@ -34,7 +34,9 @@ use crate::session_protocol::{
 use crate::tool_facade;
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
-use super::input::{ComposerHistory, TranscriptScroll};
+use super::input::{
+    apply_scroll_action, ComposerHistory, InputMode, TranscriptScroll, VimScrollKeys,
+};
 use super::state::ViewState;
 use super::terminal::{install_panic_hook, TerminalGuard};
 
@@ -207,6 +209,10 @@ async fn run_event_loop(
     turn: &mut Option<tokio::task::JoinHandle<()>>,
     models: &[String],
 ) -> anyhow::Result<()> {
+    // Vim-style modality (process-local, never part of session state): Insert
+    // feeds the composer, Scroll hands keys to the transcript. Esc toggles.
+    let mut mode = InputMode::Insert;
+    let mut vim_keys = VimScrollKeys::default();
     loop {
         if turn
             .as_ref()
@@ -228,6 +234,7 @@ async fn run_event_loop(
                     super::RenderOptions {
                         no_color,
                         scroll_from_bottom: scroll.bottom_offset(),
+                        scroll_mode: mode == InputMode::Scroll,
                     },
                 );
                 if view.active_approval().is_none() {
@@ -249,6 +256,44 @@ async fn run_event_loop(
                     continue;
                 }
                 if resolve_approval_key(key, view, pending_approval) {
+                    continue;
+                }
+                if key.code == KeyCode::Esc {
+                    // Insert -> Scroll copies vim's Esc-to-normal; Scroll ->
+                    // Insert is the pragmatic escape hatch (vim's `i` also
+                    // works via ScrollAction::ExitScroll).
+                    mode = match mode {
+                        InputMode::Insert => InputMode::Scroll,
+                        InputMode::Scroll => InputMode::Insert,
+                    };
+                    vim_keys.reset();
+                    continue;
+                }
+                if mode == InputMode::Scroll {
+                    match key.code {
+                        KeyCode::Char(ch) => {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            if let Some(action) = vim_keys.interpret(ch, ctrl) {
+                                let page = transcript_page_height(terminal)?;
+                                if apply_scroll_action(scroll, action, page) {
+                                    mode = InputMode::Insert;
+                                }
+                            }
+                        }
+                        // Arrows and the classic keys keep working so scroll
+                        // mode never traps a non-vim user.
+                        KeyCode::Up => scroll.line_up(),
+                        KeyCode::Down => scroll.line_down(),
+                        KeyCode::PageUp => {
+                            scroll.page_up(transcript_page_height(terminal)?);
+                        }
+                        KeyCode::PageDown => {
+                            scroll.page_down(transcript_page_height(terminal)?);
+                        }
+                        KeyCode::Home => scroll.jump_to_start(),
+                        KeyCode::End => scroll.jump_to_end(),
+                        _ => {}
+                    }
                     continue;
                 }
                 match key.code {

@@ -60,7 +60,8 @@ Commands:
   /stop-session      end the current session and exit
 Anything else is sent to the agent as a prompt.
 Enter sends · Ctrl-C interrupts the current turn.
-Up/Down browse prompt history · PageUp/PageDown scroll · Home/End jump.";
+Up/Down browse prompt history · PageUp/PageDown scroll · Home/End jump.
+Esc enters scroll mode (vim keys: j/k, Ctrl-D/U, Ctrl-F/B, gg/G; Esc or i returns).";
 
 /// Parse one composer line into a [`UiCommand`].
 ///
