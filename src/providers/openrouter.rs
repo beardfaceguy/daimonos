@@ -535,9 +535,8 @@ fn parse_usage(usage: &Value) -> Usage {
             .saturating_sub(cache_read)
             .saturating_sub(cache_write),
         output: usage["completion_tokens"].as_u64().unwrap_or(0),
-        reasoning_output: usage["completion_tokens_details"]["reasoning_tokens"]
-            .as_u64()
-            .unwrap_or(0),
+        reasoning_output: usage["completion_tokens_details"]["reasoning_tokens"].as_u64(),
+        thinking_bytes: 0,
         cache_read,
         cache_write,
         // OpenRouter does not return cost in the usage object; left at zero.
@@ -852,7 +851,8 @@ mod tests {
             "usage": {
                 "prompt_tokens": 194,
                 "completion_tokens": 50,
-                "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 20}
+                "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 20},
+                "completion_tokens_details": {"reasoning_tokens": 0}
             }
         });
         let resp = parse_response(&body);
@@ -861,6 +861,7 @@ mod tests {
             "input must be the NON-cached prompt tokens"
         );
         assert_eq!(resp.usage.output, 50);
+        assert_eq!(resp.usage.reasoning_output, Some(0));
         assert_eq!(resp.usage.cache_read, 30);
         assert_eq!(resp.usage.cache_write, 20);
         assert_eq!(
@@ -882,6 +883,7 @@ mod tests {
         assert_eq!(resp.usage.input, 100);
         assert_eq!(resp.usage.cache_read, 0);
         assert_eq!(resp.usage.cache_write, 0);
+        assert_eq!(resp.usage.reasoning_output, None);
         assert_eq!(resp.usage.prompt_tokens(), 100);
     }
 

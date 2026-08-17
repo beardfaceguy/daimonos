@@ -231,7 +231,8 @@ fn map_usage(raw: AnthropicUsage, model: &str) -> Usage {
     Usage {
         input: raw.input_tokens,
         output: raw.output_tokens,
-        reasoning_output: 0,
+        reasoning_output: None,
+        thinking_bytes: 0,
         cache_read: raw.cache_read_input_tokens,
         cache_write: raw.cache_creation_input_tokens,
         cost: Cost {
@@ -927,6 +928,8 @@ mod tests {
         let u = map_usage(raw, "claude-opus-4-8");
         assert_eq!(u.input, 1_000);
         assert_eq!(u.output, 500);
+        assert_eq!(u.reasoning_output, None);
+        assert_eq!(u.thinking_bytes, 0);
         assert_eq!(u.cache_read, 2_000);
         assert_eq!(u.cache_write, 100);
     }

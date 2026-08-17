@@ -516,9 +516,7 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
         .as_u64()
         .unwrap_or(0);
     let output = usage["output_tokens"].as_u64().unwrap_or(0);
-    let reasoning_output = usage["output_tokens_details"]["reasoning_tokens"]
-        .as_u64()
-        .unwrap_or(0);
+    let reasoning_output = usage["output_tokens_details"]["reasoning_tokens"].as_u64();
     let input = total_input.saturating_sub(cache_read);
     let (input_rate, cache_rate, output_rate) = pricing(model);
     if (input > 0 || cache_read > 0 || output > 0)
@@ -539,6 +537,7 @@ fn parse_usage(usage: &Value, model: &str) -> Usage {
         input,
         output,
         reasoning_output,
+        thinking_bytes: 0,
         cache_read,
         cache_write: 0,
         cost: Cost {
@@ -1233,7 +1232,7 @@ mod tests {
         assert_eq!(response.usage.input, 60);
         assert_eq!(response.usage.cache_read, 40);
         assert_eq!(response.usage.output, 30);
-        assert_eq!(response.usage.reasoning_output, 20);
+        assert_eq!(response.usage.reasoning_output, Some(20));
         assert!(response.content.iter().any(
             |b| matches!(b, ContentBlock::ProviderState { provider, .. } if provider == "openai")
         ));
@@ -1244,6 +1243,24 @@ mod tests {
         assert!(response.content.iter().any(
             |b| matches!(b, ContentBlock::ToolCall { id, name, .. } if id == "c1" && name == "exec")
         ));
+    }
+
+    #[test]
+    fn reasoning_usage_distinguishes_unreported_from_reported_zero() {
+        let unreported = parse_usage(
+            &json!({"input_tokens": 1, "output_tokens": 1}),
+            "gpt-5.6-sol",
+        );
+        let reported_zero = parse_usage(
+            &json!({
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "output_tokens_details": {"reasoning_tokens": 0}
+            }),
+            "gpt-5.6-sol",
+        );
+        assert_eq!(unreported.reasoning_output, None);
+        assert_eq!(reported_zero.reasoning_output, Some(0));
     }
 
     #[test]

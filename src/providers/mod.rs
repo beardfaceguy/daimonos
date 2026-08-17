@@ -84,8 +84,12 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
     /// Reasoning-token detail already included in `output`; informational only
-    /// and never added again when computing totals/cost.
-    pub reasoning_output: u64,
+    /// and never added again when computing totals/cost. `None` means the
+    /// provider does not report this detail; `Some(0)` is a reported zero.
+    pub reasoning_output: Option<u64>,
+    /// Exact UTF-8 bytes emitted through `ThinkingDelta` for this call. This is
+    /// deliberately byte-denominated; it is never presented as a token count.
+    pub thinking_bytes: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost: Cost,
@@ -670,6 +674,8 @@ mod tests {
         let u = Usage::default();
         assert_eq!(u.input, 0);
         assert_eq!(u.output, 0);
+        assert_eq!(u.reasoning_output, None);
+        assert_eq!(u.thinking_bytes, 0);
         assert_eq!(u.cache_read, 0);
         assert_eq!(u.cache_write, 0);
         assert_eq!(u.cost.total_usd, 0.0);
@@ -682,7 +688,8 @@ mod tests {
         let u = Usage {
             input: 100,
             output: 9,
-            reasoning_output: 4,
+            reasoning_output: Some(4),
+            thinking_bytes: 9,
             cache_read: 30,
             cache_write: 20,
             cost: Cost::default(),

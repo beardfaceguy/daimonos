@@ -157,6 +157,10 @@ pub struct AgentRunRecord {
     pub task_prefix: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-reported reasoning tokens, or `None` when unavailable.
+    pub reasoning_output_tokens: Option<u64>,
+    /// Exact UTF-8 bytes streamed as model thinking.
+    pub thinking_bytes: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
@@ -216,6 +220,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     task_prefix TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
+    reasoning_output_tokens INTEGER,
+    thinking_bytes INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL,
     cache_write_tokens INTEGER NOT NULL,
     cost_usd REAL NOT NULL,
@@ -235,6 +241,8 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
     let migrations = [
         "ALTER TABLE tool_calls ADD COLUMN external_session_id TEXT",
         "CREATE INDEX IF NOT EXISTS idx_tc_external_session ON tool_calls(external_session_id)",
+        "ALTER TABLE agent_runs ADD COLUMN reasoning_output_tokens INTEGER",
+        "ALTER TABLE agent_runs ADD COLUMN thinking_bytes INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in migrations {
         if let Err(e) = conn.execute_batch(sql) {
@@ -394,9 +402,10 @@ impl AnalyticsStore {
         let db = self.db_lock();
         let _ = db.execute(
             "INSERT INTO agent_runs (timestamp, session_id, external_session_id,
-             task_prefix, input_tokens, output_tokens, cache_read_tokens,
-             cache_write_tokens, cost_usd, stop_reason, turns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             task_prefix, input_tokens, output_tokens, reasoning_output_tokens,
+             thinking_bytes, cache_read_tokens, cache_write_tokens, cost_usd,
+             stop_reason, turns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 now,
                 self.session_id,
@@ -404,6 +413,8 @@ impl AnalyticsStore {
                 rec.task_prefix,
                 rec.input_tokens as i64,
                 rec.output_tokens as i64,
+                rec.reasoning_output_tokens.map(|value| value as i64),
+                rec.thinking_bytes as i64,
                 rec.cache_read_tokens as i64,
                 rec.cache_write_tokens as i64,
                 rec.cost_usd,
@@ -1210,6 +1221,28 @@ mod tests {
                     was_filtered INTEGER NOT NULL DEFAULT 0,
                     read_dedup INTEGER NOT NULL DEFAULT 0,
                     batch_size INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE agent_runs (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    external_session_id TEXT,
+                    task_prefix TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    cache_read_tokens INTEGER NOT NULL,
+                    cache_write_tokens INTEGER NOT NULL,
+                    cost_usd REAL NOT NULL,
+                    stop_reason TEXT NOT NULL,
+                    turns INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO agent_runs (
+                    timestamp, session_id, task_prefix, input_tokens,
+                    output_tokens, cache_read_tokens, cache_write_tokens,
+                    cost_usd, stop_reason, turns
+                ) VALUES (
+                    '2024-01-01T00:00:00Z', 'old', 'legacy', 10,
+                    5, 0, 0, 0.0, 'end_turn', 1
                 );",
             )
             .unwrap();
@@ -1236,6 +1269,16 @@ mod tests {
             .history_summary_filtered(36500, Some("sid-new"))
             .unwrap();
         assert_eq!(only_new.total_calls, 1);
+        let db = store.db_lock();
+        let legacy: (Option<i64>, i64) = db
+            .query_row(
+                "SELECT reasoning_output_tokens, thinking_bytes
+                 FROM agent_runs WHERE session_id = 'old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, 0));
     }
 
     // --- agent_runs table (#877) ---
@@ -1246,6 +1289,8 @@ mod tests {
             task_prefix: "test task".into(),
             input_tokens: 1000,
             output_tokens: 500,
+            reasoning_output_tokens: None,
+            thinking_bytes: 0,
             cache_read_tokens: 200,
             cache_write_tokens: 100,
             cost_usd: 0.0125,
@@ -1272,24 +1317,58 @@ mod tests {
         store.record_agent_run(&AgentRunRecord {
             input_tokens: 1111,
             output_tokens: 2222,
+            reasoning_output_tokens: Some(77),
+            thinking_bytes: 88,
             cache_read_tokens: 333,
             cache_write_tokens: 44,
             ..sample_agent_run()
         });
 
         let db = store.db_lock();
-        let (inp, out, cr, cw): (i64, i64, i64, i64) = db
+        let (inp, out, reasoning, thinking, cr, cw): (i64, i64, Option<i64>, i64, i64, i64) = db
             .query_row(
-                "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                "SELECT input_tokens, output_tokens, reasoning_output_tokens,
+                        thinking_bytes, cache_read_tokens, cache_write_tokens
                  FROM agent_runs",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(inp, 1111);
         assert_eq!(out, 2222);
+        assert_eq!(reasoning, Some(77));
+        assert_eq!(thinking, 88);
         assert_eq!(cr, 333);
         assert_eq!(cw, 44);
+    }
+
+    #[test]
+    fn reasoning_analytics_distinguishes_unreported_from_reported_zero() {
+        let (_dir, store) = test_store();
+        store.record_agent_run(&sample_agent_run());
+        store.record_agent_run(&AgentRunRecord {
+            reasoning_output_tokens: Some(0),
+            ..sample_agent_run()
+        });
+
+        let db = store.db_lock();
+        let values = db
+            .prepare("SELECT reasoning_output_tokens FROM agent_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<i64>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, vec![None, Some(0)]);
     }
 
     #[test]
