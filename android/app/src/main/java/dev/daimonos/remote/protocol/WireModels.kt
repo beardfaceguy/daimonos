@@ -25,6 +25,7 @@ const val PROTOCOL_VERSION: Int = 2
 enum class ClientCapability {
     @SerialName("observe") OBSERVE,
     @SerialName("prompt") PROMPT,
+    @SerialName("configure") CONFIGURE,
     @SerialName("interrupt") INTERRUPT,
     @SerialName("stop") STOP,
     @SerialName("approve_once") APPROVE_ONCE,

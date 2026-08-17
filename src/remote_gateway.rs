@@ -650,6 +650,7 @@ fn is_control_capability(capability: &ClientCapability) -> bool {
     matches!(
         capability,
         ClientCapability::Prompt
+            | ClientCapability::Configure
             | ClientCapability::Interrupt
             | ClientCapability::ApproveOnce
             | ClientCapability::ApproveAlways

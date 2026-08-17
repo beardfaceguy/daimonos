@@ -62,6 +62,7 @@ impl CapabilityPolicy {
             allowed: [
                 ClientCapability::Observe,
                 ClientCapability::Prompt,
+                ClientCapability::Configure,
                 ClientCapability::Interrupt,
                 ClientCapability::Stop,
                 ClientCapability::ApproveOnce,
@@ -1249,12 +1250,12 @@ impl SessionDaemon {
                                 .await?;
                             continue;
                         }
-                        if !attachment.has_capability(ClientCapability::Prompt) {
+                        if !attachment.has_capability(ClientCapability::Configure) {
                             transport
                                 .send(&ServerMessage::Error {
                                     request_id: request_id(&message),
                                     code: "capability_denied".to_string(),
-                                    message: "prompt capability was not granted".to_string(),
+                                    message: "configure capability was not granted".to_string(),
                                 })
                                 .await?;
                             continue;
@@ -1267,10 +1268,9 @@ impl SessionDaemon {
                         else {
                             unreachable!("matched set config");
                         };
-                        if let Err(error) = attachment
-                            .core()
-                            .apply_runtime_option(&config_id, value)
-                            .await
+                        let _admission = attachment.entry.admission.lock().await;
+                        if let Err(error) =
+                            attachment.core().apply_runtime_option(&config_id, value).await
                         {
                             let (code, message) = match error {
                                 RuntimeConfigError::Busy => (
@@ -2988,7 +2988,11 @@ mod tests {
                 session_id: Some("session-1".to_string()),
                 ticket: None,
                 client: terminal_client(),
-                requested_capabilities: vec![ClientCapability::Observe, ClientCapability::Prompt],
+                requested_capabilities: vec![
+                    ClientCapability::Observe,
+                    ClientCapability::Prompt,
+                    ClientCapability::Configure,
+                ],
             })
             .await
             .unwrap();

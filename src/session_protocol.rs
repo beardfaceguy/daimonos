@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 pub enum ClientCapability {
     Observe,
     Prompt,
+    Configure,
     Interrupt,
     Stop,
     ApproveOnce,
@@ -818,6 +819,7 @@ mod tests {
         let granted = vec![ClientCapability::Observe, ClientCapability::Prompt];
         assert!(has_capability(&granted, ClientCapability::Observe));
         assert!(has_capability(&granted, ClientCapability::Prompt));
+        assert!(!has_capability(&granted, ClientCapability::Configure));
         assert!(!has_capability(&granted, ClientCapability::Interrupt));
         assert!(!has_capability(&granted, ClientCapability::Stop));
         assert!(!has_capability(&granted, ClientCapability::ApproveOnce));
