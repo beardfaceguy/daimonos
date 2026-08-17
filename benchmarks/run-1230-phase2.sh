@@ -10,7 +10,7 @@
 # the 2-call floor, contributes only noise (PR #159 finding).
 #
 # Usage: ./run-1230-phase2.sh <task-id> <reps>
-set -u
+set -eu
 cd "$(dirname "$0")" || exit 1
 
 TASK="${1:?task id prefix required}"

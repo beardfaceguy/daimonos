@@ -21,7 +21,9 @@ it into a variable, transform the variable, write it back, and verify — one ca
 
       def main():
           c = read_file("src/config.rs")["content"]
-          write_file("src/config.rs", c.replace("old_name", "new_name"))
+          written = write_file("src/config.rs", c.replace("old_name", "new_name"))
+          if not written.get("ok"):
+              fail("write_file failed")
           return exec("cargo", ["test", "-q"])["exit"]
       result = main()
 
