@@ -493,6 +493,16 @@ pub trait LlmProvider: Send + Sync {
     async fn context_window(&self, _model: &str) -> Option<u64> {
         None
     }
+
+    /// Live model catalog from the provider's list-models endpoint, newest
+    /// first where the API exposes recency. `None` means "no live catalog"
+    /// (unsupported adapter, network/auth failure, or an empty list) — the
+    /// caller falls back to the statically configured model list rather than
+    /// guessing. Feeds startup model discovery: the `/model` picker and the
+    /// #1240 failover chain.
+    async fn list_models(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[cfg(test)]

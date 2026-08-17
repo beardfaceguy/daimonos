@@ -42,6 +42,37 @@ impl LlmProvider for OpenRouterProvider {
         true
     }
 
+    async fn list_models(&self) -> Option<Vec<String>> {
+        // OpenRouter serves hundreds of models across vendors; slugs sorted
+        // newest-first by `created` so the failover chain degrades toward
+        // older models. The picker is long, but discovery is the point.
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        let mut entries: Vec<(i64, String)> = body["data"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some((
+                    m["created"].as_i64().unwrap_or(0),
+                    m["id"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        entries.sort_by_key(|(created, _)| std::cmp::Reverse(*created));
+        let ids: Vec<String> = entries.into_iter().map(|(_, id)| id).collect();
+        (!ids.is_empty()).then_some(ids)
+    }
+
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
         let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
         let tools = tools_to_wire(&ctx.tools);

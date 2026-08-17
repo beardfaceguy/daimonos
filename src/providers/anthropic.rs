@@ -874,6 +874,29 @@ impl LlmProvider for AnthropicProvider {
         let body: Value = resp.json().await.ok()?;
         max_input_tokens_from_model(&body).map(effective_context_window)
     }
+
+    async fn list_models(&self) -> Option<Vec<String>> {
+        // The API returns newest-first, which is exactly the order the
+        // failover chain wants (walk forward = degrade to older siblings).
+        let resp = self
+            .client
+            .get(format!("{}/v1/models?limit=1000", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        let ids: Vec<String> = body["data"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
 }
 
 #[cfg(test)]
@@ -1014,6 +1037,72 @@ mod tests {
     fn windows_at_or_below_the_cap_pass_through() {
         assert_eq!(effective_context_window(200_000), 200_000);
         assert_eq!(effective_context_window(150_000), 150_000);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_slugs_in_api_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let mut head = Vec::new();
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r#"{"data":[{"id":"claude-opus-5","created_at":"2026-07-24T00:00:00Z"},{"id":"claude-opus-4-8","created_at":"2026-05-28T00:00:00Z"}],"has_more":false}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.ok();
+            }
+        });
+        let provider =
+            AnthropicProvider::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        assert_eq!(
+            provider.list_models().await,
+            Some(vec![
+                "claude-opus-5".to_string(),
+                "claude-opus-4-8".to_string()
+            ]),
+            "newest-first API order must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_http_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp =
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+                stream.write_all(resp.as_bytes()).await.ok();
+            }
+        });
+        let provider =
+            AnthropicProvider::new("bad").with_base_url(format!("http://127.0.0.1:{port}"));
+        assert_eq!(
+            provider.list_models().await,
+            None,
+            "a failed fetch must fall back, never yield a partial catalog"
+        );
     }
 
     #[tokio::test]
