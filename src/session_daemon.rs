@@ -2953,6 +2953,16 @@ mod tests {
                 ],
             ),
         ]);
+        core.context_windows
+            .lock()
+            .await
+            .insert("model-b".to_string(), 200);
+        core.publish_context_usage(crate::session_protocol::ContextUsage::new(
+            50,
+            Some(100),
+            0,
+            None,
+        ));
         daemon
             .create_session("session-1".to_string(), Arc::clone(&core))
             .unwrap();
@@ -2991,6 +3001,13 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Event {
+                event: SessionEvent::ContextUsageChanged { usage },
+                ..
+            }) if usage.prompt_tokens == 50 && usage.model_context_window == Some(200)
+        ));
         assert!(matches!(
             client.recv().await,
             Some(ServerMessage::Event {

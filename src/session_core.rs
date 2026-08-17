@@ -8,8 +8,8 @@ use crate::agent::AgentSession;
 use crate::compaction::CompactionPolicy;
 use crate::providers::{Message, ThinkingLevel};
 use crate::session_protocol::{
-    ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, RuntimeOption,
-    RuntimeValue, SessionEvent, TurnStatus,
+    ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, ContextUsage,
+    RuntimeOption, RuntimeValue, SessionEvent, TurnStatus,
 };
 use crate::session_store::SessionStore;
 
@@ -601,6 +601,7 @@ pub struct SessionCore {
     pub(crate) events: Arc<SessionEventRouter>,
     pub(crate) tool_lifecycle: Arc<CanonicalToolLifecycle>,
     runtime_options: StdMutex<Vec<RuntimeOption>>,
+    current_context_usage: StdMutex<Option<ContextUsage>>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -668,6 +669,7 @@ impl SessionCore {
             events,
             tool_lifecycle,
             runtime_options: StdMutex::new(Vec::new()),
+            current_context_usage: StdMutex::new(None),
             persistence,
         }
     }
@@ -717,7 +719,8 @@ impl SessionCore {
         match (config_id, &value) {
             ("model", RuntimeValue::String(model)) => {
                 let mut session = self.session.lock().await;
-                self.prepare_model(&mut session, model)
+                let context_window = self
+                    .prepare_model(&mut session, model)
                     .await
                     .map_err(RuntimeConfigError::ApplyFailed)?;
                 let history = session.history().to_vec();
@@ -728,6 +731,14 @@ impl SessionCore {
                 drop(session);
                 let client_ids = self.client_user_message_ids.lock().await.clone();
                 self.persist(model, &history, &client_ids);
+                let used_tokens = self
+                    .current_context_usage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .map(|usage| usage.prompt_tokens)
+                    .unwrap_or(0);
+                self.publish_context_usage(self.context_usage(used_tokens, context_window));
             }
             ("thinking", RuntimeValue::String(level)) => {
                 let thinking =
@@ -802,14 +813,14 @@ impl SessionCore {
         }))
     }
 
-    pub fn context_usage(
-        &self,
-        used_tokens: u64,
-        context_window: Option<u64>,
-    ) -> crate::session_protocol::ContextUsage {
-        let (reservation, high_water) = self
+    pub fn context_usage(&self, used_tokens: u64, context_window: Option<u64>) -> ContextUsage {
+        let model = self.current_model();
+        let policy = self
             .compaction
-            .policy
+            .policy_for(&model, context_window)
+            .ok()
+            .flatten();
+        let (reservation, high_water) = policy
             .as_ref()
             .map(|policy| {
                 let budget = policy.budget();
@@ -821,12 +832,17 @@ impl SessionCore {
                 (policy.output_reservation, high_water)
             })
             .unwrap_or((0, None));
-        crate::session_protocol::ContextUsage::new(
-            used_tokens,
-            context_window,
-            reservation,
-            high_water,
-        )
+        ContextUsage::new(used_tokens, context_window, reservation, high_water)
+    }
+
+    pub(crate) fn publish_context_usage(&self, usage: ContextUsage) {
+        *self
+            .current_context_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
+        let _ = self
+            .events
+            .emit(SessionEvent::ContextUsageChanged { usage });
     }
 
     pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
@@ -953,7 +969,11 @@ impl SessionCore {
             tool_calls,
             pending_approvals: self.approvals.pending(),
             runtime_options: self.runtime_options(),
-            context_usage: None,
+            context_usage: self
+                .current_context_usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             history_truncated: false,
         }
     }
@@ -1101,9 +1121,7 @@ impl SessionCore {
                 .last_call_usage
                 .prompt_tokens()
                 .saturating_add(turn.last_call_usage.output);
-            let _ = self.events.emit(SessionEvent::ContextUsageChanged {
-                usage: self.context_usage(used_tokens, context_window),
-            });
+            self.publish_context_usage(self.context_usage(used_tokens, context_window));
             let outcome = outcome_mapper(turn);
             self.assistant_outcomes
                 .lock()

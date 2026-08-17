@@ -96,8 +96,18 @@ impl SessionFactory for AgentSessionFactory {
         let thinking = persisted
             .as_ref()
             .and_then(|record| record.thinking.as_deref())
-            .map(ThinkingLevel::from_input)
-            .transpose()?
+            .and_then(|raw| match ThinkingLevel::from_input(raw) {
+                Ok(thinking) => Some(thinking),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "daimonos::session_factory",
+                        event = "persisted_thinking_invalid",
+                        session_id,
+                        "falling back to configured thinking level",
+                    );
+                    None
+                }
+            })
             .unwrap_or_else(|| self.thinking.clone());
         let provider = (self.make_provider)()?;
         let events = Arc::new(SessionEventRouter::new_with_replay(
@@ -361,7 +371,7 @@ mod tests {
             ThinkingLevel::default(),
             SafetyPolicy::default(),
             None,
-            store,
+            store.clone(),
             SessionCompaction::new(None, false),
             services,
         );
@@ -401,5 +411,25 @@ mod tests {
                 .as_str(),
             "saved-model"
         );
+
+        store.save_acp_with_thinking(
+            "invalid-thinking",
+            "saved-model",
+            "removed-level",
+            &[crate::providers::Message::user("still loadable")],
+            directory.path(),
+            &[],
+            &[],
+        );
+        let invalid = factory
+            .open("invalid-thinking", SessionOpenMode::Load)
+            .await
+            .expect("invalid persisted thinking falls back");
+        let snapshot = invalid
+            .initial_snapshot("invalid-thinking".to_string(), 32)
+            .await;
+        assert!(snapshot.runtime_options.iter().any(|option| {
+            option.id == "thinking" && option.value == RuntimeValue::String("medium".to_string())
+        }));
     }
 }
