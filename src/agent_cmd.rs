@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tracing::Instrument;
@@ -11,7 +13,9 @@ use crate::agent::{AgentConfig, AgentResult, TokenLogConfig};
 use crate::analytics::{AgentRunRecord, AnalyticsStore};
 use crate::config::Config;
 use crate::observability::{PromptMetadata, PromptSpan};
-use crate::providers::{CompleteOpts, ContentBlock, LlmProvider, Message, Role, ToolSchema};
+use crate::providers::{
+    CompleteOpts, ContentBlock, LlmProvider, Message, Role, StreamEvent, ToolSchema,
+};
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
 use crate::tool_facade;
@@ -26,9 +30,78 @@ pub struct AgentCmdArgs {
     pub analytics: Option<Arc<AnalyticsStore>>,
     /// `--debug-tokens` log file path. `None` = no per-call token logging.
     pub token_log: Option<std::path::PathBuf>,
+    /// Private, truncate-per-run destination for streamed thinking text.
+    pub thought_log: Option<std::path::PathBuf>,
     /// Reasoning effort for the model (#1122), from `DAIMONOS_AGENT_THINKING`
     /// (default `medium`). Forwarded into `CompleteOpts.thinking`.
     pub thinking: crate::providers::ThinkingLevel,
+}
+
+enum ThoughtCaptureState {
+    Active(File),
+    Failed(String),
+}
+
+struct ThoughtCapture {
+    path: std::path::PathBuf,
+    state: Mutex<ThoughtCaptureState>,
+}
+
+impl ThoughtCapture {
+    fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(Self {
+            path,
+            state: Mutex::new(ThoughtCaptureState::Active(file)),
+        })
+    }
+
+    fn write_delta(&self, text: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ThoughtCaptureState::Active(file) = &mut *state else {
+            return;
+        };
+        if let Err(error) = file.write_all(text.as_bytes()) {
+            *state = ThoughtCaptureState::Failed(error.to_string());
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &mut *state {
+            ThoughtCaptureState::Active(file) => file.flush().map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to flush thought log {}: {error}",
+                    self.path.display()
+                )
+            }),
+            ThoughtCaptureState::Failed(error) => Err(anyhow::anyhow!(
+                "failed to write thought log {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
 }
 
 // NOTE: no compaction policy here — ADR-002 compaction operates BETWEEN
@@ -77,6 +150,20 @@ pub async fn run_agent(
 
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
+    let thought_capture = match args.thought_log {
+        Some(path) => Some(Arc::new(ThoughtCapture::open(path.clone()).map_err(
+            |error| anyhow::anyhow!("failed to open thought log {}: {error}", path.display()),
+        )?)),
+        None => None,
+    };
+    let on_stream_event = thought_capture.as_ref().map(|capture| {
+        let capture = Arc::clone(capture);
+        Box::new(move |event| {
+            if let StreamEvent::ThinkingDelta(text) = event {
+                capture.write_delta(&text);
+            }
+        }) as crate::agent::StreamHook
+    });
     let config = AgentConfig {
         system: Some(crate::prompts::agent_system(&cfg).await),
         tools,
@@ -86,6 +173,7 @@ pub async fn run_agent(
             ..CompleteOpts::default()
         },
         before_tool_call,
+        on_stream_event,
         token_log: args.token_log.map(|path| TokenLogConfig {
             path,
             label: "agent".to_string(),
@@ -117,6 +205,10 @@ pub async fn run_agent(
     let result = crate::agent::run(provider, session, initial, &config)
         .instrument(prompt_span.span().clone())
         .await;
+    let thought_capture_result = match thought_capture {
+        Some(capture) => capture.finish(),
+        None => Ok(()),
+    };
     let error_type = match result.stop_reason {
         crate::providers::StopReason::Error => Some("provider_error"),
         crate::providers::StopReason::Refusal => Some("refusal"),
@@ -141,6 +233,10 @@ pub async fn run_agent(
             turns,
         });
     }
+
+    // A local debug-artifact failure must be reported, but only after the
+    // completed provider run has closed its span and reached analytics.
+    thought_capture_result?;
 
     for msg in &result.messages {
         if matches!(msg.role, Role::Assistant) {
@@ -229,8 +325,94 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn thought_capture_writes_only_thinking_in_order_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private").join("thoughts.log");
+        let provider = MockProvider::new(vec![LlmResponse {
+            retryable: false,
+            content: vec![
+                ContentBlock::Thinking("first ".to_string()),
+                ContentBlock::Text("answer".to_string()),
+                ContentBlock::Thinking("second".to_string()),
+            ],
+            stop_reason: crate::providers::StopReason::EndTurn,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage::default(),
+        }]);
+        let mut capture_args = args("go");
+        capture_args.thought_log = Some(path.clone());
+        let mut out = Vec::new();
+
+        run_agent(&provider, dir.path(), default_cfg(), capture_args, &mut out)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first second");
+        assert_eq!(String::from_utf8(out).unwrap().trim(), "answer");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn thought_capture_surfaces_open_failures_before_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_file = dir.path().join("not-a-directory");
+        std::fs::write(&parent_file, "x").unwrap();
+        let path = parent_file.join("thoughts.log");
+        let provider = MockProvider::new(vec![end_turn_with_text("unused")]);
+        let mut capture_args = args("go");
+        capture_args.thought_log = Some(path.clone());
+        let mut out = Vec::new();
+
+        let error =
+            match run_agent(&provider, dir.path(), default_cfg(), capture_args, &mut out).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid thought path must fail"),
+            };
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(provider.call_opts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thought_capture_creates_an_empty_file_when_provider_emits_no_thinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thoughts.log");
+        let provider = MockProvider::new(vec![end_turn_with_text("answer")]);
+        let mut capture_args = args("go");
+        capture_args.thought_log = Some(path.clone());
+        let mut out = Vec::new();
+
+        run_agent(&provider, dir.path(), default_cfg(), capture_args, &mut out)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn thought_capture_failure_is_checked_after_run_observability() {
+        let source = include_str!("agent_cmd.rs");
+        let span = source
+            .find("prompt_span.finish(result.stop_reason.as_str(), error_type);")
+            .unwrap();
+        let analytics = source
+            .find("store.record_agent_run(&AgentRunRecord")
+            .unwrap();
+        let capture = source.find("thought_capture_result?;").unwrap();
+        assert!(span < capture);
+        assert!(analytics < capture);
     }
 
     fn default_cfg() -> Arc<Config> {
@@ -249,6 +431,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
@@ -267,6 +450,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
@@ -287,6 +471,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
@@ -399,6 +584,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::Medium,
         };
         let mut out = Vec::new();
@@ -432,6 +618,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::High,
         };
         let mut out = Vec::new();
@@ -489,6 +676,7 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: Some(log_path.clone()),
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
@@ -547,6 +735,7 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();
@@ -574,6 +763,7 @@ mod tests {
             safety: None,
             analytics: Some(Arc::clone(&store)),
             token_log: None,
+            thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
         let mut out = Vec::new();

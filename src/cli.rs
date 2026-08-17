@@ -32,6 +32,18 @@ pub struct AgentArgs {
     /// ~/.config/daimonos/agent.env)
     #[arg(long)]
     pub agent_env: Option<PathBuf>,
+    /// Persist streamed model thinking to a private local debug file.
+    #[arg(long, default_value_t = false, conflicts_with = "interactive")]
+    pub debug_thoughts: bool,
+    /// Override the --debug-thoughts destination (default:
+    /// ~/.config/daimonos/thought-debug.log). The file is truncated per run.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "debug_thoughts",
+        conflicts_with = "interactive"
+    )]
+    pub debug_thoughts_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -339,6 +351,35 @@ mod tests {
         assert!(args.print);
         assert!(!args.interactive);
         assert_eq!(args.task.as_deref(), Some("do work"));
+    }
+
+    #[test]
+    fn debug_thought_capture_requires_opt_in_and_accepts_path_override() {
+        let cli = Cli::try_parse_from([
+            "daimonos",
+            "agent",
+            "--debug-thoughts",
+            "--debug-thoughts-path",
+            "/tmp/thoughts.log",
+            "do work",
+        ])
+        .expect("explicit thought capture");
+        let Some(Command::Agent(args)) = cli.command else {
+            panic!("agent command");
+        };
+        assert!(args.debug_thoughts);
+        assert_eq!(
+            args.debug_thoughts_path.as_deref(),
+            Some(std::path::Path::new("/tmp/thoughts.log"))
+        );
+        assert!(Cli::try_parse_from([
+            "daimonos",
+            "agent",
+            "--debug-thoughts-path",
+            "/tmp/thoughts.log",
+            "do work",
+        ])
+        .is_err());
     }
 
     #[test]
