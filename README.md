@@ -292,10 +292,17 @@ Agent-mode configuration lives in a dotenv-style `agent.env`
 
 ## Architecture
 
-Daimonos is a single Rust binary (~15 MB) that speaks
-[MCP](https://modelcontextprotocol.io/) (Model Context Protocol) over stdio.
-Your IDE spawns it as a subprocess — no network, no containers, no setup beyond
-a JSON config entry.
+Daimonos is a single Rust binary with two planes that share one tool
+implementation, one opcode protocol, one config, and one analytics store:
+
+1. **Tool server** — speaks [MCP](https://modelcontextprotocol.io/) over
+   stdio (or a Unix socket) to an external agent. Your IDE spawns it as a
+   subprocess — no network, no containers, no setup beyond a JSON config
+   entry.
+2. **Agent harness** — runs the agent loop itself, dispatching those same
+   tools in-process (no MCP hop) and talking to LLM providers directly.
+
+### Tool-server plane
 
 ```
 ┌──────────────┐     MCP (JSON-RPC over stdio)     ┌─────────────────┐
@@ -320,26 +327,62 @@ has a numeric identifier and compact field names (`c`, `p`, `s`, `n`) to
 minimize token overhead. The MCP layer translates between standard JSON-RPC
 and the internal opcode format.
 
+### Agent-harness plane
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Frontends: TUI · ACP (Zed) · one-shot CLI · chat REPL │
+│             session daemon (attach/detach, Android)    │
+├────────────────────────────────────────────────────────┤
+│  Shared session core: agent loop · canonical events    │
+│  compaction · tool-result bounding · working memory    │
+│  checkpoints · approvals/safety policy                 │
+├────────────────────────────────────────────────────────┤
+│  Provider layer: retries · model failover · resume     │
+│  multi-provider router (routes each call by model)     │
+│     ├─ Anthropic adapter                               │
+│     ├─ OpenAI adapter                                  │
+│     └─ OpenRouter adapter                              │
+└────────────────────────────────────────────────────────┘
+```
+
+Every frontend drives the same transport-independent session core, so a
+conversation started in the TUI can detach to the daemon and be reattached
+from another terminal or a paired phone. Provider adapters own all
+provider-specific wire format and error classification; everything above
+them sees one `LlmProvider` interface and plain model strings — which is
+what makes failover, live model discovery, and multi-provider routing
+composable rather than special-cased.
+
 ## Project vision
 
 Daimonos is being built in three phases:
 
-### Phase 1: User-space MCP server (current)
+### Phase 1: User-space MCP server + agent harness (current)
 
-A Rust daemon that runs on any Linux or macOS machine and provides
-agent-optimized tools via MCP. This is what you install today. It proves
-out the protocol design and structured I/O patterns.
+A Rust binary that runs on any Linux or macOS machine, in two roles that
+prove out the same protocol design and structured I/O patterns:
 
-**Status: Production-ready.** Used daily for real development work. Pre-built
-binaries available for Linux (x86_64, aarch64, musl) and macOS (Apple Silicon,
-Intel).
+- **Tool server** for third-party agents (Cursor, Copilot, Claude Code,
+  Zed, …) via MCP — the original phase-1 deliverable.
+- **Agent harness** in its own right: interactive TUI, ACP backend for
+  Zed, one-shot CLI, and daemon-owned sessions with remote attach — with
+  multi-provider routing, model failover, compaction, and per-turn
+  checkpoints built in (see [Agent harness
+  features](#agent-harness-features)).
+
+**Status: Production-ready.** Both roles are used daily for real development
+work — including developing Daimonos itself. Pre-built binaries available
+for Linux (x86_64, aarch64, musl) and macOS (Apple Silicon, Intel).
 
 ### Phase 2: Minimal Linux distro
 
 A purpose-built Buildroot Linux image with Daimonos as the primary user-space
 application. Designed for cloud deployment where AI agents need a clean,
 minimal environment. The distro boots in seconds, has no shell or human-facing
-UI, and runs the Daimonos daemon as PID 1's direct child.
+UI, and runs the Daimonos daemon as PID 1's direct child. The session daemon
+and remote-control gateway from phase 1 are the intended tenants: headless
+agent sessions in the cloud, attached to from a terminal or phone.
 
 **Status: Working prototype.** Boots in QEMU, deployable to AWS EC2. Used for
 remote benchmarking.
