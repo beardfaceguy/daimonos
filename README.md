@@ -41,8 +41,10 @@ use — read files, write files, search, execute commands, git operations — bu
 returns compact, structured JSON instead of raw text.
 
 The single binary also provides ACP, one-shot agent, interactive chat, and
-socket-daemon runtimes. See [Runtime modes](docs/runtime-modes.md) for the
-explicit subcommands and compatibility aliases.
+socket-daemon runtimes — a full coding-agent harness in its own right; see
+[Agent harness features](#agent-harness-features) below and
+[Runtime modes](docs/runtime-modes.md) for the explicit subcommands and
+compatibility aliases.
 
 ```
 Agent: exec("cargo test")
@@ -212,6 +214,81 @@ These appear automatically when the corresponding CLI tool is found on PATH:
 - **Token analytics** — Per-tool-call tracking with cross-session history (`daimonos --stats`)
 - **Background processes** — Start, poll, and kill long-running commands
 - **Configurable** — All tunables in a single [TOML config file](docs/configuration.md)
+
+## Agent harness features
+
+Beyond the MCP server, the same binary is a complete coding-agent harness:
+an interactive terminal UI (`daimonos agent`), an ACP backend for Zed, a
+one-shot CLI, and a session daemon with attach/detach and remote control.
+
+Many of its recent features come from a systematic study of 60+ open-source
+agent harnesses (Aider, OpenHands, SWE-agent, Goose, OpenCode, Forge, Pi,
+the Cline family, and others) — mining the ecosystem for proven techniques
+and adapting the best ones.
+
+### Provider resilience — a hiccup never kills the turn
+
+- **Bounded provider retries** with backoff for transient failures (429/5xx/
+  network), classified at the provider boundary — fatal auth/validation
+  errors surface immediately
+- **Automatic model failover** — on a sustained overload the turn continues
+  on the next model in the chain, then returns to your preferred model on
+  the next turn
+- **Turn-level error resume** — when retries and failover are spent, the
+  agent pauses, repairs the conversation (keeping partial streamed output),
+  and continues where it left off; recovery actions surface in the UI
+- **Retry-storm detection** — fingerprints repeated identical tool calls and
+  steers the model out of loops
+- **Orphan tool-call repair** — max-token truncation mid-tool-call is
+  repaired instead of poisoning the session
+
+### Multi-provider sessions
+
+- **Several providers, one session** — configure Anthropic, OpenAI, and
+  OpenRouter side by side (`DAIMONOS_AGENT_<NAME>_API_KEY`); every call is
+  routed to the right provider by model, with an explicit `provider:slug`
+  override
+- **Live model discovery** — at startup the configured provider(s) are
+  queried for their full model catalogs; the model picker and failover
+  chain always reflect what is actually served, newest first
+- **Cross-provider failover** — with more than one provider configured, an
+  outage at one can fail over to models at another, mid-turn
+- **Provider-reported context windows** — compaction thresholds derive from
+  the live model metadata instead of hardcoded numbers
+
+### Context economy at the harness level
+
+- **Conversation compaction** — summarize-and-continue with high/low
+  water-mark thresholds and provider-honest token accounting
+- **Bounded tool results** — oversized tool output is capped at the dispatch
+  boundary and offloaded to files the agent can re-read selectively
+- **Reverse-budget pruning** — old tool results shrink before new ones, so a
+  long turn keeps its recent working set sharp
+- **Distilled working memory** — durable facts/snippets/notes that survive
+  compaction, separate from the transcript
+- **Resilient edit matching** (mined from Aider) — whitespace-tolerant
+  search/replace cuts failed-edit retry costs
+- **Batched scripting** — the agent is steered to bundle multi-step tool
+  work into single Starlark scripts (~2.2x cost lever, benchmarked)
+
+### Session durability and control
+
+- **Per-turn workspace checkpoints** — automatic snapshots with diff/compare
+  and code-only restore
+- **Daemon-owned sessions** — detach from a running agent, reattach later
+  (or from another terminal), with a reconnect event ring and canonical
+  snapshot recovery
+- **Persistent terminal UI** — streaming output, tool-lifecycle cards,
+  approval modal, model/usage status bar, and vim-style scrollback
+- **Remote control** — paired Android controller over an authenticated WSS
+  gateway
+- **Subagent delegation** — drive external ACP agents (cursor-agent,
+  codex-acp, …) as delegated workers
+- **Thought capture** — opt-in local persistence of streamed model reasoning
+  for later inspection
+
+Agent-mode configuration lives in a dotenv-style `agent.env`
+(`~/.config/daimonos/agent.env`); see [Runtime modes](docs/runtime-modes.md).
 
 ## Architecture
 
