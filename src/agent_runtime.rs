@@ -22,15 +22,26 @@ fn try_build_provider(
     match provider {
         "openrouter" => providers::openrouter::OpenRouterProvider::new(
             api_key.to_string(),
-            base_url.to_string(),
+            // Secondary providers may omit the base URL (multi-provider
+            // support); unlike the other adapters OpenRouter's constructor
+            // does not self-default.
+            if base_url.trim().is_empty() {
+                "https://openrouter.ai/api/v1".to_string()
+            } else {
+                base_url.to_string()
+            },
         )
         .map(|p| Box::new(p.with_timeouts(timeouts)) as Box<dyn providers::LlmProvider>),
-        "anthropic" => Ok(Box::new(
-            providers::anthropic::AnthropicProvider::new(api_key.to_string())
-                .with_base_url(base_url.to_string())
+        "anthropic" => {
+            let mut p = providers::anthropic::AnthropicProvider::new(api_key.to_string())
                 .with_prompt_cache(prompt_cache)
-                .with_timeouts(timeouts),
-        )),
+                .with_timeouts(timeouts);
+            // Empty = keep the adapter's own default endpoint.
+            if !base_url.trim().is_empty() {
+                p = p.with_base_url(base_url.to_string());
+            }
+            Ok(Box::new(p))
+        }
         "openai" => {
             providers::openai::OpenAiProvider::new(api_key.to_string(), base_url.to_string())
                 .map(|p| Box::new(p.with_timeouts(timeouts)) as Box<dyn providers::LlmProvider>)
@@ -97,16 +108,61 @@ fn models_discovery_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Build the session's provider handle: the primary adapter alone, or a
+/// [`providers::router::MultiProvider`] when `agent.env` configures
+/// secondary providers (`DAIMONOS_AGENT_<NAME>_API_KEY`). The router
+/// dispatches per call by model, so every downstream consumer keeps seeing
+/// one `dyn LlmProvider`.
+fn try_build_session_provider(
+    effective_provider: &str,
+    api_key: &str,
+    base_url: &str,
+    prompt_cache: bool,
+    secondaries: &[agent_env::SecondaryProvider],
+    timeouts: providers::ProviderTimeouts,
+) -> Result<Box<dyn providers::LlmProvider>, String> {
+    let primary = try_build_provider(
+        effective_provider,
+        api_key,
+        base_url,
+        prompt_cache,
+        timeouts,
+    )?;
+    // A secondary matching the (possibly --provider-overridden) primary is
+    // redundant: the primary's credentials already serve those models.
+    let secondaries: Vec<&agent_env::SecondaryProvider> = secondaries
+        .iter()
+        .filter(|s| s.name != effective_provider)
+        .collect();
+    if secondaries.is_empty() {
+        return Ok(primary);
+    }
+    let mut adapters = vec![(effective_provider.to_string(), primary)];
+    for s in secondaries {
+        let adapter = try_build_provider(&s.name, &s.api_key, &s.base_url, prompt_cache, timeouts)
+            .map_err(|e| format!("secondary provider {}: {e}", s.name))?;
+        adapters.push((s.name.clone(), adapter));
+    }
+    tracing::info!(
+        target: "daimonos::agent_runtime",
+        event = "multi_provider",
+        adapters = adapters.len(),
+        "routing across multiple providers"
+    );
+    Ok(Box::new(providers::router::MultiProvider::new(adapters)))
+}
+
 fn build_provider(
     effective_provider: &str,
     agent: &agent_env::AgentEnv,
     timeouts: providers::ProviderTimeouts,
 ) -> anyhow::Result<Box<dyn providers::LlmProvider>> {
-    try_build_provider(
+    try_build_session_provider(
         effective_provider,
         &agent.api_key,
         &agent.base_url,
         agent.prompt_cache,
+        &agent.secondary_providers,
         timeouts,
     )
     .map_err(anyhow::Error::msg)
@@ -343,8 +399,18 @@ pub async fn run_acp(
         let api_key = agent.api_key.clone();
         let base_url = agent.base_url.clone();
         let prompt_cache = agent.prompt_cache;
+        let secondaries = agent.secondary_providers.clone();
         let timeouts = providers::ProviderTimeouts::from_config(&cfg.provider_timeouts);
-        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache, timeouts))
+        Arc::new(move || {
+            try_build_session_provider(
+                &provider,
+                &api_key,
+                &base_url,
+                prompt_cache,
+                &secondaries,
+                timeouts,
+            )
+        })
     };
     let compaction_follows_model = matches!(
         &agent.compaction,
@@ -414,8 +480,18 @@ pub async fn run_session_daemon(
         let api_key = agent.api_key.clone();
         let base_url = agent.base_url.clone();
         let prompt_cache = agent.prompt_cache;
+        let secondaries = agent.secondary_providers.clone();
         let timeouts = providers::ProviderTimeouts::from_config(&cfg.provider_timeouts);
-        Arc::new(move || try_build_provider(&provider, &api_key, &base_url, prompt_cache, timeouts))
+        Arc::new(move || {
+            try_build_session_provider(
+                &provider,
+                &api_key,
+                &base_url,
+                prompt_cache,
+                &secondaries,
+                timeouts,
+            )
+        })
     };
     let compaction_follows_model = matches!(
         &agent.compaction,
@@ -777,6 +853,37 @@ mod tests {
         // No provider at all (factory failed): same fallback.
         let models = discover_models(None, &configured, "other").await;
         assert_eq!(models, vec!["other", "cfg-a", "cfg-b"]);
+    }
+
+    #[test]
+    fn session_provider_wraps_in_a_router_only_when_secondaries_exist() {
+        let timeouts = providers::ProviderTimeouts::default();
+        // No secondaries: plain single-adapter handle, pre-existing behaviour.
+        let single = try_build_session_provider("anthropic", "k", "", false, &[], timeouts);
+        assert!(single.is_ok());
+        // Secondaries: builds every adapter (empty base_url = adapter default,
+        // including OpenRouter which does not self-default).
+        let secondaries = vec![
+            crate::agent_env::SecondaryProvider {
+                name: "openai".into(),
+                api_key: "k2".into(),
+                base_url: String::new(),
+            },
+            crate::agent_env::SecondaryProvider {
+                name: "openrouter".into(),
+                api_key: "k3".into(),
+                base_url: String::new(),
+            },
+        ];
+        let multi = try_build_session_provider("anthropic", "k", "", false, &secondaries, timeouts);
+        assert!(multi.is_ok(), "{:?}", multi.as_ref().err());
+        // A secondary duplicating the primary is filtered, not doubled.
+        let dup = vec![crate::agent_env::SecondaryProvider {
+            name: "anthropic".into(),
+            api_key: "other".into(),
+            base_url: String::new(),
+        }];
+        assert!(try_build_session_provider("anthropic", "k", "", false, &dup, timeouts).is_ok());
     }
 
     #[tokio::test]

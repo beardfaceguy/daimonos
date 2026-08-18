@@ -7,6 +7,7 @@ use serde_json::Value;
 pub mod anthropic;
 pub mod openai;
 pub mod openrouter;
+pub mod router;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Role {
