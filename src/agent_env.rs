@@ -68,6 +68,20 @@ const COMPACTION_REQUIRED: &[&str] = &[
     "DAIMONOS_AGENT_OUTPUT_RESERVATION",
 ];
 
+/// Credentials for an additional provider beyond the primary one
+/// (multi-provider support, operator request 2026-08-17). Configured via
+/// `DAIMONOS_AGENT_<NAME>_API_KEY` (+ optional `DAIMONOS_AGENT_<NAME>_BASE_URL`)
+/// where NAME is ANTHROPIC | OPENAI | OPENROUTER. A suffixed key matching the
+/// primary `DAIMONOS_AGENT_PROVIDER` is ignored — the primary's unsuffixed
+/// credentials win.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryProvider {
+    pub name: String,
+    pub api_key: String,
+    /// Empty means "use the adapter's default endpoint".
+    pub base_url: String,
+}
+
 /// Validated agent connection config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentEnv {
@@ -100,6 +114,9 @@ pub struct AgentEnv {
     /// prior hardwired value). Both command paths forward this into the
     /// per-turn `CompleteOpts.thinking`.
     pub thinking: ThinkingLevel,
+    /// Additional providers routable in the same session (multi-provider
+    /// support). Empty = single-provider, exactly the pre-existing behaviour.
+    pub secondary_providers: Vec<SecondaryProvider>,
 }
 
 impl AgentEnv {
@@ -214,6 +231,22 @@ impl AgentEnv {
             path,
         )?;
 
+        let secondary_providers = ["anthropic", "openai", "openrouter"]
+            .iter()
+            .filter(|name| **name != provider)
+            .filter_map(|name| {
+                let upper = name.to_ascii_uppercase();
+                let api_key = present(&format!("DAIMONOS_AGENT_{upper}_API_KEY"))?;
+                let base_url =
+                    present(&format!("DAIMONOS_AGENT_{upper}_BASE_URL")).unwrap_or_default();
+                Some(SecondaryProvider {
+                    name: name.to_string(),
+                    api_key,
+                    base_url,
+                })
+            })
+            .collect();
+
         Ok(AgentEnv {
             provider,
             model,
@@ -227,6 +260,7 @@ impl AgentEnv {
             compaction,
             timestamp_turns,
             thinking,
+            secondary_providers,
         })
     }
 
@@ -548,6 +582,54 @@ mod tests {
          DAIMONOS_AGENT_API_KEY=sk-test\n\
          DAIMONOS_AGENT_COMPACTION=off\n"
             .to_string()
+    }
+
+    #[test]
+    fn secondary_providers_parse_from_suffixed_vars() {
+        let env = load_str(&format!(
+            "{}DAIMONOS_AGENT_ANTHROPIC_API_KEY=sk-ant\n\
+             DAIMONOS_AGENT_OPENAI_API_KEY=sk-oai\n\
+             DAIMONOS_AGENT_OPENAI_BASE_URL=https://proxy.example/v1\n",
+            base()
+        ))
+        .unwrap();
+        // Primary is openrouter; both suffixed providers become secondaries,
+        // in canonical order. Missing base_url stays empty (adapter default).
+        assert_eq!(
+            env.secondary_providers,
+            vec![
+                SecondaryProvider {
+                    name: "anthropic".into(),
+                    api_key: "sk-ant".into(),
+                    base_url: String::new(),
+                },
+                SecondaryProvider {
+                    name: "openai".into(),
+                    api_key: "sk-oai".into(),
+                    base_url: "https://proxy.example/v1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn suffixed_key_matching_the_primary_provider_is_ignored() {
+        let env = load_str(&format!(
+            "{}DAIMONOS_AGENT_OPENROUTER_API_KEY=sk-duplicate\n",
+            base()
+        ))
+        .unwrap();
+        assert!(
+            env.secondary_providers.is_empty(),
+            "the primary's unsuffixed credentials must win: {:?}",
+            env.secondary_providers
+        );
+    }
+
+    #[test]
+    fn no_suffixed_vars_means_no_secondaries() {
+        let env = load_str(&base()).unwrap();
+        assert!(env.secondary_providers.is_empty());
     }
 
     fn compaction_on() -> String {
