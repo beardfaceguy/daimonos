@@ -139,7 +139,7 @@ pub async fn run_agent(
         });
     }
 
-    let tools: Vec<ToolSchema> = schemas
+    let mut tools: Vec<ToolSchema> = schemas
         .into_iter()
         .map(|s| ToolSchema {
             name: s.name,
@@ -147,6 +147,14 @@ pub async fn run_agent(
             input_schema: s.input_schema,
         })
         .collect();
+    // Outbound MCP servers (#1289): one-shot agent mode reads the
+    // Claude-style file named by `[agent.mcp]`.
+    let native_names: std::collections::HashSet<String> =
+        tools.iter().map(|tool| tool.name.clone()).collect();
+    let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, args.analytics.clone()).await;
+    if let Some(mcp) = &agent_mcp {
+        tools.extend(mcp.tools());
+    }
 
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
@@ -178,6 +186,7 @@ pub async fn run_agent(
             path,
             label: "agent".to_string(),
         }),
+        remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
         ..AgentConfig::default()
     };
 
@@ -205,6 +214,10 @@ pub async fn run_agent(
     let result = crate::agent::run(provider, session, initial, &config)
         .instrument(prompt_span.span().clone())
         .await;
+    // Graceful bridge teardown before reporting; bounded by [acp.mcp] budgets.
+    if let Some(mcp) = agent_mcp {
+        mcp.shutdown().await;
+    }
     let thought_capture_result = match thought_capture {
         Some(capture) => capture.finish(),
         None => Ok(()),

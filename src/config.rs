@@ -25,6 +25,10 @@ pub struct Config {
     pub pipeline_cache: PipelineCacheConfig,
     pub mcp: McpConfig,
     pub acp: AcpConfig,
+    /// `[agent.*]` — daimonos's own agent frontends (TUI, one-shot, chat
+    /// REPL, session daemon), as opposed to `[acp.*]` which configures the
+    /// ACP server this binary exposes to Zed.
+    pub agent: AgentModeConfig,
     pub session: SessionRuntimeConfig,
     pub tui: TuiConfig,
     pub discord: DiscordConfig,
@@ -33,6 +37,40 @@ pub struct Config {
     pub prompts: PromptsConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
+}
+
+/// `[agent]` — settings for daimonos's own agent frontends.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct AgentModeConfig {
+    pub mcp: AgentMcpConfig,
+}
+
+/// `[agent.mcp]` — outbound MCP servers for non-ACP agent frontends
+/// (vikunja #1289). On the ACP path the *client* (Zed) forwards the server
+/// list per session; the TUI / one-shot / chat / daemon frontends have no
+/// client to do that, so they read a Claude-style `mcpServers` JSON file
+/// instead — the same format Claude Desktop and Claude Code use, so one
+/// file can feed every harness. Bridge tuning (timeouts, per-server caps,
+/// allow_stdio/allow_http gates, self-connection refusal) is shared with
+/// `[acp.mcp]`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AgentMcpConfig {
+    /// Master switch. When false the servers file is never read.
+    pub enabled: bool,
+    /// Path to the Claude-style `mcpServers` JSON file. A missing file is
+    /// not an error — agent mode simply runs with native tools only.
+    pub servers_file: String,
+}
+
+impl Default for AgentMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers_file: "~/.config/daimonos/mcp_servers.json".to_string(),
+        }
+    }
 }
 
 /// Runtime overrides for the model-facing prompts (vikunja #974). Each field is

@@ -2,6 +2,7 @@ mod acp_cmd;
 mod agent;
 mod agent_cmd;
 mod agent_env;
+mod agent_mcp;
 mod agent_runtime;
 mod analytics;
 mod chat_cmd;

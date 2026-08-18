@@ -233,7 +233,7 @@ pub async fn run_chat(
     compaction: Option<CompactionPolicy>,
 ) -> anyhow::Result<()> {
     let system_prompt = crate::prompts::agent_system(&cfg).await;
-    let config = build_agent_config_with_descriptions(
+    let mut config = build_agent_config_with_descriptions(
         workspace,
         model.clone(),
         safety,
@@ -242,6 +242,15 @@ pub async fn run_chat(
         system_prompt,
         &cfg.prompts.resolved_tool_descriptions,
     );
+    // Outbound MCP servers (#1289): the chat REPL reads the Claude-style
+    // file named by `[agent.mcp]`.
+    let native_names: std::collections::HashSet<String> =
+        config.tools.iter().map(|tool| tool.name.clone()).collect();
+    let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, None).await;
+    if let Some(mcp) = &agent_mcp {
+        config.tools.extend(mcp.tools());
+        config.remote_tool_dispatch = Some(mcp.dispatch_hook());
+    }
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
 
@@ -364,6 +373,9 @@ pub async fn run_chat(
         }
     }
 
+    if let Some(mcp) = agent_mcp {
+        mcp.shutdown().await;
+    }
     Ok(())
 }
 

@@ -258,6 +258,21 @@ scrollback_entries = 2_000
 # an opaque continuation cursor when more sessions remain.
 session_list_page_size = 50
 
+[agent.mcp]
+# Outbound MCP servers for daimonos's own agent frontends — interactive TUI,
+# one-shot `agent`, `chat` REPL, and the session daemon (#1289). The ACP path
+# is unaffected (there the client forwards the server list per session).
+# Reads a Claude-style `mcpServers` JSON file — the same format Claude
+# Desktop / Claude Code use — so one file can feed every harness:
+#   { "mcpServers": {
+#       "linear":   { "command": "npx", "args": ["-y", "linear-mcp"] },
+#       "repowise": { "url": "http://127.0.0.1:8931/mcp" } } }
+# A missing file is not an error: agent mode runs with native tools only.
+# Bridge tuning (timeouts, caps, allow_stdio/allow_http, self-connection
+# refusal) is shared with [acp.mcp] below.
+enabled = true
+servers_file = "~/.config/daimonos/mcp_servers.json"
+
 [acp.mcp]
 # MCP-server bridge (ADR-003, #990). Zed forwards every configured context
 # server on session/new and session/load; when enabled, daimonos connects to

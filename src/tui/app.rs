@@ -90,7 +90,15 @@ pub async fn run(
         options: runtime_options,
     });
 
-    let tools = active_tools(workspace, &cfg);
+    let mut tools = active_tools(workspace, &cfg);
+    // Outbound MCP servers (#1289): the TUI is its own client, so the server
+    // list comes from the Claude-style file named by `[agent.mcp]`.
+    let native_names: std::collections::HashSet<String> =
+        tools.iter().map(|tool| tool.name.clone()).collect();
+    let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, options.analytics.clone()).await;
+    if let Some(mcp) = &agent_mcp {
+        tools.extend(mcp.tools());
+    }
     let safety = Arc::new(options.safety);
     let before_tool_call = build_before_tool_call_hook(
         Arc::clone(&events),
@@ -134,6 +142,7 @@ pub async fn run(
             label: "tui".to_string(),
         }),
         compaction: options.compaction,
+        remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
         // Provider recovery (transient-error resume, failover) surfaces in the
         // transcript as a system entry: visible, but the turn keeps running.
         on_provider_notice: Some(Box::new({
@@ -202,6 +211,9 @@ pub async fn run(
     if let Some(active) = turn.take() {
         active.abort();
         let _ = active.await;
+    }
+    if let Some(mcp) = agent_mcp {
+        mcp.shutdown().await;
     }
     pending_approval
         .lock()
