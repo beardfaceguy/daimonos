@@ -128,7 +128,7 @@ impl SessionFactory for AgentSessionFactory {
         let before_lifecycle = Arc::clone(&tool_lifecycle);
         let after_lifecycle = Arc::clone(&tool_lifecycle);
         let stream_events = Arc::clone(&events);
-        let tools = crate::tool_facade::active_schemas(
+        let mut tools: Vec<ToolSchema> = crate::tool_facade::active_schemas(
             &workspace,
             &self.config.prompts.resolved_tool_descriptions,
         )
@@ -139,6 +139,16 @@ impl SessionFactory for AgentSessionFactory {
             input_schema: schema.input_schema,
         })
         .collect();
+        // Outbound MCP servers (#1289). The bridge is kept alive by the
+        // dispatch hook's Arc; on session drop the client pool reaps stdio
+        // children (bounded teardown, #1293) — no explicit shutdown hook
+        // exists on this path yet.
+        let native_names: std::collections::HashSet<String> =
+            tools.iter().map(|tool| tool.name.clone()).collect();
+        let agent_mcp = crate::agent_mcp::connect(&self.config, &native_names, None).await;
+        if let Some(mcp) = &agent_mcp {
+            tools.extend(mcp.tools());
+        }
         let agent_config = AgentConfig {
             system: Some(crate::prompts::agent_system(&self.config).await),
             tools,
@@ -167,6 +177,7 @@ impl SessionFactory for AgentSessionFactory {
                 label: "session-daemon".to_string(),
             }),
             compaction: self.compaction.policy.clone(),
+            remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
             ..AgentConfig::default()
         };
         let mut tool_session = Session::new(workspace.clone(), Arc::clone(&self.config));
