@@ -1,15 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::json;
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
-
-/// Output cap (chars) applied to each pytest run before parsing. Mirrors the
-/// default of `config.process.exec_output_max_chars` for consistency. A noisy
-/// test run would otherwise return arbitrarily large plugin output.
-const MAX_OUTPUT_CHARS: usize = 100_000;
+use serde_json::json;
 
 /// Pytest plugin: runs Python tests via the `pytest` binary and returns
 /// structured pass/fail counts plus a list of failed test ids.
@@ -55,17 +48,23 @@ impl ToolPlugin for PytestPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = PytestRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let (output, success) = match command {
-            "run" => pytest_run(cwd, args).await?,
-            "collect" => pytest_collect(cwd, args).await?,
+            "run" => pytest_run(&runner, args).await?,
+            "collect" => pytest_collect(&runner, args).await?,
             _ => return Err(format!("unknown pytest command: {command}")),
         };
 
@@ -79,48 +78,45 @@ impl ToolPlugin for PytestPlugin {
     }
 }
 
-async fn run_pytest(cwd: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
-    let output = Command::new("pytest")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("pytest exec: {e}"))?;
-
-    let stdout = cap_output(String::from_utf8_lossy(&output.stdout).into_owned());
-    let stderr = cap_output(String::from_utf8_lossy(&output.stderr).into_owned());
-    Ok((stdout, stderr, output.status.success()))
+struct PytestRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
 }
 
-/// Truncate `s` to `MAX_OUTPUT_CHARS`, keeping the first half and last half
-/// with a notice in the middle (mirrors exec_filter truncation style).
-fn cap_output(s: String) -> String {
-    if s.len() <= MAX_OUTPUT_CHARS {
-        return s;
+impl PytestRun<'_> {
+    async fn run(&self, args: &[&str]) -> Result<(String, String, bool), String> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let output = crate::managed_process::run(
+            "pytest",
+            &args,
+            self.cwd,
+            self.env,
+            self.process_cfg,
+            None,
+        )
+        .await
+        .map_err(|e| format!("pytest exec: {e}"))?;
+        if output.timed_out {
+            return Err(format!(
+                "pytest timed out after {} seconds",
+                self.process_cfg.default_timeout_secs
+            ));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err("pytest output exceeded process.output_memory_bytes".into());
+        }
+        Ok((output.stdout, output.stderr, output.status.success()))
     }
-    let half = MAX_OUTPUT_CHARS / 2;
-    // Floor the head cut to a char boundary: `half` is a byte offset and a raw
-    // cut mid-UTF-8 char panics (the tail below is already boundary-aligned).
-    let head = &s[..crate::plugins::floor_char_boundary(&s, half)];
-    // Find a char boundary going backwards from `half` into the tail.
-    let tail_start = s.len() - half;
-    let tail_start = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .find(|&i| i >= tail_start)
-        .unwrap_or(s.len());
-    let tail = &s[tail_start..];
-    let truncated_chars = s.len() - MAX_OUTPUT_CHARS;
-    format!("{head}\n[... {truncated_chars} chars truncated ...]\n{tail}")
 }
 
 async fn pytest_run(
-    cwd: &Path,
+    runner: &PytestRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<(serde_json::Value, bool), String> {
     let pytest_args = build_run_args(args);
     let arg_refs: Vec<&str> = pytest_args.iter().map(|s| s.as_str()).collect();
-    let (stdout, stderr, success) = run_pytest(cwd, &arg_refs).await?;
+    let (stdout, stderr, success) = runner.run(&arg_refs).await?;
     let combined = format!("{stdout}\n{stderr}");
 
     let summary = parse_pytest_summary(&combined);
@@ -196,7 +192,7 @@ fn build_run_args(args: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 async fn pytest_collect(
-    cwd: &Path,
+    runner: &PytestRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<(serde_json::Value, bool), String> {
     let path = args
@@ -210,7 +206,7 @@ async fn pytest_collect(
     }
 
     let arg_refs: Vec<&str> = pytest_args.iter().map(|s| s.as_str()).collect();
-    let (stdout, _stderr, success) = run_pytest(cwd, &arg_refs).await?;
+    let (stdout, _stderr, success) = runner.run(&arg_refs).await?;
 
     // `--collect-only -q` prints one test id per line, then a blank line, then the
     // summary "N tests collected in 0.05s". We take everything before the blank line
@@ -344,17 +340,6 @@ mod tests {
     use super::*;
     use crate::tool_runner::ToolRegistry;
     use std::sync::Arc;
-
-    #[test]
-    fn cap_output_does_not_panic_on_multibyte_char_at_head_cut() {
-        // '€' (3 bytes) straddles the head cut at MAX_OUTPUT_CHARS/2.
-        let half = MAX_OUTPUT_CHARS / 2;
-        let mut s = "a".repeat(half - 1);
-        s.push('€');
-        s.push_str(&"b".repeat(MAX_OUTPUT_CHARS));
-        let out = cap_output(s);
-        assert!(out.contains("chars truncated"));
-    }
 
     const PASSING_TEST: &str = r#"def test_add():
     assert 1 + 1 == 2
@@ -606,6 +591,31 @@ ERROR tests/test_qux.py::test_setup - fixture failed
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown pytest command"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_pytest_rejects_managed_capture_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("pytest");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 1000)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), dir.path().display().to_string());
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let error = PytestPlugin::new()
+            .run_command_with_config("run", dir.path(), &env, None, None, &cfg)
+            .await
+            .unwrap_err();
+        assert!(error.contains("output exceeded"));
     }
 
     #[tokio::test]

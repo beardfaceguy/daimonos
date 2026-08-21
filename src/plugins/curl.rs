@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::{json, Value};
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
+use serde_json::{json, Value};
 
 pub fn is_available() -> bool {
     std::process::Command::new("curl")
@@ -53,17 +51,18 @@ impl ToolPlugin for CurlPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
         match command {
             "request" => {
-                let output = curl_request(cwd, args).await?;
+                let output = curl_request(cwd, env, process_cfg, args).await?;
                 Ok(ToolResult {
                     tool: "curl".into(),
                     command: "request".into(),
@@ -80,7 +79,12 @@ impl ToolPlugin for CurlPlugin {
 const METRICS_SENTINEL: &str = "__CURL_METRICS__:";
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
-async fn curl_request(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
+async fn curl_request(
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    process_cfg: &crate::config::ProcessConfig,
+    args: Option<&Value>,
+) -> Result<Value, String> {
     let args = args
         .and_then(|v| v.as_object())
         .ok_or("curl: args must be a JSON object")?;
@@ -126,30 +130,25 @@ async fn curl_request(cwd: &Path, args: Option<&Value>) -> Result<Value, String>
 
     cmd_args.push(url.to_string());
 
-    let output = Command::new("curl")
-        .args(&cmd_args)
-        .current_dir(cwd)
-        .output()
+    let output = crate::managed_process::run("curl", &cmd_args, cwd, env, process_cfg, None)
         .await
         .map_err(|e| format!("curl exec: {e}"))?;
 
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let raw = output.stdout;
 
     // Non-zero exit means a transport error (connection refused, timeout, DNS, etc.)
     // The sentinel may still be present with status=0 — ignore it and return the error.
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Ok(json!({
-            "error": stderr.trim(),
+            "error": output.stderr.trim(),
             "exit": output.status.code().unwrap_or(-1),
         }));
     }
 
     let sentinel_needle = format!("\n{METRICS_SENTINEL}");
     let Some(sentinel_pos) = raw.rfind(&sentinel_needle) else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Ok(json!({
-            "error": stderr.trim(),
+            "error": output.stderr.trim(),
             "exit": output.status.code().unwrap_or(-1),
         }));
     };

@@ -71,6 +71,7 @@ pub fn schema(op: &Op) -> Response {
                 ("s", "cmd", true),
                 ("a", "args", false),
                 ("q", "cwd", false),
+                ("kv", "env", false),
             ],
         ),
         op_schema(

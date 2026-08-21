@@ -63,7 +63,7 @@ With Daimonos (structured JSON):
 {"ok":true,"tests":47,"passed":47,"failed":0,"failures":[]}
 ```
 
-### Three layers of optimization
+### Four layers of optimization
 
 1. **Native tool plugins** — `git`, `cargo`, `gh`, and `docker` are exposed as
    first-class MCP tools with structured JSON output. When agents call
@@ -79,6 +79,12 @@ With Daimonos (structured JSON):
    file returns `{"unchanged":true}` instead of the full content), compact
    field names, lazy tool exposure, batch operations, and a terse output
    directive that cuts LLM prose by ~30%.
+
+4. **Managed subprocess execution** — Command output is bounded while it is
+   read instead of after full buffering. Daimonos owns Unix process groups,
+   retires descendants on cancellation or session shutdown, isolates child
+   environments through an explicit allowlist, and stores background output
+   in private bounded artifacts.
 
 ## Benchmark results
 
@@ -192,7 +198,7 @@ close it. No daemon to manage, no background service.
 | `write_file` | Write with auto-mkdir |
 | `edit_file` | String replacement with diff confirmation |
 | `search` | Regex search (content mode) or file discovery (file mode) |
-| `exec` | Run commands with semantic output filtering |
+| `exec` | Run commands with semantic filtering, bounded capture, and owned teardown |
 | `batch` | Multiple operations in a single round-trip |
 | `workspace_info` | Project type, git status, directory listing, analytics |
 
@@ -212,8 +218,26 @@ These appear automatically when the corresponding CLI tool is found on PATH:
 - **Workspace snapshots** — Checkpoint before risky edits, rollback on failure
 - **Starlark scripting** — Bundle multiple tool calls into a single script
 - **Token analytics** — Per-tool-call tracking with cross-session history (`daimonos --stats`)
-- **Background processes** — Start, poll, and kill long-running commands
+- **Background processes** — Start, poll, and stop long-running commands with
+  admission limits, private bounded logs, and descendant cleanup
 - **Configurable** — All tunables in a single [TOML config file](docs/configuration.md)
+
+### Managed process lifecycle
+
+Raw `exec`, background jobs, and CLI plugins (`cargo`, `git`, `gh`, `docker`,
+`npm`, `pytest`, `curl`, and `shellcheck`) share one managed execution layer:
+
+- **Streaming-time bounds** — stdout and stderr retain UTF-8-safe head/tail
+  previews without first allocating the complete output
+- **Process-group ownership on Unix** — cancellation and shutdown send TERM,
+  wait a configurable grace period, then escalate to KILL and reap descendants
+- **Secure background artifacts** — random exclusive `0600` files under a
+  private `0700` directory, with configurable byte and job-count limits
+- **Environment isolation** — children inherit only configured parent
+  variables plus explicit session, tool, and per-call overrides; provider and
+  MCP credentials are not ambiently leaked
+- **Structured-output integrity** — plugins reject truncated JSON rather than
+  reporting an incomplete result as valid
 
 ## Agent harness features
 
@@ -436,7 +460,9 @@ All behavior is tunable via a TOML config file. See
 Key sections:
 - `[index]` — Trigram indexer tuning (max depth, file size limits)
 - `[search]` — Search result limits
-- `[process]` — Exec timeout, output capping, semantic filters, max concurrent Starlark script threads
+- `[process]` — Process timeouts, in-memory/artifact bounds, background
+  admission, termination grace, inherited environment, semantic filters, and
+  max concurrent Starlark script threads
 - `[pipeline_cache]` — Subprocess result cache size, inotify watch cap, extra ignored directories
 - `[analytics]` — Token tracking (SQLite storage, retention)
 - `[tools.*]` — Per-tool plugin configuration

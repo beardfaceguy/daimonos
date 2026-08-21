@@ -1593,6 +1593,7 @@ pub async fn run_mcp_server(
 
     let instructions = build_instructions(&workspace, &session.cfg).await;
     let handler = DaimonosHandler::new(session, activity, startup_logs);
+    let session_handle = Arc::clone(&handler.session);
 
     let server_details = InitializeResult {
         server_info: Implementation {
@@ -1637,10 +1638,12 @@ pub async fn run_mcp_server(
         );
     }
 
-    server
+    let result = server
         .start()
         .await
-        .map_err(|e| anyhow::anyhow!("mcp server: {e}"))
+        .map_err(|e| anyhow::anyhow!("mcp server: {e}"));
+    session_handle.lock().await.shutdown_processes().await;
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,6 +1860,7 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
         }
     }
 
+    session.lock().await.shutdown_processes().await;
     Ok(())
 }
 

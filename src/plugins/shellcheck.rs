@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::{json, Value};
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
+use serde_json::{json, Value};
 
 pub fn is_available() -> bool {
     std::process::Command::new("shellcheck")
@@ -53,17 +51,18 @@ impl ToolPlugin for ShellcheckPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
         match command {
             "check" => {
-                let output = shellcheck_check(cwd, args).await?;
+                let output = shellcheck_check(cwd, env, process_cfg, args).await?;
                 Ok(ToolResult {
                     tool: "shellcheck".into(),
                     command: "check".into(),
@@ -77,7 +76,12 @@ impl ToolPlugin for ShellcheckPlugin {
     }
 }
 
-async fn shellcheck_check(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
+async fn shellcheck_check(
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    process_cfg: &crate::config::ProcessConfig,
+    args: Option<&Value>,
+) -> Result<Value, String> {
     let args = args
         .and_then(|v| v.as_object())
         .ok_or("shellcheck: args must be a JSON object")?;
@@ -102,18 +106,21 @@ async fn shellcheck_check(cwd: &Path, args: Option<&Value>) -> Result<Value, Str
     let mut cmd_args: Vec<String> = vec!["--format=json".into(), format!("--shell={shell}")];
     cmd_args.extend(files.iter().cloned());
 
-    let output = Command::new("shellcheck")
-        .args(&cmd_args)
-        .current_dir(cwd)
-        .output()
+    let output = crate::managed_process::run("shellcheck", &cmd_args, cwd, env, process_cfg, None)
         .await
         .map_err(|e| format!("shellcheck exec: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = output.stdout;
+    let stderr = output.stderr.trim().to_string();
 
     // shellcheck exits 0 = no issues, 1 = issues found, 2+ = fatal error
     let exit_code = output.status.code().unwrap_or(-1);
+    if output.stdout_truncated || output.stderr_truncated {
+        return Ok(json!({
+            "error": "shellcheck output exceeded process.output_memory_bytes",
+            "exit": exit_code,
+        }));
+    }
 
     if exit_code >= 2 || (!output.status.success() && stdout.trim().is_empty()) {
         return Ok(json!({
@@ -253,6 +260,40 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown shellcheck command"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncated_json_is_never_reported_clean() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("shellcheck");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n/usr/bin/python3 -c 'print(\"[\" + \" \" * 1000 + \"]\")'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("test.sh"), "echo ok\n").unwrap();
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), dir.path().display().to_string());
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let result = ShellcheckPlugin::new()
+            .run_command_with_config(
+                "check",
+                dir.path(),
+                &env,
+                None,
+                Some(&json!({"file": "test.sh"})),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        assert!(result.output.get("error").is_some());
+        assert!(result.output.get("clean").is_none());
     }
 
     #[tokio::test]

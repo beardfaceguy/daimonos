@@ -145,13 +145,14 @@ impl ToolPlugin for DiscordPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         _cwd: &Path,
         _env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        _process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
         if !self.cfg.enabled {
             return Err("discord integration disabled in config ([discord].enabled=false)".into());

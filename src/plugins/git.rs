@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::json;
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
+use serde_json::json;
+#[cfg(test)]
+use tokio::process::Command;
 
 pub struct GitPlugin {
     descriptor: ToolDescriptor,
@@ -46,24 +46,30 @@ impl ToolPlugin for GitPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = GitRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let output = match command {
-            "status" => git_status(cwd).await?,
-            "log" => git_log(cwd, args).await?,
-            "diff" => git_diff(cwd, args).await?,
-            "branch" => git_branch(cwd).await?,
-            "add" => git_add(cwd, args).await?,
-            "commit" => git_commit(cwd, args).await?,
-            "push" => git_push(cwd, args).await?,
-            "pull" => git_pull(cwd, args).await?,
-            "checkout" => git_checkout(cwd, args).await?,
+            "status" => git_status(&runner).await?,
+            "log" => git_log(&runner, args).await?,
+            "diff" => git_diff(&runner, args).await?,
+            "branch" => git_branch(&runner).await?,
+            "add" => git_add(&runner, args).await?,
+            "commit" => git_commit(&runner, args).await?,
+            "push" => git_push(&runner, args).await?,
+            "pull" => git_pull(&runner, args).await?,
+            "checkout" => git_checkout(&runner, args).await?,
             _ => return Err(format!("unknown git command: {command}")),
         };
 
@@ -77,25 +83,39 @@ impl ToolPlugin for GitPlugin {
     }
 }
 
-async fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("git exec: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {}: {}", args[0], stderr.trim()));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+struct GitRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
 }
 
-async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
-    let out = run_git(cwd, &["status", "--porcelain=v1", "-uall"]).await?;
+impl GitRun<'_> {
+    async fn output(&self, args: &[&str]) -> Result<crate::managed_process::ManagedOutput, String> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let mut env = self.env.clone();
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        crate::managed_process::run("git", &args, self.cwd, &env, self.process_cfg, None)
+            .await
+            .map_err(|e| format!("git exec: {e}"))
+    }
+
+    async fn text(&self, args: &[&str]) -> Result<String, String> {
+        let output = self.output(args).await?;
+        if !output.status.success() {
+            return Err(format!("git {}: {}", args[0], output.stderr.trim()));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(format!(
+                "git {} output exceeded process.output_memory_bytes",
+                args[0]
+            ));
+        }
+        Ok(output.stdout)
+    }
+}
+
+async fn git_status(runner: &GitRun<'_>) -> Result<serde_json::Value, String> {
+    let out = runner.text(&["status", "--porcelain=v1", "-uall"]).await?;
 
     let mut modified = Vec::new();
     let mut added = Vec::new();
@@ -131,13 +151,15 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
         && renamed.is_empty();
 
     // Include branch and HEAD info so a single status call gives full context
-    let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let branch = runner
+        .text(&["rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .unwrap_or_default()
         .trim()
         .to_string();
 
-    let head = run_git(cwd, &["log", "-1", "--format=%h%x00%s"])
+    let head = runner
+        .text(&["log", "-1", "--format=%h%x00%s"])
         .await
         .ok()
         .and_then(|out| {
@@ -149,7 +171,8 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
             }
         });
 
-    let commit_count = run_git(cwd, &["rev-list", "--count", "HEAD"])
+    let commit_count = runner
+        .text(&["rev-list", "--count", "HEAD"])
         .await
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
@@ -180,7 +203,7 @@ async fn git_status(cwd: &Path) -> Result<serde_json::Value, String> {
 }
 
 async fn git_log(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let limit = args
@@ -212,7 +235,7 @@ async fn git_log(
             git_args.push(&path_owned);
         }
 
-        let out = run_git(cwd, &git_args).await?;
+        let out = runner.text(&git_args).await?;
         let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
         return Ok(json!({
             "log": lines,
@@ -231,7 +254,7 @@ async fn git_log(
         git_args.push(&path_owned);
     }
 
-    let out = run_git(cwd, &git_args).await?;
+    let out = runner.text(&git_args).await?;
 
     let commits: Vec<serde_json::Value> = out
         .lines()
@@ -257,7 +280,7 @@ async fn git_log(
 }
 
 async fn git_diff(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let mode = args
@@ -271,14 +294,14 @@ async fn git_diff(
         numstat_args.push("--cached");
     }
 
-    let out = run_git(cwd, &numstat_args).await?;
+    let out = runner.text(&numstat_args).await?;
 
     let mut full_args = vec!["diff", "-U3"];
     if staged {
         full_args.push("--cached");
     }
 
-    let full_out = run_git(cwd, &full_args).await?;
+    let full_out = runner.text(&full_args).await?;
 
     let files = parse_numstat(&out);
     let hunks = parse_unified_diff(&full_out);
@@ -353,13 +376,16 @@ fn parse_unified_diff(output: &str) -> Vec<serde_json::Value> {
     hunks
 }
 
-async fn git_branch(cwd: &Path) -> Result<serde_json::Value, String> {
-    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+async fn git_branch(runner: &GitRun<'_>) -> Result<serde_json::Value, String> {
+    let current = runner
+        .text(&["rev-parse", "--abbrev-ref", "HEAD"])
         .await?
         .trim()
         .to_string();
 
-    let out = run_git(cwd, &["branch", "--format=%(refname:short)"]).await?;
+    let out = runner
+        .text(&["branch", "--format=%(refname:short)"])
+        .await?;
     let branches: Vec<&str> = out.lines().collect();
 
     Ok(json!({
@@ -370,7 +396,7 @@ async fn git_branch(cwd: &Path) -> Result<serde_json::Value, String> {
 }
 
 async fn git_add(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let paths: Vec<String> = args
@@ -388,9 +414,9 @@ async fn git_add(
         git_args.push(p.as_str());
     }
 
-    run_git(cwd, &git_args).await?;
+    runner.text(&git_args).await?;
 
-    let status = git_status(cwd).await?;
+    let status = git_status(runner).await?;
     Ok(json!({
         "added_paths": paths,
         "status": status,
@@ -398,7 +424,7 @@ async fn git_add(
 }
 
 async fn git_commit(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let message = args
@@ -416,22 +442,16 @@ async fn git_commit(
         git_args.insert(1, "-a");
     }
 
-    let output = Command::new("git")
-        .args(&git_args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("git exec: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let output = runner.output(&git_args).await?;
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
     if !output.status.success() {
         return Err(format!("git commit: {}", stderr.trim()));
     }
 
-    let hash = run_git(cwd, &["rev-parse", "--short", "HEAD"])
+    let hash = runner
+        .text(&["rev-parse", "--short", "HEAD"])
         .await
         .unwrap_or_default()
         .trim()
@@ -445,7 +465,7 @@ async fn git_commit(
 }
 
 async fn git_push(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let remote = args
@@ -471,16 +491,9 @@ async fn git_push(
         git_args.insert(1, "-u");
     }
 
-    let output = Command::new("git")
-        .args(&git_args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("git exec: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let output = runner.output(&git_args).await?;
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
     if !output.status.success() {
         return Err(format!("git push: {}", stderr.trim()));
@@ -493,7 +506,7 @@ async fn git_push(
 }
 
 async fn git_pull(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let remote = args
@@ -519,16 +532,9 @@ async fn git_pull(
         git_args.insert(1, "--rebase");
     }
 
-    let output = Command::new("git")
-        .args(&git_args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("git exec: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let output = runner.output(&git_args).await?;
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
     if !output.status.success() {
         return Err(format!("git pull: {}", stderr.trim()));
@@ -542,7 +548,7 @@ async fn git_pull(
 }
 
 async fn git_checkout(
-    cwd: &Path,
+    runner: &GitRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let target = args
@@ -580,21 +586,15 @@ async fn git_checkout(
         }
     }
 
-    let output = Command::new("git")
-        .args(&git_args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("git exec: {e}"))?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let output = runner.output(&git_args).await?;
+    let stderr = output.stderr;
 
     if !output.status.success() {
         return Err(format!("git checkout: {}", stderr.trim()));
     }
 
-    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let current = runner
+        .text(&["rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .unwrap_or_default()
         .trim()
@@ -1138,6 +1138,31 @@ mod tests {
             .run_command("checkout", dir.path(), &env, None, None)
             .await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_git_rejects_managed_capture_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 1000)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), dir.path().display().to_string());
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let error = GitPlugin::new()
+            .run_command_with_config("status", dir.path(), &env, None, None, &cfg)
+            .await
+            .unwrap_err();
+        assert!(error.contains("output exceeded"));
     }
 
     #[tokio::test]

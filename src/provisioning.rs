@@ -45,7 +45,7 @@ pub async fn build_tool_services(
     eager_index: bool,
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> ToolServices {
-    let registry = Arc::new(ToolRegistry::new());
+    let registry = Arc::new(ToolRegistry::with_process_config(cfg.process.clone()));
     crate::plugins::register_builtin_plugins(cfg, &registry, quiet_stderr).await;
 
     let index = Arc::new(WorkspaceIndex::new(

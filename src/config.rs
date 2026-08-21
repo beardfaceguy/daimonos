@@ -162,7 +162,7 @@ pub struct SearchConfig {
     pub default_find_max: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ProcessConfig {
     pub poll_tail_lines: usize,
@@ -202,6 +202,27 @@ pub struct ProcessConfig {
     pub max_script_subcalls: usize,
     /// Max prompts a single `llm_query_batched` call may take.
     pub max_script_subcall_batch: usize,
+    /// Maximum background processes owned by one session. Running and
+    /// stopping processes both count until they have fully settled.
+    pub max_background_processes: usize,
+    /// Grace period between SIGTERM and SIGKILL for managed processes.
+    pub termination_grace_ms: u64,
+    /// Maximum bytes retained in memory per stdout/stderr stream while a
+    /// process runs. Overflow keeps a UTF-8-safe head/tail preview.
+    pub output_memory_bytes: usize,
+    /// Maximum bytes retained in a background-process artifact. Pipes continue
+    /// to be drained after this limit so a noisy child cannot deadlock.
+    pub artifact_max_bytes: u64,
+    /// Private process-artifact directory. `None` resolves under
+    /// `~/.daimonos/process-output`.
+    pub artifact_directory: Option<String>,
+    /// Default foreground/plugin process timeout. Zero disables the deadline.
+    pub default_timeout_secs: u64,
+    /// Parent environment names inherited by managed children. Session and
+    /// per-call values are then overlaid, with per-call values winning.
+    pub inherit_env: Vec<String>,
+    /// Parent environment prefixes inherited by managed children.
+    pub inherit_env_prefixes: Vec<String>,
 }
 
 /// Default cap for `ProcessConfig::max_script_threads`. Exposed so the
@@ -835,6 +856,15 @@ impl ProcessConfig {
     fn validate(&self) -> Result<(), String> {
         if self.exec_stream_chunk_bytes == 0 {
             return Err("process.exec_stream_chunk_bytes must be greater than zero".to_string());
+        }
+        if self.max_background_processes == 0 {
+            return Err("process.max_background_processes must be greater than zero".to_string());
+        }
+        if self.output_memory_bytes == 0 {
+            return Err("process.output_memory_bytes must be greater than zero".to_string());
+        }
+        if self.artifact_max_bytes == 0 {
+            return Err("process.artifact_max_bytes must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -1474,6 +1504,49 @@ impl Default for ProcessConfig {
             script_llm_enabled: false,
             max_script_subcalls: 32,
             max_script_subcall_batch: 16,
+            max_background_processes: 16,
+            termination_grace_ms: 2_000,
+            output_memory_bytes: 1024 * 1024,
+            artifact_max_bytes: 100 * 1024 * 1024,
+            artifact_directory: None,
+            default_timeout_secs: 0,
+            inherit_env: vec![
+                "HOME".into(),
+                "USER".into(),
+                "LOGNAME".into(),
+                "SHELL".into(),
+                "PATH".into(),
+                "TMPDIR".into(),
+                "TEMP".into(),
+                "TMP".into(),
+                "TERM".into(),
+                "COLORTERM".into(),
+                "LANG".into(),
+                "LANGUAGE".into(),
+                "TZ".into(),
+                "SSH_AUTH_SOCK".into(),
+                "GPG_AGENT_INFO".into(),
+                "CARGO_HOME".into(),
+                "RUSTUP_HOME".into(),
+                "RUSTC_WRAPPER".into(),
+                "VIRTUAL_ENV".into(),
+                "PYENV_ROOT".into(),
+                "NVM_DIR".into(),
+                "DOCKER_HOST".into(),
+                "DOCKER_CONTEXT".into(),
+                "KUBECONFIG".into(),
+                "SSL_CERT_FILE".into(),
+                "SSL_CERT_DIR".into(),
+                "HTTP_PROXY".into(),
+                "HTTPS_PROXY".into(),
+                "ALL_PROXY".into(),
+                "NO_PROXY".into(),
+                "http_proxy".into(),
+                "https_proxy".into(),
+                "all_proxy".into(),
+                "no_proxy".into(),
+            ],
+            inherit_env_prefixes: vec!["LC_".into(), "XDG_".into()],
         }
     }
 }
@@ -1819,6 +1892,13 @@ mod tests {
         assert_eq!(cfg.process.poll_tail_lines, 20);
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
+        assert_eq!(cfg.process.max_background_processes, 16);
+        assert_eq!(cfg.process.termination_grace_ms, 2_000);
+        assert_eq!(cfg.process.output_memory_bytes, 1024 * 1024);
+        assert_eq!(cfg.process.artifact_max_bytes, 100 * 1024 * 1024);
+        assert!(cfg.process.artifact_directory.is_none());
+        assert_eq!(cfg.process.default_timeout_secs, 0);
+        assert!(cfg.process.inherit_env.iter().any(|name| name == "PATH"));
         assert!(cfg.logging.enabled);
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.stderr_level, "warn");
@@ -1861,6 +1941,11 @@ mod tests {
         assert_eq!(cfg.process.exec_output_max_chars, 100_000);
         assert_eq!(cfg.process.exec_stream_chunk_bytes, 8_192);
         assert_eq!(cfg.process.poll_tail_lines, 20);
+        assert_eq!(cfg.process.max_background_processes, 16);
+        assert_eq!(cfg.process.termination_grace_ms, 2_000);
+        assert_eq!(cfg.process.output_memory_bytes, 1_048_576);
+        assert_eq!(cfg.process.artifact_max_bytes, 104_857_600);
+        assert_eq!(cfg.process.default_timeout_secs, 0);
         assert_eq!(cfg.tui.history_entries, 100);
         assert_eq!(cfg.tui.scrollback_entries, 2_000);
         assert_eq!(cfg.index.mode, IndexMode::Hybrid);

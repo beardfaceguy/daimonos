@@ -22,10 +22,10 @@ to retrieve the full registry with argument schemas.
 | 5 | glob | pattern, root? | {files[]} |
 | 6 | grep | pattern, path?, glob?, max? | {matches[{file,line,text}]} |
 | 7 | find | query, kind?, root? | {results[]} |
-| 8 | exec | cmd, args[], cwd?, env? | {exit, stdout, stderr} |
-| 9 | bg | cmd, args[], cwd? | {pid, output_path} |
+| 8 | exec | cmd, args[], cwd?, env? | {exit, out, err?} |
+| 9 | bg | cmd, args[], cwd?, env? | {pid, log} |
 | 10 | poll | pid | {running, exit?, tail?} |
-| 11 | kill | pid, signal? | {ok} |
+| 11 | kill | pid | {ok} |
 | 12 | snap | tag? | {id, timestamp} |
 | 13 | restore | id | {ok} |
 | 14 | diff | a, b | {hunks[]} |

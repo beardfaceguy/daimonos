@@ -1,7 +1,7 @@
+use crate::config::ProcessConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -88,6 +88,7 @@ pub trait ToolPlugin: Send + Sync {
 
     /// Run a single command. Plugins can override for custom execution.
     /// `args` carries tool-specific parameters (e.g. limit, mode, path filter).
+    #[cfg(test)]
     async fn run_command(
         &self,
         command: &str,
@@ -95,6 +96,28 @@ pub trait ToolPlugin: Send + Sync {
         env: &HashMap<String, String>,
         stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+    ) -> Result<ToolResult, String> {
+        self.run_command_with_config(
+            command,
+            cwd,
+            env,
+            stdin_data,
+            args,
+            &ProcessConfig::default(),
+        )
+        .await
+    }
+
+    /// Config-aware execution path used by the production registry. Direct
+    /// plugin calls in focused tests retain the compatibility wrapper above.
+    async fn run_command_with_config(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        stdin_data: Option<&[u8]>,
+        args: Option<&serde_json::Value>,
+        process_cfg: &ProcessConfig,
     ) -> Result<ToolResult, String> {
         let _ = args;
         let desc = self.descriptor();
@@ -104,42 +127,20 @@ pub trait ToolPlugin: Send + Sync {
             .ok_or_else(|| format!("unknown command '{}' for tool '{}'", command, desc.id))?;
 
         let mut proc = Command::new(&cmd_desc.bin);
-        proc.args(&cmd_desc.args)
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Explicit either way: never inherit our stdin. Under `daimonos acp`
-        // fd 0 is the JSON-RPC pipe from the client, and an inheriting child can
-        // both steal protocol bytes and leave O_NONBLOCK set on the shared open
-        // file description.
-        if stdin_data.is_some() {
-            proc.stdin(Stdio::piped());
-        } else {
-            proc.stdin(Stdio::null());
-        }
-
-        for (k, v) in env {
-            proc.env(k, v);
-        }
-
-        let mut child = proc.spawn().map_err(|e| format!("spawn: {e}"))?;
-
-        if let Some(data) = stdin_data {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(data).await;
-                drop(stdin);
-            }
-        }
-
-        let output = child
-            .wait_with_output()
+        proc.args(&cmd_desc.args).current_dir(cwd);
+        crate::managed_process::apply_environment(&mut proc, process_cfg, env);
+        let output = crate::managed_process::capture(&mut proc, process_cfg, None, stdin_data)
             .await
-            .map_err(|e| format!("wait: {e}"))?;
+            .map_err(|e| format!("run: {e}"))?;
+        if output.timed_out {
+            return Err(format!(
+                "timeout after {} seconds",
+                process_cfg.default_timeout_secs
+            ));
+        }
         let exit_code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = output.stdout;
+        let stderr = output.stderr;
 
         let parsed = if cmd_desc.output == "json" {
             serde_json::from_str(&stdout)
@@ -226,12 +227,19 @@ pub enum QuickFix {
 /// Registry of all registered tool plugins.
 pub struct ToolRegistry {
     plugins: Arc<RwLock<HashMap<String, Arc<dyn ToolPlugin>>>>,
+    process_cfg: Arc<ProcessConfig>,
 }
 
 impl ToolRegistry {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_process_config(ProcessConfig::default())
+    }
+
+    pub fn with_process_config(process_cfg: ProcessConfig) -> Self {
         Self {
             plugins: Arc::new(RwLock::new(HashMap::new())),
+            process_cfg: Arc::new(process_cfg),
         }
     }
 
@@ -268,7 +276,7 @@ impl ToolRegistry {
             .await
             .ok_or_else(|| format!("unknown tool: {tool_id}"))?;
         plugin
-            .run_command(command, cwd, env, stdin_data, args)
+            .run_command_with_config(command, cwd, env, stdin_data, args, &self.process_cfg)
             .await
     }
 
@@ -293,7 +301,9 @@ impl ToolRegistry {
         let mut total_fixes: u32 = 0;
 
         for i in 0..max_iterations {
-            let lint_result = plugin.run_command("lint", cwd, env, None, None).await?;
+            let lint_result = plugin
+                .run_command_with_config("lint", cwd, env, None, None, &self.process_cfg)
+                .await?;
             let fixes = plugin.extract_quickfixes(&lint_result.output);
 
             if fixes.is_empty() || lint_result.exit_code == 0 {
@@ -370,7 +380,9 @@ impl ToolRegistry {
                     stderr: String::new(),
                 }
             } else {
-                plugin.run_command(stage_name, cwd, env, None, None).await?
+                plugin
+                    .run_command_with_config(stage_name, cwd, env, None, None, &self.process_cfg)
+                    .await?
             };
 
             let failed = result.exit_code != 0;
@@ -670,13 +682,14 @@ mod tests {
             &self.descriptor
         }
 
-        async fn run_command(
+        async fn run_command_with_config(
             &self,
             command: &str,
             _cwd: &Path,
             _env: &HashMap<String, String>,
             _stdin_data: Option<&[u8]>,
             _args: Option<&serde_json::Value>,
+            _process_cfg: &ProcessConfig,
         ) -> Result<ToolResult, String> {
             if command != "lint" {
                 return Err(format!("mock: unknown command {command}"));
