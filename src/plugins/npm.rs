@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::{json, Value};
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
+use serde_json::{json, Value};
 
 pub fn is_available() -> bool {
     std::process::Command::new("npm")
@@ -55,20 +53,26 @@ impl ToolPlugin for NpmPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = NpmRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let output = match command {
-            "install" => npm_install(cwd, args).await?,
-            "run" => npm_run(cwd, args).await?,
-            "test" => npm_test(cwd, args).await?,
-            "build" => npm_build(cwd, args).await?,
-            "audit" => npm_audit(cwd, args).await?,
+            "install" => npm_install(&runner, args).await?,
+            "run" => npm_run(&runner, args).await?,
+            "test" => npm_test(&runner, args).await?,
+            "build" => npm_build(&runner, args).await?,
+            "audit" => npm_audit(&runner, args).await?,
             _ => return Err(format!("unknown npm command: {command}")),
         };
         Ok(ToolResult {
@@ -81,34 +85,35 @@ impl ToolPlugin for NpmPlugin {
     }
 }
 
-const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+struct NpmRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
+}
 
-fn truncate(s: String) -> String {
-    if s.len() > MAX_OUTPUT_BYTES {
-        // Floor to a char boundary: a raw byte cut mid-UTF-8 char panics.
-        let end = crate::plugins::floor_char_boundary(&s, MAX_OUTPUT_BYTES);
-        format!("{}...[{} bytes truncated]", &s[..end], s.len() - end)
-    } else {
-        s
+impl NpmRun<'_> {
+    async fn run(&self, npm_args: &[&str]) -> Result<(i32, String, String), String> {
+        let args: Vec<String> = npm_args.iter().map(|arg| (*arg).to_string()).collect();
+        let output =
+            crate::managed_process::run("npm", &args, self.cwd, self.env, self.process_cfg, None)
+                .await
+                .map_err(|e| format!("npm exec: {e}"))?;
+        if output.timed_out {
+            return Err(format!(
+                "npm timed out after {} seconds",
+                self.process_cfg.default_timeout_secs
+            ));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err("npm output exceeded process.output_memory_bytes".into());
+        }
+        let exit = output.status.code().unwrap_or(-1);
+        Ok((exit, output.stdout, output.stderr))
     }
 }
 
-async fn run_npm(cwd: &Path, npm_args: &[&str]) -> Result<(i32, String, String), String> {
-    let output = Command::new("npm")
-        .args(npm_args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("npm exec: {e}"))?;
-
-    let stdout = truncate(String::from_utf8_lossy(&output.stdout).into_owned());
-    let stderr = truncate(String::from_utf8_lossy(&output.stderr).into_owned());
-    let exit = output.status.code().unwrap_or(-1);
-    Ok((exit, stdout, stderr))
-}
-
-async fn npm_install(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
-    let (exit, stdout, stderr) = run_npm(cwd, &["install", "--no-fund", "--no-audit"]).await?;
+async fn npm_install(runner: &NpmRun<'_>, _args: Option<&Value>) -> Result<Value, String> {
+    let (exit, stdout, stderr) = runner.run(&["install", "--no-fund", "--no-audit"]).await?;
     Ok(json!({
         "exit": exit,
         "ok": exit == 0,
@@ -117,13 +122,13 @@ async fn npm_install(cwd: &Path, _args: Option<&Value>) -> Result<Value, String>
     }))
 }
 
-async fn npm_run(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
+async fn npm_run(runner: &NpmRun<'_>, args: Option<&Value>) -> Result<Value, String> {
     let script = args
         .and_then(|v| v.get("script"))
         .and_then(|v| v.as_str())
         .ok_or("npm run: 'script' is required")?;
 
-    let (exit, stdout, stderr) = run_npm(cwd, &["run", script]).await?;
+    let (exit, stdout, stderr) = runner.run(&["run", script]).await?;
     Ok(json!({
         "exit": exit,
         "ok": exit == 0,
@@ -133,8 +138,8 @@ async fn npm_run(cwd: &Path, args: Option<&Value>) -> Result<Value, String> {
     }))
 }
 
-async fn npm_test(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
-    let (exit, stdout, stderr) = run_npm(cwd, &["test", "--", "--passWithNoTests"]).await?;
+async fn npm_test(runner: &NpmRun<'_>, _args: Option<&Value>) -> Result<Value, String> {
+    let (exit, stdout, stderr) = runner.run(&["test", "--", "--passWithNoTests"]).await?;
     Ok(json!({
         "exit": exit,
         "ok": exit == 0,
@@ -143,8 +148,8 @@ async fn npm_test(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
     }))
 }
 
-async fn npm_build(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
-    let (exit, stdout, stderr) = run_npm(cwd, &["run", "build"]).await?;
+async fn npm_build(runner: &NpmRun<'_>, _args: Option<&Value>) -> Result<Value, String> {
+    let (exit, stdout, stderr) = runner.run(&["run", "build"]).await?;
     Ok(json!({
         "exit": exit,
         "ok": exit == 0,
@@ -153,23 +158,15 @@ async fn npm_build(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
     }))
 }
 
-async fn npm_audit(cwd: &Path, _args: Option<&Value>) -> Result<Value, String> {
-    let output = Command::new("npm")
-        .args(["audit", "--json"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("npm exec: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let exit = output.status.code().unwrap_or(-1);
+async fn npm_audit(runner: &NpmRun<'_>, _args: Option<&Value>) -> Result<Value, String> {
+    let (exit, stdout, stderr) = runner.run(&["audit", "--json"]).await?;
 
     // npm audit exits non-zero when vulnerabilities are found — that's expected.
     // Fatal errors (no package.json, network failure) produce non-JSON output.
     match serde_json::from_str::<Value>(&stdout) {
         Ok(parsed) => Ok(compact_audit(parsed)),
         Err(_) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = stderr.trim().to_string();
             Ok(json!({
                 "error": if stderr.is_empty() { "npm audit produced no JSON output" } else { &stderr },
                 "exit": exit,
@@ -225,20 +222,6 @@ fn compact_audit(full: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_does_not_panic_on_multibyte_char_at_cap() {
-        // A 3-byte '€' straddles MAX_OUTPUT_BYTES; a raw byte slice would panic.
-        let mut s = "a".repeat(MAX_OUTPUT_BYTES - 1);
-        s.push('€');
-        s.push_str("tail");
-        let out = truncate(s);
-        assert!(out.contains("bytes truncated]"));
-        assert!(
-            !out.contains('€'),
-            "the straddling char must be dropped, not split"
-        );
-    }
 
     #[test]
     fn npm_is_available() {

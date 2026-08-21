@@ -85,6 +85,33 @@ script_llm_enabled = false
 max_script_subcalls = 32
 # Max prompts a single llm_query_batched call may take.
 max_script_subcall_batch = 16
+# Maximum background processes owned by one session. Running and stopping
+# processes both count until teardown has fully settled.
+max_background_processes = 16
+# Grace period between SIGTERM and SIGKILL for managed processes.
+termination_grace_ms = 2_000
+# Maximum bytes retained in memory for each stdout/stderr stream while running.
+# Overflow retains a head/tail preview and continues draining the child.
+output_memory_bytes = 1_048_576
+# Maximum bytes retained in a background process's private output artifact.
+artifact_max_bytes = 104_857_600
+# Private process-artifact directory. Defaults to ~/.daimonos/process-output.
+# artifact_directory = "/path/to/private/process-output"
+# Default foreground/plugin process timeout in seconds. 0 disables it.
+default_timeout_secs = 0
+# Ambient parent variables managed children may inherit before session and
+# per-call overrides are applied. Provider/MCP credentials are deliberately
+# absent; add an exact name only when a child genuinely requires it.
+inherit_env = [
+  "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "TEMP", "TMP",
+  "TERM", "COLORTERM", "LANG", "LANGUAGE", "TZ", "SSH_AUTH_SOCK",
+  "GPG_AGENT_INFO", "CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER",
+  "VIRTUAL_ENV", "PYENV_ROOT", "NVM_DIR", "DOCKER_HOST", "DOCKER_CONTEXT",
+  "KUBECONFIG", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY",
+  "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+  "all_proxy", "no_proxy",
+]
+inherit_env_prefixes = ["LC_", "XDG_"]
 
 [session]
 # Optional local session-daemon socket override. By default the path is derived

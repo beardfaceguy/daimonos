@@ -20,6 +20,7 @@ mod index;
 mod kgl;
 mod logging;
 mod loop_detector;
+mod managed_process;
 mod mcp;
 mod mcp_bridge;
 mod observability;
@@ -572,5 +573,6 @@ async fn handle_connection(
         writer.flush().await?;
     }
 
+    session.shutdown_processes().await;
     Ok(())
 }

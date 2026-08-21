@@ -1,13 +1,12 @@
 use crate::ops::{exec_filter, ExecProgress, ExecProgressCallback};
 use crate::protocol::{Op, Response};
-use crate::session::{BgProcess, Session};
+use crate::session::Session;
 use crate::tool_runner::ToolRegistry;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 /// Merge per-call env vars (`op.kv`) on top of the session env, so callers
@@ -454,40 +453,58 @@ pub async fn exec_with_progress(
     }
 
     let mut command = build_command(&cmd, &args);
-    command
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    for (k, v) in &env {
-        command.env(k, v);
-    }
-
-    let (stdout_bytes, stderr_bytes, status) = if let Some(on_progress) = on_progress {
-        match run_streaming_command(
-            &mut command,
-            session.cfg.process.exec_stream_chunk_bytes,
-            on_progress,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(e) => return Response::err(5, &format!("exec: {e}")),
+    command.current_dir(&cwd);
+    crate::managed_process::apply_environment(&mut command, &session.cfg.process, &env);
+    let progress = on_progress.map(|callback| {
+        move |text: String| {
+            callback(ExecProgress::Output(text));
         }
-    } else {
-        let output = match command.output().await {
-            Ok(output) => output,
-            Err(e) => return Response::err(5, &format!("exec: {e}")),
-        };
-        (output.stdout, output.stderr, output.status)
+    });
+    let output = match crate::managed_process::capture(
+        &mut command,
+        &session.cfg.process,
+        progress
+            .as_ref()
+            .map(|callback| callback as &crate::managed_process::ProgressCallback<'_>),
+        None,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(callback) = on_progress {
+                callback(ExecProgress::Exit {
+                    code: None,
+                    signal: Some("exec_error".to_string()),
+                });
+            }
+            return Response::err(5, &format!("exec: {error}"));
+        }
     };
-
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
-    let exit = status.code().unwrap_or(-1);
+    if let Some(callback) = on_progress {
+        callback(ExecProgress::Exit {
+            code: output.status.code(),
+            signal: exit_signal(&output.status),
+        });
+    }
+    if output.timed_out {
+        return Response::err(
+            6,
+            &format!(
+                "exec timed out after {} seconds",
+                session.cfg.process.default_timeout_secs
+            ),
+        );
+    }
+    let stdout = output.stdout;
+    let stderr = output.stderr;
+    let exit = output.status.code().unwrap_or(-1);
     let max = session.cfg.process.exec_output_max_chars;
 
-    if session.cfg.process.exec_output_filters {
+    if session.cfg.process.exec_output_filters
+        && !output.stdout_truncated
+        && !output.stderr_truncated
+    {
         if let Some(filtered) = exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit) {
             let raw_chars = stdout.len() + stderr.len();
             let mut resp = json!({
@@ -514,114 +531,6 @@ pub async fn exec_with_progress(
     Response::ok(resp)
 }
 
-async fn run_streaming_command(
-    command: &mut Command,
-    chunk_bytes: usize,
-    on_progress: &ExecProgressCallback<'_>,
-) -> std::io::Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            on_progress(ExecProgress::Exit {
-                code: None,
-                signal: Some("spawn_error".to_string()),
-            });
-            return Err(error);
-        }
-    };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("spawned exec has no stdout pipe"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| std::io::Error::other("spawned exec has no stderr pipe"))?;
-
-    let (stdout, stderr, status) = tokio::join!(
-        read_stream(stdout, chunk_bytes, on_progress),
-        read_stream(stderr, chunk_bytes, on_progress),
-        child.wait()
-    );
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => {
-            on_progress(ExecProgress::Exit {
-                code: None,
-                signal: Some("wait_error".to_string()),
-            });
-            return Err(error);
-        }
-    };
-    on_progress(ExecProgress::Exit {
-        code: status.code(),
-        signal: exit_signal(&status),
-    });
-    Ok((stdout?, stderr?, status))
-}
-
-async fn read_stream<R: AsyncRead + Unpin>(
-    mut reader: R,
-    chunk_bytes: usize,
-    on_progress: &ExecProgressCallback<'_>,
-) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut pending_utf8 = Vec::new();
-    let mut chunk = vec![0; chunk_bytes];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            let text = decode_stream_utf8(&mut pending_utf8, true);
-            if !text.is_empty() {
-                on_progress(ExecProgress::Output(text));
-            }
-            return Ok(output);
-        }
-        output.extend_from_slice(&chunk[..read]);
-        pending_utf8.extend_from_slice(&chunk[..read]);
-        let text = decode_stream_utf8(&mut pending_utf8, false);
-        if !text.is_empty() {
-            on_progress(ExecProgress::Output(text));
-        }
-    }
-}
-
-fn decode_stream_utf8(pending: &mut Vec<u8>, eof: bool) -> String {
-    let mut rendered = String::new();
-    let mut consumed = 0;
-    while consumed < pending.len() {
-        match std::str::from_utf8(&pending[consumed..]) {
-            Ok(text) => {
-                rendered.push_str(text);
-                consumed = pending.len();
-            }
-            Err(error) => {
-                let valid = error.valid_up_to();
-                rendered.push_str(
-                    std::str::from_utf8(&pending[consumed..consumed + valid])
-                        .expect("valid_up_to always identifies valid UTF-8"),
-                );
-                consumed += valid;
-                match error.error_len() {
-                    Some(invalid_bytes) => {
-                        rendered.push('\u{FFFD}');
-                        consumed += invalid_bytes;
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-    if consumed > 0 {
-        pending.drain(..consumed);
-    }
-    if eof && !pending.is_empty() {
-        rendered.push_str(&String::from_utf8_lossy(pending));
-        pending.clear();
-    }
-    rendered
-}
-
 #[cfg(unix)]
 fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
@@ -646,42 +555,31 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
         None => session.cwd.clone(),
     };
 
+    if session.bg_processes.len() >= session.cfg.process.max_background_processes {
+        return Response::err(
+            5,
+            &format!(
+                "background process limit reached ({})",
+                session.cfg.process.max_background_processes
+            ),
+        );
+    }
     let pid = session.alloc_pid();
-    let output_path = std::env::temp_dir().join(format!("daimonos_bg_{pid}.log"));
-
-    let out_file = match std::fs::File::create(&output_path) {
-        Ok(f) => f,
-        Err(e) => return Response::err(4, &format!("create log: {e}")),
-    };
-
-    let err_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => return Response::err(4, &format!("clone log: {e}")),
-    };
 
     let mut command = build_command(&cmd, &args);
-    command
-        .current_dir(&cwd)
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file));
-
+    command.current_dir(&cwd);
     let env = merge_env(&session.env, op.kv.as_ref());
-    for (k, v) in &env {
-        command.env(k, v);
-    }
-
-    let child = match command.spawn() {
-        Ok(c) => c,
+    crate::managed_process::apply_environment(&mut command, &session.cfg.process, &env);
+    let process = match crate::managed_process::ManagedBackground::spawn(
+        &mut command,
+        &session.cfg.process,
+        &format!("bg-{pid}"),
+    ) {
+        Ok(process) => process,
         Err(e) => return Response::err(5, &format!("spawn: {e}")),
     };
-
-    session.bg_processes.insert(
-        pid,
-        BgProcess {
-            child,
-            output_path: output_path.clone(),
-        },
-    );
+    let output_path = process.output_path.clone();
+    session.bg_processes.insert(pid, process);
 
     Response::ok(json!({
         "pid": pid,
@@ -691,64 +589,79 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
 
 pub async fn poll(session: &mut Session, op: &Op) -> Response {
     let pid = match op.n {
-        Some(p) => p as u32,
+        Some(p) if p > 0 && p <= u32::MAX as i64 => p as u32,
+        Some(_) => return Response::err(3, "poll pid must be a positive u32"),
         None => return Response::err(3, "poll requires pid in 'n'"),
     };
 
-    let proc = match session.bg_processes.get_mut(&pid) {
-        Some(p) => p,
+    let process = match session.bg_processes.get_mut(&pid) {
+        Some(process) => process,
         None => return Response::err(7, &format!("no process with pid {pid}")),
     };
 
-    let status = proc.child.try_wait();
-    let output_path = proc.output_path.clone();
+    let status = process.try_wait();
+    let output_path = process.output_path.clone();
     let tail_n = session.cfg.process.poll_tail_lines;
-
-    let tail = tokio::fs::read_to_string(&output_path).await.ok().map(|s| {
-        let lines: Vec<&str> = s.lines().collect();
-        let start = if lines.len() > tail_n {
-            lines.len() - tail_n
-        } else {
-            0
-        };
-        lines[start..].join("\n")
-    });
 
     match status {
         Ok(Some(exit)) => {
             let code = exit.code().unwrap_or(-1);
-            session.bg_processes.remove(&pid);
-            let _ = std::fs::remove_file(&output_path);
+            if let Some(mut process) = session.bg_processes.remove(&pid) {
+                let _ = process.settle_output().await;
+                let tail = crate::managed_process::tail_lines(
+                    &output_path,
+                    tail_n,
+                    session.cfg.process.output_memory_bytes,
+                )
+                .await
+                .ok();
+                process.cleanup_artifact();
+                return Response::ok(json!({
+                    "running": false,
+                    "exit": code,
+                    "tail": tail,
+                }));
+            }
             Response::ok(json!({
                 "running": false,
                 "exit": code,
+                "tail": serde_json::Value::Null,
+            }))
+        }
+        Ok(None) => {
+            let tail = crate::managed_process::tail_lines(
+                &output_path,
+                tail_n,
+                session.cfg.process.output_memory_bytes,
+            )
+            .await
+            .ok();
+            Response::ok(json!({
+                "running": true,
                 "tail": tail,
             }))
         }
-        Ok(None) => Response::ok(json!({
-            "running": true,
-            "tail": tail,
-        })),
         Err(e) => Response::err(4, &format!("poll: {e}")),
     }
 }
 
 pub async fn kill(session: &mut Session, op: &Op) -> Response {
     let pid = match op.n {
-        Some(p) => p as u32,
+        Some(p) if p > 0 && p <= u32::MAX as i64 => p as u32,
+        Some(_) => return Response::err(3, "kill pid must be a positive u32"),
         None => return Response::err(3, "kill requires pid in 'n'"),
     };
 
-    let proc = match session.bg_processes.get_mut(&pid) {
-        Some(p) => p,
+    let process = match session.bg_processes.remove(&pid) {
+        Some(process) => process,
         None => return Response::err(7, &format!("no process with pid {pid}")),
     };
 
-    let output_path = proc.output_path.clone();
-    match proc.child.kill().await {
-        Ok(()) => {
-            session.bg_processes.remove(&pid);
-            let _ = std::fs::remove_file(&output_path);
+    let output_path = process.output_path.clone();
+    let grace = std::time::Duration::from_millis(session.cfg.process.termination_grace_ms);
+    match process.terminate(grace).await {
+        Ok(_) => {
+            crate::managed_process::remove_artifact(&output_path);
             Response::ok(json!({"ok": true}))
         }
         Err(e) => Response::err(4, &format!("kill: {e}")),
@@ -944,16 +857,6 @@ mod tests {
             events.last(),
             Some(ExecProgress::Exit { code: Some(7), .. })
         ));
-    }
-
-    #[test]
-    fn streaming_utf8_decoder_preserves_codepoints_split_across_reads() {
-        let euro = "€".as_bytes();
-        let mut pending = euro[..1].to_vec();
-        assert_eq!(decode_stream_utf8(&mut pending, false), "");
-        pending.extend_from_slice(&euro[1..]);
-        assert_eq!(decode_stream_utf8(&mut pending, false), "€");
-        assert!(pending.is_empty());
     }
 
     #[tokio::test]
@@ -1393,7 +1296,8 @@ mod tests {
         .await;
         assert!(bg_resp.ok);
         let pid = bg_resp.d.as_ref().unwrap()["pid"].as_u64().unwrap() as i64;
-        let log_path = std::env::temp_dir().join(format!("daimonos_bg_{}.log", pid));
+        let log_path =
+            std::path::PathBuf::from(bg_resp.d.as_ref().unwrap()["log"].as_str().unwrap());
         assert!(log_path.exists(), "log file should exist after bg spawn");
 
         // Poll in a loop until the process is observed completed (or the loop
@@ -1474,6 +1378,217 @@ mod tests {
             "all 10 completed processes should be cleaned up, but {} remain",
             s.bg_processes.len()
         );
+    }
+
+    #[tokio::test]
+    async fn bg_admission_counts_live_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.process.max_background_processes = 1;
+        cfg.process.artifact_directory = Some(dir.path().join("logs").display().to_string());
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        let first = bg(
+            &mut session,
+            &Op {
+                c: 9,
+                s: Some("sleep 30".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(first.ok);
+        let second = bg(
+            &mut session,
+            &Op {
+                c: 9,
+                s: Some("sleep 30".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(!second.ok);
+        assert!(second.m.unwrap().contains("limit reached"));
+        let pid = first.d.unwrap()["pid"].as_i64().unwrap();
+        assert!(
+            kill(
+                &mut session,
+                &Op {
+                    c: 11,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await
+            .ok
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_kill_reject_invalid_synthetic_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session_in(dir.path());
+        for id in [-1, 0, i64::from(u32::MAX) + 1] {
+            assert!(
+                !poll(
+                    &mut session,
+                    &Op {
+                        c: 10,
+                        n: Some(id),
+                        ..Op::default()
+                    },
+                )
+                .await
+                .ok
+            );
+            assert!(
+                !kill(
+                    &mut session,
+                    &Op {
+                        c: 11,
+                        n: Some(id),
+                        ..Op::default()
+                    },
+                )
+                .await
+                .ok
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn background_artifact_is_bounded_while_child_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.process.artifact_directory = Some(dir.path().join("logs").display().to_string());
+        cfg.process.artifact_max_bytes = 32;
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        let response = bg(
+            &mut session,
+            &Op {
+                c: 9,
+                s: Some(
+                    "python3 -c 'print(\"x\" * 4096, flush=True); import time; time.sleep(30)'"
+                        .into(),
+                ),
+                ..Op::default()
+            },
+        )
+        .await;
+        assert!(response.ok);
+        let pid = response.d.as_ref().unwrap()["pid"].as_i64().unwrap();
+        let path = std::path::PathBuf::from(response.d.as_ref().unwrap()["log"].as_str().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(len <= 32, "artifact exceeded configured bound: {len}");
+            if len == 32 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            kill(
+                &mut session,
+                &Op {
+                    c: 11,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await
+            .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_shutdown_retires_background_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.process.artifact_directory = Some(dir.path().join("logs").display().to_string());
+        cfg.process.termination_grace_ms = 20;
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        let pid_file = dir.path().join("child.pid");
+        let command = format!(
+            "sh -c 'sleep 30 & echo $! > \"{}\"; wait'",
+            pid_file.display()
+        );
+        assert!(
+            bg(
+                &mut session,
+                &Op {
+                    c: 9,
+                    s: Some(command),
+                    ..Op::default()
+                },
+            )
+            .await
+            .ok
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pid_file.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let child_pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        session.shutdown_processes().await;
+        assert!(session.bg_processes.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 probes existence without changing process state.
+            let rc = unsafe { libc::kill(child_pid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background descendant {child_pid} was not reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_poll_waits_for_final_output_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.process.artifact_directory = Some(dir.path().join("logs").display().to_string());
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        let response = bg(
+            &mut session,
+            &Op {
+                c: 9,
+                s: Some("printf start; sleep 0.05; printf end".into()),
+                ..Op::default()
+            },
+        )
+        .await;
+        let pid = response.d.unwrap()["pid"].as_i64().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let response = poll(
+                &mut session,
+                &Op {
+                    c: 10,
+                    n: Some(pid),
+                    ..Op::default()
+                },
+            )
+            .await;
+            assert!(response.ok);
+            let data = response.d.unwrap();
+            if data["running"] == false {
+                assert_eq!(data["tail"], "startend");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]

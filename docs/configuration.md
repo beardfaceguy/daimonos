@@ -205,6 +205,19 @@ default_find_max = 20
 | `exec_output_max_chars` | `100000` (100 KB) | Max characters of exec stdout/stderr before auto-truncation |
 | `exec_stream_chunk_bytes` | `8192` (8 KB) | Read size for live foreground-exec updates sent to ACP clients |
 | `extra_path` | *(none)* | Additional directories to prepend to `PATH` for exec/bg commands |
+| `max_background_processes` | `16` | Maximum running or stopping background processes owned by one session |
+| `termination_grace_ms` | `2000` | Grace between TERM and KILL for an owned process group |
+| `output_memory_bytes` | `1048576` (1 MiB) | Maximum bytes retained in memory per stdout/stderr stream while reading |
+| `artifact_max_bytes` | `104857600` (100 MiB) | Maximum bytes retained in one private background-output artifact |
+| `artifact_directory` | `~/.daimonos/process-output` | Optional private process-artifact directory override |
+| `default_timeout_secs` | `0` | Foreground/plugin deadline; `0` disables it |
+| `inherit_env` | *(reviewed list)* | Exact ambient parent variables inherited before session/per-call overrides |
+| `inherit_env_prefixes` | `LC_`, `XDG_` | Ambient parent prefixes inherited by managed children |
+
+Managed execution bounds output while it is read, owns Unix process groups,
+and retires them with TERM followed by KILL after the configured grace.
+Background output uses random exclusive `0600` files under a `0700` directory;
+the returned `log` field is the supported way to discover the path.
 
 Auto-truncation keeps the first and last lines of output with a
 `[N lines, M chars truncated]` notice in the middle. This prevents large build

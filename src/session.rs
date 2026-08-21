@@ -80,10 +80,7 @@ pub struct Session {
     pub verbosity: crate::verbosity::Verbosity,
 }
 
-pub struct BgProcess {
-    pub child: tokio::process::Child,
-    pub output_path: PathBuf,
-}
+pub type BgProcess = crate::managed_process::ManagedBackground;
 
 impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
@@ -170,6 +167,24 @@ impl Session {
         // `Ordering::Relaxed` is sufficient — we don't need a memory
         // fence, just a unique monotonic value.
         NEXT_BG_PID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Retire every background process owned by this session. Callers should
+    /// await this at orderly teardown; `ManagedBackground::drop` remains a
+    /// best-effort emergency path for abrupt owner loss.
+    pub async fn shutdown_processes(&mut self) {
+        let grace = std::time::Duration::from_millis(self.cfg.process.termination_grace_ms);
+        let processes: Vec<_> = self
+            .bg_processes
+            .drain()
+            .map(|(_, process)| process)
+            .collect();
+        futures_util::future::join_all(
+            processes
+                .into_iter()
+                .map(|process| async move { process.terminate(grace).await }),
+        )
+        .await;
     }
 
     /// Hash file content using a fast non-cryptographic hash.

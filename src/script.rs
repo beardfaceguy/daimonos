@@ -1842,13 +1842,14 @@ result = True
             &self.descriptor
         }
 
-        async fn run_command(
+        async fn run_command_with_config(
             &self,
             command: &str,
             _cwd: &Path,
             _env: &HashMap<String, String>,
             _stdin_data: Option<&[u8]>,
             _args: Option<&serde_json::Value>,
+            _process_cfg: &crate::config::ProcessConfig,
         ) -> Result<ToolResult, String> {
             Ok(ToolResult {
                 tool: self.descriptor.id.clone(),

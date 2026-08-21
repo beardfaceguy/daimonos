@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::json;
-use tokio::process::Command;
-
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
+use serde_json::json;
 
 pub struct CargoPlugin {
     descriptor: ToolDescriptor,
@@ -44,21 +42,27 @@ impl ToolPlugin for CargoPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = CargoRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let output = match command {
-            "test" => cargo_test(cwd, args).await?,
-            "build" => cargo_diagnostics(cwd, "build", args).await?,
-            "check" => cargo_diagnostics(cwd, "check", args).await?,
-            "clippy" => cargo_diagnostics(cwd, "clippy", args).await?,
-            "fmt" => cargo_fmt(cwd, args).await?,
-            "add" => cargo_add(cwd, args).await?,
+            "test" => cargo_test(&runner, args).await?,
+            "build" => cargo_diagnostics(&runner, "build", args).await?,
+            "check" => cargo_diagnostics(&runner, "check", args).await?,
+            "clippy" => cargo_diagnostics(&runner, "clippy", args).await?,
+            "fmt" => cargo_fmt(&runner, args).await?,
+            "add" => cargo_add(&runner, args).await?,
             _ => return Err(format!("unknown cargo command: {command}")),
         };
 
@@ -72,18 +76,30 @@ impl ToolPlugin for CargoPlugin {
     }
 }
 
-/// Run cargo with given args, returning (stdout, stderr, success).
-async fn run_cargo(cwd: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
-    let output = Command::new("cargo")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("cargo exec: {e}"))?;
+struct CargoRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((stdout, stderr, output.status.success()))
+impl CargoRun<'_> {
+    async fn run(&self, args: &[&str]) -> Result<(String, String, bool), String> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let output =
+            crate::managed_process::run("cargo", &args, self.cwd, self.env, self.process_cfg, None)
+                .await
+                .map_err(|e| format!("cargo exec: {e}"))?;
+        if output.timed_out {
+            return Err(format!(
+                "cargo timed out after {} seconds",
+                self.process_cfg.default_timeout_secs
+            ));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err("cargo output exceeded process.output_memory_bytes".into());
+        }
+        Ok((output.stdout, output.stderr, output.status.success()))
+    }
 }
 
 fn append_package_arg<'a>(cargo_args: &mut Vec<&'a str>, pkg: &'a str) {
@@ -93,7 +109,7 @@ fn append_package_arg<'a>(cargo_args: &mut Vec<&'a str>, pkg: &'a str) {
 
 /// Run `cargo test`, parse output into structured results.
 async fn cargo_test(
-    cwd: &Path,
+    runner: &CargoRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let mut cargo_args = vec!["test"];
@@ -123,7 +139,7 @@ async fn cargo_test(
         cargo_args.push(f);
     }
 
-    let (stdout, stderr, success) = run_cargo(cwd, &cargo_args).await?;
+    let (stdout, stderr, success) = runner.run(&cargo_args).await?;
     let combined = format!("{stderr}{stdout}");
 
     let mut passed: i64 = 0;
@@ -262,7 +278,7 @@ fn parse_cargo_json(stdout: &str) -> CargoParse {
 
 /// Run `cargo build/check/clippy` with `--message-format=json` and parse compiler diagnostics.
 async fn cargo_diagnostics(
-    cwd: &Path,
+    runner: &CargoRun<'_>,
     subcommand: &str,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
@@ -284,7 +300,7 @@ async fn cargo_diagnostics(
         cargo_args.push("--release");
     }
 
-    let (stdout, _stderr, success) = run_cargo(cwd, &cargo_args).await?;
+    let (stdout, _stderr, success) = runner.run(&cargo_args).await?;
     let parsed = parse_cargo_json(&stdout);
 
     // `rebuilt` distinguishes a real recompile from a cargo no-op: `ok:true`
@@ -334,7 +350,7 @@ fn extract_span_location(message: &serde_json::Value) -> (Option<String>, Option
 
 /// Run `cargo fmt --check`, report whether formatting is needed.
 async fn cargo_fmt(
-    cwd: &Path,
+    runner: &CargoRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let mut cargo_args = vec!["fmt", "--check"];
@@ -347,7 +363,7 @@ async fn cargo_fmt(
         append_package_arg(&mut cargo_args, p);
     }
 
-    let (_stdout, stderr, success) = run_cargo(cwd, &cargo_args).await?;
+    let (_stdout, stderr, success) = runner.run(&cargo_args).await?;
 
     let mut unformatted: Vec<String> = Vec::new();
     for line in stderr.lines() {
@@ -366,7 +382,7 @@ async fn cargo_fmt(
 
 /// Run `cargo add <package>`, return success/failure.
 async fn cargo_add(
-    cwd: &Path,
+    runner: &CargoRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let package = args
@@ -384,7 +400,7 @@ async fn cargo_add(
         cargo_args.push("--dev");
     }
 
-    let (_stdout, stderr, success) = run_cargo(cwd, &cargo_args).await?;
+    let (_stdout, stderr, success) = runner.run(&cargo_args).await?;
 
     if !success {
         return Err(format!("cargo add: {}", stderr.trim()));
@@ -542,6 +558,31 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown cargo command"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_cargo_rejects_managed_capture_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("cargo");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n/usr/bin/python3 -c 'print(\"x\" * 1000)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), dir.path().display().to_string());
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let error = CargoPlugin::new()
+            .run_command_with_config("check", dir.path(), &env, None, None, &cfg)
+            .await
+            .unwrap_err();
+        assert!(error.contains("output exceeded"));
     }
 
     #[tokio::test]

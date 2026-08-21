@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::json;
-use tokio::process::Command;
 
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
 
@@ -60,30 +59,36 @@ impl ToolPlugin for GhPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = GhRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let output = match command {
-            "pr_view" => gh_pr_view(cwd, args).await?,
-            "pr_list" => gh_pr_list(cwd, args).await?,
-            "pr_create" => gh_pr_create(cwd, args).await?,
-            "pr_diff" => gh_pr_diff(cwd, args).await?,
-            "pr_checks" => gh_pr_checks(cwd, args).await?,
-            "pr_merge" => gh_pr_merge(cwd, args).await?,
-            "pr_checkout" => gh_pr_checkout(cwd, args).await?,
-            "run_list" => gh_run_list(cwd, args).await?,
-            "run_view" => gh_run_view(cwd, args).await?,
-            "issue_list" => gh_issue_list(cwd, args).await?,
-            "issue_view" => gh_issue_view(cwd, args).await?,
-            "issue_create" => gh_issue_create(cwd, args).await?,
-            "issue_comment" => gh_issue_comment(cwd, args).await?,
-            "api" => gh_api(cwd, args).await?,
-            "raw" => gh_raw(cwd, args).await?,
+            "pr_view" => gh_pr_view(&runner, args).await?,
+            "pr_list" => gh_pr_list(&runner, args).await?,
+            "pr_create" => gh_pr_create(&runner, args).await?,
+            "pr_diff" => gh_pr_diff(&runner, args).await?,
+            "pr_checks" => gh_pr_checks(&runner, args).await?,
+            "pr_merge" => gh_pr_merge(&runner, args).await?,
+            "pr_checkout" => gh_pr_checkout(&runner, args).await?,
+            "run_list" => gh_run_list(&runner, args).await?,
+            "run_view" => gh_run_view(&runner, args).await?,
+            "issue_list" => gh_issue_list(&runner, args).await?,
+            "issue_view" => gh_issue_view(&runner, args).await?,
+            "issue_create" => gh_issue_create(&runner, args).await?,
+            "issue_comment" => gh_issue_comment(&runner, args).await?,
+            "api" => gh_api(&runner, args).await?,
+            "raw" => gh_raw(&runner, args).await?,
             _ => return Err(format!("unknown gh command: {command}")),
         };
 
@@ -109,26 +114,44 @@ impl ToolPlugin for GhPlugin {
     }
 }
 
-async fn run_gh(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(args)
-        .current_dir(cwd)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .output()
-        .await
-        .map_err(|e| format!("gh exec: {e}"))?;
+struct GhRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh {}: {}", args[0], stderr.trim()));
+impl GhRun<'_> {
+    async fn output(
+        &self,
+        args: &[String],
+    ) -> Result<crate::managed_process::ManagedOutput, String> {
+        let mut env = self.env.clone();
+        env.insert("GH_PROMPT_DISABLED".into(), "1".into());
+        env.insert("NO_COLOR".into(), "1".into());
+        crate::managed_process::run("gh", args, self.cwd, &env, self.process_cfg, None)
+            .await
+            .map_err(|e| format!("gh exec: {e}"))
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    async fn text(&self, args: &[String]) -> Result<String, String> {
+        let output = self.output(args).await?;
+        if !output.status.success() {
+            return Err(format!("gh {}: {}", args[0], output.stderr.trim()));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err("gh output exceeded process.output_memory_bytes".into());
+        }
+        Ok(output.stdout)
+    }
+}
+
+async fn run_gh(runner: &GhRun<'_>, args: &[&str]) -> Result<String, String> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    runner.text(&args).await
 }
 
 async fn gh_pr_view(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let json_fields = "number,title,state,author,url,headRefName,baseRefName,additions,deletions,changedFiles,reviewDecision,checks,body";
@@ -141,12 +164,12 @@ async fn gh_pr_view(
         gh_args.insert(2, &number_str);
     }
 
-    let out = run_gh(cwd, &gh_args).await?;
+    let out = run_gh(runner, &gh_args).await?;
     serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))
 }
 
 async fn gh_pr_list(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let state = args
@@ -180,7 +203,7 @@ async fn gh_pr_list(
         gh_args.push(&author_owned);
     }
 
-    let out = run_gh(cwd, &gh_args).await?;
+    let out = run_gh(runner, &gh_args).await?;
     let prs: serde_json::Value =
         serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))?;
 
@@ -191,7 +214,7 @@ async fn gh_pr_list(
 }
 
 async fn gh_pr_create(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let title = args
@@ -223,7 +246,7 @@ async fn gh_pr_create(
         gh_args.push("--draft");
     }
 
-    let out = run_gh(cwd, &gh_args).await?;
+    let out = run_gh(runner, &gh_args).await?;
 
     Ok(json!({
         "url": out.trim(),
@@ -231,7 +254,7 @@ async fn gh_pr_create(
 }
 
 async fn gh_pr_diff(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let number_str;
@@ -242,17 +265,22 @@ async fn gh_pr_diff(
         gh_args.push(&number_str);
     }
 
-    let out = run_gh(cwd, &gh_args).await?;
-    let (diff, truncated) = cap_str(&out, MAX_GH_OUTPUT);
+    let owned_args: Vec<String> = gh_args.iter().map(|arg| (*arg).to_string()).collect();
+    let output = runner.output(&owned_args).await?;
+    if !output.status.success() {
+        return Err(format!("gh pr: {}", output.stderr.trim()));
+    }
+    let managed_truncated = output.stdout_truncated || output.stderr_truncated;
+    let (diff, truncated) = cap_str(&output.stdout, MAX_GH_OUTPUT);
 
     Ok(json!({
         "diff": diff,
-        "truncated": truncated,
+        "truncated": managed_truncated || truncated,
     }))
 }
 
 async fn gh_pr_checks(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let json_fields = "name,state,conclusion,link";
@@ -265,7 +293,7 @@ async fn gh_pr_checks(
         gh_args.insert(2, &number_str);
     }
 
-    let out = run_gh(cwd, &gh_args).await?;
+    let out = run_gh(runner, &gh_args).await?;
     let checks: serde_json::Value =
         serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))?;
 
@@ -275,7 +303,10 @@ async fn gh_pr_checks(
     }))
 }
 
-async fn gh_api(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn gh_api(
+    runner: &GhRun<'_>,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let endpoint = args
         .and_then(|a| a.get("endpoint"))
         .and_then(|v| v.as_str())
@@ -288,7 +319,7 @@ async fn gh_api(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_js
 
     let gh_args = vec!["api", "-X", method, endpoint];
 
-    let out = run_gh(cwd, &gh_args).await?;
+    let out = run_gh(runner, &gh_args).await?;
 
     serde_json::from_str(&out).or_else(|_| Ok(json!({"raw": out.trim()})))
 }
@@ -310,9 +341,8 @@ fn arg_bool(args: Option<&serde_json::Value>, key: &str) -> bool {
 }
 
 /// Run gh from an owned arg vector (the `*_argv` builders below produce these).
-async fn run_gh_owned(cwd: &Path, args: &[String]) -> Result<String, String> {
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_gh(cwd, &refs).await
+async fn run_gh_owned(runner: &GhRun<'_>, args: &[String]) -> Result<String, String> {
+    runner.text(args).await
 }
 
 /// Max bytes of any single gh command's captured output retained before
@@ -359,24 +389,18 @@ fn raw_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
 /// Run an arbitrary gh invocation, surfacing exit code + stdout + stderr rather
 /// than erroring on a non-zero exit (the caller chose the command; let them see
 /// the full result). stdout is JSON-parsed when possible, else returned verbatim.
-async fn gh_raw(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn gh_raw(
+    runner: &GhRun<'_>,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let argv = raw_argv(args)?;
-    let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("gh")
-        .args(&refs)
-        .current_dir(cwd)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .output()
-        .await
-        .map_err(|e| format!("gh exec: {e}"))?;
-    let (stdout, stdout_truncated) =
-        cap_str(&String::from_utf8_lossy(&output.stdout), MAX_GH_OUTPUT);
-    let (stderr, stderr_truncated) =
-        cap_str(&String::from_utf8_lossy(&output.stderr), MAX_GH_OUTPUT);
+    let output = runner.output(&argv).await?;
+    let managed_truncated = output.stdout_truncated || output.stderr_truncated;
+    let (stdout, stdout_truncated) = cap_str(&output.stdout, MAX_GH_OUTPUT);
+    let (stderr, stderr_truncated) = cap_str(&output.stderr, MAX_GH_OUTPUT);
     // Parse stdout as JSON only when returned intact — a truncated buffer isn't
     // valid JSON, so surface it as a string in that case.
-    let stdout_val = if stdout_truncated {
+    let stdout_val = if managed_truncated || stdout_truncated {
         json!(stdout)
     } else {
         serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|_| json!(stdout))
@@ -385,7 +409,7 @@ async fn gh_raw(cwd: &Path, args: Option<&serde_json::Value>) -> Result<serde_js
         "exit_code": output.status.code().unwrap_or(-1),
         "stdout": stdout_val,
         "stderr": stderr.trim(),
-        "truncated": stdout_truncated || stderr_truncated,
+        "truncated": managed_truncated || stdout_truncated || stderr_truncated,
     }))
 }
 
@@ -421,10 +445,10 @@ fn pr_merge_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String
 }
 
 async fn gh_pr_merge(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &pr_merge_argv(args)?).await?;
+    let out = run_gh_owned(runner, &pr_merge_argv(args)?).await?;
     // Return gh's own output rather than a synthesized boolean; gh exits non-zero
     // (surfaced as an error above) when it cannot merge, so success == the merge
     // message it printed.
@@ -440,10 +464,10 @@ fn pr_checkout_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, Str
 }
 
 async fn gh_pr_checkout(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &pr_checkout_argv(args)?).await?;
+    let out = run_gh_owned(runner, &pr_checkout_argv(args)?).await?;
     Ok(json!({ "output": out.trim() }))
 }
 
@@ -477,10 +501,10 @@ fn run_list_argv(args: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 async fn gh_run_list(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &run_list_argv(args)).await?;
+    let out = run_gh_owned(runner, &run_list_argv(args)).await?;
     let runs: serde_json::Value =
         serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))?;
     Ok(json!({
@@ -503,10 +527,10 @@ fn run_view_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String
 }
 
 async fn gh_run_view(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &run_view_argv(args)?).await?;
+    let out = run_gh_owned(runner, &run_view_argv(args)?).await?;
     serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))
 }
 
@@ -538,10 +562,10 @@ fn issue_list_argv(args: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 async fn gh_issue_list(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &issue_list_argv(args)).await?;
+    let out = run_gh_owned(runner, &issue_list_argv(args)).await?;
     let issues: serde_json::Value =
         serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))?;
     Ok(json!({
@@ -563,10 +587,10 @@ fn issue_view_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, Stri
 }
 
 async fn gh_issue_view(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &issue_view_argv(args)?).await?;
+    let out = run_gh_owned(runner, &issue_view_argv(args)?).await?;
     serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))
 }
 
@@ -591,10 +615,10 @@ fn issue_create_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, St
 }
 
 async fn gh_issue_create(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &issue_create_argv(args)?).await?;
+    let out = run_gh_owned(runner, &issue_create_argv(args)?).await?;
     Ok(json!({ "url": out.trim() }))
 }
 
@@ -611,10 +635,10 @@ fn issue_comment_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, S
 }
 
 async fn gh_issue_comment(
-    cwd: &Path,
+    runner: &GhRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let out = run_gh_owned(cwd, &issue_comment_argv(args)?).await?;
+    let out = run_gh_owned(runner, &issue_comment_argv(args)?).await?;
     Ok(json!({ "url": out.trim() }))
 }
 
@@ -665,6 +689,121 @@ mod tests {
             .run("gh", "nonexistent", dir.path(), &env, None, None)
             .await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    fn fake_gh(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir.display().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_runner_forwards_explicit_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_gh(
+            dir.path(),
+            "printf '{\"sentinel\":\"%s\"}' \"$PLUGIN_SENTINEL\"",
+        );
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        env.insert("PLUGIN_SENTINEL".into(), "visible".into());
+        let plugin = GhPlugin::new();
+        let result = plugin
+            .run_command_with_config(
+                "raw",
+                dir.path(),
+                &env,
+                None,
+                Some(&json!({"args": ["test"]})),
+                &crate::config::ProcessConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["stdout"]["sentinel"], "visible");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_reports_managed_capture_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_gh(dir.path(), "/usr/bin/python3 -c 'print(\"x\" * 1000)'");
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let result = GhPlugin::new()
+            .run_command_with_config(
+                "raw",
+                dir.path(),
+                &env,
+                None,
+                Some(&json!({"args": ["test"]})),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["truncated"], true);
+        assert!(result.output["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_diff_preserves_managed_capture_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_gh(
+            dir.path(),
+            "/usr/bin/python3 -c 'print(\"diff\" + \"x\" * 1000)'",
+        );
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let result = GhPlugin::new()
+            .run_command_with_config("pr_diff", dir.path(), &env, None, None, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(result.output["truncated"], true);
+        assert!(result.output["diff"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_runner_honors_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_gh(dir.path(), "/bin/sleep 30");
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        let cfg = crate::config::ProcessConfig {
+            default_timeout_secs: 1,
+            termination_grace_ms: 10,
+            ..crate::config::ProcessConfig::default()
+        };
+        let error = GhPlugin::new()
+            .run_command_with_config(
+                "raw",
+                dir.path(),
+                &env,
+                None,
+                Some(&json!({"args": ["test"]})),
+                &cfg,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"));
     }
 
     #[test]

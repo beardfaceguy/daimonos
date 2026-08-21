@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::json;
-use tokio::process::Command;
 
 use crate::tool_runner::{ToolCommand, ToolDescriptor, ToolPlugin, ToolResult};
 
@@ -54,24 +53,30 @@ impl ToolPlugin for DockerPlugin {
         &self.descriptor
     }
 
-    async fn run_command(
+    async fn run_command_with_config(
         &self,
         command: &str,
         cwd: &Path,
-        _env: &HashMap<String, String>,
+        env: &HashMap<String, String>,
         _stdin_data: Option<&[u8]>,
         args: Option<&serde_json::Value>,
+        process_cfg: &crate::config::ProcessConfig,
     ) -> Result<ToolResult, String> {
+        let runner = DockerRun {
+            cwd,
+            env,
+            process_cfg,
+        };
         let output = match command {
-            "ps" => docker_ps(cwd).await?,
-            "logs" => docker_logs(cwd, args).await?,
-            "exec" => docker_exec(cwd, args).await?,
-            "images" => docker_images(cwd).await?,
-            "inspect" => docker_inspect(cwd, args).await?,
-            "stop" => docker_stop(cwd, args).await?,
-            "compose_up" => docker_compose_up(cwd, args).await?,
-            "compose_down" => docker_compose_down(cwd, args).await?,
-            "compose_ps" => docker_compose_ps(cwd, args).await?,
+            "ps" => docker_ps(&runner).await?,
+            "logs" => docker_logs(&runner, args).await?,
+            "exec" => docker_exec(&runner, args).await?,
+            "images" => docker_images(&runner).await?,
+            "inspect" => docker_inspect(&runner, args).await?,
+            "stop" => docker_stop(&runner, args).await?,
+            "compose_up" => docker_compose_up(&runner, args).await?,
+            "compose_down" => docker_compose_down(&runner, args).await?,
+            "compose_ps" => docker_compose_ps(&runner, args).await?,
             _ => return Err(format!("unknown docker command: {command}")),
         };
 
@@ -85,13 +90,34 @@ impl ToolPlugin for DockerPlugin {
     }
 }
 
-async fn run_docker(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("docker")
-        .args(args)
-        .current_dir(cwd)
-        .output()
+struct DockerRun<'a> {
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    process_cfg: &'a crate::config::ProcessConfig,
+}
+
+impl DockerRun<'_> {
+    async fn output(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let output = crate::managed_process::run(
+            "docker",
+            &args,
+            self.cwd,
+            self.env,
+            self.process_cfg,
+            None,
+        )
         .await
-        .map_err(|e| format!("docker exec: {e}"))
+        .map_err(|e| format!("docker exec: {e}"))?;
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err("docker output exceeded process.output_memory_bytes".into());
+        }
+        Ok(std::process::Output {
+            status: output.status,
+            stdout: output.stdout.into_bytes(),
+            stderr: output.stderr.into_bytes(),
+        })
+    }
 }
 
 /// Parse docker's line-delimited JSON output into an array.
@@ -104,8 +130,8 @@ fn parse_json_lines(stdout: &str) -> serde_json::Value {
     json!(items)
 }
 
-async fn docker_ps(cwd: &Path) -> Result<serde_json::Value, String> {
-    let output = run_docker(cwd, &["ps", "--format", "{{json .}}"]).await?;
+async fn docker_ps(runner: &DockerRun<'_>) -> Result<serde_json::Value, String> {
+    let output = runner.output(&["ps", "--format", "{{json .}}"]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,7 +144,7 @@ async fn docker_ps(cwd: &Path) -> Result<serde_json::Value, String> {
 }
 
 async fn docker_logs(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let container = args
@@ -132,7 +158,9 @@ async fn docker_logs(
         .unwrap_or(50);
 
     let tail_str = tail.to_string();
-    let output = run_docker(cwd, &["logs", "--tail", &tail_str, container]).await?;
+    let output = runner
+        .output(&["logs", "--tail", &tail_str, container])
+        .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -152,7 +180,7 @@ async fn docker_logs(
 }
 
 async fn docker_exec(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let container = args
@@ -165,12 +193,9 @@ async fn docker_exec(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "exec requires 'command' argument".to_string())?;
 
-    let output = Command::new("docker")
-        .args(["exec", container, "sh", "-c", command])
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("docker exec: {e}"))?;
+    let output = runner
+        .output(&["exec", container, "sh", "-c", command])
+        .await?;
 
     let exit = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -186,8 +211,8 @@ async fn docker_exec(
     Ok(result)
 }
 
-async fn docker_images(cwd: &Path) -> Result<serde_json::Value, String> {
-    let output = run_docker(cwd, &["images", "--format", "{{json .}}"]).await?;
+async fn docker_images(runner: &DockerRun<'_>) -> Result<serde_json::Value, String> {
+    let output = runner.output(&["images", "--format", "{{json .}}"]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -200,7 +225,7 @@ async fn docker_images(cwd: &Path) -> Result<serde_json::Value, String> {
 }
 
 async fn docker_inspect(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let container = args
@@ -208,7 +233,9 @@ async fn docker_inspect(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "inspect requires 'container' argument".to_string())?;
 
-    let output = run_docker(cwd, &["inspect", "--format", "{{json .}}", container]).await?;
+    let output = runner
+        .output(&["inspect", "--format", "{{json .}}", container])
+        .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -223,7 +250,7 @@ async fn docker_inspect(
 }
 
 async fn docker_stop(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let container = args
@@ -231,7 +258,7 @@ async fn docker_stop(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "stop requires 'container' argument".to_string())?;
 
-    let output = run_docker(cwd, &["stop", container]).await?;
+    let output = runner.output(&["stop", container]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -242,7 +269,7 @@ async fn docker_stop(
 }
 
 async fn docker_compose_up(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
@@ -266,12 +293,7 @@ async fn docker_compose_up(
         docker_args.push("-d");
     }
 
-    let output = Command::new("docker")
-        .args(&docker_args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("docker compose up: {e}"))?;
+    let output = runner.output(&docker_args).await?;
 
     let exit = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -288,7 +310,7 @@ async fn docker_compose_up(
 }
 
 async fn docker_compose_down(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
@@ -304,12 +326,7 @@ async fn docker_compose_down(
 
     docker_args.push("down");
 
-    let output = Command::new("docker")
-        .args(&docker_args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("docker compose down: {e}"))?;
+    let output = runner.output(&docker_args).await?;
 
     let exit = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -326,7 +343,7 @@ async fn docker_compose_down(
 }
 
 async fn docker_compose_ps(
-    cwd: &Path,
+    runner: &DockerRun<'_>,
     args: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let file = args.and_then(|a| a.get("file")).and_then(|v| v.as_str());
@@ -344,12 +361,7 @@ async fn docker_compose_ps(
     docker_args.push("--format");
     docker_args.push("json");
 
-    let output = Command::new("docker")
-        .args(&docker_args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| format!("docker compose ps: {e}"))?;
+    let output = runner.output(&docker_args).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -407,6 +419,61 @@ mod tests {
 
         let plugin = registry.get("docker").await;
         assert!(plugin.is_some());
+    }
+
+    #[cfg(unix)]
+    fn fake_docker(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("docker");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir.display().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_runner_forwards_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_docker(
+            dir.path(),
+            "printf '{\"Sentinel\":\"%s\"}\\n' \"$PLUGIN_SENTINEL\"",
+        );
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        env.insert("PLUGIN_SENTINEL".into(), "visible".into());
+        let result = DockerPlugin::new()
+            .run_command_with_config(
+                "ps",
+                dir.path(),
+                &env,
+                None,
+                None,
+                &crate::config::ProcessConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["containers"][0]["Sentinel"], "visible");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_output_fails_instead_of_parsing_truncated_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_docker(
+            dir.path(),
+            "/usr/bin/python3 -c 'print(\"{\\\\\\\"Name\\\\\\\":\\\\\\\"\" + \"x\" * 1000 + \"\\\\\\\"}\")'",
+        );
+        let mut env = HashMap::new();
+        env.insert("PATH".into(), path);
+        let cfg = crate::config::ProcessConfig {
+            output_memory_bytes: 32,
+            ..crate::config::ProcessConfig::default()
+        };
+        let error = DockerPlugin::new()
+            .run_command_with_config("ps", dir.path(), &env, None, None, &cfg)
+            .await
+            .unwrap_err();
+        assert!(error.contains("output exceeded"));
     }
 
     #[test]
