@@ -110,6 +110,18 @@ sealed interface ClientMessage {
     ) : ClientMessage
 
     @Serializable
+    @SerialName("clear_history")
+    data class ClearHistory(
+        @SerialName("request_id") val requestId: String,
+    ) : ClientMessage
+
+    @Serializable
+    @SerialName("get_usage")
+    data class GetUsage(
+        @SerialName("request_id") val requestId: String,
+    ) : ClientMessage
+
+    @Serializable
     @SerialName("list_sessions")
     data class ListSessions(
         @SerialName("request_id") val requestId: String,
@@ -195,6 +207,13 @@ sealed interface ServerMessage {
     ) : ServerMessage
 
     @Serializable
+    @SerialName("usage")
+    data class Usage(
+        @SerialName("request_id") val requestId: String,
+        val usage: SessionUsage,
+    ) : ServerMessage
+
+    @Serializable
     @SerialName("pong")
     data object Pong : ServerMessage
 
@@ -233,6 +252,17 @@ data class SessionListEntry(
     @SerialName("session_id") val sessionId: String,
     val active: Boolean,
     @SerialName("attached_clients") val attachedClients: Int,
+)
+
+@Serializable
+data class SessionUsage(
+    val input: Long,
+    val output: Long,
+    @SerialName("reasoning_output") val reasoningOutput: Long? = null,
+    @SerialName("thinking_bytes") val thinkingBytes: Long,
+    @SerialName("cache_read") val cacheRead: Long,
+    @SerialName("cache_write") val cacheWrite: Long,
+    @SerialName("cost_usd_micros") val costUsdMicros: Long,
 )
 
 @Serializable
@@ -354,6 +384,10 @@ sealed interface SessionEvent {
     @Serializable
     @SerialName("context_usage_changed")
     data class ContextUsageChanged(val usage: ContextUsage) : SessionEvent
+
+    @Serializable
+    @SerialName("conversation_cleared")
+    data object ConversationCleared : SessionEvent
 
     @Serializable
     @SerialName("turn_status_changed")
