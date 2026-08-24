@@ -219,7 +219,17 @@ sealed interface ServerMessage {
 
     @Serializable
     @SerialName("revoked")
-    data class Revoked(val reason: String) : ServerMessage
+    data class Revoked(
+        val reason: String,
+        val code: RevocationCode? = null,
+    ) : ServerMessage
+}
+
+@Serializable
+enum class RevocationCode {
+    @SerialName("session_stopped") SESSION_STOPPED,
+    @SerialName("event_queue_lagged") EVENT_QUEUE_LAGGED,
+    @SerialName("attachment_replaced") ATTACHMENT_REPLACED,
 }
 
 @Serializable

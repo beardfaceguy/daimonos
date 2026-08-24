@@ -10,8 +10,8 @@ use std::fmt;
 use crate::client_transport::{FrontendTransport, TransportError};
 use crate::frontend_state::{ApplyOutcome, ViewState};
 use crate::session_protocol::{
-    has_capability, ApprovalDecision, ClientCapability, ClientInfo, ClientMessage, RuntimeValue,
-    ServerMessage, SessionUsage, PROTOCOL_VERSION,
+    has_capability, ApprovalDecision, ClientCapability, ClientInfo, ClientMessage, RevocationCode,
+    RuntimeValue, ServerMessage, SessionUsage, PROTOCOL_VERSION,
 };
 
 #[derive(Debug)]
@@ -74,7 +74,10 @@ pub enum SessionClientOutcome {
         request_id: String,
         usage: SessionUsage,
     },
-    Revoked(String),
+    Revoked {
+        code: Option<RevocationCode>,
+        reason: String,
+    },
 }
 
 pub struct SessionClient<T: FrontendTransport> {
@@ -122,6 +125,13 @@ impl<T: FrontendTransport> SessionClient<T> {
     pub fn replace_transport(&mut self, transport: T) {
         self.transport = transport;
         self.clear_attachment();
+    }
+
+    /// A physical reconnect is a new daemon attachment even though it resumes
+    /// the same logical session/watermark. A fresh id prevents two half-dead
+    /// transports from repeatedly replacing one another.
+    pub fn rotate_client_identity(&mut self) {
+        self.client.id = format!("reconnect-{}", uuid::Uuid::new_v4());
     }
 
     pub async fn attach(&mut self, session_id: Option<String>) -> Result<(), SessionClientError> {
@@ -313,9 +323,9 @@ impl<T: FrontendTransport> SessionClient<T> {
             ServerMessage::Usage { request_id, usage } => {
                 Ok(SessionClientOutcome::Usage { request_id, usage })
             }
-            ServerMessage::Revoked { reason } => {
+            ServerMessage::Revoked { code, reason } => {
                 self.attached = false;
-                Ok(SessionClientOutcome::Revoked(reason))
+                Ok(SessionClientOutcome::Revoked { code, reason })
             }
             ServerMessage::AttachOk { .. } | ServerMessage::AttachDenied { .. } => {
                 Err(SessionClientError::Protocol(

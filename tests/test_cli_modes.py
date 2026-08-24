@@ -198,6 +198,7 @@ def test_concurrent_interactive_ttys_share_bootstrapped_daemon_and_detach(
                 f'socket_path = "{socket_path}"',
                 "bootstrap_timeout_secs = 5",
                 "bootstrap_retry_interval_ms = 10",
+                "client_command_timeout_secs = 30",
                 "",
             ]
         )

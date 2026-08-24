@@ -338,6 +338,9 @@ the local TUI/UDS client, and future remote clients.
 | `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
 | `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
 | `bootstrap_retry_interval_ms` | `50` | Delay between automatic session-daemon connection attempts. |
+| `reconnect_attempts` | `4` | Maximum automatic reconnect attempts after resumable revocation or transport loss. |
+| `reconnect_initial_backoff_ms` | `100` | Initial automatic reconnect delay. |
+| `reconnect_max_backoff_ms` | `1000` | Maximum exponential reconnect delay. |
 | `remote_pairing_ttl_secs` | `300` | Lifetime of one single-use remote pairing claim. |
 | `remote_pairing_wait_secs` | `300` | Maximum wait for local approval of a pairing request. |
 | `remote_auth_timeout_secs` | `10` | Maximum time for the first remote authentication frame. |
@@ -357,6 +360,12 @@ the local TUI/UDS client, and future remote clients.
 | `max_runtime_value_bytes` | `4096` | Maximum UTF-8 bytes in a string runtime-option value. |
 | `max_capabilities` | `16` | Maximum requested capabilities in one attach. |
 
+Automatic reconnect treats only typed `event_queue_lagged` revocation and
+transport loss as resumable. `session_stopped`, `attachment_replaced`, and
+reason-only revocations from older daemons are terminal; core logic never
+parses free-text reasons. After recovery, the TUI warns that a command written
+immediately before disconnect may need verification.
+
 ```toml
 [session]
 # socket_path = "~/.daimonos/custom-session.sock"
@@ -375,6 +384,9 @@ shutdown_grace_secs = 5
 client_command_timeout_secs = 10
 bootstrap_timeout_secs = 15
 bootstrap_retry_interval_ms = 50
+reconnect_attempts = 4
+reconnect_initial_backoff_ms = 100
+reconnect_max_backoff_ms = 1000
 remote_pairing_ttl_secs = 300
 remote_pairing_wait_secs = 300
 remote_auth_timeout_secs = 10

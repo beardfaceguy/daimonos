@@ -456,6 +456,13 @@ pub struct SessionRuntimeConfig {
     pub bootstrap_timeout_secs: u64,
     /// Delay between session-daemon bootstrap connection attempts.
     pub bootstrap_retry_interval_ms: u64,
+    /// Maximum automatic reconnect attempts after a resumable revocation or
+    /// transport loss.
+    pub reconnect_attempts: usize,
+    /// Initial delay before retrying a lost frontend connection.
+    pub reconnect_initial_backoff_ms: u64,
+    /// Maximum exponential reconnect delay.
+    pub reconnect_max_backoff_ms: u64,
     /// Lifetime of a single-use remote pairing claim.
     pub remote_pairing_ttl_secs: u64,
     /// Maximum time a remote pairing socket waits for local consent.
@@ -507,6 +514,9 @@ impl Default for SessionRuntimeConfig {
             client_command_timeout_secs: 10,
             bootstrap_timeout_secs: 15,
             bootstrap_retry_interval_ms: 50,
+            reconnect_attempts: 4,
+            reconnect_initial_backoff_ms: 100,
+            reconnect_max_backoff_ms: 1_000,
             remote_pairing_ttl_secs: 300,
             remote_pairing_wait_secs: 300,
             remote_auth_timeout_secs: 10,
@@ -575,6 +585,20 @@ impl SessionRuntimeConfig {
         if self.bootstrap_retry_interval_ms == 0 {
             return Err(
                 "session.bootstrap_retry_interval_ms must be greater than zero".to_string(),
+            );
+        }
+        if self.reconnect_attempts == 0 {
+            return Err("session.reconnect_attempts must be greater than zero".to_string());
+        }
+        if self.reconnect_initial_backoff_ms == 0 {
+            return Err(
+                "session.reconnect_initial_backoff_ms must be greater than zero".to_string(),
+            );
+        }
+        if self.reconnect_max_backoff_ms < self.reconnect_initial_backoff_ms {
+            return Err(
+                "session.reconnect_max_backoff_ms must be at least reconnect_initial_backoff_ms"
+                    .to_string(),
             );
         }
         for (field, is_zero) in [
@@ -1908,6 +1932,9 @@ mod tests {
         assert_eq!(cfg.session.client_command_timeout_secs, 10);
         assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
         assert_eq!(cfg.session.bootstrap_retry_interval_ms, 50);
+        assert_eq!(cfg.session.reconnect_attempts, 4);
+        assert_eq!(cfg.session.reconnect_initial_backoff_ms, 100);
+        assert_eq!(cfg.session.reconnect_max_backoff_ms, 1_000);
         assert_eq!(cfg.session.max_frame_bytes, 1_048_576);
         assert_eq!(cfg.session.max_prompt_bytes, 131_072);
         assert_eq!(cfg.session.max_identifier_bytes, 128);
@@ -2265,6 +2292,21 @@ mod tests {
                 .expect_err("zero bootstrap limit must be rejected")
                 .contains(&format!("session.{field}")));
         }
+        for field in ["reconnect_attempts", "reconnect_initial_backoff_ms"] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero reconnect limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
+        let invalid: Config = toml::from_str(
+            "[session]\nreconnect_initial_backoff_ms = 100\nreconnect_max_backoff_ms = 99\n",
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("reconnect max must cover initial delay")
+            .contains("session.reconnect_max_backoff_ms"));
         let invalid: Config = toml::from_str(
             "[session]\nmax_frame_bytes = 256\nmax_prompt_bytes = 32\n\
              max_tool_event_output_bytes = 32\n",
