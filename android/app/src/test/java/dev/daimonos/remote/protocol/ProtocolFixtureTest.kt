@@ -94,6 +94,19 @@ class ProtocolFixtureTest {
     }
 
     @Test
+    fun attachDeniedCodeIsTypedButLegacyReasonStillDecodes() {
+        val typed = ProtocolCodec.decodeServer(
+            """{"type":"attach_denied","code":"client_limit_reached","reason":"full"}""",
+        ) as ServerMessage.AttachDenied
+        assertEquals(AttachDeniedCode.CLIENT_LIMIT_REACHED, typed.code)
+
+        val legacy = ProtocolCodec.decodeServer(
+            """{"type":"attach_denied","reason":"legacy"}""",
+        ) as ServerMessage.AttachDenied
+        assertEquals(null, legacy.code)
+    }
+
+    @Test
     fun remoteAuthFixtureIncludesValidRustCompatibleEd25519Vector() {
         val fixture = ProtocolCodec.json
             .parseToJsonElement(fixture("remote_auth.json"))

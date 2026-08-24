@@ -1,0 +1,53 @@
+```rust
+// session_protocol.rs
+pub enum ServerMessage {
+    AttachDenied {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<AttachDeniedCode>,
+        reason: String,
+    },
+}
+#[serde(rename_all = "snake_case")]
+pub enum AttachDeniedCode {
+    InvalidMessage, ProtocolVersion, SessionNotFound, SessionStopped,
+    SessionLimitReached, ClientLimitReached, DuplicateClient,
+    SessionAlreadyActive, SessionOpenFailed, FactoryUnavailable,
+    EventSubscriptionFailed, DaemonShuttingDown, SnapshotTooLarge,
+}
+```
+
+```rust
+// session_daemon.rs
+fn session_daemon_error_code(error: &SessionDaemonError) -> AttachDeniedCode {
+    match error {
+        DuplicateSession(_) => SessionAlreadyActive,
+        SessionLimitReached {..} => SessionLimitReached,
+        SessionNotFound(_) => SessionNotFound,
+        SessionStopped(_) => SessionStopped,
+        DuplicateClient(_) => DuplicateClient,
+        ClientLimitReached {..} => ClientLimitReached,
+        EventSubscription(_) => EventSubscriptionFailed,
+        FactoryUnavailable => FactoryUnavailable,
+        OpenFailed(_) => SessionOpenFailed,
+        ShuttingDown => DaemonShuttingDown,
+    }
+}
+
+// All AttachDenied send sites add exact code:
+// malformed/first-message -> InvalidMessage
+// version mismatch -> ProtocolVersion
+// open/attach errors -> mapping above
+// stopped during attach -> SessionStopped
+// fitted snapshot failure -> SnapshotTooLarge
+```
+
+```rust
+// session_client.rs
+pub enum SessionClientError {
+    AttachDenied { code: Option<AttachDeniedCode>, reason: String },
+}
+ServerMessage::AttachDenied { code, reason } =>
+    Err(SessionClientError::AttachDenied { code, reason })
+```
+
+Android WireModels adds nullable AttachDeniedCode with matching serial names. Tests pin exact ClientLimitReached wire shape, legacy reason-only decode in Rust and Android, InvalidMessage mapping, and ClientLimitReached daemon mapping. Focused tests and cargo check pass.
