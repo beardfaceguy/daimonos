@@ -1710,6 +1710,29 @@ impl ApprovalBroker {
         pending
     }
 
+    fn update_deadline(&self, approval_id: &str, deadline_unix_ms: u64, paused: bool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = state.pending.get_mut(approval_id) else {
+            return false;
+        };
+        debug_assert!(
+            pending.request.ineligible_deadline_unix_ms.is_none()
+                || pending.request.ineligible_deadline_unix_ms == Some(deadline_unix_ms),
+            "approval deadline must remain anchored at first ineligibility"
+        );
+        if pending.request.ineligible_deadline_unix_ms == Some(deadline_unix_ms)
+            && pending.request.deadline_paused == paused
+        {
+            return false;
+        }
+        pending.request.ineligible_deadline_unix_ms = Some(deadline_unix_ms);
+        pending.request.deadline_paused = paused;
+        true
+    }
+
     pub fn resolve(
         &self,
         approval_id: &str,
@@ -1814,6 +1837,17 @@ pub enum ApprovalRequestError {
 /// No transport handle crosses this boundary. ACP, a local UDS client, and a
 /// future Android client all observe the same `ApprovalRequested` event and
 /// answer through the same broker.
+fn system_deadline_unix_ms(timeout: std::time::Duration) -> u64 {
+    let deadline = std::time::SystemTime::now()
+        .checked_add(timeout)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    deadline
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 pub async fn request_approval(
     broker: &ApprovalBroker,
     events: &SessionEventRouter,
@@ -1845,24 +1879,61 @@ pub async fn request_approval(
         ApprovalRequestError::BrokerClosed
     };
     let resolution = if let Some(timeout) = broker.timeout {
-        let mut ineligible_deadline = None;
+        let mut ineligible_deadline: Option<(tokio::time::Instant, u64)> = None;
         loop {
-            let eligibility_changed = broker.eligibility_changed.notified();
+            // Tokio oneshot::Receiver::try_recv consumes only a ready value;
+            // Empty leaves it valid for the cancel-safe &mut Receiver branch
+            // below. Biased selects prefer resolution over simultaneous
+            // eligibility churn.
+            match receiver.try_recv() {
+                Ok(resolution) => break resolution,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Err(broker_closed());
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            let mut eligibility_changed = Box::pin(broker.eligibility_changed.notified());
+            // notify_waiters does not retain a permit for a future that has
+            // not registered yet. Enable before reading eligibility so every
+            // transition after this point wakes this exact loop iteration.
+            eligibility_changed.as_mut().enable();
             if broker.has_eligible_client(&approval_id) {
+                if let Some((_, deadline_unix_ms)) = ineligible_deadline {
+                    if broker.update_deadline(&approval_id, deadline_unix_ms, true) {
+                        let _ = events.emit(SessionEvent::ApprovalDeadlineChanged {
+                            approval_id: approval_id.clone(),
+                            ineligible_deadline_unix_ms: deadline_unix_ms,
+                            paused: true,
+                        });
+                    }
+                }
                 tokio::select! {
+                    biased;
                     resolution = &mut receiver => {
                         break resolution.map_err(|_| broker_closed())?;
                     }
-                    _ = eligibility_changed => continue,
+                    _ = &mut eligibility_changed => continue,
                 }
             } else {
-                let deadline = *ineligible_deadline
-                    .get_or_insert_with(|| tokio::time::Instant::now() + timeout);
+                let (deadline, deadline_unix_ms) = *ineligible_deadline.get_or_insert_with(|| {
+                    (
+                        tokio::time::Instant::now() + timeout,
+                        system_deadline_unix_ms(timeout),
+                    )
+                });
+                if broker.update_deadline(&approval_id, deadline_unix_ms, false) {
+                    let _ = events.emit(SessionEvent::ApprovalDeadlineChanged {
+                        approval_id: approval_id.clone(),
+                        ineligible_deadline_unix_ms: deadline_unix_ms,
+                        paused: false,
+                    });
+                }
                 tokio::select! {
+                    biased;
                     resolution = &mut receiver => {
                         break resolution.map_err(|_| broker_closed())?;
                     }
-                    _ = eligibility_changed => continue,
+                    _ = &mut eligibility_changed => continue,
                     _ = tokio::time::sleep_until(deadline) => {
                         match broker.resolve(
                             &approval_id,
@@ -2174,6 +2245,8 @@ mod tests {
             tool: "exec".to_string(),
             detail: "run tests".to_string(),
             allow_always_available: true,
+            ineligible_deadline_unix_ms: None,
+            deadline_paused: false,
         }
     }
 
@@ -2477,6 +2550,123 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn approval_deadline_state_is_anchored_and_paused_not_reset() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new_with_timeout(
+            false,
+            std::time::Duration::from_secs(1),
+        ));
+        let events = std::sync::Arc::new(SessionEventRouter::default());
+        let request_broker = std::sync::Arc::clone(&broker);
+        let request_events = std::sync::Arc::clone(&events);
+        let pending = tokio::spawn(async move {
+            request_approval(&request_broker, &request_events, request()).await
+        });
+
+        let anchored = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(request) = broker.pending().pop() {
+                    if let Some(deadline) = request.ineligible_deadline_unix_ms {
+                        break (request.id, deadline);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first ineligible deadline is advertised");
+
+        broker.set_eligible_client_counts(1, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let request = broker.pending().pop().unwrap();
+                if request.deadline_paused {
+                    assert_eq!(request.ineligible_deadline_unix_ms, Some(anchored.1));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eligible reconnect pauses the anchored deadline");
+
+        broker.set_eligible_client_counts(0, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let request = broker.pending().pop().unwrap();
+                if !request.deadline_paused {
+                    assert_eq!(request.ineligible_deadline_unix_ms, Some(anchored.1));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eligibility loss resumes without extending deadline");
+
+        broker
+            .resolve(
+                &anchored.0,
+                "local",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::Deny,
+            )
+            .unwrap();
+        assert_eq!(
+            pending.await.unwrap().unwrap().decision,
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn eligibility_restored_before_expiry_pauses_even_past_deadline() {
+        let broker = std::sync::Arc::new(ApprovalBroker::new_with_timeout(
+            false,
+            std::time::Duration::from_millis(200),
+        ));
+        let events = std::sync::Arc::new(SessionEventRouter::default());
+        let request_broker = std::sync::Arc::clone(&broker);
+        let request_events = std::sync::Arc::clone(&events);
+        let pending = tokio::spawn(async move {
+            request_approval(&request_broker, &request_events, request()).await
+        });
+        let approval_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(request) = broker.pending().pop() {
+                    if request.ineligible_deadline_unix_ms.is_some() {
+                        break request.id;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        broker.set_eligible_client_counts(1, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            broker
+                .pending()
+                .iter()
+                .any(|request| request.id == approval_id),
+            "eligible client pauses expiry even after anchored wall time passes"
+        );
+        broker
+            .resolve(
+                &approval_id,
+                "local",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::AllowOnce,
+            )
+            .unwrap();
+        assert_eq!(
+            pending.await.unwrap().unwrap().decision,
+            ApprovalDecision::AllowOnce
+        );
     }
 
     #[tokio::test]

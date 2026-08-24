@@ -57,6 +57,15 @@ class SessionReducerTest {
         reducer.applyEvent(2, SessionEvent.ApprovalRequested(second))
         reducer.applyEvent(
             3,
+            SessionEvent.ApprovalDeadlineChanged(
+                approvalId = first.id,
+                ineligibleDeadlineUnixMs = 123_456,
+                paused = true,
+            ),
+        )
+        assertTrue(reducer.state.pendingApprovals.first().deadlinePaused)
+        reducer.applyEvent(
+            4,
             SessionEvent.ApprovalResolved(
                 approvalId = first.id,
                 decision = dev.daimonos.remote.protocol.ApprovalDecision.DENY,

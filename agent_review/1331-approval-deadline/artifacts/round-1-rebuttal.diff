@@ -1,0 +1,53 @@
+```diff
+--- a/src/session_core.rs
++++ b/src/session_core.rs
+@@
+ loop {
++    // oneshot try_recv consumes only ready values; Empty remains valid.
+     match receiver.try_recv() { ... }
+-    let eligibility_changed = broker.eligibility_changed.notified();
++    let mut eligibility_changed = Box::pin(broker.eligibility_changed.notified());
++    // notify_waiters retains no permit for unregistered futures.
++    eligibility_changed.as_mut().enable();
+     if broker.has_eligible_client(...) {
+         ...
+         tokio::select! {
++            biased;
+             resolution = &mut receiver => ...,
+-            _ = eligibility_changed => continue,
++            _ = &mut eligibility_changed => continue,
+         }
+     } else {
+         // same already-enabled future and biased resolution-first select
+     }
+ }
+@@ ApprovalBroker::update_deadline
++debug_assert!(existing_deadline.is_none() || existing_deadline == Some(deadline_unix_ms));
+```
+
+```diff
+--- a/src/session_protocol.rs
++++ b/src/session_protocol.rs
+@@
+-/// Wall-clock deadline...
++/// Display-only wall-clock deadline; enforcement is monotonic and clients
++/// tolerate wall-clock adjustments.
+@@
+ ApprovalDeadlineChanged {
++    /// Idempotent last-write-wins update; snapshots may already contain it.
+ }
+```
+
+```diff
+--- a/src/tui/render.rs
++++ b/src/tui/render.rs
+@@
+-format!("auto-deny in {remaining}s ...")
++format!("auto-deny in ~{remaining}s ...")
+```
+
+Tests added:
+- eligibility_restored_before_expiry_pauses_even_past_deadline: eligible at half-time, wait past anchored instant, approval remains pending.
+- approval_deadline_state_is_anchored_and_paused_not_reset: same unix deadline through pause/resume.
+- existing churn timeout test remains green.
+- Android/Rust fixtures decode ApprovalRequest without new fields (defaults) then apply ApprovalDeadlineChanged.

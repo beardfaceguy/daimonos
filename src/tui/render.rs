@@ -247,7 +247,7 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let Some(approval) = state.active_approval() else {
         return;
     };
-    let modal = centered_rect(60, 9, area);
+    let modal = centered_rect(60, 10, area);
     // Clear the cells under the modal so the transcript does not bleed through.
     Clear.render(modal, buf);
 
@@ -263,6 +263,23 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
     ];
     for part in sanitize(&approval.detail).split('\n') {
         lines.push(Line::from(part.to_string()));
+    }
+    if let Some(deadline) = approval.ineligible_deadline_unix_ms {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let status = if approval.deadline_paused {
+            "auto-deny timer paused; original deadline retained".to_string()
+        } else {
+            let remaining = deadline.saturating_sub(now).div_ceil(1_000);
+            format!("auto-deny in ~{remaining}s if no eligible client remains")
+        };
+        lines.push(Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     lines.push(Line::from(String::new()));
 
@@ -931,6 +948,8 @@ mod tests {
                     tool: "exec".into(),
                     detail: detail.into(),
                     allow_always_available: allow_always,
+                    ineligible_deadline_unix_ms: None,
+                    deadline_paused: false,
                 },
             },
         );
@@ -950,6 +969,22 @@ mod tests {
         assert!(out.contains("[y]"), "allow-once key missing:\n{out}");
         assert!(out.contains("[n]"), "deny key missing:\n{out}");
         assert!(out.contains("[a]"), "allow-always key missing:\n{out}");
+    }
+
+    #[test]
+    fn approval_modal_shows_paused_anchored_deadline() {
+        let mut state = approval_state(false, "inspect");
+        state.apply_event(
+            2,
+            SessionEvent::ApprovalDeadlineChanged {
+                approval_id: "a1".into(),
+                ineligible_deadline_unix_ms: 123_456,
+                paused: true,
+            },
+        );
+        let rendered = render_to_string(&state, "", 100, 30);
+        assert!(rendered.contains("auto-deny timer paused"));
+        assert!(rendered.contains("original deadline retained"));
     }
 
     #[test]
