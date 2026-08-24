@@ -10,15 +10,18 @@ use std::fmt;
 use crate::client_transport::{FrontendTransport, TransportError};
 use crate::frontend_state::{ApplyOutcome, ViewState};
 use crate::session_protocol::{
-    has_capability, ApprovalDecision, ClientCapability, ClientInfo, ClientMessage, RevocationCode,
-    RuntimeValue, ServerMessage, SessionUsage, PROTOCOL_VERSION,
+    has_capability, ApprovalDecision, AttachDeniedCode, ClientCapability, ClientInfo,
+    ClientMessage, RevocationCode, RuntimeValue, ServerMessage, SessionUsage, PROTOCOL_VERSION,
 };
 
 #[derive(Debug)]
 pub enum SessionClientError {
     Transport(TransportError),
     Disconnected,
-    AttachDenied(String),
+    AttachDenied {
+        code: Option<AttachDeniedCode>,
+        reason: String,
+    },
     Server {
         request_id: Option<String>,
         code: String,
@@ -33,7 +36,9 @@ impl fmt::Display for SessionClientError {
         match self {
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Disconnected => formatter.write_str("frontend transport disconnected"),
-            Self::AttachDenied(reason) => write!(formatter, "attach denied: {reason}"),
+            Self::AttachDenied { code, reason } => {
+                write!(formatter, "attach denied ({code:?}): {reason}")
+            }
             Self::Server { code, message, .. } => write!(formatter, "{code}: {message}"),
             Self::Protocol(message) => formatter.write_str(message),
             Self::MissingCapability(capability) => {
@@ -239,8 +244,8 @@ impl<T: FrontendTransport> SessionClient<T> {
                     self.state.apply_snapshot(state);
                     return Ok(());
                 }
-                ServerMessage::AttachDenied { reason } => {
-                    return Err(SessionClientError::AttachDenied(reason));
+                ServerMessage::AttachDenied { code, reason } => {
+                    return Err(SessionClientError::AttachDenied { code, reason });
                 }
                 ServerMessage::Error {
                     request_id,

@@ -14,9 +14,9 @@ use crate::session_core::{
     RuntimeConfigError, SessionCore, SessionEventSubscription, SessionReplay,
 };
 use crate::session_protocol::{
-    ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage, SessionEvent,
-    SessionListEntry, SessionSnapshot, ToolCallState, ToolCallStateStatus, TranscriptEntry,
-    TranscriptRole,
+    AttachDeniedCode, ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage,
+    SessionEvent, SessionListEntry, SessionSnapshot, ToolCallState, ToolCallStateStatus,
+    TranscriptEntry, TranscriptRole,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,6 +726,7 @@ impl SessionDaemon {
         if let Err(error) = limits.validate_client_message(&first) {
             transport
                 .send(&ServerMessage::AttachDenied {
+                    code: Some(AttachDeniedCode::InvalidMessage),
                     reason: format!("invalid attach message: {error:?}"),
                 })
                 .await?;
@@ -763,6 +764,7 @@ impl SessionDaemon {
             _ => {
                 transport
                     .send(&ServerMessage::AttachDenied {
+                        code: Some(AttachDeniedCode::InvalidMessage),
                         reason: "first message must be attach or resume".to_string(),
                     })
                     .await?;
@@ -772,6 +774,7 @@ impl SessionDaemon {
         if protocol_version != crate::session_protocol::PROTOCOL_VERSION {
             transport
                 .send(&ServerMessage::AttachDenied {
+                    code: Some(AttachDeniedCode::ProtocolVersion),
                     reason: format!(
                         "unsupported protocol version {protocol_version}; expected {}",
                         crate::session_protocol::PROTOCOL_VERSION
@@ -786,7 +789,10 @@ impl SessionDaemon {
             Err(error) => {
                 let reason = session_daemon_error_message(&error);
                 transport
-                    .send(&ServerMessage::AttachDenied { reason })
+                    .send(&ServerMessage::AttachDenied {
+                        code: Some(session_daemon_error_code(&error)),
+                        reason,
+                    })
                     .await?;
                 return Ok(());
             }
@@ -806,7 +812,10 @@ impl SessionDaemon {
             Err(error) => {
                 let reason = session_daemon_error_message(&error);
                 transport
-                    .send(&ServerMessage::AttachDenied { reason })
+                    .send(&ServerMessage::AttachDenied {
+                        code: Some(session_daemon_error_code(&error)),
+                        reason,
+                    })
                     .await?;
                 return Ok(());
             }
@@ -870,6 +879,7 @@ impl SessionDaemon {
             if attachment.entry.stopped.load(Ordering::Acquire) {
                 transport
                     .send(&ServerMessage::AttachDenied {
+                        code: Some(AttachDeniedCode::SessionStopped),
                         reason: "session stopped during attach".to_string(),
                     })
                     .await?;
@@ -880,7 +890,10 @@ impl SessionDaemon {
                 Ok(snapshot) => Some(snapshot),
                 Err(reason) => {
                     transport
-                        .send(&ServerMessage::AttachDenied { reason })
+                        .send(&ServerMessage::AttachDenied {
+                            code: Some(AttachDeniedCode::SnapshotTooLarge),
+                            reason,
+                        })
                         .await?;
                     return Ok(());
                 }
@@ -2275,6 +2288,23 @@ fn session_daemon_error_message(error: &SessionDaemonError) -> String {
     .to_string()
 }
 
+fn session_daemon_error_code(error: &SessionDaemonError) -> AttachDeniedCode {
+    match error {
+        SessionDaemonError::DuplicateSession(_) => AttachDeniedCode::SessionAlreadyActive,
+        SessionDaemonError::SessionLimitReached { .. } => AttachDeniedCode::SessionLimitReached,
+        SessionDaemonError::SessionNotFound(_) => AttachDeniedCode::SessionNotFound,
+        SessionDaemonError::SessionStopped(_) => AttachDeniedCode::SessionStopped,
+        SessionDaemonError::DuplicateClient(_) => AttachDeniedCode::DuplicateClient,
+        SessionDaemonError::ClientLimitReached { .. } => AttachDeniedCode::ClientLimitReached,
+        SessionDaemonError::EventSubscription(_) => AttachDeniedCode::EventSubscriptionFailed,
+        SessionDaemonError::FactoryUnavailable => AttachDeniedCode::FactoryUnavailable,
+        // Task 1335's version/corrupt/workspace store errors subdivide this
+        // coarse prerequisite code in the coordinated protocol-v3 change.
+        SessionDaemonError::OpenFailed(_) => AttachDeniedCode::SessionOpenFailed,
+        SessionDaemonError::ShuttingDown => AttachDeniedCode::DaemonShuttingDown,
+    }
+}
+
 fn client_request_key(client_id: &str, request_id: &str) -> String {
     format!("{}:{client_id}{request_id}", client_id.len())
 }
@@ -2988,6 +3018,10 @@ mod tests {
             kind: ClientKind::Headless,
             label: "headless".to_string(),
         };
+        assert_eq!(
+            session_daemon_error_code(&SessionDaemonError::ClientLimitReached { max: 1 }),
+            AttachDeniedCode::ClientLimitReached
+        );
         assert!(matches!(
             daemon
                 .attach("session-1", second.clone(), vec![ClientCapability::Observe])
@@ -3117,7 +3151,10 @@ mod tests {
 
         assert!(matches!(
             client.recv().await,
-            Some(ServerMessage::AttachDenied { reason })
+            Some(ServerMessage::AttachDenied {
+                code: Some(AttachDeniedCode::InvalidMessage),
+                reason,
+            })
                 if reason.contains("first message must be attach")
         ));
     }

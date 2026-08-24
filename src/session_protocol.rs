@@ -111,6 +111,8 @@ pub enum ServerMessage {
         seq: u64,
     },
     AttachDenied {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<AttachDeniedCode>,
         reason: String,
     },
     Event {
@@ -146,6 +148,25 @@ pub enum ServerMessage {
         code: Option<RevocationCode>,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AttachDeniedCode {
+    InvalidMessage,
+    ProtocolVersion,
+    SessionNotFound,
+    SessionStopped,
+    SessionLimitReached,
+    ClientLimitReached,
+    DuplicateClient,
+    SessionAlreadyActive,
+    SessionOpenFailed,
+    FactoryUnavailable,
+    EventSubscriptionFailed,
+    DaemonShuttingDown,
+    SnapshotTooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,6 +824,33 @@ mod tests {
             }))
             .unwrap(),
             ServerMessage::Revoked {
+                code: None,
+                reason: "legacy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn attach_denied_code_is_additive_and_legacy_reason_still_decodes() {
+        assert_eq!(
+            serde_json::to_value(ServerMessage::AttachDenied {
+                code: Some(AttachDeniedCode::ClientLimitReached),
+                reason: "client limit reached".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "attach_denied",
+                "code": "client_limit_reached",
+                "reason": "client limit reached"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServerMessage>(json!({
+                "type": "attach_denied",
+                "reason": "legacy"
+            }))
+            .unwrap(),
+            ServerMessage::AttachDenied {
                 code: None,
                 reason: "legacy".to_string(),
             }

@@ -166,7 +166,10 @@ sealed interface ServerMessage {
 
     @Serializable
     @SerialName("attach_denied")
-    data class AttachDenied(val reason: String) : ServerMessage
+    data class AttachDenied(
+        val reason: String,
+        val code: AttachDeniedCode? = null,
+    ) : ServerMessage
 
     @Serializable
     @SerialName("event")
@@ -223,6 +226,23 @@ sealed interface ServerMessage {
         val reason: String,
         val code: RevocationCode? = null,
     ) : ServerMessage
+}
+
+@Serializable
+enum class AttachDeniedCode {
+    @SerialName("invalid_message") INVALID_MESSAGE,
+    @SerialName("protocol_version") PROTOCOL_VERSION,
+    @SerialName("session_not_found") SESSION_NOT_FOUND,
+    @SerialName("session_stopped") SESSION_STOPPED,
+    @SerialName("session_limit_reached") SESSION_LIMIT_REACHED,
+    @SerialName("client_limit_reached") CLIENT_LIMIT_REACHED,
+    @SerialName("duplicate_client") DUPLICATE_CLIENT,
+    @SerialName("session_already_active") SESSION_ALREADY_ACTIVE,
+    @SerialName("session_open_failed") SESSION_OPEN_FAILED,
+    @SerialName("factory_unavailable") FACTORY_UNAVAILABLE,
+    @SerialName("event_subscription_failed") EVENT_SUBSCRIPTION_FAILED,
+    @SerialName("daemon_shutting_down") DAEMON_SHUTTING_DOWN,
+    @SerialName("snapshot_too_large") SNAPSHOT_TOO_LARGE,
 }
 
 @Serializable
