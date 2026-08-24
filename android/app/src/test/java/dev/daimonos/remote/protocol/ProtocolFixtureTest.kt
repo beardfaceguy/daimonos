@@ -81,6 +81,19 @@ class ProtocolFixtureTest {
     }
 
     @Test
+    fun revocationCodeIsTypedButLegacyReasonStillDecodes() {
+        val typed = ProtocolCodec.decodeServer(
+            """{"type":"revoked","code":"event_queue_lagged","reason":"lagged"}""",
+        ) as ServerMessage.Revoked
+        assertEquals(RevocationCode.EVENT_QUEUE_LAGGED, typed.code)
+
+        val legacy = ProtocolCodec.decodeServer(
+            """{"type":"revoked","reason":"legacy"}""",
+        ) as ServerMessage.Revoked
+        assertEquals(null, legacy.code)
+    }
+
+    @Test
     fun remoteAuthFixtureIncludesValidRustCompatibleEd25519Vector() {
         val fixture = ProtocolCodec.json
             .parseToJsonElement(fixture("remote_auth.json"))

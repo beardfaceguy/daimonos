@@ -1,0 +1,109 @@
+```rust
+// src/session_protocol.rs
+pub enum ServerMessage {
+    Revoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<RevocationCode>,
+        reason: String,
+    },
+}
+#[serde(rename_all = "snake_case")]
+pub enum RevocationCode { SessionStopped, EventQueueLagged, AttachmentReplaced }
+```
+
+```rust
+// src/session_controller.rs
+pub struct ReconnectPolicy {
+    pub attempts: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+pub type ReconnectFactory<T> = Arc<dyn Fn() -> ReconnectFuture<T> + Send + Sync>;
+
+async fn reconnect_client<T: FrontendTransport>(
+    client: &mut SessionClient<T>, policy: ReconnectPolicy, factory: &ReconnectFactory<T>,
+) -> Result<(), SessionClientError> {
+    let session_id = client.state().session_id().to_string();
+    let mut delay = policy.initial_backoff;
+    let mut last_error = "no reconnect attempt completed".to_string();
+    for _ in 0..policy.attempts.max(1) {
+        tokio::time::sleep(delay).await;
+        match factory().await {
+            Ok(transport) => {
+                client.replace_transport(transport);
+                match client.attach(Some(session_id.clone())).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = error.to_string(),
+                }
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+        delay = delay.saturating_mul(2).min(policy.max_backoff);
+    }
+    Err(SessionClientError::Protocol(format!("reconnect exhausted: {last_error}")))
+}
+
+// run_controller receive branch
+Ok(Revoked { code: Some(EventQueueLagged), .. }) if reconnect.is_some() => {
+    reconnect_client(...).await?;
+    emit(Attached { canonical state, granted capabilities });
+}
+Ok(Revoked { code, reason }) => {
+    emit(StateChanged { outcome: Revoked { code, reason } });
+    break ControllerStopReason::Revoked(reason);
+}
+Err(receive_error) if reconnect.is_some() => {
+    match reconnect_client(...) {
+        Ok => emit(Attached),
+        Err => emit Failed("reconnect") and stop ReconnectExhausted,
+    }
+}
+```
+
+```rust
+// src/agent_runtime.rs
+let reconnect_factory: ReconnectFactory<UnixFrontendTransport> = Arc::new(move || {
+    let socket = reconnect_socket.clone();
+    Box::pin(async move {
+        let stream = UnixStream::connect(&socket).await.map_err(TransportError::Io)?;
+        UnixFrontendTransport::new(stream, label, max_frame)
+            .map_err(SessionClientError::from)
+    })
+});
+SessionControllerHandle::spawn_with_reconnect(
+    initial_transport, client_info, capabilities, scrollback,
+    command_capacity, event_capacity,
+    ReconnectPolicy {
+        attempts: cfg.session.reconnect_attempts,
+        initial_backoff: Duration::from_millis(cfg.session.reconnect_initial_backoff_ms),
+        max_backoff: Duration::from_millis(cfg.session.reconnect_max_backoff_ms),
+    },
+    reconnect_factory,
+)
+```
+
+```rust
+// src/session_client.rs
+ServerMessage::Revoked { code, reason } => {
+    self.attached = false;
+    Ok(SessionClientOutcome::Revoked { code, reason })
+}
+// attach(Some(same_session)) already emits Resume with state.last_seq and validates replay/snapshot.
+```
+
+Daemon Revoked send sites now attach exact codes. TuiSession maps terminal Revoked to Failed; resumable lag is suppressed inside controller until Attached. Android adds nullable RevocationCode and typed SessionStopped handling with reason fallback for old daemons.
+
+Config additions, positive/coherent validation, defaults/docs:
+- reconnect_attempts=4
+- reconnect_initial_backoff_ms=100
+- reconnect_max_backoff_ms=1000
+
+Tests:
+- exact typed wire shape + legacy reason-only decode
+- lag revocation creates new transport, sends Resume with same client/session and watermark, and emits Attached
+- transport EOF reconnects instead of stopping controller
+- terminal revocation surfaces typed reason to TUI
+- daemon SessionStopped Revoked carries typed code
+- Android typed/legacy decoding test
+
+Focused Rust tests and cargo check pass.

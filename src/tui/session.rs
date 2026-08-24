@@ -66,7 +66,9 @@ impl TuiSession {
                         anyhow::bail!("session controller stopped during attach");
                     }
                     SessionControllerEvent::StateChanged { .. }
+                    | SessionControllerEvent::Reconnected { .. }
                     | SessionControllerEvent::CommandAccepted { .. }
+                    | SessionControllerEvent::CommandRejected { .. }
                     | SessionControllerEvent::Detached => {}
                 }
             }
@@ -164,15 +166,22 @@ impl TuiSession {
                     {
                         anyhow::bail!("daemon rejected {expected_operation}: {message}")
                     }
+                    SessionControllerEvent::CommandRejected { operation, message }
+                        if operation == expected_operation =>
+                    {
+                        anyhow::bail!("{operation}: {message}")
+                    }
                     SessionControllerEvent::Detached | SessionControllerEvent::Stopped => {
                         anyhow::bail!("{}", self.controller_stop_message());
                     }
-                    SessionControllerEvent::Attached { .. } => {
+                    SessionControllerEvent::Attached { .. }
+                    | SessionControllerEvent::Reconnected { .. } => {
                         anyhow::bail!(
                             "session attachment changed while waiting for {expected_operation}"
                         );
                     }
                     SessionControllerEvent::CommandAccepted { .. }
+                    | SessionControllerEvent::CommandRejected { .. }
                     | SessionControllerEvent::Failed { .. } => {}
                 }
             }
@@ -216,21 +225,42 @@ impl TuiSession {
                 self.state = state;
                 TuiSessionUpdate::Updated
             }
+            SessionControllerEvent::Reconnected {
+                mut state, message, ..
+            } => {
+                state.push_system_message(message);
+                self.state = state;
+                TuiSessionUpdate::Updated
+            }
             SessionControllerEvent::StateChanged { mut state, outcome } => {
-                if let SessionClientOutcome::Usage { usage, .. } = outcome {
-                    state.push_system_message(format!(
-                        "input={} output={} cache_read={} cache_write={} cost=${:.4}",
-                        usage.input,
-                        usage.output,
-                        usage.cache_read,
-                        usage.cache_write,
-                        usage.cost_usd_micros as f64 / 1_000_000.0,
-                    ));
+                match outcome {
+                    SessionClientOutcome::Revoked { code, reason } => {
+                        self.state = state;
+                        return TuiSessionUpdate::Failed(format!(
+                            "session revoked ({code:?}): {reason}"
+                        ));
+                    }
+                    SessionClientOutcome::Usage { usage, .. } => {
+                        state.push_system_message(format!(
+                            "input={} output={} cache_read={} cache_write={} cost=${:.4}",
+                            usage.input,
+                            usage.output,
+                            usage.cache_read,
+                            usage.cache_write,
+                            usage.cost_usd_micros as f64 / 1_000_000.0,
+                        ));
+                    }
+                    _ => {}
                 }
                 self.state = state;
                 TuiSessionUpdate::Updated
             }
             SessionControllerEvent::CommandAccepted { .. } => TuiSessionUpdate::Updated,
+            SessionControllerEvent::CommandRejected { operation, message } => {
+                self.state
+                    .push_system_message(format!("{operation}: {message}"));
+                TuiSessionUpdate::Updated
+            }
             SessionControllerEvent::Detached => TuiSessionUpdate::Detached,
             SessionControllerEvent::Failed { operation, message } => {
                 TuiSessionUpdate::Failed(format!("{operation}: {message}"))
@@ -250,8 +280,8 @@ mod tests {
     use crate::client_transport::{in_memory_transport_pair, ClientTransport};
     use crate::session_controller::SessionControllerHandle;
     use crate::session_protocol::{
-        ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage, ServerMessage,
-        SessionEvent, SessionSnapshot, SessionUsage, TurnStatus, PROTOCOL_VERSION,
+        ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage, RevocationCode,
+        ServerMessage, SessionEvent, SessionSnapshot, SessionUsage, TurnStatus, PROTOCOL_VERSION,
     };
 
     fn controller() -> (impl ClientTransport, SessionControllerHandle) {
@@ -577,6 +607,37 @@ mod tests {
         })
         .await
         .expect("usage notice should reach the TUI");
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_revocation_surfaces_typed_reason() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        accept_attach(&server, "daemon-session").await;
+        let mut session = attach.await.unwrap().unwrap();
+        server
+            .send(&ServerMessage::Revoked {
+                code: Some(RevocationCode::SessionStopped),
+                reason: "stopped".to_string(),
+            })
+            .await
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(TuiSessionUpdate::Failed(message)) = session.poll() {
+                    break message;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(update.contains("SessionStopped"));
+        assert!(update.contains("stopped"));
         session.shutdown().await;
     }
 }

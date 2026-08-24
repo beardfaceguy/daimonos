@@ -142,8 +142,18 @@ pub enum ServerMessage {
     },
     Pong,
     Revoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<RevocationCode>,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationCode {
+    SessionStopped,
+    EventQueueLagged,
+    AttachmentReplaced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +762,33 @@ mod tests {
                     "cost_usd_micros": 125000
                 }
             })
+        );
+    }
+
+    #[test]
+    fn revocation_code_is_additive_and_legacy_reason_still_decodes() {
+        assert_eq!(
+            serde_json::to_value(ServerMessage::Revoked {
+                code: Some(RevocationCode::EventQueueLagged),
+                reason: "lagged".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "revoked",
+                "code": "event_queue_lagged",
+                "reason": "lagged"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServerMessage>(json!({
+                "type": "revoked",
+                "reason": "legacy"
+            }))
+            .unwrap(),
+            ServerMessage::Revoked {
+                code: None,
+                reason: "legacy".to_string(),
+            }
         );
     }
 

@@ -1,0 +1,80 @@
+```diff
+--- a/src/session_client.rs
++++ b/src/session_client.rs
+@@
++pub fn rotate_client_identity(&mut self) {
++    self.client.id = format!("reconnect-{}", Uuid::new_v4());
++}
+```
+
+```diff
+--- a/src/session_controller.rs
++++ b/src/session_controller.rs
+@@
+ pub enum SessionControllerEvent {
+     Attached { state, granted_capabilities },
++    Reconnected { state, granted_capabilities, message: String },
+ }
+@@
+ async fn reconnect_client(...) {
+-    for attempt { sleep(delay); factory; attach; }
++    for attempt {
++        if attempt > 0 { sleep(delay).await; }
++        let transport = factory().await?;
++        client.replace_transport(transport);
++        client.rotate_client_identity();
++        client.attach(Some(session_id.clone())).await?; // replay OR snapshot
++    }
+ }
++
++async fn drive_reconnect(..., commands: &mut Receiver<Command>, ...) -> ReconnectDrive {
++    let reconnect = reconnect_client(...);
++    pin!(reconnect);
++    loop {
++        select! {
++            biased;
++            command = commands.recv() => match command {
++                None => Stop(CommandChannelClosed),
++                Some(Shutdown) => Stop(Shutdown),
++                Some(Detach) => { emit(Detached); Stop(Shutdown) },
++                Some(command) => emit(Failed {
++                    operation: command.operation(),
++                    message: "command rejected while reconnecting",
++                }),
++            },
++            result = &mut reconnect => return Connected_or_Failed(result),
++        }
++    }
++}
+@@ lag revocation
+-reconnect_client(...).await?;
+-emit(Attached { ... });
++drive_reconnect(...).await?;
++emit(Reconnected {
++    state: canonical_replayed_or_snapshot_state,
++    message: "session resumed after event queue lag; verify any command accepted immediately before revocation",
++});
+@@ transport loss
++emit(Reconnected {
++    message: "session resumed after transport loss; verify any command accepted immediately before disconnect",
++});
+```
+
+```diff
+--- a/src/tui/session.rs
++++ b/src/tui/session.rs
+@@
++SessionControllerEvent::Reconnected { mut state, message, .. } => {
++    state.push_system_message(message);
++    self.state = state;
++    Updated
++}
+```
+
+Tests revised/added:
+- lag_revocation_resumes_with_watermark_on_new_transport now forces snapshot fallback at seq 5 and asserts recovered transcript/state.
+- transport_loss_reconnects_instead_of_stopping_controller asserts fresh physical client id.
+- shutdown_cancels_an_inflight_reconnect_promptly proves 100ms shutdown against pending reconnect.
+- attachment_replaced_revocation_never_enters_reconnect_loop proves typed terminal classification before EOF and zero factory calls.
+
+Reconnect attempts are now immediate first, with exponential delay only after failure. Config docs will state missing typed codes are terminal for legacy daemons.

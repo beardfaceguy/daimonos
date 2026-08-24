@@ -940,6 +940,7 @@ impl SessionDaemon {
                         }
                         transport
                             .send(&ServerMessage::Revoked {
+                                code: Some(crate::session_protocol::RevocationCode::SessionStopped),
                                 reason: "session stopped".to_string(),
                             })
                             .await?;
@@ -1481,6 +1482,9 @@ impl SessionDaemon {
                     if event_lagged.swap(false, Ordering::AcqRel) {
                         transport
                             .send(&ServerMessage::Revoked {
+                                code: Some(
+                                    crate::session_protocol::RevocationCode::EventQueueLagged,
+                                ),
                                 reason: "event queue lagged; reconnect for a full snapshot"
                                     .to_string(),
                             })
@@ -1498,6 +1502,7 @@ impl SessionDaemon {
                     if attachment.entry.stopped.load(Ordering::Acquire) {
                         transport
                             .send(&ServerMessage::Revoked {
+                                code: Some(crate::session_protocol::RevocationCode::SessionStopped),
                                 reason: "session stopped".to_string(),
                             })
                             .await?;
@@ -1519,6 +1524,7 @@ impl SessionDaemon {
                         }
                         transport
                             .send(&ServerMessage::Revoked {
+                                code: Some(crate::session_protocol::RevocationCode::SessionStopped),
                                 reason: "session stopped".to_string(),
                             })
                             .await?;
@@ -1529,6 +1535,9 @@ impl SessionDaemon {
                     if *replacement_receiver.borrow() {
                         transport
                             .send(&ServerMessage::Revoked {
+                                code: Some(
+                                    crate::session_protocol::RevocationCode::AttachmentReplaced,
+                                ),
                                 reason: "attachment replaced by reconnect".to_string(),
                             })
                             .await?;
@@ -2797,7 +2806,10 @@ mod tests {
         ));
         assert!(matches!(
             client.recv().await,
-            Some(ServerMessage::Revoked { reason }) if reason == "session stopped"
+            Some(ServerMessage::Revoked {
+                code: Some(crate::session_protocol::RevocationCode::SessionStopped),
+                reason,
+            }) if reason == "session stopped"
         ));
         serve.await.unwrap().unwrap();
     }

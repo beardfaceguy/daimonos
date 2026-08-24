@@ -97,6 +97,13 @@ every attached or replaying frontend resets at the same point. `/usage` reads
 typed process-lifetime cumulative usage directly from the daemon without
 polluting canonical replay.
 
+Daemon revocation carries an additive typed code. Event-queue lag and transport
+loss trigger bounded Resume from the last canonical sequence, accepting replay
+or a full snapshot; each physical reconnect uses a fresh client id so it cannot
+replace a newer attachment. Session stop, attachment replacement, and untyped
+legacy revocations are terminal. Recovery surfaces a local warning because a
+wire command accepted immediately before disconnect may need verification.
+
 ### 4. Terminal correctness (hard requirements)
 
 - A RAII terminal guard **always** restores canonical mode, cursor, mouse/paste
@@ -126,9 +133,8 @@ polluting canonical replay.
    resize/suspend, and broader accessibility remain.
 7. Wire the TUI behind opt-in `--interactive`; retain the default and explicit
    `--print` stable print modes. *(daemon-client wiring landed in task #1331;
-   connect-first automatic daemon bootstrap has also landed; typed reconnect
-   remains.)* Reconsider a TTY default only after the daemon-owned lifecycle is
-   complete.
+   connect-first bootstrap and typed bounded reconnect have also landed.)*
+   Reconsider a TTY default only after the daemon-owned lifecycle is complete.
 
 ## Verification gates (TDD)
 

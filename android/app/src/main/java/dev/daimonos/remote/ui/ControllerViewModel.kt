@@ -11,6 +11,7 @@ import dev.daimonos.remote.network.RemoteAuthenticationException
 import dev.daimonos.remote.network.SessionConnection
 import dev.daimonos.remote.protocol.ApprovalDecision
 import dev.daimonos.remote.protocol.ClientCapability
+import dev.daimonos.remote.protocol.RevocationCode
 import dev.daimonos.remote.protocol.ServerMessage
 import dev.daimonos.remote.session.ApplyResult
 import dev.daimonos.remote.session.SessionReducer
@@ -316,7 +317,11 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                 is ServerMessage.Revoked -> {
                     if (
                         reducer.state.endingReason != null ||
-                        message.reason.contains("stopped", ignoreCase = true)
+                        message.code == RevocationCode.SESSION_STOPPED ||
+                        (
+                            message.code == null &&
+                                message.reason.contains("stopped", ignoreCase = true)
+                        )
                     ) {
                         desiredSessionId = null
                         reducer = SessionReducer()

@@ -291,7 +291,25 @@ pub async fn run_agent(
                 );
             }
         }
-        let controller = crate::session_controller::SessionControllerHandle::spawn(
+        let reconnect_socket = socket_path.clone();
+        let reconnect_max_frame_bytes = cfg.session.max_frame_bytes;
+        let reconnect_factory: crate::session_controller::ReconnectFactory<
+            crate::client_transport::UnixFrontendTransport,
+        > = Arc::new(move || {
+            let socket_path = reconnect_socket.clone();
+            Box::pin(async move {
+                let stream = tokio::net::UnixStream::connect(&socket_path)
+                    .await
+                    .map_err(crate::client_transport::TransportError::Io)?;
+                crate::client_transport::UnixFrontendTransport::new(
+                    stream,
+                    format!("session daemon {}", socket_path.display()),
+                    reconnect_max_frame_bytes,
+                )
+                .map_err(crate::session_client::SessionClientError::from)
+            })
+        });
+        let controller = crate::session_controller::SessionControllerHandle::spawn_with_reconnect(
             bootstrap.transport,
             crate::session_protocol::ClientInfo {
                 id: "tui".to_string(),
@@ -310,6 +328,14 @@ pub async fn run_agent(
             cfg.tui.scrollback_entries,
             cfg.session.event_queue_capacity,
             cfg.session.event_queue_capacity,
+            crate::session_controller::ReconnectPolicy {
+                attempts: cfg.session.reconnect_attempts,
+                initial_backoff: std::time::Duration::from_millis(
+                    cfg.session.reconnect_initial_backoff_ms,
+                ),
+                max_backoff: std::time::Duration::from_millis(cfg.session.reconnect_max_backoff_ms),
+            },
+            reconnect_factory,
         );
         return tui::run_tui(
             controller,
