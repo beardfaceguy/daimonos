@@ -1,0 +1,43 @@
+```rust
+struct TuiSession {
+    active: ActiveSession,
+    command_timeout: Duration,
+    controller_factory: Option<ControllerFactory>,
+    switch_policy: SwitchPolicy,
+    last_detached_session: Option<String>,
+}
+struct ActiveSession {
+    controller: SessionControllerHandle,
+    epoch: u64,
+    state: ViewState,
+    termination_reported: bool,
+}
+
+// commit
+let departed_session = self.active.state.session_id().to_string();
+let old_active = std::mem::replace(&mut self.active, candidate.active);
+self.last_detached_session = Some(departed_session);
+tokio::spawn(old_active.controller.shutdown());
+```
+
+```rust
+impl Drop for SessionControllerHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+```
+
+```rust
+// exponential bounded retry
+let multiplier = 1_u32 << (attempt - 1).min(31);
+sleep(policy.retry_backoff.saturating_mul(multiplier)).await;
+```
+
+Tests added/refined:
+- cancelling_candidate_handshake_preserves_current_and_releases_transport
+- unrelated_client_limit_is_not_retried
+- post-commit stale old EpochEvent cannot replace candidate state
+- delivered precommit approval aborts and remains visible on current A
+
+ADR-011 now states the late-old-approval eligibility/deadline contract.

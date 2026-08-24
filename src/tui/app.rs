@@ -34,11 +34,19 @@ pub struct TuiOptions {
     pub model_override: Option<String>,
     pub history_entries: usize,
     pub command_timeout: Duration,
+    pub controller_factory: Option<super::session::ControllerFactory>,
+    pub switch_policy: super::session::SwitchPolicy,
 }
 
 /// Attach the full-screen UI to one daemon-owned session.
 pub async fn run(controller: SessionControllerHandle, options: TuiOptions) -> anyhow::Result<()> {
-    let mut session = TuiSession::attach(controller, options.command_timeout).await?;
+    let mut session = TuiSession::attach_with_switching(
+        controller,
+        options.command_timeout,
+        options.controller_factory,
+        options.switch_policy,
+    )
+    .await?;
 
     if let Some(model) = options.model_override.as_deref() {
         let candidate = RuntimeValue::String(model.to_string());

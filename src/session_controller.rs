@@ -19,7 +19,7 @@ use crate::client_transport::FrontendTransport;
 use crate::frontend_state::ViewState;
 use crate::session_client::{SessionClient, SessionClientError, SessionClientOutcome};
 use crate::session_protocol::{
-    ApprovalDecision, ClientCapability, ClientInfo, RevocationCode, RuntimeValue,
+    ApprovalDecision, AttachDeniedCode, ClientCapability, ClientInfo, RevocationCode, RuntimeValue,
 };
 
 static NEXT_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +55,7 @@ pub enum SessionControllerCommand {
     StopSession,
     ClearHistory,
     GetUsage,
+    Sync,
     Ping,
     Detach,
     Shutdown,
@@ -71,6 +72,7 @@ impl SessionControllerCommand {
             Self::StopSession => "stop_session",
             Self::ClearHistory => "clear_history",
             Self::GetUsage => "get_usage",
+            Self::Sync => "sync",
             Self::Ping => "ping",
             Self::Detach => "detach",
             Self::Shutdown => "shutdown",
@@ -99,6 +101,10 @@ pub enum SessionControllerEvent {
     },
     CommandRejected {
         operation: &'static str,
+        message: String,
+    },
+    AttachFailed {
+        code: Option<AttachDeniedCode>,
         message: String,
     },
     Detached,
@@ -274,6 +280,22 @@ impl SessionControllerHandle {
     pub async fn shutdown(mut self) {
         let _ = self.commands.send(SessionControllerCommand::Shutdown).await;
         let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for SessionControllerHandle {
+    fn drop(&mut self) {
+        // The handle is the sole owner of this physical connection. Aborting
+        // makes cancellation of an in-progress attach drop the transport
+        // promptly instead of leaving the actor blocked inside the handshake.
+        if !self.task.is_finished() {
+            tracing::debug!(
+                target: "daimonos::session_controller",
+                event = "controller_handle_drop_abort",
+                epoch = self.epoch,
+            );
+            self.task.abort();
+        }
     }
 }
 
@@ -588,6 +610,7 @@ async fn handle_command<T: FrontendTransport>(
             SessionControllerCommand::GetUsage => {
                 client.get_usage().await.map(|id| (Some(id), None))
             }
+            SessionControllerCommand::Sync => client.sync().await.map(|()| (None, None)),
             SessionControllerCommand::Ping => client.ping().await.map(|()| (None, None)),
             SessionControllerCommand::Detach => client
                 .detach()
@@ -609,6 +632,14 @@ async fn handle_command<T: FrontendTransport>(
             });
             emit(events, epoch, event)
         }
+        Err(SessionClientError::AttachDenied { code, reason }) if operation == "attach" => emit(
+            events,
+            epoch,
+            SessionControllerEvent::AttachFailed {
+                code,
+                message: reason,
+            },
+        ),
         Err(error) => emit_failure(events, epoch, operation, &error),
     }
 }

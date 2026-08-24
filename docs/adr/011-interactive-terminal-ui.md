@@ -88,8 +88,18 @@ workspace, config, provider, model, and agent environment. Concurrent launchers
 retry the owner-locked socket for a configured bounded interval; they never kill
 a version-skewed daemon. The daemon publishes owner-only PID/version metadata
 beside its socket for diagnostics and removes it with the socket. Session
-discovery and switching remain separate follow-up tasks, so the current command
-starts a fresh daemon-owned session.
+discovery remains a separate follow-up task; the switching transaction is now
+available for that picker to invoke.
+
+Switching is a two-phase whole-attachment transaction. A fresh controller
+attaches and hydrates off-screen; only a validated candidate and a final
+idle/no-approval check can replace the active controller, epoch, and view
+together. Candidate failure or cancellation closes only the candidate. The old
+attachment starts detaching only after commit. An approval already delivered
+before commit aborts the switch. An approval created on the old daemon session
+after the final client-side check is not mixed into the new view: normal daemon
+eligibility semantics start its sticky ineligible deadline, and switching back
+before expiry pauses it.
 
 `/clear` is also daemon-authoritative: it is rejected during active turns,
 persists empty history, and emits a sequenced `ConversationCleared` event so

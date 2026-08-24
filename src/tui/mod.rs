@@ -39,5 +39,6 @@ pub use commands::{approval_from_key, parse_command, UiCommand};
 pub use render::{
     composer_cursor_position, render, render_with_options, tui_layout, RenderOptions,
 };
+pub(crate) use session::{ControllerFactory, SwitchPolicy};
 pub use state::{ApplyOutcome, ViewLine, ViewState};
 pub use terminal::TerminalGuard;

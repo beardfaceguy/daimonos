@@ -187,6 +187,56 @@ fn resolve_thought_log_path(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_tui_controller(
+    transport: crate::client_transport::UnixFrontendTransport,
+    client_label: String,
+    scrollback_entries: usize,
+    event_queue_capacity: usize,
+    reconnect_socket: PathBuf,
+    max_frame_bytes: usize,
+    reconnect_policy: crate::session_controller::ReconnectPolicy,
+) -> crate::session_controller::SessionControllerHandle {
+    let reconnect_factory: crate::session_controller::ReconnectFactory<
+        crate::client_transport::UnixFrontendTransport,
+    > = Arc::new(move || {
+        let socket_path = reconnect_socket.clone();
+        Box::pin(async move {
+            let stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .map_err(crate::client_transport::TransportError::Io)?;
+            crate::client_transport::UnixFrontendTransport::new(
+                stream,
+                format!("session daemon {}", socket_path.display()),
+                max_frame_bytes,
+            )
+            .map_err(crate::session_client::SessionClientError::from)
+        })
+    });
+    crate::session_controller::SessionControllerHandle::spawn_with_reconnect(
+        transport,
+        crate::session_protocol::ClientInfo {
+            id: "tui".to_string(),
+            kind: crate::session_protocol::ClientKind::Terminal,
+            label: client_label,
+        },
+        vec![
+            crate::session_protocol::ClientCapability::Observe,
+            crate::session_protocol::ClientCapability::Prompt,
+            crate::session_protocol::ClientCapability::Configure,
+            crate::session_protocol::ClientCapability::Interrupt,
+            crate::session_protocol::ClientCapability::Stop,
+            crate::session_protocol::ClientCapability::ApproveOnce,
+            crate::session_protocol::ClientCapability::ApproveAlways,
+        ],
+        scrollback_entries,
+        event_queue_capacity,
+        event_queue_capacity,
+        reconnect_policy,
+        reconnect_factory,
+    )
+}
+
 pub async fn run_agent(
     args: AgentArgs,
     workspace: &Path,
@@ -291,52 +341,49 @@ pub async fn run_agent(
                 );
             }
         }
-        let reconnect_socket = socket_path.clone();
-        let reconnect_max_frame_bytes = cfg.session.max_frame_bytes;
-        let reconnect_factory: crate::session_controller::ReconnectFactory<
-            crate::client_transport::UnixFrontendTransport,
-        > = Arc::new(move || {
-            let socket_path = reconnect_socket.clone();
-            Box::pin(async move {
-                let stream = tokio::net::UnixStream::connect(&socket_path)
-                    .await
-                    .map_err(crate::client_transport::TransportError::Io)?;
-                crate::client_transport::UnixFrontendTransport::new(
-                    stream,
-                    format!("session daemon {}", socket_path.display()),
-                    reconnect_max_frame_bytes,
-                )
-                .map_err(crate::session_client::SessionClientError::from)
-            })
-        });
-        let controller = crate::session_controller::SessionControllerHandle::spawn_with_reconnect(
+        let reconnect_policy = crate::session_controller::ReconnectPolicy {
+            attempts: cfg.session.reconnect_attempts,
+            initial_backoff: std::time::Duration::from_millis(
+                cfg.session.reconnect_initial_backoff_ms,
+            ),
+            max_backoff: std::time::Duration::from_millis(cfg.session.reconnect_max_backoff_ms),
+        };
+        let client_label = format!("terminal {}", workspace.display());
+        let controller = spawn_tui_controller(
             bootstrap.transport,
-            crate::session_protocol::ClientInfo {
-                id: "tui".to_string(),
-                kind: crate::session_protocol::ClientKind::Terminal,
-                label: format!("terminal {}", workspace.display()),
-            },
-            vec![
-                crate::session_protocol::ClientCapability::Observe,
-                crate::session_protocol::ClientCapability::Prompt,
-                crate::session_protocol::ClientCapability::Configure,
-                crate::session_protocol::ClientCapability::Interrupt,
-                crate::session_protocol::ClientCapability::Stop,
-                crate::session_protocol::ClientCapability::ApproveOnce,
-                crate::session_protocol::ClientCapability::ApproveAlways,
-            ],
+            client_label.clone(),
             cfg.tui.scrollback_entries,
             cfg.session.event_queue_capacity,
-            cfg.session.event_queue_capacity,
-            crate::session_controller::ReconnectPolicy {
-                attempts: cfg.session.reconnect_attempts,
-                initial_backoff: std::time::Duration::from_millis(
-                    cfg.session.reconnect_initial_backoff_ms,
-                ),
-                max_backoff: std::time::Duration::from_millis(cfg.session.reconnect_max_backoff_ms),
-            },
-            reconnect_factory,
+            socket_path.clone(),
+            cfg.session.max_frame_bytes,
+            reconnect_policy,
         );
+        let switch_socket = socket_path.clone();
+        let switch_scrollback = cfg.tui.scrollback_entries;
+        let switch_event_capacity = cfg.session.event_queue_capacity;
+        let switch_max_frame = cfg.session.max_frame_bytes;
+        let switch_label = client_label;
+        let controller_factory: crate::tui::ControllerFactory = Arc::new(move || {
+            let socket_path = switch_socket.clone();
+            let client_label = switch_label.clone();
+            Box::pin(async move {
+                let stream = tokio::net::UnixStream::connect(&socket_path).await?;
+                let transport = crate::client_transport::UnixFrontendTransport::new(
+                    stream,
+                    format!("session daemon {}", socket_path.display()),
+                    switch_max_frame,
+                )?;
+                Ok(spawn_tui_controller(
+                    transport,
+                    client_label,
+                    switch_scrollback,
+                    switch_event_capacity,
+                    socket_path,
+                    switch_max_frame,
+                    reconnect_policy,
+                ))
+            })
+        });
         return tui::run_tui(
             controller,
             tui::TuiOptions {
@@ -347,6 +394,13 @@ pub async fn run_agent(
                 command_timeout: std::time::Duration::from_secs(
                     cfg.session.client_command_timeout_secs,
                 ),
+                controller_factory: Some(controller_factory),
+                switch_policy: crate::tui::SwitchPolicy {
+                    retry_attempts: cfg.session.switch_attach_retry_attempts,
+                    retry_backoff: std::time::Duration::from_millis(
+                        cfg.session.switch_attach_retry_backoff_ms,
+                    ),
+                },
             },
         )
         .await;

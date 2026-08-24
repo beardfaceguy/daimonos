@@ -341,6 +341,8 @@ the local TUI/UDS client, and future remote clients.
 | `reconnect_attempts` | `4` | Maximum automatic reconnect attempts after resumable revocation or transport loss. |
 | `reconnect_initial_backoff_ms` | `100` | Initial automatic reconnect delay. |
 | `reconnect_max_backoff_ms` | `1000` | Maximum exponential reconnect delay. |
+| `switch_attach_retry_attempts` | `3` | Candidate attach attempts when rapidly switching back to a session whose prior connection may still be tearing down. |
+| `switch_attach_retry_backoff_ms` | `50` | Delay between transient client-limit switch retries. |
 | `remote_pairing_ttl_secs` | `300` | Lifetime of one single-use remote pairing claim. |
 | `remote_pairing_wait_secs` | `300` | Maximum wait for local approval of a pairing request. |
 | `remote_auth_timeout_secs` | `10` | Maximum time for the first remote authentication frame. |
@@ -387,6 +389,8 @@ bootstrap_retry_interval_ms = 50
 reconnect_attempts = 4
 reconnect_initial_backoff_ms = 100
 reconnect_max_backoff_ms = 1000
+switch_attach_retry_attempts = 3
+switch_attach_retry_backoff_ms = 50
 remote_pairing_ttl_secs = 300
 remote_pairing_wait_secs = 300
 remote_auth_timeout_secs = 10

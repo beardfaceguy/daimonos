@@ -433,6 +433,16 @@ impl<T: FrontendTransport> SessionClient<T> {
         Ok(request_id)
     }
 
+    pub async fn sync(&mut self) -> Result<(), SessionClientError> {
+        self.require(ClientCapability::Observe)?;
+        self.transport
+            .send(ClientMessage::SyncRequest {
+                last_seen_seq: self.state.last_seq(),
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn ping(&mut self) -> Result<(), SessionClientError> {
         self.transport.send(ClientMessage::Ping).await?;
         Ok(())
