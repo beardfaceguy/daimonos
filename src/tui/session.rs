@@ -4,8 +4,10 @@
 //! only canonical daemon snapshots/events and exposes the resulting
 //! [`ViewState`](crate::frontend_state::ViewState) to rendering.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +43,9 @@ pub struct TuiSession {
     controller_factory: Option<ControllerFactory>,
     switch_policy: SwitchPolicy,
     last_detached_session: Option<String>,
+    switching: Arc<AtomicBool>,
+    pending_operations: BTreeMap<&'static str, PendingOperation>,
+    sync_target: Option<u64>,
 }
 
 struct ActiveSession {
@@ -56,6 +61,34 @@ enum CandidateAttachError {
         message: String,
     },
     Other(String),
+}
+
+enum OldAttachmentStatus {
+    Live,
+    Dead(String),
+}
+
+enum PendingOperation {
+    Generic,
+    Approval(String),
+}
+
+struct SwitchingGuard(Arc<AtomicBool>);
+
+impl Drop for SwitchingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn pending_operation(command: &SessionControllerCommand) -> Option<PendingOperation> {
+    match command {
+        SessionControllerCommand::Approve { approval_id, .. } => {
+            Some(PendingOperation::Approval(approval_id.clone()))
+        }
+        command if command.blocks_switch() => Some(PendingOperation::Generic),
+        _ => None,
+    }
 }
 
 impl TuiSession {
@@ -136,6 +169,9 @@ impl TuiSession {
                             controller_factory,
                             switch_policy,
                             last_detached_session: None,
+                            switching: Arc::new(AtomicBool::new(false)),
+                            pending_operations: BTreeMap::new(),
+                            sync_target: None,
                         });
                     }
                     SessionControllerEvent::AttachFailed { code, message } => {
@@ -180,16 +216,22 @@ impl TuiSession {
 
     pub async fn switch_to(&mut self, target_session_id: &str) -> anyhow::Result<()> {
         if target_session_id == self.active.state.session_id() {
-            self.send(SessionControllerCommand::Sync)
+            self.active
+                .controller
+                .send(SessionControllerCommand::Sync)
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request session resync: {error:?}"))?;
             return Ok(());
         }
+        // The exclusive `&mut self` is the serialization boundary. Publish
+        // Switching before the admission recheck so modal command routing also
+        // rejects mutations; the guard is advisory outside this single-owner
+        // boundary, not a substitute for it.
+        let _switching = self.begin_switch()?;
         self.ensure_switch_allowed()?;
-        let factory = self
-            .controller_factory
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("session switching is unavailable"))?;
+        let factory = self.controller_factory.clone().ok_or_else(|| {
+            anyhow::anyhow!("switch_unavailable: session switching is unavailable")
+        })?;
         let transient_retry = self.last_detached_session.as_deref() == Some(target_session_id);
         let attempts = if transient_retry {
             self.switch_policy.retry_attempts.max(1)
@@ -203,7 +245,9 @@ impl TuiSession {
                 tokio::time::sleep(self.switch_policy.retry_backoff.saturating_mul(multiplier))
                     .await;
             }
-            let controller = factory().await?;
+            let controller = factory()
+                .await
+                .map_err(|error| anyhow::anyhow!("switch_connection_failed: {error}"))?;
             match Self::attach_to(
                 controller,
                 Some(target_session_id.to_string()),
@@ -213,33 +257,44 @@ impl TuiSession {
             )
             .await
             {
-                Ok(candidate) => {
-                    self.drain_before_switch_commit()?;
-                    self.ensure_switch_allowed()?;
-                    let departed_session = self.active.state.session_id().to_string();
-                    let old_active = std::mem::replace(&mut self.active, candidate.active);
-                    self.last_detached_session = Some(departed_session);
-                    tokio::spawn(old_active.controller.shutdown());
-                    return Ok(());
+                Ok(mut candidate) => {
+                    match self.drain_before_switch_commit() {
+                        OldAttachmentStatus::Live => self.ensure_switch_allowed()?,
+                        OldAttachmentStatus::Dead(reason) => {
+                            candidate.active.state.push_system_message(format!(
+                                "switch_old_session_lost: previous session disconnected during \
+                                 switch: {reason}"
+                            ));
+                            return self.commit_candidate(candidate);
+                        }
+                    }
+                    return self.commit_candidate(candidate);
                 }
                 Err(CandidateAttachError::Denied {
                     code: Some(AttachDeniedCode::ClientLimitReached),
                     ..
-                }) if transient_retry && attempt + 1 < attempts => continue,
+                }) if transient_retry && attempt + 1 < attempts => {
+                    self.require_live_rollback_target()?;
+                    self.ensure_switch_allowed()?;
+                    continue;
+                }
                 Err(CandidateAttachError::Denied {
                     code: Some(AttachDeniedCode::ClientLimitReached),
                     message,
                 }) if transient_retry => {
+                    self.require_live_rollback_target()?;
                     anyhow::bail!(
-                        "target session may still contain this TUI's departing attachment after \
-                         {attempts} attempts: {message}"
+                        "switch_attach_capacity: target session may still contain this TUI's \
+                         departing attachment after {attempts} attempts: {message}"
                     );
                 }
                 Err(CandidateAttachError::Denied { code, message }) => {
-                    anyhow::bail!("target session attach denied ({code:?}): {message}");
+                    self.require_live_rollback_target()?;
+                    anyhow::bail!("switch_attach_denied ({code:?}): {message}");
                 }
                 Err(CandidateAttachError::Other(message)) => {
-                    anyhow::bail!("{message}");
+                    self.require_live_rollback_target()?;
+                    anyhow::bail!("switch_connection_failed: {message}");
                 }
             }
         }
@@ -251,33 +306,111 @@ impl TuiSession {
             self.active.state.turn_status(),
             TurnStatus::Idle | TurnStatus::Cancelled
         ) {
-            anyhow::bail!("cannot switch sessions while a turn is active");
+            anyhow::bail!("switch_turn_active: cannot switch sessions while a turn is active");
         }
         if !self.active.state.pending_approvals().is_empty() {
-            anyhow::bail!("cannot switch sessions while an approval is pending");
+            anyhow::bail!(
+                "switch_approval_pending: cannot switch sessions while an approval is pending"
+            );
+        }
+        if !self.pending_operations.is_empty() || self.sync_target.is_some() {
+            anyhow::bail!(
+                "switch_operation_in_flight: cannot switch while {} is in flight",
+                self.pending_operations
+                    .keys()
+                    .copied()
+                    .chain(self.sync_target.is_some().then_some("sync"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         Ok(())
     }
 
-    fn drain_before_switch_commit(&mut self) -> anyhow::Result<()> {
+    fn begin_switch(&self) -> anyhow::Result<SwitchingGuard> {
+        // Publish before the caller's admission recheck. This ordering is
+        // load-bearing for modal routing; do not move it after the check.
+        self.switching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                anyhow::anyhow!("switch_in_progress: a session switch is already active")
+            })?;
+        Ok(SwitchingGuard(Arc::clone(&self.switching)))
+    }
+
+    fn commit_candidate(&mut self, candidate: TuiSession) -> anyhow::Result<()> {
+        let departed_session = self.active.state.session_id().to_string();
+        let old_active = std::mem::replace(&mut self.active, candidate.active);
+        self.last_detached_session = Some(departed_session);
+        self.pending_operations.clear();
+        self.sync_target = None;
+        tokio::spawn(old_active.controller.shutdown());
+        Ok(())
+    }
+
+    fn require_live_rollback_target(&mut self) -> anyhow::Result<()> {
+        match self.drain_before_switch_commit() {
+            OldAttachmentStatus::Live => Ok(()),
+            OldAttachmentStatus::Dead(reason) => anyhow::bail!(
+                "switch_rollback_unavailable: candidate failed after current session disconnected: \
+                 {reason}"
+            ),
+        }
+    }
+
+    fn drain_before_switch_commit(&mut self) -> OldAttachmentStatus {
         while let Some(update) = self.poll() {
             match update {
                 TuiSessionUpdate::Updated => {}
-                TuiSessionUpdate::Failed(message) => anyhow::bail!("{message}"),
+                TuiSessionUpdate::Failed(message) => return OldAttachmentStatus::Dead(message),
                 TuiSessionUpdate::Detached | TuiSessionUpdate::Stopped => {
-                    anyhow::bail!("current session disconnected during switch")
+                    return OldAttachmentStatus::Dead(
+                        "current session disconnected during switch".to_string(),
+                    )
                 }
             }
+        }
+        OldAttachmentStatus::Live
+    }
+
+    pub fn try_send(
+        &mut self,
+        command: SessionControllerCommand,
+    ) -> Result<(), ControllerSendError> {
+        let blocks_switch = command.blocks_switch();
+        if blocks_switch && self.switching.load(Ordering::Acquire) {
+            return Err(ControllerSendError::SwitchInProgress);
+        }
+        let operation = command.operation();
+        if blocks_switch && self.pending_operations.contains_key(operation) {
+            return Err(ControllerSendError::OperationInFlight);
+        }
+        let pending = pending_operation(&command);
+        self.active.controller.try_send(command)?;
+        if let Some(pending) = pending {
+            self.pending_operations.insert(operation, pending);
         }
         Ok(())
     }
 
-    pub fn try_send(&self, command: SessionControllerCommand) -> Result<(), ControllerSendError> {
-        self.active.controller.try_send(command)
-    }
-
-    pub async fn send(&self, command: SessionControllerCommand) -> Result<(), ControllerSendError> {
-        self.active.controller.send(command).await
+    pub async fn send(
+        &mut self,
+        command: SessionControllerCommand,
+    ) -> Result<(), ControllerSendError> {
+        let blocks_switch = command.blocks_switch();
+        if blocks_switch && self.switching.load(Ordering::Acquire) {
+            return Err(ControllerSendError::SwitchInProgress);
+        }
+        let operation = command.operation();
+        if blocks_switch && self.pending_operations.contains_key(operation) {
+            return Err(ControllerSendError::OperationInFlight);
+        }
+        let pending = pending_operation(&command);
+        self.active.controller.send(command).await?;
+        if let Some(pending) = pending {
+            self.pending_operations.insert(operation, pending);
+        }
+        Ok(())
     }
 
     pub async fn set_config(
@@ -330,6 +463,22 @@ impl TuiSession {
                     }
                     SessionControllerEvent::StateChanged { state, outcome } => {
                         self.active.state = state;
+                        match &outcome {
+                            SessionClientOutcome::RequestedSync { expected_seq } => {
+                                self.sync_target =
+                                    Some(self.sync_target.unwrap_or_default().max(*expected_seq));
+                            }
+                            SessionClientOutcome::AppliedSnapshot(_) => {
+                                self.sync_target = None;
+                                self.pending_operations.clear();
+                            }
+                            SessionClientOutcome::AppliedEvent(seq)
+                                if self.sync_target.is_some_and(|target| *seq >= target) =>
+                            {
+                                self.sync_target = None;
+                            }
+                            _ => {}
+                        }
                         if let SessionClientOutcome::CommandResult {
                             request_id,
                             operation,
@@ -339,6 +488,7 @@ impl TuiSession {
                             if operation == expected_operation
                                 && accepted_request_id.as_deref() == Some(request_id.as_str())
                             {
+                                self.pending_operations.remove(operation.as_str());
                                 return Ok(());
                             }
                         }
@@ -346,11 +496,13 @@ impl TuiSession {
                     SessionControllerEvent::Failed { operation, message }
                         if operation == expected_operation =>
                     {
+                        self.pending_operations.remove(operation);
                         anyhow::bail!("daemon rejected {expected_operation}: {message}")
                     }
                     SessionControllerEvent::CommandRejected { operation, message }
                         if operation == expected_operation =>
                     {
+                        self.pending_operations.remove(operation);
                         anyhow::bail!("{operation}: {message}")
                     }
                     SessionControllerEvent::Detached | SessionControllerEvent::Stopped => {
@@ -358,6 +510,8 @@ impl TuiSession {
                     }
                     SessionControllerEvent::Attached { .. }
                     | SessionControllerEvent::Reconnected { .. } => {
+                        self.pending_operations.clear();
+                        self.sync_target = None;
                         anyhow::bail!(
                             "session attachment changed while waiting for {expected_operation}"
                         );
@@ -425,9 +579,46 @@ impl TuiSession {
             } => {
                 state.push_system_message(message);
                 self.active.state = state;
+                self.sync_target = None;
+                self.pending_operations.clear();
                 TuiSessionUpdate::Updated
             }
             SessionControllerEvent::StateChanged { mut state, outcome } => {
+                match &outcome {
+                    SessionClientOutcome::RequestedSync { expected_seq } => {
+                        self.sync_target =
+                            Some(self.sync_target.unwrap_or_default().max(*expected_seq));
+                    }
+                    SessionClientOutcome::AppliedSnapshot(_) => {
+                        self.sync_target = None;
+                        self.pending_operations.clear();
+                    }
+                    SessionClientOutcome::AppliedEvent(seq) => {
+                        if self.sync_target.is_some_and(|target| *seq >= target) {
+                            self.sync_target = None;
+                        }
+                    }
+                    SessionClientOutcome::CommandResult { operation, .. } => {
+                        self.pending_operations.remove(operation.as_str());
+                    }
+                    _ => {}
+                }
+                if !matches!(
+                    state.turn_status(),
+                    TurnStatus::Idle | TurnStatus::Cancelled
+                ) {
+                    self.pending_operations.remove("prompt");
+                }
+                // One correlated approval is valid because queueing rejects a
+                // second in-flight operation of the same kind.
+                let resolved_approval = matches!(
+                    self.pending_operations.get("approve"),
+                    Some(PendingOperation::Approval(id))
+                        if !state.pending_approvals().iter().any(|request| request.id == *id)
+                );
+                if resolved_approval {
+                    self.pending_operations.remove("approve");
+                }
                 match outcome {
                     SessionClientOutcome::Revoked { code, reason } => {
                         self.active.state = state;
@@ -452,6 +643,7 @@ impl TuiSession {
             }
             SessionControllerEvent::CommandAccepted { .. } => TuiSessionUpdate::Updated,
             SessionControllerEvent::CommandRejected { operation, message } => {
+                self.pending_operations.remove(operation);
                 self.active
                     .state
                     .push_system_message(format!("{operation}: {message}"));
@@ -462,6 +654,7 @@ impl TuiSession {
             }
             SessionControllerEvent::Detached => TuiSessionUpdate::Detached,
             SessionControllerEvent::Failed { operation, message } => {
+                self.pending_operations.remove(operation);
                 TuiSessionUpdate::Failed(format!("{operation}: {message}"))
             }
             SessionControllerEvent::Stopped => TuiSessionUpdate::Stopped,
@@ -482,8 +675,9 @@ mod tests {
     use crate::client_transport::{in_memory_transport_pair, ClientTransport};
     use crate::session_controller::SessionControllerHandle;
     use crate::session_protocol::{
-        ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage, RevocationCode,
-        ServerMessage, SessionEvent, SessionSnapshot, SessionUsage, TurnStatus, PROTOCOL_VERSION,
+        ApprovalDecision, ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage,
+        RevocationCode, ServerMessage, SessionEvent, SessionSnapshot, SessionUsage, TurnStatus,
+        PROTOCOL_VERSION,
     };
 
     fn controller() -> (impl ClientTransport, SessionControllerHandle) {
@@ -595,6 +789,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_admission_accepts_only_quiescent_operation_free_state() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+
+        for status in [TurnStatus::Idle, TurnStatus::Cancelled] {
+            let mut state = snapshot("session-a");
+            state.turn_status = status;
+            session.active.state.apply_snapshot(state);
+            assert!(session.ensure_switch_allowed().is_ok());
+        }
+        for status in [
+            TurnStatus::Running,
+            TurnStatus::WaitingForApproval,
+            TurnStatus::Cancelling,
+        ] {
+            let mut state = snapshot("session-a");
+            state.turn_status = status;
+            session.active.state.apply_snapshot(state);
+            assert!(session
+                .ensure_switch_allowed()
+                .unwrap_err()
+                .to_string()
+                .starts_with("switch_turn_active:"));
+        }
+
+        session.active.state.apply_snapshot(snapshot("session-a"));
+        for operation in [
+            "prompt",
+            "interrupt",
+            "approve",
+            "set_config",
+            "stop_session",
+            "clear_history",
+        ] {
+            session
+                .pending_operations
+                .insert(operation, PendingOperation::Generic);
+            assert!(session
+                .ensure_switch_allowed()
+                .unwrap_err()
+                .to_string()
+                .starts_with("switch_operation_in_flight:"));
+            session.pending_operations.clear();
+        }
+        session.sync_target = Some(9);
+        assert!(session
+            .ensure_switch_allowed()
+            .unwrap_err()
+            .to_string()
+            .starts_with("switch_operation_in_flight:"));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn switching_rejects_every_mutating_controller_command() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        session.switching.store(true, Ordering::Release);
+        let commands = vec![
+            SessionControllerCommand::Prompt { text: "x".into() },
+            SessionControllerCommand::Interrupt,
+            SessionControllerCommand::Approve {
+                approval_id: "approval-1".into(),
+                decision: ApprovalDecision::Deny,
+            },
+            SessionControllerCommand::SetConfig {
+                config_id: "model".into(),
+                value: RuntimeValue::String("other".into()),
+            },
+            SessionControllerCommand::StopSession,
+            SessionControllerCommand::ClearHistory,
+        ];
+        for command in commands {
+            assert_eq!(
+                session.try_send(command),
+                Err(ControllerSendError::SwitchInProgress)
+            );
+        }
+        session.switching.store(false, Ordering::Release);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_operation_kind_is_rejected_until_canonical_resolution() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        session
+            .try_send(SessionControllerCommand::Prompt { text: "one".into() })
+            .unwrap();
+        assert_eq!(
+            session.try_send(SessionControllerCommand::Prompt { text: "two".into() }),
+            Err(ControllerSendError::OperationInFlight)
+        );
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn approval_operation_clears_when_its_id_resolves_with_others_pending() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        let request = |id: &str| crate::session_protocol::ApprovalRequest {
+            id: id.to_string(),
+            tool_call_id: format!("tool-{id}"),
+            tool: "exec".to_string(),
+            detail: "cargo test".to_string(),
+            allow_always_available: false,
+            ineligible_deadline_unix_ms: None,
+            deadline_paused: false,
+        };
+        let mut state = snapshot("session-a");
+        state.pending_approvals = vec![request("one"), request("two")];
+        server
+            .send(&ServerMessage::Snapshot { seq: 0, state })
+            .await
+            .unwrap();
+        assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+        session
+            .pending_operations
+            .insert("approve", PendingOperation::Approval("one".to_string()));
+        server
+            .send(&ServerMessage::Event {
+                seq: 1,
+                event: SessionEvent::ApprovalResolved {
+                    approval_id: "one".to_string(),
+                    decision: ApprovalDecision::Deny,
+                    resolved_by: "tui".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+        assert!(!session.pending_operations.contains_key("approve"));
+        assert_eq!(session.state().pending_approvals().len(), 1);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_reconnect_snapshot_reconciles_pending_operations() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        session
+            .pending_operations
+            .insert("prompt", PendingOperation::Generic);
+        session.sync_target = Some(4);
+        let mut state = ViewState::new("session-a");
+        state.apply_snapshot(snapshot("session-a"));
+        session.apply(EpochEvent {
+            epoch: session.active.epoch,
+            event: SessionControllerEvent::Reconnected {
+                state,
+                granted_capabilities: vec![ClientCapability::Observe],
+                message: "reconnected".to_string(),
+            },
+        });
+        assert!(session.pending_operations.is_empty());
+        assert_eq!(session.sync_target, None);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_reaching_sync_target_clears_switch_block() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        server
+            .send(&ServerMessage::Event {
+                seq: 2,
+                event: SessionEvent::AssistantDelta {
+                    text: "late".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+        assert_eq!(session.sync_target, Some(1));
+        assert!(matches!(
+            server.recv().await.unwrap(),
+            Some(ClientMessage::SyncRequest { last_seen_seq: 0 })
+        ));
+
+        server
+            .send(&ServerMessage::Event {
+                seq: 1,
+                event: SessionEvent::AssistantDelta {
+                    text: "replayed".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+        assert_eq!(session.sync_target, None);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn switch_commits_whole_candidate_then_detaches_old_controller() {
         let (old_server, old_controller) = controller();
         let (target_server, target_controller) = controller();
@@ -686,6 +1110,7 @@ mod tests {
         drop(switching);
 
         assert_eq!(session.state().session_id(), "session-a");
+        assert!(!session.switching.load(Ordering::Acquire));
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), target_server.recv())
                 .await
@@ -747,9 +1172,108 @@ mod tests {
             .unwrap();
 
         let (result, session) = switching.await.unwrap();
-        assert!(result.unwrap_err().to_string().contains("approval"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("switch_approval_pending:"));
         assert_eq!(session.state().session_id(), "session-a");
         assert_eq!(session.state().pending_approvals().len(), 1);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn successful_candidate_commits_when_old_controller_dies_during_stage() {
+        let (old_server, old_controller) = controller();
+        let (target_server, target_controller) = controller();
+        let session = attach_switching(
+            old_controller,
+            &old_server,
+            "session-a",
+            controller_factory(vec![target_controller]),
+        )
+        .await;
+        let switching = tokio::spawn(async move {
+            let mut session = session;
+            let result = session.switch_to("session-b").await;
+            (result, session)
+        });
+        let Some(ClientMessage::Attach { .. }) = target_server.recv().await.unwrap() else {
+            panic!("expected candidate attach");
+        };
+        old_server
+            .send(&ServerMessage::Revoked {
+                code: Some(RevocationCode::SessionStopped),
+                reason: "old stopped".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        target_server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-b".into(),
+                granted_capabilities: vec![ClientCapability::Observe],
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        target_server
+            .send(&ServerMessage::Snapshot {
+                seq: 0,
+                state: snapshot("session-b"),
+            })
+            .await
+            .unwrap();
+
+        let (result, session) = switching.await.unwrap();
+        result.unwrap();
+        assert_eq!(session.state().session_id(), "session-b");
+        assert!(session.state().transcript().iter().any(|entry| entry
+            .text
+            .contains("previous session disconnected during switch")));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_reports_when_old_rollback_target_died() {
+        let (old_server, old_controller) = controller();
+        let (target_server, target_controller) = controller();
+        let session = attach_switching(
+            old_controller,
+            &old_server,
+            "session-a",
+            controller_factory(vec![target_controller]),
+        )
+        .await;
+        let switching = tokio::spawn(async move {
+            let mut session = session;
+            let result = session.switch_to("missing").await;
+            (result, session)
+        });
+        let Some(ClientMessage::Attach { .. }) = target_server.recv().await.unwrap() else {
+            panic!("expected candidate attach");
+        };
+        old_server
+            .send(&ServerMessage::Revoked {
+                code: Some(RevocationCode::SessionStopped),
+                reason: "old stopped".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        target_server
+            .send(&ServerMessage::AttachDenied {
+                code: Some(AttachDeniedCode::SessionNotFound),
+                reason: "session was not found".into(),
+            })
+            .await
+            .unwrap();
+
+        let (result, session) = switching.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("switch_rollback_unavailable:"));
         session.shutdown().await;
     }
 
@@ -792,6 +1316,52 @@ mod tests {
         let (result, session) = to_a.await.unwrap();
         result.unwrap();
         assert_eq!(session.state().session_id(), "session-a");
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_untyped_switch_back_denial_is_not_retried() {
+        let (server_a, controller_a) = controller();
+        let (server_b, controller_b) = controller();
+        let (legacy_server, legacy_controller) = controller();
+        let (unused_server, unused_controller) = controller();
+        let factory = controller_factory(vec![controller_b, legacy_controller, unused_controller]);
+        let session = attach_switching(controller_a, &server_a, "session-a", factory).await;
+
+        let to_b = tokio::spawn(async move {
+            let mut session = session;
+            session.switch_to("session-b").await.unwrap();
+            session
+        });
+        accept_attach(&server_b, "session-b").await;
+        let session = to_b.await.unwrap();
+
+        let to_a = tokio::spawn(async move {
+            let mut session = session;
+            let result = session.switch_to("session-a").await;
+            (result, session)
+        });
+        let Some(ClientMessage::Attach { .. }) = legacy_server.recv().await.unwrap() else {
+            panic!("expected legacy candidate attach");
+        };
+        legacy_server
+            .send(&ServerMessage::AttachDenied {
+                code: None,
+                reason: "client limit reached".to_string(),
+            })
+            .await
+            .unwrap();
+        let (result, session) = to_a.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("switch_attach_denied"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), unused_server.recv())
+                .await
+                .is_err(),
+            "legacy free text must never trigger typed retry"
+        );
         session.shutdown().await;
     }
 

@@ -1,0 +1,41 @@
+```rust
+pending_operations: BTreeMap<&'static str, PendingOperation>
+enum PendingOperation { Generic, Approval(String) }
+
+if blocks_switch && pending_operations.contains_key(operation) {
+    return Err(ControllerSendError::OperationInFlight);
+}
+```
+
+```rust
+// authoritative reconciliation
+AppliedSnapshot(_) => {
+    sync_target = None;
+    pending_operations.clear();
+}
+Reconnected { state, .. } => {
+    active.state = state;
+    sync_target = None;
+    pending_operations.clear();
+}
+
+let resolved = matches!(
+    pending_operations.get("approve"),
+    Some(PendingOperation::Approval(id))
+        if !state.pending_approvals().iter().any(|request| request.id == *id)
+);
+if resolved { pending_operations.remove("approve"); }
+```
+
+```rust
+// switch_to ordering
+// &mut self is serialization boundary; AtomicBool is modal advisory.
+let _switching = self.begin_switch()?; // publish first
+self.ensure_switch_allowed()?;         // then recheck all canonical/local state
+```
+
+Additional changes:
+- old-actor death notice now has `switch_old_session_lost:` stable prefix
+- legacy untyped AttachDenied switch-back test proves no free-text retry
+- AppliedSnapshot/Reconnected request paths also reconcile pending operations
+- tests for duplicate operation rejection, id-specific approval resolution, and reconnect reconciliation all pass
