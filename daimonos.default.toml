@@ -145,6 +145,12 @@ idle_retention_secs = 300
 session_list_page_size = 50
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
+# Maximum seconds a local frontend waits for a daemon command result.
+client_command_timeout_secs = 10
+# Maximum seconds to wait for an automatically started session daemon.
+bootstrap_timeout_secs = 15
+# Delay between automatic session-daemon connection attempts.
+bootstrap_retry_interval_ms = 50
 # Remote gateway security and liveness limits.
 remote_pairing_ttl_secs = 300
 remote_pairing_wait_secs = 300

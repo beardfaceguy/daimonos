@@ -335,6 +335,9 @@ the local TUI/UDS client, and future remote clients.
 | `idle_retention_secs` | `300` | Seconds before unloading a detached idle core while preserving its durable record for reattach; `0` keeps cores resident. |
 | `session_list_page_size` | `50` | Maximum entries returned by one daemon session-list page. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
+| `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
+| `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
+| `bootstrap_retry_interval_ms` | `50` | Delay between automatic session-daemon connection attempts. |
 | `remote_pairing_ttl_secs` | `300` | Lifetime of one single-use remote pairing claim. |
 | `remote_pairing_wait_secs` | `300` | Maximum wait for local approval of a pairing request. |
 | `remote_auth_timeout_secs` | `10` | Maximum time for the first remote authentication frame. |
@@ -369,6 +372,9 @@ accept_error_backoff_ms = 100
 idle_retention_secs = 0
 session_list_page_size = 50
 shutdown_grace_secs = 5
+client_command_timeout_secs = 10
+bootstrap_timeout_secs = 15
+bootstrap_retry_interval_ms = 50
 remote_pairing_ttl_secs = 300
 remote_pairing_wait_secs = 300
 remote_auth_timeout_secs = 10

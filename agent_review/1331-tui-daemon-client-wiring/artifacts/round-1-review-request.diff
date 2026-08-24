@@ -1,0 +1,247 @@
+Load-bearing actual code under review (full uncommitted workspace diff is in the named files):
+
+```rust
+// src/agent_runtime.rs — interactive branch
+if mode == tui::AgentMode::Interactive {
+    if let Some(provider) = provider {
+        anyhow::bail!(
+            "--provider '{provider}' cannot override a running session daemon; start the daemon with that provider"
+        );
+    }
+    let socket_path = cfg.session.resolved_socket_path(workspace);
+    let stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .map_err(|error| anyhow::anyhow!(
+            "session daemon is unavailable at {}: {error}; start `daimonos --workspace {} session-daemon`",
+            socket_path.display(), workspace.display()
+        ))?;
+    let transport = crate::client_transport::UnixFrontendTransport::new(
+        stream,
+        format!("session daemon {}", socket_path.display()),
+        cfg.session.max_frame_bytes,
+    )?;
+    let controller = crate::session_controller::SessionControllerHandle::spawn(
+        transport,
+        crate::session_protocol::ClientInfo {
+            id: "tui".to_string(),
+            kind: crate::session_protocol::ClientKind::Terminal,
+            label: format!("terminal {}", workspace.display()),
+        },
+        vec![
+            ClientCapability::Observe, ClientCapability::Prompt,
+            ClientCapability::Configure, ClientCapability::Interrupt,
+            ClientCapability::Stop, ClientCapability::ApproveOnce,
+            ClientCapability::ApproveAlways,
+        ],
+        cfg.tui.scrollback_entries,
+        cfg.session.event_queue_capacity,
+        cfg.session.event_queue_capacity,
+    );
+    return tui::run_tui(controller, tui::TuiOptions {
+        initial_prompt: task,
+        no_color,
+        model_override: model,
+        history_entries: cfg.tui.history_entries,
+    }).await;
+}
+```
+
+```rust
+// src/client_transport.rs — frontend side of framed Unix transport
+pub struct UnixFrontendTransport {
+    reader: UnixReadState,
+    writer: OwnedWriteHalf,
+    peer_label: String,
+    max_frame_bytes: usize,
+}
+
+#[async_trait]
+impl FrontendTransport for UnixFrontendTransport {
+    async fn send(&mut self, message: ClientMessage) -> Result<(), TransportError> {
+        let frame = encode_frame(&message, self.max_frame_bytes)?;
+        self.writer.write_all(&frame).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<ServerMessage>, TransportError> {
+        let Some(frame) = read_frame(&mut self.reader, self.max_frame_bytes).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&frame)?))
+    }
+
+    fn peer_label(&self) -> &str { &self.peer_label }
+}
+```
+
+```rust
+// src/session_controller.rs — bounded actor
+pub struct SessionControllerHandle {
+    epoch: u64,
+    commands: mpsc::Sender<SessionControllerCommand>,
+    events: mpsc::Receiver<EpochEvent>,
+    task: JoinHandle<()>,
+}
+
+async fn emit(sender: &mpsc::Sender<EpochEvent>, epoch: u64, event: SessionControllerEvent) -> bool {
+    sender.try_send(EpochEvent { epoch, event }).is_ok()
+}
+
+async fn run_controller<T: FrontendTransport>(
+    epoch: u64,
+    mut client: SessionClient<T>,
+    mut commands: mpsc::Receiver<SessionControllerCommand>,
+    events: mpsc::Sender<EpochEvent>,
+) {
+    loop {
+        if client.is_attached() {
+            tokio::select! {
+                biased;
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    if !handle_command(epoch, &mut client, command, &events).await { break; }
+                }
+                received = client.receive() => {
+                    match received {
+                        Ok(outcome) => {
+                            let state = client.state().clone();
+                            if !emit(&events, epoch, SessionControllerEvent::StateChanged { state, outcome }).await { break; }
+                        }
+                        Err(error) => {
+                            if !emit_failure(&events, epoch, "receive", &error).await { break; }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            let Some(command) = commands.recv().await else { break; };
+            if !handle_command(epoch, &mut client, command, &events).await { break; }
+        }
+    }
+    let _ = emit(&events, epoch, SessionControllerEvent::Stopped).await;
+}
+
+impl SessionControllerHandle {
+    pub async fn shutdown(mut self) {
+        let _ = self.commands.send(SessionControllerCommand::Shutdown).await;
+        let _ = (&mut self.task).await;
+    }
+}
+```
+
+```rust
+// src/tui/session.rs — canonical-state adapter
+pub struct TuiSession {
+    controller: SessionControllerHandle,
+    epoch: u64,
+    state: ViewState,
+}
+
+impl TuiSession {
+    pub async fn attach(mut controller: SessionControllerHandle) -> anyhow::Result<Self> {
+        let epoch = controller.epoch();
+        controller.send(SessionControllerCommand::Attach { session_id: None }).await
+            .map_err(|error| anyhow::anyhow!("failed to queue daemon attach: {error:?}"))?;
+        loop {
+            let event = controller.recv().await
+                .ok_or_else(|| anyhow::anyhow!("session controller stopped during attach"))?;
+            if event.epoch != epoch { continue; }
+            match event.event {
+                SessionControllerEvent::Attached { state, .. } => return Ok(Self { controller, epoch, state }),
+                SessionControllerEvent::Failed { message, .. } => anyhow::bail!("daemon attach failed: {message}"),
+                SessionControllerEvent::Stopped => anyhow::bail!("session controller stopped during attach"),
+                _ => {}
+            }
+        }
+    }
+
+    pub async fn set_config(&mut self, config_id: impl Into<String>, value: RuntimeValue) -> anyhow::Result<()> {
+        self.send(SessionControllerCommand::SetConfig { config_id: config_id.into(), value }).await
+            .map_err(|error| anyhow::anyhow!("failed to queue config change: {error:?}"))?;
+        let mut accepted_request_id = None;
+        loop {
+            let event = self.controller.recv().await
+                .ok_or_else(|| anyhow::anyhow!("controller stopped during config change"))?;
+            if event.epoch != self.epoch { continue; }
+            match event.event {
+                SessionControllerEvent::CommandAccepted { operation: "set_config", request_id: Some(id) } => accepted_request_id = Some(id),
+                SessionControllerEvent::StateChanged { state, outcome } => {
+                    self.state = state;
+                    if let SessionClientOutcome::CommandResult { request_id, operation, .. } = outcome {
+                        if operation == "set_config" && accepted_request_id.as_deref() == Some(request_id.as_str()) { return Ok(()); }
+                    }
+                }
+                SessionControllerEvent::Failed { operation: "set_config", message } => anyhow::bail!("daemon rejected config change: {message}"),
+                SessionControllerEvent::Detached | SessionControllerEvent::Stopped => anyhow::bail!("controller stopped during config change"),
+                SessionControllerEvent::Attached { state, .. } => self.state = state,
+                _ => {}
+            }
+        }
+    }
+
+    pub fn poll(&mut self) -> Option<TuiSessionUpdate> {
+        match self.controller.try_recv() {
+            Ok(event) => Some(self.apply(event)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(TuiSessionUpdate::Stopped),
+        }
+    }
+
+    pub async fn shutdown(self) { self.controller.shutdown().await; }
+}
+```
+
+```rust
+// src/tui/app.rs — startup ordering and event loop core
+pub async fn run(controller: SessionControllerHandle, options: TuiOptions) -> anyhow::Result<()> {
+    let mut session = TuiSession::attach(controller).await?;
+    if let Some(model) = options.model_override.as_deref() {
+        let candidate = RuntimeValue::String(model.to_string());
+        let option = session.state().runtime_options().iter().find(|o| o.id == "model")
+            .ok_or_else(|| anyhow::anyhow!("the daemon does not advertise a model option"))?;
+        if !option.accepts(&candidate) { anyhow::bail!("model '{model}' is not offered by the running session daemon"); }
+        session.set_config("model", candidate).await?;
+    }
+    let initial_prompt = options.initial_prompt.filter(|p| !p.trim().is_empty());
+    if let Some(prompt) = initial_prompt.as_ref() {
+        if !matches!(session.state().turn_status(), TurnStatus::Idle | TurnStatus::Cancelled) {
+            anyhow::bail!("new daemon session was not idle; initial prompt was not sent");
+        }
+        session.send(SessionControllerCommand::Prompt { text: prompt.clone() }).await?;
+    }
+    let mut guard = TerminalGuard::enter()?;
+    // terminal setup, bounded poll/render/input loop
+    let outcome = run_event_loop(/* terminal state */, &mut session).await;
+    guard.restore();
+    session.shutdown().await;
+    outcome
+}
+
+// The actual loop drains session.poll(), renders session.state(), and maps:
+// prompt -> Prompt; Ctrl-C -> Interrupt; approval keys -> Approve;
+// /model -> SetConfig; /quit or /detach -> loop exit then shutdown/Detach;
+// /stop-session -> StopSession then shutdown. Clear/usage/compact show an
+// explicit deferred-protocol notice rather than mutating local session state.
+```
+
+```rust
+// src/session_client.rs — preserve request identity for daemon confirmation
+pub async fn set_config(&mut self, config_id: impl Into<String>, value: RuntimeValue) -> Result<String, SessionClientError> {
+    self.require(ClientCapability::Configure)?;
+    let request_id = self.next_request_id("set-config");
+    self.transport.send(ClientMessage::SetConfig {
+        request_id: Some(request_id.clone()), config_id: config_id.into(), value,
+    }).await?;
+    Ok(request_id)
+}
+```
+
+Tests added/updated in the actual code:
+- Unix frontend client/server message roundtrip.
+- Controller unique epochs, attach, command forwarding, bounded backpressure, and disconnect termination.
+- TUI canonical attach, detach wire behavior, prompt/event flow, and config-change wait for CommandResult.
+- PTY CLI test verifies interactive mode attempts daemon connection before loading agent env.
+
+Verification already run: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test (1679 tests); pytest tests/ -v (294 passed).

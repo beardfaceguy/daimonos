@@ -450,6 +450,12 @@ pub struct SessionRuntimeConfig {
     pub session_list_page_size: usize,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
+    /// Maximum wait for a daemon command result in a local frontend.
+    pub client_command_timeout_secs: u64,
+    /// Maximum wait for a bootstrapped session daemon to accept connections.
+    pub bootstrap_timeout_secs: u64,
+    /// Delay between session-daemon bootstrap connection attempts.
+    pub bootstrap_retry_interval_ms: u64,
     /// Lifetime of a single-use remote pairing claim.
     pub remote_pairing_ttl_secs: u64,
     /// Maximum time a remote pairing socket waits for local consent.
@@ -498,6 +504,9 @@ impl Default for SessionRuntimeConfig {
             idle_retention_secs: 300,
             session_list_page_size: 50,
             shutdown_grace_secs: 5,
+            client_command_timeout_secs: 10,
+            bootstrap_timeout_secs: 15,
+            bootstrap_retry_interval_ms: 50,
             remote_pairing_ttl_secs: 300,
             remote_pairing_wait_secs: 300,
             remote_auth_timeout_secs: 10,
@@ -554,6 +563,19 @@ impl SessionRuntimeConfig {
         }
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
+        }
+        if self.client_command_timeout_secs == 0 {
+            return Err(
+                "session.client_command_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.bootstrap_timeout_secs == 0 {
+            return Err("session.bootstrap_timeout_secs must be greater than zero".to_string());
+        }
+        if self.bootstrap_retry_interval_ms == 0 {
+            return Err(
+                "session.bootstrap_retry_interval_ms must be greater than zero".to_string(),
+            );
         }
         for (field, is_zero) in [
             ("remote_pairing_ttl_secs", self.remote_pairing_ttl_secs == 0),
@@ -1883,6 +1905,9 @@ mod tests {
         assert_eq!(cfg.session.idle_retention_secs, 300);
         assert_eq!(cfg.session.session_list_page_size, 50);
         assert_eq!(cfg.session.shutdown_grace_secs, 5);
+        assert_eq!(cfg.session.client_command_timeout_secs, 10);
+        assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
+        assert_eq!(cfg.session.bootstrap_retry_interval_ms, 50);
         assert_eq!(cfg.session.max_frame_bytes, 1_048_576);
         assert_eq!(cfg.session.max_prompt_bytes, 131_072);
         assert_eq!(cfg.session.max_identifier_bytes, 128);
@@ -2227,6 +2252,19 @@ mod tests {
             .validate()
             .expect_err("zero session list page size must be rejected")
             .contains("session.session_list_page_size"));
+        let invalid: Config =
+            toml::from_str("[session]\nclient_command_timeout_secs = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero client command timeout must be rejected")
+            .contains("session.client_command_timeout_secs"));
+        for field in ["bootstrap_timeout_secs", "bootstrap_retry_interval_ms"] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero bootstrap limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
         let invalid: Config = toml::from_str(
             "[session]\nmax_frame_bytes = 256\nmax_prompt_bytes = 32\n\
              max_tool_event_output_bytes = 32\n",

@@ -1,6 +1,7 @@
 //! Daemon-owned interactive agent sessions (Vikunja #1096).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -1309,6 +1310,14 @@ impl SessionDaemon {
                                     message: message.to_string(),
                                 })
                                 .await?;
+                        } else if let Some(request_id) = request_id {
+                            transport
+                                .send(&ServerMessage::CommandResult {
+                                    request_id,
+                                    operation: "set_config".to_string(),
+                                    changed: true,
+                                })
+                                .await?;
                         }
                     }
                     Some(message @ ClientMessage::ListSessions { .. }) => {
@@ -1532,6 +1541,7 @@ struct SocketPathGuard {
     device: u64,
     inode: u64,
     _lock_file: std::fs::File,
+    instance_file: Option<(PathBuf, u64, u64)>,
 }
 
 struct HandshakeSessionGuard<'a> {
@@ -1562,6 +1572,9 @@ impl Drop for HandshakeSessionGuard<'_> {
 
 impl Drop for SocketPathGuard {
     fn drop(&mut self) {
+        if let Some(instance_file) = &self.instance_file {
+            remove_matching_regular_file(instance_file);
+        }
         let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
             return;
         };
@@ -1570,6 +1583,14 @@ impl Drop for SocketPathGuard {
             && metadata.ino() == self.inode
         {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn remove_matching_regular_file((path, device, inode): &(PathBuf, u64, u64)) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_file() && metadata.dev() == *device && metadata.ino() == *inode {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -1651,16 +1672,82 @@ fn bind_local_socket(
         }
         std::fs::remove_file(socket_path)?;
     }
-    let listener = tokio::net::UnixListener::bind(socket_path)?;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
-    let metadata = std::fs::symlink_metadata(socket_path)?;
+    // Publish identity before bind: once connect(2) can succeed, launchers are
+    // guaranteed to observe the complete atomically-renamed metadata file.
+    let instance_file = write_instance_metadata(socket_path)?;
+    let listener = match tokio::net::UnixListener::bind(socket_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            remove_matching_regular_file(&instance_file);
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+    {
+        let _ = std::fs::remove_file(socket_path);
+        remove_matching_regular_file(&instance_file);
+        return Err(error);
+    }
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = std::fs::remove_file(socket_path);
+            remove_matching_regular_file(&instance_file);
+            return Err(error);
+        }
+    };
     let guard = SocketPathGuard {
         path: socket_path.to_path_buf(),
         device: metadata.dev(),
         inode: metadata.ino(),
         _lock_file: lock_file,
+        instance_file: Some(instance_file),
     };
     Ok((listener, guard, metadata.uid()))
+}
+
+pub(crate) fn instance_metadata_path(socket_path: &Path) -> PathBuf {
+    let mut path = socket_path.as_os_str().to_os_string();
+    path.push(".pid");
+    PathBuf::from(path)
+}
+
+fn write_instance_metadata(socket_path: &Path) -> std::io::Result<(PathBuf, u64, u64)> {
+    let path = instance_metadata_path(socket_path);
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temporary = PathBuf::from(temporary);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "socket": socket_path,
+        "started_unix_ms": started_unix_ms,
+        "bootstrap_fingerprint": std::env::var(
+            crate::session_bootstrap::BOOTSTRAP_FINGERPRINT_ENV
+        ).ok(),
+    }))
+    .map_err(std::io::Error::other)?;
+    if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    Ok((path, metadata.dev(), metadata.ino()))
 }
 
 fn verify_peer_owner(stream: &tokio::net::UnixStream, owner_uid: u32) -> std::io::Result<()> {
@@ -3015,23 +3102,37 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(
-            client.recv().await,
-            Some(ServerMessage::Event {
-                event: SessionEvent::ContextUsageChanged { usage },
-                ..
-            }) if usage.prompt_tokens == 50
-                && usage.model_context_window == Some(200)
-                && usage.estimated
-        ));
-        assert!(matches!(
-            client.recv().await,
-            Some(ServerMessage::Event {
-                event: SessionEvent::RuntimeOptionsChanged { options },
-                ..
-            }) if options[0].value
-                == crate::session_protocol::RuntimeValue::String("model-b".to_string())
-        ));
+        let mut saw_context = false;
+        let mut saw_model = false;
+        let mut saw_result = false;
+        for _ in 0..3 {
+            match client.recv().await {
+                Some(ServerMessage::Event {
+                    event: SessionEvent::ContextUsageChanged { usage },
+                    ..
+                }) => {
+                    saw_context = usage.prompt_tokens == 50
+                        && usage.model_context_window == Some(200)
+                        && usage.estimated;
+                }
+                Some(ServerMessage::Event {
+                    event: SessionEvent::RuntimeOptionsChanged { options },
+                    ..
+                }) => {
+                    saw_model = options[0].value
+                        == crate::session_protocol::RuntimeValue::String("model-b".to_string());
+                }
+                Some(ServerMessage::CommandResult {
+                    request_id,
+                    operation,
+                    changed: true,
+                }) => {
+                    saw_result = request_id == "model-change" && operation == "set_config";
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_context && saw_model && saw_result);
         client
             .send(ClientMessage::SetConfig {
                 request_id: Some("thinking-change".to_string()),
@@ -3040,17 +3141,31 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(
-            client.recv().await,
-            Some(ServerMessage::Event {
-                event: SessionEvent::RuntimeOptionsChanged { options },
-                ..
-            }) if options.iter().any(|option|
-                option.id == "thinking"
-                    && option.value
-                        == crate::session_protocol::RuntimeValue::String("high".to_string())
-            )
-        ));
+        let mut saw_thinking = false;
+        let mut saw_result = false;
+        for _ in 0..2 {
+            match client.recv().await {
+                Some(ServerMessage::Event {
+                    event: SessionEvent::RuntimeOptionsChanged { options },
+                    ..
+                }) => {
+                    saw_thinking = options.iter().any(|option| {
+                        option.id == "thinking"
+                            && option.value
+                                == crate::session_protocol::RuntimeValue::String("high".to_string())
+                    });
+                }
+                Some(ServerMessage::CommandResult {
+                    request_id,
+                    operation,
+                    changed: true,
+                }) => {
+                    saw_result = request_id == "thinking-change" && operation == "set_config";
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_thinking && saw_result);
 
         client.send(ClientMessage::Detach).await.unwrap();
         serve.await.unwrap().unwrap();
@@ -4152,6 +4267,13 @@ mod tests {
                 & 0o777,
             0o600
         );
+        let instance_path = instance_metadata_path(&socket_path);
+        let instance_metadata = std::fs::metadata(&instance_path).unwrap();
+        assert_eq!(instance_metadata.permissions().mode() & 0o777, 0o600);
+        let instance: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&instance_path).unwrap()).unwrap();
+        assert_eq!(instance["pid"], std::process::id());
+        assert_eq!(instance["socket"], socket_path.to_string_lossy().as_ref());
         let (reader, mut writer) = stream.into_split();
         let attach = ClientMessage::Attach {
             protocol_version: crate::session_protocol::PROTOCOL_VERSION,
@@ -4181,6 +4303,7 @@ mod tests {
 
         serve.await.unwrap().unwrap();
         assert!(!socket_path.exists());
+        assert!(!instance_path.exists());
     }
 
     #[tokio::test]
@@ -4214,6 +4337,23 @@ mod tests {
         drop(listener);
         drop(guard);
         assert!(bind_local_socket(&socket_path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unix_listener_replaces_stale_owner_socket_under_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("session.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        drop(stale);
+        assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
+
+        let (listener, guard, _) = bind_local_socket(&socket_path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_ok());
+        drop(listener);
+        drop(guard);
+        assert!(!socket_path.exists());
+        assert!(!instance_metadata_path(&socket_path).exists());
     }
 
     #[test]
