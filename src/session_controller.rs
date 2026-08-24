@@ -62,7 +62,7 @@ pub enum SessionControllerCommand {
 }
 
 impl SessionControllerCommand {
-    fn operation(&self) -> &'static str {
+    pub(crate) fn operation(&self) -> &'static str {
         match self {
             Self::Attach { .. } => "attach",
             Self::Prompt { .. } => "prompt",
@@ -77,6 +77,18 @@ impl SessionControllerCommand {
             Self::Detach => "detach",
             Self::Shutdown => "shutdown",
         }
+    }
+
+    pub(crate) fn blocks_switch(&self) -> bool {
+        matches!(
+            self,
+            Self::Prompt { .. }
+                | Self::Interrupt
+                | Self::Approve { .. }
+                | Self::SetConfig { .. }
+                | Self::StopSession
+                | Self::ClearHistory
+        )
     }
 }
 
@@ -125,6 +137,8 @@ pub struct EpochEvent {
 pub enum ControllerSendError {
     Backpressure,
     Closed,
+    SwitchInProgress,
+    OperationInFlight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

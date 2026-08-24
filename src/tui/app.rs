@@ -413,6 +413,8 @@ fn queue(session: &mut TuiSession, command: SessionControllerCommand, operation:
         let reason = match error {
             ControllerSendError::Backpressure => "controller queue is full",
             ControllerSendError::Closed => "controller is closed",
+            ControllerSendError::SwitchInProgress => "switch_in_progress",
+            ControllerSendError::OperationInFlight => "operation already in flight",
         };
         notice(session, format!("{operation} failed: {reason}"));
     }

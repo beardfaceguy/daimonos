@@ -1,0 +1,57 @@
+```rust
+struct TuiSession {
+    active: ActiveSession,
+    // stable plumbing
+    switching: Arc<AtomicBool>,
+    pending_operations: BTreeSet<&'static str>,
+    sync_target: Option<u64>,
+}
+struct SwitchingGuard(Arc<AtomicBool>);
+impl Drop for SwitchingGuard { fn drop(&mut self) { self.0.store(false, Release); } }
+```
+
+```rust
+fn ensure_switch_allowed(&self) -> anyhow::Result<()> {
+    if !matches!(turn, Idle | Cancelled) { bail!("switch_turn_active: ..."); }
+    if !pending_approvals.is_empty() { bail!("switch_approval_pending: ..."); }
+    if !pending_operations.is_empty() || sync_target.is_some() {
+        bail!("switch_operation_in_flight: ...");
+    }
+    Ok(())
+}
+```
+
+```rust
+pub fn try_send(&mut self, command: SessionControllerCommand) -> Result<(), ControllerSendError> {
+    let blocks = command.blocks_switch();
+    if blocks && switching.load(Acquire) { return Err(SwitchInProgress); }
+    let operation = command.operation();
+    active.controller.try_send(command)?;
+    if blocks { pending_operations.insert(operation); }
+    Ok(())
+}
+```
+
+```rust
+// canonical clearing
+RequestedSync { expected_seq } => sync_target = Some(max(current, expected_seq)),
+AppliedSnapshot(_) | Reconnected => sync_target = None,
+AppliedEvent(seq) if seq >= target => sync_target = None,
+CommandResult { operation, .. } => pending_operations.remove(operation),
+nonquiescent canonical turn => pending_operations.remove("prompt"),
+empty canonical pending approvals => pending_operations.remove("approve"),
+CommandRejected/Failed => pending_operations.remove(operation),
+```
+
+```rust
+match old_drain {
+    Live => final ensure_switch_allowed(),
+    Dead(reason) => candidate.state.push_system_message(reason), // commit valid candidate
+}
+// candidate failure:
+if old_drain == Dead { bail!("switch_rollback_unavailable: ...") }
+```
+
+Stable errors: switch_in_progress, switch_turn_active, switch_approval_pending, switch_operation_in_flight, switch_unavailable, switch_connection_failed, switch_attach_denied, switch_attach_capacity, switch_rollback_unavailable.
+
+Tests: Idle+Cancelled allowed; all three active states block; each mutating op+sync blocks; each mutating command rejects during Switching; cancellation clears Switching; replay reaches sync target; delivered approval aborts; old death success commits; old death failure reports rollback unavailable; untyped legacy denial does not retry; typed cap=1 retry still passes.

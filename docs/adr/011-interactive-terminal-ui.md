@@ -101,6 +101,14 @@ after the final client-side check is not mixed into the new view: normal daemon
 eligibility semantics start its sticky ineligible deadline, and switching back
 before expiry pauses it.
 
+Switch admission is client-serialized and conservative: canonical turn state
+must be `Idle` or `Cancelled`, no approval may be pending, and no prompt,
+interrupt, approval response, configuration, stop, clear, or gap-recovery sync
+may be unresolved. While staging, mutating commands reject with the stable
+`switch_in_progress` code. Success commits even if the old actor dies during
+staging; candidate failure reports `switch_rollback_unavailable` when no live
+old attachment remains instead of claiming rollback succeeded.
+
 `/clear` is also daemon-authoritative: it is rejected during active turns,
 persists empty history, and emits a sequenced `ConversationCleared` event so
 every attached or replaying frontend resets at the same point. `/usage` reads
