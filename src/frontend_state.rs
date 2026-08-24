@@ -289,6 +289,13 @@ impl ViewState {
             SessionEvent::ContextUsageChanged { usage } => {
                 self.context_usage = Some(usage);
             }
+            SessionEvent::ConversationCleared => {
+                self.transcript.clear();
+                self.tool_calls.clear();
+                self.pending_approvals.clear();
+                self.history_truncated = false;
+                self.ending_reason = None;
+            }
             SessionEvent::TurnStatusChanged { status } => {
                 self.turn_status = status;
             }
@@ -438,6 +445,34 @@ mod tests {
         assert!(!state.transcript()[0].open);
         assert_eq!(state.transcript()[1].role, TranscriptRole::System);
         assert_eq!(state.transcript()[1].text, "help");
+    }
+
+    #[test]
+    fn canonical_clear_resets_conversation_projection_at_its_sequence() {
+        let mut state = ViewState::new("session-1");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::UserMessage {
+                text: "before".to_string(),
+                request_id: None,
+            },
+        );
+        ev(&mut state, 2, SessionEvent::ConversationCleared);
+        assert!(state.transcript().is_empty());
+        assert!(state.tool_calls().is_empty());
+        assert!(state.pending_approvals().is_empty());
+        assert_eq!(state.last_seq(), 2);
+
+        ev(
+            &mut state,
+            3,
+            SessionEvent::UserMessage {
+                text: "after".to_string(),
+                request_id: None,
+            },
+        );
+        assert_eq!(state.transcript()[0].text, "after");
     }
 
     #[test]

@@ -91,6 +91,12 @@ beside its socket for diagnostics and removes it with the socket. Session
 discovery and switching remain separate follow-up tasks, so the current command
 starts a fresh daemon-owned session.
 
+`/clear` is also daemon-authoritative: it is rejected during active turns,
+persists empty history, and emits a sequenced `ConversationCleared` event so
+every attached or replaying frontend resets at the same point. `/usage` reads
+typed process-lifetime cumulative usage directly from the daemon without
+polluting canonical replay.
+
 ### 4. Terminal correctness (hard requirements)
 
 - A RAII terminal guard **always** restores canonical mode, cursor, mouse/paste
@@ -113,7 +119,8 @@ starts a fresh daemon-owned session.
 2. **Pure view reducer + exhaustive unit tests.** *(this slice)*
 3. Streaming assistant output, tool lifecycle cards, interrupt (render layer).
 4. Permission modal + local control authority.
-5. Session/model/usage/remote-control commands + status bar.
+5. Session/model/usage/remote-control commands + status bar. *(model, clear,
+   and usage are daemon-backed; discovery and remote-control commands remain.)*
 6. Polish: bounded scrollback + navigation, prompt history, and no-color
    rendering are implemented; expandable diffs/terminal output, search/copy,
    resize/suspend, and broader accessibility remain.

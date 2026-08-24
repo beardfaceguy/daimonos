@@ -78,6 +78,12 @@ pub enum ClientMessage {
     StopSession {
         request_id: String,
     },
+    ClearHistory {
+        request_id: String,
+    },
+    GetUsage {
+        request_id: String,
+    },
     ListSessions {
         request_id: String,
         cursor: Option<String>,
@@ -130,6 +136,10 @@ pub enum ServerMessage {
         sessions: Vec<SessionListEntry>,
         next_cursor: Option<String>,
     },
+    Usage {
+        request_id: String,
+        usage: SessionUsage,
+    },
     Pong,
     Revoked {
         reason: String,
@@ -172,6 +182,20 @@ pub struct SessionListEntry {
     pub session_id: String,
     pub active: bool,
     pub attached_clients: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Cumulative usage for the current live daemon process. Session persistence
+/// does not yet retain these counters across daemon restarts.
+pub struct SessionUsage {
+    pub input: u64,
+    pub output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output: Option<u64>,
+    pub thinking_bytes: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd_micros: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +304,7 @@ pub enum SessionEvent {
     ContextUsageChanged {
         usage: ContextUsage,
     },
+    ConversationCleared,
     TurnStatusChanged {
         status: TurnStatus,
     },
@@ -602,6 +627,16 @@ impl ProtocolLimits {
                 request_id,
                 self.max_identifier_bytes,
             ),
+            ClientMessage::ClearHistory { request_id } => check(
+                "clear_history.request_id",
+                request_id,
+                self.max_identifier_bytes,
+            ),
+            ClientMessage::GetUsage { request_id } => check(
+                "get_usage.request_id",
+                request_id,
+                self.max_identifier_bytes,
+            ),
             ClientMessage::ListSessions { request_id, cursor } => check(
                 "list_sessions.request_id",
                 request_id,
@@ -671,6 +706,52 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ClientMessage>(with_future_field).unwrap(),
             message
+        );
+    }
+
+    #[test]
+    fn clear_and_usage_wire_shapes_are_additive_v2_commands() {
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ClearHistory {
+                request_id: "clear-1".to_string(),
+            })
+            .unwrap(),
+            json!({"type": "clear_history", "request_id": "clear-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::GetUsage {
+                request_id: "usage-1".to_string(),
+            })
+            .unwrap(),
+            json!({"type": "get_usage", "request_id": "usage-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::Usage {
+                request_id: "usage-1".to_string(),
+                usage: SessionUsage {
+                    input: 10,
+                    output: 5,
+                    reasoning_output: Some(2),
+                    thinking_bytes: 3,
+                    cache_read: 4,
+                    cache_write: 1,
+                    cost_usd_micros: 125_000,
+                },
+            })
+            .unwrap(),
+            json!({
+                "type": "usage",
+                "request_id": "usage-1",
+                "usage": {
+                    "input": 10,
+                    "output": 5,
+                    "reasoning_output": 2,
+                    "thinking_bytes": 3,
+                    "cache_read": 4,
+                    "cache_write": 1,
+                    "cost_usd_micros": 125000
+                }
+            })
         );
     }
 
@@ -1203,7 +1284,7 @@ mod tests {
         let events: Vec<ServerMessage> =
             serde_json::from_str(include_str!("../contracts/android/v2/event_stream.json"))
                 .unwrap();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
         assert!(events
             .iter()
             .all(|message| matches!(message, ServerMessage::Event { .. })));
@@ -1222,12 +1303,13 @@ mod tests {
             );
         }
         assert!(view.pending_approvals().is_empty());
-        assert_eq!(view.tool_calls()[0].status, ToolCallStateStatus::Completed);
+        assert!(view.tool_calls().is_empty());
+        assert!(view.transcript().is_empty());
 
         let commands: Vec<ClientMessage> =
             serde_json::from_str(include_str!("../contracts/android/v2/client_commands.json"))
                 .unwrap();
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 8);
         assert!(matches!(commands.last(), Some(ClientMessage::Detach)));
     }
 }

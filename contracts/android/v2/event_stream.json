@@ -45,5 +45,12 @@
         "type": "completed"
       }
     }
+  },
+  {
+    "type": "event",
+    "seq": 10,
+    "event": {
+      "type": "conversation_cleared"
+    }
   }
 ]

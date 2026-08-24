@@ -1,0 +1,67 @@
+```diff
+--- a/src/session_core.rs
++++ b/src/session_core.rs
+@@
++struct SessionMutationPermit<'a>(&'a AtomicBool);
++impl SessionMutationPermit<'_> {
++    fn acquire(active: &AtomicBool) -> Result<Self, HistoryMutationError> {
++        active.compare_exchange(false, true, AcqRel, Acquire)
++            .map(|_| Self(active)).map_err(|_| HistoryMutationError::Busy)
++    }
++}
++impl Drop for SessionMutationPermit<'_> {
++    fn drop(&mut self) { self.0.store(false, Release); }
++}
+@@
+ pub struct SessionCore {
++    mutation_active: AtomicBool,
+ }
+@@
+ pub fn begin_turn(&self) -> Result<SessionTurn<'_>, TurnError> {
++    if self.mutation_active.load(Acquire) { return Err(TurnError::Busy); }
+     let active = self.turn.begin()?;
++    if self.mutation_active.load(Acquire) {
++        drop(active);
++        return Err(TurnError::Busy);
++    }
+     // emit Running and return
+ }
+@@
+ pub async fn clear_history(&self) -> Result<bool, HistoryMutationError> {
++    let _mutation = SessionMutationPermit::acquire(&self.mutation_active)?;
+     if self.turn.is_active() { return Err(Busy); }
+     let _lifecycle = self.lifecycle.lock().await;
+     // clear memory, persist empty state, emit clear + zero context
+ }
+@@ prompt terminal ordering
+-drop(active_turn);
+ if let (Some(messages), Some(ids)) = (...) {
+     self.persist(&model, &messages, &ids);
+ }
++// Keep active permit through terminal persistence so /clear cannot be
++// followed by a late old-history rewrite.
++drop(active_turn);
+```
+
+```diff
+--- a/src/session_daemon.rs
++++ b/src/session_daemon.rs
+@@ SnapshotState::apply
+ SessionEvent::ConversationCleared => {
+     transcript.clear();
+     tool_calls.clear();
+     pending_approvals.clear();
+     history_truncated = false;
+-    next_transcript_id = 1;
+ }
+```
+
+Tests added/revised:
+- canonical_clear_resets_memory_persistence_and_snapshot pauses clear after mutation permit acquisition and asserts begin_turn is Busy.
+- attach_waits_for_the_same_admission_gate_as_clear holds SessionEntry.admission and proves attach blocks until release.
+- clear_and_usage_commands_are_daemon_authoritative now emits a post-clear UserMessage and asserts its transcript ID exceeds the pre-clear ID.
+
+Additional non-blocking follow-ups applied:
+- SessionUsage documents process-lifetime scope.
+- invalid/non-finite/negative cumulative costs emit debug diagnostics before mapping to zero.
+- GetUsage handler documents why active turns are rejected instead of waiting on the whole-turn AgentSession mutex.

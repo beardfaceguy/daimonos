@@ -37,6 +37,8 @@ pub enum SessionControllerCommand {
         value: RuntimeValue,
     },
     StopSession,
+    ClearHistory,
+    GetUsage,
     Ping,
     Detach,
     Shutdown,
@@ -51,6 +53,8 @@ impl SessionControllerCommand {
             Self::Approve { .. } => "approve",
             Self::SetConfig { .. } => "set_config",
             Self::StopSession => "stop_session",
+            Self::ClearHistory => "clear_history",
+            Self::GetUsage => "get_usage",
             Self::Ping => "ping",
             Self::Detach => "detach",
             Self::Shutdown => "shutdown",
@@ -316,6 +320,12 @@ async fn handle_command<T: FrontendTransport>(
                 .map(|id| (Some(id), None)),
             SessionControllerCommand::StopSession => {
                 client.stop_session().await.map(|id| (Some(id), None))
+            }
+            SessionControllerCommand::ClearHistory => {
+                client.clear_history().await.map(|id| (Some(id), None))
+            }
+            SessionControllerCommand::GetUsage => {
+                client.get_usage().await.map(|id| (Some(id), None))
             }
             SessionControllerCommand::Ping => client.ping().await.map(|()| (None, None)),
             SessionControllerCommand::Detach => client

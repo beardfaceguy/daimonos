@@ -36,6 +36,14 @@
     "last_seen_seq": 8
   },
   {
+    "type": "get_usage",
+    "request_id": "usage-1"
+  },
+  {
+    "type": "clear_history",
+    "request_id": "clear-1"
+  },
+  {
     "type": "detach"
   }
 ]

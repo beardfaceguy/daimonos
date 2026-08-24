@@ -1127,6 +1127,97 @@ impl SessionDaemon {
                             }
                         }
                     }
+                    Some(message @ ClientMessage::ClearHistory { .. }) => {
+                        if let Err(error) = limits.validate_client_message(&message) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: request_id(&message),
+                                    code: "invalid_message".to_string(),
+                                    message: format!("{error:?}"),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        if !attachment.has_capability(ClientCapability::Configure) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: request_id(&message),
+                                    code: "capability_denied".to_string(),
+                                    message: "configure capability was not granted".to_string(),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let ClientMessage::ClearHistory { request_id } = message else {
+                            unreachable!("matched clear history");
+                        };
+                        let _admission = attachment.entry.admission.lock().await;
+                        match attachment.core().clear_history().await {
+                            Ok(changed) => {
+                                transport
+                                    .send(&ServerMessage::CommandResult {
+                                        request_id,
+                                        operation: "clear_history".to_string(),
+                                        changed,
+                                    })
+                                    .await?;
+                            }
+                            Err(crate::session_core::HistoryMutationError::Busy) => {
+                                transport
+                                    .send(&ServerMessage::Error {
+                                        request_id: Some(request_id),
+                                        code: "session_busy".to_string(),
+                                        message: "history cannot be cleared while a turn is running"
+                                            .to_string(),
+                                    })
+                                    .await?;
+                            }
+                        }
+                    }
+                    Some(message @ ClientMessage::GetUsage { .. }) => {
+                        if let Err(error) = limits.validate_client_message(&message) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: request_id(&message),
+                                    code: "invalid_message".to_string(),
+                                    message: format!("{error:?}"),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        if !attachment.has_capability(ClientCapability::Observe) {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: request_id(&message),
+                                    code: "capability_denied".to_string(),
+                                    message: "observe capability was not granted".to_string(),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let ClientMessage::GetUsage { request_id } = message else {
+                            unreachable!("matched get usage");
+                        };
+                        // AgentSession owns cumulative usage behind the same
+                        // mutex held for a whole provider turn. Rejecting while
+                        // active is explicit and avoids making this read-only
+                        // query wait unpredictably for a long model/tool turn.
+                        let _admission = attachment.entry.admission.lock().await;
+                        if attachment.core().turn_is_active() {
+                            transport
+                                .send(&ServerMessage::Error {
+                                    request_id: Some(request_id),
+                                    code: "session_busy".to_string(),
+                                    message: "usage is available after the active turn".to_string(),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let usage = attachment.core().cumulative_usage().await;
+                        transport
+                            .send(&ServerMessage::Usage { request_id, usage })
+                            .await?;
+                    }
                     Some(message @ ClientMessage::ApprovalResponse { .. }) => {
                         if let Err(error) = limits.validate_client_message(&message) {
                             transport
@@ -1912,6 +2003,12 @@ impl SnapshotState {
             SessionEvent::ContextUsageChanged { usage } => {
                 self.snapshot.context_usage = Some(usage);
             }
+            SessionEvent::ConversationCleared => {
+                self.snapshot.transcript.clear();
+                self.snapshot.tool_calls.clear();
+                self.snapshot.pending_approvals.clear();
+                self.snapshot.history_truncated = false;
+            }
             SessionEvent::TurnStatusChanged { status } => {
                 self.snapshot.turn_status = status;
             }
@@ -2125,6 +2222,8 @@ fn request_id(message: &ClientMessage) -> Option<String> {
         ClientMessage::Prompt { request_id, .. } => Some(request_id.clone()),
         ClientMessage::Interrupt { request_id } => request_id.clone(),
         ClientMessage::StopSession { request_id } => Some(request_id.clone()),
+        ClientMessage::ClearHistory { request_id } => Some(request_id.clone()),
+        ClientMessage::GetUsage { request_id } => Some(request_id.clone()),
         ClientMessage::ListSessions { request_id, .. } => Some(request_id.clone()),
         ClientMessage::SetConfig { request_id, .. } => request_id.clone(),
         ClientMessage::Attach { .. }
@@ -2395,6 +2494,75 @@ mod tests {
         test_core_with_provider(Box::new(StaticProvider))
     }
 
+    #[tokio::test]
+    async fn canonical_clear_resets_memory_persistence_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::new(directory.path().to_path_buf());
+        let core = test_core_with_options(
+            Box::new(StaticProvider),
+            Some(crate::session_core::SessionPersistence::new(
+                "session-1",
+                store.clone(),
+            )),
+            8,
+        );
+        {
+            let mut session = core.session.lock().await;
+            session.set_history(vec![
+                crate::providers::Message::user("before"),
+                crate::providers::Message::assistant("answer"),
+            ]);
+        }
+        core.client_user_message_ids
+            .lock()
+            .await
+            .push("request-1".to_string());
+        core.assistant_outcomes
+            .lock()
+            .unwrap()
+            .push(crate::session_protocol::AssistantOutcome::Completed);
+        core.persist(
+            "test-model",
+            core.session.lock().await.history(),
+            &["request-1".to_string()],
+        );
+
+        let lifecycle = core.lifecycle.lock().await;
+        let clearing = {
+            let core = Arc::clone(&core);
+            tokio::spawn(async move { core.clear_history().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !core.mutation_is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clear acquires the mutation permit before awaiting lifecycle");
+        assert!(matches!(
+            core.begin_turn(),
+            Err(crate::session_core::TurnError::Busy)
+        ));
+        drop(lifecycle);
+        assert!(clearing.await.unwrap().unwrap());
+        assert!(core.session.lock().await.history().is_empty());
+        assert!(core.client_user_message_ids.lock().await.is_empty());
+        assert!(core.assistant_outcomes.lock().unwrap().is_empty());
+        let persisted = store.load("session-1").expect("cleared session persists");
+        assert!(persisted.messages.is_empty());
+        assert!(persisted.client_user_message_ids.is_empty());
+        assert!(persisted.assistant_outcomes.is_empty());
+        let snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
+        assert!(snapshot.transcript.is_empty());
+        assert!(snapshot.tool_calls.is_empty());
+        assert!(matches!(
+            core.events.replay_since(0),
+            SessionReplay::Available { events, .. }
+                if events.iter().any(|(_, event)|
+                    matches!(event, SessionEvent::ConversationCleared))
+        ));
+    }
+
     fn terminal_client() -> ClientInfo {
         ClientInfo {
             id: "terminal-1".to_string(),
@@ -2547,8 +2715,13 @@ mod tests {
             )),
         );
         let daemon = SessionDaemon::new(1, 1, 8, 32);
+        let initial_snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
         daemon
-            .create_session("session-1".to_string(), Arc::clone(&core))
+            .create_session_with_snapshot(
+                "session-1".to_string(),
+                Arc::clone(&core),
+                initial_snapshot,
+            )
             .unwrap();
         let persister = std::thread::spawn(move || {
             for _ in 0..100 {
@@ -3170,6 +3343,169 @@ mod tests {
         client.send(ClientMessage::Detach).await.unwrap();
         serve.await.unwrap().unwrap();
         assert_eq!(core.current_model(), "model-b");
+    }
+
+    #[tokio::test]
+    async fn clear_and_usage_commands_are_daemon_authoritative() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 16, 32));
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::new(directory.path().to_path_buf());
+        let core = test_core_with_persistence(
+            Box::new(StaticProvider),
+            Some(crate::session_core::SessionPersistence::new(
+                "session-1",
+                store.clone(),
+            )),
+        );
+        core.session
+            .lock()
+            .await
+            .set_history(vec![crate::providers::Message::user("before")]);
+        core.persist("test-model", core.session.lock().await.history(), &[]);
+        let initial_snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
+        daemon
+            .create_session_with_snapshot(
+                "session-1".to_string(),
+                Arc::clone(&core),
+                initial_snapshot,
+            )
+            .unwrap();
+
+        let (transport, mut client) = in_memory_transport_pair(16, "test client");
+        let serve_daemon = Arc::clone(&daemon);
+        let serve = tokio::spawn(async move {
+            serve_daemon
+                .serve_client(transport, &protocol_limits())
+                .await
+        });
+        client
+            .send(ClientMessage::Attach {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: Some("session-1".to_string()),
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![
+                    ClientCapability::Observe,
+                    ClientCapability::Configure,
+                ],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::AttachOk { .. })
+        ));
+        let Some(ServerMessage::Snapshot { state, .. }) = client.recv().await else {
+            panic!("expected snapshot");
+        };
+        let initial_transcript_id = state.transcript[0].id;
+
+        client
+            .send(ClientMessage::GetUsage {
+                request_id: "usage-1".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Usage { request_id, usage })
+                if request_id == "usage-1"
+                    && usage.input == 0
+                    && usage.output == 0
+                    && usage.cost_usd_micros == 0
+        ));
+
+        client
+            .send(ClientMessage::ClearHistory {
+                request_id: "clear-1".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut saw_clear = false;
+        let mut saw_context = false;
+        let mut saw_result = false;
+        for _ in 0..3 {
+            match client.recv().await {
+                Some(ServerMessage::Event {
+                    event: SessionEvent::ConversationCleared,
+                    ..
+                }) => saw_clear = true,
+                Some(ServerMessage::Event {
+                    event: SessionEvent::ContextUsageChanged { usage },
+                    ..
+                }) => saw_context = usage.prompt_tokens == 0,
+                Some(ServerMessage::CommandResult {
+                    request_id,
+                    operation,
+                    changed: true,
+                }) => {
+                    saw_result = request_id == "clear-1" && operation == "clear_history";
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_clear && saw_context && saw_result);
+        assert!(core.session.lock().await.history().is_empty());
+        assert!(store.load("session-1").unwrap().messages.is_empty());
+        let _ = core.events.emit(SessionEvent::UserMessage {
+            text: "after".to_string(),
+            request_id: None,
+        });
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Event {
+                event: SessionEvent::UserMessage { text, .. },
+                ..
+            }) if text == "after"
+        ));
+        let snapshot = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .unwrap()
+            .snapshot
+            .lock()
+            .unwrap()
+            .snapshot
+            .clone();
+        assert!(snapshot.transcript[0].id > initial_transcript_id);
+
+        client.send(ClientMessage::Detach).await.unwrap();
+        serve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_waits_for_the_same_admission_gate_as_clear() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 8, 32));
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .unwrap()
+            .clone();
+        let admission = Arc::clone(&entry.admission).lock_owned().await;
+        let attaching = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move {
+                daemon
+                    .attach(
+                        "session-1",
+                        terminal_client(),
+                        vec![ClientCapability::Observe],
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!attaching.is_finished());
+        drop(admission);
+        let attached = attaching.await.unwrap().unwrap();
+        drop(attached);
     }
 
     #[tokio::test]

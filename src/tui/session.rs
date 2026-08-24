@@ -212,8 +212,21 @@ impl TuiSession {
             return TuiSessionUpdate::Updated;
         }
         match event.event {
-            SessionControllerEvent::Attached { state, .. }
-            | SessionControllerEvent::StateChanged { state, .. } => {
+            SessionControllerEvent::Attached { state, .. } => {
+                self.state = state;
+                TuiSessionUpdate::Updated
+            }
+            SessionControllerEvent::StateChanged { mut state, outcome } => {
+                if let SessionClientOutcome::Usage { usage, .. } = outcome {
+                    state.push_system_message(format!(
+                        "input={} output={} cache_read={} cache_write={} cost=${:.4}",
+                        usage.input,
+                        usage.output,
+                        usage.cache_read,
+                        usage.cache_write,
+                        usage.cost_usd_micros as f64 / 1_000_000.0,
+                    ));
+                }
                 self.state = state;
                 TuiSessionUpdate::Updated
             }
@@ -238,7 +251,7 @@ mod tests {
     use crate::session_controller::SessionControllerHandle;
     use crate::session_protocol::{
         ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage, ServerMessage,
-        SessionEvent, SessionSnapshot, TurnStatus, PROTOCOL_VERSION,
+        SessionEvent, SessionSnapshot, SessionUsage, TurnStatus, PROTOCOL_VERSION,
     };
 
     fn controller() -> (impl ClientTransport, SessionControllerHandle) {
@@ -515,6 +528,55 @@ mod tests {
         .await
         .expect("overflow failure should reach the TUI");
         assert!(message.contains("event queue overflowed"));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn usage_response_is_rendered_as_a_frontend_local_notice() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        accept_attach(&server, "daemon-session").await;
+        let mut session = attach.await.unwrap().unwrap();
+        session
+            .try_send(SessionControllerCommand::GetUsage)
+            .unwrap();
+        let Some(ClientMessage::GetUsage { request_id }) = server.recv().await.unwrap() else {
+            panic!("expected get_usage");
+        };
+        server
+            .send(&ServerMessage::Usage {
+                request_id,
+                usage: SessionUsage {
+                    input: 10,
+                    output: 5,
+                    reasoning_output: None,
+                    thinking_bytes: 0,
+                    cache_read: 4,
+                    cache_write: 1,
+                    cost_usd_micros: 125_000,
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let _ = session.poll();
+                if session
+                    .state()
+                    .transcript()
+                    .iter()
+                    .any(|entry| entry.text.contains("cost=$0.1250"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("usage notice should reach the TUI");
         session.shutdown().await;
     }
 }
