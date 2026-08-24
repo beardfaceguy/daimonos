@@ -294,10 +294,23 @@ fn handle_command(
             };
             notice(session, text);
         }
-        UiCommand::Clear | UiCommand::Usage | UiCommand::Compact => {
+        UiCommand::Clear if quiescent => {
+            queue(
+                session,
+                SessionControllerCommand::ClearHistory,
+                "clear history",
+            );
+        }
+        UiCommand::Usage if quiescent => {
+            queue(session, SessionControllerCommand::GetUsage, "usage");
+        }
+        UiCommand::Clear | UiCommand::Usage => {
+            notice(session, "command unavailable while a turn is running");
+        }
+        UiCommand::Compact => {
             notice(
                 session,
-                "command awaits daemon-authoritative protocol support in task 1331",
+                "manual compaction awaits daemon-authoritative protocol support",
             );
         }
         UiCommand::Unknown(command) => notice(session, format!("unknown command: {command}")),

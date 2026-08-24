@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
@@ -9,13 +9,43 @@ use crate::compaction::CompactionPolicy;
 use crate::providers::{Message, ThinkingLevel};
 use crate::session_protocol::{
     ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, ContextUsage,
-    RuntimeOption, RuntimeValue, SessionEvent, TurnStatus,
+    RuntimeOption, RuntimeValue, SessionEvent, SessionUsage, TurnStatus,
 };
 use crate::session_store::SessionStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnError {
     Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryMutationError {
+    Busy,
+}
+
+impl std::fmt::Display for HistoryMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("session is busy")
+    }
+}
+
+impl std::error::Error for HistoryMutationError {}
+
+struct SessionMutationPermit<'a>(&'a AtomicBool);
+
+impl<'a> SessionMutationPermit<'a> {
+    fn acquire(active: &'a AtomicBool) -> Result<Self, HistoryMutationError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(active))
+            .map_err(|_| HistoryMutationError::Busy)
+    }
+}
+
+impl Drop for SessionMutationPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl std::fmt::Display for TurnError {
@@ -588,6 +618,7 @@ impl SessionPersistence {
 /// approvals, persistence identity, model/window state, and canonical events.
 pub struct SessionCore {
     pub(crate) lifecycle: tokio::sync::Mutex<()>,
+    mutation_active: AtomicBool,
     pub(crate) session: tokio::sync::Mutex<AgentSession>,
     pub(crate) turn: TurnController,
     pub(crate) approvals: Arc<ApprovalBroker>,
@@ -615,7 +646,19 @@ impl SessionCore {
     }
 
     pub fn begin_turn(&self) -> Result<SessionTurn<'_>, TurnError> {
+        // Mutation/turn exclusion is a two-claim protocol: clear publishes its
+        // AcqRel permit before inspecting the turn slot; a turn checks that
+        // permit both before and after claiming the slot. If the claims cross,
+        // one side observes the other with Acquire ordering and releases its
+        // own claim, so history mutation and prompt execution never overlap.
+        if self.mutation_active.load(Ordering::Acquire) {
+            return Err(TurnError::Busy);
+        }
         let active = self.turn.begin()?;
+        if self.mutation_active.load(Ordering::Acquire) {
+            drop(active);
+            return Err(TurnError::Busy);
+        }
         let _ = self.events.emit(SessionEvent::TurnStatusChanged {
             status: crate::session_protocol::TurnStatus::Running,
         });
@@ -641,6 +684,67 @@ impl SessionCore {
         })
     }
 
+    pub fn turn_is_active(&self) -> bool {
+        self.turn.is_active()
+    }
+
+    #[cfg(test)]
+    pub fn mutation_is_active(&self) -> bool {
+        self.mutation_active.load(Ordering::Acquire)
+    }
+
+    /// Reset canonical conversation history while retaining cumulative usage
+    /// and runtime configuration. The clear event is sequenced so every
+    /// attached/replaying frontend resets at the same point.
+    pub async fn clear_history(&self) -> Result<bool, HistoryMutationError> {
+        let _mutation = SessionMutationPermit::acquire(&self.mutation_active)?;
+        if self.turn.is_active() {
+            return Err(HistoryMutationError::Busy);
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.turn.is_active() {
+            return Err(HistoryMutationError::Busy);
+        }
+
+        let mut session = self.session.lock().await;
+        let mut client_ids = self.client_user_message_ids.lock().await;
+        let history_changed = !session.history().is_empty() || !client_ids.is_empty();
+        session.clear();
+        client_ids.clear();
+        let model = session.model().to_string();
+        drop(client_ids);
+        drop(session);
+        let outcomes_changed = {
+            let mut outcomes = self
+                .assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = !outcomes.is_empty();
+            outcomes.clear();
+            changed
+        };
+        let changed = history_changed || outcomes_changed;
+        let context_window = self.context_windows.lock().await.get(&model).copied();
+
+        self.persist(&model, &[], &[]);
+        let _ = self.events.emit(SessionEvent::ConversationCleared);
+        self.publish_context_usage(self.context_usage(0, context_window));
+        Ok(changed)
+    }
+
+    pub async fn cumulative_usage(&self) -> SessionUsage {
+        let usage = self.session.lock().await.total_usage().clone();
+        SessionUsage {
+            input: usage.input,
+            output: usage.output,
+            reasoning_output: usage.reasoning_output,
+            thinking_bytes: usage.thinking_bytes,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            cost_usd_micros: usd_to_micros(usage.cost.total_usd),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: AgentSession,
@@ -656,6 +760,7 @@ impl SessionCore {
         let current_thinking = session.thinking().clone();
         Self {
             lifecycle: tokio::sync::Mutex::new(()),
+            mutation_active: AtomicBool::new(false),
             session: tokio::sync::Mutex::new(session),
             turn: TurnController::default(),
             approvals,
@@ -1142,11 +1247,14 @@ impl SessionCore {
                 .push(outcome.clone());
             let _ = self.events.emit(SessionEvent::AssistantDone { outcome });
         }
-        drop(active_turn);
-
         if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
             self.persist(&model, &messages, &client_ids);
         }
+        // Keep the active-turn permit through the terminal persistence write.
+        // History mutations use this permit as their exclusion boundary, so
+        // dropping it earlier could let /clear persist empty state and then be
+        // overwritten by this turn's late snapshot.
+        drop(active_turn);
 
         Ok(SessionPromptExecution {
             outcome: match turn {
@@ -1157,6 +1265,20 @@ impl SessionCore {
             cumulative_cost_usd,
         })
     }
+}
+
+fn usd_to_micros(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        if value != 0.0 {
+            tracing::debug!(
+                target: "daimonos::session_core",
+                event = "invalid_cumulative_cost",
+                value,
+            );
+        }
+        return 0;
+    }
+    (value * 1_000_000.0).round().min(u64::MAX as f64) as u64
 }
 
 fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
@@ -2053,6 +2175,14 @@ mod tests {
             detail: "run tests".to_string(),
             allow_always_available: true,
         }
+    }
+
+    #[test]
+    fn cumulative_cost_uses_bounded_microdollar_wire_units() {
+        assert_eq!(usd_to_micros(0.123_456_7), 123_457);
+        assert_eq!(usd_to_micros(f64::NAN), 0);
+        assert_eq!(usd_to_micros(-1.0), 0);
+        assert_eq!(usd_to_micros(f64::INFINITY), 0);
     }
 
     #[tokio::test]

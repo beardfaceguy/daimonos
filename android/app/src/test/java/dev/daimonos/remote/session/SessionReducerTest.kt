@@ -104,6 +104,18 @@ class SessionReducerTest {
     }
 
     @Test
+    fun canonicalClearResetsConversationAtItsSequence() {
+        val reducer = SessionReducer()
+        reducer.applyEvent(1, SessionEvent.UserMessage("before"))
+        reducer.applyEvent(2, SessionEvent.ConversationCleared)
+
+        assertTrue(reducer.state.transcript.isEmpty())
+        assertEquals(2, reducer.state.seq)
+        reducer.applyEvent(3, SessionEvent.UserMessage("after"))
+        assertEquals(listOf("after"), reducer.state.transcript.map { it.text })
+    }
+
+    @Test
     fun oversizedSnapshotMarksHistoryTruncatedLocally() {
         val reducer = SessionReducer(maxEntries = 1)
         reducer.applySnapshot(

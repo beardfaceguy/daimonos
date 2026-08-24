@@ -11,7 +11,7 @@ use crate::client_transport::{FrontendTransport, TransportError};
 use crate::frontend_state::{ApplyOutcome, ViewState};
 use crate::session_protocol::{
     has_capability, ApprovalDecision, ClientCapability, ClientInfo, ClientMessage, RuntimeValue,
-    ServerMessage, PROTOCOL_VERSION,
+    ServerMessage, SessionUsage, PROTOCOL_VERSION,
 };
 
 #[derive(Debug)]
@@ -69,6 +69,10 @@ pub enum SessionClientOutcome {
         request_id: String,
         count: usize,
         next_cursor: Option<String>,
+    },
+    Usage {
+        request_id: String,
+        usage: SessionUsage,
     },
     Revoked(String),
 }
@@ -306,6 +310,9 @@ impl<T: FrontendTransport> SessionClient<T> {
                 count: sessions.len(),
                 next_cursor,
             }),
+            ServerMessage::Usage { request_id, usage } => {
+                Ok(SessionClientOutcome::Usage { request_id, usage })
+            }
             ServerMessage::Revoked { reason } => {
                 self.attached = false;
                 Ok(SessionClientOutcome::Revoked(reason))
@@ -383,6 +390,28 @@ impl<T: FrontendTransport> SessionClient<T> {
         let request_id = self.next_request_id("stop");
         self.transport
             .send(ClientMessage::StopSession {
+                request_id: request_id.clone(),
+            })
+            .await?;
+        Ok(request_id)
+    }
+
+    pub async fn clear_history(&mut self) -> Result<String, SessionClientError> {
+        self.require(ClientCapability::Configure)?;
+        let request_id = self.next_request_id("clear");
+        self.transport
+            .send(ClientMessage::ClearHistory {
+                request_id: request_id.clone(),
+            })
+            .await?;
+        Ok(request_id)
+    }
+
+    pub async fn get_usage(&mut self) -> Result<String, SessionClientError> {
+        self.require(ClientCapability::Observe)?;
+        let request_id = self.next_request_id("usage");
+        self.transport
+            .send(ClientMessage::GetUsage {
                 request_id: request_id.clone(),
             })
             .await?;

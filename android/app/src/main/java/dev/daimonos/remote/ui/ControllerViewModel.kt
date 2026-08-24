@@ -345,6 +345,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                     )
                 }
                 is ServerMessage.CommandResult,
+                is ServerMessage.Usage,
                 ServerMessage.Pong,
                 -> Unit
             }

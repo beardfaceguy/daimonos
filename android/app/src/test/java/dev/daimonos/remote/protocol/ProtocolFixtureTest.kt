@@ -53,9 +53,10 @@ class ProtocolFixtureTest {
             .jsonArray
             .map { ProtocolCodec.json.decodeFromJsonElement<ClientMessage>(it) }
 
-        assertEquals(5, events.size)
-        assertEquals(6, commands.size)
+        assertEquals(6, events.size)
+        assertEquals(8, commands.size)
         assertTrue(events.last() is ServerMessage.Event)
+        assertTrue((events.last() as ServerMessage.Event).event is SessionEvent.ConversationCleared)
         assertTrue(commands.first() is ClientMessage.Resume)
         assertTrue(commands.last() is ClientMessage.Detach)
     }

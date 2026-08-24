@@ -1,0 +1,140 @@
+```rust
+// src/session_protocol.rs
+pub enum ClientMessage {
+    // existing variants...
+    ClearHistory { request_id: String },
+    GetUsage { request_id: String },
+}
+
+pub enum ServerMessage {
+    // existing variants...
+    Usage { request_id: String, usage: SessionUsage },
+}
+
+pub struct SessionUsage {
+    pub input: u64,
+    pub output: u64,
+    pub reasoning_output: Option<u64>,
+    pub thinking_bytes: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd_micros: u64,
+}
+
+pub enum SessionEvent {
+    // existing variants...
+    ConversationCleared,
+}
+```
+
+```rust
+// src/session_core.rs
+pub async fn clear_history(&self) -> Result<bool, HistoryMutationError> {
+    if self.turn.is_active() { return Err(HistoryMutationError::Busy); }
+    let _lifecycle = self.lifecycle.lock().await;
+    if self.turn.is_active() { return Err(HistoryMutationError::Busy); }
+
+    let mut session = self.session.lock().await;
+    let mut client_ids = self.client_user_message_ids.lock().await;
+    let history_changed = !session.history().is_empty() || !client_ids.is_empty();
+    session.clear();
+    client_ids.clear();
+    let model = session.model().to_string();
+    drop(client_ids);
+    drop(session);
+    let outcomes_changed = {
+        let mut outcomes = self.assistant_outcomes.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = !outcomes.is_empty();
+        outcomes.clear();
+        changed
+    };
+    let changed = history_changed || outcomes_changed;
+    let context_window = self.context_windows.lock().await.get(&model).copied();
+    self.persist(&model, &[], &[]);
+    let _ = self.events.emit(SessionEvent::ConversationCleared);
+    self.publish_context_usage(self.context_usage(0, context_window));
+    Ok(changed)
+}
+
+pub async fn cumulative_usage(&self) -> SessionUsage {
+    let usage = self.session.lock().await.total_usage().clone();
+    SessionUsage {
+        input: usage.input,
+        output: usage.output,
+        reasoning_output: usage.reasoning_output,
+        thinking_bytes: usage.thinking_bytes,
+        cache_read: usage.cache_read,
+        cache_write: usage.cache_write,
+        cost_usd_micros: usd_to_micros(usage.cost.total_usd),
+    }
+}
+
+fn usd_to_micros(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 { return 0; }
+    (value * 1_000_000.0).round().min(u64::MAX as f64) as u64
+}
+```
+
+```rust
+// src/session_daemon.rs handler excerpts
+Some(ClientMessage::ClearHistory { request_id }) => {
+    validate; require Configure;
+    let _admission = attachment.entry.admission.lock().await;
+    match attachment.core().clear_history().await {
+        Ok(changed) => send(CommandResult { request_id, operation: "clear_history", changed }),
+        Err(Busy) => send(Error { request_id: Some(request_id), code: "session_busy", ... }),
+    }
+}
+Some(ClientMessage::GetUsage { request_id }) => {
+    validate; require Observe;
+    let _admission = attachment.entry.admission.lock().await;
+    if core.turn_is_active() { send session_busy; continue; }
+    send(ServerMessage::Usage { request_id, usage: core.cumulative_usage().await });
+}
+```
+
+```rust
+// src/frontend_state.rs and daemon SnapshotState
+SessionEvent::ConversationCleared => {
+    transcript.clear();
+    tool_calls.clear();
+    pending_approvals.clear();
+    history_truncated = false;
+    ending_reason = None; // frontend reducer
+    next_transcript_id = 1; // daemon snapshot accumulator
+}
+```
+
+```rust
+// src/tui/app.rs
+UiCommand::Clear if quiescent => queue(SessionControllerCommand::ClearHistory),
+UiCommand::Usage if quiescent => queue(SessionControllerCommand::GetUsage),
+UiCommand::Clear | UiCommand::Usage => notice("command unavailable while a turn is running"),
+```
+
+```rust
+// src/tui/session.rs
+SessionControllerEvent::StateChanged { mut state, outcome } => {
+    if let SessionClientOutcome::Usage { usage, .. } = outcome {
+        state.push_system_message(format!(
+            "input={} output={} cache_read={} cache_write={} cost=${:.4}",
+            usage.input, usage.output, usage.cache_read, usage.cache_write,
+            usage.cost_usd_micros as f64 / 1_000_000.0,
+        ));
+    }
+    self.state = state;
+}
+```
+
+SessionClient adds clear_history/get_usage methods with capability checks and generated request IDs; SessionController adds matching commands and outcomes. Protocol validation caps both request IDs. Android v2 fixtures add both client commands and ConversationCleared event.
+
+Tests added:
+- exact additive wire shapes for clear/get_usage/Usage
+- canonical reducer clear sequence
+- core clear resets memory, persistence, snapshot, replay event
+- daemon handler returns typed zero usage and clear event/context/result in any scheduling order
+- usage response renders local TUI notice
+- Android v2 fixtures fold clear and deserialize new commands
+- microdollar conversion finite/negative/NaN/infinity behavior
+
+Focused tests pass; cargo check passes.

@@ -143,6 +143,14 @@ class SessionReducer(
             seq = seq,
             contextUsage = event.usage,
         )
+        SessionEvent.ConversationCleared -> previous.copy(
+            seq = seq,
+            transcript = emptyList(),
+            toolCalls = emptyList(),
+            pendingApprovals = emptyList(),
+            historyTruncated = false,
+            endingReason = null,
+        )
         is SessionEvent.TurnStatusChanged -> previous.copy(
             seq = seq,
             turnStatus = event.status,
