@@ -1,0 +1,69 @@
+```rust
+// src/session_protocol.rs
+pub struct ApprovalRequest {
+    // existing fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_deadline_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deadline_paused: bool,
+}
+pub enum SessionEvent {
+    ApprovalDeadlineChanged {
+        approval_id: String,
+        ineligible_deadline_unix_ms: u64,
+        paused: bool,
+    },
+}
+```
+
+```rust
+// ApprovalBroker
+fn update_deadline(&self, id: &str, deadline_unix_ms: u64, paused: bool) -> bool {
+    let pending = state.pending.get_mut(id)?;
+    if pending.request.ineligible_deadline_unix_ms == Some(deadline_unix_ms)
+        && pending.request.deadline_paused == paused { return false; }
+    pending.request.ineligible_deadline_unix_ms = Some(deadline_unix_ms);
+    pending.request.deadline_paused = paused;
+    true
+}
+```
+
+```rust
+// request_approval timeout loop
+let mut ineligible_deadline: Option<(tokio::time::Instant, u64)> = None;
+loop {
+    if let Ok(resolution) = receiver.try_recv() { break resolution; }
+    let eligibility_changed = broker.eligibility_changed.notified();
+    if broker.has_eligible_client(&approval_id) {
+        if let Some((_, unix_ms)) = ineligible_deadline {
+            if broker.update_deadline(&approval_id, unix_ms, true) {
+                events.emit(ApprovalDeadlineChanged { id, unix_ms, paused: true });
+            }
+        }
+        select! { resolution = &mut receiver => break ..., _ = eligibility_changed => continue }
+    } else {
+        let (deadline, unix_ms) = *ineligible_deadline.get_or_insert_with(|| (
+            Instant::now() + timeout,
+            system_deadline_unix_ms(timeout),
+        ));
+        if broker.update_deadline(&approval_id, unix_ms, false) {
+            events.emit(ApprovalDeadlineChanged { id, unix_ms, paused: false });
+        }
+        select! {
+            resolution = &mut receiver => break ...,
+            _ = eligibility_changed => continue,
+            _ = sleep_until(deadline) => resolve(Deny, "approval_timeout"),
+        }
+    }
+}
+```
+
+Frontend ViewState and daemon SnapshotState locate the pending approval by id and update deadline/paused fields. ApprovalRequested remains unchanged when initially eligible; broker.pending() supplies updated fields to fresh snapshots. TUI modal adds one status line: paused with original deadline retained, or auto-deny remaining seconds. Android ApprovalRequest, SessionEvent, reducer, fixture, and tests mirror the additive wire shape.
+
+Tests:
+- deadline becomes advertised on first ineligibility, pauses on eligible reconnect, resumes with exactly the original deadline
+- existing churn test still proves reconnect cannot extend expiry
+- frontend reducer updates pending request fields
+- TUI renders paused anchored status
+- Android/Rust v2 fixtures decode and fold ApprovalDeadlineChanged
+- all focused approval tests pass

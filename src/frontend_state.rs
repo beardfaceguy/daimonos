@@ -283,6 +283,20 @@ impl ViewState {
             SessionEvent::ApprovalResolved { approval_id, .. } => {
                 self.pending_approvals.retain(|a| a.id != approval_id);
             }
+            SessionEvent::ApprovalDeadlineChanged {
+                approval_id,
+                ineligible_deadline_unix_ms,
+                paused,
+            } => {
+                if let Some(approval) = self
+                    .pending_approvals
+                    .iter_mut()
+                    .find(|approval| approval.id == approval_id)
+                {
+                    approval.ineligible_deadline_unix_ms = Some(ineligible_deadline_unix_ms);
+                    approval.deadline_paused = paused;
+                }
+            }
             SessionEvent::RuntimeOptionsChanged { options } => {
                 self.runtime_options = options;
             }
@@ -686,6 +700,8 @@ mod tests {
             tool: "exec".into(),
             detail: "rm -rf".into(),
             allow_always_available: false,
+            ineligible_deadline_unix_ms: None,
+            deadline_paused: false,
         };
         ev(
             &mut s,
@@ -701,6 +717,20 @@ mod tests {
         ev(
             &mut s,
             3,
+            SessionEvent::ApprovalDeadlineChanged {
+                approval_id: "ap1".into(),
+                ineligible_deadline_unix_ms: 123_456,
+                paused: true,
+            },
+        );
+        assert_eq!(
+            s.active_approval().unwrap().ineligible_deadline_unix_ms,
+            Some(123_456)
+        );
+        assert!(s.active_approval().unwrap().deadline_paused);
+        ev(
+            &mut s,
+            4,
             SessionEvent::ApprovalResolved {
                 approval_id: "ap1".into(),
                 decision: crate::session_protocol::ApprovalDecision::AllowOnce,

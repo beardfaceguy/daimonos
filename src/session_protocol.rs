@@ -234,6 +234,14 @@ pub struct ApprovalRequest {
     pub tool: String,
     pub detail: String,
     pub allow_always_available: bool,
+    /// Display-only wall-clock deadline anchored at the first loss of every
+    /// eligible approval client. Enforcement uses a monotonic clock, so clients
+    /// must tolerate wall-clock adjustments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_deadline_unix_ms: Option<u64>,
+    /// True while an eligible client is attached and expiry is paused.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deadline_paused: bool,
 }
 
 impl ApprovalRequest {
@@ -250,6 +258,8 @@ impl ApprovalRequest {
             tool: tool.into(),
             detail: detail.into(),
             allow_always_available,
+            ineligible_deadline_unix_ms: None,
+            deadline_paused: false,
         }
     }
 }
@@ -307,6 +317,13 @@ pub enum SessionEvent {
         approval_id: String,
         decision: ApprovalDecision,
         resolved_by: String,
+    },
+    ApprovalDeadlineChanged {
+        /// Idempotent last-write-wins update for the named pending approval.
+        /// Snapshots may already contain the same values.
+        approval_id: String,
+        ineligible_deadline_unix_ms: u64,
+        paused: bool,
     },
     RuntimeOptionsChanged {
         options: Vec<RuntimeOption>,
@@ -1321,7 +1338,7 @@ mod tests {
         let events: Vec<ServerMessage> =
             serde_json::from_str(include_str!("../contracts/android/v2/event_stream.json"))
                 .unwrap();
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 7);
         assert!(events
             .iter()
             .all(|message| matches!(message, ServerMessage::Event { .. })));

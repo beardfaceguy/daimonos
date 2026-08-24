@@ -300,6 +300,8 @@ data class ApprovalRequest(
     val tool: String,
     val detail: String,
     @SerialName("allow_always_available") val allowAlwaysAvailable: Boolean,
+    @SerialName("ineligible_deadline_unix_ms") val ineligibleDeadlineUnixMs: Long? = null,
+    @SerialName("deadline_paused") val deadlinePaused: Boolean = false,
 )
 
 @Serializable
@@ -385,6 +387,14 @@ sealed interface SessionEvent {
         @SerialName("approval_id") val approvalId: String,
         val decision: ApprovalDecision,
         @SerialName("resolved_by") val resolvedBy: String,
+    ) : SessionEvent
+
+    @Serializable
+    @SerialName("approval_deadline_changed")
+    data class ApprovalDeadlineChanged(
+        @SerialName("approval_id") val approvalId: String,
+        @SerialName("ineligible_deadline_unix_ms") val ineligibleDeadlineUnixMs: Long,
+        val paused: Boolean,
     ) : SessionEvent
 
     @Serializable

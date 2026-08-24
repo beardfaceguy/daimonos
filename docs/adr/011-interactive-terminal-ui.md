@@ -104,6 +104,12 @@ replace a newer attachment. Session stop, attachment replacement, and untyped
 legacy revocations are terminal. Recovery surfaces a local warning because a
 wire command accepted immediately before disconnect may need verification.
 
+Approval timeout enforcement remains monotonic and runs only while no eligible
+approval client is attached. The first ineligible interval anchors one deadline;
+eligibility pauses it without resetting it, even past the displayed wall-clock
+instant. Snapshots carry the current deadline state and sequenced idempotent
+updates keep live/replaying clients synchronized.
+
 ### 4. Terminal correctness (hard requirements)
 
 - A RAII terminal guard **always** restores canonical mode, cursor, mouse/paste

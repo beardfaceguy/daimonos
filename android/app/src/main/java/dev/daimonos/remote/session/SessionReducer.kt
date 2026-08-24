@@ -135,6 +135,19 @@ class SessionReducer(
             pendingApprovals = previous.pendingApprovals
                 .filterNot { it.id == event.approvalId },
         )
+        is SessionEvent.ApprovalDeadlineChanged -> previous.copy(
+            seq = seq,
+            pendingApprovals = previous.pendingApprovals.map { approval ->
+                if (approval.id == event.approvalId) {
+                    approval.copy(
+                        ineligibleDeadlineUnixMs = event.ineligibleDeadlineUnixMs,
+                        deadlinePaused = event.paused,
+                    )
+                } else {
+                    approval
+                }
+            },
+        )
         is SessionEvent.RuntimeOptionsChanged -> previous.copy(
             seq = seq,
             runtimeOptions = event.options,

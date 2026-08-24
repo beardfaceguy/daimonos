@@ -2005,6 +2005,21 @@ impl SnapshotState {
                     .pending_approvals
                     .retain(|pending| pending.id != approval_id);
             }
+            SessionEvent::ApprovalDeadlineChanged {
+                approval_id,
+                ineligible_deadline_unix_ms,
+                paused,
+            } => {
+                if let Some(approval) = self
+                    .snapshot
+                    .pending_approvals
+                    .iter_mut()
+                    .find(|approval| approval.id == approval_id)
+                {
+                    approval.ineligible_deadline_unix_ms = Some(ineligible_deadline_unix_ms);
+                    approval.deadline_paused = paused;
+                }
+            }
             SessionEvent::RuntimeOptionsChanged { options } => {
                 self.snapshot.runtime_options = options;
                 trim_oldest(&mut self.snapshot.runtime_options, self.max_entries);
