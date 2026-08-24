@@ -37,6 +37,9 @@ mod remote_gateway;
 mod safety;
 mod script;
 mod session;
+mod session_bootstrap;
+mod session_client;
+mod session_controller;
 mod session_core;
 mod session_daemon;
 mod session_factory;
@@ -305,12 +308,20 @@ async fn main() -> anyhow::Result<()> {
         log_directory = %cfg.logging.resolved_directory().display(),
     );
     let cfg = Arc::new(cfg);
+    let explicit_config_path = cli.config.clone();
     // Agent frontends skip workspace service setup; tool-serving modes share
     // the lower dispatcher. All paths rendezvous below for ordered telemetry
     // teardown before the logging guard is dropped.
     let result = match cli.command {
         Some(Command::Agent(args)) => {
-            agent_runtime::run_agent(args, &workspace, Arc::clone(&cfg), token_log).await
+            agent_runtime::run_agent(
+                args,
+                &workspace,
+                Arc::clone(&cfg),
+                token_log,
+                explicit_config_path,
+            )
+            .await
         }
         Some(Command::Chat(args)) => {
             agent_runtime::run_chat(args, &workspace, Arc::clone(&cfg), token_log).await

@@ -1,0 +1,172 @@
+```diff
+--- a/src/session_controller.rs
++++ b/src/session_controller.rs
+@@
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ControllerStopReason {
++    Shutdown,
++    CommandChannelClosed,
++    EventQueueOverflow,
++    Transport(String),
++}
++
++impl Display for ControllerStopReason {
++    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::EventQueueOverflow => f.write_str(
++                "controller event queue overflowed; daemon session remains available to reattach",
++            ),
++            Self::Transport(message) => write!(f, "daemon transport failed: {message}"),
++            // other terminal reasons...
++        }
++    }
++}
+@@
+ pub struct SessionControllerHandle {
+     // existing bounded channels/task...
++    stop_reason: Arc<StdMutex<Option<ControllerStopReason>>>,
+ }
+@@
+-async fn emit(...) -> bool {
++fn emit(...) -> bool {
+     sender.try_send(EpochEvent { epoch, event }).is_ok()
+ }
+@@
+-    loop {
++    let reason = 'controller: loop {
+         // command/receive select
+-        if !emit(...) { break; }
++        if !emit(...) {
++            break 'controller ControllerStopReason::EventQueueOverflow;
++        }
+         // transport failure:
++        break 'controller ControllerStopReason::Transport(error.to_string());
+     };
++    *stop_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+     let _ = emit(&events, epoch, SessionControllerEvent::Stopped);
+ }
+```
+
+```diff
+--- a/src/config.rs
++++ b/src/config.rs
+@@
+ pub struct SessionRuntimeConfig {
++    /// Maximum wait for a daemon command result in a local frontend.
++    pub client_command_timeout_secs: u64,
+ }
+@@
++client_command_timeout_secs: 10,
+@@
++if self.client_command_timeout_secs == 0 {
++    return Err("session.client_command_timeout_secs must be greater than zero".to_string());
++}
+```
+
+```diff
+--- a/src/session_daemon.rs
++++ b/src/session_daemon.rs
+@@
+ if let Err(error) = attachment.core().apply_runtime_option(&config_id, value).await {
+     transport.send(&ServerMessage::Error { request_id, code, message }).await?;
++} else if let Some(request_id) = request_id {
++    transport.send(&ServerMessage::CommandResult {
++        request_id,
++        operation: "set_config".to_string(),
++        changed: true,
++    }).await?;
+ }
+```
+
+```diff
+--- a/src/tui/session.rs
++++ b/src/tui/session.rs
+@@
+ pub struct TuiSession {
+     controller: SessionControllerHandle,
+     epoch: u64,
+     state: ViewState,
++    command_timeout: Duration,
++    termination_reported: bool,
+ }
+@@
+-pub async fn attach(controller: SessionControllerHandle) -> Result<Self> {
++pub async fn attach(controller: SessionControllerHandle, command_timeout: Duration) -> Result<Self> {
++    tokio::time::timeout(command_timeout, async move {
+         // attach and wait for canonical snapshot
++    }).await.map_err(|_| anyhow!("timed out waiting for daemon attach"))?
+ }
+@@
+ pub async fn set_config(&mut self, id: impl Into<String>, value: RuntimeValue) -> Result<()> {
+-    // unbounded bespoke wait
++    self.request(SessionControllerCommand::SetConfig { config_id: id.into(), value }, "set_config").await
+ }
++
++pub async fn stop(&mut self) -> Result<()> {
++    self.request(SessionControllerCommand::StopSession, "stop_session").await
++}
++
++async fn request(&mut self, command: SessionControllerCommand, expected: &'static str) -> Result<()> {
++    self.send(command).await?;
++    tokio::time::timeout(self.command_timeout, async {
++        let mut accepted_request_id = None;
++        loop {
++            let event = self.controller.recv().await
++                .ok_or_else(|| anyhow!(self.controller_stop_message()))?;
++            match event.event {
++                SessionControllerEvent::CommandAccepted { operation, request_id: Some(id) }
++                    if operation == expected => accepted_request_id = Some(id),
++                SessionControllerEvent::StateChanged { state, outcome } => {
++                    self.state = state;
++                    if let SessionClientOutcome::CommandResult { request_id, operation, .. } = outcome {
++                        if operation == expected
++                            && accepted_request_id.as_deref() == Some(request_id.as_str()) {
++                            return Ok(());
++                        }
++                    }
++                }
++                SessionControllerEvent::Attached { .. } => {
++                    bail!("session attachment changed while waiting for {expected}");
++                }
++                SessionControllerEvent::Failed { operation, message } if operation == expected => {
++                    bail!("daemon rejected {expected}: {message}");
++                }
++                SessionControllerEvent::Detached | SessionControllerEvent::Stopped => {
++                    bail!("{}", self.controller_stop_message());
++                }
++                _ => {}
++            }
++        }
++    }).await.map_err(|_| anyhow!("timed out waiting for daemon {expected}"))?
++}
+@@
+ Err(TryRecvError::Disconnected) => {
++    if !self.termination_reported {
++        self.termination_reported = true;
++        Some(TuiSessionUpdate::Failed(self.controller_stop_message()))
++    } else {
+         Some(TuiSessionUpdate::Stopped)
++    }
+ }
+```
+
+```diff
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@
++enum TuiExit { Detach, Stop }
+@@
+-UiCommand::StopSession => { queue(StopSession); return true; }
++UiCommand::StopSession => return Some(TuiExit::Stop),
+@@
+ let outcome = run_event_loop(...).await;
+ guard.restore();
++let stop_result = match &outcome {
++    Ok(TuiExit::Stop) => session.stop().await,
++    _ => Ok(()),
++};
+ session.shutdown().await;
++stop_result?;
+```
+
+Tests added: event_overflow_records_a_durable_stop_reason; event_overflow_surfaces_an_actionable_terminal_failure; command_wait_is_bounded_when_daemon_never_answers; stop_is_confirmed_before_shutdown_detaches. Daemon SetConfig test now accepts canonical event/CommandResult scheduling in either order while requiring all outputs. Config default/zero validation updated, plus daimonos.default.toml and docs/configuration.md.

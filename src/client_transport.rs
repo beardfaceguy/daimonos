@@ -1,4 +1,4 @@
-#![allow(dead_code)] // SessionDaemon consumes this seam in the next slice.
+#![allow(dead_code)] // Server and frontend adapters consume different seam subsets.
 
 use async_trait::async_trait;
 use std::fmt;
@@ -172,6 +172,66 @@ struct UnixReadState {
     buffer: Vec<u8>,
 }
 
+async fn read_frame(
+    state: &mut UnixReadState,
+    max_frame_bytes: usize,
+) -> Result<Option<Vec<u8>>, TransportError> {
+    loop {
+        if let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            if newline > max_frame_bytes {
+                return Err(TransportError::FrameTooLarge {
+                    max_bytes: max_frame_bytes,
+                });
+            }
+            let mut frame: Vec<u8> = state.buffer.drain(..=newline).collect();
+            frame.pop();
+            if frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
+            return Ok(Some(frame));
+        }
+        if state.buffer.len() > max_frame_bytes {
+            return Err(TransportError::FrameTooLarge {
+                max_bytes: max_frame_bytes,
+            });
+        }
+
+        // Read at most one byte beyond the configured limit. That byte is
+        // enough to classify an oversized unterminated frame without ever
+        // buffering a full I/O chunk beyond the advertised bound.
+        let remaining = max_frame_bytes
+            .saturating_add(1)
+            .saturating_sub(state.buffer.len());
+        let mut chunk = [0_u8; READ_CHUNK_BYTES];
+        let read = state
+            .reader
+            .read(&mut chunk[..remaining.min(READ_CHUNK_BYTES)])
+            .await?;
+        if read == 0 {
+            return if state.buffer.is_empty() {
+                Ok(None)
+            } else {
+                Err(TransportError::UnexpectedEof)
+            };
+        }
+        state.buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn encode_frame<T: serde::Serialize>(
+    message: &T,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, TransportError> {
+    let mut frame = serde_json::to_vec(message)?;
+    if frame.len() > max_frame_bytes {
+        return Err(TransportError::FrameTooLarge {
+            max_bytes: max_frame_bytes,
+        });
+    }
+    frame.push(b'\n');
+    Ok(frame)
+}
+
 pub struct UnixSocketTransport {
     reader: Mutex<UnixReadState>,
     writer: Mutex<OwnedWriteHalf>,
@@ -206,60 +266,14 @@ impl UnixSocketTransport {
 
     async fn read_frame(&self) -> Result<Option<Vec<u8>>, TransportError> {
         let mut state = self.reader.lock().await;
-        loop {
-            if let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') {
-                if newline > self.max_frame_bytes {
-                    return Err(TransportError::FrameTooLarge {
-                        max_bytes: self.max_frame_bytes,
-                    });
-                }
-                let mut frame: Vec<u8> = state.buffer.drain(..=newline).collect();
-                frame.pop();
-                if frame.last() == Some(&b'\r') {
-                    frame.pop();
-                }
-                return Ok(Some(frame));
-            }
-            if state.buffer.len() > self.max_frame_bytes {
-                return Err(TransportError::FrameTooLarge {
-                    max_bytes: self.max_frame_bytes,
-                });
-            }
-
-            // Read at most one byte beyond the configured limit. That byte is
-            // enough to classify an oversized unterminated frame without ever
-            // buffering a full I/O chunk beyond the advertised bound.
-            let remaining = self
-                .max_frame_bytes
-                .saturating_add(1)
-                .saturating_sub(state.buffer.len());
-            let mut chunk = [0_u8; READ_CHUNK_BYTES];
-            let read = state
-                .reader
-                .read(&mut chunk[..remaining.min(READ_CHUNK_BYTES)])
-                .await?;
-            if read == 0 {
-                return if state.buffer.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(TransportError::UnexpectedEof)
-                };
-            }
-            state.buffer.extend_from_slice(&chunk[..read]);
-        }
+        read_frame(&mut state, self.max_frame_bytes).await
     }
 }
 
 #[async_trait]
 impl ClientTransport for UnixSocketTransport {
     async fn send(&self, message: &ServerMessage) -> Result<(), TransportError> {
-        let mut frame = serde_json::to_vec(message)?;
-        if frame.len() > self.max_frame_bytes {
-            return Err(TransportError::FrameTooLarge {
-                max_bytes: self.max_frame_bytes,
-            });
-        }
-        frame.push(b'\n');
+        let frame = encode_frame(message, self.max_frame_bytes)?;
         let mut writer = self.writer.lock().await;
         writer.write_all(&frame).await?;
         writer.flush().await?;
@@ -268,6 +282,56 @@ impl ClientTransport for UnixSocketTransport {
 
     async fn recv(&self) -> Result<Option<ClientMessage>, TransportError> {
         let Some(frame) = self.read_frame().await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&frame)?))
+    }
+
+    fn peer_label(&self) -> &str {
+        &self.peer_label
+    }
+}
+
+pub struct UnixFrontendTransport {
+    reader: UnixReadState,
+    writer: OwnedWriteHalf,
+    peer_label: String,
+    max_frame_bytes: usize,
+}
+
+impl UnixFrontendTransport {
+    pub fn new(
+        stream: UnixStream,
+        peer_label: impl Into<String>,
+        max_frame_bytes: usize,
+    ) -> Result<Self, TransportError> {
+        if max_frame_bytes == 0 {
+            return Err(TransportError::InvalidFrameLimit);
+        }
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            reader: UnixReadState {
+                reader,
+                buffer: Vec::new(),
+            },
+            writer,
+            peer_label: peer_label.into(),
+            max_frame_bytes,
+        })
+    }
+}
+
+#[async_trait]
+impl FrontendTransport for UnixFrontendTransport {
+    async fn send(&mut self, message: ClientMessage) -> Result<(), TransportError> {
+        let frame = encode_frame(&message, self.max_frame_bytes)?;
+        self.writer.write_all(&frame).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<ServerMessage>, TransportError> {
+        let Some(frame) = read_frame(&mut self.reader, self.max_frame_bytes).await? else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(&frame)?))
@@ -348,6 +412,20 @@ mod tests {
             serde_json::from_str::<ServerMessage>(line.trim_end()).unwrap(),
             ServerMessage::Pong
         );
+    }
+
+    #[tokio::test]
+    async fn unix_frontend_transport_round_trips_client_and_server_messages() {
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let server = UnixSocketTransport::new(server_stream, "terminal", 1024).unwrap();
+        let mut client = UnixFrontendTransport::new(client_stream, "daemon", 1024).unwrap();
+
+        client.send(ClientMessage::Ping).await.unwrap();
+        assert_eq!(server.recv().await.unwrap(), Some(ClientMessage::Ping));
+
+        server.send(&ServerMessage::Pong).await.unwrap();
+        assert_eq!(client.recv().await.unwrap(), Some(ServerMessage::Pong));
+        assert_eq!(client.peer_label(), "daemon");
     }
 
     #[tokio::test]

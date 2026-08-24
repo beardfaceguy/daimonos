@@ -1,0 +1,154 @@
+```rust
+// src/session_bootstrap.rs
+pub const BOOTSTRAP_FINGERPRINT_ENV: &str = "DAIMONOS_SESSION_BOOTSTRAP_FINGERPRINT";
+
+pub struct BootstrapOptions<'a> {
+    pub workspace: &'a Path,
+    pub config_path: Option<&'a Path>,
+    pub socket_path: &'a Path,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub agent_env: Option<&'a Path>,
+    pub max_frame_bytes: usize,
+    pub timeout: Duration,
+    pub retry_interval: Duration,
+}
+
+pub struct BootstrapConnection {
+    pub transport: UnixFrontendTransport,
+    pub accepted_launch_options: bool,
+}
+
+pub async fn connect_or_spawn(options: &BootstrapOptions<'_>) -> anyhow::Result<BootstrapConnection> {
+    match UnixStream::connect(options.socket_path).await {
+        Ok(stream) => return Ok(BootstrapConnection {
+            transport: frontend_transport(stream, options)?,
+            accepted_launch_options: instance_fingerprint(options.socket_path).ok().flatten().as_deref()
+                == Some(bootstrap_fingerprint(options).as_str()),
+        }),
+        Err(error) if should_bootstrap(&error) => {}
+        Err(error) => bail!("cannot connect to session daemon at {}: {error}", options.socket_path.display()),
+    }
+
+    let executable = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(&executable);
+    command.args(daemon_args(options))
+        .env(BOOTSTRAP_FINGERPRINT_ENV, bootstrap_fingerprint(options))
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .kill_on_drop(false);
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + options.timeout;
+    let mut child_status = None;
+
+    loop {
+        match UnixStream::connect(options.socket_path).await {
+            Ok(stream) => {
+                if child.try_wait()?.is_none() {
+                    tokio::spawn(async move { let _ = child.wait().await; });
+                }
+                return Ok(BootstrapConnection {
+                    transport: frontend_transport(stream, options)?,
+                    accepted_launch_options: instance_fingerprint(options.socket_path).ok().flatten().as_deref()
+                        == Some(bootstrap_fingerprint(options).as_str()),
+                });
+            }
+            Err(error) if should_bootstrap(&error) => {}
+            Err(error) => bail!("cannot connect to bootstrapped session daemon at {}: {error}", options.socket_path.display()),
+        }
+        if child_status.is_none() { child_status = child.try_wait()?; }
+        let now = Instant::now();
+        if now >= deadline { break; }
+        sleep(options.retry_interval.min(deadline - now)).await;
+    }
+    if child_status.is_none() && child.try_wait()?.is_none() {
+        tokio::spawn(async move { let _ = child.wait().await; });
+    }
+    let status = child_status.map(|s| format!("; spawned daemon exited with {s}")).unwrap_or_default();
+    bail!("timed out waiting for session daemon at {}{status}; run `daimonos --workspace {} session-daemon --socket {}` directly for startup diagnostics", options.socket_path.display(), options.workspace.display(), options.socket_path.display())
+}
+
+fn should_bootstrap(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused)
+}
+
+fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
+    // --workspace, optional --config, session-daemon --socket,
+    // optional --provider/--model/--agent-env, preserving OsString paths
+}
+
+fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
+    // SHA-256 over nul-delimited workspace/config/socket/provider/model/agent-env bytes
+}
+```
+
+```rust
+// src/agent_runtime.rs interactive branch
+let bootstrap = session_bootstrap::connect_or_spawn(&BootstrapOptions {
+    workspace,
+    config_path: explicit_config_path.as_deref(),
+    socket_path: &socket_path,
+    provider: provider.as_deref(),
+    model: model.as_deref(),
+    agent_env: agent_env.as_deref(),
+    max_frame_bytes: cfg.session.max_frame_bytes,
+    timeout: Duration::from_secs(cfg.session.bootstrap_timeout_secs),
+    retry_interval: Duration::from_millis(cfg.session.bootstrap_retry_interval_ms),
+}).await?;
+if !bootstrap.accepted_launch_options {
+    if let Some(provider) = provider.as_deref() {
+        bail!("--provider '{provider}' cannot override a running session daemon; restart the daemon with that provider");
+    }
+    if let Some(path) = agent_env.as_deref() {
+        bail!("--agent-env {} cannot override a running session daemon; restart the daemon with that environment", path.display());
+    }
+}
+let controller = SessionControllerHandle::spawn(bootstrap.transport, /* capabilities and bounded channels */);
+```
+
+```rust
+// src/session_daemon.rs socket ownership metadata
+struct SocketPathGuard {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _lock_file: File,
+    instance_file: Option<(PathBuf, u64, u64)>,
+}
+
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        // Remove instance file and socket only when current device/inode match.
+    }
+}
+
+fn write_instance_metadata(socket_path: &Path) -> io::Result<(PathBuf, u64, u64)> {
+    let path = instance_metadata_path(socket_path); // <socket>.pid
+    let temporary = unique sibling path;
+    let mut file = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&temporary)?;
+    let body = json!({
+        "pid": process::id(), "version": env!("CARGO_PKG_VERSION"),
+        "socket": socket_path, "started_unix_ms": now,
+        "bootstrap_fingerprint": env::var(BOOTSTRAP_FINGERPRINT_ENV).ok(),
+    });
+    file.write_all(&serde_json::to_vec(&body)?)?;
+    file.sync_all()?;
+    rename(temporary, path)?;
+    let metadata = symlink_metadata(path)?;
+    Ok((path, metadata.dev(), metadata.ino()))
+}
+```
+
+Config additions (validated positive and documented):
+- session.bootstrap_timeout_secs = 15
+- session.bootstrap_retry_interval_ms = 50
+
+Tests:
+- daemon_args preserves exact explicit selections.
+- fingerprint stable and changes with daemon-owned selection.
+- only NotFound/ConnectionRefused trigger spawn.
+- socket test verifies mode-0600 PID metadata contents and lifecycle cleanup.
+- PTY integration launches two concurrent interactive agents with identical explicit config/provider/model/agent-env; both attach to one daemon, both quit cleanly, daemon remains, then SIGTERM removes socket and metadata.
+- PTY missing-agent-env test verifies bounded failure names child exit and direct diagnostic command.
+
+Verification: cargo fmt/clippy clean; full cargo test passed; full pytest passed (295).

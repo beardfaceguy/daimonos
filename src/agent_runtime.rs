@@ -63,9 +63,10 @@ async fn discover_models(
     llm: Option<&dyn providers::LlmProvider>,
     configured: &[String],
     effective_model: &str,
+    discover_live: bool,
 ) -> Vec<String> {
     let mut models = match llm {
-        Some(llm) if !models_discovery_disabled() => {
+        Some(llm) if discover_live => {
             match tokio::time::timeout(std::time::Duration::from_secs(5), llm.list_models()).await {
                 Ok(Some(live)) => {
                     tracing::info!(
@@ -191,6 +192,7 @@ pub async fn run_agent(
     workspace: &Path,
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
+    explicit_config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let AgentArgs {
         task,
@@ -254,6 +256,76 @@ pub async fn run_agent(
         return Ok(());
     }
 
+    if mode == tui::AgentMode::Interactive {
+        let socket_path = cfg.session.resolved_socket_path(workspace);
+        let bootstrap = crate::session_bootstrap::connect_or_spawn(
+            &crate::session_bootstrap::BootstrapOptions {
+                workspace,
+                config_path: explicit_config_path.as_deref(),
+                socket_path: &socket_path,
+                provider: provider.as_deref(),
+                model: model.as_deref(),
+                agent_env: agent_env.as_deref(),
+                max_frame_bytes: cfg.session.max_frame_bytes,
+                timeout: std::time::Duration::from_secs(cfg.session.bootstrap_timeout_secs),
+                retry_interval: std::time::Duration::from_millis(
+                    cfg.session.bootstrap_retry_interval_ms,
+                ),
+            },
+        )
+        .await?;
+        match bootstrap.launch_identity {
+            crate::session_bootstrap::LaunchIdentity::NotRequested
+            | crate::session_bootstrap::LaunchIdentity::Matched => {}
+            crate::session_bootstrap::LaunchIdentity::Mismatched => {
+                anyhow::bail!(
+                    "explicit config/provider/agent-env selection differs from the running \
+                     session daemon; restart the daemon with the requested selection"
+                );
+            }
+            crate::session_bootstrap::LaunchIdentity::Unavailable => {
+                anyhow::bail!(
+                    "the running session daemon does not publish a comparable launch identity; \
+                     restart it with this daimonos version before applying explicit \
+                     config/provider/agent-env selection"
+                );
+            }
+        }
+        let controller = crate::session_controller::SessionControllerHandle::spawn(
+            bootstrap.transport,
+            crate::session_protocol::ClientInfo {
+                id: "tui".to_string(),
+                kind: crate::session_protocol::ClientKind::Terminal,
+                label: format!("terminal {}", workspace.display()),
+            },
+            vec![
+                crate::session_protocol::ClientCapability::Observe,
+                crate::session_protocol::ClientCapability::Prompt,
+                crate::session_protocol::ClientCapability::Configure,
+                crate::session_protocol::ClientCapability::Interrupt,
+                crate::session_protocol::ClientCapability::Stop,
+                crate::session_protocol::ClientCapability::ApproveOnce,
+                crate::session_protocol::ClientCapability::ApproveAlways,
+            ],
+            cfg.tui.scrollback_entries,
+            cfg.session.event_queue_capacity,
+            cfg.session.event_queue_capacity,
+        );
+        return tui::run_tui(
+            controller,
+            tui::TuiOptions {
+                initial_prompt: task,
+                no_color,
+                model_override: model,
+                history_entries: cfg.tui.history_entries,
+                command_timeout: std::time::Duration::from_secs(
+                    cfg.session.client_command_timeout_secs,
+                ),
+            },
+        )
+        .await;
+    }
+
     let task = if mode == tui::AgentMode::Print {
         Some(require_agent_task(task, mode, interactive_fell_back)?)
     } else {
@@ -275,32 +347,6 @@ pub async fn run_agent(
     } else {
         None
     };
-
-    if mode == tui::AgentMode::Interactive {
-        let compaction = agent
-            .resolve_compaction(llm.as_ref(), &effective_model)
-            .await
-            .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
-        let compaction = prompts::apply_summary_override(compaction, &cfg).await;
-        let models = discover_models(Some(llm.as_ref()), &agent.models, &effective_model).await;
-        return tui::run_tui(
-            llm,
-            workspace,
-            cfg,
-            tui::TuiOptions {
-                initial_prompt: task,
-                no_color,
-                model: effective_model,
-                models,
-                safety: agent.to_safety_policy(None),
-                token_log,
-                compaction,
-                analytics: analytics_store,
-                thinking: agent.thinking,
-            },
-        )
-        .await;
-    }
 
     let task = require_agent_task(task, mode, false)?;
     let approve_fn = if agent.approval_mode == "auto" {
@@ -424,7 +470,13 @@ pub async fn run_acp(
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     // The probe instance already exists for compaction resolution; reuse it
     // for live model discovery.
-    let models = discover_models(Some(probe.as_ref()), &agent.models, &effective_model).await;
+    let models = discover_models(
+        Some(probe.as_ref()),
+        &agent.models,
+        &effective_model,
+        !models_discovery_disabled(),
+    )
+    .await;
     let safety = agent.to_safety_policy(None);
     let sessions_dir = paths::agent_sessions_dir();
     let analytics_store = if cfg.analytics.enabled {
@@ -525,7 +577,13 @@ pub async fn run_session_daemon(
         )
         .await,
     );
-    let models = discover_models(Some(probe.as_ref()), &agent.models, &effective_model).await;
+    let models = discover_models(
+        Some(probe.as_ref()),
+        &agent.models,
+        &effective_model,
+        !models_discovery_disabled(),
+    )
+    .await;
     let factory = Arc::new(session_factory::AgentSessionFactory::new(
         make_provider,
         workspace.to_path_buf(),
@@ -838,7 +896,7 @@ mod tests {
     async fn discovery_prefers_the_live_catalog_and_anchors_the_active_model() {
         let stub = CatalogStub(Some(vec!["new-model".into(), "old-model".into()]));
         let configured = vec!["stale-a".into(), "stale-b".into()];
-        let models = discover_models(Some(&stub), &configured, "active-model").await;
+        let models = discover_models(Some(&stub), &configured, "active-model", true).await;
         // Live catalog replaces the static snapshot; the active model is
         // prepended because the failover chain anchors on it.
         assert_eq!(models, vec!["active-model", "new-model", "old-model"]);
@@ -848,11 +906,19 @@ mod tests {
     async fn discovery_falls_back_to_configured_models_when_catalog_unavailable() {
         let stub = CatalogStub(None);
         let configured = vec!["cfg-a".into(), "cfg-b".into()];
-        let models = discover_models(Some(&stub), &configured, "cfg-a").await;
+        let models = discover_models(Some(&stub), &configured, "cfg-a", true).await;
         assert_eq!(models, vec!["cfg-a", "cfg-b"]);
         // No provider at all (factory failed): same fallback.
-        let models = discover_models(None, &configured, "other").await;
+        let models = discover_models(None, &configured, "other", true).await;
         assert_eq!(models, vec!["other", "cfg-a", "cfg-b"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_policy_can_disable_the_live_catalog() {
+        let stub = CatalogStub(Some(vec!["live-model".into()]));
+        let configured = vec!["configured-model".into()];
+        let models = discover_models(Some(&stub), &configured, "active-model", false).await;
+        assert_eq!(models, vec!["active-model", "configured-model"]);
     }
 
     #[test]

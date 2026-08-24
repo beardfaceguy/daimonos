@@ -2,6 +2,7 @@
 
 - **Status:** Accepted (incremental; layers land across Vikunja #1091 phases)
 - **Date:** 2026-08-04
+- **Amended:** 2026-08-23 (Vikunja #1331 daemon-client migration)
 - **Tracking:** Vikunja #1091 (project #183, `daimonos-agent`)
 - **Relates to:** ADR-010 (session daemon + remote control, Vikunja #1090),
   Vikunja #955 (`daimonos chat` Reedline REPL — superseded/aliased)
@@ -53,7 +54,7 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
 
 - `daimonos agent --interactive` launches the persistent TUI when stdin and
   stdout are attached to a TTY, with an optional initial prompt. Interactive
-  mode is deliberately opt-in while the daemon-owned detach/reconnect path is
+  mode is deliberately opt-in while session discovery and typed reconnect are
   still being completed.
 - A **stable, explicit non-interactive mode** is preserved for scripts, CI,
   benchmarks, and shell composition: `daimonos agent "task"` remains the
@@ -66,9 +67,9 @@ exhaustively tested for out-of-order/duplicate/reconnect behavior.
   non-full-screen fallback editor but must never own stdin concurrently with a
   raw-mode TUI.
 
-### 3. Future detach vs stop contract (not currently exposed)
+### 3. Detach vs stop contract
 
-The intended daemon-owned contract remains:
+The daemon-owned contract is:
 
 - closing/detaching a client does not kill its daemon session;
 - reattaching by session id or picker restores a canonical snapshot;
@@ -76,11 +77,19 @@ The intended daemon-owned contract remains:
 - the local TUI retains authority to approve, interrupt, revoke remote clients,
   and stop the session, regardless of remote attachment (ADR-010 arbitration).
 
-The current TUI is process-local, so `/detach` is intentionally disabled and
-omitted from help. `/quit` exits the TUI and ends its session. Do not expose
-detach until the daemon provides local attach, session discovery, reconnect
-snapshot recovery, explicit stop/delete, and bounded idle/retention cleanup;
-without those pieces detach would only create unreachable abandoned sessions.
+The TUI now attaches through the bounded `SessionController` actor. `/quit` and
+`/detach` close only that client connection; `/stop-session` sends the explicit
+daemon stop command. Canonical snapshots and events are the only source of
+rendered state. Commands that gate later work wait for a correlated daemon
+`CommandResult`; successful `SetConfig` now guarantees that response after the
+runtime option is applied. Startup connects first and, only when the socket is
+absent or stale, launches a fully detached session daemon with the selected
+workspace, config, provider, model, and agent environment. Concurrent launchers
+retry the owner-locked socket for a configured bounded interval; they never kill
+a version-skewed daemon. The daemon publishes owner-only PID/version metadata
+beside its socket for diagnostics and removes it with the socket. Session
+discovery and switching remain separate follow-up tasks, so the current command
+starts a fresh daemon-owned session.
 
 ### 4. Terminal correctness (hard requirements)
 
@@ -109,8 +118,10 @@ without those pieces detach would only create unreachable abandoned sessions.
    rendering are implemented; expandable diffs/terminal output, search/copy,
    resize/suspend, and broader accessibility remain.
 7. Wire the TUI behind opt-in `--interactive`; retain the default and explicit
-   `--print` stable print modes. Reconsider a TTY default only after the
-   daemon-owned detach/reconnect lifecycle is complete.
+   `--print` stable print modes. *(daemon-client wiring landed in task #1331;
+   connect-first automatic daemon bootstrap has also landed; typed reconnect
+   remains.)* Reconsider a TTY default only after the daemon-owned lifecycle is
+   complete.
 
 ## Verification gates (TDD)
 

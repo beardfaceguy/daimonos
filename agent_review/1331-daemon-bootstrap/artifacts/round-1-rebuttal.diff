@@ -1,0 +1,115 @@
+```diff
+--- a/src/session_bootstrap.rs
++++ b/src/session_bootstrap.rs
+@@
+-pub struct BootstrapConnection { pub transport: UnixFrontendTransport, pub accepted_launch_options: bool }
++pub struct BootstrapConnection { pub transport: UnixFrontendTransport, pub launch_identity: LaunchIdentity }
++
++pub enum LaunchIdentity {
++    NotRequested,
++    Matched,
++    Mismatched,
++    Unavailable,
++}
+@@
+-command.as_std_mut().process_group(0);
+-let mut child = command.spawn()?;
++unsafe {
++    command.as_std_mut().pre_exec(|| {
++        if libc::setsid() < 0 { return Err(io::Error::last_os_error()); }
++        let pid = libc::fork();
++        if pid < 0 { return Err(io::Error::last_os_error()); }
++        if pid > 0 { libc::_exit(0); }
++        Ok(())
++    });
++}
++let mut intermediate = command.spawn()?;
++let status = intermediate.wait().await?;
++if !status.success() { bail!("session daemon bootstrap process exited with {status}"); }
+@@
+-// tokio::spawn(child.wait()) on success/error
++// no persistent child handle: daemon grandchild is reparented outside TUI
+@@
+ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
+-    // workspace, config, socket, provider, model, agent-env
++    // workspace, explicit config, provider, agent-env
++    // model excluded: it is daemon-confirmed mutable runtime state
+ }
++
++fn launch_identity(options: &BootstrapOptions<'_>) -> io::Result<LaunchIdentity> {
++    if options.config_path.is_none() && options.provider.is_none() && options.agent_env.is_none() {
++        return Ok(LaunchIdentity::NotRequested);
++    }
++    let Some(metadata) = instance_metadata(options.socket_path)? else {
++        return Ok(LaunchIdentity::Unavailable);
++    };
++    let Some(actual) = metadata["bootstrap_fingerprint"].as_str() else {
++        return Ok(LaunchIdentity::Unavailable);
++    };
++    Ok(if actual == bootstrap_fingerprint(options) {
++        LaunchIdentity::Matched
++    } else {
++        LaunchIdentity::Mismatched
++    })
++}
++
++fn instance_metadata(socket: &Path) -> io::Result<Option<Value>> {
++    let metadata = symlink_metadata(path)?;
++    if !metadata.file_type().is_file()
++        || metadata.uid() != geteuid()
++        || metadata.permissions().mode() & 0o077 != 0 {
++        return Err(io::Error::new(PermissionDenied, "metadata is not owner-only regular file"));
++    }
++    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
++    let opened = file.metadata()?;
++    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
++        return Err(io::Error::other("metadata changed while opening"));
++    }
++    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
++    if bytes.len() > 16 * 1024 { return Err(io::Error::new(InvalidData, "metadata too large")); }
++    Ok(Some(serde_json::from_slice(&bytes)?))
++}
+```
+
+```diff
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@
+-if !bootstrap.accepted_launch_options { /* provider/agent-env-only checks */ }
++match bootstrap.launch_identity {
++    LaunchIdentity::NotRequested | LaunchIdentity::Matched => {}
++    LaunchIdentity::Mismatched => bail!(
++        "explicit config/provider/agent-env selection differs from the running session daemon; restart it"
++    ),
++    LaunchIdentity::Unavailable => bail!(
++        "running daemon publishes no comparable identity; restart with this version before explicit selection"
++    ),
++}
+```
+
+```diff
+--- a/src/session_daemon.rs
++++ b/src/session_daemon.rs
+@@
+- let listener = UnixListener::bind(socket_path)?;
+- // chmod and metadata
+- guard.instance_file = Some(write_instance_metadata(socket_path)?);
++ // Exact socket-derived flock is already held and any stale owner socket removed.
++ let instance_file = write_instance_metadata(socket_path)?;
++ let listener = match UnixListener::bind(socket_path) {
++     Ok(listener) => listener,
++     Err(error) => { remove_matching_regular_file(&instance_file); return Err(error); }
++ };
++ // chmod/metadata failures remove both socket and matching instance file.
++ let guard = SocketPathGuard { instance_file: Some(instance_file), /* inode ownership */ };
+```
+
+Tests added/revised:
+- LaunchIdentity match/mismatch/unavailable/not-requested policy.
+- Model changes do not alter immutable fingerprint; provider changes do.
+- Metadata symlink rejection with O_NOFOLLOW path.
+- Stale owner socket replacement under flock.
+- External SIGKILL stale-socket recovery.
+- Concurrent PTY bootstrap asserts daemon PPid is neither TUI PID (double-fork reparenting).
+
+Full paths and implementation are in src/session_bootstrap.rs, src/session_daemon.rs, src/agent_runtime.rs, and tests/test_cli_modes.py.

@@ -29,6 +29,7 @@ pub mod app;
 pub mod commands;
 pub mod input;
 pub mod render;
+mod session;
 pub mod state;
 pub mod terminal;
 

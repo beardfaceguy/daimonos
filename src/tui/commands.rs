@@ -37,12 +37,12 @@ pub enum UiCommand {
     Compact,
     /// Interrupt the in-flight turn without quitting.
     Interrupt,
-    /// Exit the process-local TUI and end its session.
+    /// Detach the TUI while leaving the daemon-owned session running.
     Quit,
-    /// End the current process-local session and exit.
+    /// End the current daemon-owned session and exit.
     StopSession,
-    /// Reserved for the future daemon reattach lifecycle; currently disabled.
-    DetachUnavailable,
+    /// Detach the TUI while leaving the daemon-owned session running.
+    Detach,
     /// An unrecognized `/command` (echoed back so the UI can hint).
     Unknown(String),
 }
@@ -56,7 +56,8 @@ Commands:
   /model [id]        switch model (no id opens the picker)
   /compact           compact context now
   /interrupt, /stop  interrupt the in-flight turn
-  /quit, /exit       exit the TUI and end this process-local session
+  /quit, /exit       detach the TUI; the daemon session keeps running
+  /detach            detach the TUI; the daemon session keeps running
   /stop-session      end the current session and exit
 Anything else is sent to the agent as a prompt.
 Enter sends · Ctrl-C interrupts the current turn.
@@ -86,7 +87,7 @@ pub fn parse_command(line: &str) -> UiCommand {
         "/compact" => UiCommand::Compact,
         "/interrupt" | "/stop" | "/cancel" => UiCommand::Interrupt,
         "/quit" | "/exit" | "/q" => UiCommand::Quit,
-        "/detach" => UiCommand::DetachUnavailable,
+        "/detach" => UiCommand::Detach,
         "/stop-session" | "/kill" => UiCommand::StopSession,
         other => UiCommand::Unknown(other.to_string()),
     }
@@ -159,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn detach_is_disabled_until_reattach_exists() {
-        assert_eq!(parse_command("/detach"), UiCommand::DetachUnavailable);
-        assert!(!HELP_TEXT.contains("/detach"));
+    fn detach_is_available_for_daemon_owned_sessions() {
+        assert_eq!(parse_command("/detach"), UiCommand::Detach);
+        assert!(HELP_TEXT.contains("/detach"));
     }
 
     #[test]

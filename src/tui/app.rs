@@ -1,171 +1,71 @@
-//! Local full-screen frontend for a stateful [`AgentSession`] (Vikunja #1091).
+//! Full-screen terminal client for a daemon-owned agent session (Vikunja #1331).
 //!
-//! The event hooks project provider and tool activity into the same canonical
-//! [`SessionEvent`] stream used by ACP clients. Rendering reads only
-//! [`ViewState`]; it never reaches into the provider or tool loop.
+//! Rendering and input consume only canonical daemon state through
+//! [`TuiSession`]. Providers, tools, approvals, persistence, and turn tasks stay
+//! in the session daemon.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
-use tokio::sync::oneshot;
 
-use crate::agent::{
-    AfterHookResult, AgentConfig, AgentSession, BeforeHookResult, TokenLogConfig, ToolCallInfo,
-    TurnResult,
+use crate::session_controller::{
+    ControllerSendError, SessionControllerCommand, SessionControllerHandle,
 };
-use crate::analytics::AnalyticsStore;
-use crate::compaction::CompactionPolicy;
-use crate::config::Config;
-use crate::providers::{
-    CompleteOpts, LlmProvider, StopReason, StreamEvent, ThinkingLevel, ToolSchema,
-};
-use crate::safety::{Gate, SafetyPolicy};
-use crate::session::Session;
-use crate::session_core::{SessionEventHandler, SessionEventRouter};
-use crate::session_protocol::{
-    ApprovalDecision, ApprovalRequest, AssistantOutcome, ContextUsage, RuntimeChoice,
-    RuntimeOption, RuntimeValue, SessionEvent, ToolCallStateStatus, TurnStatus,
-};
-use crate::tool_facade;
+use crate::session_protocol::{RuntimeOptionSpec, RuntimeValue, TurnStatus};
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
 use super::input::{
     apply_scroll_action, ComposerHistory, InputMode, TranscriptScroll, VimScrollKeys,
 };
-use super::state::ViewState;
+use super::session::{TuiSession, TuiSessionUpdate};
 use super::terminal::{install_panic_hook, TerminalGuard};
 
-/// Runtime inputs already resolved by `agent_runtime`.
+/// Runtime inputs resolved before entering raw terminal mode.
 pub struct TuiOptions {
     pub initial_prompt: Option<String>,
     pub no_color: bool,
-    pub model: String,
-    pub models: Vec<String>,
-    pub safety: SafetyPolicy,
-    pub token_log: Option<PathBuf>,
-    pub compaction: Option<CompactionPolicy>,
-    pub analytics: Option<Arc<AnalyticsStore>>,
-    pub thinking: ThinkingLevel,
+    pub model_override: Option<String>,
+    pub history_entries: usize,
+    pub command_timeout: Duration,
 }
 
-struct PendingApproval {
-    sender: oneshot::Sender<ApprovalDecision>,
-}
+/// Attach the full-screen UI to one daemon-owned session.
+pub async fn run(controller: SessionControllerHandle, options: TuiOptions) -> anyhow::Result<()> {
+    let mut session = TuiSession::attach(controller, options.command_timeout).await?;
 
-type SharedView = Arc<StdMutex<ViewState>>;
-type SharedApproval = Arc<StdMutex<Option<PendingApproval>>>;
-
-/// Run the opt-in full-screen TUI until quit or stop-session.
-pub async fn run(
-    provider: Box<dyn LlmProvider>,
-    workspace: &Path,
-    cfg: Arc<Config>,
-    options: TuiOptions,
-) -> anyhow::Result<()> {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let history_entries = cfg.tui.history_entries;
-    let scrollback_entries = cfg.tui.scrollback_entries;
-    let view = Arc::new(StdMutex::new(ViewState::with_scrollback_limit(
-        session_id.clone(),
-        scrollback_entries,
-    )));
-    let handler_view = Arc::clone(&view);
-    let handler: SessionEventHandler = Arc::new(move |seq, event| {
-        let mut view = handler_view
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = view.apply_event(seq, event);
-    });
-    let events = Arc::new(SessionEventRouter::new(Some(handler)));
-    let pending_approval: SharedApproval = Arc::new(StdMutex::new(None));
-    let streamed_text = Arc::new(AtomicBool::new(false));
-
-    let runtime_options = model_runtime_options(&options.models, &options.model);
-    let _ = events.emit(SessionEvent::RuntimeOptionsChanged {
-        options: runtime_options,
-    });
-
-    let mut tools = active_tools(workspace, &cfg);
-    // Outbound MCP servers (#1289): the TUI is its own client, so the server
-    // list comes from the Claude-style file named by `[agent.mcp]`.
-    let native_names: std::collections::HashSet<String> =
-        tools.iter().map(|tool| tool.name.clone()).collect();
-    let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, options.analytics.clone()).await;
-    if let Some(mcp) = &agent_mcp {
-        tools.extend(mcp.tools());
+    if let Some(model) = options.model_override.as_deref() {
+        let candidate = RuntimeValue::String(model.to_string());
+        let option = session
+            .state()
+            .runtime_options()
+            .iter()
+            .find(|option| option.id == "model")
+            .ok_or_else(|| anyhow::anyhow!("the daemon does not advertise a model option"))?;
+        if !option.accepts(&candidate) {
+            anyhow::bail!("model '{model}' is not offered by the running session daemon");
+        }
+        session
+            .set_config("model", candidate)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to apply model override: {error}"))?;
     }
-    let safety = Arc::new(options.safety);
-    let before_tool_call = build_before_tool_call_hook(
-        Arc::clone(&events),
-        Arc::clone(&pending_approval),
-        Arc::clone(&safety),
-    );
-    let after_tool_call = build_after_tool_call_hook(Arc::clone(&events));
-    let stream_events = Arc::clone(&events);
-    let stream_seen = Arc::clone(&streamed_text);
-    let compaction_for_usage = options.compaction.clone();
-    let config = AgentConfig {
-        system: Some(crate::prompts::agent_system(&cfg).await),
-        tools,
-        opts: CompleteOpts {
-            model: options.model,
-            thinking: options.thinking,
-            ..CompleteOpts::default()
-        },
-        // #1240 parity with the ACP frontend: the failover chain IS the
-        // operator's ordered model list (`DAIMONOS_AGENT_MODELS`, the same
-        // list `/model` shows, best-first). Provider-agnostic by
-        // construction — there is no cross-provider "older sibling" API, so
-        // the operator's own preference order is the only sound generic
-        // rule. When the env var is unset this list is `[active_model]` and
-        // `next_failover_model` finds no successor, so failover stays
-        // effectively opt-in.
-        provider_retry: crate::agent::ProviderRetryConfig {
-            failover_models: options.models.clone(),
-            ..crate::agent::ProviderRetryConfig::default()
-        },
-        before_tool_call: Some(before_tool_call),
-        after_tool_call: Some(after_tool_call),
-        on_stream_event: Some(Box::new(move |event| {
-            if matches!(event, StreamEvent::TextDelta(_)) {
-                stream_seen.store(true, Ordering::Relaxed);
-            }
-            let _ = stream_events.emit(map_stream_event(event));
-        })),
-        token_log: options.token_log.map(|path| TokenLogConfig {
-            path,
-            label: "tui".to_string(),
-        }),
-        compaction: options.compaction,
-        remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
-        // Provider recovery (transient-error resume, failover) surfaces in the
-        // transcript as a system entry: visible, but the turn keeps running.
-        on_provider_notice: Some(Box::new({
-            let view = Arc::clone(&view);
-            move |notice: &str| {
-                view.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_system_message(format!("[{notice}]"));
-            }
-        })),
-        ..AgentConfig::default()
-    };
 
-    let services =
-        crate::provisioning::build_tool_services(workspace, &cfg, true, false, options.analytics)
-            .await;
-    let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
-    crate::provisioning::provision_session(&mut tool_session, &services);
-    let session = Arc::new(tokio::sync::Mutex::new(AgentSession::new(
-        provider,
-        tool_session,
-        config,
-    )));
+    let initial_prompt = options
+        .initial_prompt
+        .filter(|prompt| !prompt.trim().is_empty());
+    if let Some(prompt) = initial_prompt.as_ref() {
+        if !is_quiescent(session.state().turn_status()) {
+            anyhow::bail!("new daemon session was not idle; initial prompt was not sent");
+        }
+        session
+            .send(SessionControllerCommand::Prompt {
+                text: prompt.clone(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to queue initial prompt: {error:?}"))?;
+    }
 
     let mut guard = TerminalGuard::enter()?;
     install_panic_hook();
@@ -174,111 +74,89 @@ pub async fn run(
     terminal.clear()?;
 
     let mut composer = String::new();
-    let mut history = ComposerHistory::new(history_entries);
-    let mut scroll = TranscriptScroll::default();
-    let mut turn = None;
-    if let Some(prompt) = options
-        .initial_prompt
-        .filter(|prompt| !prompt.trim().is_empty())
-    {
-        history.record(prompt.clone());
-        turn = Some(start_turn(
-            prompt,
-            Arc::clone(&session),
-            Arc::clone(&events),
-            Arc::clone(&streamed_text),
-            compaction_for_usage.clone(),
-        ));
+    let mut history = ComposerHistory::new(options.history_entries);
+    if let Some(prompt) = initial_prompt {
+        history.record(prompt);
     }
-
+    let mut scroll = TranscriptScroll::default();
     let outcome = run_event_loop(
         &mut terminal,
         &mut composer,
         &mut history,
         &mut scroll,
         options.no_color,
-        &view,
-        &session,
-        &events,
-        &pending_approval,
-        &streamed_text,
-        &compaction_for_usage,
-        &mut turn,
-        &options.models,
+        &mut session,
     )
     .await;
 
-    if let Some(active) = turn.take() {
-        active.abort();
-        let _ = active.await;
-    }
-    if let Some(mcp) = agent_mcp {
-        mcp.shutdown().await;
-    }
-    pending_approval
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
     let show_cursor = terminal.show_cursor();
     guard.restore();
+    let stop_result = match &outcome {
+        Ok(TuiExit::Stop) => session.stop().await.map_err(|error| {
+            anyhow::anyhow!(
+                "session stop was not confirmed; the daemon session may still be running: {error}"
+            )
+        }),
+        Ok(TuiExit::Detach) | Err(_) => Ok(()),
+    };
+    session.shutdown().await;
     match outcome {
         Err(error) => Err(error),
-        Ok(()) => show_cursor.map_err(Into::into),
+        Ok(_) => {
+            stop_result?;
+            show_cursor.map_err(Into::into)
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiExit {
+    Detach,
+    Stop,
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     composer: &mut String,
     history: &mut ComposerHistory,
     scroll: &mut TranscriptScroll,
     no_color: bool,
-    view: &SharedView,
-    session: &Arc<tokio::sync::Mutex<AgentSession>>,
-    events: &Arc<SessionEventRouter>,
-    pending_approval: &SharedApproval,
-    streamed_text: &Arc<AtomicBool>,
-    compaction: &Option<CompactionPolicy>,
-    turn: &mut Option<tokio::task::JoinHandle<()>>,
-    models: &[String],
-) -> anyhow::Result<()> {
-    // Vim-style modality (process-local, never part of session state): Insert
-    // feeds the composer, Scroll hands keys to the transcript. Esc toggles.
+    session: &mut TuiSession,
+) -> anyhow::Result<TuiExit> {
     let mut mode = InputMode::Insert;
     let mut vim_keys = VimScrollKeys::default();
     loop {
-        if turn
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            if let Some(finished) = turn.take() {
-                let _ = finished.await;
+        loop {
+            match session.poll() {
+                Some(TuiSessionUpdate::Updated) => {}
+                Some(TuiSessionUpdate::Failed(message)) => {
+                    anyhow::bail!("{message}");
+                }
+                Some(TuiSessionUpdate::Detached | TuiSessionUpdate::Stopped) => {
+                    return Ok(TuiExit::Detach);
+                }
+                None => break,
             }
         }
 
-        {
-            let view = view.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            terminal.draw(|frame| {
-                super::render_with_options(
-                    &view,
-                    composer,
-                    frame.area(),
-                    frame.buffer_mut(),
-                    super::RenderOptions {
-                        no_color,
-                        scroll_from_bottom: scroll.bottom_offset(),
-                        scroll_mode: mode == InputMode::Scroll,
-                    },
-                );
-                if view.active_approval().is_none() {
-                    if let Some(position) = super::composer_cursor_position(composer, frame.area())
-                    {
-                        frame.set_cursor_position(position);
-                    }
+        terminal.draw(|frame| {
+            super::render_with_options(
+                session.state(),
+                composer,
+                frame.area(),
+                frame.buffer_mut(),
+                super::RenderOptions {
+                    no_color,
+                    scroll_from_bottom: scroll.bottom_offset(),
+                    scroll_mode: mode == InputMode::Scroll,
+                },
+            );
+            if session.state().active_approval().is_none() {
+                if let Some(position) = super::composer_cursor_position(composer, frame.area()) {
+                    frame.set_cursor_position(position);
                 }
-            })?;
-        }
+            }
+        })?;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -286,16 +164,13 @@ async fn run_event_loop(
         match event::read()? {
             Event::Key(key) if accepts_key(key) => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    cancel_turn(turn, events, pending_approval).await;
+                    interrupt(session);
                     continue;
                 }
-                if resolve_approval_key(key, view, pending_approval) {
+                if handle_approval_key(key, session) {
                     continue;
                 }
                 if key.code == KeyCode::Esc {
-                    // Insert -> Scroll copies vim's Esc-to-normal; Scroll ->
-                    // Insert is the pragmatic escape hatch (vim's `i` also
-                    // works via ScrollAction::ExitScroll).
                     mode = match mode {
                         InputMode::Insert => InputMode::Scroll,
                         InputMode::Scroll => InputMode::Insert,
@@ -304,30 +179,7 @@ async fn run_event_loop(
                     continue;
                 }
                 if mode == InputMode::Scroll {
-                    match key.code {
-                        KeyCode::Char(ch) => {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            if let Some(action) = vim_keys.interpret(ch, ctrl) {
-                                let page = transcript_page_height(terminal)?;
-                                if apply_scroll_action(scroll, action, page) {
-                                    mode = InputMode::Insert;
-                                }
-                            }
-                        }
-                        // Arrows and the classic keys keep working so scroll
-                        // mode never traps a non-vim user.
-                        KeyCode::Up => scroll.line_up(),
-                        KeyCode::Down => scroll.line_down(),
-                        KeyCode::PageUp => {
-                            scroll.page_up(transcript_page_height(terminal)?);
-                        }
-                        KeyCode::PageDown => {
-                            scroll.page_down(transcript_page_height(terminal)?);
-                        }
-                        KeyCode::Home => scroll.jump_to_start(),
-                        KeyCode::End => scroll.jump_to_end(),
-                        _ => {}
-                    }
+                    handle_scroll_key(key, terminal, scroll, &mut mode, &mut vim_keys)?;
                     continue;
                 }
                 match key.code {
@@ -337,94 +189,10 @@ async fn run_event_loop(
                     }
                     KeyCode::Enter => {
                         let line = std::mem::take(composer);
-                        match parse_command(&line) {
-                            UiCommand::Prompt(prompt) if !prompt.is_empty() && turn.is_none() => {
-                                history.record(prompt.clone());
-                                scroll.jump_to_end();
-                                *turn = Some(start_turn(
-                                    prompt,
-                                    Arc::clone(session),
-                                    Arc::clone(events),
-                                    Arc::clone(streamed_text),
-                                    compaction.clone(),
-                                ));
-                            }
-                            UiCommand::Prompt(prompt) if !prompt.is_empty() => {
-                                *composer = prompt;
-                                push_notice(
-                                    view,
-                                    "a turn is already running; wait for it or press Ctrl-C to interrupt",
-                                );
-                            }
-                            UiCommand::Quit => break,
-                            UiCommand::StopSession => {
-                                let _ = events.emit(SessionEvent::SessionEnding {
-                                    reason: "stopped by local terminal".to_string(),
-                                });
-                                break;
-                            }
-                            UiCommand::Interrupt => {
-                                if turn.is_some() {
-                                    cancel_turn(turn, events, pending_approval).await;
-                                } else {
-                                    push_notice(view, "no turn is running");
-                                }
-                            }
-                            UiCommand::Clear if turn.is_none() => {
-                                session.lock().await.clear();
-                                view.lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clear_transcript();
-                            }
-                            UiCommand::Usage if turn.is_none() => {
-                                let usage = session.lock().await.total_usage().clone();
-                                push_notice(
-                                    view,
-                                    format!(
-                                        "input={} output={} cache_read={} cache_write={} cost=${:.4}",
-                                        usage.input,
-                                        usage.output,
-                                        usage.cache_read,
-                                        usage.cache_write,
-                                        usage.cost.total_usd
-                                    ),
-                                );
-                            }
-                            UiCommand::Usage => {
-                                push_notice(view, "usage is available after the active turn");
-                            }
-                            UiCommand::Help => push_notice(view, HELP_TEXT),
-                            UiCommand::Model(Some(model)) if turn.is_none() => {
-                                session.lock().await.set_model(model.clone());
-                                let _ = events.emit(SessionEvent::RuntimeOptionsChanged {
-                                    options: model_runtime_options(models, &model),
-                                });
-                            }
-                            UiCommand::Model(None) => {
-                                push_notice(view, format!("models: {}", models.join(", ")));
-                            }
-                            UiCommand::Compact => {
-                                let message = if compaction.is_some() {
-                                    "manual compaction is not implemented in the TUI yet; \
-                                     automatic compaction remains active"
-                                } else {
-                                    "manual compaction is not available in this frontend"
-                                };
-                                push_notice(view, message);
-                            }
-                            UiCommand::DetachUnavailable => {
-                                push_notice(
-                                    view,
-                                    "detach is unavailable until daemon reattach support exists; use /quit",
-                                );
-                            }
-                            UiCommand::Unknown(command) => {
-                                push_notice(view, format!("unknown command: {command}"));
-                            }
-                            UiCommand::Clear | UiCommand::Model(Some(_)) => {
-                                push_notice(view, "command unavailable while a turn is running");
-                            }
-                            UiCommand::Prompt(_) => {}
+                        if let Some(exit) =
+                            handle_command(parse_command(&line), session, history, scroll)
+                        {
+                            return Ok(exit);
                         }
                     }
                     KeyCode::Backspace => {
@@ -441,18 +209,10 @@ async fn run_event_loop(
                             *composer = next;
                         }
                     }
-                    KeyCode::PageUp => {
-                        scroll.page_up(transcript_page_height(terminal)?);
-                    }
-                    KeyCode::PageDown => {
-                        scroll.page_down(transcript_page_height(terminal)?);
-                    }
-                    KeyCode::Home => {
-                        scroll.jump_to_start();
-                    }
-                    KeyCode::End => {
-                        scroll.jump_to_end();
-                    }
+                    KeyCode::PageUp => scroll.page_up(transcript_page_height(terminal)?),
+                    KeyCode::PageDown => scroll.page_down(transcript_page_height(terminal)?),
+                    KeyCode::Home => scroll.jump_to_start(),
+                    KeyCode::End => scroll.jump_to_end(),
                     KeyCode::Char(ch)
                         if !key.modifiers.intersects(
                             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
@@ -475,15 +235,172 @@ async fn run_event_loop(
             | Event::Key(_) => {}
         }
     }
+}
+
+fn handle_command(
+    command: UiCommand,
+    session: &mut TuiSession,
+    history: &mut ComposerHistory,
+    scroll: &mut TranscriptScroll,
+) -> Option<TuiExit> {
+    let quiescent = is_quiescent(session.state().turn_status());
+    match command {
+        UiCommand::Prompt(prompt) if !prompt.is_empty() && quiescent => {
+            history.record(prompt.clone());
+            scroll.jump_to_end();
+            queue(
+                session,
+                SessionControllerCommand::Prompt { text: prompt },
+                "prompt",
+            );
+        }
+        UiCommand::Prompt(prompt) if !prompt.is_empty() => {
+            notice(session, "a turn is already running; wait or interrupt it");
+        }
+        UiCommand::Quit | UiCommand::Detach => return Some(TuiExit::Detach),
+        UiCommand::StopSession => return Some(TuiExit::Stop),
+        UiCommand::Interrupt => interrupt(session),
+        UiCommand::Help => notice(session, HELP_TEXT),
+        UiCommand::Model(Some(model)) if quiescent => {
+            let candidate = RuntimeValue::String(model.clone());
+            let accepted = session
+                .state()
+                .runtime_options()
+                .iter()
+                .find(|option| option.id == "model")
+                .is_some_and(|option| option.accepts(&candidate));
+            if accepted {
+                queue(
+                    session,
+                    SessionControllerCommand::SetConfig {
+                        config_id: "model".to_string(),
+                        value: candidate,
+                    },
+                    "model change",
+                );
+            } else {
+                notice(
+                    session,
+                    format!("model '{model}' is not offered by the daemon"),
+                );
+            }
+        }
+        UiCommand::Model(None) => {
+            let models = model_choices(session);
+            let text = if models.is_empty() {
+                "the daemon advertises no model choices".to_string()
+            } else {
+                format!("models: {}", models.join(", "))
+            };
+            notice(session, text);
+        }
+        UiCommand::Clear | UiCommand::Usage | UiCommand::Compact => {
+            notice(
+                session,
+                "command awaits daemon-authoritative protocol support in task 1331",
+            );
+        }
+        UiCommand::Unknown(command) => notice(session, format!("unknown command: {command}")),
+        UiCommand::Model(Some(_)) => {
+            notice(session, "command unavailable while a turn is running");
+        }
+        UiCommand::Prompt(_) => {}
+    }
+    None
+}
+
+fn handle_approval_key(key: KeyEvent, session: &mut TuiSession) -> bool {
+    let Some(request) = session.state().active_approval().cloned() else {
+        return false;
+    };
+    let KeyCode::Char(ch) = key.code else {
+        return true;
+    };
+    if let Some(decision) = approval_from_key(ch, request.allow_always_available) {
+        queue(
+            session,
+            SessionControllerCommand::Approve {
+                approval_id: request.id,
+                decision,
+            },
+            "approval",
+        );
+    }
+    true
+}
+
+fn interrupt(session: &mut TuiSession) {
+    if is_quiescent(session.state().turn_status()) {
+        notice(session, "no turn is running");
+    } else {
+        queue(session, SessionControllerCommand::Interrupt, "interrupt");
+    }
+}
+
+fn queue(session: &mut TuiSession, command: SessionControllerCommand, operation: &str) {
+    if let Err(error) = session.try_send(command) {
+        let reason = match error {
+            ControllerSendError::Backpressure => "controller queue is full",
+            ControllerSendError::Closed => "controller is closed",
+        };
+        notice(session, format!("{operation} failed: {reason}"));
+    }
+}
+
+fn notice(session: &mut TuiSession, text: impl Into<String>) {
+    session.state_mut().push_system_message(text);
+}
+
+fn model_choices(session: &TuiSession) -> Vec<String> {
+    session
+        .state()
+        .runtime_options()
+        .iter()
+        .find(|option| option.id == "model")
+        .and_then(|option| match &option.spec {
+            RuntimeOptionSpec::Select { choices } => {
+                Some(choices.iter().map(|choice| choice.id.clone()).collect())
+            }
+            RuntimeOptionSpec::Boolean | RuntimeOptionSpec::Integer { .. } => None,
+        })
+        .unwrap_or_default()
+}
+
+fn is_quiescent(status: TurnStatus) -> bool {
+    matches!(status, TurnStatus::Idle | TurnStatus::Cancelled)
+}
+
+fn handle_scroll_key(
+    key: KeyEvent,
+    terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
+    scroll: &mut TranscriptScroll,
+    mode: &mut InputMode,
+    vim_keys: &mut VimScrollKeys,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Char(ch) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if let Some(action) = vim_keys.interpret(ch, ctrl) {
+                let page = transcript_page_height(terminal)?;
+                if apply_scroll_action(scroll, action, page) {
+                    *mode = InputMode::Insert;
+                }
+            }
+        }
+        KeyCode::Up => scroll.line_up(),
+        KeyCode::Down => scroll.line_down(),
+        KeyCode::PageUp => scroll.page_up(transcript_page_height(terminal)?),
+        KeyCode::PageDown => scroll.page_down(transcript_page_height(terminal)?),
+        KeyCode::Home => scroll.jump_to_start(),
+        KeyCode::End => scroll.jump_to_end(),
+        _ => {}
+    }
     Ok(())
 }
 
 fn transcript_page_height(
     terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> anyhow::Result<usize> {
-    // Derived from the real layout, not from a constant describing it. Those
-    // were two independent descriptions of one split, and only one of them
-    // moved when the panes became proportional.
     let size = terminal.size()?;
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     Ok(usize::from(
@@ -495,499 +412,16 @@ fn accepts_key(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-fn push_notice(view: &SharedView, text: impl Into<String>) {
-    view.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push_system_message(text);
-}
-
-fn resolve_approval_key(
-    key: KeyEvent,
-    view: &SharedView,
-    pending_approval: &SharedApproval,
-) -> bool {
-    let allow_always = view
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .active_approval()
-        .map(|request| request.allow_always_available);
-    let Some(allow_always) = allow_always else {
-        return false;
-    };
-    let KeyCode::Char(ch) = key.code else {
-        return true;
-    };
-    let Some(decision) = approval_from_key(ch, allow_always) else {
-        return true;
-    };
-    if let Some(pending) = pending_approval
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        let _ = pending.sender.send(decision);
-    }
-    true
-}
-
-fn start_turn(
-    prompt: String,
-    session: Arc<tokio::sync::Mutex<AgentSession>>,
-    events: Arc<SessionEventRouter>,
-    streamed_text: Arc<AtomicBool>,
-    compaction: Option<CompactionPolicy>,
-) -> tokio::task::JoinHandle<()> {
-    streamed_text.store(false, Ordering::Relaxed);
-    let _ = events.emit(SessionEvent::UserMessage {
-        text: prompt.clone(),
-        request_id: None,
-    });
-    let _ = events.emit(SessionEvent::TurnStatusChanged {
-        status: TurnStatus::Running,
-    });
-    tokio::spawn(async move {
-        let turn = session.lock().await.prompt(prompt).await;
-        if !streamed_text.load(Ordering::Relaxed) && !turn.text.is_empty() {
-            let _ = events.emit(SessionEvent::AssistantDelta {
-                text: turn.text.clone(),
-            });
-        }
-        let _ = events.emit(SessionEvent::AssistantDone {
-            outcome: turn_outcome(&turn),
-        });
-        let _ = events.emit(SessionEvent::ContextUsageChanged {
-            usage: context_usage(&turn, compaction.as_ref()),
-        });
-        let _ = events.emit(SessionEvent::TurnStatusChanged {
-            status: TurnStatus::Idle,
-        });
-    })
-}
-
-async fn cancel_turn(
-    turn: &mut Option<tokio::task::JoinHandle<()>>,
-    events: &Arc<SessionEventRouter>,
-    pending_approval: &SharedApproval,
-) {
-    let Some(active) = turn.take() else {
-        return;
-    };
-    active.abort();
-    match active.await {
-        // A successful task emits AssistantDone + its terminal status before
-        // returning, so there is nothing for the interrupt path to synthesize.
-        Ok(()) => return,
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => {
-            let _ = events.emit(SessionEvent::AssistantDone {
-                outcome: AssistantOutcome::Errored {
-                    context_overflow: false,
-                    message: format!("turn task failed: {error}"),
-                },
-            });
-            let _ = events.emit(SessionEvent::TurnStatusChanged {
-                status: TurnStatus::Idle,
-            });
-            return;
-        }
-    }
-    let _ = events.emit(SessionEvent::TurnStatusChanged {
-        status: TurnStatus::Cancelling,
-    });
-    pending_approval
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    let _ = events.emit(SessionEvent::AssistantDone {
-        outcome: AssistantOutcome::Aborted,
-    });
-    let _ = events.emit(SessionEvent::TurnStatusChanged {
-        status: TurnStatus::Cancelled,
-    });
-}
-
-fn active_tools(workspace: &Path, cfg: &Config) -> Vec<ToolSchema> {
-    tool_facade::active_schemas(workspace, &cfg.prompts.resolved_tool_descriptions)
-        .into_iter()
-        .map(|schema| ToolSchema {
-            name: schema.name,
-            description: schema.description,
-            input_schema: schema.input_schema,
-        })
-        .collect()
-}
-
-fn build_before_tool_call_hook(
-    events: Arc<SessionEventRouter>,
-    pending_approval: SharedApproval,
-    safety: Arc<SafetyPolicy>,
-) -> crate::agent::BeforeHook {
-    Box::new(move |info: &ToolCallInfo| {
-        let events = Arc::clone(&events);
-        let pending_approval = Arc::clone(&pending_approval);
-        let safety = Arc::clone(&safety);
-        let id = info.id.clone();
-        let name = info.name.clone();
-        let detail = serde_json::to_string(&info.input).unwrap_or_else(|_| "{}".to_string());
-        Box::pin(async move {
-            let _ = events.emit(SessionEvent::ToolCallStarted {
-                id: id.clone(),
-                name: name.clone(),
-                title: name.clone(),
-                input_summary: Some(detail.clone()),
-            });
-            let decision = match safety.gate(&name) {
-                Gate::Block(reason) => BeforeHookResult::Block(reason),
-                Gate::Allow => BeforeHookResult::Allow,
-                Gate::NeedsApproval => {
-                    let approval_id = uuid::Uuid::new_v4().to_string();
-                    let (sender, receiver) = oneshot::channel();
-                    let registered = {
-                        let mut pending = pending_approval
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if pending.is_some() {
-                            false
-                        } else {
-                            *pending = Some(PendingApproval { sender });
-                            true
-                        }
-                    };
-                    if !registered {
-                        // The TUI admits one active turn and AgentSession runs
-                        // tool calls serially. Treat a violated invariant as a
-                        // blocked call instead of silently replacing the first
-                        // operator decision channel.
-                        BeforeHookResult::Block(
-                            "another tool approval is already pending".to_string(),
-                        )
-                    } else {
-                        let _ = events.emit(SessionEvent::TurnStatusChanged {
-                            status: TurnStatus::WaitingForApproval,
-                        });
-                        let _ = events.emit(SessionEvent::ApprovalRequested {
-                            request: ApprovalRequest {
-                                id: approval_id.clone(),
-                                tool_call_id: id.clone(),
-                                tool: name.clone(),
-                                detail,
-                                allow_always_available: true,
-                            },
-                        });
-                        let approval = receiver.await.unwrap_or(ApprovalDecision::Deny);
-                        let _ = events.emit(SessionEvent::ApprovalResolved {
-                            approval_id,
-                            decision: approval,
-                            resolved_by: "tui_local".to_string(),
-                        });
-                        let _ = events.emit(SessionEvent::TurnStatusChanged {
-                            status: TurnStatus::Running,
-                        });
-                        match approval {
-                            ApprovalDecision::AllowOnce => BeforeHookResult::Allow,
-                            ApprovalDecision::AllowAlways => {
-                                safety.remember_always(&name);
-                                BeforeHookResult::Allow
-                            }
-                            ApprovalDecision::Deny => BeforeHookResult::Block(format!(
-                                "blocked: operator declined approval for '{name}'"
-                            )),
-                        }
-                    }
-                }
-            };
-            let status = if matches!(decision, BeforeHookResult::Allow) {
-                ToolCallStateStatus::InProgress
-            } else {
-                ToolCallStateStatus::Failed
-            };
-            let _ = events.emit(SessionEvent::ToolCallUpdated {
-                id: id.clone(),
-                status,
-            });
-            if let BeforeHookResult::Block(reason) = &decision {
-                let _ = events.emit(SessionEvent::ToolCallFinished {
-                    id,
-                    status: ToolCallStateStatus::Failed,
-                    output: reason.clone(),
-                });
-            }
-            decision
-        })
-    })
-}
-
-fn build_after_tool_call_hook(events: Arc<SessionEventRouter>) -> crate::agent::AfterHook {
-    Box::new(move |info, output, is_error| {
-        let _ = events.emit(SessionEvent::ToolCallFinished {
-            id: info.id.clone(),
-            status: if is_error {
-                ToolCallStateStatus::Failed
-            } else {
-                ToolCallStateStatus::Completed
-            },
-            output: output.to_string(),
-        });
-        AfterHookResult::Continue
-    })
-}
-
-fn map_stream_event(event: StreamEvent) -> SessionEvent {
-    match event {
-        StreamEvent::TextDelta(text) => SessionEvent::AssistantDelta { text },
-        StreamEvent::ThinkingDelta(text) => SessionEvent::ThoughtDelta { text },
-    }
-}
-
-fn turn_outcome(turn: &TurnResult) -> AssistantOutcome {
-    crate::session_core::canonical_assistant_outcome_with_logging("tui", turn)
-}
-
-fn context_usage(turn: &TurnResult, compaction: Option<&CompactionPolicy>) -> ContextUsage {
-    let (window, reservation, high_water) = compaction.map_or((None, 0, None), |policy| {
-        (
-            Some(policy.context_window),
-            policy.output_reservation,
-            // agent_env enforces 0 < low_water < high_water < 1 at load time;
-            // the clamp is defense-in-depth so a nonsensical threshold can
-            // never reach the UI even if a new config path skips validation.
-            Some((policy.high_water.clamp(0.0, 1.0) * policy.budget() as f64) as u64),
-        )
-    });
-    ContextUsage::new(
-        turn.last_call_usage.prompt_tokens(),
-        window,
-        reservation,
-        high_water,
-    )
-}
-
-fn model_runtime_options(models: &[String], current: &str) -> Vec<RuntimeOption> {
-    let mut choices = models.to_vec();
-    if !choices.iter().any(|model| model == current) {
-        choices.insert(0, current.to_string());
-    }
-    vec![RuntimeOption::select(
-        "model",
-        "Model",
-        RuntimeValue::String(current.to_string()),
-        choices
-            .into_iter()
-            .map(|model| RuntimeChoice::new(model.clone(), model))
-            .collect(),
-    )]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::Usage;
-    use crate::safety::ApprovalMode;
-    use serde_json::json;
-
-    fn turn(stop_reason: StopReason) -> TurnResult {
-        TurnResult {
-            text: String::new(),
-            usage: Usage::default(),
-            last_call_usage: Usage::default(),
-            stop_reason,
-            error_message: None,
-            context_overflow: false,
-        }
-    }
 
     #[test]
-    fn stream_events_use_the_canonical_projection() {
-        assert_eq!(
-            map_stream_event(StreamEvent::TextDelta("hello".to_string())),
-            SessionEvent::AssistantDelta {
-                text: "hello".to_string()
-            }
-        );
-        assert_eq!(
-            map_stream_event(StreamEvent::ThinkingDelta("hmm".to_string())),
-            SessionEvent::ThoughtDelta {
-                text: "hmm".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn terminal_turn_outcomes_remain_distinct() {
-        assert_eq!(
-            turn_outcome(&turn(StopReason::EndTurn)),
-            AssistantOutcome::Completed
-        );
-        assert_eq!(
-            turn_outcome(&turn(StopReason::Refusal)),
-            AssistantOutcome::Refused
-        );
-        assert_eq!(
-            turn_outcome(&turn(StopReason::Aborted)),
-            AssistantOutcome::Aborted
-        );
-        assert_eq!(
-            turn_outcome(&turn(StopReason::MaxTokens)),
-            AssistantOutcome::MaxTokens
-        );
-    }
-
-    #[test]
-    fn provider_errors_preserve_overflow_and_message() {
-        let mut error = turn(StopReason::Error);
-        error.context_overflow = true;
-        error.error_message = Some("too large".to_string());
-
-        assert_eq!(
-            turn_outcome(&error),
-            AssistantOutcome::Errored {
-                context_overflow: true,
-                message: "Provider rejected the prompt because the context window was exceeded."
-                    .to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn model_option_includes_current_model_once() {
-        let options = model_runtime_options(&["a".to_string(), "b".to_string()], "b");
-        let RuntimeValue::String(value) = &options[0].value else {
-            panic!("string model value");
-        };
-        assert_eq!(value, "b");
-        let crate::session_protocol::RuntimeOptionSpec::Select { choices } = &options[0].spec
-        else {
-            panic!("select model option");
-        };
-        assert_eq!(choices.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn approval_hook_routes_local_decision_into_canonical_state() {
-        let view = Arc::new(StdMutex::new(ViewState::new("session")));
-        let handler_view = Arc::clone(&view);
-        let events = Arc::new(SessionEventRouter::new(Some(Arc::new(
-            move |seq, event| {
-                let _ = handler_view
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .apply_event(seq, event);
-            },
-        ))));
-        let pending: SharedApproval = Arc::new(StdMutex::new(None));
-        let safety = Arc::new(SafetyPolicy {
-            approval_mode: ApprovalMode::Interactive,
-            ..SafetyPolicy::default()
-        });
-        let hook = build_before_tool_call_hook(Arc::clone(&events), Arc::clone(&pending), safety);
-        let info = ToolCallInfo {
-            id: "call-1".to_string(),
-            name: "exec".to_string(),
-            input: json!({"command": "true"}),
-        };
-        let respond = async {
-            loop {
-                let waiting = pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(waiting) = waiting {
-                    waiting.sender.send(ApprovalDecision::AllowOnce).unwrap();
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        };
-
-        let (decision, ()) = tokio::join!(hook(&info), respond);
-
-        assert!(matches!(decision, BeforeHookResult::Allow));
-        let view = view.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(view.active_approval().is_none());
-        assert_eq!(view.turn_status(), TurnStatus::Running);
-        assert_eq!(view.tool_calls()[0].status, ToolCallStateStatus::InProgress);
-    }
-
-    #[tokio::test]
-    async fn completed_turn_is_not_relabelled_cancelled() {
-        let seen = Arc::new(StdMutex::new(Vec::new()));
-        let handler_seen = Arc::clone(&seen);
-        let events = Arc::new(SessionEventRouter::new(Some(Arc::new(
-            move |_seq, event| {
-                handler_seen
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(event);
-            },
-        ))));
-        let pending: SharedApproval = Arc::new(StdMutex::new(None));
-        let mut turn = Some(tokio::spawn(async {}));
-        while !turn.as_ref().unwrap().is_finished() {
-            tokio::task::yield_now().await;
-        }
-
-        cancel_turn(&mut turn, &events, &pending).await;
-
-        assert!(turn.is_none());
-        assert!(seen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn second_approval_is_blocked_without_replacing_first() {
-        let events = Arc::new(SessionEventRouter::default());
-        let pending: SharedApproval = Arc::new(StdMutex::new(None));
-        let safety = Arc::new(SafetyPolicy {
-            approval_mode: ApprovalMode::Paranoid,
-            ..SafetyPolicy::default()
-        });
-        let hook = build_before_tool_call_hook(Arc::clone(&events), Arc::clone(&pending), safety);
-        let first_info = ToolCallInfo {
-            id: "call-1".to_string(),
-            name: "read_file".to_string(),
-            input: json!({"path": "one"}),
-        };
-        let second_info = ToolCallInfo {
-            id: "call-2".to_string(),
-            name: "read_file".to_string(),
-            input: json!({"path": "two"}),
-        };
-        let first = hook(&first_info);
-        tokio::pin!(first);
-        loop {
-            tokio::select! {
-                _ = &mut first => panic!("first approval resolved before a response"),
-                _ = tokio::task::yield_now() => {
-                    if pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let second = tokio::time::timeout(Duration::from_millis(50), hook(&second_info))
-            .await
-            .expect("second approval should not wait");
-
-        assert!(matches!(
-            second,
-            BeforeHookResult::Block(ref reason) if reason.contains("already pending")
-        ));
-        let first_pending = pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .expect("first approval remains registered");
-        first_pending
-            .sender
-            .send(ApprovalDecision::AllowOnce)
-            .unwrap();
-        assert!(matches!(first.await, BeforeHookResult::Allow));
+    fn cancelled_and_idle_turns_accept_new_prompts() {
+        assert!(is_quiescent(TurnStatus::Idle));
+        assert!(is_quiescent(TurnStatus::Cancelled));
+        assert!(!is_quiescent(TurnStatus::Running));
+        assert!(!is_quiescent(TurnStatus::WaitingForApproval));
+        assert!(!is_quiescent(TurnStatus::Cancelling));
     }
 }
