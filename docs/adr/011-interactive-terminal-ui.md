@@ -120,6 +120,10 @@ updates keep live/replaying clients synchronized.
 - Tool/model output is **never** allowed to inject terminal control sequences;
   it is sanitized/rendered as escaped text (the reducer stores raw text; the
   render layer sanitizes at draw time).
+- Terminal input uses Crossterm `EventStream`, selected with human input first,
+  a bounded render tick second, and canonical session updates third. This keeps
+  the Tokio runtime nonblocking and prevents token floods from starving local
+  control; input redraws immediately while session redraws coalesce.
 - No unbounded UI event queue or transcript duplication; lag/reconnect recovers
   from a canonical snapshot (enforced by the reducer's gap handling).
 

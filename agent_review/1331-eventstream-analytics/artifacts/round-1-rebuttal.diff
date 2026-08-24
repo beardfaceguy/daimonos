@@ -1,0 +1,50 @@
+```diff
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@
+ let input = tokio::select! {
++    biased;
++    event = terminal_events.next() => Terminal(event),
++    _ = render_tick.tick() => Render,
+     update = session.next_update() => Session(update),
+-    event = terminal_events.next() => Terminal(event),
+-    _ = render_tick.tick() => Render,
+ };
+@@
+-TerminalClosed => bail!("terminal event stream closed"),
++TerminalClosed => return Ok(TuiExit::Detach),
+@@ terminal input branches
+ interrupt(session);
++draw_tui(...)?;
+ continue;
+@@
+ handle_approval_key(...);
++draw_tui(...)?;
+ continue;
+@@
+ // after composer/paste/resize handling
++draw_tui(...)?;
+```
+
+```diff
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@
+-let analytics_store = AnalyticsStore::new(...).ok().map(Arc::new);
++let analytics_store = match AnalyticsStore::new(...) {
++    Ok(store) => Some(Arc::new(store)),
++    Err(error) => { warn!(event="session_daemon_analytics_init_failed", error); None }
++};
+@@
+-AgentSessionFactory::new(..., analytics_store, services)
++AgentSessionFactory::new(..., analytics_store.clone(), services)
+@@ daemon shutdown
+ daemon.shutdown().await;
++if let Some(analytics) = analytics_store {
++    if !analytics.wait_until_quiet(Duration::from_secs(cfg.session.shutdown_grace_secs)).await {
++        warn!(event="session_daemon_analytics_drain_timeout", pending=analytics.pending_writes());
++    }
++}
+```
+
+Code comment in run() pins EventStream-drop-before-terminal-restore ordering. Existing phase-6 ADR text continues to identify suspend/resume as deferred. Existing PTY tests exercise normal detach and terminal restoration; full suite will rerun.

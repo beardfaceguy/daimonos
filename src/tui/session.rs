@@ -199,13 +199,24 @@ impl TuiSession {
             Ok(event) => Some(self.apply(event)),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                if self.termination_reported {
-                    Some(TuiSessionUpdate::Stopped)
-                } else {
-                    self.termination_reported = true;
-                    Some(TuiSessionUpdate::Failed(self.controller_stop_message()))
-                }
+                Some(self.disconnected_update())
             }
+        }
+    }
+
+    pub async fn next_update(&mut self) -> TuiSessionUpdate {
+        match self.controller.recv().await {
+            Some(event) => self.apply(event),
+            None => self.disconnected_update(),
+        }
+    }
+
+    fn disconnected_update(&mut self) -> TuiSessionUpdate {
+        if self.termination_reported {
+            TuiSessionUpdate::Stopped
+        } else {
+            self.termination_reported = true;
+            TuiSessionUpdate::Failed(self.controller_stop_message())
         }
     }
 

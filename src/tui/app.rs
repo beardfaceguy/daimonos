@@ -6,8 +6,11 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::Terminal;
 
 use crate::session_controller::{
@@ -21,6 +24,8 @@ use super::input::{
 };
 use super::session::{TuiSession, TuiSessionUpdate};
 use super::terminal::{install_panic_hook, TerminalGuard};
+
+const RENDER_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Runtime inputs resolved before entering raw terminal mode.
 pub struct TuiOptions {
@@ -79,6 +84,8 @@ pub async fn run(controller: SessionControllerHandle, options: TuiOptions) -> an
         history.record(prompt);
     }
     let mut scroll = TranscriptScroll::default();
+    // run_event_loop owns EventStream. Returning drops its reader before this
+    // frame restores cursor/raw/alternate-screen state on every exit path.
     let outcome = run_event_loop(
         &mut terminal,
         &mut composer,
@@ -125,49 +132,60 @@ async fn run_event_loop(
 ) -> anyhow::Result<TuiExit> {
     let mut mode = InputMode::Insert;
     let mut vim_keys = VimScrollKeys::default();
+    let mut terminal_events = EventStream::new();
+    let mut render_tick = tokio::time::interval(RENDER_INTERVAL);
+    render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    render_tick.tick().await;
+    draw_tui(terminal, composer, scroll, no_color, session, mode)?;
     loop {
-        loop {
-            match session.poll() {
-                Some(TuiSessionUpdate::Updated) => {}
-                Some(TuiSessionUpdate::Failed(message)) => {
-                    anyhow::bail!("{message}");
-                }
-                Some(TuiSessionUpdate::Detached | TuiSessionUpdate::Stopped) => {
-                    return Ok(TuiExit::Detach);
-                }
-                None => break,
-            }
+        enum LoopInput {
+            Session(TuiSessionUpdate),
+            Terminal(std::io::Result<Event>),
+            TerminalClosed,
+            Render,
         }
-
-        terminal.draw(|frame| {
-            super::render_with_options(
-                session.state(),
-                composer,
-                frame.area(),
-                frame.buffer_mut(),
-                super::RenderOptions {
-                    no_color,
-                    scroll_from_bottom: scroll.bottom_offset(),
-                    scroll_mode: mode == InputMode::Scroll,
-                },
-            );
-            if session.state().active_approval().is_none() {
-                if let Some(position) = super::composer_cursor_position(composer, frame.area()) {
-                    frame.set_cursor_position(position);
+        let input = tokio::select! {
+            // Human input and the bounded render cadence intentionally outrank
+            // model-token updates so a hot session stream cannot starve local
+            // control. This is a responsiveness invariant, not a fairness
+            // micro-optimization.
+            biased;
+            event = terminal_events.next() => match event {
+                Some(event) => LoopInput::Terminal(event),
+                None => LoopInput::TerminalClosed,
+            },
+            _ = render_tick.tick() => LoopInput::Render,
+            update = session.next_update() => LoopInput::Session(update),
+        };
+        let event = match input {
+            LoopInput::Session(update) => {
+                match update {
+                    TuiSessionUpdate::Updated => {}
+                    TuiSessionUpdate::Failed(message) => {
+                        anyhow::bail!("{message}");
+                    }
+                    TuiSessionUpdate::Detached | TuiSessionUpdate::Stopped => {
+                        return Ok(TuiExit::Detach);
+                    }
                 }
+                continue;
             }
-        })?;
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        match event::read()? {
+            LoopInput::Terminal(event) => event?,
+            LoopInput::TerminalClosed => return Ok(TuiExit::Detach),
+            LoopInput::Render => {
+                draw_tui(terminal, composer, scroll, no_color, session, mode)?;
+                continue;
+            }
+        };
+        match event {
             Event::Key(key) if accepts_key(key) => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     interrupt(session);
+                    draw_tui(terminal, composer, scroll, no_color, session, mode)?;
                     continue;
                 }
                 if handle_approval_key(key, session) {
+                    draw_tui(terminal, composer, scroll, no_color, session, mode)?;
                     continue;
                 }
                 if key.code == KeyCode::Esc {
@@ -176,10 +194,12 @@ async fn run_event_loop(
                         InputMode::Scroll => InputMode::Insert,
                     };
                     vim_keys.reset();
+                    draw_tui(terminal, composer, scroll, no_color, session, mode)?;
                     continue;
                 }
                 if mode == InputMode::Scroll {
                     handle_scroll_key(key, terminal, scroll, &mut mode, &mut vim_keys)?;
+                    draw_tui(terminal, composer, scroll, no_color, session, mode)?;
                     continue;
                 }
                 match key.code {
@@ -234,7 +254,37 @@ async fn run_event_loop(
             | Event::Mouse(_)
             | Event::Key(_) => {}
         }
+        draw_tui(terminal, composer, scroll, no_color, session, mode)?;
     }
+}
+
+fn draw_tui(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    composer: &str,
+    scroll: &TranscriptScroll,
+    no_color: bool,
+    session: &TuiSession,
+    mode: InputMode,
+) -> anyhow::Result<()> {
+    terminal.draw(|frame| {
+        super::render_with_options(
+            session.state(),
+            composer,
+            frame.area(),
+            frame.buffer_mut(),
+            super::RenderOptions {
+                no_color,
+                scroll_from_bottom: scroll.bottom_offset(),
+                scroll_mode: mode == InputMode::Scroll,
+            },
+        );
+        if session.state().active_approval().is_none() {
+            if let Some(position) = super::composer_cursor_position(composer, frame.area()) {
+                frame.set_cursor_position(position);
+            }
+        }
+    })?;
+    Ok(())
 }
 
 fn handle_command(

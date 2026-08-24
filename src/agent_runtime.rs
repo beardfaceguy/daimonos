@@ -582,12 +582,20 @@ pub async fn run_session_daemon(
         .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let analytics_store = if cfg.analytics.enabled {
-        analytics::AnalyticsStore::new(
+        match analytics::AnalyticsStore::new(
             &cfg.analytics.resolved_db_path(),
             cfg.analytics.retention_days,
-        )
-        .ok()
-        .map(Arc::new)
+        ) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    target: "daimonos::analytics",
+                    event = "session_daemon_analytics_init_failed",
+                    error,
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -621,6 +629,7 @@ pub async fn run_session_daemon(
         token_log,
         session_store::SessionStore::new(sessions_dir),
         crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
+        analytics_store.clone(),
         services,
     ));
     let daemon = Arc::new(session_daemon::SessionDaemon::with_factory(
@@ -715,6 +724,20 @@ pub async fn run_session_daemon(
         }
     };
     daemon.shutdown().await;
+    if let Some(analytics) = analytics_store {
+        let drained = analytics
+            .wait_until_quiet(std::time::Duration::from_secs(
+                cfg.session.shutdown_grace_secs,
+            ))
+            .await;
+        if !drained {
+            tracing::warn!(
+                target: "daimonos::analytics",
+                event = "session_daemon_analytics_drain_timeout",
+                pending_writes = analytics.pending_writes(),
+            );
+        }
+    }
     result
 }
 
