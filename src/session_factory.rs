@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::{AfterHookResult, AgentConfig, AgentSession, TokenLogConfig};
+use crate::analytics::AnalyticsStore;
 use crate::config::Config;
 use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ThinkingLevel, ToolSchema};
 use crate::safety::SafetyPolicy;
@@ -31,6 +32,7 @@ pub struct AgentSessionFactory {
     token_log: Option<PathBuf>,
     store: SessionStore,
     compaction: SessionCompaction,
+    analytics: Option<Arc<AnalyticsStore>>,
     services: Arc<crate::provisioning::ToolServices>,
 }
 
@@ -47,6 +49,7 @@ impl AgentSessionFactory {
         token_log: Option<PathBuf>,
         store: SessionStore,
         compaction: SessionCompaction,
+        analytics: Option<Arc<AnalyticsStore>>,
         services: Arc<crate::provisioning::ToolServices>,
     ) -> Self {
         Self {
@@ -60,6 +63,7 @@ impl AgentSessionFactory {
             token_log,
             store,
             compaction,
+            analytics,
             services,
         }
     }
@@ -145,7 +149,8 @@ impl SessionFactory for AgentSessionFactory {
         // exists on this path yet.
         let native_names: std::collections::HashSet<String> =
             tools.iter().map(|tool| tool.name.clone()).collect();
-        let agent_mcp = crate::agent_mcp::connect(&self.config, &native_names, None).await;
+        let agent_mcp =
+            crate::agent_mcp::connect(&self.config, &native_names, self.analytics.clone()).await;
         if let Some(mcp) = &agent_mcp {
             tools.extend(mcp.tools());
         }
@@ -307,6 +312,7 @@ mod tests {
             None,
             store.clone(),
             SessionCompaction::new(None, false),
+            None,
             services,
         );
         let core = factory
@@ -385,6 +391,7 @@ mod tests {
             None,
             store.clone(),
             SessionCompaction::new(None, false),
+            None,
             services,
         );
         assert_eq!(

@@ -1,0 +1,80 @@
+```rust
+// Cargo.toml
+crossterm = { version = "0.29", features = ["event-stream"] }
+```
+
+```rust
+// src/tui/session.rs
+pub async fn next_update(&mut self) -> TuiSessionUpdate {
+    match self.controller.recv().await {
+        Some(event) => self.apply(event),
+        None => self.disconnected_update(),
+    }
+}
+```
+
+```rust
+// src/tui/app.rs
+const RENDER_INTERVAL: Duration = Duration::from_millis(50);
+
+async fn run_event_loop(...) -> Result<TuiExit> {
+    let mut terminal_events = EventStream::new();
+    let mut render_tick = tokio::time::interval(RENDER_INTERVAL);
+    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    render_tick.tick().await;
+    draw_tui(...)?;
+    loop {
+        enum LoopInput {
+            Session(TuiSessionUpdate),
+            Terminal(io::Result<Event>),
+            TerminalClosed,
+            Render,
+        }
+        let input = tokio::select! {
+            update = session.next_update() => LoopInput::Session(update),
+            event = terminal_events.next() => match event {
+                Some(event) => LoopInput::Terminal(event),
+                None => LoopInput::TerminalClosed,
+            },
+            _ = render_tick.tick() => LoopInput::Render,
+        };
+        let event = match input {
+            Session(Updated) => continue,
+            Session(Failed(message)) => bail!(message),
+            Session(Detached | Stopped) => return Ok(Detach),
+            Terminal(event) => event?,
+            TerminalClosed => bail!("terminal event stream closed"),
+            Render => { draw_tui(...)?; continue; }
+        };
+        // existing pure key/paste/resize handling; no blocking poll/read
+    }
+}
+```
+
+```rust
+// src/session_factory.rs
+pub struct AgentSessionFactory {
+    // existing fields
+    analytics: Option<Arc<AnalyticsStore>>,
+}
+
+// constructor receives/stores analytics
+let agent_mcp = agent_mcp::connect(
+    &self.config,
+    &native_names,
+    self.analytics.clone(),
+).await;
+```
+
+```rust
+// src/agent_runtime.rs session daemon setup
+let analytics_store = if cfg.analytics.enabled { AnalyticsStore::new(...).ok().map(Arc::new) } else { None };
+let services = build_tool_services(..., analytics_store.clone()).await;
+let factory = AgentSessionFactory::new(
+    // provider/workspace/config/runtime/persistence
+    analytics_store,
+    services,
+);
+```
+
+Existing PTY tests exercise interactive startup, cursor query, `/quit`, detach, and concurrent TUI clients. Existing TUI unit tests cover key mapping/rendering; session controller tests cover high-rate state updates and disconnect. Cargo check passes with one crossterm version.
