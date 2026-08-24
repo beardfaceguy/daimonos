@@ -463,6 +463,11 @@ pub struct SessionRuntimeConfig {
     pub reconnect_initial_backoff_ms: u64,
     /// Maximum exponential reconnect delay.
     pub reconnect_max_backoff_ms: u64,
+    /// Candidate attach attempts when switching back to a session whose prior
+    /// physical attachment may still be tearing down.
+    pub switch_attach_retry_attempts: usize,
+    /// Delay between transient client-limit switch retries.
+    pub switch_attach_retry_backoff_ms: u64,
     /// Lifetime of a single-use remote pairing claim.
     pub remote_pairing_ttl_secs: u64,
     /// Maximum time a remote pairing socket waits for local consent.
@@ -517,6 +522,8 @@ impl Default for SessionRuntimeConfig {
             reconnect_attempts: 4,
             reconnect_initial_backoff_ms: 100,
             reconnect_max_backoff_ms: 1_000,
+            switch_attach_retry_attempts: 3,
+            switch_attach_retry_backoff_ms: 50,
             remote_pairing_ttl_secs: 300,
             remote_pairing_wait_secs: 300,
             remote_auth_timeout_secs: 10,
@@ -599,6 +606,16 @@ impl SessionRuntimeConfig {
             return Err(
                 "session.reconnect_max_backoff_ms must be at least reconnect_initial_backoff_ms"
                     .to_string(),
+            );
+        }
+        if self.switch_attach_retry_attempts == 0 {
+            return Err(
+                "session.switch_attach_retry_attempts must be greater than zero".to_string(),
+            );
+        }
+        if self.switch_attach_retry_backoff_ms == 0 {
+            return Err(
+                "session.switch_attach_retry_backoff_ms must be greater than zero".to_string(),
             );
         }
         for (field, is_zero) in [
@@ -1935,6 +1952,8 @@ mod tests {
         assert_eq!(cfg.session.reconnect_attempts, 4);
         assert_eq!(cfg.session.reconnect_initial_backoff_ms, 100);
         assert_eq!(cfg.session.reconnect_max_backoff_ms, 1_000);
+        assert_eq!(cfg.session.switch_attach_retry_attempts, 3);
+        assert_eq!(cfg.session.switch_attach_retry_backoff_ms, 50);
         assert_eq!(cfg.session.max_frame_bytes, 1_048_576);
         assert_eq!(cfg.session.max_prompt_bytes, 131_072);
         assert_eq!(cfg.session.max_identifier_bytes, 128);
@@ -2307,6 +2326,16 @@ mod tests {
             .validate()
             .expect_err("reconnect max must cover initial delay")
             .contains("session.reconnect_max_backoff_ms"));
+        for field in [
+            "switch_attach_retry_attempts",
+            "switch_attach_retry_backoff_ms",
+        ] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero switch retry limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
         let invalid: Config = toml::from_str(
             "[session]\nmax_frame_bytes = 256\nmax_prompt_bytes = 32\n\
              max_tool_event_output_bytes = 32\n",

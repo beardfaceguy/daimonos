@@ -156,6 +156,10 @@ reconnect_attempts = 4
 # Initial and maximum exponential reconnect delays.
 reconnect_initial_backoff_ms = 100
 reconnect_max_backoff_ms = 1000
+# Candidate attach retries for rapid switch-back while the prior connection
+# finishes daemon-side teardown.
+switch_attach_retry_attempts = 3
+switch_attach_retry_backoff_ms = 50
 # Remote gateway security and liveness limits.
 remote_pairing_ttl_secs = 300
 remote_pairing_wait_secs = 300

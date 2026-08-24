@@ -1,0 +1,57 @@
+```rust
+pub type ControllerFactory = Arc<dyn Fn() -> ControllerFuture + Send + Sync>;
+pub struct SwitchPolicy { retry_attempts: usize, retry_backoff: Duration }
+
+pub async fn switch_to(&mut self, target: &str) -> anyhow::Result<()> {
+    if target == self.state.session_id() {
+        self.send(SessionControllerCommand::Sync).await?;
+        return Ok(());
+    }
+    self.ensure_switch_allowed()?;
+    let transient_retry = self.last_detached_session.as_deref() == Some(target);
+    let attempts = if transient_retry { policy.retry_attempts } else { 1 };
+    for attempt in 0..attempts {
+        if attempt > 0 { sleep(policy.retry_backoff).await; }
+        let controller = factory().await?;
+        match Self::attach_to(controller, Some(target.to_string()), ...).await {
+            Ok(mut candidate) => {
+                self.drain_before_switch_commit()?;
+                self.ensure_switch_allowed()?;
+                candidate.last_detached_session = Some(self.state.session_id().to_string());
+                std::mem::swap(self, &mut candidate);
+                tokio::spawn(candidate.shutdown());
+                return Ok(());
+            }
+            Err(Denied { code: Some(ClientLimitReached), .. })
+                if transient_retry && attempt + 1 < attempts => continue,
+            // typed actionable failures
+        }
+    }
+}
+```
+
+```rust
+// Controller additions
+SessionControllerCommand::Sync => client.sync()
+SessionControllerEvent::AttachFailed { code: Option<AttachDeniedCode>, message }
+// every controller outcome remains wrapped in EpochEvent
+```
+
+```rust
+// production factory
+let controller_factory = Arc::new(move || Box::pin(async move {
+    let stream = UnixStream::connect(socket).await?;
+    let transport = UnixFrontendTransport::new(stream, ..., max_frame)?;
+    Ok(spawn_tui_controller(transport, label, limits, socket, reconnect_policy))
+}));
+TuiOptions { controller_factory: Some(factory), switch_policy: configured }
+```
+
+New config: session.switch_attach_retry_attempts=3, switch_attach_retry_backoff_ms=50 with nonzero validation/docs.
+
+Tests all pass:
+- switch_commits_whole_candidate_then_detaches_old_controller
+- failed_candidate_attach_preserves_current_controller_and_view
+- delivered_approval_before_commit_aborts_switch_without_mixing_state
+- rapid_switch_back_retries_transient_client_limit
+- selecting_current_session_requests_resync_without_new_controller
