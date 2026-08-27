@@ -143,6 +143,14 @@ accept_error_backoff_ms = 100
 idle_retention_secs = 300
 # Maximum entries returned by one daemon session-list page.
 session_list_page_size = 50
+# Maximum UTF-8 bytes retained in a local session-list preview.
+session_list_preview_bytes = 256
+# Maximum bytes accepted for an opaque session-list cursor.
+session_list_cursor_bytes = 128
+# Maximum rows retained in one connection-bound listing snapshot.
+session_list_snapshot_entries = 1000
+# Lifetime of one connection-bound listing snapshot.
+session_list_snapshot_ttl_secs = 60
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
 # Maximum seconds a local frontend waits for a daemon command result.

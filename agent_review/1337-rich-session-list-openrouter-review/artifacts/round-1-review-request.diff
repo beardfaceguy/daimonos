@@ -1,0 +1,236 @@
+Review the current uncommitted workspace diff for task 1337. Load-bearing actual code is below.
+
+```rust
+// src/session_protocol.rs
+pub struct SessionListEntry {
+    pub session_id: String,
+    pub active: bool,
+    pub attached_clients: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<TurnStatus>,
+}
+
+pub struct SessionWorkspace { pub id: String, pub label: String }
+
+// ServerMessage::SessionList adds:
+workspace: Option<SessionWorkspace>
+// ProtocolLimits adds max_cursor_bytes; ListSessions validates against it.
+```
+
+```rust
+// src/session_daemon.rs
+pub enum ConnectionTrust { LocalOwner, RemotePaired }
+
+struct ConnectionListingSnapshot {
+    rows: Vec<SessionListEntry>,
+    offset: usize,
+    expected_cursor: Option<String>,
+    expires_at: tokio::time::Instant,
+}
+
+async fn listing_rows(&self) -> Result<Vec<SessionListEntry>, SessionListPageError> {
+    let mut sessions = BTreeMap::new();
+    if let Some(factory) = self.factory.as_ref() {
+        for summary in factory.persisted_session_summaries(self.session_list_preview_bytes).await {
+            sessions.insert(summary.id.clone(), SessionListEntry {
+                session_id: summary.id,
+                active: false,
+                attached_clients: 0,
+                model: Some(summary.model),
+                updated_at_unix_ms: summary.updated_at.map(system_time_unix_ms),
+                preview: summary.first_user_line,
+                message_count: Some(summary.message_count),
+                turn_status: None,
+            });
+        }
+    }
+    let active: Vec<_> = self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+        .iter().map(|(id, entry)| (id.clone(), Arc::clone(entry))).collect();
+    for (session_id, entry) in active {
+        let attached_clients = entry.clients.lock().unwrap_or_else(|p| p.into_inner()).len();
+        let (turn_status, snapshot_preview) = {
+            let snapshot = entry.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            let preview = snapshot.snapshot.transcript.iter()
+                .find(|entry| entry.role == TranscriptRole::User)
+                .and_then(|entry| entry.text.lines().next())
+                .and_then(|line| session_store::normalize_preview(line, self.session_list_preview_bytes));
+            (snapshot.snapshot.turn_status, preview)
+        };
+        let (message_count, preview) = match entry.core.session.try_lock() {
+            Ok(session) => (
+                Some(session.history().len()),
+                session_store::first_user_preview(session.history(), self.session_list_preview_bytes),
+            ),
+            Err(_) => (None, snapshot_preview),
+        };
+        sessions.insert(session_id.clone(), SessionListEntry {
+            session_id,
+            active: true,
+            attached_clients,
+            model: Some(entry.core.current_model()),
+            updated_at_unix_ms: Some(entry.last_activity_unix_ms.load(Ordering::Acquire)),
+            preview,
+            message_count,
+            turn_status: Some(turn_status),
+        });
+    }
+    let mut rows: Vec<_> = sessions.into_values().collect();
+    rows.sort_by(|a,b| b.updated_at_unix_ms.unwrap_or_default()
+        .cmp(&a.updated_at_unix_ms.unwrap_or_default())
+        .then_with(|| a.session_id.cmp(&b.session_id)));
+    if rows.len() > self.session_list_snapshot_entries {
+        return Err(SessionListPageError::CapacityExceeded);
+    }
+    Ok(rows)
+}
+
+async fn list_sessions_for_connection(
+    &self,
+    request_id: String,
+    cursor: Option<&str>,
+    trust: ConnectionTrust,
+    snapshot: &mut Option<ConnectionListingSnapshot>,
+    max_frame_bytes: usize,
+) -> Result<ServerMessage, SessionListPageError> {
+    if cursor.is_none() {
+        *snapshot = Some(ConnectionListingSnapshot {
+            rows: self.listing_rows().await?,
+            offset: 0,
+            expected_cursor: None,
+            expires_at: Instant::now() + self.session_list_snapshot_ttl,
+        });
+    }
+    let listing = snapshot.as_mut().ok_or(SessionListPageError::InvalidCursor)?;
+    if Instant::now() >= listing.expires_at
+        || cursor.is_some_and(|cursor| listing.expected_cursor.as_deref() != Some(cursor))
+    {
+        *snapshot = None;
+        return Err(SessionListPageError::InvalidCursor);
+    }
+    let end = listing.offset.saturating_add(self.session_list_page_size).min(listing.rows.len());
+    let rows = render_listing_rows(&listing.rows[listing.offset..end], trust);
+    let remaining = listing.rows.len().saturating_sub(listing.offset);
+    let next_cursor = format!("v1_{}", Uuid::new_v4());
+    let workspace = (trust == ConnectionTrust::LocalOwner)
+        .then(|| self.workspace_identity.clone()).flatten();
+    let (message, sent) = fit_session_list_to_frame(
+        request_id, workspace, rows, remaining, next_cursor, max_frame_bytes,
+    ).map_err(SessionListPageError::TooLarge)?;
+    listing.offset = listing.offset.saturating_add(sent);
+    listing.expected_cursor = match &message {
+        ServerMessage::SessionList { next_cursor, .. } => next_cursor.clone(),
+        _ => unreachable!(),
+    };
+    if listing.expected_cursor.is_none() { *snapshot = None; }
+    Ok(message)
+}
+
+fn render_listing_rows(rows: &[SessionListEntry], trust: ConnectionTrust) -> Vec<SessionListEntry> {
+    rows.iter().cloned().map(|mut row| {
+        if trust == ConnectionTrust::RemotePaired {
+            row.model = None;
+            row.updated_at_unix_ms = None;
+            row.preview = None;
+            row.message_count = None;
+            row.turn_status = None;
+        }
+        row
+    }).collect()
+}
+
+fn fit_session_list_to_frame(
+    request_id: String,
+    workspace: Option<SessionWorkspace>,
+    mut sessions: Vec<SessionListEntry>,
+    remaining: usize,
+    cursor: String,
+    max_frame_bytes: usize,
+) -> Result<(ServerMessage, usize), String> {
+    loop {
+        let next_cursor = (sessions.len() < remaining).then(|| cursor.clone());
+        let message = ServerMessage::SessionList {
+            request_id: request_id.clone(),
+            workspace: workspace.clone(),
+            sessions: sessions.clone(),
+            next_cursor,
+        };
+        if serde_json::to_vec(&message).map_err(|e| e.to_string())?.len() <= max_frame_bytes {
+            return Ok((message, sessions.len()));
+        }
+        sessions.pop();
+        if sessions.is_empty() { return Err("one entry exceeds frame".to_string()); }
+    }
+}
+```
+
+```rust
+// Connection trust is explicit in CapabilityPolicy. serve_client uses
+// LocalOwner; serve_client_with_capabilities (remote gateway) uses RemotePaired.
+// One listing_snapshot variable lives inside each serve_client_with_policy loop.
+// Unknown, replayed, expired, cross-connection and oversized cursors return a
+// nonfatal ServerMessage::Error with code invalid_cursor. Capacity excess and
+// frame excess have separate typed string codes.
+```
+
+```rust
+// src/session_factory.rs
+// workspace is canonicalized at construction. SessionWorkspace.id is SHA-256
+// over canonical path, while label is a UTF-8 bounded basename. Legacy records
+// canonicalize stored cwd before matching. Durable scan is isolated:
+async fn persisted_session_summaries(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
+    let store = self.store.clone();
+    let workspace = self.workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        store.list_with_preview_limit(max_preview_bytes).into_iter()
+            .filter(|summary| summary.cwd.as_deref()
+                .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+                .is_some_and(|cwd| cwd == workspace))
+            .collect()
+    }).await.unwrap_or_default()
+}
+```
+
+```rust
+// src/session_store.rs
+// first_user_preview selects first user text line. normalize_preview incrementally
+// collapses whitespace and uses floor_char_boundary so output never exceeds the
+// configured byte cap and never splits UTF-8.
+```
+
+```rust
+// src/session_client.rs
+pub enum SessionClientOutcome {
+    SessionList {
+        request_id: String,
+        workspace: Option<SessionWorkspace>,
+        sessions: Vec<SessionListEntry>,
+        next_cursor: Option<String>,
+    },
+    ServerError { request_id: Option<String>, code: String, message: String },
+    // ...
+}
+// Attached-session ServerMessage::Error maps to ServerError (nonterminal);
+// attach-handshake Error remains SessionClientError::Server.
+```
+
+```rust
+// SessionControllerCommand::ListSessions forwards through SessionClient and
+// blocks session switching while in flight. TuiSession keeps bounded pending
+// operation/request maps, stores typed rows, exposes take_session_list(), and
+// clears list state on a correlated ServerError.
+```
+
+```kotlin
+// Android WireModels adds nullable workspace and nullable rich row fields.
+// ProtocolFixtureTest decodes both rich local and minimal remote rows.
+```
+
+The full diff also adds configurable preview/cursor/snapshot-entry/snapshot-TTL limits in config, default TOML, and docs; updates ADR-010; and adds extensive Rust tests for trust, cursor lifecycle, ordering, frame fitting, capacity, active/busy metadata, legacy workspace aliases, client/controller/TUI propagation, and nonfatal errors.

@@ -1,6 +1,7 @@
 # ADR-010: Daemon-owned agent sessions, local TUI, and remote control
 
 **Date:** 2026-07-26  
+**Amended:** 2026-08-27 (Vikunja #1337 session discovery trust boundary)
 **Status:** Accepted  
 **Tracks:** Vikunja project 183, epic #1092; research #1090; TUI #1091  
 **Builds on:** ADR-002 (compaction), ADR-003 (ACP-MCP bridge), ADR-006
@@ -298,6 +299,13 @@ Daimonos trusts forwarded headers only from configured proxy peers.
 Public unauthenticated endpoints disclose no session id, workspace path, model,
 agent identity, or pairing state. Both proxy and daemon enforce connection,
 pairing-attempt, rate, frame-size, queue, and idle limits.
+
+Session discovery carries an explicit connection-trust classification separate
+from capabilities. Local-owner responses may include a privacy-safe workspace
+identity, model, timestamp, bounded preview, provider-history count, and live
+turn status. Paired remote responses remain minimal (session id, active state,
+and attachment count). Pagination uses short-lived opaque snapshots bound to
+one connection; invalid, expired, or replayed cursors fail as `invalid_cursor`.
 
 Native Android clients are not authenticated by browser `Origin`. A future web
 client must use a strict Origin allowlist.

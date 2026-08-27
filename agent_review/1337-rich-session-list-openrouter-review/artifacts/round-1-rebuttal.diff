@@ -1,0 +1,41 @@
+```rust
+#[test]
+fn frame_trimmed_pages_cover_snapshot_rows_once_in_order() {
+    let rows = (0_u64..12).map(|index| SessionListEntry {
+        session_id: format!("session-{index:04}"),
+        active: true,
+        attached_clients: 0,
+        model: Some("model-with-enough-length-to-force-trimming".to_string()),
+        updated_at_unix_ms: Some(100 - index),
+        preview: Some("bounded preview content".to_string()),
+        message_count: Some(2),
+        turn_status: Some(TurnStatus::Idle),
+    }).collect::<Vec<_>>();
+    let expected = rows.iter().map(|row| row.session_id.clone()).collect::<Vec<_>>();
+    let mut delivered = Vec::new();
+    let mut offset = 0;
+    while offset < rows.len() {
+        let end = offset.saturating_add(5).min(rows.len());
+        let remaining = rows.len() - offset;
+        let (message, sent) = fit_session_list_to_frame(
+            format!("page-{offset}"), None, rows[offset..end].to_vec(),
+            remaining, format!("v1_cursor_{offset}"), 420,
+        ).unwrap();
+        let ServerMessage::SessionList { sessions, next_cursor, .. } = message else { panic!() };
+        assert!(sent > 0);
+        assert_eq!(sent, sessions.len());
+        delivered.extend(sessions.into_iter().map(|row| row.session_id));
+        offset += sent;
+        assert_eq!(next_cursor.is_some(), offset < rows.len());
+    }
+    assert_eq!(delivered, expected);
+}
+```
+
+```diff
+- ConnectionTrust::LocalOwner,
++ ConnectionTrust::RemotePaired,
+  &mut other_connection,
+```
+
+Focused pagination invariant test passes. Existing evidence referenced in disputes remains unchanged: zero-TTL config validation, expired-cursor test, spawn_blocking scan, bounded remote admission, and explicit remote-minimal privacy tests.

@@ -1307,6 +1307,7 @@ mod tests {
             max_prompt_bytes: 16 * 1024,
             max_label_bytes: 256,
             max_identifier_bytes: 256,
+            max_cursor_bytes: 256,
             max_ticket_bytes: 512,
             max_runtime_value_bytes: 1024,
             max_capabilities: 16,

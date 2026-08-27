@@ -107,6 +107,28 @@ class ProtocolFixtureTest {
     }
 
     @Test
+    fun sessionListDecodesRichLocalAndMinimalRemoteRows() {
+        val rich = ProtocolCodec.decodeServer(
+            """
+            {"type":"session_list","request_id":"list-1",
+             "workspace":{"id":"ws_1","label":"workspace"},
+             "sessions":[{"session_id":"session-1","active":true,"attached_clients":1,
+             "model":"model","updated_at_unix_ms":42,"preview":"hello",
+             "message_count":2,"turn_status":"idle"}],"next_cursor":"v1_cursor"}
+            """.trimIndent(),
+        ) as ServerMessage.SessionList
+        assertEquals("ws_1", rich.workspace?.id)
+        assertEquals("hello", rich.sessions.single().preview)
+        assertEquals(TurnStatus.IDLE, rich.sessions.single().turnStatus)
+
+        val minimal = ProtocolCodec.decodeServer(
+            """{"type":"session_list","request_id":"list-2","sessions":[{"session_id":"session-1","active":true,"attached_clients":1}]}""",
+        ) as ServerMessage.SessionList
+        assertEquals(null, minimal.workspace)
+        assertEquals(null, minimal.sessions.single().preview)
+    }
+
+    @Test
     fun remoteAuthFixtureIncludesValidRustCompatibleEd25519Vector() {
         val fixture = ProtocolCodec.json
             .parseToJsonElement(fixture("remote_auth.json"))

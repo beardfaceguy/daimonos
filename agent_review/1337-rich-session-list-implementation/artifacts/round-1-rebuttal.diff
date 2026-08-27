@@ -1,0 +1,63 @@
+```diff
+--- a/src/session_daemon.rs
++++ b/src/session_daemon.rs
+@@
+-            let durable = sessions.get(&session_id);
++            let (turn_status, snapshot_preview) = {
++                let snapshot = entry.snapshot.lock().unwrap_or_else(|p| p.into_inner());
++                let preview = snapshot.snapshot.transcript.iter()
++                    .find(|entry| entry.role == TranscriptRole::User)
++                    .and_then(|entry| entry.text.lines().next())
++                    .and_then(|line| session_store::normalize_preview(
++                        line, self.session_list_preview_bytes,
++                    ));
++                (snapshot.snapshot.turn_status, preview)
++            };
+             let (message_count, preview) = match entry.core.session.try_lock() {
+                 Ok(session) => (
+-                    session.history().len(),
++                    Some(session.history().len()),
+                     session_store::first_user_preview(
+                         session.history(), self.session_list_preview_bytes,
+                     ),
+                 ),
+-                Err(_) => (
+-                    durable.and_then(|row| row.message_count).unwrap_or_default(),
+-                    durable.and_then(|row| row.preview.clone()),
+-                ),
++                Err(_) => (None, snapshot_preview),
+             };
+-            let turn_status = entry.snapshot.lock()...snapshot.turn_status;
+@@
+-                    message_count: Some(message_count),
++                    message_count,
+                     turn_status: Some(turn_status),
+```
+
+```diff
+--- a/src/session_store.rs
++++ b/src/session_store.rs
+@@
+-fn normalize_preview(line: &str, max_bytes: usize) -> Option<String> {
++pub(crate) fn normalize_preview(line: &str, max_bytes: usize) -> Option<String> {
+```
+
+```rust
+#[tokio::test]
+async fn busy_active_listing_marks_count_unknown_and_uses_snapshot_preview() {
+    let daemon = SessionDaemon::new(1, 1, 8, 32);
+    let core = test_core();
+    daemon.create_session("session-a".to_string(), Arc::clone(&core)).unwrap();
+    core.events.emit(SessionEvent::UserMessage {
+        text: "  live   prompt\nignored".to_string(),
+        request_id: Some("prompt-1".to_string()),
+    }).unwrap();
+    // Wait for canonical snapshot projection, then hold AgentSession lock.
+    let _session_guard = core.session.lock().await;
+    let rows = daemon.listing_rows().await.unwrap();
+    assert_eq!(rows[0].message_count, None);
+    assert_eq!(rows[0].preview.as_deref(), Some("live prompt"));
+}
+```
+
+Focused regression and Clippy pass.

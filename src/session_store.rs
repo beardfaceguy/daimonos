@@ -172,6 +172,12 @@ impl SessionStore {
     /// Summaries of all saved sessions, most-recently-modified first. Files
     /// that don't parse or fail a stat are skipped (best-effort listing).
     pub fn list(&self) -> Vec<SessionSummary> {
+        self.list_with_preview_limit(usize::MAX)
+    }
+
+    /// Listing variant whose normalized first-user preview is UTF-8 byte
+    /// bounded before it leaves the blocking store scan.
+    pub fn list_with_preview_limit(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -202,7 +208,7 @@ impl SessionStore {
                     message_count: record.messages.len(),
                     cwd: record.cwd,
                     updated_at: Some(mtime),
-                    first_user_line: first_user_line(&record.messages),
+                    first_user_line: first_user_preview(&record.messages, max_preview_bytes),
                 },
             ));
         }
@@ -215,18 +221,45 @@ impl SessionStore {
     }
 }
 
-/// First line of the first user text message in `messages`, trimmed — a
-/// human-recognizable label for a saved session.
-fn first_user_line(messages: &[Message]) -> Option<String> {
+/// Whitespace-normalized first line of the first user text message, bounded
+/// without splitting a UTF-8 code point.
+pub(crate) fn first_user_preview(messages: &[Message], max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
     messages
         .iter()
         .find(|m| m.role == Role::User)
         .and_then(|m| {
             m.content.iter().find_map(|b| match b {
-                ContentBlock::Text(t) => t.lines().next().map(|l| l.trim().to_string()),
+                ContentBlock::Text(text) => text
+                    .lines()
+                    .next()
+                    .and_then(|line| normalize_preview(line, max_bytes)),
                 _ => None,
             })
         })
+}
+
+pub(crate) fn normalize_preview(line: &str, max_bytes: usize) -> Option<String> {
+    let mut preview = String::new();
+    for word in line.split_whitespace() {
+        let separator = usize::from(!preview.is_empty());
+        let remaining = max_bytes.saturating_sub(preview.len());
+        if remaining <= separator {
+            break;
+        }
+        if separator == 1 {
+            preview.push(' ');
+        }
+        let remaining = max_bytes.saturating_sub(preview.len());
+        let boundary = crate::plugins::floor_char_boundary(word, remaining);
+        preview.push_str(&word[..boundary]);
+        if boundary < word.len() {
+            break;
+        }
+    }
+    (!preview.is_empty()).then_some(preview)
 }
 
 #[cfg(test)]
@@ -368,6 +401,14 @@ mod tests {
         assert_eq!(s1.message_count, 2);
         // Label is the FIRST LINE of the first user message, trimmed.
         assert_eq!(s1.first_user_line.as_deref(), Some("first question"));
+    }
+
+    #[test]
+    fn bounded_preview_normalizes_whitespace_without_splitting_utf8() {
+        let preview =
+            first_user_preview(&[Message::user("  alpha   🦀🦀🦀 beta\nignored")], 13).unwrap();
+        assert_eq!(preview, "alpha 🦀");
+        assert!(preview.len() <= 13);
     }
 
     #[test]

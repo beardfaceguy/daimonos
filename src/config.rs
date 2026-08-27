@@ -448,6 +448,14 @@ pub struct SessionRuntimeConfig {
     pub idle_retention_secs: u64,
     /// Maximum sessions returned by one daemon list page.
     pub session_list_page_size: usize,
+    /// Maximum UTF-8 bytes retained in a local session-list preview.
+    pub session_list_preview_bytes: usize,
+    /// Maximum bytes accepted for an opaque session-list cursor.
+    pub session_list_cursor_bytes: usize,
+    /// Maximum rows retained in one connection-bound listing snapshot.
+    pub session_list_snapshot_entries: usize,
+    /// Lifetime of one connection-bound listing snapshot.
+    pub session_list_snapshot_ttl_secs: u64,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
     /// Maximum wait for a daemon command result in a local frontend.
@@ -515,6 +523,10 @@ impl Default for SessionRuntimeConfig {
             accept_error_backoff_ms: 100,
             idle_retention_secs: 300,
             session_list_page_size: 50,
+            session_list_preview_bytes: 256,
+            session_list_cursor_bytes: 128,
+            session_list_snapshot_entries: 1_000,
+            session_list_snapshot_ttl_secs: 60,
             shutdown_grace_secs: 5,
             client_command_timeout_secs: 10,
             bootstrap_timeout_secs: 15,
@@ -577,6 +589,23 @@ impl SessionRuntimeConfig {
         }
         if self.session_list_page_size == 0 {
             return Err("session.session_list_page_size must be greater than zero".to_string());
+        }
+        if self.session_list_preview_bytes == 0 {
+            return Err("session.session_list_preview_bytes must be greater than zero".to_string());
+        }
+        if self.session_list_cursor_bytes < 40 {
+            return Err("session.session_list_cursor_bytes must be at least 40".to_string());
+        }
+        if self.session_list_snapshot_entries < self.session_list_page_size {
+            return Err(
+                "session.session_list_snapshot_entries must be at least session_list_page_size"
+                    .to_string(),
+            );
+        }
+        if self.session_list_snapshot_ttl_secs == 0 {
+            return Err(
+                "session.session_list_snapshot_ttl_secs must be greater than zero".to_string(),
+            );
         }
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
@@ -726,6 +755,7 @@ impl SessionRuntimeConfig {
             max_prompt_bytes: self.max_prompt_bytes,
             max_label_bytes: self.max_label_bytes,
             max_identifier_bytes: self.max_identifier_bytes,
+            max_cursor_bytes: self.session_list_cursor_bytes,
             max_ticket_bytes: self.max_ticket_bytes,
             max_runtime_value_bytes: self.max_runtime_value_bytes,
             max_capabilities: self.max_capabilities,
@@ -1945,6 +1975,10 @@ mod tests {
         assert_eq!(cfg.session.accept_error_backoff_ms, 100);
         assert_eq!(cfg.session.idle_retention_secs, 300);
         assert_eq!(cfg.session.session_list_page_size, 50);
+        assert_eq!(cfg.session.session_list_preview_bytes, 256);
+        assert_eq!(cfg.session.session_list_cursor_bytes, 128);
+        assert_eq!(cfg.session.session_list_snapshot_entries, 1_000);
+        assert_eq!(cfg.session.session_list_snapshot_ttl_secs, 60);
         assert_eq!(cfg.session.shutdown_grace_secs, 5);
         assert_eq!(cfg.session.client_command_timeout_secs, 10);
         assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
@@ -2298,6 +2332,32 @@ mod tests {
             .validate()
             .expect_err("zero session list page size must be rejected")
             .contains("session.session_list_page_size"));
+        let invalid: Config =
+            toml::from_str("[session]\nsession_list_preview_bytes = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero session preview limit must be rejected")
+            .contains("session.session_list_preview_bytes"));
+        let invalid: Config =
+            toml::from_str("[session]\nsession_list_cursor_bytes = 39\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("short cursor limit must be rejected")
+            .contains("session.session_list_cursor_bytes"));
+        let invalid: Config = toml::from_str(
+            "[session]\nsession_list_page_size = 10\nsession_list_snapshot_entries = 9\n",
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("listing snapshot must hold at least one page")
+            .contains("session.session_list_snapshot_entries"));
+        let invalid: Config =
+            toml::from_str("[session]\nsession_list_snapshot_ttl_secs = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero listing snapshot ttl must be rejected")
+            .contains("session.session_list_snapshot_ttl_secs"));
         let invalid: Config =
             toml::from_str("[session]\nclient_command_timeout_secs = 0\n").unwrap();
         assert!(invalid
