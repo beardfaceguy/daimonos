@@ -11,7 +11,8 @@ use crate::client_transport::{FrontendTransport, TransportError};
 use crate::frontend_state::{ApplyOutcome, ViewState};
 use crate::session_protocol::{
     has_capability, ApprovalDecision, AttachDeniedCode, ClientCapability, ClientInfo,
-    ClientMessage, RevocationCode, RuntimeValue, ServerMessage, SessionUsage, PROTOCOL_VERSION,
+    ClientMessage, RevocationCode, RuntimeValue, ServerMessage, SessionListEntry, SessionUsage,
+    SessionWorkspace, PROTOCOL_VERSION,
 };
 
 #[derive(Debug)]
@@ -72,12 +73,18 @@ pub enum SessionClientOutcome {
     },
     SessionList {
         request_id: String,
-        count: usize,
+        workspace: Option<SessionWorkspace>,
+        sessions: Vec<SessionListEntry>,
         next_cursor: Option<String>,
     },
     Usage {
         request_id: String,
         usage: SessionUsage,
+    },
+    ServerError {
+        request_id: Option<String>,
+        code: String,
+        message: String,
     },
     Revoked {
         code: Option<RevocationCode>,
@@ -301,7 +308,7 @@ impl<T: FrontendTransport> SessionClient<T> {
                 request_id,
                 code,
                 message,
-            } => Err(SessionClientError::Server {
+            } => Ok(SessionClientOutcome::ServerError {
                 request_id,
                 code,
                 message,
@@ -318,11 +325,13 @@ impl<T: FrontendTransport> SessionClient<T> {
             }),
             ServerMessage::SessionList {
                 request_id,
+                workspace,
                 sessions,
                 next_cursor,
             } => Ok(SessionClientOutcome::SessionList {
                 request_id,
-                count: sessions.len(),
+                workspace,
+                sessions,
                 next_cursor,
             }),
             ServerMessage::Usage { request_id, usage } => {
@@ -428,6 +437,21 @@ impl<T: FrontendTransport> SessionClient<T> {
         self.transport
             .send(ClientMessage::GetUsage {
                 request_id: request_id.clone(),
+            })
+            .await?;
+        Ok(request_id)
+    }
+
+    pub async fn list_sessions(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<String, SessionClientError> {
+        self.require(ClientCapability::Observe)?;
+        let request_id = self.next_request_id("list");
+        self.transport
+            .send(ClientMessage::ListSessions {
+                request_id: request_id.clone(),
+                cursor,
             })
             .await?;
         Ok(request_id)
@@ -940,6 +964,81 @@ mod tests {
         ));
         assert_eq!(frontend.state().session_id(), "session-1");
         assert!(!frontend.is_attached());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_list_preserves_typed_rows_and_workspace() {
+        let (server, client_transport) = in_memory_transport_pair(8, "daemon");
+        let server_task = tokio::spawn(async move {
+            assert!(matches!(
+                server.recv().await.unwrap(),
+                Some(ClientMessage::Attach { .. })
+            ));
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "current".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("current", 0),
+                })
+                .await
+                .unwrap();
+            let Some(ClientMessage::ListSessions { request_id, .. }) = server.recv().await.unwrap()
+            else {
+                panic!("expected list sessions");
+            };
+            server
+                .send(&ServerMessage::SessionList {
+                    request_id,
+                    workspace: Some(SessionWorkspace {
+                        id: "ws_1".to_string(),
+                        label: "workspace".to_string(),
+                    }),
+                    sessions: vec![SessionListEntry {
+                        session_id: "saved".to_string(),
+                        active: false,
+                        attached_clients: 0,
+                        model: Some("model".to_string()),
+                        updated_at_unix_ms: Some(42),
+                        preview: Some("hello".to_string()),
+                        message_count: Some(2),
+                        turn_status: None,
+                    }],
+                    next_cursor: Some("v1_cursor".to_string()),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend.attach(None).await.unwrap();
+        let request_id = frontend.list_sessions(None).await.unwrap();
+        let outcome = frontend.receive().await.unwrap();
+        let SessionClientOutcome::SessionList {
+            request_id: response_id,
+            workspace,
+            sessions,
+            next_cursor,
+        } = outcome
+        else {
+            panic!("expected typed session list");
+        };
+        assert_eq!(response_id, request_id);
+        assert_eq!(workspace.unwrap().id, "ws_1");
+        assert_eq!(sessions[0].preview.as_deref(), Some("hello"));
+        assert_eq!(next_cursor.as_deref(), Some("v1_cursor"));
         server_task.await.unwrap();
     }
 }

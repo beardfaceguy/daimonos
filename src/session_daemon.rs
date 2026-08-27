@@ -15,9 +15,10 @@ use crate::session_core::{
 };
 use crate::session_protocol::{
     AttachDeniedCode, ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage,
-    SessionEvent, SessionListEntry, SessionSnapshot, ToolCallState, ToolCallStateStatus,
-    TranscriptEntry, TranscriptRole,
+    SessionEvent, SessionListEntry, SessionSnapshot, SessionWorkspace, ToolCallState,
+    ToolCallStateStatus, TranscriptEntry, TranscriptRole,
 };
+use crate::session_store::SessionSummary;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOpenMode {
@@ -33,8 +34,12 @@ pub trait SessionFactory: Send + Sync {
         mode: SessionOpenMode,
     ) -> Result<Arc<SessionCore>, String>;
 
-    fn persisted_session_ids(&self) -> Vec<String> {
+    async fn persisted_session_summaries(&self, _max_preview_bytes: usize) -> Vec<SessionSummary> {
         Vec::new()
+    }
+
+    fn workspace_identity(&self) -> Option<SessionWorkspace> {
+        None
     }
 }
 
@@ -55,6 +60,13 @@ pub enum SessionDaemonError {
 #[derive(Clone)]
 pub struct CapabilityPolicy {
     allowed: std::collections::HashSet<ClientCapability>,
+    trust: ConnectionTrust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTrust {
+    LocalOwner,
+    RemotePaired,
 }
 
 impl CapabilityPolicy {
@@ -71,6 +83,7 @@ impl CapabilityPolicy {
             ]
             .into_iter()
             .collect(),
+            trust: ConnectionTrust::LocalOwner,
         }
     }
 
@@ -78,6 +91,7 @@ impl CapabilityPolicy {
     fn allowing(capabilities: impl IntoIterator<Item = ClientCapability>) -> Self {
         Self {
             allowed: capabilities.into_iter().collect(),
+            trust: ConnectionTrust::RemotePaired,
         }
     }
 
@@ -111,6 +125,22 @@ struct SessionEntry {
     _snapshot_subscription: SessionEventSubscription,
     active_prompt_tasks: AtomicUsize,
     prompt_tasks_changed: tokio::sync::Notify,
+    last_activity_unix_ms: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ConnectionListingSnapshot {
+    rows: Vec<SessionListEntry>,
+    offset: usize,
+    expected_cursor: Option<String>,
+    expires_at: tokio::time::Instant,
+}
+
+#[derive(Debug)]
+enum SessionListPageError {
+    InvalidCursor,
+    CapacityExceeded,
+    TooLarge(String),
 }
 
 pub struct SessionDaemon {
@@ -121,6 +151,10 @@ pub struct SessionDaemon {
     max_snapshot_entries: usize,
     idle_retention: Option<std::time::Duration>,
     session_list_page_size: usize,
+    session_list_preview_bytes: usize,
+    session_list_snapshot_entries: usize,
+    session_list_snapshot_ttl: std::time::Duration,
+    workspace_identity: Option<SessionWorkspace>,
     factory: Option<Arc<dyn SessionFactory>>,
     creation_gate: tokio::sync::Mutex<()>,
     creating_sessions: Mutex<std::collections::HashSet<String>>,
@@ -147,6 +181,10 @@ impl SessionDaemon {
             max_snapshot_entries: max_snapshot_entries.max(1),
             idle_retention: None,
             session_list_page_size: max_sessions.max(1),
+            session_list_preview_bytes: 256,
+            session_list_snapshot_entries: max_sessions.max(1),
+            session_list_snapshot_ttl: std::time::Duration::from_secs(60),
+            workspace_identity: None,
             factory: None,
             creation_gate: tokio::sync::Mutex::new(()),
             creating_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -177,6 +215,10 @@ impl SessionDaemon {
             max_snapshot_entries: max_snapshot_entries.max(1),
             idle_retention,
             session_list_page_size: session_list_page_size.max(1),
+            session_list_preview_bytes: 256,
+            session_list_snapshot_entries: 1_000,
+            session_list_snapshot_ttl: std::time::Duration::from_secs(60),
+            workspace_identity: factory.workspace_identity(),
             factory: Some(factory),
             creation_gate: tokio::sync::Mutex::new(()),
             creating_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -186,6 +228,19 @@ impl SessionDaemon {
             client_tasks_changed: tokio::sync::Notify::new(),
             next_attachment_id: AtomicU64::new(1),
         }
+    }
+
+    pub fn with_listing_limits(
+        mut self,
+        preview_bytes: usize,
+        snapshot_entries: usize,
+        snapshot_ttl: std::time::Duration,
+    ) -> Self {
+        self.session_list_preview_bytes = preview_bytes.max(1);
+        self.session_list_snapshot_entries =
+            snapshot_entries.max(self.session_list_page_size).max(1);
+        self.session_list_snapshot_ttl = snapshot_ttl;
+        self
     }
 
     async fn open_session(
@@ -299,11 +354,14 @@ impl SessionDaemon {
             self.max_snapshot_entries,
         )));
         let snapshot_for_events = Arc::clone(&snapshot);
+        let last_activity_unix_ms = Arc::new(AtomicU64::new(now_unix_ms()));
+        let activity_for_events = Arc::clone(&last_activity_unix_ms);
         let snapshot_subscription = core
             .events
             .subscribe(
                 self.max_clients_per_session.saturating_add(1),
                 Arc::new(move |seq, event| {
+                    activity_for_events.store(now_unix_ms(), Ordering::Release);
                     snapshot_for_events
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -326,6 +384,7 @@ impl SessionDaemon {
                 _snapshot_subscription: snapshot_subscription,
                 active_prompt_tasks: AtomicUsize::new(0),
                 prompt_tasks_changed: tokio::sync::Notify::new(),
+                last_activity_unix_ms,
             }),
         );
         Ok(())
@@ -431,49 +490,153 @@ impl SessionDaemon {
             .map(|entry| Arc::clone(&entry.core))
     }
 
-    fn list_sessions(&self, cursor: Option<&str>) -> (Vec<SessionListEntry>, Option<String>) {
+    async fn listing_rows(&self) -> Result<Vec<SessionListEntry>, SessionListPageError> {
         let mut sessions = std::collections::BTreeMap::new();
-        {
-            let active = self
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (session_id, entry) in active.iter() {
-                let attached_clients = entry
-                    .clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .len();
+        if let Some(factory) = self.factory.as_ref() {
+            for summary in factory
+                .persisted_session_summaries(self.session_list_preview_bytes)
+                .await
+            {
                 sessions.insert(
-                    session_id.clone(),
+                    summary.id.clone(),
                     SessionListEntry {
-                        session_id: session_id.clone(),
-                        active: true,
-                        attached_clients,
+                        session_id: summary.id,
+                        active: false,
+                        attached_clients: 0,
+                        model: Some(summary.model),
+                        updated_at_unix_ms: summary.updated_at.map(system_time_unix_ms),
+                        preview: summary.first_user_line,
+                        message_count: Some(summary.message_count),
+                        turn_status: None,
                     },
                 );
             }
         }
-        if let Some(factory) = self.factory.as_ref() {
-            for session_id in factory.persisted_session_ids() {
-                sessions
-                    .entry(session_id.clone())
-                    .or_insert(SessionListEntry {
-                        session_id,
-                        active: false,
-                        attached_clients: 0,
-                    });
-            }
-        }
-        let mut page: Vec<SessionListEntry> = sessions
-            .into_values()
-            .filter(|entry| cursor.is_none_or(|cursor| entry.session_id.as_str() > cursor))
-            .take(self.session_list_page_size.saturating_add(1))
+
+        let active: Vec<(String, Arc<SessionEntry>)> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
             .collect();
-        let next_cursor = (page.len() > self.session_list_page_size)
-            .then(|| page[self.session_list_page_size - 1].session_id.clone());
-        page.truncate(self.session_list_page_size);
-        (page, next_cursor)
+        for (session_id, entry) in active {
+            let attached_clients = entry
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            let (turn_status, snapshot_preview) = {
+                let snapshot = entry
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let preview = snapshot
+                    .snapshot
+                    .transcript
+                    .iter()
+                    .find(|entry| entry.role == TranscriptRole::User)
+                    .and_then(|entry| entry.text.lines().next())
+                    .and_then(|line| {
+                        crate::session_store::normalize_preview(
+                            line,
+                            self.session_list_preview_bytes,
+                        )
+                    });
+                (snapshot.snapshot.turn_status, preview)
+            };
+            let (message_count, preview) = match entry.core.session.try_lock() {
+                Ok(session) => (
+                    Some(session.history().len()),
+                    crate::session_store::first_user_preview(
+                        session.history(),
+                        self.session_list_preview_bytes,
+                    ),
+                ),
+                Err(_) => (None, snapshot_preview),
+            };
+            sessions.insert(
+                session_id.clone(),
+                SessionListEntry {
+                    session_id,
+                    active: true,
+                    attached_clients,
+                    model: Some(entry.core.current_model()),
+                    updated_at_unix_ms: Some(entry.last_activity_unix_ms.load(Ordering::Acquire)),
+                    preview,
+                    message_count,
+                    turn_status: Some(turn_status),
+                },
+            );
+        }
+        let mut rows: Vec<_> = sessions.into_values().collect();
+        rows.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .unwrap_or_default()
+                .cmp(&left.updated_at_unix_ms.unwrap_or_default())
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        if rows.len() > self.session_list_snapshot_entries {
+            return Err(SessionListPageError::CapacityExceeded);
+        }
+        Ok(rows)
+    }
+
+    async fn list_sessions_for_connection(
+        &self,
+        request_id: String,
+        cursor: Option<&str>,
+        trust: ConnectionTrust,
+        snapshot: &mut Option<ConnectionListingSnapshot>,
+        max_frame_bytes: usize,
+    ) -> Result<ServerMessage, SessionListPageError> {
+        if cursor.is_none() {
+            *snapshot = Some(ConnectionListingSnapshot {
+                rows: self.listing_rows().await?,
+                offset: 0,
+                expected_cursor: None,
+                expires_at: tokio::time::Instant::now() + self.session_list_snapshot_ttl,
+            });
+        }
+        let listing = snapshot
+            .as_mut()
+            .ok_or(SessionListPageError::InvalidCursor)?;
+        if tokio::time::Instant::now() >= listing.expires_at
+            || cursor.is_some_and(|cursor| listing.expected_cursor.as_deref() != Some(cursor))
+        {
+            *snapshot = None;
+            return Err(SessionListPageError::InvalidCursor);
+        }
+
+        let end = listing
+            .offset
+            .saturating_add(self.session_list_page_size)
+            .min(listing.rows.len());
+        let rows = render_listing_rows(&listing.rows[listing.offset..end], trust);
+        let remaining = listing.rows.len().saturating_sub(listing.offset);
+        let next_cursor = format!("v1_{}", uuid::Uuid::new_v4());
+        let workspace = (trust == ConnectionTrust::LocalOwner)
+            .then(|| self.workspace_identity.clone())
+            .flatten();
+        let (message, sent) = fit_session_list_to_frame(
+            request_id,
+            workspace,
+            rows,
+            remaining,
+            next_cursor,
+            max_frame_bytes,
+        )
+        .map_err(SessionListPageError::TooLarge)?;
+        listing.offset = listing.offset.saturating_add(sent);
+        let ServerMessage::SessionList { next_cursor, .. } = &message else {
+            unreachable!("session-list fitter returned another message");
+        };
+        listing.expected_cursor = next_cursor.clone();
+        if listing.expected_cursor.is_none() {
+            *snapshot = None;
+        }
+        Ok(message)
     }
 
     async fn evict_idle_sessions(&self) {
@@ -709,6 +872,7 @@ impl SessionDaemon {
     ) -> Result<(), TransportError> {
         let capability_policy = CapabilityPolicy {
             allowed: allowed_capabilities.into_iter().collect(),
+            trust: ConnectionTrust::RemotePaired,
         };
         self.serve_client_with_policy(transport, limits, &capability_policy)
             .await
@@ -936,6 +1100,7 @@ impl SessionDaemon {
         let mut stop_receiver = attachment.entry.stop_notifier.subscribe();
         let mut replacement_receiver = attachment.replacement_receiver.clone();
         let mut replacement_open = true;
+        let mut listing_snapshot = None;
         loop {
             tokio::select! {
                 incoming = transport.recv() => match incoming? {
@@ -1427,10 +1592,22 @@ impl SessionDaemon {
                     }
                     Some(message @ ClientMessage::ListSessions { .. }) => {
                         if let Err(error) = limits.validate_client_message(&message) {
+                            let invalid_cursor = matches!(
+                                error,
+                                crate::session_protocol::ProtocolValidationError::FieldTooLarge {
+                                    field: "list_sessions.cursor",
+                                    ..
+                                }
+                            );
                             transport
                                 .send(&ServerMessage::Error {
                                     request_id: request_id(&message),
-                                    code: "invalid_message".to_string(),
+                                    code: if invalid_cursor {
+                                        "invalid_cursor"
+                                    } else {
+                                        "invalid_message"
+                                    }
+                                    .to_string(),
                                     message: format!("{error:?}"),
                                 })
                                 .await?;
@@ -1449,15 +1626,38 @@ impl SessionDaemon {
                         let ClientMessage::ListSessions { request_id, cursor } = message else {
                             unreachable!("matched list sessions");
                         };
-                        let (sessions, next_cursor) = self.list_sessions(cursor.as_deref());
-                        match fit_session_list_to_frame(
-                            request_id.clone(),
-                            sessions,
-                            next_cursor,
-                            limits.max_frame_bytes,
-                        ) {
+                        match self
+                            .list_sessions_for_connection(
+                                request_id.clone(),
+                                cursor.as_deref(),
+                                capability_policy.trust,
+                                &mut listing_snapshot,
+                                limits.max_frame_bytes,
+                            )
+                            .await
+                        {
                             Ok(message) => transport.send(&message).await?,
-                            Err(message) => {
+                            Err(SessionListPageError::InvalidCursor) => {
+                                transport
+                                    .send(&ServerMessage::Error {
+                                        request_id: Some(request_id),
+                                        code: "invalid_cursor".to_string(),
+                                        message: "session-list cursor is invalid or expired"
+                                            .to_string(),
+                                    })
+                                    .await?;
+                            }
+                            Err(SessionListPageError::CapacityExceeded) => {
+                                transport
+                                    .send(&ServerMessage::Error {
+                                        request_id: Some(request_id),
+                                        code: "session_list_capacity".to_string(),
+                                        message: "session listing exceeds the configured snapshot capacity"
+                                            .to_string(),
+                                    })
+                                    .await?;
+                            }
+                            Err(SessionListPageError::TooLarge(message)) => {
                                 transport
                                     .send(&ServerMessage::Error {
                                         request_id: Some(request_id),
@@ -1647,6 +1847,33 @@ impl SessionDaemon {
             });
         }
     }
+}
+
+fn now_unix_ms() -> u64 {
+    system_time_unix_ms(std::time::SystemTime::now())
+}
+
+fn system_time_unix_ms(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn render_listing_rows(rows: &[SessionListEntry], trust: ConnectionTrust) -> Vec<SessionListEntry> {
+    rows.iter()
+        .cloned()
+        .map(|mut row| {
+            if trust == ConnectionTrust::RemotePaired {
+                row.model = None;
+                row.updated_at_unix_ms = None;
+                row.preview = None;
+                row.message_count = None;
+                row.turn_status = None;
+            }
+            row
+        })
+        .collect()
 }
 
 struct SocketPathGuard {
@@ -2229,28 +2456,31 @@ fn tool_calls_without_oldest_terminal(
 
 fn fit_session_list_to_frame(
     request_id: String,
+    workspace: Option<SessionWorkspace>,
     mut sessions: Vec<SessionListEntry>,
-    mut next_cursor: Option<String>,
+    remaining: usize,
+    cursor: String,
     max_frame_bytes: usize,
-) -> Result<ServerMessage, String> {
+) -> Result<(ServerMessage, usize), String> {
     loop {
+        let next_cursor = (sessions.len() < remaining).then(|| cursor.clone());
         let message = ServerMessage::SessionList {
             request_id: request_id.clone(),
+            workspace: workspace.clone(),
             sessions: sessions.clone(),
-            next_cursor: next_cursor.clone(),
+            next_cursor,
         };
         let encoded = serde_json::to_vec(&message)
             .map_err(|error| format!("session list serialization failed: {error}"))?;
         if encoded.len() <= max_frame_bytes {
-            return Ok(message);
+            return Ok((message, sessions.len()));
         }
         sessions.pop();
-        let Some(last) = sessions.last() else {
+        if sessions.is_empty() {
             return Err(format!(
                 "one session entry exceeds the configured {max_frame_bytes}-byte frame limit"
             ));
-        };
-        next_cursor = Some(last.session_id.clone());
+        }
     }
 }
 
@@ -2631,6 +2861,7 @@ mod tests {
             max_prompt_bytes: 1024,
             max_label_bytes: 128,
             max_identifier_bytes: 128,
+            max_cursor_bytes: 128,
             max_ticket_bytes: 256,
             max_runtime_value_bytes: 256,
             max_capabilities: 8,
@@ -4404,9 +4635,9 @@ mod tests {
         assert_eq!(daemon.session_count(), 0);
     }
 
-    #[test]
-    fn session_listing_is_bounded_and_cursor_paginated() {
-        let daemon = SessionDaemon::with_factory(
+    #[tokio::test]
+    async fn session_listing_is_bounded_and_snapshot_paginated() {
+        let mut daemon = SessionDaemon::with_factory(
             3,
             1,
             8,
@@ -4416,6 +4647,379 @@ mod tests {
             std::time::Duration::from_secs(1),
             Arc::new(TestSessionFactory),
         );
+        daemon.workspace_identity = Some(SessionWorkspace {
+            id: "ws_test".to_string(),
+            label: "workspace".to_string(),
+        });
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        daemon
+            .create_session("session-b".to_string(), test_core())
+            .unwrap();
+        {
+            let sessions = daemon
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sessions["session-a"]
+                .last_activity_unix_ms
+                .store(200, Ordering::Release);
+            sessions["session-b"]
+                .last_activity_unix_ms
+                .store(100, Ordering::Release);
+        }
+
+        let mut snapshot = None;
+        let first = daemon
+            .list_sessions_for_connection(
+                "list-1".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            sessions,
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("first session-list page");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-a");
+
+        let second = daemon
+            .list_sessions_for_connection(
+                "list-2".to_string(),
+                Some(&cursor),
+                ConnectionTrust::LocalOwner,
+                &mut snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            sessions,
+            next_cursor,
+            ..
+        } = second
+        else {
+            panic!("second session-list page");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-b");
+        assert!(next_cursor.is_none());
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "list-3".to_string(),
+                    Some(&cursor),
+                    ConnectionTrust::LocalOwner,
+                    &mut snapshot,
+                    4_096,
+                )
+                .await,
+            Err(SessionListPageError::InvalidCursor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_session_listing_strips_rich_metadata_and_workspace() {
+        let mut daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            10,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        );
+        daemon.workspace_identity = Some(SessionWorkspace {
+            id: "ws_private".to_string(),
+            label: "secret-workspace".to_string(),
+        });
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+
+        let mut local_snapshot = None;
+        let local = daemon
+            .list_sessions_for_connection(
+                "local".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut local_snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            workspace: Some(workspace),
+            sessions: local_rows,
+            ..
+        } = local
+        else {
+            panic!("local session list");
+        };
+        assert_eq!(workspace.id, "ws_private");
+        assert!(local_rows[0].model.is_some());
+        assert!(local_rows[0].updated_at_unix_ms.is_some());
+        assert!(local_rows[0].message_count.is_some());
+        assert!(local_rows[0].turn_status.is_some());
+
+        let mut remote_snapshot = None;
+        let remote = daemon
+            .list_sessions_for_connection(
+                "remote".to_string(),
+                None,
+                ConnectionTrust::RemotePaired,
+                &mut remote_snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            workspace,
+            sessions: remote_rows,
+            ..
+        } = remote
+        else {
+            panic!("remote session list");
+        };
+        assert!(workspace.is_none());
+        assert_eq!(remote_rows[0].session_id, "session-a");
+        assert!(remote_rows[0].model.is_none());
+        assert!(remote_rows[0].updated_at_unix_ms.is_none());
+        assert!(remote_rows[0].preview.is_none());
+        assert!(remote_rows[0].message_count.is_none());
+        assert!(remote_rows[0].turn_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_listing_uses_provider_history_and_canonical_activity() {
+        let daemon = SessionDaemon::new(1, 1, 8, 32);
+        let core = test_core();
+        core.session
+            .lock()
+            .await
+            .set_history(vec![crate::providers::Message::user(
+                "  hello   world\nignored",
+            )]);
+        daemon
+            .create_session("session-a".to_string(), Arc::clone(&core))
+            .unwrap();
+        let before = daemon
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())["session-a"]
+            .last_activity_unix_ms
+            .load(Ordering::Acquire);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        core.events
+            .emit(SessionEvent::AssistantDelta {
+                text: "activity".to_string(),
+            })
+            .unwrap();
+
+        let rows = daemon.listing_rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_count, Some(1));
+        assert_eq!(rows[0].preview.as_deref(), Some("hello world"));
+        assert_eq!(
+            rows[0].turn_status,
+            Some(crate::session_protocol::TurnStatus::Idle)
+        );
+        assert!(rows[0].updated_at_unix_ms.unwrap() >= before);
+    }
+
+    #[tokio::test]
+    async fn busy_active_listing_marks_count_unknown_and_uses_snapshot_preview() {
+        let daemon = SessionDaemon::new(1, 1, 8, 32);
+        let core = test_core();
+        daemon
+            .create_session("session-a".to_string(), Arc::clone(&core))
+            .unwrap();
+        core.events
+            .emit(SessionEvent::UserMessage {
+                text: "  live   prompt\nignored".to_string(),
+                request_id: Some("prompt-1".to_string()),
+            })
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())["session-a"]
+            .clone();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !entry
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .snapshot
+                    .transcript
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("snapshot projection should observe the live prompt");
+        let _session_guard = core.session.lock().await;
+
+        let rows = daemon.listing_rows().await.unwrap();
+        assert_eq!(rows[0].message_count, None);
+        assert_eq!(rows[0].preview.as_deref(), Some("live prompt"));
+    }
+
+    #[tokio::test]
+    async fn connection_policy_applies_local_and_remote_listing_trust() {
+        async fn list_once(daemon: Arc<SessionDaemon>, remote: bool) -> ServerMessage {
+            let (transport, mut client) = in_memory_transport_pair(8, "listing client");
+            let serving = tokio::spawn(async move {
+                if remote {
+                    daemon
+                        .serve_client_with_capabilities(
+                            transport,
+                            &protocol_limits(),
+                            vec![ClientCapability::Observe],
+                        )
+                        .await
+                } else {
+                    daemon.serve_client(transport, &protocol_limits()).await
+                }
+            });
+            client
+                .send(ClientMessage::Attach {
+                    protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                    session_id: Some("session-a".to_string()),
+                    ticket: None,
+                    client: terminal_client(),
+                    requested_capabilities: vec![ClientCapability::Observe],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.recv().await,
+                Some(ServerMessage::AttachOk { .. })
+            ));
+            assert!(matches!(
+                client.recv().await,
+                Some(ServerMessage::Snapshot { .. })
+            ));
+            client
+                .send(ClientMessage::ListSessions {
+                    request_id: "list".to_string(),
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            let response = client.recv().await.unwrap();
+            client.send(ClientMessage::Detach).await.unwrap();
+            serving.await.unwrap().unwrap();
+            response
+        }
+
+        let daemon = Arc::new(SessionDaemon::new(1, 2, 8, 32));
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        let local = list_once(Arc::clone(&daemon), false).await;
+        let remote = list_once(daemon, true).await;
+        let ServerMessage::SessionList {
+            sessions: local, ..
+        } = local
+        else {
+            panic!("local list response");
+        };
+        let ServerMessage::SessionList {
+            sessions: remote, ..
+        } = remote
+        else {
+            panic!("remote list response");
+        };
+        assert!(local[0].model.is_some());
+        assert!(remote[0].model.is_none());
+        assert!(remote[0].preview.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_listing_cursor_is_typed_and_keeps_connection_alive() {
+        let daemon = Arc::new(SessionDaemon::new(1, 1, 8, 32));
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        let (transport, mut client) = in_memory_transport_pair(8, "listing client");
+        let serving_daemon = Arc::clone(&daemon);
+        let serving = tokio::spawn(async move {
+            serving_daemon
+                .serve_client(transport, &protocol_limits())
+                .await
+        });
+        client
+            .send(ClientMessage::Attach {
+                protocol_version: crate::session_protocol::PROTOCOL_VERSION,
+                session_id: Some("session-a".to_string()),
+                ticket: None,
+                client: terminal_client(),
+                requested_capabilities: vec![ClientCapability::Observe],
+            })
+            .await
+            .unwrap();
+        let _ = client.recv().await;
+        let _ = client.recv().await;
+        client
+            .send(ClientMessage::ListSessions {
+                request_id: "bad-list".to_string(),
+                cursor: Some("v1_unknown".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Error {
+                request_id: Some(request_id),
+                code,
+                ..
+            }) if request_id == "bad-list" && code == "invalid_cursor"
+        ));
+        client.send(ClientMessage::Ping).await.unwrap();
+        assert_eq!(client.recv().await, Some(ServerMessage::Pong));
+        client
+            .send(ClientMessage::ListSessions {
+                request_id: "oversized".to_string(),
+                cursor: Some("x".repeat(129)),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(ServerMessage::Error { code, .. }) if code == "invalid_cursor"
+        ));
+        client.send(ClientMessage::Detach).await.unwrap();
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn listing_cursor_is_connection_bound_and_expires() {
+        let daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            1,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_listing_limits(64, 10, std::time::Duration::from_millis(1));
         daemon
             .create_session("session-a".to_string(), test_core())
             .unwrap();
@@ -4423,13 +5027,84 @@ mod tests {
             .create_session("session-b".to_string(), test_core())
             .unwrap();
 
-        let (first, cursor) = daemon.list_sessions(None);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].session_id, "session-a");
-        let (second, next) = daemon.list_sessions(cursor.as_deref());
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].session_id, "session-b");
-        assert!(next.is_none());
+        let mut first_connection = None;
+        let first = daemon
+            .list_sessions_for_connection(
+                "first".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut first_connection,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("first page cursor");
+        };
+        let mut other_connection = None;
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "other".to_string(),
+                    Some(&cursor),
+                    ConnectionTrust::RemotePaired,
+                    &mut other_connection,
+                    4_096,
+                )
+                .await,
+            Err(SessionListPageError::InvalidCursor)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "expired".to_string(),
+                    Some(&cursor),
+                    ConnectionTrust::LocalOwner,
+                    &mut first_connection,
+                    4_096,
+                )
+                .await,
+            Err(SessionListPageError::InvalidCursor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn listing_snapshot_capacity_fails_instead_of_hiding_rows() {
+        let daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            1,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_listing_limits(64, 1, std::time::Duration::from_secs(1));
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        daemon
+            .create_session("session-b".to_string(), test_core())
+            .unwrap();
+        let mut snapshot = None;
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "list".to_string(),
+                    None,
+                    ConnectionTrust::LocalOwner,
+                    &mut snapshot,
+                    4_096,
+                )
+                .await,
+            Err(SessionListPageError::CapacityExceeded)
+        ));
     }
 
     #[tokio::test]
@@ -4603,9 +5278,22 @@ mod tests {
                 session_id: format!("session-{index:04}"),
                 active: true,
                 attached_clients: 0,
+                model: Some("model".to_string()),
+                updated_at_unix_ms: Some(index),
+                preview: Some("preview".repeat(4)),
+                message_count: Some(2),
+                turn_status: Some(crate::session_protocol::TurnStatus::Idle),
             })
-            .collect();
-        let message = fit_session_list_to_frame("list-1".to_string(), sessions, None, 300).unwrap();
+            .collect::<Vec<_>>();
+        let (message, sent) = fit_session_list_to_frame(
+            "list-1".to_string(),
+            None,
+            sessions.clone(),
+            sessions.len(),
+            "v1_cursor".to_string(),
+            300,
+        )
+        .unwrap();
         assert!(serde_json::to_vec(&message).unwrap().len() <= 300);
         let ServerMessage::SessionList {
             sessions,
@@ -4617,6 +5305,61 @@ mod tests {
         };
         assert!(!sessions.is_empty());
         assert!(next_cursor.is_some());
+        assert_eq!(sessions.len(), sent);
+        assert_ne!(
+            next_cursor.as_deref(),
+            sessions.last().map(|row| row.session_id.as_str())
+        );
+    }
+
+    #[test]
+    fn frame_trimmed_pages_cover_snapshot_rows_once_in_order() {
+        let rows = (0_u64..12)
+            .map(|index| SessionListEntry {
+                session_id: format!("session-{index:04}"),
+                active: true,
+                attached_clients: 0,
+                model: Some("model-with-enough-length-to-force-trimming".to_string()),
+                updated_at_unix_ms: Some(100 - index),
+                preview: Some("bounded preview content".to_string()),
+                message_count: Some(2),
+                turn_status: Some(crate::session_protocol::TurnStatus::Idle),
+            })
+            .collect::<Vec<_>>();
+        let expected = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let mut delivered = Vec::new();
+        let mut offset = 0;
+        let page_size = 5;
+        while offset < rows.len() {
+            let end = offset.saturating_add(page_size).min(rows.len());
+            let remaining = rows.len() - offset;
+            let (message, sent) = fit_session_list_to_frame(
+                format!("page-{offset}"),
+                None,
+                rows[offset..end].to_vec(),
+                remaining,
+                format!("v1_cursor_{offset}"),
+                420,
+            )
+            .unwrap();
+            let ServerMessage::SessionList {
+                sessions,
+                next_cursor,
+                ..
+            } = message
+            else {
+                panic!("session list");
+            };
+            assert!(sent > 0);
+            assert_eq!(sent, sessions.len());
+            delivered.extend(sessions.into_iter().map(|row| row.session_id));
+            offset += sent;
+            assert_eq!(next_cursor.is_some(), offset < rows.len());
+        }
+        assert_eq!(delivered, expected);
     }
 
     #[tokio::test]

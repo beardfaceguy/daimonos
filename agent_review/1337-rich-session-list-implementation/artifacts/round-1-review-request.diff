@@ -1,0 +1,247 @@
+Actual load-bearing implementation excerpts; the full uncommitted diff is present in the workspace paths named below.
+
+```rust
+// src/session_protocol.rs
+pub enum ServerMessage {
+    // ...
+    SessionList {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<SessionWorkspace>,
+        sessions: Vec<SessionListEntry>,
+        next_cursor: Option<String>,
+    },
+}
+
+pub struct SessionListEntry {
+    pub session_id: String,
+    pub active: bool,
+    pub attached_clients: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<TurnStatus>,
+}
+
+pub struct SessionWorkspace { pub id: String, pub label: String }
+
+pub struct ProtocolLimits {
+    // ...
+    pub max_identifier_bytes: usize,
+    pub max_cursor_bytes: usize,
+}
+// ListSessions cursor validation uses max_cursor_bytes, not identifier bytes.
+```
+
+```rust
+// src/session_daemon.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTrust { LocalOwner, RemotePaired }
+
+#[derive(Clone)]
+pub struct CapabilityPolicy {
+    allowed: HashSet<ClientCapability>,
+    trust: ConnectionTrust,
+}
+
+struct SessionEntry {
+    // existing core/client/snapshot state...
+    last_activity_unix_ms: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ConnectionListingSnapshot {
+    rows: Vec<SessionListEntry>,
+    offset: usize,
+    expected_cursor: Option<String>,
+    expires_at: tokio::time::Instant,
+}
+
+async fn listing_rows(&self) -> Result<Vec<SessionListEntry>, SessionListPageError> {
+    let mut sessions = BTreeMap::new();
+    if let Some(factory) = self.factory.as_ref() {
+        for summary in factory.persisted_session_summaries(self.session_list_preview_bytes).await {
+            sessions.insert(summary.id.clone(), SessionListEntry {
+                session_id: summary.id, active: false, attached_clients: 0,
+                model: Some(summary.model),
+                updated_at_unix_ms: summary.updated_at.map(system_time_unix_ms),
+                preview: summary.first_user_line,
+                message_count: Some(summary.message_count), turn_status: None,
+            });
+        }
+    }
+    let active: Vec<(String, Arc<SessionEntry>)> = self.sessions.lock()...iter()
+        .map(|(id, entry)| (id.clone(), Arc::clone(entry))).collect();
+    for (session_id, entry) in active {
+        let durable = sessions.get(&session_id);
+        let (message_count, preview) = match entry.core.session.try_lock() {
+            Ok(session) => (session.history().len(), first_user_preview(session.history(), self.session_list_preview_bytes)),
+            Err(_) => (durable.and_then(|r| r.message_count).unwrap_or_default(), durable.and_then(|r| r.preview.clone())),
+        };
+        sessions.insert(session_id.clone(), SessionListEntry {
+            session_id, active: true,
+            attached_clients: entry.clients.lock()...len(),
+            model: Some(entry.core.current_model()),
+            updated_at_unix_ms: Some(entry.last_activity_unix_ms.load(Ordering::Acquire)),
+            preview, message_count: Some(message_count),
+            turn_status: Some(entry.snapshot.lock()...snapshot.turn_status),
+        });
+    }
+    let mut rows: Vec<_> = sessions.into_values().collect();
+    rows.sort_by(|a,b| b.updated_at_unix_ms.unwrap_or_default()
+        .cmp(&a.updated_at_unix_ms.unwrap_or_default())
+        .then_with(|| a.session_id.cmp(&b.session_id)));
+    if rows.len() > self.session_list_snapshot_entries {
+        return Err(SessionListPageError::CapacityExceeded);
+    }
+    Ok(rows)
+}
+
+async fn list_sessions_for_connection(
+    &self, request_id: String, cursor: Option<&str>, trust: ConnectionTrust,
+    snapshot: &mut Option<ConnectionListingSnapshot>, max_frame_bytes: usize,
+) -> Result<ServerMessage, SessionListPageError> {
+    if cursor.is_none() {
+        *snapshot = Some(ConnectionListingSnapshot {
+            rows: self.listing_rows().await?, offset: 0, expected_cursor: None,
+            expires_at: Instant::now() + self.session_list_snapshot_ttl,
+        });
+    }
+    let listing = snapshot.as_mut().ok_or(InvalidCursor)?;
+    if Instant::now() >= listing.expires_at
+        || cursor.is_some_and(|c| listing.expected_cursor.as_deref() != Some(c)) {
+        *snapshot = None; return Err(InvalidCursor);
+    }
+    let end = (listing.offset + self.session_list_page_size).min(listing.rows.len());
+    let rows = render_listing_rows(&listing.rows[listing.offset..end], trust);
+    let remaining = listing.rows.len() - listing.offset;
+    let next = format!("v1_{}", Uuid::new_v4());
+    let workspace = (trust == LocalOwner).then(|| self.workspace_identity.clone()).flatten();
+    let (message, sent) = fit_session_list_to_frame(
+        request_id, workspace, rows, remaining, next, max_frame_bytes,
+    ).map_err(TooLarge)?;
+    listing.offset += sent;
+    listing.expected_cursor = match &message { SessionList { next_cursor, .. } => next_cursor.clone(), _ => unreachable!() };
+    if listing.expected_cursor.is_none() { *snapshot = None; }
+    Ok(message)
+}
+
+fn render_listing_rows(rows: &[SessionListEntry], trust: ConnectionTrust) -> Vec<SessionListEntry> {
+    rows.iter().cloned().map(|mut row| {
+        if trust == RemotePaired {
+            row.model = None; row.updated_at_unix_ms = None; row.preview = None;
+            row.message_count = None; row.turn_status = None;
+        }
+        row
+    }).collect()
+}
+
+fn fit_session_list_to_frame(
+    request_id: String, workspace: Option<SessionWorkspace>,
+    mut sessions: Vec<SessionListEntry>, remaining: usize,
+    cursor: String, max_frame_bytes: usize,
+) -> Result<(ServerMessage, usize), String> {
+    loop {
+        let next_cursor = (sessions.len() < remaining).then(|| cursor.clone());
+        let message = ServerMessage::SessionList { request_id: request_id.clone(), workspace: workspace.clone(), sessions: sessions.clone(), next_cursor };
+        if serde_json::to_vec(&message)?.len() <= max_frame_bytes { return Ok((message, sessions.len())); }
+        sessions.pop();
+        if sessions.is_empty() { return Err(...); }
+    }
+}
+```
+
+```rust
+// serve_client_with_policy keeps one listing_snapshot local to the physical
+// connection. CapabilityPolicy::local_trusted has LocalOwner; the remote
+// serve_client_with_capabilities constructor always sets RemotePaired.
+let mut listing_snapshot = None;
+// ListSessions validates cursor with max_cursor_bytes, then:
+match self.list_sessions_for_connection(
+    request_id.clone(), cursor.as_deref(), capability_policy.trust,
+    &mut listing_snapshot, limits.max_frame_bytes,
+).await {
+    Ok(message) => transport.send(&message).await?,
+    Err(InvalidCursor) => send_error("invalid_cursor"),
+    Err(CapacityExceeded) => send_error("session_list_capacity"),
+    Err(TooLarge(message)) => send_error("session_list_too_large"),
+}
+```
+
+```rust
+// src/session_factory.rs
+pub struct AgentSessionFactory {
+    workspace: PathBuf, // canonicalized at construction
+    workspace_identity: SessionWorkspace, // ws_<sha256 canonical path>, bounded basename label
+    // ...
+}
+
+async fn persisted_session_summaries(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
+    let store = self.store.clone();
+    let workspace = self.workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        store.list_with_preview_limit(max_preview_bytes).into_iter().filter(|summary| {
+            summary.cwd.as_deref().and_then(|cwd| canonicalize(cwd).ok())
+                .is_some_and(|cwd| cwd == workspace)
+        }).collect()
+    }).await.unwrap_or_default()
+}
+```
+
+```rust
+// src/session_store.rs
+pub(crate) fn first_user_preview(messages: &[Message], max_bytes: usize) -> Option<String> {
+    // selects first user text line and passes it to normalize_preview
+}
+fn normalize_preview(line: &str, max_bytes: usize) -> Option<String> {
+    let mut preview = String::new();
+    for word in line.split_whitespace() {
+        // append one normalized separator and only a floor_char_boundary slice
+        // while preview.len() remains <= max_bytes
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+```
+
+```rust
+// src/session_client.rs
+pub enum SessionClientOutcome {
+    SessionList { request_id: String, workspace: Option<SessionWorkspace>, sessions: Vec<SessionListEntry>, next_cursor: Option<String> },
+    ServerError { request_id: Option<String>, code: String, message: String },
+    // ...
+}
+// ServerMessage::Error during an attached session is a nonterminal typed
+// outcome rather than a transport failure; attach-handshake Error stays fatal.
+pub async fn list_sessions(&mut self, cursor: Option<String>) -> Result<String, SessionClientError> {
+    self.require(ClientCapability::Observe)?;
+    let request_id = self.next_request_id("list");
+    self.transport.send(ClientMessage::ListSessions { request_id: request_id.clone(), cursor }).await?;
+    Ok(request_id)
+}
+```
+
+```rust
+// src/session_controller.rs and src/tui/session.rs
+SessionControllerCommand::ListSessions { cursor } forwards to SessionClient and
+blocks atomic session switching while in flight. TuiSession records the local
+CommandAccepted request id, clears the bounded pending-operation maps on either
+SessionList or correlated ServerError, and exposes take_session_list() returning
+(workspace, rows, next_cursor).
+```
+
+```kotlin
+// android/.../WireModels.kt
+ServerMessage.SessionList adds nullable workspace. SessionListEntry adds nullable
+model, updatedAtUnixMs, preview, messageCount, and turnStatus. All are optional,
+so minimal remote and older daemon rows still decode.
+```
+
+Tests in the actual diff cover: dedicated cursor limit; additive Rust wire roundtrip; UTF-8 preview normalization/cap; legacy cwd alias canonicalization; async filtered summaries; active provider-history metadata/activity; local-vs-remote trust both directly and through serve policy; bounded snapshot pagination; connection-bound, replayed, expired, oversized and unknown cursors; frame trimming preserving opaque cursor; capacity failure instead of silent omission; nonfatal invalid_cursor connection; typed rows through SessionClient and TuiSession; Kotlin rich/minimal decoding.
+
+Verification: cargo fmt clean; cargo clippy --all-targets -- -D warnings clean; cargo test 1724 passed, 10 ignored; pytest 296 passed. Android ./gradlew test could not start because no java executable/JAVA_HOME exists on this machine.

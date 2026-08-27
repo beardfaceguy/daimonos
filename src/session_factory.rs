@@ -1,6 +1,7 @@
 //! Production construction of daemon-owned [`SessionCore`] instances.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,8 +16,11 @@ use crate::session_core::{
     SessionPersistence,
 };
 use crate::session_daemon::{SessionFactory, SessionOpenMode};
-use crate::session_protocol::{RuntimeChoice, RuntimeOption, RuntimeValue, SessionEvent};
-use crate::session_store::SessionStore;
+use crate::session_protocol::{
+    RuntimeChoice, RuntimeOption, RuntimeValue, SessionEvent, SessionWorkspace,
+};
+use crate::session_store::{SessionStore, SessionSummary};
+use sha2::{Digest, Sha256};
 
 pub type ProviderFactory =
     Arc<dyn Fn() -> Result<Box<dyn LlmProvider>, String> + Send + Sync + 'static>;
@@ -24,6 +28,7 @@ pub type ProviderFactory =
 pub struct AgentSessionFactory {
     make_provider: ProviderFactory,
     workspace: PathBuf,
+    workspace_identity: SessionWorkspace,
     config: Arc<Config>,
     default_model: String,
     models: Vec<String>,
@@ -52,9 +57,12 @@ impl AgentSessionFactory {
         analytics: Option<Arc<AnalyticsStore>>,
         services: Arc<crate::provisioning::ToolServices>,
     ) -> Self {
+        let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
+        let workspace_identity = session_workspace(&workspace, config.session.max_label_bytes);
         Self {
             make_provider,
             workspace,
+            workspace_identity,
             config,
             default_model,
             models,
@@ -84,10 +92,13 @@ impl SessionFactory for AgentSessionFactory {
                     .ok_or_else(|| format!("persisted session '{session_id}' was not found"))?,
             ),
         };
-        if persisted
-            .as_ref()
-            .is_some_and(|record| record.cwd.as_ref() != Some(&self.workspace))
-        {
+        if persisted.as_ref().is_some_and(|record| {
+            record
+                .cwd
+                .as_deref()
+                .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+                .is_none_or(|cwd| cwd != self.workspace)
+        }) {
             return Err(format!(
                 "persisted session '{session_id}' belongs to a different workspace"
             ));
@@ -228,13 +239,44 @@ impl SessionFactory for AgentSessionFactory {
         Ok(core)
     }
 
-    fn persisted_session_ids(&self) -> Vec<String> {
-        self.store
-            .list()
-            .into_iter()
-            .filter(|summary| summary.cwd.as_ref() == Some(&self.workspace))
-            .map(|summary| summary.id)
-            .collect()
+    async fn persisted_session_summaries(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .list_with_preview_limit(max_preview_bytes)
+                .into_iter()
+                .filter(|summary| {
+                    summary
+                        .cwd
+                        .as_deref()
+                        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+                        .is_some_and(|cwd| cwd == workspace)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    fn workspace_identity(&self) -> Option<SessionWorkspace> {
+        Some(self.workspace_identity.clone())
+    }
+}
+
+fn session_workspace(workspace: &std::path::Path, max_label_bytes: usize) -> SessionWorkspace {
+    let mut digest = Sha256::new();
+    digest.update(workspace.as_os_str().as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    let label = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let label_end = crate::plugins::floor_char_boundary(label, max_label_bytes);
+    SessionWorkspace {
+        id: format!("ws_{}", &digest[..32]),
+        label: label[..label_end].to_string(),
     }
 }
 
@@ -357,7 +399,7 @@ mod tests {
                     }],
                 },
             ],
-            directory.path(),
+            &directory.path().join("."),
             &["prompt-1".to_string()],
             &[crate::session_protocol::AssistantOutcome::Errored {
                 context_overflow: false,
@@ -394,10 +436,18 @@ mod tests {
             None,
             services,
         );
+        let summaries = factory.persisted_session_summaries(256).await;
         assert_eq!(
-            factory.persisted_session_ids(),
-            vec!["session-1".to_string()]
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-1"]
         );
+        assert_eq!(summaries[0].model, "saved-model");
+        assert_eq!(summaries[0].message_count, 3);
+        assert_eq!(summaries[0].first_user_line.as_deref(), Some("first"));
+        assert!(factory.workspace_identity().is_some());
 
         let core = factory
             .open("session-1", SessionOpenMode::Load)

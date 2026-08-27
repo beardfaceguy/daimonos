@@ -334,6 +334,10 @@ the local TUI/UDS client, and future remote clients.
 | `accept_error_backoff_ms` | `100` | Delay before retrying a recoverable local Unix listener accept failure. |
 | `idle_retention_secs` | `300` | Seconds before unloading a detached idle core while preserving its durable record for reattach; `0` keeps cores resident. |
 | `session_list_page_size` | `50` | Maximum entries returned by one daemon session-list page. |
+| `session_list_preview_bytes` | `256` | Maximum UTF-8 bytes retained in each local session-list preview. |
+| `session_list_cursor_bytes` | `128` | Maximum accepted opaque daemon session-list cursor size. |
+| `session_list_snapshot_entries` | `1000` | Maximum rows retained in one connection-bound listing snapshot. |
+| `session_list_snapshot_ttl_secs` | `60` | Lifetime of one connection-bound listing snapshot. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
 | `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
 | `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
@@ -382,6 +386,10 @@ max_tool_event_output_bytes = 65536
 accept_error_backoff_ms = 100
 idle_retention_secs = 0
 session_list_page_size = 50
+session_list_preview_bytes = 256
+session_list_cursor_bytes = 128
+session_list_snapshot_entries = 1000
+session_list_snapshot_ttl_secs = 60
 shutdown_grace_secs = 5
 client_command_timeout_secs = 10
 bootstrap_timeout_secs = 15

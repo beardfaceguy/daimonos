@@ -686,17 +686,24 @@ pub async fn run_session_daemon(
         analytics_store.clone(),
         services,
     ));
-    let daemon = Arc::new(session_daemon::SessionDaemon::with_factory(
-        cfg.session.max_sessions,
-        cfg.session.max_clients_per_session,
-        cfg.session.event_queue_capacity,
-        cfg.session.snapshot_entries,
-        (cfg.session.idle_retention_secs > 0)
-            .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
-        cfg.session.session_list_page_size,
-        std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
-        factory,
-    ));
+    let daemon = Arc::new(
+        session_daemon::SessionDaemon::with_factory(
+            cfg.session.max_sessions,
+            cfg.session.max_clients_per_session,
+            cfg.session.event_queue_capacity,
+            cfg.session.snapshot_entries,
+            (cfg.session.idle_retention_secs > 0)
+                .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
+            cfg.session.session_list_page_size,
+            std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
+            factory,
+        )
+        .with_listing_limits(
+            cfg.session.session_list_preview_bytes,
+            cfg.session.session_list_snapshot_entries,
+            std::time::Duration::from_secs(cfg.session.session_list_snapshot_ttl_secs),
+        ),
+    );
     let socket_path = socket.unwrap_or_else(|| cfg.session.resolved_socket_path(workspace));
     eprintln!(
         "daimonos session daemon listening on {}",

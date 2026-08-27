@@ -55,6 +55,9 @@ pub enum SessionControllerCommand {
     StopSession,
     ClearHistory,
     GetUsage,
+    ListSessions {
+        cursor: Option<String>,
+    },
     Sync,
     Ping,
     Detach,
@@ -72,6 +75,7 @@ impl SessionControllerCommand {
             Self::StopSession => "stop_session",
             Self::ClearHistory => "clear_history",
             Self::GetUsage => "get_usage",
+            Self::ListSessions { .. } => "list_sessions",
             Self::Sync => "sync",
             Self::Ping => "ping",
             Self::Detach => "detach",
@@ -88,6 +92,7 @@ impl SessionControllerCommand {
                 | Self::SetConfig { .. }
                 | Self::StopSession
                 | Self::ClearHistory
+                | Self::ListSessions { .. }
         )
     }
 }
@@ -624,6 +629,10 @@ async fn handle_command<T: FrontendTransport>(
             SessionControllerCommand::GetUsage => {
                 client.get_usage().await.map(|id| (Some(id), None))
             }
+            SessionControllerCommand::ListSessions { cursor } => client
+                .list_sessions(cursor)
+                .await
+                .map(|id| (Some(id), None)),
             SessionControllerCommand::Sync => client.sync().await.map(|()| (None, None)),
             SessionControllerCommand::Ping => client.ping().await.map(|()| (None, None)),
             SessionControllerCommand::Detach => client

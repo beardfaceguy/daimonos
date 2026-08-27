@@ -135,6 +135,8 @@ pub enum ServerMessage {
     },
     SessionList {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<SessionWorkspace>,
         sessions: Vec<SessionListEntry>,
         next_cursor: Option<String>,
     },
@@ -213,6 +215,22 @@ pub struct SessionListEntry {
     pub session_id: String,
     pub active: bool,
     pub attached_clients: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<TurnStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspace {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +591,7 @@ pub struct ProtocolLimits {
     /// UTF-8 byte cap. Validation rejects; it never truncates at this boundary.
     pub max_label_bytes: usize,
     pub max_identifier_bytes: usize,
+    pub max_cursor_bytes: usize,
     pub max_ticket_bytes: usize,
     pub max_runtime_value_bytes: usize,
     pub max_capabilities: usize,
@@ -691,9 +710,9 @@ impl ProtocolLimits {
                 self.max_identifier_bytes,
             )
             .or_else(|| {
-                cursor.as_deref().and_then(|cursor| {
-                    check("list_sessions.cursor", cursor, self.max_identifier_bytes)
-                })
+                cursor
+                    .as_deref()
+                    .and_then(|cursor| check("list_sessions.cursor", cursor, self.max_cursor_bytes))
             }),
             ClientMessage::SetConfig {
                 request_id,
@@ -940,6 +959,7 @@ mod tests {
             max_prompt_bytes: 64,
             max_label_bytes: 64,
             max_identifier_bytes: 4,
+            max_cursor_bytes: 8,
             max_ticket_bytes: 64,
             max_runtime_value_bytes: 64,
             max_capabilities: 8,
@@ -950,6 +970,60 @@ mod tests {
                 field: "stop_session.request_id",
                 max_bytes: 4,
             })
+        );
+    }
+
+    #[test]
+    fn session_list_cursor_uses_its_dedicated_limit() {
+        let limits = ProtocolLimits {
+            max_frame_bytes: 1_024,
+            max_prompt_bytes: 64,
+            max_label_bytes: 64,
+            max_identifier_bytes: 4,
+            max_cursor_bytes: 8,
+            max_ticket_bytes: 64,
+            max_runtime_value_bytes: 64,
+            max_capabilities: 8,
+        };
+        let message = ClientMessage::ListSessions {
+            request_id: "list".to_string(),
+            cursor: Some("123456789".to_string()),
+        };
+        assert_eq!(
+            limits.validate_client_message(&message),
+            Err(ProtocolValidationError::FieldTooLarge {
+                field: "list_sessions.cursor",
+                max_bytes: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn rich_session_list_fields_are_additive_on_the_wire() {
+        let message = ServerMessage::SessionList {
+            request_id: "list-1".to_string(),
+            workspace: Some(SessionWorkspace {
+                id: "ws_1".to_string(),
+                label: "workspace".to_string(),
+            }),
+            sessions: vec![SessionListEntry {
+                session_id: "session-1".to_string(),
+                active: true,
+                attached_clients: 1,
+                model: Some("model".to_string()),
+                updated_at_unix_ms: Some(42),
+                preview: Some("hello".to_string()),
+                message_count: Some(2),
+                turn_status: Some(TurnStatus::Idle),
+            }],
+            next_cursor: None,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["workspace"]["id"], "ws_1");
+        assert_eq!(encoded["sessions"][0]["preview"], "hello");
+        assert_eq!(
+            serde_json::from_value::<ServerMessage>(encoded).unwrap(),
+            message
         );
     }
 
@@ -1194,6 +1268,7 @@ mod tests {
             max_prompt_bytes: 8,
             max_label_bytes: 6,
             max_identifier_bytes: 4,
+            max_cursor_bytes: 8,
             max_ticket_bytes: 6,
             max_runtime_value_bytes: 5,
             max_capabilities: 3,
@@ -1240,6 +1315,7 @@ mod tests {
             max_prompt_bytes: 64,
             max_label_bytes: 64,
             max_identifier_bytes: 4,
+            max_cursor_bytes: 8,
             max_ticket_bytes: 6,
             max_runtime_value_bytes: 5,
             max_capabilities: 2,

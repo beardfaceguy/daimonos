@@ -205,6 +205,7 @@ sealed interface ServerMessage {
     @SerialName("session_list")
     data class SessionList(
         @SerialName("request_id") val requestId: String,
+        val workspace: SessionWorkspace? = null,
         val sessions: List<SessionListEntry>,
         @SerialName("next_cursor") val nextCursor: String? = null,
     ) : ServerMessage
@@ -282,6 +283,17 @@ data class SessionListEntry(
     @SerialName("session_id") val sessionId: String,
     val active: Boolean,
     @SerialName("attached_clients") val attachedClients: Int,
+    val model: String? = null,
+    @SerialName("updated_at_unix_ms") val updatedAtUnixMs: Long? = null,
+    val preview: String? = null,
+    @SerialName("message_count") val messageCount: Int? = null,
+    @SerialName("turn_status") val turnStatus: TurnStatus? = null,
+)
+
+@Serializable
+data class SessionWorkspace(
+    val id: String,
+    val label: String,
 )
 
 @Serializable

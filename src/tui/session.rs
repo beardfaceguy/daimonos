@@ -17,7 +17,9 @@ use crate::session_controller::{
     ControllerSendError, EpochEvent, SessionControllerCommand, SessionControllerEvent,
     SessionControllerHandle,
 };
-use crate::session_protocol::{AttachDeniedCode, RuntimeValue, TurnStatus};
+use crate::session_protocol::{
+    AttachDeniedCode, RuntimeValue, SessionListEntry, SessionWorkspace, TurnStatus,
+};
 
 pub type ControllerFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<SessionControllerHandle>> + Send + 'static>>;
@@ -45,7 +47,13 @@ pub struct TuiSession {
     last_detached_session: Option<String>,
     switching: Arc<AtomicBool>,
     pending_operations: BTreeMap<&'static str, PendingOperation>,
+    pending_request_ids: BTreeMap<String, &'static str>,
     sync_target: Option<u64>,
+    session_list: Option<(
+        Option<SessionWorkspace>,
+        Vec<SessionListEntry>,
+        Option<String>,
+    )>,
 }
 
 struct ActiveSession {
@@ -171,7 +179,9 @@ impl TuiSession {
                             last_detached_session: None,
                             switching: Arc::new(AtomicBool::new(false)),
                             pending_operations: BTreeMap::new(),
+                            pending_request_ids: BTreeMap::new(),
                             sync_target: None,
+                            session_list: None,
                         });
                     }
                     SessionControllerEvent::AttachFailed { code, message } => {
@@ -212,6 +222,21 @@ impl TuiSession {
 
     pub fn state_mut(&mut self) -> &mut ViewState {
         &mut self.active.state
+    }
+
+    pub fn take_session_list(
+        &mut self,
+    ) -> Option<(
+        Option<SessionWorkspace>,
+        Vec<SessionListEntry>,
+        Option<String>,
+    )> {
+        self.session_list.take()
+    }
+
+    fn clear_pending_operations(&mut self) {
+        self.pending_operations.clear();
+        self.pending_request_ids.clear();
     }
 
     pub async fn switch_to(&mut self, target_session_id: &str) -> anyhow::Result<()> {
@@ -342,7 +367,7 @@ impl TuiSession {
         let departed_session = self.active.state.session_id().to_string();
         let old_active = std::mem::replace(&mut self.active, candidate.active);
         self.last_detached_session = Some(departed_session);
-        self.pending_operations.clear();
+        self.clear_pending_operations();
         self.sync_target = None;
         tokio::spawn(old_active.controller.shutdown());
         Ok(())
@@ -470,7 +495,7 @@ impl TuiSession {
                             }
                             SessionClientOutcome::AppliedSnapshot(_) => {
                                 self.sync_target = None;
-                                self.pending_operations.clear();
+                                self.clear_pending_operations();
                             }
                             SessionClientOutcome::AppliedEvent(seq)
                                 if self.sync_target.is_some_and(|target| *seq >= target) =>
@@ -479,18 +504,26 @@ impl TuiSession {
                             }
                             _ => {}
                         }
-                        if let SessionClientOutcome::CommandResult {
-                            request_id,
-                            operation,
-                            ..
-                        } = outcome
-                        {
-                            if operation == expected_operation
-                                && accepted_request_id.as_deref() == Some(request_id.as_str())
+                        match outcome {
+                            SessionClientOutcome::CommandResult {
+                                request_id,
+                                operation,
+                                ..
+                            } if operation == expected_operation
+                                && accepted_request_id.as_deref() == Some(request_id.as_str()) =>
                             {
                                 self.pending_operations.remove(operation.as_str());
                                 return Ok(());
                             }
+                            SessionClientOutcome::ServerError {
+                                request_id: Some(request_id),
+                                code,
+                                message,
+                            } if accepted_request_id.as_deref() == Some(request_id.as_str()) => {
+                                self.pending_operations.remove(expected_operation);
+                                anyhow::bail!("{code}: {message}");
+                            }
+                            _ => {}
                         }
                     }
                     SessionControllerEvent::Failed { operation, message }
@@ -510,7 +543,7 @@ impl TuiSession {
                     }
                     SessionControllerEvent::Attached { .. }
                     | SessionControllerEvent::Reconnected { .. } => {
-                        self.pending_operations.clear();
+                        self.clear_pending_operations();
                         self.sync_target = None;
                         anyhow::bail!(
                             "session attachment changed while waiting for {expected_operation}"
@@ -580,7 +613,7 @@ impl TuiSession {
                 state.push_system_message(message);
                 self.active.state = state;
                 self.sync_target = None;
-                self.pending_operations.clear();
+                self.clear_pending_operations();
                 TuiSessionUpdate::Updated
             }
             SessionControllerEvent::StateChanged { mut state, outcome } => {
@@ -591,15 +624,32 @@ impl TuiSession {
                     }
                     SessionClientOutcome::AppliedSnapshot(_) => {
                         self.sync_target = None;
-                        self.pending_operations.clear();
+                        self.clear_pending_operations();
                     }
                     SessionClientOutcome::AppliedEvent(seq) => {
                         if self.sync_target.is_some_and(|target| *seq >= target) {
                             self.sync_target = None;
                         }
                     }
-                    SessionClientOutcome::CommandResult { operation, .. } => {
+                    SessionClientOutcome::CommandResult {
+                        request_id,
+                        operation,
+                        ..
+                    } => {
+                        self.pending_request_ids.remove(request_id);
                         self.pending_operations.remove(operation.as_str());
+                    }
+                    SessionClientOutcome::SessionList { request_id, .. } => {
+                        self.pending_request_ids.remove(request_id);
+                        self.pending_operations.remove("list_sessions");
+                    }
+                    SessionClientOutcome::ServerError { request_id, .. } => {
+                        if let Some(operation) = request_id
+                            .as_ref()
+                            .and_then(|request_id| self.pending_request_ids.remove(request_id))
+                        {
+                            self.pending_operations.remove(operation);
+                        }
                     }
                     _ => {}
                 }
@@ -636,12 +686,33 @@ impl TuiSession {
                             usage.cost_usd_micros as f64 / 1_000_000.0,
                         ));
                     }
+                    SessionClientOutcome::SessionList {
+                        workspace,
+                        sessions,
+                        next_cursor,
+                        ..
+                    } => {
+                        self.session_list = Some((workspace, sessions, next_cursor));
+                    }
+                    SessionClientOutcome::ServerError { code, message, .. } => {
+                        state.push_system_message(format!("{code}: {message}"));
+                    }
                     _ => {}
                 }
                 self.active.state = state;
                 TuiSessionUpdate::Updated
             }
-            SessionControllerEvent::CommandAccepted { .. } => TuiSessionUpdate::Updated,
+            SessionControllerEvent::CommandAccepted {
+                operation,
+                request_id,
+            } => {
+                if self.pending_operations.contains_key(operation) {
+                    if let Some(request_id) = request_id {
+                        self.pending_request_ids.insert(request_id, operation);
+                    }
+                }
+                TuiSessionUpdate::Updated
+            }
             SessionControllerEvent::CommandRejected { operation, message } => {
                 self.pending_operations.remove(operation);
                 self.active
@@ -785,6 +856,93 @@ mod tests {
         accept_attach(&server, "daemon-session").await;
         let session = attach.await.unwrap().unwrap();
         assert_eq!(session.state().session_id(), "daemon-session");
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn typed_session_list_reaches_tui_adapter() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        accept_attach(&server, "daemon-session").await;
+        let mut session = attach.await.unwrap().unwrap();
+        session
+            .try_send(SessionControllerCommand::ListSessions { cursor: None })
+            .unwrap();
+        let Some(ClientMessage::ListSessions { request_id, .. }) = server.recv().await.unwrap()
+        else {
+            panic!("expected list request");
+        };
+        server
+            .send(&ServerMessage::SessionList {
+                request_id,
+                workspace: Some(SessionWorkspace {
+                    id: "ws_1".to_string(),
+                    label: "workspace".to_string(),
+                }),
+                sessions: vec![SessionListEntry {
+                    session_id: "saved".to_string(),
+                    active: false,
+                    attached_clients: 0,
+                    model: Some("model".to_string()),
+                    updated_at_unix_ms: Some(1),
+                    preview: Some("preview".to_string()),
+                    message_count: Some(1),
+                    turn_status: None,
+                }],
+                next_cursor: None,
+            })
+            .await
+            .unwrap();
+        let (workspace, rows, next) = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+                if let Some(list) = session.take_session_list() {
+                    break list;
+                }
+            }
+        })
+        .await
+        .expect("typed list should reach the adapter");
+        assert_eq!(workspace.unwrap().id, "ws_1");
+        assert_eq!(rows[0].session_id, "saved");
+        assert!(next.is_none());
+        assert!(!session.pending_operations.contains_key("list_sessions"));
+
+        session
+            .try_send(SessionControllerCommand::ListSessions {
+                cursor: Some("v1_invalid".to_string()),
+            })
+            .unwrap();
+        let Some(ClientMessage::ListSessions { request_id, .. }) = server.recv().await.unwrap()
+        else {
+            panic!("expected invalid cursor request");
+        };
+        server
+            .send(&ServerMessage::Error {
+                request_id: Some(request_id),
+                code: "invalid_cursor".to_string(),
+                message: "cursor expired".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
+                if !session.pending_operations.contains_key("list_sessions") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("typed list error should clear the pending operation");
+        assert!(session
+            .state()
+            .transcript()
+            .iter()
+            .any(|line| line.text.contains("invalid_cursor")));
         session.shutdown().await;
     }
 
