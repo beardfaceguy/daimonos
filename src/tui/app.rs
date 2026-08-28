@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use crate::session_controller::{
     ControllerSendError, SessionControllerCommand, SessionControllerHandle,
 };
-use crate::session_protocol::{RuntimeOptionSpec, RuntimeValue, TurnStatus};
+use crate::session_protocol::{ClientCapability, RuntimeOptionSpec, RuntimeValue, TurnStatus};
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
 use super::input::{
@@ -284,6 +284,7 @@ fn draw_tui(
                 no_color,
                 scroll_from_bottom: scroll.bottom_offset(),
                 scroll_mode: mode == InputMode::Scroll,
+                allow_always_granted: session.has_capability(ClientCapability::ApproveAlways),
             },
         );
         if session.state().active_approval().is_none() {
@@ -316,7 +317,12 @@ fn handle_command(
             notice(session, "a turn is already running; wait or interrupt it");
         }
         UiCommand::Quit | UiCommand::Detach => return Some(TuiExit::Detach),
-        UiCommand::StopSession => return Some(TuiExit::Stop),
+        UiCommand::StopSession if session.has_capability(ClientCapability::Stop) => {
+            return Some(TuiExit::Stop);
+        }
+        UiCommand::StopSession => {
+            notice(session, "stop capability was not granted for this session");
+        }
         UiCommand::Interrupt => interrupt(session),
         UiCommand::Help => notice(session, HELP_TEXT),
         UiCommand::Model(Some(model)) if quiescent => {
@@ -387,7 +393,7 @@ fn handle_approval_key(key: KeyEvent, session: &mut TuiSession) -> bool {
     let KeyCode::Char(ch) = key.code else {
         return true;
     };
-    if let Some(decision) = approval_from_key(ch, request.allow_always_available) {
+    if let Some(decision) = approval_from_key(ch, session.allow_always_available()) {
         queue(
             session,
             SessionControllerCommand::Approve {

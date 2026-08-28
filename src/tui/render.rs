@@ -41,6 +41,8 @@ pub struct RenderOptions {
     /// True while the TUI is in vim-style scroll mode; draws the `-- SCROLL --`
     /// indicator over the right edge of the status line.
     pub scroll_mode: bool,
+    /// Optional capability gate layered with the canonical request policy.
+    pub allow_always_granted: bool,
 }
 
 /// Render the whole TUI frame for `state` into `area` of `buf`.
@@ -73,7 +75,7 @@ pub fn render_with_options(
     // lands on the status line at common terminal heights, and the status is
     // meant to stay readable while an approval is pending. Keeping it inside
     // the transcript also leaves the composer visible.
-    render_approval_modal(state, chunks[0], buf);
+    render_approval_modal(state, chunks[0], buf, options.allow_always_granted);
     if options.no_color {
         for cell in &mut buf.content {
             cell.set_fg(Color::Reset).set_bg(Color::Reset);
@@ -243,7 +245,12 @@ fn current_model(state: &ViewState) -> Option<String> {
 }
 
 /// Centered modal for the active approval request. No-op when none is pending.
-fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
+fn render_approval_modal(
+    state: &ViewState,
+    area: Rect,
+    buf: &mut Buffer,
+    allow_always_granted: bool,
+) {
     let Some(approval) = state.active_approval() else {
         return;
     };
@@ -297,7 +304,7 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
         ),
         Span::raw(" deny"),
     ];
-    if approval.allow_always_available {
+    if approval.allow_always_available && allow_always_granted {
         options.push(Span::raw("   "));
         options.push(Span::styled(
             "[a]",
@@ -544,6 +551,27 @@ mod tests {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         render(state, composer, area, &mut buf);
+        buffer_to_string(&buf)
+    }
+
+    fn render_to_string_with_allow_always(
+        state: &ViewState,
+        composer: &str,
+        w: u16,
+        h: u16,
+    ) -> String {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        render_with_options(
+            state,
+            composer,
+            area,
+            &mut buf,
+            RenderOptions {
+                allow_always_granted: true,
+                ..RenderOptions::default()
+            },
+        );
         buffer_to_string(&buf)
     }
 
@@ -959,7 +987,7 @@ mod tests {
     #[test]
     fn approval_modal_renders_detail_and_options() {
         let state = approval_state(true, "rm -rf /tmp/x");
-        let out = render_to_string(&state, "", 72, 18);
+        let out = render_to_string_with_allow_always(&state, "", 72, 18);
         assert!(
             out.contains("Approval required"),
             "modal title missing:\n{out}"
@@ -995,6 +1023,17 @@ mod tests {
         assert!(
             !out.contains("[a]"),
             "allow-always must be hidden when host-gated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn approval_modal_hides_allow_always_without_client_capability() {
+        let state = approval_state(true, "touch x");
+        let out = render_to_string(&state, "", 72, 18);
+        assert!(out.contains("[y]"));
+        assert!(
+            !out.contains("[a]"),
+            "allow-always must require both host policy and client capability:\n{out}"
         );
     }
 
