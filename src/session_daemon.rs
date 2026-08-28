@@ -1056,6 +1056,8 @@ impl SessionDaemon {
     }
 
     pub async fn stop_session(&self, session_id: &str) -> std::io::Result<bool> {
+        // Serializes stop with every production open's final registry commit,
+        // so the entry cannot be replaced while payload deletion is in flight.
         let _creation = self.creation_gate.lock().await;
         self.end_session(session_id, "stopped", true).await
     }
@@ -1076,6 +1078,27 @@ impl SessionDaemon {
             return Ok(false);
         };
         let admission = entry.admission.lock().await;
+        let still_current = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry));
+        if !still_current {
+            return Ok(false);
+        }
+        let _ = entry.core.cancel_turn();
+        if delete_persisted {
+            // Keep admission through the bounded wait: already-started prompt
+            // tasks no longer need it after begin_turn, while queued tasks stay
+            // blocked until deletion either commits or fails.
+            self.wait_for_prompt_tasks(&entry).await;
+            entry.core.cleanup_cancelled_turn();
+            // SessionPersistence holds its state lock across unlink and marks
+            // deletion before release, so a timed-out prompt's later save is
+            // serialized behind this call and becomes a no-op.
+            entry.core.delete_persisted()?;
+        }
         let removed = {
             let mut sessions = self
                 .sessions
@@ -1091,11 +1114,20 @@ impl SessionDaemon {
             }
         };
         let Some(entry) = removed else {
-            return Ok(false);
+            return Err(std::io::Error::other(
+                "session registry changed after confirmed payload deletion",
+            ));
         };
         entry.stopped.store(true, Ordering::Release);
-        let _ = entry.core.cancel_turn();
         drop(admission);
+        if !delete_persisted {
+            self.wait_for_prompt_tasks(&entry).await;
+        }
+        Self::finish_removed_entry(entry, reason, false)?;
+        Ok(true)
+    }
+
+    async fn wait_for_prompt_tasks(&self, entry: &SessionEntry) {
         let _ = tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = entry.prompt_tasks_changed.notified();
@@ -1106,8 +1138,6 @@ impl SessionDaemon {
             }
         })
         .await;
-        Self::finish_removed_entry(entry, reason, delete_persisted)?;
-        Ok(true)
     }
 
     fn finish_removed_entry(
@@ -1643,11 +1673,18 @@ impl SessionDaemon {
                                     .await?;
                             }
                             Err(error) => {
+                                tracing::warn!(
+                                    target: "daimonos::session_daemon",
+                                    event = "session_delete_failed",
+                                    session_id,
+                                    error = %error,
+                                    "persisted session deletion failed; session remains active"
+                                );
                                 transport
                                     .send(&ServerMessage::Error {
                                         request_id: Some(request_id),
                                         code: "session_delete_failed".to_string(),
-                                        message: error.to_string(),
+                                        message: session_delete_error_message().to_string(),
                                     })
                                     .await?;
                             }
@@ -2905,6 +2942,10 @@ fn session_daemon_error_message(error: &SessionDaemonError) -> String {
     .to_string()
 }
 
+fn session_delete_error_message() -> &'static str {
+    "persisted session could not be deleted"
+}
+
 fn session_daemon_error_code(error: &SessionDaemonError) -> AttachDeniedCode {
     match error {
         SessionDaemonError::DuplicateSession(_) => AttachDeniedCode::SessionAlreadyActive,
@@ -3052,6 +3093,10 @@ mod tests {
                 AttachDeniedCode::SessionOpenFailed
             );
         }
+        assert_eq!(
+            session_delete_error_message(),
+            "persisted session could not be deleted"
+        );
     }
 
     struct StaticProvider;
@@ -3500,6 +3545,61 @@ mod tests {
 
         assert!(daemon.stop_session("session-1").await.unwrap());
 
+        assert!(store.load("session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_payload_delete_keeps_session_resident_and_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("sessions");
+        let displaced_store_path = directory.path().join("sessions-displaced");
+        let store = crate::session_store::SessionStore::new(store_path.clone());
+        store.save_acp(
+            "session-1",
+            "test-model",
+            "medium",
+            &[crate::providers::Message::user("persisted")],
+            directory.path(),
+            &[],
+            &[],
+        );
+        std::fs::rename(&store_path, &displaced_store_path).unwrap();
+        std::fs::write(&store_path, b"blocking file").unwrap();
+        let core = test_core_with_persistence(
+            Box::new(StaticProvider),
+            Some(crate::session_core::SessionPersistence::new(
+                "session-1",
+                store.clone(),
+            )),
+        );
+        let daemon = SessionDaemon::new(1, 1, 8, 32);
+        daemon
+            .create_session("session-1".to_string(), Arc::clone(&core))
+            .unwrap();
+
+        assert!(daemon.stop_session("session-1").await.is_err());
+        assert!(Arc::ptr_eq(
+            &daemon
+                .session("session-1")
+                .expect("failed delete must retain the session"),
+            &core
+        ));
+        std::fs::remove_file(&store_path).unwrap();
+        std::fs::rename(&displaced_store_path, &store_path).unwrap();
+        assert!(store.load("session-1").is_some());
+        core.prompt(
+            crate::providers::Message::user("still usable"),
+            "still usable".to_string(),
+            Some("after-failed-stop".to_string()),
+            None,
+            || {},
+            |_| crate::session_protocol::AssistantOutcome::Completed,
+        )
+        .await
+        .expect("failed deletion leaves the session promptable");
+
+        assert!(daemon.stop_session("session-1").await.unwrap());
+        assert!(daemon.session("session-1").is_none());
         assert!(store.load("session-1").is_none());
     }
 
