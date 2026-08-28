@@ -637,8 +637,20 @@ impl SessionPersistence {
         if state.deleted {
             return Ok(false);
         }
+        let deleted = match self.store.delete(&self.session_id) {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!(
+                    target: "daimonos::session_core",
+                    event = "session_payload_delete_failed",
+                    session_id = %self.session_id,
+                    error = %error,
+                    "persisted session deletion failed before tombstone commit"
+                );
+                return Err(error);
+            }
+        };
         state.deleted = true;
-        let deleted = self.store.delete(&self.session_id)?;
         if let Some(writer) = &self.catalog_writer {
             writer.enqueue_deleted(&self.session_id);
         }
@@ -3905,5 +3917,59 @@ mod tests {
                 .await
         );
         assert!(writer.catalog().row("session-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_payload_delete_does_not_commit_state_or_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_store_path = directory.path().join("not-a-directory");
+        std::fs::write(&invalid_store_path, b"file").unwrap();
+        let catalog = match crate::session_catalog::SessionCatalog::open(
+            directory.path().join("catalog.sqlite"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            crate::session_catalog::CatalogOpen::Ready(catalog) => catalog,
+            crate::session_catalog::CatalogOpen::NewerSchema { .. } => panic!("fresh catalog"),
+        };
+        let writer = crate::session_catalog::SessionCatalogWriter::start(
+            catalog,
+            "workspace".to_string(),
+            8,
+            4,
+            64,
+        );
+        let store = SessionStore::new(invalid_store_path.clone());
+        let persistence = SessionPersistence::new("session-1", store.clone())
+            .with_catalog_writer(Arc::clone(&writer));
+
+        assert!(persistence.delete().is_err());
+        assert!(writer.catalog().row("session-1").unwrap().is_none());
+
+        std::fs::remove_file(&invalid_store_path).unwrap();
+        std::fs::create_dir(&invalid_store_path).unwrap();
+        assert!(!persistence.delete().unwrap());
+        assert!(
+            writer
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        assert!(writer.catalog().row("session-1").unwrap().unwrap().deleted);
+        persistence.save(
+            "model",
+            "medium",
+            &[Message::user("must not resurrect")],
+            directory.path(),
+            &[],
+            &[],
+        );
+        assert!(store.load("session-1").is_none());
+        assert!(
+            writer
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        assert!(writer.catalog().row("session-1").unwrap().unwrap().deleted);
     }
 }
