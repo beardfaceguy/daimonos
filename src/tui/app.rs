@@ -20,7 +20,7 @@ use crate::session_protocol::{ClientCapability, RuntimeOptionSpec, RuntimeValue,
 
 use super::commands::{approval_from_key, parse_command, UiCommand, HELP_TEXT};
 use super::input::{
-    apply_scroll_action, ComposerHistory, InputMode, TranscriptScroll, VimScrollKeys,
+    apply_scroll_action, Composer, ComposerHistory, InputMode, TranscriptScroll, VimScrollKeys,
 };
 use super::session::{TuiSession, TuiSessionUpdate};
 use super::terminal::{install_panic_hook, TerminalGuard};
@@ -86,7 +86,7 @@ pub async fn run(controller: SessionControllerHandle, options: TuiOptions) -> an
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut composer = String::new();
+    let mut composer = Composer::default();
     let mut history = ComposerHistory::new(options.history_entries);
     if let Some(prompt) = initial_prompt {
         history.record(prompt);
@@ -130,9 +130,89 @@ enum TuiExit {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerKeyOutcome {
+    Unhandled,
+    Navigated,
+    Edited,
+}
+
+fn handle_composer_key(key: KeyEvent, composer: &mut Composer) -> ComposerKeyOutcome {
+    match key.code {
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            composer.insert_char('\n');
+            ComposerKeyOutcome::Edited
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            composer.insert_char('\n');
+            ComposerKeyOutcome::Edited
+        }
+        KeyCode::Backspace => {
+            composer.backspace();
+            ComposerKeyOutcome::Edited
+        }
+        KeyCode::Delete => {
+            composer.delete();
+            ComposerKeyOutcome::Edited
+        }
+        KeyCode::Left => {
+            composer.move_left();
+            ComposerKeyOutcome::Navigated
+        }
+        KeyCode::Right => {
+            composer.move_right();
+            ComposerKeyOutcome::Navigated
+        }
+        KeyCode::Home => {
+            composer.move_home();
+            ComposerKeyOutcome::Navigated
+        }
+        KeyCode::End => {
+            composer.move_end();
+            ComposerKeyOutcome::Navigated
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            composer.insert_char(ch);
+            ComposerKeyOutcome::Edited
+        }
+        _ => ComposerKeyOutcome::Unhandled,
+    }
+}
+
+fn handle_vertical_composer_key(
+    code: KeyCode,
+    composer: &mut Composer,
+    history: &mut ComposerHistory,
+) -> bool {
+    match code {
+        KeyCode::Up if composer.move_up() => {}
+        KeyCode::Up => {
+            if let Some(previous) = history.previous(composer.as_str()) {
+                composer.replace(previous);
+            }
+        }
+        KeyCode::Down if composer.move_down() => {}
+        KeyCode::Down => {
+            if let Some(next) = history.next() {
+                composer.replace(next);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    composer: &mut String,
+    composer: &mut Composer,
     history: &mut ComposerHistory,
     scroll: &mut TranscriptScroll,
     no_color: bool,
@@ -210,50 +290,30 @@ async fn run_event_loop(
                     draw_tui(terminal, composer, scroll, no_color, session, mode)?;
                     continue;
                 }
-                match key.code {
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        composer.push('\n');
+                match handle_composer_key(key, composer) {
+                    ComposerKeyOutcome::Edited => {
                         history.reset_navigation();
                     }
-                    KeyCode::Enter => {
-                        let line = std::mem::take(composer);
-                        if let Some(exit) =
-                            handle_command(parse_command(&line), session, history, scroll)
-                        {
-                            return Ok(exit);
+                    ComposerKeyOutcome::Navigated => {}
+                    ComposerKeyOutcome::Unhandled
+                        if handle_vertical_composer_key(key.code, composer, history) => {}
+                    ComposerKeyOutcome::Unhandled => match key.code {
+                        KeyCode::Enter => {
+                            let line = composer.take();
+                            if let Some(exit) =
+                                handle_command(parse_command(&line), session, history, scroll)
+                            {
+                                return Ok(exit);
+                            }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        composer.pop();
-                        history.reset_navigation();
-                    }
-                    KeyCode::Up => {
-                        if let Some(previous) = history.previous(composer) {
-                            *composer = previous;
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(next) = history.next() {
-                            *composer = next;
-                        }
-                    }
-                    KeyCode::PageUp => scroll.page_up(transcript_page_height(terminal)?),
-                    KeyCode::PageDown => scroll.page_down(transcript_page_height(terminal)?),
-                    KeyCode::Home => scroll.jump_to_start(),
-                    KeyCode::End => scroll.jump_to_end(),
-                    KeyCode::Char(ch)
-                        if !key.modifiers.intersects(
-                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                        ) =>
-                    {
-                        composer.push(ch);
-                        history.reset_navigation();
-                    }
-                    _ => {}
+                        KeyCode::PageUp => scroll.page_up(transcript_page_height(terminal)?),
+                        KeyCode::PageDown => scroll.page_down(transcript_page_height(terminal)?),
+                        _ => {}
+                    },
                 }
             }
             Event::Paste(text) => {
-                composer.push_str(&text);
+                composer.insert_str(&text);
                 history.reset_navigation();
             }
             Event::Resize(_, _)
@@ -268,7 +328,7 @@ async fn run_event_loop(
 
 fn draw_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    composer: &str,
+    composer: &Composer,
     scroll: &TranscriptScroll,
     no_color: bool,
     session: &TuiSession,
@@ -277,7 +337,7 @@ fn draw_tui(
     terminal.draw(|frame| {
         super::render_with_options(
             session.state(),
-            composer,
+            composer.as_str(),
             frame.area(),
             frame.buffer_mut(),
             super::RenderOptions {
@@ -285,10 +345,15 @@ fn draw_tui(
                 scroll_from_bottom: scroll.bottom_offset(),
                 scroll_mode: mode == InputMode::Scroll,
                 allow_always_granted: session.has_capability(ClientCapability::ApproveAlways),
+                composer_cursor: Some(composer.cursor()),
             },
         );
         if session.state().active_approval().is_none() {
-            if let Some(position) = super::composer_cursor_position(composer, frame.area()) {
+            if let Some(position) = super::composer_cursor_position_at(
+                composer.as_str(),
+                composer.cursor(),
+                frame.area(),
+            ) {
                 frame.set_cursor_position(position);
             }
         }
@@ -456,6 +521,9 @@ fn handle_scroll_key(
     mode: &mut InputMode,
     vim_keys: &mut VimScrollKeys,
 ) -> anyhow::Result<()> {
+    if handle_scroll_boundary_key(key.code, scroll) {
+        return Ok(());
+    }
     match key.code {
         KeyCode::Char(ch) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -470,11 +538,18 @@ fn handle_scroll_key(
         KeyCode::Down => scroll.line_down(),
         KeyCode::PageUp => scroll.page_up(transcript_page_height(terminal)?),
         KeyCode::PageDown => scroll.page_down(transcript_page_height(terminal)?),
-        KeyCode::Home => scroll.jump_to_start(),
-        KeyCode::End => scroll.jump_to_end(),
         _ => {}
     }
     Ok(())
+}
+
+fn handle_scroll_boundary_key(code: KeyCode, scroll: &mut TranscriptScroll) -> bool {
+    match code {
+        KeyCode::Home => scroll.jump_to_start(),
+        KeyCode::End => scroll.jump_to_end(),
+        _ => return false,
+    }
+    true
 }
 
 fn transcript_page_height(
@@ -494,6 +569,111 @@ fn accepts_key(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_key_mapping_navigates_and_edits_at_cursor() {
+        let mut composer = Composer::default();
+        composer.insert_str("helo");
+        assert_eq!(
+            handle_composer_key(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                &mut composer
+            ),
+            ComposerKeyOutcome::Navigated
+        );
+        for _ in 0..3 {
+            handle_composer_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                &mut composer,
+            );
+        }
+        handle_composer_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut composer,
+        );
+        assert_eq!(composer.as_str(), "hello");
+        handle_composer_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &mut composer,
+        );
+        handle_composer_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut composer,
+        );
+        handle_composer_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &mut composer,
+        );
+        handle_composer_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            &mut composer,
+        );
+        assert_eq!(composer.as_str(), "hello\n\n\n");
+        assert_eq!(
+            handle_composer_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &mut composer
+            ),
+            ComposerKeyOutcome::Unhandled
+        );
+        assert_eq!(
+            handle_composer_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                &mut composer
+            ),
+            ComposerKeyOutcome::Unhandled,
+            "Ctrl-Enter intentionally follows the normal send path"
+        );
+    }
+
+    #[test]
+    fn scroll_mode_keeps_home_and_end_transcript_navigation() {
+        let mut scroll = TranscriptScroll::default();
+        assert!(handle_scroll_boundary_key(KeyCode::Home, &mut scroll));
+        assert_eq!(scroll.bottom_offset(), usize::MAX);
+        assert!(handle_scroll_boundary_key(KeyCode::End, &mut scroll));
+        assert_eq!(scroll.bottom_offset(), 0);
+    }
+
+    #[test]
+    fn multiline_history_navigation_preserves_original_draft() {
+        let mut history = ComposerHistory::new(4);
+        history.record("older");
+        history.record("top\nbottom");
+        let mut composer = Composer::default();
+        composer.replace("draft".to_string());
+
+        assert!(handle_vertical_composer_key(
+            KeyCode::Up,
+            &mut composer,
+            &mut history
+        ));
+        assert_eq!(composer.as_str(), "top\nbottom");
+        assert!(handle_vertical_composer_key(
+            KeyCode::Up,
+            &mut composer,
+            &mut history
+        ));
+        assert_eq!(&composer.as_str()[..composer.cursor()], "top");
+        assert!(handle_vertical_composer_key(
+            KeyCode::Up,
+            &mut composer,
+            &mut history
+        ));
+        assert_eq!(composer.as_str(), "older");
+        assert!(handle_vertical_composer_key(
+            KeyCode::Down,
+            &mut composer,
+            &mut history
+        ));
+        assert_eq!(composer.as_str(), "top\nbottom");
+        assert!(handle_vertical_composer_key(
+            KeyCode::Down,
+            &mut composer,
+            &mut history
+        ));
+        assert_eq!(composer.as_str(), "draft");
+    }
 
     #[test]
     fn cancelled_and_idle_turns_accept_new_prompts() {

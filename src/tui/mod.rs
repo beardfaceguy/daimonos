@@ -37,7 +37,8 @@ pub use agent_mode::{resolve_agent_mode, AgentMode};
 pub use app::{run as run_tui, TuiOptions};
 pub use commands::{approval_from_key, parse_command, UiCommand};
 pub use render::{
-    composer_cursor_position, render, render_with_options, tui_layout, RenderOptions,
+    composer_cursor_position, composer_cursor_position_at, render, render_with_options, tui_layout,
+    RenderOptions,
 };
 pub(crate) use session::{ControllerFactory, SwitchPolicy};
 pub use state::{ApplyOutcome, ViewLine, ViewState};

@@ -2,6 +2,163 @@
 
 use std::collections::VecDeque;
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Composer {
+    text: String,
+    cursor: usize,
+    /// Retained across vertical moves through short lines; horizontal moves
+    /// and edits deliberately reset it, matching conventional editors.
+    preferred_column: Option<usize>,
+}
+
+impl Composer {
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn replace(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+    }
+
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        self.preferred_column = None;
+        std::mem::take(&mut self.text)
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.preferred_column = None;
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.preferred_column = None;
+    }
+
+    pub fn move_left(&mut self) {
+        if let Some((index, _)) = self.text[..self.cursor].grapheme_indices(true).next_back() {
+            self.cursor = index;
+        }
+        self.preferred_column = None;
+    }
+
+    pub fn move_right(&mut self) {
+        if let Some(grapheme) = self.text[self.cursor..].graphemes(true).next() {
+            self.cursor += grapheme.len();
+        }
+        self.preferred_column = None;
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+        self.preferred_column = None;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+    }
+
+    pub fn move_up(&mut self) -> bool {
+        let current_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if current_start == 0 {
+            return false;
+        }
+        let target_column = self
+            .preferred_column
+            .unwrap_or_else(|| composer_display_width(&self.text[current_start..self.cursor]));
+        let previous_end = current_start - 1;
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.cursor = previous_start
+            + byte_at_display_column(&self.text[previous_start..previous_end], target_column);
+        self.preferred_column = Some(target_column);
+        true
+    }
+
+    pub fn move_down(&mut self) -> bool {
+        let current_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let Some(relative_end) = self.text[self.cursor..].find('\n') else {
+            return false;
+        };
+        let current_end = self.cursor + relative_end;
+        let target_column = self
+            .preferred_column
+            .unwrap_or_else(|| composer_display_width(&self.text[current_start..self.cursor]));
+        let next_start = current_end + 1;
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map_or(self.text.len(), |index| next_start + index);
+        self.cursor =
+            next_start + byte_at_display_column(&self.text[next_start..next_end], target_column);
+        self.preferred_column = Some(target_column);
+        true
+    }
+
+    pub fn backspace(&mut self) {
+        let end = self.cursor;
+        self.move_left();
+        if self.cursor < end {
+            self.text.drain(self.cursor..end);
+        }
+        self.preferred_column = None;
+    }
+
+    pub fn delete(&mut self) {
+        let Some(grapheme) = self.text[self.cursor..].graphemes(true).next() else {
+            return;
+        };
+        self.text.drain(self.cursor..self.cursor + grapheme.len());
+        self.preferred_column = None;
+    }
+}
+
+fn composer_display_width(text: &str) -> usize {
+    text.graphemes(true)
+        .map(|grapheme| {
+            if grapheme == "\t" {
+                4
+            } else if grapheme.chars().all(char::is_control) {
+                0
+            } else {
+                UnicodeWidthStr::width(grapheme)
+            }
+        })
+        .sum()
+}
+
+fn byte_at_display_column(line: &str, target: usize) -> usize {
+    let mut column = 0usize;
+    for (index, grapheme) in line.grapheme_indices(true) {
+        let next = column.saturating_add(composer_display_width(grapheme));
+        if next > target {
+            return index;
+        }
+        if next == target {
+            return index + grapheme.len();
+        }
+        column = next;
+    }
+    line.len()
+}
+
 pub struct ComposerHistory {
     entries: VecDeque<String>,
     max_entries: usize,
@@ -205,6 +362,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn composer_inserts_and_deletes_at_the_cursor() {
+        let mut composer = Composer::default();
+        composer.insert_str("helo world");
+        for _ in 0..7 {
+            composer.move_left();
+        }
+        composer.insert_char('l');
+        assert_eq!(composer.as_str(), "hello world");
+        composer.move_right();
+        composer.delete();
+        assert_eq!(composer.as_str(), "helloworld");
+        composer.backspace();
+        assert_eq!(composer.as_str(), "hellworld");
+    }
+
+    #[test]
+    fn composer_navigation_and_deletion_preserve_graphemes() {
+        let mut composer = Composer::default();
+        composer.insert_str("a👩‍🔬e\u{301}z");
+        composer.move_left();
+        composer.move_left();
+        let before_combining_grapheme = composer.cursor();
+        composer.move_left();
+        assert!(composer.cursor() < before_combining_grapheme);
+        composer.delete();
+        assert_eq!(composer.as_str(), "ae\u{301}z");
+        composer.move_end();
+        composer.backspace();
+        assert_eq!(composer.as_str(), "ae\u{301}");
+        composer.backspace();
+        assert_eq!(composer.as_str(), "a");
+    }
+
+    #[test]
+    fn composer_home_end_replace_and_take_keep_cursor_valid() {
+        let mut composer = Composer::default();
+        composer.replace("middle".to_string());
+        assert_eq!(composer.cursor(), "middle".len());
+        composer.move_home();
+        composer.insert_str("start-");
+        composer.move_end();
+        composer.insert_str("-end");
+        assert_eq!(composer.take(), "start-middle-end");
+        assert_eq!(composer.as_str(), "");
+        assert_eq!(composer.cursor(), 0);
+    }
+
+    #[test]
+    fn composer_moves_vertically_and_preserves_preferred_column() {
+        let mut composer = Composer::default();
+        composer.replace("abcd\nx\nwxyz".to_string());
+        assert!(composer.move_up());
+        assert_eq!(&composer.as_str()[..composer.cursor()], "abcd\nx");
+        assert!(composer.move_up());
+        assert_eq!(&composer.as_str()[..composer.cursor()], "abcd");
+        assert!(!composer.move_up());
+        assert!(composer.move_down());
+        assert_eq!(&composer.as_str()[..composer.cursor()], "abcd\nx");
+        assert!(composer.move_down());
+        assert_eq!(composer.cursor(), composer.as_str().len());
+        assert!(!composer.move_down());
+    }
+
+    #[test]
+    fn composer_vertical_motion_uses_display_columns() {
+        let mut composer = Composer::default();
+        composer.replace("界x\nabcd".to_string());
+        composer.move_home();
+        composer.move_right();
+        assert!(composer.move_down());
+        assert_eq!(&composer.as_str()[..composer.cursor()], "界x\nab");
+    }
+
+    #[test]
+    fn vertical_motion_snaps_wide_cells_and_keeps_long_preferred_column() {
+        let mut composer = Composer::default();
+        composer.replace("a\n界".to_string());
+        composer.move_home();
+        composer.move_right();
+        assert!(composer.move_down());
+        assert_eq!(&composer.as_str()[composer.cursor()..], "界");
+        assert!(composer.as_str().is_char_boundary(composer.cursor()));
+
+        composer.replace("abcdef\nx\n界\nabc".to_string());
+        composer.move_home();
+        for _ in 0..6 {
+            composer.move_right();
+        }
+        for expected_prefix in ["abcdef\nx", "abcdef\nx\n界", "abcdef\nx\n界\nabc"] {
+            assert!(composer.move_down());
+            assert_eq!(&composer.as_str()[..composer.cursor()], expected_prefix);
+            assert!(composer.as_str().is_char_boundary(composer.cursor()));
+        }
+    }
+
+    #[test]
     fn history_is_bounded_and_restores_the_draft() {
         let mut history = ComposerHistory::new(2);
         history.record("one");
@@ -218,6 +471,18 @@ mod tests {
         assert_eq!(history.next(), Some("three".to_string()));
         assert_eq!(history.next(), Some("draft".to_string()));
         assert_eq!(history.next(), None);
+    }
+
+    #[test]
+    fn recalled_history_places_cursor_at_end_and_remains_editable() {
+        let mut history = ComposerHistory::new(2);
+        history.record("hello");
+        let mut composer = Composer::default();
+        composer.replace(history.previous(composer.as_str()).expect("history entry"));
+        assert_eq!(composer.cursor(), composer.as_str().len());
+        composer.move_left();
+        composer.backspace();
+        assert_eq!(composer.as_str(), "helo");
     }
 
     #[test]
