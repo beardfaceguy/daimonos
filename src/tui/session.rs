@@ -39,6 +39,14 @@ pub enum TuiSessionUpdate {
     Stopped,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiSessionList {
+    pub workspace: Option<SessionWorkspace>,
+    pub sessions: Vec<SessionListEntry>,
+    pub next_cursor: Option<String>,
+    pub incomplete: bool,
+}
+
 pub struct TuiSession {
     active: ActiveSession,
     command_timeout: Duration,
@@ -49,11 +57,7 @@ pub struct TuiSession {
     pending_operations: BTreeMap<&'static str, PendingOperation>,
     pending_request_ids: BTreeMap<String, &'static str>,
     sync_target: Option<u64>,
-    session_list: Option<(
-        Option<SessionWorkspace>,
-        Vec<SessionListEntry>,
-        Option<String>,
-    )>,
+    session_list: Option<TuiSessionList>,
 }
 
 struct ActiveSession {
@@ -224,13 +228,7 @@ impl TuiSession {
         &mut self.active.state
     }
 
-    pub fn take_session_list(
-        &mut self,
-    ) -> Option<(
-        Option<SessionWorkspace>,
-        Vec<SessionListEntry>,
-        Option<String>,
-    )> {
+    pub fn take_session_list(&mut self) -> Option<TuiSessionList> {
         self.session_list.take()
     }
 
@@ -690,9 +688,15 @@ impl TuiSession {
                         workspace,
                         sessions,
                         next_cursor,
+                        incomplete,
                         ..
                     } => {
-                        self.session_list = Some((workspace, sessions, next_cursor));
+                        self.session_list = Some(TuiSessionList {
+                            workspace,
+                            sessions,
+                            next_cursor,
+                            incomplete,
+                        });
                     }
                     SessionClientOutcome::ServerError { code, message, .. } => {
                         state.push_system_message(format!("{code}: {message}"));
@@ -893,10 +897,11 @@ mod tests {
                     turn_status: None,
                 }],
                 next_cursor: None,
+                incomplete: true,
             })
             .await
             .unwrap();
-        let (workspace, rows, next) = tokio::time::timeout(Duration::from_secs(1), async {
+        let list = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 assert_eq!(session.next_update().await, TuiSessionUpdate::Updated);
                 if let Some(list) = session.take_session_list() {
@@ -906,9 +911,10 @@ mod tests {
         })
         .await
         .expect("typed list should reach the adapter");
-        assert_eq!(workspace.unwrap().id, "ws_1");
-        assert_eq!(rows[0].session_id, "saved");
-        assert!(next.is_none());
+        assert_eq!(list.workspace.unwrap().id, "ws_1");
+        assert_eq!(list.sessions[0].session_id, "saved");
+        assert!(list.next_cursor.is_none());
+        assert!(list.incomplete);
         assert!(!session.pending_operations.contains_key("list_sessions"));
 
         session

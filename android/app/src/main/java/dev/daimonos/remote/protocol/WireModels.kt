@@ -208,6 +208,7 @@ sealed interface ServerMessage {
         val workspace: SessionWorkspace? = null,
         val sessions: List<SessionListEntry>,
         @SerialName("next_cursor") val nextCursor: String? = null,
+        val incomplete: Boolean = false,
     ) : ServerMessage
 
     @Serializable

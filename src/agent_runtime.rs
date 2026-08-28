@@ -655,6 +655,43 @@ pub async fn run_session_daemon(
     };
     let sessions_dir = paths::daemon_sessions_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for session persistence"))?;
+    let session_store = session_store::SessionStore::new(sessions_dir.clone());
+    let workspace_identity =
+        session_factory::canonical_session_workspace(workspace, cfg.session.max_label_bytes);
+    let catalog = match crate::session_catalog::SessionCatalog::open(
+        cfg.session.resolved_session_catalog_path(&sessions_dir),
+        std::time::Duration::from_millis(cfg.session.session_catalog_busy_timeout_ms),
+    ) {
+        Ok(crate::session_catalog::CatalogOpen::Ready(catalog)) => Some(catalog),
+        Ok(crate::session_catalog::CatalogOpen::NewerSchema { found }) => {
+            tracing::warn!(
+                target: "daimonos::session_catalog",
+                event = "newer_catalog_schema",
+                found,
+                "leaving newer session catalog untouched; using fallback discovery"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "daimonos::session_catalog",
+                event = "catalog_open_failed",
+                error = %error,
+                "using fallback session discovery"
+            );
+            None
+        }
+    };
+    let catalog_writer = catalog.clone().map(|catalog| {
+        let _ = catalog.mark_incomplete(&workspace_identity.id);
+        crate::session_catalog::SessionCatalogWriter::start(
+            catalog,
+            workspace_identity.id.clone(),
+            cfg.session.session_catalog_pending_entries,
+            cfg.session.session_catalog_write_batch,
+            cfg.session.session_list_preview_bytes,
+        )
+    });
     let services = Arc::new(
         crate::provisioning::build_tool_services(
             workspace,
@@ -672,7 +709,7 @@ pub async fn run_session_daemon(
         !models_discovery_disabled(),
     )
     .await;
-    let factory = Arc::new(session_factory::AgentSessionFactory::new(
+    let factory = session_factory::AgentSessionFactory::new(
         make_provider,
         workspace.to_path_buf(),
         Arc::clone(&cfg),
@@ -681,29 +718,50 @@ pub async fn run_session_daemon(
         agent.thinking.clone(),
         agent.to_safety_policy(None),
         token_log,
-        session_store::SessionStore::new(sessions_dir),
+        session_store,
         crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
         analytics_store.clone(),
         services,
-    ));
-    let daemon = Arc::new(
-        session_daemon::SessionDaemon::with_factory(
-            cfg.session.max_sessions,
-            cfg.session.max_clients_per_session,
-            cfg.session.event_queue_capacity,
-            cfg.session.snapshot_entries,
-            (cfg.session.idle_retention_secs > 0)
-                .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
-            cfg.session.session_list_page_size,
-            std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
-            factory,
-        )
-        .with_listing_limits(
-            cfg.session.session_list_preview_bytes,
-            cfg.session.session_list_snapshot_entries,
-            std::time::Duration::from_secs(cfg.session.session_list_snapshot_ttl_secs),
-        ),
     );
+    let factory = Arc::new(match catalog_writer.as_ref() {
+        Some(writer) => factory.with_catalog_writer(Arc::clone(writer)),
+        None => factory,
+    });
+    let daemon = session_daemon::SessionDaemon::with_factory(
+        cfg.session.max_sessions,
+        cfg.session.max_clients_per_session,
+        cfg.session.event_queue_capacity,
+        cfg.session.snapshot_entries,
+        (cfg.session.idle_retention_secs > 0)
+            .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
+        cfg.session.session_list_page_size,
+        std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
+        factory,
+    )
+    .with_listing_limits(
+        cfg.session.session_list_preview_bytes,
+        cfg.session.session_list_snapshot_entries,
+        std::time::Duration::from_secs(cfg.session.session_list_snapshot_ttl_secs),
+    )
+    .with_global_listing_snapshot_capacity(cfg.session.session_list_snapshot_global_capacity)
+    .with_discovery_fallback_limits(
+        std::time::Duration::from_millis(cfg.session.session_catalog_query_timeout_ms),
+        cfg.session.session_catalog_fallback_entries,
+        cfg.session.session_catalog_query_concurrency,
+    );
+    let daemon = match (catalog, catalog_writer) {
+        (Some(catalog), Some(writer)) => daemon.with_catalog_discovery(
+            catalog,
+            writer,
+            workspace_identity.id,
+            cfg.session.session_catalog_reconcile_entries,
+            std::time::Duration::from_millis(cfg.session.session_catalog_reconcile_interval_ms),
+            std::time::Duration::from_secs(cfg.session.session_catalog_full_rescan_secs),
+            std::time::Duration::from_secs(cfg.session.session_catalog_tombstone_retention_secs),
+        ),
+        _ => daemon,
+    };
+    let daemon = Arc::new(daemon);
     let socket_path = socket.unwrap_or_else(|| cfg.session.resolved_socket_path(workspace));
     eprintln!(
         "daimonos session daemon listening on {}",

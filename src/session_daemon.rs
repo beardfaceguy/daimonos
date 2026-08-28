@@ -7,9 +7,10 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::client_transport::{ClientTransport, TransportError, UnixSocketTransport};
+use crate::session_catalog::{CatalogMutation, CatalogRow, SessionCatalog, SessionCatalogWriter};
 use crate::session_core::{
     RuntimeConfigError, SessionCore, SessionEventSubscription, SessionReplay,
 };
@@ -18,7 +19,7 @@ use crate::session_protocol::{
     SessionEvent, SessionListEntry, SessionSnapshot, SessionWorkspace, ToolCallState,
     ToolCallStateStatus, TranscriptEntry, TranscriptRole,
 };
-use crate::session_store::SessionSummary;
+use crate::session_store::{SessionSummary, SessionSummaryScan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOpenMode {
@@ -34,8 +35,23 @@ pub trait SessionFactory: Send + Sync {
         mode: SessionOpenMode,
     ) -> Result<Arc<SessionCore>, String>;
 
-    async fn persisted_session_summaries(&self, _max_preview_bytes: usize) -> Vec<SessionSummary> {
-        Vec::new()
+    async fn scan_persisted_summaries(
+        &self,
+        _max_preview_bytes: usize,
+        _after_name: Option<String>,
+        _max_entries: usize,
+        _max_duration: std::time::Duration,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> SessionSummaryScan {
+        SessionSummaryScan {
+            summaries: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        }
+    }
+
+    async fn missing_persisted_ids(&self, session_ids: Vec<String>) -> Vec<String> {
+        session_ids
     }
 
     fn workspace_identity(&self) -> Option<SessionWorkspace> {
@@ -134,6 +150,20 @@ struct ConnectionListingSnapshot {
     offset: usize,
     expected_cursor: Option<String>,
     expires_at: tokio::time::Instant,
+    incomplete: bool,
+    valid: Arc<AtomicBool>,
+}
+
+struct CatalogDiscovery {
+    catalog: SessionCatalog,
+    writer: Arc<SessionCatalogWriter>,
+    workspace_id: String,
+    reconcile_entries: usize,
+    reconcile_owner: String,
+    reconcile_interval: std::time::Duration,
+    full_rescan_interval: std::time::Duration,
+    last_full_rescan_unix_ms: AtomicU64,
+    tombstone_retention: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -154,7 +184,14 @@ pub struct SessionDaemon {
     session_list_preview_bytes: usize,
     session_list_snapshot_entries: usize,
     session_list_snapshot_ttl: std::time::Duration,
+    session_list_query_timeout: std::time::Duration,
+    session_list_fallback_entries: usize,
+    session_list_query_permits: Arc<tokio::sync::Semaphore>,
     workspace_identity: Option<SessionWorkspace>,
+    catalog_discovery: Option<CatalogDiscovery>,
+    listing_snapshot_global_capacity: usize,
+    local_listing_snapshot_registry: Mutex<std::collections::VecDeque<Weak<AtomicBool>>>,
+    remote_listing_snapshot_registry: Mutex<std::collections::VecDeque<Weak<AtomicBool>>>,
     factory: Option<Arc<dyn SessionFactory>>,
     creation_gate: tokio::sync::Mutex<()>,
     creating_sessions: Mutex<std::collections::HashSet<String>>,
@@ -184,7 +221,14 @@ impl SessionDaemon {
             session_list_preview_bytes: 256,
             session_list_snapshot_entries: max_sessions.max(1),
             session_list_snapshot_ttl: std::time::Duration::from_secs(60),
+            session_list_query_timeout: std::time::Duration::from_secs(6),
+            session_list_fallback_entries: max_sessions.max(1),
+            session_list_query_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             workspace_identity: None,
+            catalog_discovery: None,
+            listing_snapshot_global_capacity: max_sessions.max(1),
+            local_listing_snapshot_registry: Mutex::new(std::collections::VecDeque::new()),
+            remote_listing_snapshot_registry: Mutex::new(std::collections::VecDeque::new()),
             factory: None,
             creation_gate: tokio::sync::Mutex::new(()),
             creating_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -218,7 +262,14 @@ impl SessionDaemon {
             session_list_preview_bytes: 256,
             session_list_snapshot_entries: 1_000,
             session_list_snapshot_ttl: std::time::Duration::from_secs(60),
+            session_list_query_timeout: std::time::Duration::from_secs(6),
+            session_list_fallback_entries: 256,
+            session_list_query_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             workspace_identity: factory.workspace_identity(),
+            catalog_discovery: None,
+            listing_snapshot_global_capacity: max_sessions.max(1),
+            local_listing_snapshot_registry: Mutex::new(std::collections::VecDeque::new()),
+            remote_listing_snapshot_registry: Mutex::new(std::collections::VecDeque::new()),
             factory: Some(factory),
             creation_gate: tokio::sync::Mutex::new(()),
             creating_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -240,6 +291,49 @@ impl SessionDaemon {
         self.session_list_snapshot_entries =
             snapshot_entries.max(self.session_list_page_size).max(1);
         self.session_list_snapshot_ttl = snapshot_ttl;
+        self
+    }
+
+    pub fn with_discovery_fallback_limits(
+        mut self,
+        query_timeout: std::time::Duration,
+        fallback_entries: usize,
+        query_concurrency: usize,
+    ) -> Self {
+        self.session_list_query_timeout = query_timeout;
+        self.session_list_fallback_entries = fallback_entries.max(1);
+        self.session_list_query_permits =
+            Arc::new(tokio::sync::Semaphore::new(query_concurrency.max(1)));
+        self
+    }
+
+    pub fn with_global_listing_snapshot_capacity(mut self, capacity: usize) -> Self {
+        self.listing_snapshot_global_capacity = capacity.max(1);
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_catalog_discovery(
+        mut self,
+        catalog: SessionCatalog,
+        writer: Arc<SessionCatalogWriter>,
+        workspace_id: String,
+        reconcile_entries: usize,
+        reconcile_interval: std::time::Duration,
+        full_rescan_interval: std::time::Duration,
+        tombstone_retention: std::time::Duration,
+    ) -> Self {
+        self.catalog_discovery = Some(CatalogDiscovery {
+            catalog,
+            writer,
+            workspace_id,
+            reconcile_entries: reconcile_entries.max(1),
+            reconcile_owner: uuid::Uuid::new_v4().to_string(),
+            reconcile_interval,
+            full_rescan_interval,
+            last_full_rescan_unix_ms: AtomicU64::new(now_unix_ms()),
+            tombstone_retention,
+        });
         self
     }
 
@@ -490,27 +584,239 @@ impl SessionDaemon {
             .map(|entry| Arc::clone(&entry.core))
     }
 
-    async fn listing_rows(&self) -> Result<Vec<SessionListEntry>, SessionListPageError> {
-        let mut sessions = std::collections::BTreeMap::new();
-        if let Some(factory) = self.factory.as_ref() {
-            for summary in factory
-                .persisted_session_summaries(self.session_list_preview_bytes)
-                .await
-            {
-                sessions.insert(
-                    summary.id.clone(),
-                    SessionListEntry {
-                        session_id: summary.id,
-                        active: false,
-                        attached_clients: 0,
-                        model: Some(summary.model),
-                        updated_at_unix_ms: summary.updated_at.map(system_time_unix_ms),
-                        preview: summary.first_user_line,
-                        message_count: Some(summary.message_count),
-                        turn_status: None,
-                    },
-                );
+    async fn acquire_listing_query_permit(
+        &self,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(
+            self.session_list_query_timeout,
+            Arc::clone(&self.session_list_query_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("catalog query permit timed out"))?
+        .map_err(|_| anyhow::anyhow!("catalog query semaphore closed"))
+    }
+
+    async fn run_catalog_blocking<R, F>(&self, work: F) -> anyhow::Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> anyhow::Result<R> + Send + 'static,
+    {
+        let permit = self.acquire_listing_query_permit().await?;
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        });
+        tokio::time::timeout(self.session_list_query_timeout, task)
+            .await
+            .map_err(|_| anyhow::anyhow!("catalog blocking operation timed out"))??
+    }
+
+    async fn durable_listing_rows(&self) -> (Vec<SessionListEntry>, bool) {
+        if let Some(discovery) = self.catalog_discovery.as_ref() {
+            if discovery.writer.is_healthy() {
+                let catalog = discovery.catalog.clone();
+                let workspace_id = discovery.workspace_id.clone();
+                let limit = self.session_list_snapshot_entries.saturating_add(1);
+                let query = self
+                    .run_catalog_blocking(move || {
+                        let (complete, _) = catalog.workspace_state(&workspace_id)?;
+                        let rows = complete
+                            .then(|| catalog.rows(&workspace_id, limit))
+                            .transpose()?;
+                        anyhow::Ok((complete, rows.unwrap_or_default()))
+                    })
+                    .await;
+                if let Ok((true, rows)) = query {
+                    let now_ms = now_unix_ms();
+                    let interval_ms = discovery
+                        .full_rescan_interval
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let previous = discovery.last_full_rescan_unix_ms.load(Ordering::Acquire);
+                    if now_ms.saturating_sub(previous) < interval_ms
+                        || discovery
+                            .last_full_rescan_unix_ms
+                            .compare_exchange(previous, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return (
+                            rows.into_iter().map(catalog_row_to_list_entry).collect(),
+                            false,
+                        );
+                    }
+                    let catalog = discovery.catalog.clone();
+                    let workspace_id = discovery.workspace_id.clone();
+                    let _ = self
+                        .run_catalog_blocking(move || catalog.mark_incomplete(&workspace_id))
+                        .await;
+                }
+                let _ = self.reconcile_catalog_once(discovery).await;
             }
+        }
+
+        let Some(factory) = self.factory.as_ref() else {
+            return (Vec::new(), false);
+        };
+        let Ok(permit) = self.acquire_listing_query_permit().await else {
+            return (Vec::new(), true);
+        };
+        let scan = tokio::time::timeout(
+            self.session_list_query_timeout,
+            factory.scan_persisted_summaries(
+                self.session_list_preview_bytes,
+                None,
+                self.session_list_fallback_entries,
+                self.session_list_query_timeout,
+                permit,
+            ),
+        )
+        .await
+        .unwrap_or(SessionSummaryScan {
+            summaries: Vec::new(),
+            next_cursor: None,
+            complete: false,
+        });
+        (
+            scan.summaries
+                .into_iter()
+                .map(summary_to_list_entry)
+                .collect(),
+            !scan.complete,
+        )
+    }
+
+    async fn reconcile_catalog_once(&self, discovery: &CatalogDiscovery) -> anyhow::Result<()> {
+        let catalog = discovery.catalog.clone();
+        let owner = discovery.reconcile_owner.clone();
+        let interval = discovery.reconcile_interval;
+        let acquired = self
+            .run_catalog_blocking(move || {
+                catalog.try_acquire_reconcile_lease(&owner, now_unix_ms(), interval)
+            })
+            .await?;
+        if !acquired {
+            return Ok(());
+        }
+        let catalog = discovery.catalog.clone();
+        let workspace_id = discovery.workspace_id.clone();
+        let state = self
+            .run_catalog_blocking(move || catalog.workspace_state(&workspace_id))
+            .await?;
+        let cursor = state.1.unwrap_or_default();
+        if let Some(after_id) = cursor.strip_prefix("ghost:") {
+            let catalog = discovery.catalog.clone();
+            let workspace_id = discovery.workspace_id.clone();
+            let after = (!after_id.is_empty()).then(|| after_id.to_string());
+            let limit = discovery.reconcile_entries;
+            let ids = self
+                .run_catalog_blocking(move || {
+                    catalog.ids_after(&workspace_id, after.as_deref(), limit)
+                })
+                .await?;
+            let missing = self
+                .factory
+                .as_ref()
+                .expect("catalog discovery requires factory")
+                .missing_persisted_ids(ids.clone())
+                .await;
+            let catalog = discovery.catalog.clone();
+            let workspace_id = discovery.workspace_id.clone();
+            let retention = discovery.tombstone_retention;
+            self.run_catalog_blocking(move || {
+                let now_ms = now_unix_ms();
+                for (offset, session_id) in missing.into_iter().enumerate() {
+                    catalog.apply(&CatalogMutation {
+                        session_id,
+                        workspace_id: workspace_id.clone(),
+                        model: None,
+                        updated_at_unix_ns: now_ms
+                            .saturating_mul(1_000_000)
+                            .saturating_add(offset as u64),
+                        preview: None,
+                        message_count: None,
+                        writer_instance_id: "reconciler".to_string(),
+                        generation: now_ms.saturating_add(offset as u64),
+                        deleted: true,
+                        observed_at_unix_ms: now_ms,
+                        authoritative_observation: true,
+                    })?;
+                }
+                if ids.len() < limit {
+                    catalog.set_workspace_state(&workspace_id, true, None)?;
+                    let cutoff = now_ms
+                        .saturating_sub(retention.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let _ = catalog.purge_tombstones(cutoff, limit)?;
+                } else if let Some(last) = ids.last() {
+                    catalog.set_workspace_state(
+                        &workspace_id,
+                        false,
+                        Some(&format!("ghost:{last}")),
+                    )?;
+                }
+                anyhow::Ok(())
+            })
+            .await?;
+            return Ok(());
+        }
+
+        let after_name = cursor
+            .strip_prefix("dir:")
+            .filter(|value| !value.is_empty());
+        let permit = self.acquire_listing_query_permit().await?;
+        let scan = tokio::time::timeout(
+            self.session_list_query_timeout,
+            self.factory
+                .as_ref()
+                .expect("catalog discovery requires factory")
+                .scan_persisted_summaries(
+                    self.session_list_preview_bytes,
+                    after_name.map(str::to_string),
+                    discovery.reconcile_entries,
+                    self.session_list_query_timeout,
+                    permit,
+                ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("catalog directory scan timed out"))?;
+        let catalog = discovery.catalog.clone();
+        let workspace_id = discovery.workspace_id.clone();
+        self.run_catalog_blocking(move || {
+            let now_ms = now_unix_ms();
+            for (offset, summary) in scan.summaries.into_iter().enumerate() {
+                catalog.apply(&CatalogMutation {
+                    session_id: summary.id,
+                    workspace_id: workspace_id.clone(),
+                    model: Some(summary.model),
+                    updated_at_unix_ns: summary
+                        .updated_at
+                        .map(system_time_unix_ns)
+                        .unwrap_or_default(),
+                    preview: summary.first_user_line,
+                    message_count: Some(summary.message_count),
+                    writer_instance_id: "reconciler".to_string(),
+                    generation: now_ms.saturating_add(offset as u64),
+                    deleted: false,
+                    observed_at_unix_ms: now_ms,
+                    authoritative_observation: true,
+                })?;
+            }
+            let next = if scan.complete {
+                Some("ghost:".to_string())
+            } else {
+                scan.next_cursor.map(|cursor| format!("dir:{cursor}"))
+            };
+            catalog.set_workspace_state(&workspace_id, false, next.as_deref())?;
+            anyhow::Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn listing_rows(&self) -> Result<(Vec<SessionListEntry>, bool), SessionListPageError> {
+        let mut sessions = std::collections::BTreeMap::new();
+        let (durable, incomplete) = self.durable_listing_rows().await;
+        for row in durable {
+            sessions.insert(row.session_id.clone(), row);
         }
 
         let active: Vec<(String, Arc<SessionEntry>)> = self
@@ -580,7 +886,26 @@ impl SessionDaemon {
         if rows.len() > self.session_list_snapshot_entries {
             return Err(SessionListPageError::CapacityExceeded);
         }
-        Ok(rows)
+        Ok((rows, incomplete))
+    }
+
+    fn register_listing_snapshot(&self, trust: ConnectionTrust) -> Arc<AtomicBool> {
+        let valid = Arc::new(AtomicBool::new(true));
+        let registry = match trust {
+            ConnectionTrust::LocalOwner => &self.local_listing_snapshot_registry,
+            ConnectionTrust::RemotePaired => &self.remote_listing_snapshot_registry,
+        };
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|entry| entry.strong_count() > 0);
+        while registry.len() >= self.listing_snapshot_global_capacity {
+            if let Some(evicted) = registry.pop_front().and_then(|entry| entry.upgrade()) {
+                evicted.store(false, Ordering::Release);
+            }
+        }
+        registry.push_back(Arc::downgrade(&valid));
+        valid
     }
 
     async fn list_sessions_for_connection(
@@ -592,17 +917,21 @@ impl SessionDaemon {
         max_frame_bytes: usize,
     ) -> Result<ServerMessage, SessionListPageError> {
         if cursor.is_none() {
+            let (rows, incomplete) = self.listing_rows().await?;
             *snapshot = Some(ConnectionListingSnapshot {
-                rows: self.listing_rows().await?,
+                rows,
                 offset: 0,
                 expected_cursor: None,
                 expires_at: tokio::time::Instant::now() + self.session_list_snapshot_ttl,
+                incomplete,
+                valid: self.register_listing_snapshot(trust),
             });
         }
         let listing = snapshot
             .as_mut()
             .ok_or(SessionListPageError::InvalidCursor)?;
-        if tokio::time::Instant::now() >= listing.expires_at
+        if !listing.valid.load(Ordering::Acquire)
+            || tokio::time::Instant::now() >= listing.expires_at
             || cursor.is_some_and(|cursor| listing.expected_cursor.as_deref() != Some(cursor))
         {
             *snapshot = None;
@@ -626,6 +955,7 @@ impl SessionDaemon {
             remaining,
             next_cursor,
             max_frame_bytes,
+            listing.incomplete,
         )
         .map_err(SessionListPageError::TooLarge)?;
         listing.offset = listing.offset.saturating_add(sent);
@@ -829,6 +1159,9 @@ impl SessionDaemon {
             }
         })
         .await;
+        if let Some(discovery) = self.catalog_discovery.as_ref() {
+            let _ = discovery.writer.wait_until_quiet(self.shutdown_grace).await;
+        }
     }
 
     #[cfg(test)]
@@ -1860,6 +2193,39 @@ fn system_time_unix_ms(time: std::time::SystemTime) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn system_time_unix_ns(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn summary_to_list_entry(summary: SessionSummary) -> SessionListEntry {
+    SessionListEntry {
+        session_id: summary.id,
+        active: false,
+        attached_clients: 0,
+        model: Some(summary.model),
+        updated_at_unix_ms: summary.updated_at.map(system_time_unix_ms),
+        preview: summary.first_user_line,
+        message_count: Some(summary.message_count),
+        turn_status: None,
+    }
+}
+
+fn catalog_row_to_list_entry(row: CatalogRow) -> SessionListEntry {
+    SessionListEntry {
+        session_id: row.session_id,
+        active: false,
+        attached_clients: 0,
+        model: row.model,
+        updated_at_unix_ms: Some(row.updated_at_unix_ns / 1_000_000),
+        preview: row.preview,
+        message_count: row.message_count,
+        turn_status: None,
+    }
+}
+
 fn render_listing_rows(rows: &[SessionListEntry], trust: ConnectionTrust) -> Vec<SessionListEntry> {
     rows.iter()
         .cloned()
@@ -2461,6 +2827,7 @@ fn fit_session_list_to_frame(
     remaining: usize,
     cursor: String,
     max_frame_bytes: usize,
+    incomplete: bool,
 ) -> Result<(ServerMessage, usize), String> {
     loop {
         let next_cursor = (sessions.len() < remaining).then(|| cursor.clone());
@@ -2469,6 +2836,7 @@ fn fit_session_list_to_frame(
             workspace: workspace.clone(),
             sessions: sessions.clone(),
             next_cursor,
+            incomplete,
         };
         let encoded = serde_json::to_vec(&message)
             .map_err(|error| format!("session list serialization failed: {error}"))?;
@@ -2668,6 +3036,20 @@ mod tests {
 
     struct TestSessionFactory;
 
+    struct IncompleteSummaryFactory {
+        summaries: Vec<SessionSummary>,
+    }
+
+    struct ReconcilingFactory {
+        summaries: Vec<SessionSummary>,
+        existing: std::collections::HashSet<String>,
+    }
+
+    struct SlowScanFactory {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
     impl SessionFactory for TestSessionFactory {
         async fn open(
@@ -2676,6 +3058,120 @@ mod tests {
             _mode: SessionOpenMode,
         ) -> Result<Arc<SessionCore>, String> {
             Ok(test_core())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionFactory for IncompleteSummaryFactory {
+        async fn open(
+            &self,
+            _session_id: &str,
+            _mode: SessionOpenMode,
+        ) -> Result<Arc<SessionCore>, String> {
+            Ok(test_core())
+        }
+
+        async fn scan_persisted_summaries(
+            &self,
+            _max_preview_bytes: usize,
+            _after_name: Option<String>,
+            _max_entries: usize,
+            _max_duration: std::time::Duration,
+            _permit: tokio::sync::OwnedSemaphorePermit,
+        ) -> SessionSummaryScan {
+            SessionSummaryScan {
+                summaries: self.summaries.clone(),
+                next_cursor: Some("next.json".to_string()),
+                complete: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionFactory for ReconcilingFactory {
+        async fn open(
+            &self,
+            _session_id: &str,
+            _mode: SessionOpenMode,
+        ) -> Result<Arc<SessionCore>, String> {
+            Ok(test_core())
+        }
+
+        async fn scan_persisted_summaries(
+            &self,
+            _max_preview_bytes: usize,
+            after_name: Option<String>,
+            max_entries: usize,
+            _max_duration: std::time::Duration,
+            _permit: tokio::sync::OwnedSemaphorePermit,
+        ) -> SessionSummaryScan {
+            let mut summaries = self.summaries.clone();
+            summaries.sort_by(|left, right| left.id.cmp(&right.id));
+            summaries.retain(|summary| {
+                after_name
+                    .as_deref()
+                    .is_none_or(|after| format!("{}.json", summary.id).as_str() > after)
+            });
+            let complete = summaries.len() <= max_entries;
+            summaries.truncate(max_entries);
+            SessionSummaryScan {
+                next_cursor: (!complete)
+                    .then(|| summaries.last().map(|row| format!("{}.json", row.id)))
+                    .flatten(),
+                summaries,
+                complete,
+            }
+        }
+
+        async fn missing_persisted_ids(&self, session_ids: Vec<String>) -> Vec<String> {
+            session_ids
+                .into_iter()
+                .filter(|session_id| !self.existing.contains(session_id))
+                .collect()
+        }
+
+        fn workspace_identity(&self) -> Option<SessionWorkspace> {
+            Some(SessionWorkspace {
+                id: "workspace".to_string(),
+                label: "workspace".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionFactory for SlowScanFactory {
+        async fn open(
+            &self,
+            _session_id: &str,
+            _mode: SessionOpenMode,
+        ) -> Result<Arc<SessionCore>, String> {
+            Ok(test_core())
+        }
+
+        async fn scan_persisted_summaries(
+            &self,
+            _max_preview_bytes: usize,
+            _after_name: Option<String>,
+            _max_entries: usize,
+            _max_duration: std::time::Duration,
+            permit: tokio::sync::OwnedSemaphorePermit,
+        ) -> SessionSummaryScan {
+            let active = Arc::clone(&self.active);
+            let max_active = Arc::clone(&self.max_active);
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(current, Ordering::AcqRel);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                active.fetch_sub(1, Ordering::AcqRel);
+                SessionSummaryScan {
+                    summaries: Vec::new(),
+                    next_cursor: None,
+                    complete: false,
+                }
+            })
+            .await
+            .unwrap()
         }
     }
 
@@ -4728,6 +5224,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_fallback_marker_survives_every_snapshot_page() {
+        let summaries = ["session-a", "session-b"]
+            .into_iter()
+            .map(|id| SessionSummary {
+                id: id.to_string(),
+                model: "model".to_string(),
+                message_count: 1,
+                cwd: None,
+                updated_at: Some(std::time::UNIX_EPOCH),
+                first_user_line: Some(id.to_string()),
+            })
+            .collect();
+        let daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            1,
+            std::time::Duration::from_secs(1),
+            Arc::new(IncompleteSummaryFactory { summaries }),
+        );
+        let mut snapshot = None;
+        let first = daemon
+            .list_sessions_for_connection(
+                "first".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            incomplete,
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("first incomplete page");
+        };
+        assert!(incomplete);
+        let second = daemon
+            .list_sessions_for_connection(
+                "second".to_string(),
+                Some(&cursor),
+                ConnectionTrust::LocalOwner,
+                &mut snapshot,
+                4_096,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            second,
+            ServerMessage::SessionList {
+                incomplete: true,
+                next_cursor: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn timed_out_fallback_keeps_permit_until_blocking_scan_finishes() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let daemon = Arc::new(
+            SessionDaemon::with_factory(
+                2,
+                1,
+                8,
+                32,
+                None,
+                2,
+                std::time::Duration::from_secs(1),
+                Arc::new(SlowScanFactory {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }),
+            )
+            .with_discovery_fallback_limits(std::time::Duration::from_millis(20), 2, 1),
+        );
+        let first_daemon = Arc::clone(&daemon);
+        let first = tokio::spawn(async move { first_daemon.listing_rows().await });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = daemon.listing_rows().await.unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert!(first.1);
+        assert!(second.1);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_catalog_serves_without_payload_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = match SessionCatalog::open(
+            directory.path().join("catalog.sqlite"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            crate::session_catalog::CatalogOpen::Ready(catalog) => catalog,
+            crate::session_catalog::CatalogOpen::NewerSchema { .. } => panic!("fresh catalog"),
+        };
+        catalog
+            .apply(&CatalogMutation {
+                session_id: "catalog-session".to_string(),
+                workspace_id: "workspace".to_string(),
+                model: Some("catalog-model".to_string()),
+                updated_at_unix_ns: 42_000_000,
+                preview: Some("catalog preview".to_string()),
+                message_count: Some(2),
+                writer_instance_id: "seed".to_string(),
+                generation: 1,
+                deleted: false,
+                observed_at_unix_ms: 42,
+                authoritative_observation: false,
+            })
+            .unwrap();
+        catalog
+            .set_workspace_state("workspace", true, None)
+            .unwrap();
+        let writer =
+            SessionCatalogWriter::start(catalog.clone(), "workspace".to_string(), 4, 4, 64);
+        let daemon = SessionDaemon::new(1, 1, 8, 32).with_catalog_discovery(
+            catalog,
+            writer,
+            "workspace".to_string(),
+            4,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+
+        let (rows, incomplete) = daemon.listing_rows().await.unwrap();
+        assert!(!incomplete);
+        assert_eq!(rows[0].session_id, "catalog-session");
+        assert_eq!(rows[0].model.as_deref(), Some("catalog-model"));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_progresses_directory_then_removes_catalog_ghosts() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = match SessionCatalog::open(
+            directory.path().join("catalog.sqlite"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            crate::session_catalog::CatalogOpen::Ready(catalog) => catalog,
+            crate::session_catalog::CatalogOpen::NewerSchema { .. } => panic!("fresh catalog"),
+        };
+        catalog
+            .apply(&CatalogMutation {
+                session_id: "ghost".to_string(),
+                workspace_id: "workspace".to_string(),
+                model: Some("old".to_string()),
+                updated_at_unix_ns: 1,
+                preview: None,
+                message_count: Some(0),
+                writer_instance_id: "old".to_string(),
+                generation: 1,
+                deleted: false,
+                observed_at_unix_ms: 1,
+                authoritative_observation: false,
+            })
+            .unwrap();
+        let summaries = ["a", "b"]
+            .into_iter()
+            .map(|id| SessionSummary {
+                id: id.to_string(),
+                model: "model".to_string(),
+                message_count: 1,
+                cwd: None,
+                updated_at: Some(std::time::SystemTime::now()),
+                first_user_line: Some(id.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let factory = Arc::new(ReconcilingFactory {
+            summaries,
+            existing: ["a".to_string(), "b".to_string()].into_iter().collect(),
+        });
+        let writer =
+            SessionCatalogWriter::start(catalog.clone(), "workspace".to_string(), 8, 4, 64);
+        let daemon = SessionDaemon::with_factory(
+            4,
+            1,
+            8,
+            32,
+            None,
+            4,
+            std::time::Duration::from_secs(1),
+            factory,
+        )
+        .with_discovery_fallback_limits(std::time::Duration::from_secs(1), 1, 1)
+        .with_catalog_discovery(
+            catalog.clone(),
+            writer,
+            "workspace".to_string(),
+            1,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+
+        let (_, first_incomplete) = daemon.listing_rows().await.unwrap();
+        assert!(first_incomplete);
+        assert!(!catalog.workspace_state("workspace").unwrap().0);
+        for _ in 0..7 {
+            let _ = daemon.listing_rows().await.unwrap();
+            if catalog.workspace_state("workspace").unwrap().0 {
+                break;
+            }
+        }
+        assert!(catalog.workspace_state("workspace").unwrap().0);
+        let (rows, incomplete) = daemon.listing_rows().await.unwrap();
+        assert!(!incomplete);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(catalog.row("ghost").unwrap().unwrap().deleted);
+    }
+
+    #[tokio::test]
     async fn remote_session_listing_strips_rich_metadata_and_workspace() {
         let mut daemon = SessionDaemon::with_factory(
             2,
@@ -4826,7 +5551,8 @@ mod tests {
             })
             .unwrap();
 
-        let rows = daemon.listing_rows().await.unwrap();
+        let (rows, incomplete) = daemon.listing_rows().await.unwrap();
+        assert!(!incomplete);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message_count, Some(1));
         assert_eq!(rows[0].preview.as_deref(), Some("hello world"));
@@ -4874,7 +5600,8 @@ mod tests {
         .expect("snapshot projection should observe the live prompt");
         let _session_guard = core.session.lock().await;
 
-        let rows = daemon.listing_rows().await.unwrap();
+        let (rows, incomplete) = daemon.listing_rows().await.unwrap();
+        assert!(!incomplete);
         assert_eq!(rows[0].message_count, None);
         assert_eq!(rows[0].preview.as_deref(), Some("live prompt"));
     }
@@ -5070,6 +5797,130 @@ mod tests {
                 )
                 .await,
             Err(SessionListPageError::InvalidCursor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn global_listing_snapshot_capacity_evicts_oldest_cursor() {
+        let daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            1,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_global_listing_snapshot_capacity(1);
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        daemon
+            .create_session("session-b".to_string(), test_core())
+            .unwrap();
+        let mut oldest = None;
+        let first = daemon
+            .list_sessions_for_connection(
+                "first".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut oldest,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("first cursor");
+        };
+        let mut newer = None;
+        daemon
+            .list_sessions_for_connection(
+                "newer".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut newer,
+                4_096,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "evicted".to_string(),
+                    Some(&cursor),
+                    ConnectionTrust::LocalOwner,
+                    &mut oldest,
+                    4_096,
+                )
+                .await,
+            Err(SessionListPageError::InvalidCursor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_snapshot_churn_cannot_evict_remote_cursor() {
+        let daemon = SessionDaemon::with_factory(
+            2,
+            1,
+            8,
+            32,
+            None,
+            1,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_global_listing_snapshot_capacity(1);
+        daemon
+            .create_session("session-a".to_string(), test_core())
+            .unwrap();
+        daemon
+            .create_session("session-b".to_string(), test_core())
+            .unwrap();
+        let mut remote = None;
+        let first = daemon
+            .list_sessions_for_connection(
+                "remote-first".to_string(),
+                None,
+                ConnectionTrust::RemotePaired,
+                &mut remote,
+                4_096,
+            )
+            .await
+            .unwrap();
+        let ServerMessage::SessionList {
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("remote first page");
+        };
+        let mut local = None;
+        daemon
+            .list_sessions_for_connection(
+                "local".to_string(),
+                None,
+                ConnectionTrust::LocalOwner,
+                &mut local,
+                4_096,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            daemon
+                .list_sessions_for_connection(
+                    "remote-second".to_string(),
+                    Some(&cursor),
+                    ConnectionTrust::RemotePaired,
+                    &mut remote,
+                    4_096,
+                )
+                .await,
+            Ok(ServerMessage::SessionList { .. })
         ));
     }
 
@@ -5292,6 +6143,7 @@ mod tests {
             sessions.len(),
             "v1_cursor".to_string(),
             300,
+            false,
         )
         .unwrap();
         assert!(serde_json::to_vec(&message).unwrap().len() <= 300);
@@ -5343,6 +6195,7 @@ mod tests {
                 remaining,
                 format!("v1_cursor_{offset}"),
                 420,
+                false,
             )
             .unwrap();
             let ServerMessage::SessionList {

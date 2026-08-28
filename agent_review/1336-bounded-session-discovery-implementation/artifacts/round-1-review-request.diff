@@ -1,0 +1,211 @@
+Review the actual current uncommitted diff. Load-bearing implementation excerpts follow.
+
+```rust
+// src/session_catalog.rs
+const SCHEMA_VERSION: i64 = 1;
+
+pub enum CatalogOpen {
+    Ready(SessionCatalog),
+    NewerSchema { found: i64 },
+}
+
+pub struct CatalogMutation {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub model: Option<String>,
+    pub updated_at_unix_ns: u64,
+    pub preview: Option<String>,
+    pub message_count: Option<usize>,
+    pub writer_instance_id: String,
+    pub generation: u64,
+    pub deleted: bool,
+    pub observed_at_unix_ms: u64,
+    pub authoritative_observation: bool,
+}
+
+// Open checks schema_meta before applying WAL pragmas. A newer schema returns
+// NewerSchema without touching DB content/journal mode. Current/older schemas
+// initialize under BEGIN IMMEDIATE. Older catalog tables are dropped/rebuilt;
+// authoritative JSON files are outside the DB and untouched. Ready connections
+// use WAL, synchronous=NORMAL, configurable busy timeout, owner-only parent and
+// mode-0600 catalog file.
+
+// session_catalog columns: session_id PK, workspace_id, model, updated ns,
+// preview, count, writer_instance_id, generation, deleted, observed timestamp.
+// workspace_state: per-workspace complete + stable reconciliation cursor.
+// reconcile_lease: one global owner/expiry row.
+
+pub fn apply(&self, mutation: &CatalogMutation) -> Result<bool> {
+    // INSERT ... ON CONFLICT DO UPDATE WHERE:
+    // same writer_instance_id && increasing generation
+    // OR different writer and newer actual payload mtime
+    // OR equal mtime where a tombstone supersedes a live row
+    // OR authoritative_observation from reconciliation.
+}
+
+pub fn rows(&self, workspace, limit) -> Result<Vec<CatalogRow>> {
+    // WHERE workspace_id=? AND deleted=0
+    // ORDER BY updated_at_unix_ns DESC, session_id ASC LIMIT ?
+}
+
+pub fn ids_after(&self, workspace, after, limit) -> Result<Vec<String>> {
+    // stable session-id scan over nondeleted catalog rows
+}
+
+pub fn try_acquire_reconcile_lease(&self, owner, now, interval) -> Result<bool> {
+    // BEGIN IMMEDIATE; only replace expired global lease.
+}
+```
+
+```rust
+// bounded daemon-only writer in src/session_catalog.rs
+pub struct SessionCatalogWriter {
+    catalog: SessionCatalog,
+    workspace_id: String,
+    writer_instance_id: String,
+    max_pending: usize,
+    batch_size: usize,
+    max_preview_bytes: usize,
+    generation: AtomicU64,
+    pending: Mutex<PendingState>, // BTreeMap<session_id, latest mutation>
+    wake: mpsc::Sender<()>,       // capacity 1
+    in_flight: AtomicUsize,
+    healthy: AtomicBool,
+    quiet: Notify,
+}
+
+fn enqueue(&self, mutation: CatalogMutation) {
+    if !self.is_healthy() { return; }
+    let mut pending = self.pending.lock()...;
+    if !pending.mutations.contains_key(&mutation.session_id)
+        && pending.mutations.len() >= self.max_pending {
+        pending.mark_incomplete = true; // distinct-key saturation
+    } else {
+        pending.mutations.insert(mutation.session_id.clone(), mutation); // coalesce
+    }
+    drop(pending);
+    let _ = self.wake.try_send(());
+}
+
+async fn run_writer(weak_writer, receiver) {
+    // Upgrade Weak only while processing, avoiding an Arc/task/channel cycle.
+    // Remove at most batch_size mutations while holding pending lock and
+    // increment in_flight before releasing it, so wait_until_quiet has no gap.
+    // One spawn_blocking worker serializes same-key application. Rejected
+    // cross-instance writes mark workspace incomplete for reconciliation.
+}
+```
+
+```rust
+// src/session_store.rs / src/session_core.rs
+pub fn save_acp_result(...) -> io::Result<PersistedWrite> {
+    // Serialize record, write to per-write UUID temp path, atomic rename,
+    // stat actual post-rename mtime, return bounded summary only on success.
+}
+
+// SessionPersistence has optional daemon-only SessionCatalogWriter.
+// Successful save enqueues saved metadata; failed write logs and never indexes.
+// Successful/idempotent first delete enqueues a materialized tombstone. Repeated
+// delete returns false without refreshing tombstone retention.
+```
+
+```rust
+// src/session_store.rs
+pub fn scan_summaries(max_preview, after_name, max_entries, deadline) -> SessionSummaryScan {
+    // Walk until deadline, retain only lexicographically smallest max_entries+1
+    // names above stable cursor in a bounded BTreeMap, parse at most max_entries
+    // payloads, return sorted summaries + next filename cursor + complete flag.
+}
+```
+
+```rust
+// src/session_daemon.rs
+struct CatalogDiscovery {
+    catalog: SessionCatalog,
+    writer: Arc<SessionCatalogWriter>,
+    workspace_id: String,
+    reconcile_entries: usize,
+    reconcile_owner: String,
+    reconcile_interval: Duration,
+    full_rescan_interval: Duration,
+    last_full_rescan_unix_ms: AtomicU64,
+    tombstone_retention: Duration,
+}
+
+async fn run_catalog_blocking(&self, work) -> Result<R> {
+    // Acquire OwnedSemaphorePermit with timeout; move permit into spawn_blocking;
+    // outer timeout may cancel await but blocking job retains permit until exit.
+}
+
+async fn durable_listing_rows(&self) -> (Vec<SessionListEntry>, bool) {
+    // Healthy+complete catalog: bounded indexed query.
+    // Periodically mark complete catalog incomplete to start a full drift sweep.
+    // Cold/incomplete/newer-schema/unhealthy: one bounded factory scan and
+    // return incomplete=true rather than silently claiming completeness.
+}
+
+async fn reconcile_catalog_once(&self, discovery) -> Result<()> {
+    // Acquire global DB lease. workspace_state cursor phases:
+    // dir:<filename>: bounded stable payload batch -> authoritative upserts.
+    // ghost:<session_id>: bounded catalog-id batch -> validate JSON, materialize
+    // missing/corrupt ghosts as authoritative tombstones. On completion mark
+    // workspace complete and purge one bounded old-tombstone batch.
+}
+```
+
+```rust
+// Task-1337 integration retained and extended.
+struct ConnectionListingSnapshot {
+    rows: Vec<SessionListEntry>,
+    offset: usize,
+    expected_cursor: Option<String>,
+    expires_at: Instant,
+    incomplete: bool,
+    valid: Arc<AtomicBool>,
+}
+
+// Global bounded registry stores Weak validity flags. New snapshots prune dead
+// connections and invalidate oldest live cursors at capacity. Connection drop
+// drops the rows. list_sessions_for_connection freezes (rows,incomplete), and
+// every page passes snapshot.incomplete to fit_session_list_to_frame.
+
+// ConnectionTrust remains separate from capabilities: LocalOwner receives rich
+// workspace/model/time/preview/count/status; RemotePaired receives only the
+// pre-existing session_id/active/attached count. Random rotating cursors remain
+// physical-connection-local; cross-trust/connection replay is invalid_cursor.
+```
+
+```rust
+// Protocol/client/mirror changes
+ServerMessage::SessionList adds backward-compatible defaulted/omitted
+`incomplete: bool`. SessionClientOutcome and TuiSessionList preserve it through
+SessionClient -> SessionController -> TuiSession. Android SessionList adds
+`incomplete: Boolean = false`; fixture tests true and default false decoding.
+```
+
+```rust
+// Startup wiring
+SessionCatalog::open beside daemon JSON. Newer/failed catalog => bounded fallback.
+Ready catalog is marked incomplete at daemon start, writer injected only into
+AgentSessionFactory/SessionPersistence, and SessionDaemon receives catalog,
+writer, workspace identity, reconcile/query/fallback/snapshot limits. Shutdown
+waits for writer quiet within existing shutdown grace.
+```
+
+Config/default docs add: optional catalog path; busy timeout; pending entries;
+write batch; query timeout (> busy timeout); query concurrency; fallback entries;
+reconcile entries; shared reconcile interval; full rescan interval; tombstone
+retention; global listing snapshot capacity. ADR-010 records JSON authority,
+trust boundary, incomplete pages, cursor replacement, and catalog lifecycle.
+
+Tests in actual diff cover: WAL multiprocess visibility; newer schema untouched;
+older schema rebuild without payload mutation; same/cross writer ordering;
+equal-mtime tombstone and authoritative recreate; stale resurrection prevention;
+writer coalescing/saturation/incomplete state; failed write exclusion; unique
+concurrent temp paths; writer task lifecycle; shutdown drain primitive; global
+reconcile lease; stable bounded scan/deadline; directory then ghost reconciliation;
+catalog-ready listing; incomplete every page; query permit retained after timeout;
+global snapshot oldest eviction; and all task-1337 trust/cursor/frame/metadata
+regressions.
+
+Verification before review: cargo fmt/clippy clean; cargo test 1751 passed/10 ignored; pytest 296 passed. Android Gradle remains locally blocked by absent Java, but the Kotlin test is included.

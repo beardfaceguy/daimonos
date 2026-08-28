@@ -19,7 +19,7 @@ use crate::session_daemon::{SessionFactory, SessionOpenMode};
 use crate::session_protocol::{
     RuntimeChoice, RuntimeOption, RuntimeValue, SessionEvent, SessionWorkspace,
 };
-use crate::session_store::{SessionStore, SessionSummary};
+use crate::session_store::{SessionStore, SessionSummaryScan};
 use sha2::{Digest, Sha256};
 
 pub type ProviderFactory =
@@ -39,6 +39,7 @@ pub struct AgentSessionFactory {
     compaction: SessionCompaction,
     analytics: Option<Arc<AnalyticsStore>>,
     services: Arc<crate::provisioning::ToolServices>,
+    catalog_writer: Option<Arc<crate::session_catalog::SessionCatalogWriter>>,
 }
 
 impl AgentSessionFactory {
@@ -58,7 +59,8 @@ impl AgentSessionFactory {
         services: Arc<crate::provisioning::ToolServices>,
     ) -> Self {
         let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
-        let workspace_identity = session_workspace(&workspace, config.session.max_label_bytes);
+        let workspace_identity =
+            canonical_session_workspace(&workspace, config.session.max_label_bytes);
         Self {
             make_provider,
             workspace,
@@ -73,7 +75,16 @@ impl AgentSessionFactory {
             compaction,
             analytics,
             services,
+            catalog_writer: None,
         }
+    }
+
+    pub fn with_catalog_writer(
+        mut self,
+        catalog_writer: Arc<crate::session_catalog::SessionCatalogWriter>,
+    ) -> Self {
+        self.catalog_writer = Some(catalog_writer);
+        self
     }
 }
 
@@ -215,10 +226,14 @@ impl SessionFactory for AgentSessionFactory {
             self.compaction.clone(),
             context_windows,
             approvals,
-            Some(SessionPersistence::new(
-                session_id.to_string(),
-                self.store.clone(),
-            )),
+            Some({
+                let persistence =
+                    SessionPersistence::new(session_id.to_string(), self.store.clone());
+                match &self.catalog_writer {
+                    Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
+                    None => persistence,
+                }
+            }),
             events,
             tool_lifecycle,
         ));
@@ -239,20 +254,48 @@ impl SessionFactory for AgentSessionFactory {
         Ok(core)
     }
 
-    async fn persisted_session_summaries(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
+    async fn scan_persisted_summaries(
+        &self,
+        max_preview_bytes: usize,
+        after_name: Option<String>,
+        max_entries: usize,
+        max_duration: std::time::Duration,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> SessionSummaryScan {
         let store = self.store.clone();
         let workspace = self.workspace.clone();
+        let fallback_cursor = after_name.clone();
         tokio::task::spawn_blocking(move || {
-            store
-                .list_with_preview_limit(max_preview_bytes)
+            let _permit = permit;
+            let mut scan = store.scan_summaries(
+                max_preview_bytes,
+                after_name.as_deref(),
+                max_entries,
+                std::time::Instant::now() + max_duration,
+            );
+            scan.summaries.retain(|summary| {
+                summary
+                    .cwd
+                    .as_deref()
+                    .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+                    .is_some_and(|cwd| cwd == workspace)
+            });
+            scan
+        })
+        .await
+        .unwrap_or(SessionSummaryScan {
+            summaries: Vec::new(),
+            next_cursor: fallback_cursor,
+            complete: false,
+        })
+    }
+
+    async fn missing_persisted_ids(&self, session_ids: Vec<String>) -> Vec<String> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            session_ids
                 .into_iter()
-                .filter(|summary| {
-                    summary
-                        .cwd
-                        .as_deref()
-                        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-                        .is_some_and(|cwd| cwd == workspace)
-                })
+                .filter(|session_id| store.load(session_id).is_none())
                 .collect()
         })
         .await
@@ -264,7 +307,10 @@ impl SessionFactory for AgentSessionFactory {
     }
 }
 
-fn session_workspace(workspace: &std::path::Path, max_label_bytes: usize) -> SessionWorkspace {
+pub(crate) fn canonical_session_workspace(
+    workspace: &std::path::Path,
+    max_label_bytes: usize,
+) -> SessionWorkspace {
     let mut digest = Sha256::new();
     digest.update(workspace.as_os_str().as_bytes());
     let digest = format!("{:x}", digest.finalize());
@@ -436,7 +482,20 @@ mod tests {
             None,
             services,
         );
-        let summaries = factory.persisted_session_summaries(256).await;
+        let scan = factory
+            .scan_persisted_summaries(
+                256,
+                None,
+                100,
+                std::time::Duration::from_secs(1),
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+        assert!(scan.complete);
+        let summaries = scan.summaries;
         assert_eq!(
             summaries
                 .iter()

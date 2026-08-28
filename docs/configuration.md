@@ -337,7 +337,19 @@ the local TUI/UDS client, and future remote clients.
 | `session_list_preview_bytes` | `256` | Maximum UTF-8 bytes retained in each local session-list preview. |
 | `session_list_cursor_bytes` | `128` | Maximum accepted opaque daemon session-list cursor size. |
 | `session_list_snapshot_entries` | `1000` | Maximum rows retained in one connection-bound listing snapshot. |
+| `session_list_snapshot_global_capacity` | `256` | Maximum live listing snapshots per trust domain across all connections; the oldest same-domain snapshot is invalidated first. |
 | `session_list_snapshot_ttl_secs` | `60` | Lifetime of one connection-bound listing snapshot. |
+| `session_catalog_path` | beside daemon JSON | Optional shared SQLite metadata catalog path. |
+| `session_catalog_busy_timeout_ms` | `5000` | SQLite writer wait under multiprocess contention. |
+| `session_catalog_pending_entries` | `1024` | Maximum distinct latest-wins pending catalog mutations per daemon. |
+| `session_catalog_write_batch` | `64` | Maximum mutations applied by one blocking worker batch. |
+| `session_catalog_query_timeout_ms` | `6000` | Maximum catalog query/reconciliation wait; must exceed the SQLite busy timeout. |
+| `session_catalog_query_concurrency` | `2` | Maximum blocking catalog queries/reconciliation jobs per daemon. Timed-out jobs retain a permit until SQLite returns. |
+| `session_catalog_fallback_entries` | `256` | Maximum payload files examined by one incomplete-catalog fallback. |
+| `session_catalog_reconcile_entries` | `128` | Maximum catalog/directory entries repaired per reconciliation pass. |
+| `session_catalog_reconcile_interval_ms` | `100` | Shared minimum interval between reconciliation passes across daemon processes. |
+| `session_catalog_full_rescan_secs` | `60` | Interval between full drift sweeps after a workspace catalog reaches completeness. |
+| `session_catalog_tombstone_retention_secs` | `300` | Minimum retention for confirmed materialized deletion rows. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
 | `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
 | `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
@@ -389,7 +401,18 @@ session_list_page_size = 50
 session_list_preview_bytes = 256
 session_list_cursor_bytes = 128
 session_list_snapshot_entries = 1000
+session_list_snapshot_global_capacity = 256
 session_list_snapshot_ttl_secs = 60
+session_catalog_busy_timeout_ms = 5000
+session_catalog_pending_entries = 1024
+session_catalog_write_batch = 64
+session_catalog_query_timeout_ms = 6000
+session_catalog_query_concurrency = 2
+session_catalog_fallback_entries = 256
+session_catalog_reconcile_entries = 128
+session_catalog_reconcile_interval_ms = 100
+session_catalog_full_rescan_secs = 60
+session_catalog_tombstone_retention_secs = 300
 shutdown_grace_secs = 5
 client_command_timeout_secs = 10
 bootstrap_timeout_secs = 15
@@ -418,6 +441,13 @@ max_ticket_bytes = 1024
 max_runtime_value_bytes = 4096
 max_capabilities = 16
 ```
+
+Catalog reconciliation advances at most one configured batch per shared
+`session_catalog_reconcile_interval_ms`. A drift sweep needs approximately
+`ceil((payload files + catalog rows) / session_catalog_reconcile_entries)`
+successful list-triggered passes; every page remains explicitly `incomplete`
+until the sweep finishes. Timed-out blocking jobs retain their concurrency
+permit until SQLite or the bounded directory scan returns.
 
 ### `[tui]` — Interactive terminal frontend
 

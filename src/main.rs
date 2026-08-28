@@ -38,6 +38,7 @@ mod safety;
 mod script;
 mod session;
 mod session_bootstrap;
+mod session_catalog;
 mod session_client;
 mod session_controller;
 mod session_core;

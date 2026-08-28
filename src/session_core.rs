@@ -558,6 +558,7 @@ pub struct SessionPersistence {
     session_id: String,
     store: SessionStore,
     state: Arc<StdMutex<SessionPersistenceState>>,
+    catalog_writer: Option<Arc<crate::session_catalog::SessionCatalogWriter>>,
 }
 
 #[derive(Default)]
@@ -571,7 +572,16 @@ impl SessionPersistence {
             session_id: session_id.into(),
             store,
             state: Arc::new(StdMutex::new(SessionPersistenceState::default())),
+            catalog_writer: None,
         }
+    }
+
+    pub fn with_catalog_writer(
+        mut self,
+        catalog_writer: Arc<crate::session_catalog::SessionCatalogWriter>,
+    ) -> Self {
+        self.catalog_writer = Some(catalog_writer);
+        self
     }
 
     fn save(
@@ -590,7 +600,12 @@ impl SessionPersistence {
         if state.deleted {
             return;
         }
-        self.store.save_acp(
+        let max_preview_bytes = self
+            .catalog_writer
+            .as_ref()
+            .map(|writer| writer.max_preview_bytes())
+            .unwrap_or(usize::MAX);
+        match self.store.save_acp_result(
             &self.session_id,
             model,
             thinking,
@@ -598,7 +613,20 @@ impl SessionPersistence {
             cwd,
             client_user_message_ids,
             assistant_outcomes,
-        );
+            max_preview_bytes,
+        ) {
+            Ok(write) => {
+                if let Some(writer) = &self.catalog_writer {
+                    writer.enqueue_saved(write);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "session store: failed to persist session {}: {error}",
+                    self.session_id
+                );
+            }
+        }
     }
 
     fn delete(&self) -> std::io::Result<bool> {
@@ -606,8 +634,15 @@ impl SessionPersistence {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.deleted {
+            return Ok(false);
+        }
         state.deleted = true;
-        self.store.delete(&self.session_id)
+        let deleted = self.store.delete(&self.session_id)?;
+        if let Some(writer) = &self.catalog_writer {
+            writer.enqueue_deleted(&self.session_id);
+        }
+        Ok(deleted)
     }
 }
 
@@ -3782,5 +3817,93 @@ mod tests {
                 .context_window,
             100
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_persistence_updates_and_tombstones_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let catalog = match crate::session_catalog::SessionCatalog::open(
+            directory.path().join("catalog.sqlite"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            crate::session_catalog::CatalogOpen::Ready(catalog) => catalog,
+            crate::session_catalog::CatalogOpen::NewerSchema { .. } => panic!("fresh catalog"),
+        };
+        let writer = crate::session_catalog::SessionCatalogWriter::start(
+            catalog,
+            "workspace".to_string(),
+            8,
+            4,
+            64,
+        );
+        let persistence =
+            SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
+        persistence.save(
+            "model",
+            "medium",
+            &[Message::user("hello")],
+            directory.path(),
+            &["prompt-1".to_string()],
+            &[],
+        );
+        assert!(
+            writer
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        let row = writer.catalog().row("session-1").unwrap().unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.preview.as_deref(), Some("hello"));
+
+        assert!(persistence.delete().unwrap());
+        assert!(
+            writer
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        assert!(writer.catalog().row("session-1").unwrap().unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn failed_payload_write_never_enters_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_store_path = directory.path().join("not-a-directory");
+        std::fs::write(&invalid_store_path, b"file").unwrap();
+        let store = SessionStore::new(invalid_store_path);
+        let catalog = match crate::session_catalog::SessionCatalog::open(
+            directory.path().join("catalog.sqlite"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            crate::session_catalog::CatalogOpen::Ready(catalog) => catalog,
+            crate::session_catalog::CatalogOpen::NewerSchema { .. } => panic!("fresh catalog"),
+        };
+        let writer = crate::session_catalog::SessionCatalogWriter::start(
+            catalog,
+            "workspace".to_string(),
+            8,
+            4,
+            64,
+        );
+        let persistence =
+            SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
+        persistence.save(
+            "model",
+            "medium",
+            &[Message::user("hello")],
+            directory.path(),
+            &[],
+            &[],
+        );
+        assert!(
+            writer
+                .wait_until_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        assert!(writer.catalog().row("session-1").unwrap().is_none());
     }
 }
