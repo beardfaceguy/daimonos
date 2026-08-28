@@ -2,7 +2,8 @@
 
 - **Status:** Accepted (incremental; layers land across Vikunja #1091 phases)
 - **Date:** 2026-08-04
-- **Amended:** 2026-08-23 (Vikunja #1331 daemon-client migration)
+- **Amended:** 2026-08-27 (Vikunja #1331 daemon-client migration, #1334
+  canonical switch hydration)
 - **Tracking:** Vikunja #1091 (project #183, `daimonos-agent`)
 - **Relates to:** ADR-010 (session daemon + remote control, Vikunja #1090),
   Vikunja #955 (`daimonos chat` Reedline REPL — superseded/aliased)
@@ -101,6 +102,19 @@ after the final client-side check is not mixed into the new view: normal daemon
 eligibility semantics start its sticky ineligible deadline, and switching back
 before expiry pauses it.
 
+Candidate hydration accepts only the daemon's canonical bounded snapshot and
+applies it once through a fresh reducer configured with the TUI scrollback
+limit. The requested, acknowledged, envelope, and snapshot identities and
+sequences must agree; duplicate protocol identities and oversized frames fail
+before commit. Interactive attachment requires Observe, Prompt, Interrupt,
+ApproveOnce, and Configure grants. Stop and ApproveAlways are optional:
+ungranted actions remain hidden or disabled, and allow-always additionally
+requires the approval request's host-policy gate. A readiness probe orders
+candidate frames already queued before the probe ahead of commit. Revocation
+that races after the probe uses the active controller's normal bounded recovery.
+The probe and any reconnect share `session.client_command_timeout_secs` as one
+switch-stabilization budget.
+
 Switch admission is client-serialized and conservative: canonical turn state
 must be `Idle` or `Cancelled`, no approval may be pending, and no prompt,
 interrupt, approval response, configuration, stop, clear, or gap-recovery sync
@@ -117,7 +131,7 @@ polluting canonical replay.
 
 Daemon revocation carries an additive typed code. Event-queue lag and transport
 loss trigger bounded Resume from the last canonical sequence, accepting replay
-or a full snapshot; each physical reconnect uses a fresh client id so it cannot
+or a canonical bounded snapshot; each physical reconnect uses a fresh client id so it cannot
 replace a newer attachment. Session stop, attachment replacement, and untyped
 legacy revocations are terminal. Recovery surfaces a local warning because a
 wire command accepted immediately before disconnect may need verification.

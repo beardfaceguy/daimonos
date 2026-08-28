@@ -321,6 +321,10 @@ impl TuiSession {
             .await
             {
                 Ok(mut candidate) => {
+                    if let Err(message) = candidate.stabilize_candidate().await {
+                        self.require_live_rollback_target()?;
+                        anyhow::bail!("switch_connection_failed: {message}");
+                    }
                     match self.drain_before_switch_commit() {
                         OldAttachmentStatus::Live => self.ensure_switch_allowed()?,
                         OldAttachmentStatus::Dead(reason) => {
@@ -362,6 +366,67 @@ impl TuiSession {
             }
         }
         unreachable!("switch attempts are always at least one")
+    }
+
+    /// Order frames already queued before the probe; later revocations remain
+    /// the active controller's responsibility after commit.
+    async fn stabilize_candidate(&mut self) -> Result<(), String> {
+        let command_timeout = self.command_timeout;
+        let stabilize = async {
+            self.active
+                .controller
+                .send(SessionControllerCommand::Ping)
+                .await
+                .map_err(|error| format!("failed to queue candidate readiness probe: {error:?}"))?;
+            loop {
+                let event = self
+                    .active
+                    .controller
+                    .recv()
+                    .await
+                    .ok_or_else(|| self.controller_stop_message())?;
+                if event.epoch != self.active.epoch {
+                    continue;
+                }
+                let pong = matches!(
+                    &event.event,
+                    SessionControllerEvent::StateChanged {
+                        outcome: SessionClientOutcome::Pong,
+                        ..
+                    }
+                );
+                let reconnected =
+                    matches!(&event.event, SessionControllerEvent::Reconnected { .. });
+                match self.apply(event) {
+                    TuiSessionUpdate::Updated if pong => return Ok(()),
+                    TuiSessionUpdate::Updated if reconnected => {
+                        self.active
+                            .controller
+                            .send(SessionControllerCommand::Ping)
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "failed to queue candidate readiness probe after reconnect: \
+                                     {error:?}"
+                                )
+                            })?;
+                    }
+                    TuiSessionUpdate::Updated => {}
+                    TuiSessionUpdate::Failed(message) => return Err(message),
+                    TuiSessionUpdate::Detached | TuiSessionUpdate::Stopped => {
+                        return Err(self.controller_stop_message())
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(command_timeout, stabilize)
+            .await
+            .map_err(|_| {
+                "candidate_unstable: timed out waiting for readiness after canonical hydration \
+                 and bounded reconnect; increase session.client_command_timeout_secs if the \
+                 daemon is healthy but slow"
+                    .to_string()
+            })?
     }
 
     fn ensure_switch_allowed(&self) -> anyhow::Result<()> {
@@ -407,6 +472,7 @@ impl TuiSession {
         self.last_detached_session = Some(departed_session);
         self.clear_pending_operations();
         self.sync_target = None;
+        self.session_list = None;
         tokio::spawn(old_active.controller.shutdown());
         Ok(())
     }
@@ -806,13 +872,17 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::client_transport::{in_memory_transport_pair, ClientTransport};
-    use crate::session_controller::SessionControllerHandle;
-    use crate::session_protocol::{
-        ApprovalDecision, ClientCapability, ClientInfo, ClientKind, ClientMessage, ContextUsage,
-        RevocationCode, ServerMessage, SessionEvent, SessionSnapshot, SessionUsage, TurnStatus,
-        PROTOCOL_VERSION,
+    use crate::client_transport::{
+        in_memory_transport_pair, ClientTransport, UnixFrontendTransport, UnixSocketTransport,
     };
+    use crate::session_controller::{ReconnectPolicy, SessionControllerHandle};
+    use crate::session_protocol::{
+        ApprovalDecision, AssistantOutcome, ClientCapability, ClientInfo, ClientKind,
+        ClientMessage, ContextUsage, RevocationCode, RuntimeOption, ServerMessage, SessionEvent,
+        SessionSnapshot, SessionUsage, ToolCallState, ToolCallStateStatus, TranscriptEntry,
+        TranscriptRole, TurnStatus, PROTOCOL_VERSION,
+    };
+    use tokio::net::UnixStream;
 
     fn controller() -> (impl ClientTransport, SessionControllerHandle) {
         let (server, transport) = in_memory_transport_pair(8, "daemon");
@@ -919,6 +989,19 @@ mod tests {
             .unwrap();
     }
 
+    async fn confirm_candidate_ready(server: &impl ClientTransport) {
+        assert!(matches!(
+            server.recv().await.unwrap(),
+            Some(ClientMessage::Ping)
+        ));
+        server.send(&ServerMessage::Pong).await.unwrap();
+    }
+
+    async fn accept_switch_attach(server: &impl ClientTransport, session_id: &str) {
+        accept_attach(server, session_id).await;
+        confirm_candidate_ready(server).await;
+    }
+
     #[tokio::test]
     async fn attach_uses_daemon_snapshot_as_the_only_initial_view() {
         let (server, controller) = controller();
@@ -1023,6 +1106,62 @@ mod tests {
         );
         assert!(!session.allow_always_available());
         session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_hydration_snapshot_is_a_permanent_frame_mismatch() {
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let server = UnixSocketTransport::new(server_stream, "client", 4_096).unwrap();
+        let transport = UnixFrontendTransport::new(client_stream, "daemon", 256).unwrap();
+        let controller = SessionControllerHandle::spawn(
+            transport,
+            ClientInfo {
+                id: "tui".to_string(),
+                kind: ClientKind::Terminal,
+                label: "terminal test".to_string(),
+            },
+            interactive_capabilities(),
+            16,
+            4,
+            4,
+        );
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        assert!(matches!(
+            server.recv().await.unwrap(),
+            Some(ClientMessage::Attach { .. })
+        ));
+        server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-a".to_string(),
+                granted_capabilities: interactive_capabilities(),
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        let mut oversized = snapshot("session-a");
+        oversized.transcript.push(TranscriptEntry {
+            id: 1,
+            role: TranscriptRole::User,
+            text: "x".repeat(1_000),
+            outcome: None,
+        });
+        server
+            .send(&ServerMessage::Snapshot {
+                seq: 0,
+                state: oversized,
+            })
+            .await
+            .unwrap();
+        let error = match attach.await.unwrap() {
+            Ok(_) => panic!("oversized candidate snapshot must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("frame_limit_mismatch"));
+        assert!(error.contains("256"));
     }
 
     #[tokio::test]
@@ -1376,7 +1515,13 @@ mod tests {
         let (old_server, old_controller) = controller();
         let (target_server, target_controller) = controller();
         let factory = controller_factory(vec![target_controller]);
-        let session = attach_switching(old_controller, &old_server, "session-a", factory).await;
+        let mut session = attach_switching(old_controller, &old_server, "session-a", factory).await;
+        session.session_list = Some(TuiSessionList {
+            workspace: None,
+            sessions: Vec::new(),
+            next_cursor: Some("stale-cursor".to_string()),
+            incomplete: false,
+        });
         let old_epoch = session.active.epoch;
 
         let switching = tokio::spawn(async move {
@@ -1384,10 +1529,91 @@ mod tests {
             let result = session.switch_to("session-b").await;
             (result, session)
         });
-        accept_attach(&target_server, "session-b").await;
+        assert!(matches!(
+            target_server.recv().await.unwrap(),
+            Some(ClientMessage::Attach {
+                session_id: Some(ref session_id),
+                ..
+            }) if session_id == "session-b"
+        ));
+        target_server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-b".to_string(),
+                granted_capabilities: interactive_capabilities(),
+                seq: 7,
+            })
+            .await
+            .unwrap();
+        target_server
+            .send(&ServerMessage::Snapshot {
+                seq: 7,
+                state: SessionSnapshot {
+                    session_id: "session-b".to_string(),
+                    seq: 7,
+                    turn_status: TurnStatus::Cancelled,
+                    transcript: vec![TranscriptEntry {
+                        id: 41,
+                        role: TranscriptRole::Assistant,
+                        text: "canonical answer".to_string(),
+                        outcome: Some(AssistantOutcome::Aborted),
+                    }],
+                    tool_calls: vec![ToolCallState {
+                        id: "tool-1".to_string(),
+                        name: "read_file".to_string(),
+                        title: "Read canonical file".to_string(),
+                        status: ToolCallStateStatus::Completed,
+                        output: Some("canonical output".to_string()),
+                    }],
+                    pending_approvals: Vec::new(),
+                    runtime_options: vec![RuntimeOption::boolean(
+                        "thinking",
+                        "Thinking",
+                        RuntimeValue::Bool(true),
+                    )],
+                    context_usage: Some(ContextUsage::new(42, Some(1_000), 10, None)),
+                    history_truncated: true,
+                },
+            })
+            .await
+            .unwrap();
+        confirm_candidate_ready(&target_server).await;
         let (result, mut session) = switching.await.unwrap();
         result.unwrap();
         assert_eq!(session.state().session_id(), "session-b");
+        assert_eq!(session.state().last_seq(), 7);
+        assert_eq!(session.state().turn_status(), TurnStatus::Cancelled);
+        assert!(session
+            .state()
+            .transcript()
+            .iter()
+            .any(|line| line.text == "canonical answer"));
+        assert!(session
+            .state()
+            .transcript()
+            .iter()
+            .any(|line| line.text == "[turn interrupted]"));
+        assert_eq!(
+            session.state().tool_calls()[0].output.as_deref(),
+            Some("canonical output")
+        );
+        assert_eq!(
+            session.state().runtime_options()[0].value,
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            session
+                .state()
+                .context_usage()
+                .expect("canonical usage")
+                .prompt_tokens,
+            42
+        );
+        assert!(session.state().history_truncated());
+        assert!(
+            session.take_session_list().is_none(),
+            "old attachment listing must clear on switch commit"
+        );
         let mut stale_state = ViewState::new("session-a");
         stale_state.apply_snapshot(snapshot("session-a"));
         session.apply(EpochEvent {
@@ -1414,7 +1640,13 @@ mod tests {
         let (old_server, old_controller) = controller();
         let (target_server, target_controller) = controller();
         let factory = controller_factory(vec![target_controller]);
-        let session = attach_switching(old_controller, &old_server, "session-a", factory).await;
+        let mut session = attach_switching(old_controller, &old_server, "session-a", factory).await;
+        session.session_list = Some(TuiSessionList {
+            workspace: None,
+            sessions: Vec::new(),
+            next_cursor: Some("preserved-cursor".to_string()),
+            incomplete: false,
+        });
 
         let switching = tokio::spawn(async move {
             let mut session = session;
@@ -1432,9 +1664,16 @@ mod tests {
             .await
             .unwrap();
 
-        let (result, session) = switching.await.unwrap();
+        let (result, mut session) = switching.await.unwrap();
         assert!(result.unwrap_err().to_string().contains("SessionNotFound"));
         assert_eq!(session.state().session_id(), "session-a");
+        assert_eq!(
+            session
+                .take_session_list()
+                .and_then(|listing| listing.next_cursor)
+                .as_deref(),
+            Some("preserved-cursor")
+        );
         session.shutdown().await;
     }
 
@@ -1523,6 +1762,7 @@ mod tests {
             })
             .await
             .unwrap();
+        confirm_candidate_ready(&target_server).await;
 
         let (result, session) = switching.await.unwrap();
         assert!(result
@@ -1577,6 +1817,7 @@ mod tests {
             })
             .await
             .unwrap();
+        confirm_candidate_ready(&target_server).await;
 
         let (result, session) = switching.await.unwrap();
         result.unwrap();
@@ -1584,6 +1825,89 @@ mod tests {
         assert!(session.state().transcript().iter().any(|entry| entry
             .text
             .contains("previous session disconnected during switch")));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lag_revoked_candidate_reconnects_before_switch_commit() {
+        let (old_server, old_controller) = controller();
+        let (target_server, target_transport) = in_memory_transport_pair(8, "target");
+        let (reconnect_server, reconnect_transport) =
+            in_memory_transport_pair(8, "target-reconnect");
+        let reconnect_transport = Arc::new(Mutex::new(Some(reconnect_transport)));
+        let reconnect_factory = {
+            let reconnect_transport = Arc::clone(&reconnect_transport);
+            Arc::new(move || {
+                let reconnect_transport = Arc::clone(&reconnect_transport);
+                Box::pin(async move {
+                    reconnect_transport.lock().unwrap().take().ok_or_else(|| {
+                        crate::session_client::SessionClientError::Protocol(
+                            "no reconnect transport".to_string(),
+                        )
+                    })
+                }) as crate::session_controller::ReconnectFuture<_>
+            })
+        };
+        let target_controller = SessionControllerHandle::spawn_with_reconnect(
+            target_transport,
+            ClientInfo {
+                id: "candidate".to_string(),
+                kind: ClientKind::Terminal,
+                label: "candidate".to_string(),
+            },
+            interactive_capabilities(),
+            16,
+            4,
+            8,
+            ReconnectPolicy {
+                attempts: 1,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            },
+            reconnect_factory,
+        );
+        let session = attach_switching(
+            old_controller,
+            &old_server,
+            "session-a",
+            controller_factory(vec![target_controller]),
+        )
+        .await;
+        let switching = tokio::spawn(async move {
+            let mut session = session;
+            let result = session.switch_to("session-b").await;
+            (result, session)
+        });
+        accept_attach(&target_server, "session-b").await;
+        target_server
+            .send(&ServerMessage::Revoked {
+                code: Some(RevocationCode::EventQueueLagged),
+                reason: "candidate lagged during hydration".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconnect_server.recv().await.unwrap(),
+            Some(ClientMessage::Resume {
+                ref session_id,
+                last_seen_seq: 0,
+                ..
+            }) if session_id == "session-b"
+        ));
+        reconnect_server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-b".to_string(),
+                granted_capabilities: interactive_capabilities(),
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        confirm_candidate_ready(&reconnect_server).await;
+
+        let (result, session) = switching.await.unwrap();
+        result.unwrap();
+        assert_eq!(session.state().session_id(), "session-b");
         session.shutdown().await;
     }
 
@@ -1645,7 +1969,7 @@ mod tests {
             session.switch_to("session-b").await.unwrap();
             session
         });
-        accept_attach(&server_b, "session-b").await;
+        accept_switch_attach(&server_b, "session-b").await;
         let session = to_b.await.unwrap();
         assert_eq!(session.state().session_id(), "session-b");
 
@@ -1664,7 +1988,7 @@ mod tests {
             })
             .await
             .unwrap();
-        accept_attach(&server_a_retry, "session-a").await;
+        accept_switch_attach(&server_a_retry, "session-a").await;
 
         let (result, session) = to_a.await.unwrap();
         result.unwrap();
@@ -1686,7 +2010,7 @@ mod tests {
             session.switch_to("session-b").await.unwrap();
             session
         });
-        accept_attach(&server_b, "session-b").await;
+        accept_switch_attach(&server_b, "session-b").await;
         let session = to_b.await.unwrap();
 
         let to_a = tokio::spawn(async move {
