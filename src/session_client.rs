@@ -5,14 +5,16 @@
 //! supplies bounded actor/channel orchestration for the TUI.
 #![allow(dead_code)] // Discovery/reconnect actions land in later task-1331 slices.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::hash::Hash;
 
 use crate::client_transport::{FrontendTransport, TransportError};
 use crate::frontend_state::{ApplyOutcome, ViewState};
 use crate::session_protocol::{
     has_capability, ApprovalDecision, AttachDeniedCode, ClientCapability, ClientInfo,
-    ClientMessage, RevocationCode, RuntimeValue, ServerMessage, SessionListEntry, SessionUsage,
-    SessionWorkspace, PROTOCOL_VERSION,
+    ClientMessage, RevocationCode, RuntimeValue, ServerMessage, SessionListEntry, SessionSnapshot,
+    SessionUsage, SessionWorkspace, PROTOCOL_VERSION,
 };
 
 #[derive(Debug)]
@@ -110,6 +112,49 @@ pub enum SessionClientOutcome {
     },
 }
 
+fn validate_snapshot_ids(snapshot: &SessionSnapshot) -> Result<(), SessionClientError> {
+    fn require_unique<T: Clone + Eq + Hash + fmt::Debug>(
+        kind: &str,
+        ids: impl IntoIterator<Item = T>,
+    ) -> Result<(), SessionClientError> {
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                return Err(SessionClientError::Protocol(format!(
+                    "snapshot contains duplicate {kind} id {id:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    require_unique(
+        "transcript",
+        snapshot.transcript.iter().map(|entry| entry.id),
+    )?;
+    require_unique(
+        "tool call",
+        snapshot.tool_calls.iter().map(|call| call.id.as_str()),
+    )?;
+    require_unique(
+        "approval",
+        snapshot
+            .pending_approvals
+            .iter()
+            .map(|approval| approval.id.as_str()),
+    )?;
+    // A bounded snapshot may legitimately trim the tool card referenced by an
+    // active approval; task 1338's HistoryWindow will preserve mandatory live
+    // tool state. Validate identity uniqueness here, not cross-reference presence.
+    require_unique(
+        "runtime option",
+        snapshot
+            .runtime_options
+            .iter()
+            .map(|option| option.id.as_str()),
+    )
+}
+
 pub struct SessionClient<T: FrontendTransport> {
     transport: T,
     state: ViewState,
@@ -174,6 +219,7 @@ impl<T: FrontendTransport> SessionClient<T> {
     }
 
     async fn attach_inner(&mut self, session_id: Option<String>) -> Result<(), SessionClientError> {
+        let requested_session_id = session_id.clone();
         let can_resume = session_id
             .as_deref()
             .is_some_and(|session_id| session_id == self.state.session_id());
@@ -212,9 +258,12 @@ impl<T: FrontendTransport> SessionClient<T> {
                             "server protocol {protocol_version} does not match {PROTOCOL_VERSION}"
                         )));
                     }
-                    if can_resume && self.state.session_id() != session_id {
+                    if requested_session_id
+                        .as_deref()
+                        .is_some_and(|requested| requested != session_id)
+                    {
                         return Err(SessionClientError::Protocol(
-                            "resume AttachOk session does not match requested session".to_string(),
+                            "AttachOk session does not match requested session".to_string(),
                         ));
                     }
                     self.granted_capabilities = granted_capabilities;
@@ -266,6 +315,7 @@ impl<T: FrontendTransport> SessionClient<T> {
                             "attach snapshot sequence does not match AttachOk".to_string(),
                         ));
                     }
+                    validate_snapshot_ids(&state)?;
                     self.state.apply_snapshot(state);
                     return Ok(());
                 }
@@ -319,6 +369,13 @@ impl<T: FrontendTransport> SessionClient<T> {
                         "snapshot session does not match attached session".to_string(),
                     ));
                 }
+                // Obsolete snapshots cannot affect the projection, so ignore
+                // them before structural validation. Equal-sequence snapshots
+                // remain authoritative rebases that can repair local drift.
+                if seq < self.state.last_seq() {
+                    return Ok(SessionClientOutcome::IgnoredDuplicate(seq));
+                }
+                validate_snapshot_ids(&state)?;
                 self.state.apply_snapshot(state);
                 Ok(SessionClientOutcome::AppliedSnapshot(seq))
             }
@@ -611,6 +668,82 @@ mod tests {
             frontend.granted_capabilities(),
             ClientCapability::Prompt
         ));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_rejects_unrequested_session_identity() {
+        let (server, client_transport) = in_memory_transport_pair(4, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "wrong-session".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        let error = frontend
+            .attach(Some("requested-session".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("AttachOk session does not match requested session"));
+        assert!(!frontend.is_attached());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_duplicate_canonical_snapshot_ids() {
+        let (server, client_transport) = in_memory_transport_pair(4, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            let mut invalid = snapshot("session-1", 0);
+            invalid.transcript = ["first", "second"]
+                .into_iter()
+                .map(|text| crate::session_protocol::TranscriptEntry {
+                    id: 1,
+                    role: crate::session_protocol::TranscriptRole::User,
+                    text: text.to_string(),
+                    outcome: None,
+                })
+                .collect();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: invalid,
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        let error = frontend.attach(None).await.unwrap_err();
+        assert!(error.to_string().contains("duplicate transcript id"));
+        assert!(!frontend.is_attached());
         server_task.await.unwrap();
     }
 
@@ -991,6 +1124,195 @@ mod tests {
             Err(SessionClientError::Protocol(_))
         ));
         assert_eq!(frontend.state().session_id(), "session-1");
+        assert!(!frontend.is_attached());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_midstream_snapshot_cannot_rewind_sequence() {
+        let (server, client_transport) = in_memory_transport_pair(8, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("session-1", 0),
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Event {
+                    seq: 1,
+                    event: SessionEvent::UserMessage {
+                        text: "new".to_string(),
+                        request_id: None,
+                    },
+                })
+                .await
+                .unwrap();
+            let mut stale = snapshot("session-1", 0);
+            stale.transcript = ["obsolete-a", "obsolete-b"]
+                .into_iter()
+                .map(|text| crate::session_protocol::TranscriptEntry {
+                    id: 1,
+                    role: crate::session_protocol::TranscriptRole::User,
+                    text: text.to_string(),
+                    outcome: None,
+                })
+                .collect();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: stale,
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            frontend.receive().await.unwrap(),
+            SessionClientOutcome::AppliedEvent(1)
+        );
+        assert_eq!(
+            frontend.receive().await.unwrap(),
+            SessionClientOutcome::IgnoredDuplicate(0)
+        );
+        assert_eq!(frontend.state().last_seq(), 1);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn equal_sequence_snapshot_canonically_rebases_view() {
+        let (server, client_transport) = in_memory_transport_pair(8, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("session-1", 0),
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Event {
+                    seq: 1,
+                    event: SessionEvent::UserMessage {
+                        text: "provisional".to_string(),
+                        request_id: None,
+                    },
+                })
+                .await
+                .unwrap();
+            let mut canonical = snapshot("session-1", 1);
+            canonical
+                .transcript
+                .push(crate::session_protocol::TranscriptEntry {
+                    id: 7,
+                    role: crate::session_protocol::TranscriptRole::Assistant,
+                    text: "canonical".to_string(),
+                    outcome: None,
+                });
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 1,
+                    state: canonical,
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            frontend.receive().await.unwrap(),
+            SessionClientOutcome::AppliedEvent(1)
+        );
+        assert_eq!(
+            frontend.receive().await.unwrap(),
+            SessionClientOutcome::AppliedSnapshot(1)
+        );
+        assert_eq!(frontend.state().transcript().len(), 1);
+        assert_eq!(frontend.state().transcript()[0].text, "canonical");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn midstream_snapshot_rejects_envelope_state_sequence_mismatch() {
+        let (server, client_transport) = in_memory_transport_pair(8, "daemon");
+        let server_task = tokio::spawn(async move {
+            let _ = server.recv().await.unwrap();
+            server
+                .send(&ServerMessage::AttachOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: "session-1".to_string(),
+                    granted_capabilities: vec![ClientCapability::Observe],
+                    seq: 0,
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 0,
+                    state: snapshot("session-1", 0),
+                })
+                .await
+                .unwrap();
+            server
+                .send(&ServerMessage::Snapshot {
+                    seq: 2,
+                    state: snapshot("session-1", 1),
+                })
+                .await
+                .unwrap();
+        });
+        let mut frontend = SessionClient::new(
+            client_transport,
+            client(),
+            vec![ClientCapability::Observe],
+            100,
+        );
+        frontend
+            .attach(Some("session-1".to_string()))
+            .await
+            .unwrap();
+        let error = frontend.receive().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot envelope sequence does not match state"));
         assert!(!frontend.is_attached());
         server_task.await.unwrap();
     }
