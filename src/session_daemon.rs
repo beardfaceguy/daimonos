@@ -27,13 +27,27 @@ pub enum SessionOpenMode {
     Load,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOpenError {
+    NotFound,
+    UnsafeId,
+    FutureVersion,
+    UnsupportedVersion,
+    Corrupt,
+    Permission,
+    Io,
+    WorkspaceUnknown,
+    WorkspaceMismatch,
+    Internal,
+}
+
 #[async_trait::async_trait]
 pub trait SessionFactory: Send + Sync {
     async fn open(
         &self,
         session_id: &str,
         mode: SessionOpenMode,
-    ) -> Result<Arc<SessionCore>, String>;
+    ) -> Result<Arc<SessionCore>, SessionOpenError>;
 
     async fn scan_persisted_summaries(
         &self,
@@ -69,7 +83,7 @@ pub enum SessionDaemonError {
     ClientLimitReached { max: usize },
     EventSubscription(String),
     FactoryUnavailable,
-    OpenFailed(String),
+    OpenFailed(SessionOpenError),
     ShuttingDown,
 }
 
@@ -3014,6 +3028,32 @@ mod tests {
         session_protocol::{ClientMessage, ProtocolLimits, ServerMessage},
     };
 
+    #[test]
+    fn typed_open_failures_keep_wire_diagnostics_privacy_safe() {
+        for error in [
+            SessionOpenError::NotFound,
+            SessionOpenError::UnsafeId,
+            SessionOpenError::FutureVersion,
+            SessionOpenError::UnsupportedVersion,
+            SessionOpenError::Corrupt,
+            SessionOpenError::Permission,
+            SessionOpenError::Io,
+            SessionOpenError::WorkspaceUnknown,
+            SessionOpenError::WorkspaceMismatch,
+            SessionOpenError::Internal,
+        ] {
+            let daemon_error = SessionDaemonError::OpenFailed(error);
+            assert_eq!(
+                session_daemon_error_message(&daemon_error),
+                "session could not be opened"
+            );
+            assert_eq!(
+                session_daemon_error_code(&daemon_error),
+                AttachDeniedCode::SessionOpenFailed
+            );
+        }
+    }
+
     struct StaticProvider;
 
     #[async_trait::async_trait]
@@ -3061,7 +3101,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             Ok(test_core())
         }
     }
@@ -3072,7 +3112,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             Ok(test_core())
         }
 
@@ -3098,7 +3138,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             Ok(test_core())
         }
 
@@ -3149,7 +3189,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             Ok(test_core())
         }
 
@@ -3195,7 +3235,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             self.started.notify_one();
             self.release.notified().await;
             Ok(test_core())
@@ -3208,7 +3248,7 @@ mod tests {
             &self,
             _session_id: &str,
             _mode: SessionOpenMode,
-        ) -> Result<Arc<SessionCore>, String> {
+        ) -> Result<Arc<SessionCore>, SessionOpenError> {
             self.opens.fetch_add(1, Ordering::Relaxed);
             Ok(test_core())
         }

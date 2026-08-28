@@ -15,11 +15,13 @@ use crate::session_core::{
     ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventRouter,
     SessionPersistence,
 };
-use crate::session_daemon::{SessionFactory, SessionOpenMode};
+use crate::session_daemon::{SessionFactory, SessionOpenError, SessionOpenMode};
 use crate::session_protocol::{
     RuntimeChoice, RuntimeOption, RuntimeValue, SessionEvent, SessionWorkspace,
 };
-use crate::session_store::{SessionStore, SessionSummaryScan};
+use crate::session_store::{
+    SessionStore, SessionStoreError, SessionStoreErrorKind, SessionSummaryScan,
+};
 use sha2::{Digest, Sha256};
 
 pub type ProviderFactory =
@@ -94,25 +96,27 @@ impl SessionFactory for AgentSessionFactory {
         &self,
         session_id: &str,
         mode: SessionOpenMode,
-    ) -> Result<Arc<SessionCore>, String> {
+    ) -> Result<Arc<SessionCore>, SessionOpenError> {
         let persisted = match mode {
             SessionOpenMode::Create => None,
-            SessionOpenMode::Load => Some(
-                self.store
-                    .load(session_id)
-                    .ok_or_else(|| format!("persisted session '{session_id}' was not found"))?,
-            ),
+            SessionOpenMode::Load => Some(self.store.load_result(session_id).map_err(|error| {
+                log_load_error(session_id, &error);
+                session_open_error(error.kind())
+            })?),
         };
-        if persisted.as_ref().is_some_and(|record| {
-            record
+        if let Some(record) = persisted.as_ref() {
+            let cwd = record
                 .cwd
                 .as_deref()
-                .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-                .is_none_or(|cwd| cwd != self.workspace)
-        }) {
-            return Err(format!(
-                "persisted session '{session_id}' belongs to a different workspace"
-            ));
+                .ok_or(SessionOpenError::WorkspaceUnknown)?;
+            let canonical_cwd = std::fs::canonicalize(cwd).map_err(|error| {
+                let store_error = SessionStoreError::Io(error);
+                log_load_error(session_id, &store_error);
+                session_open_error(store_error.kind())
+            })?;
+            if canonical_cwd != self.workspace {
+                return Err(SessionOpenError::WorkspaceMismatch);
+            }
         }
         let workspace = self.workspace.clone();
         let model = persisted
@@ -135,7 +139,15 @@ impl SessionFactory for AgentSessionFactory {
                 }
             })
             .unwrap_or_else(|| self.thinking.clone());
-        let provider = (self.make_provider)()?;
+        let provider = (self.make_provider)().map_err(|_error| {
+            tracing::error!(
+                target: "daimonos::session_factory",
+                event = "session_provider_create_failed",
+                session_id,
+                "provider creation failed while opening session"
+            );
+            SessionOpenError::Internal
+        })?;
         let events = Arc::new(SessionEventRouter::new_with_replay(
             None,
             self.config.session.replay_events,
@@ -273,13 +285,27 @@ impl SessionFactory for AgentSessionFactory {
                 max_entries,
                 std::time::Instant::now() + max_duration,
             );
+            let mut workspace_complete = true;
             scan.summaries.retain(|summary| {
-                summary
-                    .cwd
-                    .as_deref()
-                    .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-                    .is_some_and(|cwd| cwd == workspace)
+                let Some(cwd) = summary.cwd.as_deref() else {
+                    return false;
+                };
+                match std::fs::canonicalize(cwd) {
+                    Ok(cwd) => cwd == workspace,
+                    Err(error) => {
+                        workspace_complete = false;
+                        tracing::warn!(
+                            target: "daimonos::session_factory",
+                            event = "session_summary_workspace_failed",
+                            session_id = %summary.id,
+                            error = %error,
+                            "persisted session workspace could not be resolved"
+                        );
+                        false
+                    }
+                }
             });
+            scan.complete &= workspace_complete;
             scan
         })
         .await
@@ -295,7 +321,7 @@ impl SessionFactory for AgentSessionFactory {
         tokio::task::spawn_blocking(move || {
             session_ids
                 .into_iter()
-                .filter(|session_id| store.load(session_id).is_none())
+                .filter(|session_id| persisted_id_is_missing(&store, session_id))
                 .collect()
         })
         .await
@@ -305,6 +331,45 @@ impl SessionFactory for AgentSessionFactory {
     fn workspace_identity(&self) -> Option<SessionWorkspace> {
         Some(self.workspace_identity.clone())
     }
+}
+
+impl From<SessionStoreErrorKind> for SessionOpenError {
+    fn from(kind: SessionStoreErrorKind) -> Self {
+        match kind {
+            SessionStoreErrorKind::UnsafeId => Self::UnsafeId,
+            SessionStoreErrorKind::NotFound => Self::NotFound,
+            SessionStoreErrorKind::FutureVersion => Self::FutureVersion,
+            SessionStoreErrorKind::UnsupportedVersion => Self::UnsupportedVersion,
+            SessionStoreErrorKind::Corrupt => Self::Corrupt,
+            SessionStoreErrorKind::Permission => Self::Permission,
+            SessionStoreErrorKind::Io => Self::Io,
+        }
+    }
+}
+
+fn session_open_error(kind: SessionStoreErrorKind) -> SessionOpenError {
+    kind.into()
+}
+
+fn persisted_id_is_missing(store: &SessionStore, session_id: &str) -> bool {
+    matches!(
+        store.load_result(session_id),
+        Err(SessionStoreError::NotFound | SessionStoreError::UnsafeId)
+    )
+}
+
+fn log_load_error(session_id: &str, error: &SessionStoreError) {
+    if error.kind() == SessionStoreErrorKind::NotFound {
+        return;
+    }
+    tracing::warn!(
+        target: "daimonos::session_factory",
+        event = "persisted_session_open_failed",
+        session_id,
+        error_kind = ?error.kind(),
+        error = %error,
+        "persisted session could not be opened"
+    );
 }
 
 pub(crate) fn canonical_session_workspace(
@@ -559,5 +624,48 @@ mod tests {
         assert!(snapshot.runtime_options.iter().any(|option| {
             option.id == "thinking" && option.value == RuntimeValue::String("medium".to_string())
         }));
+
+        assert!(matches!(
+            factory.open("foreign-session", SessionOpenMode::Load).await,
+            Err(SessionOpenError::WorkspaceMismatch)
+        ));
+        std::fs::write(
+            directory.path().join("sessions").join("corrupt.json"),
+            b"{not-json",
+        )
+        .unwrap();
+        assert!(matches!(
+            factory.open("corrupt", SessionOpenMode::Load).await,
+            Err(SessionOpenError::Corrupt)
+        ));
+        assert!(matches!(
+            factory.open("missing", SessionOpenMode::Load).await,
+            Err(SessionOpenError::NotFound)
+        ));
+
+        store.save("workspace-unknown", "saved-model", &[]);
+        assert!(matches!(
+            factory
+                .open("workspace-unknown", SessionOpenMode::Load)
+                .await,
+            Err(SessionOpenError::WorkspaceUnknown)
+        ));
+        store.save_acp(
+            "workspace-unavailable",
+            "saved-model",
+            "medium",
+            &[],
+            &directory.path().join("removed-workspace"),
+            &[],
+            &[],
+        );
+        assert!(matches!(
+            factory
+                .open("workspace-unavailable", SessionOpenMode::Load)
+                .await,
+            Err(SessionOpenError::Io)
+        ));
+        assert!(persisted_id_is_missing(&store, "../../unsafe"));
+        assert!(!persisted_id_is_missing(&store, "corrupt"));
     }
 }
