@@ -16,6 +16,75 @@ use crate::session_protocol::AssistantOutcome;
 /// change can be detected and old files ignored rather than mis-parsed.
 pub const SESSION_PERSIST_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStoreErrorKind {
+    UnsafeId,
+    NotFound,
+    FutureVersion,
+    UnsupportedVersion,
+    Corrupt,
+    Permission,
+    Io,
+}
+
+#[derive(Debug)]
+pub enum SessionStoreError {
+    UnsafeId,
+    NotFound,
+    FutureVersion { found: u32, supported: u32 },
+    UnsupportedVersion { found: u32, supported: u32 },
+    Corrupt(serde_json::Error),
+    Io(std::io::Error),
+}
+
+impl SessionStoreError {
+    pub fn kind(&self) -> SessionStoreErrorKind {
+        match self {
+            Self::UnsafeId => SessionStoreErrorKind::UnsafeId,
+            Self::NotFound => SessionStoreErrorKind::NotFound,
+            Self::FutureVersion { .. } => SessionStoreErrorKind::FutureVersion,
+            Self::UnsupportedVersion { .. } => SessionStoreErrorKind::UnsupportedVersion,
+            Self::Corrupt(_) => SessionStoreErrorKind::Corrupt,
+            Self::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                SessionStoreErrorKind::Permission
+            }
+            Self::Io(_) => SessionStoreErrorKind::Io,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsafeId => formatter.write_str("session id is not a safe path component"),
+            Self::NotFound => formatter.write_str("persisted session was not found"),
+            Self::FutureVersion { found, supported } => write!(
+                formatter,
+                "persisted session version {found} is newer than supported version {supported}"
+            ),
+            Self::UnsupportedVersion { found, supported } => write!(
+                formatter,
+                "persisted session version {found} is older than supported version {supported}"
+            ),
+            Self::Corrupt(error) => write!(formatter, "persisted session JSON is invalid: {error}"),
+            Self::Io(error) => write!(formatter, "session store I/O failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Corrupt(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::UnsafeId
+            | Self::NotFound
+            | Self::FutureVersion { .. }
+            | Self::UnsupportedVersion { .. } => None,
+        }
+    }
+}
+
 /// One session's on-disk record: enough to rebuild a conversation (history +
 /// the model it was on).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,13 +305,36 @@ impl SessionStore {
         std::fs::metadata(path)?.modified()
     }
 
-    /// Load a persisted session, or `None` if absent / unreadable / a version
-    /// we don't recognise (all treated as "not resumable", never an error).
+    pub fn load_result(&self, id: &str) -> Result<PersistedSession, SessionStoreError> {
+        let name = Self::file_name(id).ok_or(SessionStoreError::UnsafeId)?;
+        let bytes = std::fs::read(self.dir.join(name)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SessionStoreError::NotFound
+            } else {
+                SessionStoreError::Io(error)
+            }
+        })?;
+        decode_persisted_session(&bytes)
+    }
+
+    /// Compatibility projection for chat/ACP callers that still treat every
+    /// load failure as not resumable. Non-absence failures retain raw detail in
+    /// structured logs; daemon loading uses [`Self::load_result`] directly.
     pub fn load(&self, id: &str) -> Option<PersistedSession> {
-        let name = Self::file_name(id)?;
-        let bytes = std::fs::read(self.dir.join(name)).ok()?;
-        let record: PersistedSession = serde_json::from_slice(&bytes).ok()?;
-        (record.version == SESSION_PERSIST_VERSION).then_some(record)
+        match self.load_result(id) {
+            Ok(record) => Some(record),
+            Err(SessionStoreError::NotFound | SessionStoreError::UnsafeId) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "daimonos::session_store",
+                    event = "session_load_failed",
+                    error_kind = ?error.kind(),
+                    error = %error,
+                    "persisted session could not be loaded"
+                );
+                None
+            }
+        }
     }
 
     /// Delete a persisted session. Missing and unsafe ids are treated as
@@ -267,13 +359,23 @@ impl SessionStore {
     /// Listing variant whose normalized first-user preview is UTF-8 byte
     /// bounded before it leaves the blocking store scan.
     pub fn list_with_preview_limit(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                log_store_error("session_list_failed", &SessionStoreError::Io(error));
+                return Vec::new();
+            }
         };
         let mut rows: Vec<(std::time::SystemTime, SessionSummary)> = Vec::new();
-        for entry in entries.flatten() {
-            if let Some(row) = summary_from_path(entry.path(), max_preview_bytes) {
-                rows.push(row);
+        for entry in entries {
+            match entry
+                .map_err(SessionStoreError::Io)
+                .and_then(|entry| summary_from_path(entry.path(), max_preview_bytes))
+            {
+                Ok(Some(row)) => rows.push(row),
+                Ok(None) => {}
+                Err(error) => log_store_error("session_list_entry_failed", &error),
             }
         }
         rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
@@ -294,12 +396,23 @@ impl SessionStore {
         max_entries: usize,
         deadline: std::time::Instant,
     ) -> SessionSummaryScan {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return SessionSummaryScan {
-                summaries: Vec::new(),
-                next_cursor: None,
-                complete: true,
-            };
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SessionSummaryScan {
+                    summaries: Vec::new(),
+                    next_cursor: None,
+                    complete: true,
+                };
+            }
+            Err(error) => {
+                log_store_error("session_scan_failed", &SessionStoreError::Io(error));
+                return SessionSummaryScan {
+                    summaries: Vec::new(),
+                    next_cursor: None,
+                    complete: false,
+                };
+            }
         };
         let max_entries = max_entries.max(1);
         let mut names = std::collections::BTreeMap::new();
@@ -309,8 +422,13 @@ impl SessionStore {
                 walk_complete = false;
                 break;
             }
-            let Ok(entry) = entry else {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    walk_complete = false;
+                    log_store_error("session_scan_entry_failed", &SessionStoreError::Io(error));
+                    continue;
+                }
             };
             let name = entry.file_name();
             let Some(name_text) = name.to_str() else {
@@ -331,10 +449,18 @@ impl SessionStore {
         let next_cursor = has_more
             .then(|| names.last_key_value().map(|(name, _)| name.clone()))
             .flatten();
-        let mut rows = names
-            .into_values()
-            .filter_map(|path| summary_from_path(path, max_preview_bytes))
-            .collect::<Vec<_>>();
+        let mut payload_complete = true;
+        let mut rows = Vec::new();
+        for path in names.into_values() {
+            match summary_from_path(path, max_preview_bytes) {
+                Ok(Some(row)) => rows.push(row),
+                Ok(None) => {}
+                Err(error) => {
+                    payload_complete = false;
+                    log_store_error("session_scan_payload_failed", &error);
+                }
+            }
+        }
         rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
             b_time
                 .cmp(a_time)
@@ -343,7 +469,7 @@ impl SessionStore {
         SessionSummaryScan {
             summaries: rows.into_iter().map(|(_, summary)| summary).collect(),
             next_cursor,
-            complete: !has_more,
+            complete: !has_more && payload_complete,
         }
     }
 }
@@ -351,19 +477,23 @@ impl SessionStore {
 fn summary_from_path(
     path: PathBuf,
     max_preview_bytes: usize,
-) -> Option<(std::time::SystemTime, SessionSummary)> {
+) -> Result<Option<(std::time::SystemTime, SessionSummary)>, SessionStoreError> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-        return None;
+        return Ok(None);
     }
-    let bytes = std::fs::read(&path).ok()?;
-    let record = serde_json::from_slice::<PersistedSession>(&bytes).ok()?;
-    if record.version != SESSION_PERSIST_VERSION {
-        return None;
-    }
-    let modified = std::fs::metadata(&path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(std::time::UNIX_EPOCH);
-    Some((
+    let bytes = std::fs::read(&path).map_err(SessionStoreError::Io)?;
+    let record = decode_persisted_session(&bytes)?;
+    let modified = match std::fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified,
+        Err(error) => {
+            log_store_error(
+                "session_summary_timestamp_failed",
+                &SessionStoreError::Io(error),
+            );
+            std::time::UNIX_EPOCH
+        }
+    };
+    Ok(Some((
         modified,
         SessionSummary {
             id: record.session_id,
@@ -373,7 +503,35 @@ fn summary_from_path(
             updated_at: Some(modified),
             first_user_line: first_user_preview(&record.messages, max_preview_bytes),
         },
-    ))
+    )))
+}
+
+fn decode_persisted_session(bytes: &[u8]) -> Result<PersistedSession, SessionStoreError> {
+    let record: PersistedSession =
+        serde_json::from_slice(bytes).map_err(SessionStoreError::Corrupt)?;
+    if record.version > SESSION_PERSIST_VERSION {
+        return Err(SessionStoreError::FutureVersion {
+            found: record.version,
+            supported: SESSION_PERSIST_VERSION,
+        });
+    }
+    if record.version != SESSION_PERSIST_VERSION {
+        return Err(SessionStoreError::UnsupportedVersion {
+            found: record.version,
+            supported: SESSION_PERSIST_VERSION,
+        });
+    }
+    Ok(record)
+}
+
+fn log_store_error(event: &'static str, error: &SessionStoreError) {
+    tracing::warn!(
+        target: "daimonos::session_store",
+        event = event,
+        error_kind = ?error.kind(),
+        error = %error,
+        "session store operation skipped an entry"
+    );
 }
 
 fn system_time_unix_ns(time: std::time::SystemTime) -> u64 {
@@ -515,6 +673,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         assert!(store.load("never-saved").is_none());
+        assert_eq!(
+            store.load_result("never-saved").unwrap_err().kind(),
+            SessionStoreErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -525,6 +687,10 @@ mod tests {
         // load returns None rather than reading outside the store dir.
         store.save("../../etc/passwd", "m", &msgs());
         assert!(store.load("../../etc/passwd").is_none());
+        assert_eq!(
+            store.load_result("../../etc/passwd").unwrap_err().kind(),
+            SessionStoreErrorKind::UnsafeId
+        );
     }
 
     #[test]
@@ -547,6 +713,52 @@ mod tests {
             store.load("future").is_none(),
             "an unrecognized version must not be loaded"
         );
+        assert_eq!(
+            store.load_result("future").unwrap_err().kind(),
+            SessionStoreErrorKind::FutureVersion
+        );
+    }
+
+    #[test]
+    fn corrupt_and_io_failures_remain_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("corrupt.json"), b"{not-json").unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        assert_eq!(
+            store.load_result("corrupt").unwrap_err().kind(),
+            SessionStoreErrorKind::Corrupt
+        );
+
+        let not_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"x").unwrap();
+        let invalid_store = SessionStore::new(not_directory);
+        assert_eq!(
+            invalid_store.load_result("session").unwrap_err().kind(),
+            SessionStoreErrorKind::Io
+        );
+        assert_eq!(
+            SessionStoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .kind(),
+            SessionStoreErrorKind::Permission
+        );
+    }
+
+    #[test]
+    fn bounded_scan_marks_corrupt_payloads_incomplete_without_exposing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("valid", "model", &msgs());
+        std::fs::write(dir.path().join("corrupt.json"), b"{not-json").unwrap();
+
+        let scan = store.scan_summaries(
+            64,
+            None,
+            10,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(!scan.complete);
+        assert_eq!(scan.summaries.len(), 1);
+        assert_eq!(scan.summaries[0].id, "valid");
     }
 
     #[test]
