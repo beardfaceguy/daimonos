@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::oneshot;
 
@@ -561,9 +561,33 @@ pub struct SessionPersistence {
     catalog_writer: Option<Arc<crate::session_catalog::SessionCatalogWriter>>,
 }
 
+#[derive(Debug, Clone)]
+struct PersistenceCapture {
+    /// Core-local capture order used exclusively for latest-wins admission.
+    generation: u64,
+    /// Core-local event coverage watermark. It may understate captured state
+    /// and never participates in latest-wins admission.
+    through_seq: u64,
+    model: String,
+    thinking: String,
+    messages: Vec<Message>,
+    cwd: PathBuf,
+    client_user_message_ids: Vec<String>,
+    assistant_outcomes: Vec<AssistantOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceSaveOutcome {
+    Saved,
+    SkippedDeleted,
+    SkippedStale,
+}
+
 #[derive(Default)]
 struct SessionPersistenceState {
     deleted: bool,
+    /// Valid only for this SessionPersistence/core lifetime and never persisted.
+    last_saved_generation: Option<u64>,
 }
 
 impl SessionPersistence {
@@ -584,49 +608,52 @@ impl SessionPersistence {
         self
     }
 
-    fn save(
-        &self,
-        model: &str,
-        thinking: &str,
-        messages: &[Message],
-        cwd: &Path,
-        client_user_message_ids: &[String],
-        assistant_outcomes: &[AssistantOutcome],
-    ) {
-        let state = self
+    fn save(&self, capture: &PersistenceCapture) -> std::io::Result<PersistenceSaveOutcome> {
+        // The state lock intentionally spans check + blocking write + watermark
+        // update. This makes stale admission atomic and serializes delete;
+        // callers release all SessionCore capture locks before entering here.
+        // Production retries must recapture current state rather than reuse a
+        // failed capture; task 1406 owns that retry loop.
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.deleted {
-            return;
+            return Ok(PersistenceSaveOutcome::SkippedDeleted);
+        }
+        if state
+            .last_saved_generation
+            .is_some_and(|last_saved_generation| capture.generation < last_saved_generation)
+        {
+            tracing::debug!(
+                target: "daimonos::session_core",
+                event = "session_payload_stale_capture_skipped",
+                generation = capture.generation,
+                through_seq = capture.through_seq,
+                last_saved_generation = ?state.last_saved_generation,
+            );
+            return Ok(PersistenceSaveOutcome::SkippedStale);
         }
         let max_preview_bytes = self
             .catalog_writer
             .as_ref()
             .map(|writer| writer.max_preview_bytes())
             .unwrap_or(usize::MAX);
-        match self.store.save_acp_result(
+        let write = self.store.save_acp_result(
             &self.session_id,
-            model,
-            thinking,
-            messages,
-            cwd,
-            client_user_message_ids,
-            assistant_outcomes,
+            &capture.model,
+            &capture.thinking,
+            &capture.messages,
+            &capture.cwd,
+            &capture.client_user_message_ids,
+            &capture.assistant_outcomes,
             max_preview_bytes,
-        ) {
-            Ok(write) => {
-                if let Some(writer) = &self.catalog_writer {
-                    writer.enqueue_saved(write);
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "session store: failed to persist session {}: {error}",
-                    self.session_id
-                );
-            }
+        )?;
+        state.last_saved_generation = Some(capture.generation);
+        if let Some(writer) = &self.catalog_writer {
+            writer.enqueue_saved(write);
         }
+        Ok(PersistenceSaveOutcome::Saved)
     }
 
     fn delete(&self) -> std::io::Result<bool> {
@@ -680,6 +707,7 @@ pub struct SessionCore {
     pub(crate) tool_lifecycle: Arc<CanonicalToolLifecycle>,
     runtime_options: StdMutex<Vec<RuntimeOption>>,
     current_context_usage: StdMutex<Option<ContextUsage>>,
+    persistence_generation: AtomicU64,
     persistence: Option<SessionPersistence>,
 }
 
@@ -773,7 +801,7 @@ impl SessionCore {
         let changed = history_changed || outcomes_changed;
         let context_window = self.context_windows.lock().await.get(&model).copied();
 
-        self.persist(&model, &[], &[]);
+        self.persist_current().await;
         let _ = self.events.emit(SessionEvent::ConversationCleared);
         self.publish_context_usage(self.context_usage(0, context_window));
         Ok(changed)
@@ -822,6 +850,7 @@ impl SessionCore {
             tool_lifecycle,
             runtime_options: StdMutex::new(Vec::new()),
             current_context_usage: StdMutex::new(None),
+            persistence_generation: AtomicU64::new(0),
             persistence,
         }
     }
@@ -881,8 +910,7 @@ impl SessionCore {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = model.clone();
                 drop(session);
-                let client_ids = self.client_user_message_ids.lock().await.clone();
-                self.persist(model, &history, &client_ids);
+                self.persist_current().await;
                 // Changing models does not change the conversation bytes. Keep
                 // the last provider-observed occupancy as the best available
                 // count, but recompute reservation/utilization against the new
@@ -905,15 +933,12 @@ impl SessionCore {
                     ThinkingLevel::from_input(level).map_err(RuntimeConfigError::ApplyFailed)?;
                 let mut session = self.session.lock().await;
                 session.set_thinking(thinking.clone());
-                let model = session.model().to_string();
-                let history = session.history().to_vec();
                 *self
                     .current_thinking
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = thinking;
                 drop(session);
-                let client_ids = self.client_user_message_ids.lock().await.clone();
-                self.persist(&model, &history, &client_ids);
+                self.persist_current().await;
             }
             _ => return Err(RuntimeConfigError::UnsupportedOption),
         }
@@ -1010,25 +1035,88 @@ impl SessionCore {
             .emit(SessionEvent::ContextUsageChanged { usage });
     }
 
-    pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
-        if let Some(persistence) = &self.persistence {
-            let thinking = self
-                .current_thinking
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let outcomes = self
-                .assistant_outcomes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            persistence.save(
-                model,
-                thinking.as_str(),
-                messages,
-                &self.cwd,
-                client_user_message_ids,
-                &outcomes,
+    /// Phase one samples the router, then captures a payload under the
+    /// canonical lock order: AgentSession -> client ids -> outcome/thinking.
+    /// No awaits occur after taking a standard mutex, and event handlers must
+    /// never acquire these state locks. Sampling the monotonic sequence first
+    /// means the watermark may understate newer captured state but can never
+    /// claim an event that the payload snapshot predates. State-only mutations
+    /// may share a watermark; the generation minted while holding these locks
+    /// still gives their payload snapshots a total write order. The atomic
+    /// permits test-only synthetic captures; production correctness requires
+    /// minting while this complete lock set is held.
+    async fn capture_persistence(&self) -> Option<PersistenceCapture> {
+        self.persistence.as_ref()?;
+        let through_seq = self.events.latest_sequence();
+        let session = self.session.lock().await;
+        let client_user_message_ids = self.client_user_message_ids.lock().await;
+        let assistant_outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let thinking = self
+            .current_thinking
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self.persistence_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Some(PersistenceCapture {
+            generation,
+            through_seq,
+            model: session.model().to_string(),
+            thinking: thinking.as_str().to_string(),
+            messages: session.history().to_vec(),
+            cwd: self.cwd.clone(),
+            client_user_message_ids: client_user_message_ids.clone(),
+            assistant_outcomes: assistant_outcomes.clone(),
+        })
+    }
+
+    pub(crate) async fn persist_current(&self) {
+        let Some(capture) = self.capture_persistence().await else {
+            return;
+        };
+        // Every capture guard is dropped before phase two acquires
+        // SessionPersistence.state and performs blocking I/O.
+        self.persist_capture(&capture);
+    }
+
+    fn persist_capture(&self, capture: &PersistenceCapture) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        if let Err(error) = persistence.save(capture) {
+            // Task 1406 replaces this dropped capture with bounded recapture
+            // and retry for retryable failures.
+            tracing::warn!(
+                target: "daimonos::session_core",
+                event = "session_payload_save_failed",
+                error = %error,
+                "session payload could not be persisted"
             );
         }
+    }
+
+    #[cfg(test)]
+    /// Synthetic fixture hook; intentionally bypasses canonical capture locks.
+    pub fn persist(&self, model: &str, messages: &[Message], client_user_message_ids: &[String]) {
+        let thinking = self
+            .current_thinking
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_capture(&PersistenceCapture {
+            generation: self.persistence_generation.fetch_add(1, Ordering::AcqRel) + 1,
+            through_seq: self.events.latest_sequence(),
+            model: model.to_string(),
+            thinking: thinking.as_str().to_string(),
+            messages: messages.to_vec(),
+            cwd: self.cwd.clone(),
+            client_user_message_ids: client_user_message_ids.to_vec(),
+            assistant_outcomes: outcomes.clone(),
+        });
     }
 
     pub fn delete_persisted(&self) -> std::io::Result<bool> {
@@ -1258,16 +1346,13 @@ impl SessionCore {
             }
         }
 
-        let history_snapshot = turn.as_ref().map(|_| agent_session.history().to_vec());
+        let should_persist = turn.is_some();
         let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
-        let client_ids_snapshot = if turn.is_some() {
+        if turn.is_some() {
             let mut client_ids = self.client_user_message_ids.lock().await;
             client_ids.push(client_user_message_id.unwrap_or_default());
             align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
-            Some(client_ids.clone())
-        } else {
-            None
-        };
+        }
         if turn.is_some() {
             let completed_before_current = agent_session.user_turn_count().saturating_sub(1);
             let mut outcomes = self
@@ -1294,8 +1379,8 @@ impl SessionCore {
                 .push(outcome.clone());
             let _ = self.events.emit(SessionEvent::AssistantDone { outcome });
         }
-        if let (Some(messages), Some(client_ids)) = (history_snapshot, client_ids_snapshot) {
-            self.persist(&model, &messages, &client_ids);
+        if should_persist {
+            self.persist_current().await;
         }
         // Keep the active-turn permit through the terminal persistence write.
         // History mutations use this permit as their exclusion boundary, so
@@ -3831,6 +3916,23 @@ mod tests {
         );
     }
 
+    fn persistence_capture(
+        through_seq: u64,
+        cwd: &std::path::Path,
+        text: &str,
+    ) -> PersistenceCapture {
+        PersistenceCapture {
+            generation: through_seq,
+            through_seq,
+            model: "model".to_string(),
+            thinking: "medium".to_string(),
+            messages: vec![Message::user(text)],
+            cwd: cwd.to_path_buf(),
+            client_user_message_ids: Vec::new(),
+            assistant_outcomes: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn daemon_persistence_updates_and_tombstones_catalog() {
         let directory = tempfile::tempdir().unwrap();
@@ -3853,13 +3955,11 @@ mod tests {
         );
         let persistence =
             SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
-        persistence.save(
-            "model",
-            "medium",
-            &[Message::user("hello")],
-            directory.path(),
-            &["prompt-1".to_string()],
-            &[],
+        let mut capture = persistence_capture(1, directory.path(), "hello");
+        capture.client_user_message_ids = vec!["prompt-1".to_string()];
+        assert_eq!(
+            persistence.save(&capture).unwrap(),
+            PersistenceSaveOutcome::Saved
         );
         assert!(
             writer
@@ -3877,6 +3977,69 @@ mod tests {
                 .await
         );
         assert!(writer.catalog().row("session-1").unwrap().unwrap().deleted);
+    }
+
+    #[test]
+    fn persistence_writer_rejects_lower_generation_and_orders_equal_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new("session-1", store.clone());
+
+        assert_eq!(
+            persistence
+                .save(&persistence_capture(2, directory.path(), "newer"))
+                .unwrap(),
+            PersistenceSaveOutcome::Saved
+        );
+        assert_eq!(
+            persistence
+                .save(&persistence_capture(1, directory.path(), "stale"))
+                .unwrap(),
+            PersistenceSaveOutcome::SkippedStale
+        );
+        let loaded = store.load("session-1").unwrap();
+        assert!(matches!(
+            loaded.messages[0].content.as_slice(),
+            [crate::providers::ContentBlock::Text(text)] if text == "newer"
+        ));
+
+        let mut equal_sequence = persistence_capture(2, directory.path(), "equal");
+        equal_sequence.generation = 3;
+        assert_eq!(
+            persistence.save(&equal_sequence).unwrap(),
+            PersistenceSaveOutcome::Saved
+        );
+        let loaded = store.load("session-1").unwrap();
+        assert!(matches!(
+            loaded.messages[0].content.as_slice(),
+            [crate::providers::ContentBlock::Text(text)] if text == "equal"
+        ));
+    }
+
+    #[test]
+    fn failed_write_does_not_advance_sequence_watermark() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("not-a-directory");
+        std::fs::write(&store_path, b"file").unwrap();
+        let store = SessionStore::new(store_path.clone());
+        let persistence = SessionPersistence::new("session-1", store.clone());
+
+        assert!(persistence
+            .save(&persistence_capture(2, directory.path(), "failed"))
+            .is_err());
+        std::fs::remove_file(&store_path).unwrap();
+        std::fs::create_dir(&store_path).unwrap();
+        assert_eq!(
+            persistence
+                .save(&persistence_capture(1, directory.path(), "accepted"))
+                .unwrap(),
+            PersistenceSaveOutcome::Saved
+        );
+        let loaded = store.load("session-1").unwrap();
+        assert!(matches!(
+            loaded.messages[0].content.as_slice(),
+            [crate::providers::ContentBlock::Text(text)] if text == "accepted"
+        ));
     }
 
     #[tokio::test]
@@ -3903,14 +4066,9 @@ mod tests {
         );
         let persistence =
             SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
-        persistence.save(
-            "model",
-            "medium",
-            &[Message::user("hello")],
-            directory.path(),
-            &[],
-            &[],
-        );
+        assert!(persistence
+            .save(&persistence_capture(1, directory.path(), "hello"))
+            .is_err());
         assert!(
             writer
                 .wait_until_quiet(std::time::Duration::from_secs(1))
@@ -3956,13 +4114,15 @@ mod tests {
                 .await
         );
         assert!(writer.catalog().row("session-1").unwrap().unwrap().deleted);
-        persistence.save(
-            "model",
-            "medium",
-            &[Message::user("must not resurrect")],
-            directory.path(),
-            &[],
-            &[],
+        assert_eq!(
+            persistence
+                .save(&persistence_capture(
+                    2,
+                    directory.path(),
+                    "must not resurrect"
+                ))
+                .unwrap(),
+            PersistenceSaveOutcome::SkippedDeleted
         );
         assert!(store.load("session-1").is_none());
         assert!(

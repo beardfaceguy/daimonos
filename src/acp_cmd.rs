@@ -1857,14 +1857,16 @@ async fn run_acp_direct_command(
     }
 
     let response = run_acp_command(command, &mut agent_session);
-    let cleared_history = (command == AcpCommand::Clear).then(|| agent_session.history().to_vec());
+    let should_persist = command == AcpCommand::Clear;
     if command == AcpCommand::Clear {
         handle.core.client_user_message_ids.lock().await.clear();
     }
     drop(agent_session);
 
-    if let Some(messages) = cleared_history {
-        handle.core.persist(&model, &messages, &[]);
+    if should_persist {
+        // Keep the active-turn permit until the canonical recapture is durable,
+        // so clear cannot race another history-mutating turn.
+        handle.core.persist_current().await;
     }
     send_notification(
         cx,
@@ -2008,7 +2010,7 @@ async fn run_retry_turn(
         cleanup_cancelled_turn(handle, cx, session_id);
     }
 
-    let (stop_reason, history_snapshot) = match outcome {
+    let (stop_reason, should_persist) = match outcome {
         Some(Ok(turn)) => {
             let used_tokens = turn
                 .last_call_usage
@@ -2028,21 +2030,17 @@ async fn run_retry_turn(
                 &turn.last_call_usage,
                 cumulative_cost_usd,
             );
-            (
-                map_stop_reason(turn.stop_reason),
-                Some(agent_session.history().to_vec()),
-            )
+            (map_stop_reason(turn.stop_reason), true)
         }
         Some(Err(error)) => return Err(error),
-        None => (AcpStopReason::Cancelled, None),
+        None => (AcpStopReason::Cancelled, false),
     };
-    let client_ids = handle.core.client_user_message_ids.lock().await.clone();
     drop(agent_session);
-    drop(active_turn);
 
-    if let Some(messages) = history_snapshot {
-        handle.core.persist(&model, &messages, &client_ids);
+    if should_persist {
+        handle.core.persist_current().await;
     }
+    drop(active_turn);
     Ok(stop_reason)
 }
 
