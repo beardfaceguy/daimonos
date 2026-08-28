@@ -18,8 +18,26 @@ use crate::session_controller::{
     SessionControllerHandle,
 };
 use crate::session_protocol::{
-    AttachDeniedCode, RuntimeValue, SessionListEntry, SessionWorkspace, TurnStatus,
+    has_capability, AttachDeniedCode, ClientCapability, RuntimeValue, SessionListEntry,
+    SessionWorkspace, TurnStatus,
 };
+
+const REQUIRED_INTERACTIVE_CAPABILITIES: [ClientCapability; 5] = [
+    ClientCapability::Observe,
+    ClientCapability::Prompt,
+    ClientCapability::Interrupt,
+    ClientCapability::ApproveOnce,
+    ClientCapability::Configure,
+];
+
+fn missing_required_capabilities(
+    granted_capabilities: &[ClientCapability],
+) -> Vec<ClientCapability> {
+    REQUIRED_INTERACTIVE_CAPABILITIES
+        .into_iter()
+        .filter(|required| !has_capability(granted_capabilities, *required))
+        .collect()
+}
 
 pub type ControllerFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<SessionControllerHandle>> + Send + 'static>>;
@@ -65,6 +83,7 @@ struct ActiveSession {
     epoch: u64,
     state: ViewState,
     termination_reported: bool,
+    granted_capabilities: Vec<ClientCapability>,
 }
 
 enum CandidateAttachError {
@@ -169,13 +188,23 @@ impl TuiSession {
                     continue;
                 }
                 match event.event {
-                    SessionControllerEvent::Attached { state, .. } => {
+                    SessionControllerEvent::Attached {
+                        state,
+                        granted_capabilities,
+                    } => {
+                        let missing = missing_required_capabilities(&granted_capabilities);
+                        if !missing.is_empty() {
+                            return Err(CandidateAttachError::Other(format!(
+                                "missing_capability: interactive session requires {missing:?}"
+                            )));
+                        }
                         return Ok(Self {
                             active: ActiveSession {
                                 controller,
                                 epoch,
                                 state,
                                 termination_reported: false,
+                                granted_capabilities,
                             },
                             command_timeout,
                             controller_factory,
@@ -226,6 +255,17 @@ impl TuiSession {
 
     pub fn state_mut(&mut self) -> &mut ViewState {
         &mut self.active.state
+    }
+
+    pub fn has_capability(&self, capability: ClientCapability) -> bool {
+        has_capability(&self.active.granted_capabilities, capability)
+    }
+
+    pub fn allow_always_available(&self) -> bool {
+        self.state()
+            .active_approval()
+            .is_some_and(|request| request.allow_always_available)
+            && self.has_capability(ClientCapability::ApproveAlways)
     }
 
     pub fn take_session_list(&mut self) -> Option<TuiSessionList> {
@@ -601,15 +641,34 @@ impl TuiSession {
             return TuiSessionUpdate::Updated;
         }
         match event.event {
-            SessionControllerEvent::Attached { state, .. } => {
+            SessionControllerEvent::Attached {
+                state,
+                granted_capabilities,
+            } => {
+                let missing = missing_required_capabilities(&granted_capabilities);
+                if !missing.is_empty() {
+                    return TuiSessionUpdate::Failed(format!(
+                        "missing_capability: attached interactive session requires {missing:?}"
+                    ));
+                }
                 self.active.state = state;
+                self.active.granted_capabilities = granted_capabilities;
                 TuiSessionUpdate::Updated
             }
             SessionControllerEvent::Reconnected {
-                mut state, message, ..
+                mut state,
+                granted_capabilities,
+                message,
             } => {
+                let missing = missing_required_capabilities(&granted_capabilities);
+                if !missing.is_empty() {
+                    return TuiSessionUpdate::Failed(format!(
+                        "missing_capability: reconnected interactive session requires {missing:?}"
+                    ));
+                }
                 state.push_system_message(message);
                 self.active.state = state;
+                self.active.granted_capabilities = granted_capabilities;
                 self.sync_target = None;
                 self.clear_pending_operations();
                 TuiSessionUpdate::Updated
@@ -822,6 +881,21 @@ mod tests {
         }
     }
 
+    fn interactive_capabilities() -> Vec<ClientCapability> {
+        vec![
+            ClientCapability::Observe,
+            ClientCapability::Prompt,
+            ClientCapability::Configure,
+            ClientCapability::Interrupt,
+            ClientCapability::ApproveOnce,
+            ClientCapability::Stop,
+        ]
+    }
+
+    fn required_capabilities() -> Vec<ClientCapability> {
+        REQUIRED_INTERACTIVE_CAPABILITIES.to_vec()
+    }
+
     async fn accept_attach(server: &impl ClientTransport, session_id: &str) {
         let Some(ClientMessage::Attach { client, .. }) = server.recv().await.unwrap() else {
             panic!("expected attach");
@@ -831,12 +905,7 @@ mod tests {
             .send(&ServerMessage::AttachOk {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: session_id.to_string(),
-                granted_capabilities: vec![
-                    ClientCapability::Observe,
-                    ClientCapability::Prompt,
-                    ClientCapability::Configure,
-                    ClientCapability::Stop,
-                ],
+                granted_capabilities: interactive_capabilities(),
                 seq: 0,
             })
             .await
@@ -860,6 +929,99 @@ mod tests {
         accept_attach(&server, "daemon-session").await;
         let session = attach.await.unwrap().unwrap();
         assert_eq!(session.state().session_id(), "daemon-session");
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interactive_attach_reports_all_missing_required_capabilities() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        let Some(ClientMessage::Attach { .. }) = server.recv().await.unwrap() else {
+            panic!("expected attach");
+        };
+        server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-a".to_string(),
+                granted_capabilities: vec![ClientCapability::Observe],
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        server
+            .send(&ServerMessage::Snapshot {
+                seq: 0,
+                state: snapshot("session-a"),
+            })
+            .await
+            .unwrap();
+        let error = match attach.await.unwrap() {
+            Ok(_) => panic!("missing required capabilities must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing_capability"));
+        for capability in ["Prompt", "Interrupt", "ApproveOnce", "Configure"] {
+            assert!(error.contains(capability), "missing {capability}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_and_allow_always_are_optional_interactive_capabilities() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        let _ = server.recv().await.unwrap();
+        server
+            .send(&ServerMessage::AttachOk {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: "session-a".to_string(),
+                granted_capabilities: required_capabilities(),
+                seq: 0,
+            })
+            .await
+            .unwrap();
+        server
+            .send(&ServerMessage::Snapshot {
+                seq: 0,
+                state: snapshot("session-a"),
+            })
+            .await
+            .unwrap();
+        let session = attach.await.unwrap().unwrap();
+        assert!(!session.has_capability(ClientCapability::Stop));
+        assert!(!session.has_capability(ClientCapability::ApproveAlways));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn allow_always_requires_optional_grant_and_request_policy() {
+        let (server, controller) = controller();
+        let attach =
+            tokio::spawn(
+                async move { TuiSession::attach(controller, Duration::from_secs(1)).await },
+            );
+        accept_attach(&server, "session-a").await;
+        let mut session = attach.await.unwrap().unwrap();
+        session.state_mut().apply_event(
+            1,
+            SessionEvent::ApprovalRequested {
+                request: crate::session_protocol::ApprovalRequest {
+                    id: "approval".to_string(),
+                    tool_call_id: "tool".to_string(),
+                    tool: "exec".to_string(),
+                    detail: "cargo test".to_string(),
+                    allow_always_available: true,
+                    ineligible_deadline_unix_ms: None,
+                    deadline_paused: false,
+                },
+            },
+        );
+        assert!(!session.allow_always_available());
         session.shutdown().await;
     }
 
@@ -1133,12 +1295,39 @@ mod tests {
             epoch: session.active.epoch,
             event: SessionControllerEvent::Reconnected {
                 state,
-                granted_capabilities: vec![ClientCapability::Observe],
+                granted_capabilities: interactive_capabilities(),
                 message: "reconnected".to_string(),
             },
         });
         assert!(session.pending_operations.is_empty());
         assert_eq!(session.sync_target, None);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_required_grant_preserves_previous_state_and_capabilities() {
+        let (server, controller) = controller();
+        let mut session = attach_switching(
+            controller,
+            &server,
+            "session-a",
+            controller_factory(Vec::new()),
+        )
+        .await;
+        let update = session.apply(EpochEvent {
+            epoch: session.active.epoch,
+            event: SessionControllerEvent::Reconnected {
+                state: ViewState::new("replacement"),
+                granted_capabilities: vec![ClientCapability::Observe],
+                message: "reconnected without control".to_string(),
+            },
+        });
+        assert!(matches!(
+            update,
+            TuiSessionUpdate::Failed(message) if message.contains("missing_capability")
+        ));
+        assert_eq!(session.state().session_id(), "session-a");
+        assert!(session.has_capability(ClientCapability::Prompt));
         session.shutdown().await;
     }
 
@@ -1205,7 +1394,7 @@ mod tests {
             epoch: old_epoch,
             event: SessionControllerEvent::Attached {
                 state: stale_state,
-                granted_capabilities: vec![ClientCapability::Observe],
+                granted_capabilities: interactive_capabilities(),
             },
         });
         assert_eq!(
@@ -1266,7 +1455,7 @@ mod tests {
             .send(&ServerMessage::AttachOk {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: "session-b".to_string(),
-                granted_capabilities: vec![ClientCapability::Observe],
+                granted_capabilities: interactive_capabilities(),
                 seq: 0,
             })
             .await
@@ -1322,7 +1511,7 @@ mod tests {
             .send(&ServerMessage::AttachOk {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: "session-b".to_string(),
-                granted_capabilities: vec![ClientCapability::Observe],
+                granted_capabilities: interactive_capabilities(),
                 seq: 0,
             })
             .await
@@ -1376,7 +1565,7 @@ mod tests {
             .send(&ServerMessage::AttachOk {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: "session-b".into(),
-                granted_capabilities: vec![ClientCapability::Observe],
+                granted_capabilities: interactive_capabilities(),
                 seq: 0,
             })
             .await
