@@ -230,7 +230,6 @@ impl SessionFactory for AgentSessionFactory {
         // model on first use; the startup policy may belong to a different
         // default model.
         let context_windows = HashMap::new();
-        let persisted_model = model.clone();
         let core = Arc::new(SessionCore::new(
             agent_session,
             model.clone(),
@@ -261,7 +260,7 @@ impl SessionFactory for AgentSessionFactory {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = record.assistant_outcomes;
         } else {
-            core.persist(&persisted_model, &[], &[]);
+            core.persist_current().await;
         }
         Ok(core)
     }
