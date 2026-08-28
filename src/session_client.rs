@@ -32,9 +32,26 @@ pub enum SessionClientError {
     MissingCapability(ClientCapability),
 }
 
+impl SessionClientError {
+    /// Return the rejecting transport endpoint's configured frame bound.
+    pub fn frame_limit_mismatch(&self) -> Option<usize> {
+        match self {
+            Self::Transport(TransportError::FrameTooLarge { max_bytes }) => Some(*max_bytes),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for SessionClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Attach, receive, and command transport failures all pass through
+            // this variant, while callers can classify it without parsing text.
+            Self::Transport(TransportError::FrameTooLarge { max_bytes }) => write!(
+                formatter,
+                "frame_limit_mismatch: transport frame exceeded configured max_frame_bytes={max_bytes}; \
+                 align session.max_frame_bytes between daemon and client"
+            ),
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Disconnected => formatter.write_str("frontend transport disconnected"),
             Self::AttachDenied { code, reason } => {
@@ -544,6 +561,14 @@ mod tests {
             context_usage: Some(ContextUsage::new(1, Some(100), 0, None)),
             history_truncated: false,
         }
+    }
+
+    #[test]
+    fn frame_limit_mismatch_is_classified_independently_of_operation() {
+        let error = SessionClientError::Transport(TransportError::FrameTooLarge { max_bytes: 512 });
+        assert_eq!(error.frame_limit_mismatch(), Some(512));
+        assert!(error.to_string().starts_with("frame_limit_mismatch:"));
+        assert!(error.to_string().contains("max_frame_bytes=512"));
     }
 
     #[tokio::test]
