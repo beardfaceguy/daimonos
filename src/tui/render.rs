@@ -43,6 +43,8 @@ pub struct RenderOptions {
     pub scroll_mode: bool,
     /// Optional capability gate layered with the canonical request policy.
     pub allow_always_granted: bool,
+    /// UTF-8 byte offset of the insertion cursor; defaults to the text end.
+    pub composer_cursor: Option<usize>,
 }
 
 /// Render the whole TUI frame for `state` into `area` of `buf`.
@@ -67,7 +69,12 @@ pub fn render_with_options(
     if options.scroll_mode {
         render_scroll_mode_indicator(chunks[1], buf);
     }
-    render_composer(composer, chunks[2], buf);
+    render_composer(
+        composer,
+        options.composer_cursor.unwrap_or(composer.len()),
+        chunks[2],
+        buf,
+    );
     // Overlay last so it sits above every base layer. It is the one thing a
     // human must act on, and ADR-011 keeps approval authority with the local
     // TUI regardless of which client ultimately answers.
@@ -330,12 +337,12 @@ fn render_approval_modal(
         .render(modal, buf);
 }
 
-fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
+fn render_composer(composer: &str, cursor: usize, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("message (Enter to send · Ctrl-C interrupts · /help for help)");
+        .title("message (Enter sends · Ctrl-J newline · Ctrl-C interrupts · /help for help)");
     let inner = block.inner(area);
-    let (wrapped, viewport) = wrapped_composer(composer, inner);
+    let (wrapped, viewport) = wrapped_composer(composer, cursor, inner);
     let visible = viewport
         .map(|view| {
             wrapped
@@ -356,26 +363,32 @@ struct ComposerViewport {
     cursor_row: u16,
 }
 
-/// Terminal cursor position for the insertion point at the end of `composer`.
-///
-/// The current editor is append/backspace based, so the insertion point is
-/// always the end of the buffer. The viewport follows wrapped and explicit
-/// lines, keeping that point inside the four-row composer.
-pub fn composer_cursor_position(composer: &str, area: Rect) -> Option<(u16, u16)> {
+/// Terminal cursor position for an insertion point within `composer`.
+pub fn composer_cursor_position_at(
+    composer: &str,
+    cursor: usize,
+    area: Rect,
+) -> Option<(u16, u16)> {
     let composer_area = *tui_layout(area).get(2)?;
     let inner = Block::default().borders(Borders::ALL).inner(composer_area);
-    let viewport = composer_viewport(composer, inner)?;
+    let viewport = composer_viewport(composer, cursor, inner)?;
     Some((
         inner.x.saturating_add(viewport.cursor_column),
         inner.y.saturating_add(viewport.cursor_row),
     ))
 }
 
-fn composer_viewport(composer: &str, inner: Rect) -> Option<ComposerViewport> {
+/// Backward-compatible end-of-buffer cursor projection.
+pub fn composer_cursor_position(composer: &str, area: Rect) -> Option<(u16, u16)> {
+    composer_cursor_position_at(composer, composer.len(), area)
+}
+
+fn composer_viewport(composer: &str, cursor: usize, inner: Rect) -> Option<ComposerViewport> {
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
-    let (_, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    let cursor = clamped_grapheme_boundary(composer, cursor);
+    let (_, logical_row, column) = wrap_composer(&composer[..cursor], usize::from(inner.width));
     Some(viewport_from_cursor(logical_row, column, inner))
 }
 
@@ -393,15 +406,37 @@ fn viewport_from_cursor(logical_row: usize, column: usize, inner: Rect) -> Compo
     }
 }
 
-fn wrapped_composer(composer: &str, inner: Rect) -> (String, Option<ComposerViewport>) {
+fn wrapped_composer(
+    composer: &str,
+    cursor: usize,
+    inner: Rect,
+) -> (String, Option<ComposerViewport>) {
     if inner.width == 0 || inner.height == 0 {
         return (String::new(), None);
     }
-    let (wrapped, logical_row, column) = wrap_composer(composer, usize::from(inner.width));
+    let width = usize::from(inner.width);
+    let (wrapped, _, _) = wrap_composer(composer, width);
+    let cursor = clamped_grapheme_boundary(composer, cursor);
+    let (_, logical_row, column) = wrap_composer(&composer[..cursor], width);
     (
         wrapped,
         Some(viewport_from_cursor(logical_row, column, inner)),
     )
+}
+
+fn clamped_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    if cursor == text.len() {
+        return cursor;
+    }
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= cursor)
+        .last()
+        .unwrap_or(0)
 }
 
 fn wrap_composer(composer: &str, width: usize) -> (String, usize, usize) {
@@ -805,6 +840,60 @@ mod tests {
         // Four text rows inside a six-row bordered composer. The fifth logical
         // row scrolls, leaving the insertion cursor on the last visible row.
         assert_eq!(position, (2, 10));
+    }
+
+    #[test]
+    fn composer_cursor_position_tracks_middle_insertion_point() {
+        let area = Rect::new(0, 0, 20, 19);
+        assert_eq!(
+            composer_cursor_position_at("ab界cd", 2, area),
+            Some((3, composer_text_row(area, 0)))
+        );
+        assert_eq!(
+            composer_cursor_position_at("ab界cd", "ab界".len(), area),
+            Some((5, composer_text_row(area, 0)))
+        );
+    }
+
+    #[test]
+    fn composer_cursor_projection_matches_wrapping_and_sanitization() {
+        let narrow = Rect::new(0, 0, 8, 19);
+        assert_eq!(
+            composer_cursor_position_at("12345界", 5, narrow),
+            Some((6, composer_text_row(narrow, 0)))
+        );
+
+        let wide = Rect::new(0, 0, 20, 19);
+        assert_eq!(
+            composer_cursor_position_at("a\tb\u{7}c", 2, wide),
+            Some((6, composer_text_row(wide, 0)))
+        );
+        assert_eq!(
+            composer_cursor_position_at("a👩‍🔬b", 2, wide),
+            Some((2, composer_text_row(wide, 0))),
+            "defensive projection must snap inside-cluster offsets backward"
+        );
+    }
+
+    #[test]
+    fn composer_viewport_follows_cursor_instead_of_text_end() {
+        let state = ViewState::new("sess-1");
+        let composer = "first\nsecond\nthird\nfourth\nfifth";
+        let area = Rect::new(0, 0, 40, 19);
+        let mut buf = Buffer::empty(area);
+        render_with_options(
+            &state,
+            composer,
+            area,
+            &mut buf,
+            RenderOptions {
+                composer_cursor: Some(0),
+                ..RenderOptions::default()
+            },
+        );
+        let rendered = buffer_to_string(&buf);
+        assert!(rendered.contains("first"));
+        assert!(!rendered.contains("fifth"));
     }
 
     #[test]

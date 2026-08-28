@@ -10,13 +10,19 @@
 //! followed by `Drop` (or a panic hook firing before `Drop`) is safe.
 
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+
+static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Guards the terminal's raw/alternate-screen state for the lifetime of a TUI
 /// session. Construct with [`TerminalGuard::enter`]; drop (or call
@@ -48,6 +54,14 @@ impl TerminalGuard {
             restore_terminal(&mut out);
             return Err(err);
         }
+        if let Err(err) = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
+            restore_terminal(&mut out);
+            return Err(err);
+        }
+        KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::Release);
         Ok(Self { active: true })
     }
 
@@ -74,6 +88,9 @@ impl Drop for TerminalGuard {
 /// there is nowhere useful to report them and leaving *some* state restored is
 /// strictly better than bailing on the first failure.
 fn restore_terminal(out: &mut Stdout) {
+    if KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::AcqRel) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     let _ = out.flush();
@@ -100,6 +117,21 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_enhancement_requests_modified_enter_reporting() {
+        let mut push = Vec::new();
+        execute!(
+            push,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .unwrap();
+        assert_eq!(push, b"\x1b[>1u");
+
+        let mut pop = Vec::new();
+        execute!(pop, PopKeyboardEnhancementFlags).unwrap();
+        assert!(pop.starts_with(b"\x1b[<"));
+    }
 
     // A full raw-mode enter/exit needs a real TTY, which CI does not provide;
     // those paths are covered by the PTY integration tests in a later phase
