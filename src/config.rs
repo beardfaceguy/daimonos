@@ -454,8 +454,32 @@ pub struct SessionRuntimeConfig {
     pub session_list_cursor_bytes: usize,
     /// Maximum rows retained in one connection-bound listing snapshot.
     pub session_list_snapshot_entries: usize,
+    /// Maximum live listing snapshots per trust domain across all connections.
+    pub session_list_snapshot_global_capacity: usize,
     /// Lifetime of one connection-bound listing snapshot.
     pub session_list_snapshot_ttl_secs: u64,
+    /// Optional session metadata catalog path; defaults beside daemon JSON.
+    pub session_catalog_path: Option<String>,
+    /// SQLite busy timeout for the shared multiprocess catalog.
+    pub session_catalog_busy_timeout_ms: u64,
+    /// Maximum distinct pending catalog mutations per daemon.
+    pub session_catalog_pending_entries: usize,
+    /// Maximum catalog mutations applied by one blocking worker batch.
+    pub session_catalog_write_batch: usize,
+    /// Maximum time allowed for one catalog query.
+    pub session_catalog_query_timeout_ms: u64,
+    /// Maximum catalog queries/reconciliation jobs running concurrently.
+    pub session_catalog_query_concurrency: usize,
+    /// Maximum payload files examined by one incomplete-catalog fallback.
+    pub session_catalog_fallback_entries: usize,
+    /// Maximum catalog/directory entries reconciled in one pass.
+    pub session_catalog_reconcile_entries: usize,
+    /// Global minimum interval between shared catalog reconciliation passes.
+    pub session_catalog_reconcile_interval_ms: u64,
+    /// Interval between full drift sweeps after catalog completeness.
+    pub session_catalog_full_rescan_secs: u64,
+    /// Minimum age before a confirmed tombstone may be purged.
+    pub session_catalog_tombstone_retention_secs: u64,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
     /// Maximum wait for a daemon command result in a local frontend.
@@ -526,7 +550,19 @@ impl Default for SessionRuntimeConfig {
             session_list_preview_bytes: 256,
             session_list_cursor_bytes: 128,
             session_list_snapshot_entries: 1_000,
+            session_list_snapshot_global_capacity: 256,
             session_list_snapshot_ttl_secs: 60,
+            session_catalog_path: None,
+            session_catalog_busy_timeout_ms: 5_000,
+            session_catalog_pending_entries: 1_024,
+            session_catalog_write_batch: 64,
+            session_catalog_query_timeout_ms: 6_000,
+            session_catalog_query_concurrency: 2,
+            session_catalog_fallback_entries: 256,
+            session_catalog_reconcile_entries: 128,
+            session_catalog_reconcile_interval_ms: 100,
+            session_catalog_full_rescan_secs: 60,
+            session_catalog_tombstone_retention_secs: 300,
             shutdown_grace_secs: 5,
             client_command_timeout_secs: 10,
             bootstrap_timeout_secs: 15,
@@ -602,10 +638,67 @@ impl SessionRuntimeConfig {
                     .to_string(),
             );
         }
+        if self.session_list_snapshot_global_capacity == 0 {
+            return Err(
+                "session.session_list_snapshot_global_capacity must be greater than zero"
+                    .to_string(),
+            );
+        }
         if self.session_list_snapshot_ttl_secs == 0 {
             return Err(
                 "session.session_list_snapshot_ttl_secs must be greater than zero".to_string(),
             );
+        }
+        for (field, is_zero) in [
+            (
+                "session_catalog_busy_timeout_ms",
+                self.session_catalog_busy_timeout_ms == 0,
+            ),
+            (
+                "session_catalog_pending_entries",
+                self.session_catalog_pending_entries == 0,
+            ),
+            (
+                "session_catalog_write_batch",
+                self.session_catalog_write_batch == 0,
+            ),
+            (
+                "session_catalog_query_timeout_ms",
+                self.session_catalog_query_timeout_ms == 0,
+            ),
+            (
+                "session_catalog_query_concurrency",
+                self.session_catalog_query_concurrency == 0,
+            ),
+            (
+                "session_catalog_fallback_entries",
+                self.session_catalog_fallback_entries == 0,
+            ),
+            (
+                "session_catalog_reconcile_entries",
+                self.session_catalog_reconcile_entries == 0,
+            ),
+            (
+                "session_catalog_reconcile_interval_ms",
+                self.session_catalog_reconcile_interval_ms == 0,
+            ),
+            (
+                "session_catalog_full_rescan_secs",
+                self.session_catalog_full_rescan_secs == 0,
+            ),
+            (
+                "session_catalog_tombstone_retention_secs",
+                self.session_catalog_tombstone_retention_secs == 0,
+            ),
+        ] {
+            if is_zero {
+                return Err(format!("session.{field} must be greater than zero"));
+            }
+        }
+        if self.session_catalog_query_timeout_ms <= self.session_catalog_busy_timeout_ms {
+            return Err("session.session_catalog_query_timeout_ms must exceed \
+                 session_catalog_busy_timeout_ms"
+                .to_string());
         }
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
@@ -747,6 +840,16 @@ impl SessionRuntimeConfig {
             .unwrap_or_else(std::env::temp_dir)
             .join(".daimonos")
             .join(format!("session-{suffix}.sock"))
+    }
+
+    pub fn resolved_session_catalog_path(
+        &self,
+        daemon_sessions_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        self.session_catalog_path
+            .as_deref()
+            .map(crate::paths::expand_tilde)
+            .unwrap_or_else(|| daemon_sessions_dir.join("catalog.sqlite"))
     }
 
     pub fn protocol_limits(&self) -> crate::session_protocol::ProtocolLimits {
@@ -1978,7 +2081,18 @@ mod tests {
         assert_eq!(cfg.session.session_list_preview_bytes, 256);
         assert_eq!(cfg.session.session_list_cursor_bytes, 128);
         assert_eq!(cfg.session.session_list_snapshot_entries, 1_000);
+        assert_eq!(cfg.session.session_list_snapshot_global_capacity, 256);
         assert_eq!(cfg.session.session_list_snapshot_ttl_secs, 60);
+        assert_eq!(cfg.session.session_catalog_busy_timeout_ms, 5_000);
+        assert_eq!(cfg.session.session_catalog_pending_entries, 1_024);
+        assert_eq!(cfg.session.session_catalog_write_batch, 64);
+        assert_eq!(cfg.session.session_catalog_query_timeout_ms, 6_000);
+        assert_eq!(cfg.session.session_catalog_query_concurrency, 2);
+        assert_eq!(cfg.session.session_catalog_fallback_entries, 256);
+        assert_eq!(cfg.session.session_catalog_reconcile_entries, 128);
+        assert_eq!(cfg.session.session_catalog_reconcile_interval_ms, 100);
+        assert_eq!(cfg.session.session_catalog_full_rescan_secs, 60);
+        assert_eq!(cfg.session.session_catalog_tombstone_retention_secs, 300);
         assert_eq!(cfg.session.shutdown_grace_secs, 5);
         assert_eq!(cfg.session.client_command_timeout_secs, 10);
         assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
@@ -2358,6 +2472,39 @@ mod tests {
             .validate()
             .expect_err("zero listing snapshot ttl must be rejected")
             .contains("session.session_list_snapshot_ttl_secs"));
+        let invalid: Config =
+            toml::from_str("[session]\nsession_list_snapshot_global_capacity = 0\n").unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("zero global listing snapshot capacity must be rejected")
+            .contains("session.session_list_snapshot_global_capacity"));
+        for field in [
+            "session_catalog_busy_timeout_ms",
+            "session_catalog_pending_entries",
+            "session_catalog_write_batch",
+            "session_catalog_query_timeout_ms",
+            "session_catalog_query_concurrency",
+            "session_catalog_fallback_entries",
+            "session_catalog_reconcile_entries",
+            "session_catalog_reconcile_interval_ms",
+            "session_catalog_full_rescan_secs",
+            "session_catalog_tombstone_retention_secs",
+        ] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero catalog limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
+        let invalid: Config = toml::from_str(
+            "[session]\nsession_catalog_busy_timeout_ms = 100\n\
+             session_catalog_query_timeout_ms = 100\n",
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("catalog query timeout must exceed SQLite busy timeout")
+            .contains("session.session_catalog_query_timeout_ms"));
         let invalid: Config =
             toml::from_str("[session]\nclient_command_timeout_secs = 0\n").unwrap();
         assert!(invalid

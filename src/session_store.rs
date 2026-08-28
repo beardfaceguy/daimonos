@@ -48,6 +48,19 @@ pub struct SessionSummary {
     pub first_user_line: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistedWrite {
+    pub summary: SessionSummary,
+    pub updated_at_unix_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummaryScan {
+    pub summaries: Vec<SessionSummary>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
 /// A directory of persisted sessions.
 #[derive(Clone)]
 pub struct SessionStore {
@@ -97,7 +110,33 @@ impl SessionStore {
         client_user_message_ids: &[String],
         assistant_outcomes: &[AssistantOutcome],
     ) {
-        self.save_record(
+        if let Err(error) = self.save_acp_result(
+            id,
+            model,
+            thinking,
+            messages,
+            cwd,
+            client_user_message_ids,
+            assistant_outcomes,
+            usize::MAX,
+        ) {
+            eprintln!("session store: failed to persist session {id}: {error}");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_acp_result(
+        &self,
+        id: &str,
+        model: &str,
+        thinking: &str,
+        messages: &[Message],
+        cwd: &Path,
+        client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
+        max_preview_bytes: usize,
+    ) -> std::io::Result<PersistedWrite> {
+        self.save_record_result(
             id,
             model,
             Some(thinking.to_string()),
@@ -105,7 +144,8 @@ impl SessionStore {
             Some(cwd.to_path_buf()),
             client_user_message_ids,
             assistant_outcomes,
-        );
+            max_preview_bytes,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -137,14 +177,63 @@ impl SessionStore {
         }
     }
 
-    fn write_atomic(&self, name: &str, record: &PersistedSession) -> std::io::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn save_record_result(
+        &self,
+        id: &str,
+        model: &str,
+        thinking: Option<String>,
+        messages: &[Message],
+        cwd: Option<PathBuf>,
+        client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
+        max_preview_bytes: usize,
+    ) -> std::io::Result<PersistedWrite> {
+        let name = Self::file_name(id)
+            .ok_or_else(|| std::io::Error::other("session id is not a safe path component"))?;
+        let record = PersistedSession {
+            version: SESSION_PERSIST_VERSION,
+            session_id: id.to_string(),
+            model: model.to_string(),
+            thinking,
+            cwd: cwd.clone(),
+            client_user_message_ids: client_user_message_ids.to_vec(),
+            assistant_outcomes: assistant_outcomes.to_vec(),
+            messages: messages.to_vec(),
+        };
+        let updated_at = self.write_atomic(&name, &record)?;
+        Ok(PersistedWrite {
+            summary: SessionSummary {
+                id: id.to_string(),
+                model: model.to_string(),
+                message_count: messages.len(),
+                cwd,
+                updated_at: Some(updated_at),
+                first_user_line: first_user_preview(messages, max_preview_bytes),
+            },
+            updated_at_unix_ns: system_time_unix_ns(updated_at),
+        })
+    }
+
+    fn write_atomic(
+        &self,
+        name: &str,
+        record: &PersistedSession,
+    ) -> std::io::Result<std::time::SystemTime> {
         std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec(record).map_err(std::io::Error::other)?;
         // Write to a temp file then rename, so a crash mid-write can't leave a
         // truncated JSON file that would fail to load.
-        let tmp = self.dir.join(format!("{name}.tmp"));
+        let tmp = self
+            .dir
+            .join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, self.dir.join(name))
+        let path = self.dir.join(name);
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        std::fs::metadata(path)?.modified()
     }
 
     /// Load a persisted session, or `None` if absent / unreadable / a version
@@ -183,34 +272,9 @@ impl SessionStore {
         };
         let mut rows: Vec<(std::time::SystemTime, SessionSummary)> = Vec::new();
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+            if let Some(row) = summary_from_path(entry.path(), max_preview_bytes) {
+                rows.push(row);
             }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(record) = serde_json::from_slice::<PersistedSession>(&bytes) else {
-                continue;
-            };
-            if record.version != SESSION_PERSIST_VERSION {
-                continue;
-            }
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            rows.push((
-                mtime,
-                SessionSummary {
-                    id: record.session_id,
-                    model: record.model,
-                    message_count: record.messages.len(),
-                    cwd: record.cwd,
-                    updated_at: Some(mtime),
-                    first_user_line: first_user_preview(&record.messages, max_preview_bytes),
-                },
-            ));
         }
         rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
             b_time
@@ -219,6 +283,104 @@ impl SessionStore {
         });
         rows.into_iter().map(|(_, s)| s).collect()
     }
+
+    /// Bounded stable-name batch for reconciliation and incomplete fallback.
+    /// Directory walking stops at `deadline`; memory and payload parsing are
+    /// capped by `max_entries`.
+    pub fn scan_summaries(
+        &self,
+        max_preview_bytes: usize,
+        after_name: Option<&str>,
+        max_entries: usize,
+        deadline: std::time::Instant,
+    ) -> SessionSummaryScan {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return SessionSummaryScan {
+                summaries: Vec::new(),
+                next_cursor: None,
+                complete: true,
+            };
+        };
+        let max_entries = max_entries.max(1);
+        let mut names = std::collections::BTreeMap::new();
+        let mut walk_complete = true;
+        for entry in entries {
+            if std::time::Instant::now() >= deadline {
+                walk_complete = false;
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let name = entry.file_name();
+            let Some(name_text) = name.to_str() else {
+                continue;
+            };
+            if !name_text.ends_with(".json") || after_name.is_some_and(|after| name_text <= after) {
+                continue;
+            }
+            names.insert(name_text.to_string(), entry.path());
+            if names.len() > max_entries.saturating_add(1) {
+                names.pop_last();
+            }
+        }
+        let has_more = !walk_complete || names.len() > max_entries;
+        while names.len() > max_entries {
+            names.pop_last();
+        }
+        let next_cursor = has_more
+            .then(|| names.last_key_value().map(|(name, _)| name.clone()))
+            .flatten();
+        let mut rows = names
+            .into_values()
+            .filter_map(|path| summary_from_path(path, max_preview_bytes))
+            .collect::<Vec<_>>();
+        rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
+            b_time
+                .cmp(a_time)
+                .then_with(|| a_summary.id.cmp(&b_summary.id))
+        });
+        SessionSummaryScan {
+            summaries: rows.into_iter().map(|(_, summary)| summary).collect(),
+            next_cursor,
+            complete: !has_more,
+        }
+    }
+}
+
+fn summary_from_path(
+    path: PathBuf,
+    max_preview_bytes: usize,
+) -> Option<(std::time::SystemTime, SessionSummary)> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let record = serde_json::from_slice::<PersistedSession>(&bytes).ok()?;
+    if record.version != SESSION_PERSIST_VERSION {
+        return None;
+    }
+    let modified = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+    Some((
+        modified,
+        SessionSummary {
+            id: record.session_id,
+            model: record.model,
+            message_count: record.messages.len(),
+            cwd: record.cwd,
+            updated_at: Some(modified),
+            first_user_line: first_user_preview(&record.messages, max_preview_bytes),
+        },
+    ))
+}
+
+fn system_time_unix_ns(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// Whitespace-normalized first line of the first user text message, bounded
@@ -462,5 +624,76 @@ mod tests {
             leftover.is_empty(),
             "temp file should have been renamed away"
         );
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_never_share_temporary_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.save(
+                        "shared",
+                        &format!("model-{index}"),
+                        &[Message::user(format!("message-{index}"))],
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(store.load("shared").is_some());
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| entry.path().extension().and_then(|value| value.to_str()) != Some("tmp")));
+    }
+
+    #[test]
+    fn bounded_summary_scan_advances_stable_filename_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        for id in ["a", "b", "c"] {
+            store.save(id, "model", &[Message::user(id)]);
+        }
+        let first = store.scan_summaries(
+            64,
+            None,
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(!first.complete);
+        assert_eq!(first.next_cursor.as_deref(), Some("b.json"));
+        let mut ids = first
+            .summaries
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>();
+        let second = store.scan_summaries(
+            64,
+            first.next_cursor.as_deref(),
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(second.complete);
+        ids.extend(second.summaries.into_iter().map(|summary| summary.id));
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn expired_summary_scan_is_explicitly_incomplete() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        store.save("a", "model", &[Message::user("a")]);
+        let scan = store.scan_summaries(64, None, 2, std::time::Instant::now());
+        assert!(!scan.complete);
+        assert!(scan.summaries.is_empty());
     }
 }

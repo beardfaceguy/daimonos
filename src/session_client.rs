@@ -76,6 +76,7 @@ pub enum SessionClientOutcome {
         workspace: Option<SessionWorkspace>,
         sessions: Vec<SessionListEntry>,
         next_cursor: Option<String>,
+        incomplete: bool,
     },
     Usage {
         request_id: String,
@@ -328,11 +329,13 @@ impl<T: FrontendTransport> SessionClient<T> {
                 workspace,
                 sessions,
                 next_cursor,
+                incomplete,
             } => Ok(SessionClientOutcome::SessionList {
                 request_id,
                 workspace,
                 sessions,
                 next_cursor,
+                incomplete,
             }),
             ServerMessage::Usage { request_id, usage } => {
                 Ok(SessionClientOutcome::Usage { request_id, usage })
@@ -1013,6 +1016,7 @@ mod tests {
                         turn_status: None,
                     }],
                     next_cursor: Some("v1_cursor".to_string()),
+                    incomplete: true,
                 })
                 .await
                 .unwrap();
@@ -1031,6 +1035,7 @@ mod tests {
             workspace,
             sessions,
             next_cursor,
+            incomplete,
         } = outcome
         else {
             panic!("expected typed session list");
@@ -1039,6 +1044,7 @@ mod tests {
         assert_eq!(workspace.unwrap().id, "ws_1");
         assert_eq!(sessions[0].preview.as_deref(), Some("hello"));
         assert_eq!(next_cursor.as_deref(), Some("v1_cursor"));
+        assert!(incomplete);
         server_task.await.unwrap();
     }
 }

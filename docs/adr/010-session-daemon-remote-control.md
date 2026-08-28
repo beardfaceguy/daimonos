@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-26  
 **Amended:** 2026-08-27 (Vikunja #1337 session discovery trust boundary)
+**Amended:** 2026-08-27 (Vikunja #1336 bounded discovery catalog)
 **Status:** Accepted  
 **Tracks:** Vikunja project 183, epic #1092; research #1090; TUI #1091  
 **Builds on:** ADR-002 (compaction), ADR-003 (ACP-MCP bridge), ADR-006
@@ -306,6 +307,30 @@ identity, model, timestamp, bounded preview, provider-history count, and live
 turn status. Paired remote responses remain minimal (session id, active state,
 and attachment count). Pagination uses short-lived opaque snapshots bound to
 one connection; invalid, expired, or replayed cursors fail as `invalid_cursor`.
+A fresh cursor-less request replaces that connection's prior listing snapshot.
+
+Discovery metadata is indexed in a shared WAL SQLite catalog beside the
+authoritative daemon-session JSON. Successful atomic saves enqueue bounded
+latest-wins upserts; successful deletes enqueue materialized tombstones so stale
+workers cannot resurrect ghosts. Newer unknown catalog schemas are left
+untouched. Bounded leased reconciliation repairs directory/catalog drift and
+purges confirmed old tombstones. While a workspace catalog is cold, incomplete,
+unsupported, or unhealthy, listing uses a bounded blocking-pool scan and marks
+every page `incomplete=true`; it never silently claims a partial view is
+complete. Attach always reloads and validates the JSON payload.
+
+The catalog is supported only on one host's local filesystem; WAL catalogs on
+NFS or other network filesystems are unsupported. The global lease rate-limits
+reconciliation but is not a correctness lock: guarded authoritative upserts and
+materialized tombstones remain safe if two reconcilers overlap. Reconciliation
+is deliberately list-triggered, so one request can begin a drift sweep and
+leave the workspace explicitly incomplete until later list requests advance
+the bounded cursor.
+
+Listing-snapshot capacity is partitioned by connection trust. Same-domain
+oldest eviction produces the same opaque `invalid_cursor` recovery as expiry;
+local churn cannot evict a paired remote cursor. Same-domain capacity timing is
+not a cross-trust disclosure and is outside the protocol's privacy guarantee.
 
 Native Android clients are not authenticated by browser `Origin`. A future web
 client must use a strict Origin allowlist.

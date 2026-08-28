@@ -149,8 +149,32 @@ session_list_preview_bytes = 256
 session_list_cursor_bytes = 128
 # Maximum rows retained in one connection-bound listing snapshot.
 session_list_snapshot_entries = 1000
+# Maximum live listing snapshots per trust domain across all connections.
+session_list_snapshot_global_capacity = 256
 # Lifetime of one connection-bound listing snapshot.
 session_list_snapshot_ttl_secs = 60
+# Optional shared SQLite metadata catalog path. Empty uses daemon-sessions/catalog.sqlite.
+# session_catalog_path = "~/.daimonos/daemon-sessions/catalog.sqlite"
+# SQLite busy timeout for concurrent daemon processes.
+session_catalog_busy_timeout_ms = 5000
+# Bounded latest-wins pending catalog mutations per daemon.
+session_catalog_pending_entries = 1024
+# Maximum catalog mutations applied by one blocking worker batch.
+session_catalog_write_batch = 64
+# Catalog query timeout; must exceed session_catalog_busy_timeout_ms.
+session_catalog_query_timeout_ms = 6000
+# Maximum concurrent catalog queries/reconciliation jobs per daemon.
+session_catalog_query_concurrency = 2
+# Payload files examined by one incomplete-catalog fallback.
+session_catalog_fallback_entries = 256
+# Catalog/directory entries reconciled in one bounded pass.
+session_catalog_reconcile_entries = 128
+# Shared minimum interval between reconciliation passes across daemon processes.
+session_catalog_reconcile_interval_ms = 100
+# Interval between full drift sweeps after a workspace reaches completeness.
+session_catalog_full_rescan_secs = 60
+# Minimum age before a confirmed tombstone can be purged.
+session_catalog_tombstone_retention_secs = 300
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
 # Maximum seconds a local frontend waits for a daemon command result.

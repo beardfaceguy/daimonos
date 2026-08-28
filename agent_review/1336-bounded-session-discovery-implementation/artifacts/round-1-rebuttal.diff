@@ -1,0 +1,75 @@
+```diff
+--- a/src/session_daemon.rs
++++ b/src/session_daemon.rs
+@@
+-    listing_snapshot_registry: Mutex<VecDeque<Weak<AtomicBool>>>,
++    local_listing_snapshot_registry: Mutex<VecDeque<Weak<AtomicBool>>>,
++    remote_listing_snapshot_registry: Mutex<VecDeque<Weak<AtomicBool>>>,
+@@
+-    fn register_listing_snapshot(&self) -> Arc<AtomicBool> {
+-        let mut registry = self.listing_snapshot_registry.lock()...;
++    fn register_listing_snapshot(&self, trust: ConnectionTrust) -> Arc<AtomicBool> {
++        let registry = match trust {
++            ConnectionTrust::LocalOwner => &self.local_listing_snapshot_registry,
++            ConnectionTrust::RemotePaired => &self.remote_listing_snapshot_registry,
++        };
++        let mut registry = registry.lock()...;
+         registry.retain(|entry| entry.strong_count() > 0);
+         while registry.len() >= self.listing_snapshot_global_capacity {
+             if let Some(evicted) = registry.pop_front().and_then(|entry| entry.upgrade()) {
+                 evicted.store(false, Ordering::Release);
+             }
+         }
+         registry.push_back(Arc::downgrade(&valid));
+         valid
+     }
+@@
+-    valid: self.register_listing_snapshot(),
++    valid: self.register_listing_snapshot(trust),
+```
+
+```rust
+#[tokio::test]
+async fn local_snapshot_churn_cannot_evict_remote_cursor() {
+    // global capacity 1 per trust domain; mint RemotePaired cursor,
+    // create a LocalOwner snapshot, then successfully consume remote cursor.
+}
+
+#[tokio::test]
+async fn rejected_cross_instance_write_repairs_before_completeness_returns() {
+    // Start complete with writer A row; writer B equal-mtime live mutation is
+    // rejected and marks state incomplete. Authoritative reconciliation applies
+    // current payload metadata; set complete; assert new model and complete=true.
+}
+
+#[test]
+fn restarted_writer_cannot_resurrect_newer_tombstone() {
+    // writer_instance changes and generation restarts, but older actual payload
+    // mtime cannot supersede newer materialized tombstone.
+}
+```
+
+```diff
+--- a/src/session_catalog.rs
++++ b/src/session_catalog.rs
+@@
+         if distinct_key_capacity_exceeded {
++            if !pending.mark_incomplete {
++                tracing::warn!(event = "catalog_pending_saturated", pending, max_pending);
++            }
+             pending.mark_incomplete = true;
+         }
+```
+
+```markdown
+ADR-010 additions:
+- Catalog supports one host's local filesystem only; WAL on NFS/network FS unsupported.
+- Lease rate-limits reconciliation but is not a correctness lock; guarded authoritative
+  mutations and tombstones tolerate overlap.
+- Reconciliation is list-triggered; one request can start a sweep and remain explicitly
+  incomplete until subsequent list requests advance it.
+- Snapshot capacity is partitioned by trust; same-domain eviction maps to invalid_cursor,
+  while LocalOwner churn cannot evict RemotePaired cursors.
+```
+
+Existing tests cited for B3: timed_out_fallback_keeps_permit_until_blocking_scan_finishes. Existing config validation rejects zero catalog limits and query_timeout <= busy_timeout. Focused tests and Clippy pass.

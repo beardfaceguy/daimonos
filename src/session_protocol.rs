@@ -139,6 +139,8 @@ pub enum ServerMessage {
         workspace: Option<SessionWorkspace>,
         sessions: Vec<SessionListEntry>,
         next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        incomplete: bool,
     },
     Usage {
         request_id: String,
@@ -1017,10 +1019,12 @@ mod tests {
                 turn_status: Some(TurnStatus::Idle),
             }],
             next_cursor: None,
+            incomplete: true,
         };
         let encoded = serde_json::to_value(&message).unwrap();
         assert_eq!(encoded["workspace"]["id"], "ws_1");
         assert_eq!(encoded["sessions"][0]["preview"], "hello");
+        assert_eq!(encoded["incomplete"], true);
         assert_eq!(
             serde_json::from_value::<ServerMessage>(encoded).unwrap(),
             message
