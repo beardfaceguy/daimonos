@@ -156,7 +156,8 @@ impl ViewState {
         self.close_open_line();
         self.transcript
             .push(ViewLine::committed(TranscriptRole::System, text.into()));
-        self.trim_scrollback();
+        let truncated = self.trim_scrollback();
+        self.history_truncated |= truncated;
     }
 
     // ---- snapshot application (attach / reconnect) -----------------------
@@ -194,8 +195,11 @@ impl ViewState {
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
+        // Preserve either source of omitted history: daemon-side snapshot
+        // bounding and this frontend's independently configured scrollback.
         self.history_truncated = snapshot.history_truncated;
-        self.trim_scrollback();
+        let truncated = self.trim_scrollback();
+        self.history_truncated |= truncated;
         // A snapshot is a full canonical resync of live session state, so any
         // `ending_reason` observed before a reconnect must clear: if the
         // session were really ending, that would arrive again as a fresh
@@ -222,7 +226,8 @@ impl ViewState {
         }
         self.last_seq = seq;
         self.apply_event_body(event);
-        self.trim_scrollback();
+        let truncated = self.trim_scrollback();
+        self.history_truncated |= truncated;
         ApplyOutcome::Applied
     }
 
@@ -345,17 +350,18 @@ impl ViewState {
         }
     }
 
-    fn trim_scrollback(&mut self) {
-        trim_oldest(&mut self.transcript, self.max_scrollback_entries);
-        trim_oldest(&mut self.tool_calls, self.max_scrollback_entries);
+    fn trim_scrollback(&mut self) -> bool {
+        trim_oldest(&mut self.transcript, self.max_scrollback_entries)
+            | trim_oldest(&mut self.tool_calls, self.max_scrollback_entries)
     }
 }
 
-fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
+fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) -> bool {
     let excess = entries.len().saturating_sub(max_entries);
     if excess > 0 {
         entries.drain(..excess);
     }
+    excess > 0
 }
 
 fn transcript_entry_to_lines(entry: TranscriptEntry) -> Vec<ViewLine> {
@@ -521,6 +527,25 @@ mod tests {
         assert_eq!(state.tool_calls().len(), 2);
         assert_eq!(state.tool_calls()[0].id, "t2");
         assert_eq!(state.tool_calls()[1].id, "t3");
+        assert!(state.history_truncated());
+    }
+
+    #[test]
+    fn canonical_clear_resets_accumulated_truncation() {
+        let mut state = ViewState::with_scrollback_limit("sess-1", 1);
+        for (seq, text) in [(1, "one"), (2, "two")] {
+            ev(
+                &mut state,
+                seq,
+                SessionEvent::UserMessage {
+                    text: text.to_string(),
+                    request_id: None,
+                },
+            );
+        }
+        assert!(state.history_truncated());
+        ev(&mut state, 3, SessionEvent::ConversationCleared);
+        assert!(!state.history_truncated());
     }
 
     #[test]
@@ -863,6 +888,38 @@ mod tests {
         );
         assert_eq!(s.transcript().len(), 3);
         assert_eq!(s.last_seq(), 11);
+    }
+
+    #[test]
+    fn snapshot_hydration_uses_configured_scrollback_bound() {
+        let mut state = ViewState::with_scrollback_limit("placeholder", 1);
+        state.apply_snapshot(SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 2,
+            turn_status: TurnStatus::Idle,
+            transcript: vec![
+                TranscriptEntry {
+                    id: 1,
+                    role: TranscriptRole::User,
+                    text: "old".to_string(),
+                    outcome: None,
+                },
+                TranscriptEntry {
+                    id: 2,
+                    role: TranscriptRole::Assistant,
+                    text: "new".to_string(),
+                    outcome: None,
+                },
+            ],
+            tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+            history_truncated: false,
+        });
+        assert_eq!(state.transcript().len(), 1);
+        assert_eq!(state.transcript()[0].text, "new");
+        assert!(state.history_truncated());
     }
 
     #[test]
