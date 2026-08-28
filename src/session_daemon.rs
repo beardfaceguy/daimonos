@@ -2507,9 +2507,10 @@ impl SnapshotState {
 
     fn from_snapshot(mut snapshot: SessionSnapshot, max_entries: usize) -> Self {
         let max_entries = max_entries.max(1);
-        trim_oldest(&mut snapshot.transcript, max_entries);
-        trim_oldest(&mut snapshot.tool_calls, max_entries);
-        trim_oldest(&mut snapshot.runtime_options, max_entries);
+        snapshot.history_truncated |= trim_oldest(&mut snapshot.transcript, max_entries);
+        snapshot.history_truncated |= trim_oldest(&mut snapshot.tool_calls, max_entries);
+        // Runtime-option bounding does not omit conversation history.
+        let _ = trim_oldest(&mut snapshot.runtime_options, max_entries);
         let next_transcript_id = snapshot
             .transcript
             .iter()
@@ -2572,7 +2573,8 @@ impl SnapshotState {
                     *existing = call;
                 } else {
                     self.snapshot.tool_calls.push(call);
-                    trim_oldest(&mut self.snapshot.tool_calls, self.max_entries);
+                    self.snapshot.history_truncated |=
+                        trim_oldest(&mut self.snapshot.tool_calls, self.max_entries);
                 }
             }
             SessionEvent::ToolCallUpdated { id, status } => {
@@ -2628,7 +2630,8 @@ impl SnapshotState {
             }
             SessionEvent::RuntimeOptionsChanged { options } => {
                 self.snapshot.runtime_options = options;
-                trim_oldest(&mut self.snapshot.runtime_options, self.max_entries);
+                // Runtime-option bounding does not omit conversation history.
+                let _ = trim_oldest(&mut self.snapshot.runtime_options, self.max_entries);
             }
             SessionEvent::ContextUsageChanged { usage } => {
                 self.snapshot.context_usage = Some(usage);
@@ -2654,7 +2657,8 @@ impl SnapshotState {
             text,
             outcome: None,
         });
-        trim_oldest(&mut self.snapshot.transcript, self.max_entries);
+        self.snapshot.history_truncated |=
+            trim_oldest(&mut self.snapshot.transcript, self.max_entries);
     }
 
     fn append_transcript(&mut self, role: TranscriptRole, text: String) {
@@ -2668,11 +2672,12 @@ impl SnapshotState {
     }
 }
 
-fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
+fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) -> bool {
     let excess = entries.len().saturating_sub(max_entries);
     if excess > 0 {
         entries.drain(..excess);
     }
+    excess > 0
 }
 
 fn prompt_error(error: crate::session_core::SessionPromptError) -> (String, String) {
@@ -4410,6 +4415,27 @@ mod tests {
         assert!(encoded.len() <= 1_024);
         assert!(fitted.transcript.len() < 100);
         assert!(fitted.history_truncated);
+    }
+
+    #[test]
+    fn maintained_snapshot_marks_collection_cap_truncation() {
+        let mut snapshot = SnapshotState::new("session-1".to_string(), 1);
+        snapshot.apply(
+            1,
+            SessionEvent::UserMessage {
+                text: "first".to_string(),
+                request_id: None,
+            },
+        );
+        snapshot.apply(
+            2,
+            SessionEvent::UserMessage {
+                text: "second".to_string(),
+                request_id: None,
+            },
+        );
+        assert_eq!(snapshot.snapshot.transcript.len(), 1);
+        assert!(snapshot.snapshot.history_truncated);
     }
 
     #[tokio::test]
