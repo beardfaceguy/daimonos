@@ -486,6 +486,10 @@ pub struct SessionRuntimeConfig {
     pub persistence_retry_initial_backoff_ms: u64,
     /// Maximum exponential payload-save retry delay.
     pub persistence_retry_max_backoff_ms: u64,
+    /// Maximum extra idle retention granted to dirty/degraded sessions.
+    pub persistence_eviction_extension_secs: u64,
+    /// Maximum wait for one retention/shutdown final-save pass.
+    pub persistence_final_save_timeout_secs: u64,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
     /// Maximum wait for a daemon command result in a local frontend.
@@ -572,6 +576,8 @@ impl Default for SessionRuntimeConfig {
             persistence_retry_attempts: 3,
             persistence_retry_initial_backoff_ms: 50,
             persistence_retry_max_backoff_ms: 1_000,
+            persistence_eviction_extension_secs: 300,
+            persistence_final_save_timeout_secs: 5,
             shutdown_grace_secs: 5,
             client_command_timeout_secs: 10,
             bootstrap_timeout_secs: 15,
@@ -722,6 +728,16 @@ impl SessionRuntimeConfig {
             return Err("session.persistence_retry_max_backoff_ms must be at least \
                  persistence_retry_initial_backoff_ms"
                 .to_string());
+        }
+        if self.persistence_eviction_extension_secs == 0 {
+            return Err(
+                "session.persistence_eviction_extension_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.persistence_final_save_timeout_secs == 0 {
+            return Err(
+                "session.persistence_final_save_timeout_secs must be greater than zero".to_string(),
+            );
         }
         if self.shutdown_grace_secs == 0 {
             return Err("session.shutdown_grace_secs must be greater than zero".to_string());
@@ -2119,6 +2135,8 @@ mod tests {
         assert_eq!(cfg.session.persistence_retry_attempts, 3);
         assert_eq!(cfg.session.persistence_retry_initial_backoff_ms, 50);
         assert_eq!(cfg.session.persistence_retry_max_backoff_ms, 1_000);
+        assert_eq!(cfg.session.persistence_eviction_extension_secs, 300);
+        assert_eq!(cfg.session.persistence_final_save_timeout_secs, 5);
         assert_eq!(cfg.session.shutdown_grace_secs, 5);
         assert_eq!(cfg.session.client_command_timeout_secs, 10);
         assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
@@ -2550,6 +2568,16 @@ mod tests {
             .validate()
             .expect_err("persistence retry max must cover initial delay")
             .contains("session.persistence_retry_max_backoff_ms"));
+        for field in [
+            "persistence_eviction_extension_secs",
+            "persistence_final_save_timeout_secs",
+        ] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero persistence lifecycle limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
         let invalid: Config =
             toml::from_str("[session]\nclient_command_timeout_secs = 0\n").unwrap();
         assert!(invalid

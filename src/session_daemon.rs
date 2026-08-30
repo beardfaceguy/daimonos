@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::client_transport::{ClientTransport, TransportError, UnixSocketTransport};
 use crate::session_catalog::{CatalogMutation, CatalogRow, SessionCatalog, SessionCatalogWriter};
 use crate::session_core::{
-    RuntimeConfigError, SessionCore, SessionEventSubscription, SessionReplay,
+    PersistenceHealth, RuntimeConfigError, SessionCore, SessionEventSubscription, SessionReplay,
 };
 use crate::session_protocol::{
     AttachDeniedCode, ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage,
@@ -39,6 +39,13 @@ pub enum SessionOpenError {
     WorkspaceUnknown,
     WorkspaceMismatch,
     Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalSaveOutcome {
+    Saved,
+    Failed,
+    TimedOut,
 }
 
 #[async_trait::async_trait]
@@ -144,6 +151,7 @@ struct ClientAttachment {
 }
 
 struct SessionEntry {
+    session_id: String,
     core: Arc<SessionCore>,
     admission: Arc<tokio::sync::Mutex<()>>,
     clients: Mutex<HashMap<String, ClientAttachment>>,
@@ -156,6 +164,28 @@ struct SessionEntry {
     active_prompt_tasks: AtomicUsize,
     prompt_tasks_changed: tokio::sync::Notify,
     last_activity_unix_ms: Arc<AtomicU64>,
+    persistence_deferral_started: Mutex<Option<tokio::time::Instant>>,
+}
+
+struct LatePersistenceSaveGuard {
+    session_id: String,
+    saves: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for LatePersistenceSaveGuard {
+    fn drop(&mut self) {
+        let mut saves = self
+            .saves
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = saves.get_mut(&self.session_id) {
+            if *count <= 1 {
+                saves.remove(&self.session_id);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -189,11 +219,18 @@ enum SessionListPageError {
 
 pub struct SessionDaemon {
     sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+    // Timed-out spawn_blocking writes cannot be cancelled. Refcounts prevent
+    // same-daemon identity reuse until every detached write completes; a new
+    // daemon/process must still wait for the old daemon to exit. SessionStore
+    // temp-file + rename writes keep any concurrently observed payload whole.
+    late_persistence_saves: Arc<Mutex<HashMap<String, usize>>>,
     max_sessions: usize,
     max_clients_per_session: usize,
     event_queue_capacity: usize,
     max_snapshot_entries: usize,
     idle_retention: Option<std::time::Duration>,
+    persistence_eviction_extension: Option<std::time::Duration>,
+    persistence_final_save_timeout: Option<std::time::Duration>,
     session_list_page_size: usize,
     session_list_preview_bytes: usize,
     session_list_snapshot_entries: usize,
@@ -226,11 +263,14 @@ impl SessionDaemon {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            late_persistence_saves: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
             max_clients_per_session,
             event_queue_capacity: event_queue_capacity.max(1),
             max_snapshot_entries: max_snapshot_entries.max(1),
             idle_retention: None,
+            persistence_eviction_extension: None,
+            persistence_final_save_timeout: None,
             session_list_page_size: max_sessions.max(1),
             session_list_preview_bytes: 256,
             session_list_snapshot_entries: max_sessions.max(1),
@@ -267,11 +307,14 @@ impl SessionDaemon {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            late_persistence_saves: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
             max_clients_per_session,
             event_queue_capacity: event_queue_capacity.max(1),
             max_snapshot_entries: max_snapshot_entries.max(1),
             idle_retention,
+            persistence_eviction_extension: None,
+            persistence_final_save_timeout: None,
             session_list_page_size: session_list_page_size.max(1),
             session_list_preview_bytes: 256,
             session_list_snapshot_entries: 1_000,
@@ -305,6 +348,16 @@ impl SessionDaemon {
         self.session_list_snapshot_entries =
             snapshot_entries.max(self.session_list_page_size).max(1);
         self.session_list_snapshot_ttl = snapshot_ttl;
+        self
+    }
+
+    pub fn with_persistence_lifecycle(
+        mut self,
+        eviction_extension: std::time::Duration,
+        final_save_timeout: std::time::Duration,
+    ) -> Self {
+        self.persistence_eviction_extension = Some(eviction_extension);
+        self.persistence_final_save_timeout = Some(final_save_timeout);
         self
     }
 
@@ -384,6 +437,9 @@ impl SessionDaemon {
             if self.session(&session_id).is_some() {
                 return Ok((session_id, false));
             }
+            if self.has_late_persistence_save(&session_id) {
+                return Err(SessionDaemonError::SessionStopped(session_id));
+            }
             let sessions_len = self
                 .sessions
                 .lock()
@@ -445,6 +501,9 @@ impl SessionDaemon {
         core: Arc<SessionCore>,
         initial_snapshot: SessionSnapshot,
     ) -> Result<(), SessionDaemonError> {
+        if self.has_late_persistence_save(&session_id) {
+            return Err(SessionDaemonError::SessionStopped(session_id));
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -479,8 +538,9 @@ impl SessionDaemon {
             .map_err(|error| SessionDaemonError::EventSubscription(format!("{error:?}")))?;
         let (stop_notifier, _) = tokio::sync::watch::channel(false);
         sessions.insert(
-            session_id,
+            session_id.clone(),
             Arc::new(SessionEntry {
+                session_id,
                 core,
                 admission: Arc::new(tokio::sync::Mutex::new(())),
                 clients: Mutex::new(HashMap::new()),
@@ -493,6 +553,7 @@ impl SessionDaemon {
                 active_prompt_tasks: AtomicUsize::new(0),
                 prompt_tasks_changed: tokio::sync::Notify::new(),
                 last_activity_unix_ms,
+                persistence_deferral_started: Mutex::new(None),
             }),
         );
         Ok(())
@@ -579,6 +640,10 @@ impl SessionDaemon {
                 .last_detached_at
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *entry
+                .persistence_deferral_started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
         Ok(AttachedSession {
             entry,
@@ -596,6 +661,22 @@ impl SessionDaemon {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
             .map(|entry| Arc::clone(&entry.core))
+    }
+
+    fn has_late_persistence_save(&self, session_id: &str) -> bool {
+        let pending = self
+            .late_persistence_saves
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(session_id);
+        if pending {
+            tracing::warn!(
+                target: "daimonos::session_daemon",
+                event = "session_identity_waiting_for_late_save",
+                session_id,
+            );
+        }
+        pending
     }
 
     async fn acquire_listing_query_permit(
@@ -1032,6 +1113,50 @@ impl SessionDaemon {
             if !still_idle {
                 continue;
             }
+            if entry.core.persistence_health() != PersistenceHealth::Clean {
+                if let Some(extension) = self.persistence_eviction_extension {
+                    let extension_expired = {
+                        let mut started = entry
+                            .persistence_deferral_started
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let started = started.get_or_insert(now);
+                        now.duration_since(*started) >= extension
+                    };
+                    let final_save = self.attempt_final_save(&entry, false).await;
+                    if final_save != FinalSaveOutcome::Saved && !extension_expired {
+                        continue;
+                    }
+                    if final_save != FinalSaveOutcome::Saved {
+                        Self::log_persistence_loss_risk(
+                            &entry,
+                            "idle_retention_extension_exhausted",
+                            false,
+                            final_save,
+                        );
+                    }
+                }
+            } else {
+                *entry
+                    .persistence_deferral_started
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+            let still_idle_after_save = entry
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+                && entry
+                    .last_detached_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some_and(|detached| now.duration_since(detached) >= retention)
+                && entry.active_prompt_tasks.load(Ordering::Acquire) == 0
+                && !entry.core.turn.is_active();
+            if !still_idle_after_save {
+                continue;
+            }
             let removed = {
                 let mut sessions = self
                     .sessions
@@ -1077,7 +1202,21 @@ impl SessionDaemon {
         let Some(entry) = entry else {
             return Ok(false);
         };
-        let admission = entry.admission.lock().await;
+        let admission = if delete_persisted {
+            entry.admission.lock().await
+        } else {
+            match tokio::time::timeout(self.shutdown_grace, entry.admission.lock()).await {
+                Ok(admission) => admission,
+                Err(_) => {
+                    tracing::error!(
+                        target: "daimonos::session_daemon",
+                        event = "daemon_shutdown_admission_timeout",
+                        session_id,
+                    );
+                    return Ok(false);
+                }
+            }
+        };
         let still_current = self
             .sessions
             .lock()
@@ -1092,12 +1231,18 @@ impl SessionDaemon {
             // Keep admission through the bounded wait: already-started prompt
             // tasks no longer need it after begin_turn, while queued tasks stay
             // blocked until deletion either commits or fails.
-            self.wait_for_prompt_tasks(&entry).await;
+            let _ = self.wait_for_prompt_tasks(&entry).await;
             entry.core.cleanup_cancelled_turn();
             // SessionPersistence holds its state lock across unlink and marks
             // deletion before release, so a timed-out prompt's later save is
             // serialized behind this call and becomes a no-op.
             entry.core.delete_persisted()?;
+        } else {
+            let quiescent = self.wait_for_prompt_tasks(&entry).await;
+            let final_save = self.attempt_final_save(&entry, !quiescent).await;
+            if final_save != FinalSaveOutcome::Saved || !quiescent {
+                Self::log_persistence_loss_risk(&entry, "daemon_shutdown", !quiescent, final_save);
+            }
         }
         let removed = {
             let mut sessions = self
@@ -1120,15 +1265,12 @@ impl SessionDaemon {
         };
         entry.stopped.store(true, Ordering::Release);
         drop(admission);
-        if !delete_persisted {
-            self.wait_for_prompt_tasks(&entry).await;
-        }
         Self::finish_removed_entry(entry, reason, false)?;
         Ok(true)
     }
 
-    async fn wait_for_prompt_tasks(&self, entry: &SessionEntry) {
-        let _ = tokio::time::timeout(self.shutdown_grace, async {
+    async fn wait_for_prompt_tasks(&self, entry: &SessionEntry) -> bool {
+        tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = entry.prompt_tasks_changed.notified();
                 if entry.active_prompt_tasks.load(Ordering::Acquire) == 0 {
@@ -1137,7 +1279,82 @@ impl SessionDaemon {
                 changed.await;
             }
         })
-        .await;
+        .await
+        .is_ok()
+    }
+
+    async fn attempt_final_save(&self, entry: &SessionEntry, force: bool) -> FinalSaveOutcome {
+        if !force && entry.core.persistence_health() == PersistenceHealth::Clean {
+            return FinalSaveOutcome::Saved;
+        }
+        let Some(timeout) = self.persistence_final_save_timeout else {
+            return FinalSaveOutcome::Failed;
+        };
+        let core = Arc::clone(&entry.core);
+        let mut save = tokio::spawn(async move {
+            core.persist_current().await;
+            core.persistence_health()
+        });
+        match tokio::time::timeout(timeout, &mut save).await {
+            Ok(Ok(PersistenceHealth::Clean)) => FinalSaveOutcome::Saved,
+            Ok(Ok(_)) | Ok(Err(_)) => FinalSaveOutcome::Failed,
+            Err(_) => {
+                let session_id = entry.session_id.clone();
+                let late_saves = Arc::clone(&self.late_persistence_saves);
+                *late_saves
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(session_id.clone())
+                    .or_default() += 1;
+                tokio::spawn(async move {
+                    let _guard = LatePersistenceSaveGuard {
+                        session_id: session_id.clone(),
+                        saves: late_saves,
+                    };
+                    match save.await {
+                        Ok(PersistenceHealth::Clean) => tracing::info!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "saved",
+                        ),
+                        Ok(health) => tracing::error!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "degraded",
+                            persistence_health = ?health,
+                        ),
+                        Err(error) => tracing::error!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "task_failed",
+                            cancelled = error.is_cancelled(),
+                            panic = error.is_panic(),
+                        ),
+                    }
+                });
+                FinalSaveOutcome::TimedOut
+            }
+        }
+    }
+
+    fn log_persistence_loss_risk(
+        entry: &SessionEntry,
+        lifecycle: &str,
+        prompt_active: bool,
+        final_save: FinalSaveOutcome,
+    ) {
+        tracing::error!(
+            target: "daimonos::session_daemon",
+            event = "session_persistence_loss_risk",
+            session_id = %entry.session_id,
+            lifecycle,
+            prompt_active,
+            final_save = ?final_save,
+            persistence_health = ?entry.core.persistence_health(),
+        );
     }
 
     fn finish_removed_entry(
@@ -1188,11 +1405,12 @@ impl SessionDaemon {
             .keys()
             .cloned()
             .collect();
-        for session_id in session_ids {
-            let _ = self
-                .end_session(&session_id, "daemon_shutdown", false)
-                .await;
-        }
+        futures_util::future::join_all(
+            session_ids
+                .iter()
+                .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
+        )
+        .await;
         let _ = tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = self.client_tasks_changed.notified();
@@ -6163,6 +6381,429 @@ mod tests {
         daemon
             .create_session("session-2".to_string(), test_core())
             .expect("idle eviction releases capacity");
+    }
+
+    #[tokio::test]
+    async fn idle_retention_final_save_recovers_before_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::new(directory.path().to_path_buf());
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence));
+        core.persist_current().await;
+        assert!(matches!(
+            core.persistence_health(),
+            PersistenceHealth::Degraded { .. }
+        ));
+
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(1)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        *entry.last_detached_at.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(10));
+
+        daemon.evict_idle_sessions().await;
+
+        assert!(daemon.session("session-1").is_none());
+        assert!(store.load("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_retention_defers_then_forces_persistently_degraded_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+        ]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence));
+        core.persist_current().await;
+
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(1)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        *entry.last_detached_at.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(10));
+
+        daemon.evict_idle_sessions().await;
+        assert!(daemon.session("session-1").is_some());
+        *entry.persistence_deferral_started.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        daemon.evict_idle_sessions().await;
+        assert!(daemon.session("session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn reattach_resets_persistence_eviction_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+        ]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence));
+        core.persist_current().await;
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(1)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        *entry.last_detached_at.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(10));
+        daemon.evict_idle_sessions().await;
+        *entry.persistence_deferral_started.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        let reattached_at = tokio::time::Instant::now();
+        let mut attachment = daemon
+            .attach(
+                "session-1",
+                terminal_client(),
+                vec![ClientCapability::Observe],
+            )
+            .await
+            .unwrap();
+        attachment.finish_handshake();
+        assert!(entry.persistence_deferral_started.lock().unwrap().is_none());
+        drop(attachment);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        daemon.evict_idle_sessions().await;
+
+        assert!(daemon.session("session-1").is_some());
+        assert!(entry
+            .persistence_deferral_started
+            .lock()
+            .unwrap()
+            .is_some_and(|started| started >= reattached_at));
+    }
+
+    #[tokio::test]
+    async fn timed_out_eviction_save_quarantines_session_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence.clone()));
+        core.persist_current().await;
+        let (_save_started, release_save) = persistence.pause_next_save();
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            Some(std::time::Duration::from_millis(1)),
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(10),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        *entry.last_detached_at.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(10));
+        *entry.persistence_deferral_started.lock().unwrap() =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(10));
+
+        daemon.evict_idle_sessions().await;
+        assert!(daemon.session("session-1").is_none());
+        assert_eq!(
+            daemon.open_session(Some("session-1".to_string())).await,
+            Err(SessionDaemonError::SessionStopped("session-1".to_string()))
+        );
+        release_save.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if daemon.late_persistence_saves.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            daemon.open_session(Some("session-1".to_string())).await,
+            Ok(("session-1".to_string(), false))
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_final_save_recovers_degraded_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::new(directory.path().to_path_buf());
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence));
+        core.persist_current().await;
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            None,
+            50,
+            std::time::Duration::from_secs(1),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+
+        daemon.shutdown().await;
+
+        assert!(daemon.session("session-1").is_none());
+        assert!(store.load("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_final_save_obeys_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = test_core_with_persistence(Box::new(StaticProvider), Some(persistence.clone()));
+        core.persist_current().await;
+        let (_save_started, release_save) = persistence.pause_next_save();
+        let daemon = SessionDaemon::with_factory(
+            1,
+            1,
+            8,
+            32,
+            None,
+            50,
+            std::time::Duration::from_millis(20),
+            Arc::new(TestSessionFactory),
+        )
+        .with_persistence_lifecycle(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
+        );
+        daemon
+            .create_session("session-1".to_string(), core)
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        daemon.shutdown().await;
+        let elapsed = started.elapsed();
+        release_save.send(()).unwrap();
+
+        assert!(elapsed < std::time::Duration::from_millis(200));
+        assert!(daemon.session("session-1").is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if daemon.late_persistence_saves.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_final_saves_run_concurrently_across_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        let second_persistence = crate::session_core::SessionPersistence::new(
+            "session-2",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        first_persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        second_persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let first_core =
+            test_core_with_persistence(Box::new(StaticProvider), Some(first_persistence.clone()));
+        let second_core =
+            test_core_with_persistence(Box::new(StaticProvider), Some(second_persistence.clone()));
+        first_core.persist_current().await;
+        second_core.persist_current().await;
+        let (first_started, release_first) = first_persistence.pause_next_save();
+        let (second_started, release_second) = second_persistence.pause_next_save();
+        let daemon = Arc::new(
+            SessionDaemon::with_factory(
+                2,
+                1,
+                8,
+                32,
+                None,
+                50,
+                std::time::Duration::from_secs(1),
+                Arc::new(TestSessionFactory),
+            )
+            .with_persistence_lifecycle(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+        );
+        daemon
+            .create_session("session-1".to_string(), first_core)
+            .unwrap();
+        daemon
+            .create_session("session-2".to_string(), second_core)
+            .unwrap();
+
+        let shutdown_daemon = Arc::clone(&daemon);
+        let shutdown = tokio::spawn(async move { shutdown_daemon.shutdown().await });
+        tokio::task::spawn_blocking(move || {
+            first_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            second_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        release_first.send(()).unwrap();
+        release_second.send(()).unwrap();
+        shutdown.await.unwrap();
+
+        assert!(daemon.session("session-1").is_none());
+        assert!(daemon.session("session-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalization_has_aggregate_deadline() {
+        let daemon = Arc::new(
+            SessionDaemon::with_factory(
+                1,
+                1,
+                8,
+                32,
+                None,
+                50,
+                std::time::Duration::from_millis(10),
+                Arc::new(TestSessionFactory),
+            )
+            .with_persistence_lifecycle(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(10),
+            ),
+        );
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        let admission = entry.admission.lock().await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), daemon.shutdown())
+            .await
+            .expect("aggregate shutdown deadline");
+        drop(admission);
+
+        assert!(daemon.session("session-1").is_some());
     }
 
     #[tokio::test]

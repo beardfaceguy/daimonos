@@ -179,6 +179,9 @@ session_catalog_tombstone_retention_secs = 300
 persistence_retry_attempts = 3
 persistence_retry_initial_backoff_ms = 50
 persistence_retry_max_backoff_ms = 1000
+# Maximum extra idle retention and final-save wait for unsaved session state.
+persistence_eviction_extension_secs = 300
+persistence_final_save_timeout_secs = 5
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
 # Maximum seconds a local frontend waits for a daemon command result.
