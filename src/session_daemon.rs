@@ -167,6 +167,27 @@ struct SessionEntry {
     persistence_deferral_started: Mutex<Option<tokio::time::Instant>>,
 }
 
+struct LatePersistenceSaveGuard {
+    session_id: String,
+    saves: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for LatePersistenceSaveGuard {
+    fn drop(&mut self) {
+        let mut saves = self
+            .saves
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = saves.get_mut(&self.session_id) {
+            if *count <= 1 {
+                saves.remove(&self.session_id);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ConnectionListingSnapshot {
     rows: Vec<SessionListEntry>,
@@ -416,12 +437,7 @@ impl SessionDaemon {
             if self.session(&session_id).is_some() {
                 return Ok((session_id, false));
             }
-            if self
-                .late_persistence_saves
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&session_id)
-            {
+            if self.has_late_persistence_save(&session_id) {
                 return Err(SessionDaemonError::SessionStopped(session_id));
             }
             let sessions_len = self
@@ -485,12 +501,7 @@ impl SessionDaemon {
         core: Arc<SessionCore>,
         initial_snapshot: SessionSnapshot,
     ) -> Result<(), SessionDaemonError> {
-        if self
-            .late_persistence_saves
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&session_id)
-        {
+        if self.has_late_persistence_save(&session_id) {
             return Err(SessionDaemonError::SessionStopped(session_id));
         }
         let mut sessions = self
@@ -650,6 +661,22 @@ impl SessionDaemon {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
             .map(|entry| Arc::clone(&entry.core))
+    }
+
+    fn has_late_persistence_save(&self, session_id: &str) -> bool {
+        let pending = self
+            .late_persistence_saves
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(session_id);
+        if pending {
+            tracing::warn!(
+                target: "daimonos::session_daemon",
+                event = "session_identity_waiting_for_late_save",
+                session_id,
+            );
+        }
+        pending
     }
 
     async fn acquire_listing_query_permit(
@@ -1251,15 +1278,32 @@ impl SessionDaemon {
                     .entry(session_id.clone())
                     .or_default() += 1;
                 tokio::spawn(async move {
-                    let _ = save.await;
-                    let mut late_saves = late_saves
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(count) = late_saves.get_mut(&session_id) {
-                        *count -= 1;
-                        if *count == 0 {
-                            late_saves.remove(&session_id);
-                        }
+                    let _guard = LatePersistenceSaveGuard {
+                        session_id: session_id.clone(),
+                        saves: late_saves,
+                    };
+                    match save.await {
+                        Ok(PersistenceHealth::Clean) => tracing::info!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "saved",
+                        ),
+                        Ok(health) => tracing::error!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "degraded",
+                            persistence_health = ?health,
+                        ),
+                        Err(error) => tracing::error!(
+                            target: "daimonos::session_daemon",
+                            event = "session_late_save_completed",
+                            session_id = %session_id,
+                            outcome = "task_failed",
+                            cancelled = error.is_cancelled(),
+                            panic = error.is_panic(),
+                        ),
                     }
                 });
                 FinalSaveOutcome::TimedOut
@@ -1332,12 +1376,30 @@ impl SessionDaemon {
             .keys()
             .cloned()
             .collect();
-        futures_util::future::join_all(
-            session_ids
-                .iter()
-                .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
+        let finalization_budget = self
+            .shutdown_grace
+            .saturating_add(self.persistence_final_save_timeout.unwrap_or_default());
+        if tokio::time::timeout(
+            finalization_budget,
+            futures_util::future::join_all(
+                session_ids
+                    .iter()
+                    .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
+            ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            tracing::error!(
+                target: "daimonos::session_daemon",
+                event = "daemon_shutdown_finalization_timeout",
+                remaining_sessions = self
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len(),
+            );
+        }
         let _ = tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = self.client_tasks_changed.notified();
@@ -6693,6 +6755,44 @@ mod tests {
 
         assert!(daemon.session("session-1").is_none());
         assert!(daemon.session("session-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalization_has_aggregate_deadline() {
+        let daemon = Arc::new(
+            SessionDaemon::with_factory(
+                1,
+                1,
+                8,
+                32,
+                None,
+                50,
+                std::time::Duration::from_millis(10),
+                Arc::new(TestSessionFactory),
+            )
+            .with_persistence_lifecycle(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(10),
+            ),
+        );
+        daemon
+            .create_session("session-1".to_string(), test_core())
+            .unwrap();
+        let entry = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        let admission = entry.admission.lock().await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), daemon.shutdown())
+            .await
+            .expect("aggregate shutdown deadline");
+        drop(admission);
+
+        assert!(daemon.session("session-1").is_some());
     }
 
     #[tokio::test]
