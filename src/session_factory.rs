@@ -118,6 +118,29 @@ impl SessionFactory for AgentSessionFactory {
                 return Err(SessionOpenError::WorkspaceMismatch);
             }
         }
+        let persistence = SessionPersistence::claim(
+            session_id.to_string(),
+            self.store.clone(),
+            persisted.as_ref().map(|record| record.generation),
+            PersistenceRetryPolicy::new(
+                self.config.session.persistence_retry_attempts,
+                std::time::Duration::from_millis(
+                    self.config.session.persistence_retry_initial_backoff_ms,
+                ),
+                std::time::Duration::from_millis(
+                    self.config.session.persistence_retry_max_backoff_ms,
+                ),
+            ),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                target: "daimonos::session_factory",
+                event = "session_writer_claim_failed",
+                session_id,
+                error = %error,
+            );
+            SessionOpenError::Io
+        })?;
         let workspace = self.workspace.clone();
         let model = persisted
             .as_ref()
@@ -237,24 +260,9 @@ impl SessionFactory for AgentSessionFactory {
             self.compaction.clone(),
             context_windows,
             approvals,
-            Some({
-                let persistence = SessionPersistence::new(
-                    session_id.to_string(),
-                    self.store.clone(),
-                    PersistenceRetryPolicy::new(
-                        self.config.session.persistence_retry_attempts,
-                        std::time::Duration::from_millis(
-                            self.config.session.persistence_retry_initial_backoff_ms,
-                        ),
-                        std::time::Duration::from_millis(
-                            self.config.session.persistence_retry_max_backoff_ms,
-                        ),
-                    ),
-                );
-                match &self.catalog_writer {
-                    Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
-                    None => persistence,
-                }
+            Some(match &self.catalog_writer {
+                Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
+                None => persistence,
             }),
             events,
             tool_lifecycle,
@@ -354,6 +362,7 @@ impl From<SessionStoreErrorKind> for SessionOpenError {
                 debug_assert!(false, "session open cannot produce duplicate-import errors");
                 Self::Internal
             }
+            SessionStoreErrorKind::WriterChanged => Self::Io,
             SessionStoreErrorKind::NotFound => Self::NotFound,
             SessionStoreErrorKind::FutureVersion => Self::FutureVersion,
             SessionStoreErrorKind::UnsupportedVersion => Self::UnsupportedVersion,

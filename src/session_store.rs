@@ -22,6 +22,7 @@ const SESSION_DATABASE_NAME: &str = "sessions.sqlite3";
 pub enum SessionStoreErrorKind {
     UnsafeId,
     AlreadyExists,
+    WriterChanged,
     NotFound,
     FutureVersion,
     UnsupportedVersion,
@@ -35,6 +36,7 @@ pub enum SessionStoreErrorKind {
 pub enum SessionStoreError {
     UnsafeId,
     AlreadyExists,
+    WriterChanged { expected: u64, found: Option<u64> },
     NotFound,
     FutureVersion { found: u32, supported: u32 },
     UnsupportedVersion { found: u32, supported: u32 },
@@ -48,6 +50,7 @@ impl SessionStoreError {
         match self {
             Self::UnsafeId => SessionStoreErrorKind::UnsafeId,
             Self::AlreadyExists => SessionStoreErrorKind::AlreadyExists,
+            Self::WriterChanged { .. } => SessionStoreErrorKind::WriterChanged,
             Self::NotFound => SessionStoreErrorKind::NotFound,
             Self::FutureVersion { .. } => SessionStoreErrorKind::FutureVersion,
             Self::UnsupportedVersion { .. } => SessionStoreErrorKind::UnsupportedVersion,
@@ -66,6 +69,10 @@ impl std::fmt::Display for SessionStoreError {
         match self {
             Self::UnsafeId => formatter.write_str("session id is not a safe path component"),
             Self::AlreadyExists => formatter.write_str("session id already exists"),
+            Self::WriterChanged { expected, found } => write!(
+                formatter,
+                "session changed while claiming writer epoch: expected generation {expected}, found {found:?}"
+            ),
             Self::NotFound => formatter.write_str("persisted session was not found"),
             Self::FutureVersion { found, supported } => write!(
                 formatter,
@@ -90,6 +97,7 @@ impl std::error::Error for SessionStoreError {
             Self::Io(error) => Some(error),
             Self::UnsafeId
             | Self::AlreadyExists
+            | Self::WriterChanged { .. }
             | Self::NotFound
             | Self::FutureVersion { .. }
             | Self::UnsupportedVersion { .. } => None,
@@ -137,10 +145,17 @@ pub struct PersistedWrite {
     pub updated_at_unix_ns: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWriter {
+    session_id: String,
+    epoch: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum SessionWriteOutcome {
     Saved(PersistedWrite),
     Stale { stored_generation: u64 },
+    Superseded,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +260,10 @@ impl SessionStore {
                     preview TEXT,
                     updated_at_unix_ns INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS session_writers (
+                    session_id TEXT PRIMARY KEY,
+                    writer_epoch TEXT NOT NULL
+                 );
                  CREATE INDEX IF NOT EXISTS sessions_updated
                     ON sessions(updated_at_unix_ns DESC, session_id ASC);",
             )
@@ -261,6 +280,61 @@ impl SessionStore {
             }
         }
         Ok(connection)
+    }
+
+    pub fn claim_writer(
+        &self,
+        session_id: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<SessionWriter, SessionStoreError> {
+        if !Self::valid_id(session_id) {
+            return Err(SessionStoreError::UnsafeId);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SessionStoreError::Database)?;
+        let found_generation = transaction
+            .query_row(
+                "SELECT generation FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(SessionStoreError::Database)?;
+        match expected_generation {
+            Some(expected) if found_generation != Some(expected) => {
+                transaction
+                    .rollback()
+                    .map_err(SessionStoreError::Database)?;
+                return Err(SessionStoreError::WriterChanged {
+                    expected,
+                    found: found_generation,
+                });
+            }
+            None if found_generation.is_some() => {
+                transaction
+                    .rollback()
+                    .map_err(SessionStoreError::Database)?;
+                return Err(SessionStoreError::AlreadyExists);
+            }
+            _ => {}
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "INSERT INTO session_writers (session_id, writer_epoch)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    writer_epoch = excluded.writer_epoch",
+                params![session_id, epoch],
+            )
+            .map_err(SessionStoreError::Database)?;
+        transaction.commit().map_err(SessionStoreError::Database)?;
+        Ok(SessionWriter {
+            session_id: session_id.to_string(),
+            epoch,
+        })
     }
 
     /// Persist a single-writer chat session. Generation is assigned inside the
@@ -280,6 +354,7 @@ impl SessionStore {
 
     /// Persist an ACP/daemon session including its provider-neutral effort
     /// level so every caller makes runtime-state ownership explicit.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn save_acp(
         &self,
@@ -305,6 +380,7 @@ impl SessionStore {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn save_acp_result(
         &self,
@@ -327,10 +403,14 @@ impl SessionStore {
             assistant_outcomes,
             max_preview_bytes,
             None,
+            None,
         )? {
             SessionWriteOutcome::Saved(write) => Ok(write),
             SessionWriteOutcome::Stale { .. } => Err(std::io::Error::other(
                 "automatic session generation was stale",
+            )),
+            SessionWriteOutcome::Superseded => Err(std::io::Error::other(
+                "automatic session writer was superseded",
             )),
         }
     }
@@ -338,7 +418,7 @@ impl SessionStore {
     #[allow(clippy::too_many_arguments)]
     pub fn save_acp_generation_result(
         &self,
-        id: &str,
+        writer: &SessionWriter,
         generation: u64,
         model: &str,
         thinking: &str,
@@ -349,7 +429,7 @@ impl SessionStore {
         max_preview_bytes: usize,
     ) -> std::io::Result<SessionWriteOutcome> {
         self.save_record_result(
-            id,
+            &writer.session_id,
             model,
             Some(thinking.to_string()),
             messages,
@@ -358,6 +438,7 @@ impl SessionStore {
             assistant_outcomes,
             max_preview_bytes,
             Some(generation),
+            Some(writer),
         )
     }
 
@@ -386,7 +467,7 @@ impl SessionStore {
             assistant_outcomes: assistant_outcomes.to_vec(),
             messages: messages.to_vec(),
         };
-        if let Err(e) = self.write_record(record, usize::MAX, None) {
+        if let Err(e) = self.write_record(record, usize::MAX, None, None) {
             eprintln!("session store: failed to persist session {id}: {e}");
         }
     }
@@ -403,6 +484,7 @@ impl SessionStore {
         assistant_outcomes: &[AssistantOutcome],
         max_preview_bytes: usize,
         generation: Option<u64>,
+        writer: Option<&SessionWriter>,
     ) -> std::io::Result<SessionWriteOutcome> {
         if !Self::valid_id(id) {
             return Err(std::io::Error::other("session id is invalid"));
@@ -418,7 +500,7 @@ impl SessionStore {
             assistant_outcomes: assistant_outcomes.to_vec(),
             messages: messages.to_vec(),
         };
-        self.write_record(record, max_preview_bytes, generation)
+        self.write_record(record, max_preview_bytes, generation, writer)
     }
 
     fn write_record(
@@ -426,11 +508,31 @@ impl SessionStore {
         mut record: PersistedSession,
         max_preview_bytes: usize,
         requested_generation: Option<u64>,
+        writer: Option<&SessionWriter>,
     ) -> std::io::Result<SessionWriteOutcome> {
         let mut connection = self.connection().map_err(std::io::Error::other)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
+        let active_epoch = transaction
+            .query_row(
+                "SELECT writer_epoch FROM session_writers WHERE session_id = ?1",
+                [&record.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let epoch_matches = match writer {
+            Some(writer) => {
+                debug_assert_eq!(writer.session_id, record.session_id);
+                active_epoch.as_deref() == Some(writer.epoch.as_str())
+            }
+            None => active_epoch.is_none(),
+        };
+        if !epoch_matches {
+            transaction.rollback().map_err(std::io::Error::other)?;
+            return Ok(SessionWriteOutcome::Superseded);
+        }
         let stored_generation = transaction
             .query_row(
                 "SELECT generation FROM sessions WHERE session_id = ?1",
@@ -557,7 +659,11 @@ impl SessionStore {
             .map_err(SessionStoreError::Database)?;
         let exists = transaction
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions WHERE session_id = ?1
+                    UNION ALL
+                    SELECT 1 FROM session_writers WHERE session_id = ?1
+                 )",
                 [&record.session_id],
                 |row| row.get::<_, bool>(0),
             )
@@ -589,15 +695,73 @@ impl SessionStore {
 
     /// Delete a persisted session. Missing and unsafe ids are treated as
     /// already deleted so ACP session/delete remains idempotent.
-    pub fn delete(&self, id: &str) -> std::io::Result<bool> {
+    /// Administrative deletion by id. This intentionally revokes any active
+    /// writer epoch; live runtime deletion should use [`Self::delete_writer`].
+    pub fn delete_unconditionally(&self, id: &str) -> std::io::Result<bool> {
         if !Self::valid_id(id) {
             return Ok(false);
         }
-        let connection = self.connection().map_err(std::io::Error::other)?;
-        connection
+        let mut connection = self.connection().map_err(std::io::Error::other)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let revokes_writer = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_writers WHERE session_id = ?1
+                 )",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(std::io::Error::other)?;
+        if revokes_writer {
+            tracing::warn!(
+                target: "daimonos::session_store",
+                event = "session_writer_epoch_revoked",
+                session_id = id,
+            );
+        }
+        let changed = transaction
             .execute("DELETE FROM sessions WHERE session_id = ?1", [id])
-            .map(|changed| changed > 0)
-            .map_err(std::io::Error::other)
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute("DELETE FROM session_writers WHERE session_id = ?1", [id])
+            .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_writer(&self, writer: &SessionWriter) -> std::io::Result<Option<bool>> {
+        let mut connection = self.connection().map_err(std::io::Error::other)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let active_epoch = transaction
+            .query_row(
+                "SELECT writer_epoch FROM session_writers WHERE session_id = ?1",
+                [&writer.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        if active_epoch.as_deref() != Some(writer.epoch.as_str()) {
+            transaction.rollback().map_err(std::io::Error::other)?;
+            return Ok(None);
+        }
+        let changed = transaction
+            .execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [&writer.session_id],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute(
+                "DELETE FROM session_writers WHERE session_id = ?1",
+                [&writer.session_id],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(Some(changed > 0))
     }
 
     #[cfg(test)]
@@ -887,9 +1051,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
+        let writer = store.claim_writer("ordered", None).unwrap();
         let saved = store
             .save_acp_generation_result(
-                "ordered",
+                &writer,
                 2,
                 "new-model",
                 "medium",
@@ -904,7 +1069,7 @@ mod tests {
 
         let stale = store
             .save_acp_generation_result(
-                "ordered",
+                &writer,
                 1,
                 "old-model",
                 "medium",
@@ -925,6 +1090,116 @@ mod tests {
         let loaded = store.load_result("ordered").unwrap();
         assert_eq!(loaded.generation, 2);
         assert_eq!(loaded.model, "new-model");
+    }
+
+    #[test]
+    fn reopened_writer_epoch_rejects_old_save_and_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let old_writer = store.claim_writer("epoch", None).unwrap();
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &old_writer,
+                    1,
+                    "old",
+                    "medium",
+                    &[Message::user("old state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
+        let reopened = store.load_result("epoch").unwrap();
+        let new_writer = store
+            .claim_writer("epoch", Some(reopened.generation))
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &old_writer,
+                    99,
+                    "stale",
+                    "medium",
+                    &[Message::user("stale state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Superseded
+        ));
+        assert_eq!(store.delete_writer(&old_writer).unwrap(), None);
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &new_writer,
+                    2,
+                    "new",
+                    "medium",
+                    &[Message::user("new state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
+        assert_eq!(store.load_result("epoch").unwrap().model, "new");
+        assert_eq!(store.delete_writer(&new_writer).unwrap(), Some(true));
+        assert!(matches!(
+            store.load_result("epoch"),
+            Err(SessionStoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn writer_only_reservation_can_be_reclaimed_after_failed_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let abandoned = store.claim_writer("unpersisted", None).unwrap();
+        let replacement = store.claim_writer("unpersisted", None).unwrap();
+
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &abandoned,
+                    1,
+                    "old",
+                    "medium",
+                    &[],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Superseded
+        ));
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &replacement,
+                    1,
+                    "new",
+                    "medium",
+                    &[],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
     }
 
     #[test]
@@ -1170,10 +1445,10 @@ mod tests {
         let store = SessionStore::new(dir.path().to_path_buf());
         store.save("s1", "m", &msgs());
 
-        assert!(store.delete("s1").unwrap());
+        assert!(store.delete_unconditionally("s1").unwrap());
         assert!(store.load("s1").is_none());
-        assert!(!store.delete("s1").unwrap());
-        assert!(!store.delete("../../etc/passwd").unwrap());
+        assert!(!store.delete_unconditionally("s1").unwrap());
+        assert!(!store.delete_unconditionally("../../etc/passwd").unwrap());
     }
 
     #[test]

@@ -21,7 +21,10 @@ payload bytes; it must not require every persistence caller to be rewritten.
 SQLite is the canonical session store. Each row contains the complete
 provider-neutral session payload, indexed listing metadata, and a monotonically
 increasing generation. A transaction accepts a write only when its generation
-is greater than the stored generation. SQL remains private to `SessionStore`.
+is greater than the stored generation and its random writer epoch is still
+current. Resuming a session rotates the epoch only if the generation loaded by
+the caller is still current; this makes every delayed prior-runtime save and
+delete terminally superseded. SQL remains private to `SessionStore`.
 Schema bootstrap and every future migration run in an immediate transaction.
 Version 1 has no predecessor to migrate; future schema bumps must add an
 explicit forward migration before increasing the supported version.

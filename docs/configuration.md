@@ -401,6 +401,9 @@ daimonos session export <session-id> --format json --output session.json
 
 Import requires a top-level `session_id` and rejects an existing id. Export
 refuses to overwrite an existing output file.
+Daemon and ACP runtimes claim a new writer epoch when opening a session.
+SQLite rejects delayed saves and deletes from every superseded epoch regardless
+of their numeric capture generation.
 
 Automatic reconnect treats only typed `event_queue_lagged` revocation and
 transport loss as resumable. `session_stopped`, `attachment_replaced`, and
