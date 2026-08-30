@@ -1142,6 +1142,21 @@ impl SessionDaemon {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             }
+            let still_idle_after_save = entry
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+                && entry
+                    .last_detached_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some_and(|detached| now.duration_since(detached) >= retention)
+                && entry.active_prompt_tasks.load(Ordering::Acquire) == 0
+                && !entry.core.turn.is_active();
+            if !still_idle_after_save {
+                continue;
+            }
             let removed = {
                 let mut sessions = self
                     .sessions
