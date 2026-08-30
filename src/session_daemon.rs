@@ -1332,11 +1332,12 @@ impl SessionDaemon {
             .keys()
             .cloned()
             .collect();
-        for session_id in session_ids {
-            let _ = self
-                .end_session(&session_id, "daemon_shutdown", false)
-                .await;
-        }
+        futures_util::future::join_all(
+            session_ids
+                .iter()
+                .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
+        )
+        .await;
         let _ = tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = self.client_tasks_changed.notified();
@@ -6626,6 +6627,72 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_final_saves_run_concurrently_across_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_persistence = crate::session_core::SessionPersistence::new(
+            "session-1",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        let second_persistence = crate::session_core::SessionPersistence::new(
+            "session-2",
+            crate::session_store::SessionStore::new(directory.path().to_path_buf()),
+            crate::session_core::PersistenceRetryPolicy::single_attempt(),
+        );
+        first_persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        second_persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let first_core =
+            test_core_with_persistence(Box::new(StaticProvider), Some(first_persistence.clone()));
+        let second_core =
+            test_core_with_persistence(Box::new(StaticProvider), Some(second_persistence.clone()));
+        first_core.persist_current().await;
+        second_core.persist_current().await;
+        let (first_started, release_first) = first_persistence.pause_next_save();
+        let (second_started, release_second) = second_persistence.pause_next_save();
+        let daemon = Arc::new(
+            SessionDaemon::with_factory(
+                2,
+                1,
+                8,
+                32,
+                None,
+                50,
+                std::time::Duration::from_secs(1),
+                Arc::new(TestSessionFactory),
+            )
+            .with_persistence_lifecycle(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+        );
+        daemon
+            .create_session("session-1".to_string(), first_core)
+            .unwrap();
+        daemon
+            .create_session("session-2".to_string(), second_core)
+            .unwrap();
+
+        let shutdown_daemon = Arc::clone(&daemon);
+        let shutdown = tokio::spawn(async move { shutdown_daemon.shutdown().await });
+        tokio::task::spawn_blocking(move || {
+            first_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            second_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        release_first.send(()).unwrap();
+        release_second.send(()).unwrap();
+        shutdown.await.unwrap();
+
+        assert!(daemon.session("session-1").is_none());
+        assert!(daemon.session("session-2").is_none());
     }
 
     #[tokio::test]
