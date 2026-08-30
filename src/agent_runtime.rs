@@ -738,6 +738,10 @@ pub async fn run_session_daemon(
         std::time::Duration::from_secs(cfg.session.shutdown_grace_secs),
         factory,
     )
+    .with_persistence_lifecycle(
+        std::time::Duration::from_secs(cfg.session.persistence_eviction_extension_secs),
+        std::time::Duration::from_secs(cfg.session.persistence_final_save_timeout_secs),
+    )
     .with_listing_limits(
         cfg.session.session_list_preview_bytes,
         cfg.session.session_list_snapshot_entries,

@@ -726,7 +726,7 @@ impl SessionPersistence {
     }
 
     #[cfg(test)]
-    fn fail_saves(&self, failures: impl IntoIterator<Item = std::io::ErrorKind>) {
+    pub(crate) fn fail_saves(&self, failures: impl IntoIterator<Item = std::io::ErrorKind>) {
         self.save_failures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -734,7 +734,7 @@ impl SessionPersistence {
     }
 
     #[cfg(test)]
-    fn pause_next_save(
+    pub(crate) fn pause_next_save(
         &self,
     ) -> (
         std::sync::mpsc::Receiver<()>,

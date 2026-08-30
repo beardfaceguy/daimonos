@@ -353,6 +353,8 @@ the local TUI/UDS client, and future remote clients.
 | `persistence_retry_attempts` | `3` | Total payload-save attempts before persistence remains degraded. |
 | `persistence_retry_initial_backoff_ms` | `50` | Initial delay between retryable payload-save failures. |
 | `persistence_retry_max_backoff_ms` | `1000` | Maximum exponential payload-save retry delay. The serialized gate is held for every configured delay plus each blocking write attempt. |
+| `persistence_eviction_extension_secs` | `300` | Maximum extra idle retention granted to dirty/degraded sessions before forced eviction. |
+| `persistence_final_save_timeout_secs` | `5` | Maximum wait for one retention or shutdown final-save pass. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
 | `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
 | `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
@@ -380,6 +382,10 @@ the local TUI/UDS client, and future remote clients.
 | `max_ticket_bytes` | `1024` | Maximum authentication ticket bytes. |
 | `max_runtime_value_bytes` | `4096` | Maximum UTF-8 bytes in a string runtime-option value. |
 | `max_capabilities` | `16` | Maximum requested capabilities in one attach. |
+
+Idle eviction runs on the `idle_retention_secs` interval, so a forced eviction
+can occur up to one sweep interval after `persistence_eviction_extension_secs`
+expires.
 
 Automatic reconnect treats only typed `event_queue_lagged` revocation and
 transport loss as resumable. `session_stopped`, `attachment_replaced`, and
@@ -419,6 +425,8 @@ session_catalog_tombstone_retention_secs = 300
 persistence_retry_attempts = 3
 persistence_retry_initial_backoff_ms = 50
 persistence_retry_max_backoff_ms = 1000
+persistence_eviction_extension_secs = 300
+persistence_final_save_timeout_secs = 5
 shutdown_grace_secs = 5
 client_command_timeout_secs = 10
 bootstrap_timeout_secs = 15
