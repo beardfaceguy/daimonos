@@ -2580,13 +2580,17 @@ fn build_agent_with_state(
     // (ADR-003, D8). stdio needs no capability flag; http is gated on it.
     let mcp_enabled = cfg.acp.mcp.enabled;
     let mcp_http = mcp_enabled && cfg.acp.mcp.allow_http;
+    let session_store_busy_timeout =
+        std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
     let state = Arc::new(AcpState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         session_operations: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
         models,
         default_model: model,
-        store: sessions_dir.map(SessionStore::new),
+        store: sessions_dir.map(|directory| {
+            SessionStore::new(directory).with_busy_timeout(session_store_busy_timeout)
+        }),
         supports_images,
         supports_terminal_output: AtomicBool::new(false),
         session_list_page_size: cfg.acp.session_list_page_size,
@@ -3105,6 +3109,9 @@ fn build_agent_with_state(
                                 }
                             };
                             let model = record.model.clone();
+                            handle
+                                .core
+                                .initialize_persistence_generation(record.generation);
                             {
                                 let mut agent_session = handle.core.session.lock().await;
                                 agent_session.set_history(record.messages);

@@ -44,6 +44,7 @@ mod session_controller;
 mod session_core;
 mod session_daemon;
 mod session_factory;
+mod session_interchange;
 mod session_protocol;
 mod session_store;
 mod snapshot;
@@ -241,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Agent(args)) => !args.dry_run,
         Some(Command::Chat(args)) => !args.list,
         Some(Command::Acp(_) | Command::SessionDaemon(_)) => true,
-        Some(Command::Mcp(_) | Command::Daemon) | None => false,
+        Some(Command::Session(_) | Command::Mcp(_) | Command::Daemon) | None => false,
     };
     if uses_agent_prompt {
         cfg.prompts.additional_agent_instructions =
@@ -333,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::SessionDaemon(args)) => {
             agent_runtime::run_session_daemon(args, &workspace, Arc::clone(&cfg), token_log).await
         }
+        Some(Command::Session(args)) => session_interchange::run(args, &cfg),
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
@@ -476,6 +478,7 @@ async fn run_tool_service(
         RuntimeMode::Agent
         | RuntimeMode::Chat
         | RuntimeMode::Acp
+        | RuntimeMode::Session
         | RuntimeMode::SessionDaemon
         | RuntimeMode::Stats => {
             unreachable!("early-return runtime reached service dispatch")

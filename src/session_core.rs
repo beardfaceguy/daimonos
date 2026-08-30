@@ -11,7 +11,7 @@ use crate::session_protocol::{
     ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, ContextUsage,
     RuntimeOption, RuntimeValue, SessionEvent, SessionUsage, TurnStatus,
 };
-use crate::session_store::SessionStore;
+use crate::session_store::{SessionStore, SessionWriteOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnError {
@@ -617,7 +617,7 @@ struct PersistenceCapture {
 enum PersistenceSaveOutcome {
     Saved,
     SkippedDeleted,
-    SkippedStale,
+    SkippedStale { stored_generation: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,7 +773,9 @@ impl SessionPersistence {
                 through_seq = capture.through_seq,
                 last_saved_generation = ?state.last_saved_generation,
             );
-            return Ok(PersistenceSaveOutcome::SkippedStale);
+            return Ok(PersistenceSaveOutcome::SkippedStale {
+                stored_generation: state.last_saved_generation.unwrap_or_default(),
+            });
         }
         #[cfg(test)]
         if let Some((started, release)) = self
@@ -799,8 +801,9 @@ impl SessionPersistence {
         {
             return Err(std::io::Error::from(kind));
         }
-        let write = self.store.save_acp_result(
+        let write = self.store.save_acp_generation_result(
             &self.session_id,
+            capture.generation,
             &capture.model,
             &capture.thinking,
             &capture.messages,
@@ -809,6 +812,13 @@ impl SessionPersistence {
             &capture.assistant_outcomes,
             max_preview_bytes,
         )?;
+        let write = match write {
+            SessionWriteOutcome::Saved(write) => write,
+            SessionWriteOutcome::Stale { stored_generation } => {
+                state.last_saved_generation = Some(stored_generation);
+                return Ok(PersistenceSaveOutcome::SkippedStale { stored_generation });
+            }
+        };
         state.last_saved_generation = Some(capture.generation);
         if let Some(writer) = &self.catalog_writer {
             writer.enqueue_saved(write);
@@ -1270,10 +1280,12 @@ impl SessionCore {
                         .mark_clean_if_fully_handled(handled_request, &self.persistence_requested);
                     return;
                 }
-                Ok(PersistenceSaveOutcome::SkippedStale) => {
+                Ok(PersistenceSaveOutcome::SkippedStale { stored_generation }) => {
                     // A newer generation was already written. Production gate
                     // ownership makes this unreachable, but synthetic test
                     // captures can race it; recapture instead of claiming clean.
+                    self.persistence_generation
+                        .fetch_max(stored_generation, Ordering::AcqRel);
                     persistence.mark_dirty();
                     if attempts >= policy.attempts {
                         tracing::warn!(
@@ -1355,6 +1367,11 @@ impl SessionCore {
         self.persistence
             .as_ref()
             .map_or(PersistenceHealth::Clean, SessionPersistence::health)
+    }
+
+    pub(crate) fn initialize_persistence_generation(&self, generation: u64) {
+        self.persistence_generation
+            .store(generation, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -4417,7 +4434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_stale_captures_are_bounded_and_remain_dirty() {
+    async fn stale_generation_fast_forwards_and_recaptures() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = SessionPersistence::new(
             "session-1",
@@ -4429,9 +4446,16 @@ mod tests {
 
         core.persist_current().await;
 
-        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
-        assert_eq!(core.persistence_health(), PersistenceHealth::Dirty);
-        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 0);
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 101);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
+        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 1);
+        assert_eq!(
+            SessionStore::new(directory.path().join("sessions"))
+                .load_result("session-1")
+                .unwrap()
+                .generation,
+            101
+        );
     }
 
     #[tokio::test]
@@ -4501,7 +4525,9 @@ mod tests {
             persistence
                 .save(&persistence_capture(1, directory.path(), "stale"))
                 .unwrap(),
-            PersistenceSaveOutcome::SkippedStale
+            PersistenceSaveOutcome::SkippedStale {
+                stored_generation: 2
+            }
         );
         let loaded = store.load("session-1").unwrap();
         assert!(matches!(

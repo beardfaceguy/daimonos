@@ -251,13 +251,17 @@ pub async fn run_chat(
         config.tools.extend(mcp.tools());
         config.remote_tool_dispatch = Some(mcp.dispatch_hook());
     }
+    let session_store_busy_timeout =
+        std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
     let tool_session = build_tool_session(workspace, cfg);
     let mut session = AgentSession::new(provider, tool_session, config);
 
     // Persist to disk so the conversation can be resumed later (vikunja #963).
     // `None` disables persistence (tests). A resumed session keeps its id;
     // a fresh one mints a uuid.
-    let store = sessions_dir.map(SessionStore::new);
+    let store = sessions_dir.map(|directory| {
+        SessionStore::new(directory).with_busy_timeout(session_store_busy_timeout)
+    });
     let session_id = resume
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());

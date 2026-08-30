@@ -259,6 +259,9 @@ impl SessionFactory for AgentSessionFactory {
             events,
             tool_lifecycle,
         ));
+        if let Some(record) = persisted.as_ref() {
+            core.initialize_persistence_generation(record.generation);
+        }
         core.set_runtime_options(runtime_options(
             &self.models,
             &core.current_model(),
@@ -347,12 +350,16 @@ impl From<SessionStoreErrorKind> for SessionOpenError {
     fn from(kind: SessionStoreErrorKind) -> Self {
         match kind {
             SessionStoreErrorKind::UnsafeId => Self::UnsafeId,
+            SessionStoreErrorKind::AlreadyExists => {
+                debug_assert!(false, "session open cannot produce duplicate-import errors");
+                Self::Internal
+            }
             SessionStoreErrorKind::NotFound => Self::NotFound,
             SessionStoreErrorKind::FutureVersion => Self::FutureVersion,
             SessionStoreErrorKind::UnsupportedVersion => Self::UnsupportedVersion,
             SessionStoreErrorKind::Corrupt => Self::Corrupt,
             SessionStoreErrorKind::Permission => Self::Permission,
-            SessionStoreErrorKind::Io => Self::Io,
+            SessionStoreErrorKind::Database | SessionStoreErrorKind::Io => Self::Io,
         }
     }
 }
@@ -639,11 +646,10 @@ mod tests {
             factory.open("foreign-session", SessionOpenMode::Load).await,
             Err(SessionOpenError::WorkspaceMismatch)
         ));
-        std::fs::write(
-            directory.path().join("sessions").join("corrupt.json"),
-            b"{not-json",
-        )
-        .unwrap();
+        store.save("corrupt", "saved-model", &[]);
+        store
+            .replace_payload_for_test("corrupt", b"{not-json")
+            .unwrap();
         assert!(matches!(
             factory.open("corrupt", SessionOpenMode::Load).await,
             Err(SessionOpenError::Corrupt)

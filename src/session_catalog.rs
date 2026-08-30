@@ -1,7 +1,8 @@
 //! Rebuildable SQLite metadata catalog for daemon-owned sessions (task 1336).
 //!
-//! Conversation JSON remains authoritative. This catalog exists only to make
-//! discovery bounded; every attach still validates and loads the JSON payload.
+//! The canonical SQLite session store remains authoritative. This catalog
+//! exists only to preserve bounded cross-workspace discovery; every attach
+//! still validates and loads the canonical payload.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
