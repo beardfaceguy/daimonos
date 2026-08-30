@@ -12,8 +12,8 @@ use crate::providers::{CompleteOpts, LlmProvider, StreamEvent, ThinkingLevel, To
 use crate::safety::SafetyPolicy;
 use crate::session::Session;
 use crate::session_core::{
-    ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventRouter,
-    SessionPersistence,
+    ApprovalBroker, CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
+    SessionEventRouter, SessionPersistence,
 };
 use crate::session_daemon::{SessionFactory, SessionOpenError, SessionOpenMode};
 use crate::session_protocol::{
@@ -238,8 +238,19 @@ impl SessionFactory for AgentSessionFactory {
             context_windows,
             approvals,
             Some({
-                let persistence =
-                    SessionPersistence::new(session_id.to_string(), self.store.clone());
+                let persistence = SessionPersistence::new(
+                    session_id.to_string(),
+                    self.store.clone(),
+                    PersistenceRetryPolicy::new(
+                        self.config.session.persistence_retry_attempts,
+                        std::time::Duration::from_millis(
+                            self.config.session.persistence_retry_initial_backoff_ms,
+                        ),
+                        std::time::Duration::from_millis(
+                            self.config.session.persistence_retry_max_backoff_ms,
+                        ),
+                    ),
+                );
                 match &self.catalog_writer {
                     Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
                     None => persistence,

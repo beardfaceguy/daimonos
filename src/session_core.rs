@@ -559,6 +559,43 @@ pub struct SessionPersistence {
     store: SessionStore,
     state: Arc<StdMutex<SessionPersistenceState>>,
     catalog_writer: Option<Arc<crate::session_catalog::SessionCatalogWriter>>,
+    retry_policy: PersistenceRetryPolicy,
+    #[cfg(test)]
+    save_failures: Arc<StdMutex<VecDeque<std::io::ErrorKind>>>,
+    #[cfg(test)]
+    save_pause: Arc<StdMutex<Option<TestSavePause>>>,
+}
+
+#[cfg(test)]
+type TestSavePause = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[derive(Debug, Clone, Copy)]
+pub struct PersistenceRetryPolicy {
+    pub attempts: usize,
+    pub initial_backoff: std::time::Duration,
+    pub max_backoff: std::time::Duration,
+}
+
+impl PersistenceRetryPolicy {
+    pub fn new(
+        attempts: usize,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+    ) -> Self {
+        Self {
+            attempts: attempts.max(1),
+            initial_backoff,
+            max_backoff: max_backoff.max(initial_backoff),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single_attempt() -> Self {
+        Self::new(1, std::time::Duration::ZERO, std::time::Duration::ZERO)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -583,20 +620,55 @@ enum PersistenceSaveOutcome {
     SkippedStale,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistenceHealth {
+    Clean,
+    Dirty,
+    Degraded { retryable: bool },
+}
+
 struct SessionPersistenceState {
     deleted: bool,
     /// Valid only for this SessionPersistence/core lifetime and never persisted.
     last_saved_generation: Option<u64>,
+    health: PersistenceHealth,
+}
+
+impl Default for SessionPersistenceState {
+    fn default() -> Self {
+        Self {
+            deleted: false,
+            last_saved_generation: None,
+            health: PersistenceHealth::Clean,
+        }
+    }
+}
+
+fn is_retryable_persistence_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
 }
 
 impl SessionPersistence {
-    pub fn new(session_id: impl Into<String>, store: SessionStore) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        store: SessionStore,
+        retry_policy: PersistenceRetryPolicy,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             store,
             state: Arc::new(StdMutex::new(SessionPersistenceState::default())),
             catalog_writer: None,
+            retry_policy,
+            #[cfg(test)]
+            save_failures: Arc::new(StdMutex::new(VecDeque::new())),
+            #[cfg(test)]
+            save_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -606,6 +678,75 @@ impl SessionPersistence {
     ) -> Self {
         self.catalog_writer = Some(catalog_writer);
         self
+    }
+
+    fn mark_dirty(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.deleted {
+            state.health = PersistenceHealth::Dirty;
+        }
+    }
+
+    fn mark_clean_if_fully_handled(&self, handled_request: u64, requested: &AtomicU64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.deleted {
+            return true;
+        }
+        if requested.load(Ordering::Acquire) <= handled_request {
+            state.health = PersistenceHealth::Clean;
+            true
+        } else {
+            state.health = PersistenceHealth::Dirty;
+            false
+        }
+    }
+
+    fn mark_degraded(&self, retryable: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.deleted {
+            state.health = PersistenceHealth::Degraded { retryable };
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by task 1409's daemon lifecycle policy.
+    fn health(&self) -> PersistenceHealth {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .health
+    }
+
+    #[cfg(test)]
+    fn fail_saves(&self, failures: impl IntoIterator<Item = std::io::ErrorKind>) {
+        self.save_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(failures);
+    }
+
+    #[cfg(test)]
+    fn pause_next_save(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self
+            .save_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((started_tx, release_rx));
+        (started_rx, release_tx)
     }
 
     fn save(&self, capture: &PersistenceCapture) -> std::io::Result<PersistenceSaveOutcome> {
@@ -634,11 +775,30 @@ impl SessionPersistence {
             );
             return Ok(PersistenceSaveOutcome::SkippedStale);
         }
+        #[cfg(test)]
+        if let Some((started, release)) = self
+            .save_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = started.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+        }
         let max_preview_bytes = self
             .catalog_writer
             .as_ref()
             .map(|writer| writer.max_preview_bytes())
             .unwrap_or(usize::MAX);
+        #[cfg(test)]
+        if let Some(kind) = self
+            .save_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+        {
+            return Err(std::io::Error::from(kind));
+        }
         let write = self.store.save_acp_result(
             &self.session_id,
             &capture.model,
@@ -708,6 +868,9 @@ pub struct SessionCore {
     runtime_options: StdMutex<Vec<RuntimeOption>>,
     current_context_usage: StdMutex<Option<ContextUsage>>,
     persistence_generation: AtomicU64,
+    persistence_gate: tokio::sync::Mutex<()>,
+    persistence_requested: AtomicU64,
+    persistence_completed: AtomicU64,
     persistence: Option<SessionPersistence>,
 }
 
@@ -851,6 +1014,9 @@ impl SessionCore {
             runtime_options: StdMutex::new(Vec::new()),
             current_context_usage: StdMutex::new(None),
             persistence_generation: AtomicU64::new(0),
+            persistence_gate: tokio::sync::Mutex::new(()),
+            persistence_requested: AtomicU64::new(0),
+            persistence_completed: AtomicU64::new(0),
             persistence,
         }
     }
@@ -1045,8 +1211,7 @@ impl SessionCore {
     /// still gives their payload snapshots a total write order. The atomic
     /// permits test-only synthetic captures; production correctness requires
     /// minting while this complete lock set is held.
-    async fn capture_persistence(&self) -> Option<PersistenceCapture> {
-        self.persistence.as_ref()?;
+    async fn capture_persistence(&self) -> PersistenceCapture {
         let through_seq = self.events.latest_sequence();
         let session = self.session.lock().await;
         let client_user_message_ids = self.client_user_message_ids.lock().await;
@@ -1059,7 +1224,7 @@ impl SessionCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let generation = self.persistence_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        Some(PersistenceCapture {
+        PersistenceCapture {
             generation,
             through_seq,
             model: session.model().to_string(),
@@ -1068,18 +1233,99 @@ impl SessionCore {
             cwd: self.cwd.clone(),
             client_user_message_ids: client_user_message_ids.clone(),
             assistant_outcomes: assistant_outcomes.clone(),
-        })
+        }
     }
 
+    /// Register a save only after the caller's canonical mutation is complete.
+    /// Requests registered before the gate owner's capture are coalesced into
+    /// that snapshot; later requests retain their own uncompleted ticket.
     pub(crate) async fn persist_current(&self) {
-        let Some(capture) = self.capture_persistence().await else {
+        let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
-        // Every capture guard is dropped before phase two acquires
-        // SessionPersistence.state and performs blocking I/O.
-        self.persist_capture(&capture);
+        let request = self.persistence_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        let _gate = self.persistence_gate.lock().await;
+        if self.persistence_completed.load(Ordering::Acquire) >= request {
+            return;
+        }
+        persistence.mark_dirty();
+
+        let policy = persistence.retry_policy;
+        let handled_request = self.persistence_requested.load(Ordering::Acquire);
+        let mut attempts = 0usize;
+        let mut delay = policy.initial_backoff;
+        loop {
+            let capture = self.capture_persistence().await;
+            attempts += 1;
+            // Every capture guard is dropped before phase two acquires
+            // SessionPersistence.state and performs blocking I/O.
+            // Cancellation can detach this waiter while spawn_blocking
+            // finishes; the request remains incomplete/dirty so a later call
+            // or task-1409 final save recaptures instead of trusting it.
+            match Self::save_capture_blocking(persistence.clone(), capture).await {
+                Ok(PersistenceSaveOutcome::Saved) => {
+                    self.persistence_completed
+                        .fetch_max(handled_request, Ordering::AcqRel);
+                    persistence
+                        .mark_clean_if_fully_handled(handled_request, &self.persistence_requested);
+                    return;
+                }
+                Ok(PersistenceSaveOutcome::SkippedStale) => {
+                    // A newer generation was already written. Production gate
+                    // ownership makes this unreachable, but synthetic test
+                    // captures can race it; recapture instead of claiming clean.
+                    persistence.mark_dirty();
+                    if attempts >= policy.attempts {
+                        tracing::warn!(
+                            target: "daimonos::session_core",
+                            event = "session_payload_stale_capture_exhausted",
+                            attempts,
+                            "session payload remains dirty after repeated stale captures"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(policy.max_backoff);
+                    continue;
+                }
+                Ok(PersistenceSaveOutcome::SkippedDeleted) => {
+                    self.persistence_completed
+                        .fetch_max(handled_request, Ordering::AcqRel);
+                    return;
+                }
+                Err(error) => {
+                    let retryable = is_retryable_persistence_error(&error);
+                    persistence.mark_degraded(retryable);
+                    if !retryable || attempts >= policy.attempts {
+                        self.persistence_completed
+                            .fetch_max(handled_request, Ordering::AcqRel);
+                        tracing::warn!(
+                            target: "daimonos::session_core",
+                            event = "session_payload_save_exhausted",
+                            attempts,
+                            retryable,
+                            error = %error,
+                            "session payload remains degraded after bounded save attempts"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(policy.max_backoff);
+                }
+            }
+        }
     }
 
+    async fn save_capture_blocking(
+        persistence: SessionPersistence,
+        capture: PersistenceCapture,
+    ) -> std::io::Result<PersistenceSaveOutcome> {
+        tokio::task::spawn_blocking(move || persistence.save(&capture))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    #[cfg(test)]
     fn persist_capture(&self, capture: &PersistenceCapture) {
         let Some(persistence) = &self.persistence else {
             return;
@@ -1094,6 +1340,21 @@ impl SessionCore {
                 "session payload could not be persisted"
             );
         }
+    }
+
+    #[allow(dead_code)] // Consumed by task 1409's daemon lifecycle policy.
+    /// Lifecycle callers may trust Clean only after canonical mutation code has
+    /// registered its save through persist_current; final saves must use that
+    /// same API rather than bypassing request registration.
+    pub(crate) fn persistence_health(&self) -> PersistenceHealth {
+        if self.persistence_requested.load(Ordering::Acquire)
+            > self.persistence_completed.load(Ordering::Acquire)
+        {
+            return PersistenceHealth::Dirty;
+        }
+        self.persistence
+            .as_ref()
+            .map_or(PersistenceHealth::Clean, SessionPersistence::health)
     }
 
     #[cfg(test)]
@@ -3933,6 +4194,246 @@ mod tests {
         }
     }
 
+    struct PersistenceTestProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for PersistenceTestProvider {
+        async fn complete(
+            &self,
+            _context: &crate::providers::Context,
+            _options: &crate::providers::CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            crate::providers::LlmResponse {
+                retryable: false,
+                content: Vec::new(),
+                stop_reason: crate::providers::StopReason::EndTurn,
+                error_message: None,
+                context_overflow: false,
+                usage: crate::providers::Usage::default(),
+            }
+        }
+    }
+
+    fn persistence_test_core(
+        cwd: &std::path::Path,
+        persistence: SessionPersistence,
+    ) -> Arc<SessionCore> {
+        let config = Arc::new(crate::config::Config::default());
+        let tool_session = crate::session::Session::new(cwd.to_path_buf(), config);
+        let events = Arc::new(SessionEventRouter::default());
+        let approvals = Arc::new(ApprovalBroker::new(false));
+        let lifecycle = Arc::new(CanonicalToolLifecycle::new(
+            Arc::clone(&events),
+            Arc::clone(&approvals),
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            4,
+        ));
+        Arc::new(SessionCore::new(
+            crate::agent::AgentSession::new(
+                Box::new(PersistenceTestProvider),
+                tool_session,
+                crate::agent::AgentConfig::default(),
+            ),
+            "model".to_string(),
+            cwd.to_path_buf(),
+            SessionCompaction::new(None, false),
+            HashMap::new(),
+            approvals,
+            Some(persistence),
+            events,
+            lifecycle,
+        ))
+    }
+
+    #[tokio::test]
+    async fn retryable_save_failure_recaptures_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::new(
+                3,
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+            ),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = persistence_test_core(directory.path(), persistence);
+
+        core.persist_current().await;
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
+        assert!(store.load("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn nonretryable_save_failure_remains_degraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::new(
+                3,
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+            ),
+        );
+        persistence.fail_saves([std::io::ErrorKind::PermissionDenied]);
+        let core = persistence_test_core(directory.path(), persistence);
+
+        core.persist_current().await;
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 1);
+        assert_eq!(
+            core.persistence_health(),
+            PersistenceHealth::Degraded { retryable: false }
+        );
+        assert!(store.load("session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn retryable_save_failure_exhausts_configured_attempt_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::new(3, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.fail_saves([
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+        ]);
+        let core = persistence_test_core(directory.path(), persistence);
+
+        core.persist_current().await;
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 3);
+        assert_eq!(
+            core.persistence_health(),
+            PersistenceHealth::Degraded { retryable: true }
+        );
+        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 1);
+        assert!(store.load("session-1").is_none());
+    }
+
+    #[test]
+    fn persistence_error_retryability_is_explicit() {
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(is_retryable_persistence_error(&std::io::Error::from(kind)));
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::StorageFull,
+        ] {
+            assert!(!is_retryable_persistence_error(&std::io::Error::from(kind)));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_save_requests_coalesce_to_latest_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let core = persistence_test_core(directory.path(), persistence);
+        let gate = core.persistence_gate.lock().await;
+        let first_core = Arc::clone(&core);
+        let first = tokio::spawn(async move { first_core.persist_current().await });
+        let second_core = Arc::clone(&core);
+        let second = tokio::spawn(async move { second_core.persist_current().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while core.persistence_requested.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(gate);
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 1);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
+    }
+
+    #[tokio::test]
+    async fn request_registered_after_capture_gets_its_own_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let (save_started, release_save) = persistence.pause_next_save();
+        let core = persistence_test_core(directory.path(), persistence);
+
+        let first_core = Arc::clone(&core);
+        let first = tokio::spawn(async move { first_core.persist_current().await });
+        tokio::task::spawn_blocking(move || {
+            save_started.recv_timeout(std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        core.session
+            .lock()
+            .await
+            .set_history(vec![Message::user("new request")]);
+        let second_core = Arc::clone(&core);
+        let second = tokio::spawn(async move { second_core.persist_current().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while core.persistence_requested.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release_save.send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
+        let loaded = store.load("session-1").unwrap();
+        assert!(matches!(
+            loaded.messages[0].content.as_slice(),
+            [crate::providers::ContentBlock::Text(text)] if text == "new request"
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_stale_captures_are_bounded_and_remain_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::new(2, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.state.lock().unwrap().last_saved_generation = Some(100);
+        let core = persistence_test_core(directory.path(), persistence);
+
+        core.persist_current().await;
+
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Dirty);
+        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 0);
+    }
+
     #[tokio::test]
     async fn daemon_persistence_updates_and_tombstones_catalog() {
         let directory = tempfile::tempdir().unwrap();
@@ -3954,7 +4455,8 @@ mod tests {
             64,
         );
         let persistence =
-            SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
+            SessionPersistence::new("session-1", store, PersistenceRetryPolicy::single_attempt())
+                .with_catalog_writer(Arc::clone(&writer));
         let mut capture = persistence_capture(1, directory.path(), "hello");
         capture.client_user_message_ids = vec!["prompt-1".to_string()];
         assert_eq!(
@@ -3983,7 +4485,11 @@ mod tests {
     fn persistence_writer_rejects_lower_generation_and_orders_equal_sequence() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions"));
-        let persistence = SessionPersistence::new("session-1", store.clone());
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
 
         assert_eq!(
             persistence
@@ -4022,7 +4528,11 @@ mod tests {
         let store_path = directory.path().join("not-a-directory");
         std::fs::write(&store_path, b"file").unwrap();
         let store = SessionStore::new(store_path.clone());
-        let persistence = SessionPersistence::new("session-1", store.clone());
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
 
         assert!(persistence
             .save(&persistence_capture(2, directory.path(), "failed"))
@@ -4065,7 +4575,8 @@ mod tests {
             64,
         );
         let persistence =
-            SessionPersistence::new("session-1", store).with_catalog_writer(Arc::clone(&writer));
+            SessionPersistence::new("session-1", store, PersistenceRetryPolicy::single_attempt())
+                .with_catalog_writer(Arc::clone(&writer));
         assert!(persistence
             .save(&persistence_capture(1, directory.path(), "hello"))
             .is_err());
@@ -4099,8 +4610,12 @@ mod tests {
             64,
         );
         let store = SessionStore::new(invalid_store_path.clone());
-        let persistence = SessionPersistence::new("session-1", store.clone())
-            .with_catalog_writer(Arc::clone(&writer));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        )
+        .with_catalog_writer(Arc::clone(&writer));
 
         assert!(persistence.delete().is_err());
         assert!(writer.catalog().row("session-1").unwrap().is_none());

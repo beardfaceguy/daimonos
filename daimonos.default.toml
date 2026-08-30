@@ -175,6 +175,10 @@ session_catalog_reconcile_interval_ms = 100
 session_catalog_full_rescan_secs = 60
 # Minimum age before a confirmed tombstone can be purged.
 session_catalog_tombstone_retention_secs = 300
+# Payload save attempts and bounded exponential delay for retryable failures.
+persistence_retry_attempts = 3
+persistence_retry_initial_backoff_ms = 50
+persistence_retry_max_backoff_ms = 1000
 # Grace period for daemon-owned prompt/client tasks during shutdown.
 shutdown_grace_secs = 5
 # Maximum seconds a local frontend waits for a daemon command result.
