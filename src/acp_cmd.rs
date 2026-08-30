@@ -2047,48 +2047,31 @@ async fn run_retry_turn(
 
 async fn truncate_session(
     handle: &Arc<SessionHandle>,
-    session_id: &SessionId,
     client_user_message_id: &str,
-    store: Option<&SessionStore>,
 ) -> Result<(), String> {
-    let mut agent_session = handle.core.session.lock().await;
-    let mut client_ids = handle.core.client_user_message_ids.lock().await;
-    let user_turn_count = agent_session.user_turn_count();
-    align_client_user_message_ids(&mut client_ids, user_turn_count);
-    let Some(turn_index) = client_ids
-        .iter()
-        .position(|id| id == client_user_message_id)
-    else {
-        return Err(format!(
-            "client user message id '{client_user_message_id}' not found"
-        ));
-    };
-    agent_session.truncate_from_user_turn(turn_index)?;
-    client_ids.truncate(turn_index);
-    let mut outcomes = handle
-        .core
-        .assistant_outcomes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    outcomes.truncate(turn_index);
-
-    if let Some(store) = store {
-        let model = handle
+    {
+        let mut agent_session = handle.core.session.lock().await;
+        let mut client_ids = handle.core.client_user_message_ids.lock().await;
+        let user_turn_count = agent_session.user_turn_count();
+        align_client_user_message_ids(&mut client_ids, user_turn_count);
+        let Some(turn_index) = client_ids
+            .iter()
+            .position(|id| id == client_user_message_id)
+        else {
+            return Err(format!(
+                "client user message id '{client_user_message_id}' not found"
+            ));
+        };
+        agent_session.truncate_from_user_turn(turn_index)?;
+        client_ids.truncate(turn_index);
+        handle
             .core
-            .current_model
+            .assistant_outcomes
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        store.save_acp(
-            &session_id.to_string(),
-            &model,
-            agent_session.thinking().as_str(),
-            agent_session.history(),
-            &handle.core.cwd,
-            &client_ids,
-            &outcomes,
-        );
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .truncate(turn_index);
     }
+    handle.core.persist_current().await;
     Ok(())
 }
 
@@ -2161,6 +2144,7 @@ async fn build_session_handle(
     safety: Arc<crate::safety::SafetyPolicy>,
     token_log: Option<PathBuf>,
     session_id: SessionId,
+    persistence_writer: Option<crate::session_store::SessionWriter>,
     session_workspace: PathBuf,
     mcp_specs: Vec<ServerSpec>,
     cx: ConnectionTo<AcpClientRole>,
@@ -2238,17 +2222,24 @@ async fn build_session_handle(
             context_windows.insert(state.default_model.clone(), policy.context_window);
         }
     }
-    let persistence = state.store.clone().map(|store| {
-        SessionPersistence::new(
-            session_id.to_string(),
-            store,
-            PersistenceRetryPolicy::new(
-                cfg.session.persistence_retry_attempts,
-                std::time::Duration::from_millis(cfg.session.persistence_retry_initial_backoff_ms),
-                std::time::Duration::from_millis(cfg.session.persistence_retry_max_backoff_ms),
-            ),
-        )
-    });
+    let persistence = state
+        .store
+        .clone()
+        .zip(persistence_writer)
+        .map(|(store, writer)| {
+            SessionPersistence::with_writer(
+                session_id.to_string(),
+                store,
+                writer,
+                PersistenceRetryPolicy::new(
+                    cfg.session.persistence_retry_attempts,
+                    std::time::Duration::from_millis(
+                        cfg.session.persistence_retry_initial_backoff_ms,
+                    ),
+                    std::time::Duration::from_millis(cfg.session.persistence_retry_max_backoff_ms),
+                ),
+            )
+        });
     let core = SessionCore::new(
         AgentSession::new(provider, tool_session, config),
         state.default_model.clone(),
@@ -2580,13 +2571,17 @@ fn build_agent_with_state(
     // (ADR-003, D8). stdio needs no capability flag; http is gated on it.
     let mcp_enabled = cfg.acp.mcp.enabled;
     let mcp_http = mcp_enabled && cfg.acp.mcp.allow_http;
+    let session_store_busy_timeout =
+        std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
     let state = Arc::new(AcpState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         session_operations: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
         models,
         default_model: model,
-        store: sessions_dir.map(SessionStore::new),
+        store: sessions_dir.map(|directory| {
+            SessionStore::new(directory).with_busy_timeout(session_store_busy_timeout)
+        }),
         supports_images,
         supports_terminal_output: AtomicBool::new(false),
         session_list_page_size: cfg.acp.session_list_page_size,
@@ -2710,9 +2705,7 @@ fn build_agent_with_state(
                             match handle {
                                 Some(handle) => match truncate_session(
                                     &handle,
-                                    &req.session_id,
                                     &req.client_user_message_id,
-                                    state.store.as_ref(),
                                 )
                                 .await
                                 {
@@ -2826,7 +2819,11 @@ fn build_agent_with_state(
                             let session = handle.core.session.lock().await;
                             drop(session);
                         }
-                        if let Err(error) = store.delete(&req.session_id.to_string()) {
+                        let delete_result = match &removed_handle {
+                            Some(handle) => handle.core.delete_persisted(),
+                            None => store.delete_unconditionally(&req.session_id.to_string()),
+                        };
+                        if let Err(error) = delete_result {
                             if let Some(handle) = removed_handle {
                                 state
                                     .sessions
@@ -2901,12 +2898,28 @@ fn build_agent_with_state(
                             mcp_servers = mcp_server_count,
                         );
                         let started = std::time::Instant::now();
+                        let persistence_writer = match state
+                            .store
+                            .as_ref()
+                            .map(|store| store.claim_writer(&session_id.to_string(), None))
+                            .transpose()
+                        {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::util::internal_error(format!(
+                                        "session writer claim: {error}"
+                                    )),
+                                );
+                            }
+                        };
                         let handle = match build_session_handle(
                             &state,
                             &cfg,
                             safety,
                             token_log,
                             session_id.clone(),
+                            persistence_writer,
                             session_workspace,
                             mcp_specs,
                             cx.clone(),
@@ -2933,21 +2946,9 @@ fn build_agent_with_state(
                         // and can be resumed by session/load. Without this,
                         // session/new is in-memory only and a cold session/load
                         // for that id fails with "no session found" (vikunja
-                        // #1046). Best-effort and fire-and-forget like every
-                        // other save_acp call site: save_acp returns unit and
-                        // logs internally on a write error, so a persist failure
-                        // never fails session creation.
-                        if let Some(store) = state.store.as_ref() {
-                            store.save_acp(
-                                &session_id.to_string(),
-                                &state.default_model,
-                                state.thinking.as_str(),
-                                &[],
-                                &handle.core.cwd,
-                                &[],
-                                &[],
-                            );
-                        }
+                        // #1046). Use the core's epoch-bound persistence path
+                        // so a superseded runtime cannot recreate the row.
+                        handle.core.persist_current().await;
 
                         // Advertise the model picker (vikunja #960); new sessions
                         // start on the default model.
@@ -3083,12 +3084,33 @@ fn build_agent_with_state(
                             // 2. Persisted on disk (process was restarted):
                             // rebuild the session, seed its history + model, then
                             // replay so Zed reconstructs the thread.
+                            let persistence_writer = match state
+                                .store
+                                .as_ref()
+                                .map(|store| {
+                                    store.claim_writer(
+                                        &session_id.to_string(),
+                                        Some(record.generation),
+                                    )
+                                })
+                                .transpose()
+                            {
+                                Ok(writer) => writer,
+                                Err(error) => {
+                                    return responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(format!(
+                                            "session writer claim: {error}"
+                                        )),
+                                    );
+                                }
+                            };
                             let handle = match build_session_handle(
                                 &state,
                                 &cfg,
                                 safety,
                                 token_log,
                                 session_id.clone(),
+                                persistence_writer,
                                 session_workspace,
                                 mcp_specs,
                                 cx.clone(),
@@ -3105,6 +3127,9 @@ fn build_agent_with_state(
                                 }
                             };
                             let model = record.model.clone();
+                            handle
+                                .core
+                                .initialize_persistence_generation(record.generation);
                             {
                                 let mut agent_session = handle.core.session.lock().await;
                                 agent_session.set_history(record.messages);
@@ -7105,7 +7130,9 @@ mod tests {
                     .await?;
                 let stale_anchor = first_again.sessions[0].session_id.to_string();
                 let stale_cursor = first_again.next_cursor.expect("cursor");
-                store_for_client.delete(&stale_anchor).unwrap();
+                store_for_client
+                    .delete_unconditionally(&stale_anchor)
+                    .unwrap();
                 let stale_failed = connection
                     .send_request(ListSessionsRequest::new().cursor(stale_cursor))
                     .block_task()

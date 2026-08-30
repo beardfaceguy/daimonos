@@ -115,6 +115,33 @@ pub struct McpArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Import one versioned session archive; duplicate session ids are rejected.
+    Import {
+        /// JSON session archive to import.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Export one persisted session.
+    Export {
+        /// Persisted session id.
+        session_id: String,
+        /// Archive format.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Write to a new file instead of stdout.
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run the agent once, or launch the opt-in interactive terminal UI.
@@ -125,6 +152,8 @@ pub enum Command {
     Acp(AcpArgs),
     /// Run the persistent local interactive-session daemon.
     SessionDaemon(SessionDaemonArgs),
+    /// Import or export persisted agent sessions.
+    Session(SessionArgs),
     /// Run the MCP tool server over stdio or a Unix socket.
     Mcp(McpArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
@@ -137,6 +166,7 @@ pub enum RuntimeMode {
     Chat,
     Acp,
     SessionDaemon,
+    Session,
     McpStdio,
     McpSocket(PathBuf),
     Daemon,
@@ -150,6 +180,7 @@ impl RuntimeMode {
             Self::Chat => "chat",
             Self::Acp => "acp",
             Self::SessionDaemon => "session_daemon",
+            Self::Session => "session",
             Self::McpStdio => "mcp_stdio",
             Self::McpSocket(_) => "mcp_socket",
             Self::Daemon => "socket",
@@ -238,6 +269,7 @@ impl Cli {
             Some(Command::Chat(_)) => RuntimeMode::Chat,
             Some(Command::Acp(_)) => RuntimeMode::Acp,
             Some(Command::SessionDaemon(_)) => RuntimeMode::SessionDaemon,
+            Some(Command::Session(_)) => RuntimeMode::Session,
             Some(Command::Mcp(args)) => args
                 .socket
                 .clone()
@@ -300,7 +332,40 @@ mod tests {
             mode(&["daimonos", "session-daemon"]),
             RuntimeMode::SessionDaemon
         );
+        assert_eq!(
+            mode(&["daimonos", "session", "import", "session.json"]),
+            RuntimeMode::Session
+        );
         assert_eq!(mode(&["daimonos", "--stats"]), RuntimeMode::Stats);
+    }
+
+    #[test]
+    fn session_export_accepts_format_and_output() {
+        let cli = Cli::try_parse_from([
+            "daimonos",
+            "session",
+            "export",
+            "session-1",
+            "--format",
+            "json",
+            "--output",
+            "session.json",
+        ])
+        .unwrap();
+        let Some(Command::Session(SessionArgs {
+            command:
+                SessionCommand::Export {
+                    session_id,
+                    format,
+                    output,
+                },
+        })) = cli.command
+        else {
+            panic!("session export command");
+        };
+        assert_eq!(session_id, "session-1");
+        assert_eq!(format, "json");
+        assert_eq!(output, Some(PathBuf::from("session.json")));
     }
 
     #[test]

@@ -458,10 +458,14 @@ pub struct SessionRuntimeConfig {
     pub session_list_snapshot_global_capacity: usize,
     /// Lifetime of one connection-bound listing snapshot.
     pub session_list_snapshot_ttl_secs: u64,
-    /// Optional session metadata catalog path; defaults beside daemon JSON.
+    /// Optional session metadata catalog path; defaults beside session storage.
     pub session_catalog_path: Option<String>,
     /// SQLite busy timeout for the shared multiprocess catalog.
     pub session_catalog_busy_timeout_ms: u64,
+    /// SQLite busy timeout for canonical session payload operations.
+    pub session_store_busy_timeout_ms: u64,
+    /// Maximum bytes accepted from one imported session archive.
+    pub session_archive_max_bytes: usize,
     /// Maximum distinct pending catalog mutations per daemon.
     pub session_catalog_pending_entries: usize,
     /// Maximum catalog mutations applied by one blocking worker batch.
@@ -564,6 +568,8 @@ impl Default for SessionRuntimeConfig {
             session_list_snapshot_ttl_secs: 60,
             session_catalog_path: None,
             session_catalog_busy_timeout_ms: 5_000,
+            session_store_busy_timeout_ms: 5_000,
+            session_archive_max_bytes: 64 * 1024 * 1024,
             session_catalog_pending_entries: 1_024,
             session_catalog_write_batch: 64,
             session_catalog_query_timeout_ms: 6_000,
@@ -668,6 +674,14 @@ impl SessionRuntimeConfig {
             (
                 "session_catalog_busy_timeout_ms",
                 self.session_catalog_busy_timeout_ms == 0,
+            ),
+            (
+                "session_store_busy_timeout_ms",
+                self.session_store_busy_timeout_ms == 0,
+            ),
+            (
+                "session_archive_max_bytes",
+                self.session_archive_max_bytes == 0,
             ),
             (
                 "session_catalog_pending_entries",
@@ -2123,6 +2137,8 @@ mod tests {
         assert_eq!(cfg.session.session_list_snapshot_global_capacity, 256);
         assert_eq!(cfg.session.session_list_snapshot_ttl_secs, 60);
         assert_eq!(cfg.session.session_catalog_busy_timeout_ms, 5_000);
+        assert_eq!(cfg.session.session_store_busy_timeout_ms, 5_000);
+        assert_eq!(cfg.session.session_archive_max_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.session.session_catalog_pending_entries, 1_024);
         assert_eq!(cfg.session.session_catalog_write_batch, 64);
         assert_eq!(cfg.session.session_catalog_query_timeout_ms, 6_000);
@@ -2524,6 +2540,8 @@ mod tests {
             .contains("session.session_list_snapshot_global_capacity"));
         for field in [
             "session_catalog_busy_timeout_ms",
+            "session_store_busy_timeout_ms",
+            "session_archive_max_bytes",
             "session_catalog_pending_entries",
             "session_catalog_write_batch",
             "session_catalog_query_timeout_ms",

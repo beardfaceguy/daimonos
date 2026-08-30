@@ -3783,8 +3783,6 @@ mod tests {
             &[],
             &[],
         );
-        std::fs::rename(&store_path, &displaced_store_path).unwrap();
-        std::fs::write(&store_path, b"blocking file").unwrap();
         let core = test_core_with_persistence(
             Box::new(StaticProvider),
             Some(crate::session_core::SessionPersistence::new(
@@ -3793,6 +3791,8 @@ mod tests {
                 crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
+        std::fs::rename(&store_path, &displaced_store_path).unwrap();
+        std::fs::write(&store_path, b"blocking file").unwrap();
         let daemon = SessionDaemon::new(1, 1, 8, 32);
         daemon
             .create_session("session-1".to_string(), Arc::clone(&core))

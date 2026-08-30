@@ -12,6 +12,7 @@ listeners.
 | `daimonos agent --interactive ["<task>"]` | Opt-in full-screen terminal agent | non-TTY falls back to one-shot mode |
 | `daimonos chat` | Interactive agent REPL | unchanged |
 | `daimonos session-daemon` | Persistent daemon-owned agent sessions over the local Unix socket | new |
+| `daimonos session import/export` | Transfer versioned portable session archives | new |
 | `daimonos mcp` | MCP server over stdio | `daimonos --mcp` |
 | `daimonos mcp --socket <path>` | MCP server over a Unix socket | `daimonos --mcp-socket <path>` |
 | `daimonos daemon` | Compact opcode protocol over a Unix socket | bare `daimonos` |
@@ -22,6 +23,7 @@ Global options such as `--workspace` and `--config` precede the subcommand:
 daimonos --workspace /path/to/project mcp
 daimonos --workspace /path/to/project --socket /tmp/daimonos.sock daemon
 daimonos --workspace /path/to/project session-daemon
+daimonos --workspace /path/to/project session import session.json
 ```
 
 The legacy forms remain supported so existing editor configurations and service
@@ -41,10 +43,12 @@ rendering. History and scrollback limits are configured under `[tui]`.
 `session.socket_path` or `--socket` can override it. The socket is created mode
 `0600` in an owner-controlled directory, verifies local peer credentials, and
 is removed during orderly Ctrl-C/SIGTERM shutdown.
-ACP and daemon sessions use separate durable stores until ACP is routed through
-the daemon, preventing concurrent whole-history writers. Explicit
+ACP and daemon sessions use separate SQLite stores until ACP is routed through
+the daemon. Transactional generations reject stale whole-history writers. Explicit
 `stop_session` deletes the daemon-owned saved conversation; daemon shutdown
 preserves it for restart.
+The compatibility `chat` store assumes one active editor process per session
+id; daemon-owned sessions remain the concurrency-safe path.
 
 Remote Android access is explicit opt-in:
 

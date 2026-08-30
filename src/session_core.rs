@@ -11,7 +11,7 @@ use crate::session_protocol::{
     ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, ContextUsage,
     RuntimeOption, RuntimeValue, SessionEvent, SessionUsage, TurnStatus,
 };
-use crate::session_store::SessionStore;
+use crate::session_store::{SessionStore, SessionWriteOutcome, SessionWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnError {
@@ -556,6 +556,7 @@ impl SessionCompaction {
 #[derive(Clone)]
 pub struct SessionPersistence {
     session_id: String,
+    writer: SessionWriter,
     store: SessionStore,
     state: Arc<StdMutex<SessionPersistenceState>>,
     catalog_writer: Option<Arc<crate::session_catalog::SessionCatalogWriter>>,
@@ -617,7 +618,8 @@ struct PersistenceCapture {
 enum PersistenceSaveOutcome {
     Saved,
     SkippedDeleted,
-    SkippedStale,
+    Superseded,
+    SkippedStale { stored_generation: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,10 +627,12 @@ pub(crate) enum PersistenceHealth {
     Clean,
     Dirty,
     Degraded { retryable: bool },
+    Superseded,
 }
 
 struct SessionPersistenceState {
     deleted: bool,
+    superseded: bool,
     /// Valid only for this SessionPersistence/core lifetime and never persisted.
     last_saved_generation: Option<u64>,
     health: PersistenceHealth,
@@ -638,6 +642,7 @@ impl Default for SessionPersistenceState {
     fn default() -> Self {
         Self {
             deleted: false,
+            superseded: false,
             last_saved_generation: None,
             health: PersistenceHealth::Clean,
         }
@@ -654,13 +659,39 @@ fn is_retryable_persistence_error(error: &std::io::Error) -> bool {
 }
 
 impl SessionPersistence {
+    #[cfg(test)]
     pub fn new(
         session_id: impl Into<String>,
         store: SessionStore,
         retry_policy: PersistenceRetryPolicy,
     ) -> Self {
+        let session_id = session_id.into();
+        let expected_generation = store.load(&session_id).map(|record| record.generation);
+        Self::claim(session_id, store, expected_generation, retry_policy).unwrap()
+    }
+
+    pub fn claim(
+        session_id: impl Into<String>,
+        store: SessionStore,
+        expected_generation: Option<u64>,
+        retry_policy: PersistenceRetryPolicy,
+    ) -> std::io::Result<Self> {
+        let session_id = session_id.into();
+        let writer = store
+            .claim_writer(&session_id, expected_generation)
+            .map_err(std::io::Error::other)?;
+        Ok(Self::with_writer(session_id, store, writer, retry_policy))
+    }
+
+    pub fn with_writer(
+        session_id: String,
+        store: SessionStore,
+        writer: SessionWriter,
+        retry_policy: PersistenceRetryPolicy,
+    ) -> Self {
         Self {
-            session_id: session_id.into(),
+            session_id,
+            writer,
             store,
             state: Arc::new(StdMutex::new(SessionPersistenceState::default())),
             catalog_writer: None,
@@ -685,7 +716,7 @@ impl SessionPersistence {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.deleted {
+        if !state.deleted && !state.superseded {
             state.health = PersistenceHealth::Dirty;
         }
     }
@@ -695,7 +726,7 @@ impl SessionPersistence {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.deleted {
+        if state.deleted || state.superseded {
             return true;
         }
         if requested.load(Ordering::Acquire) <= handled_request {
@@ -712,17 +743,24 @@ impl SessionPersistence {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.deleted {
+        if !state.deleted && !state.superseded {
             state.health = PersistenceHealth::Degraded { retryable };
         }
     }
 
     #[allow(dead_code)] // Consumed by task 1409's daemon lifecycle policy.
     fn health(&self) -> PersistenceHealth {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .health
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.deleted {
+            PersistenceHealth::Clean
+        } else if state.superseded {
+            PersistenceHealth::Superseded
+        } else {
+            state.health
+        }
     }
 
     #[cfg(test)]
@@ -762,6 +800,9 @@ impl SessionPersistence {
         if state.deleted {
             return Ok(PersistenceSaveOutcome::SkippedDeleted);
         }
+        if state.superseded {
+            return Ok(PersistenceSaveOutcome::Superseded);
+        }
         if state
             .last_saved_generation
             .is_some_and(|last_saved_generation| capture.generation < last_saved_generation)
@@ -773,7 +814,9 @@ impl SessionPersistence {
                 through_seq = capture.through_seq,
                 last_saved_generation = ?state.last_saved_generation,
             );
-            return Ok(PersistenceSaveOutcome::SkippedStale);
+            return Ok(PersistenceSaveOutcome::SkippedStale {
+                stored_generation: state.last_saved_generation.unwrap_or_default(),
+            });
         }
         #[cfg(test)]
         if let Some((started, release)) = self
@@ -799,8 +842,9 @@ impl SessionPersistence {
         {
             return Err(std::io::Error::from(kind));
         }
-        let write = self.store.save_acp_result(
-            &self.session_id,
+        let write = self.store.save_acp_generation_result(
+            &self.writer,
+            capture.generation,
             &capture.model,
             &capture.thinking,
             &capture.messages,
@@ -809,6 +853,17 @@ impl SessionPersistence {
             &capture.assistant_outcomes,
             max_preview_bytes,
         )?;
+        let write = match write {
+            SessionWriteOutcome::Saved(write) => write,
+            SessionWriteOutcome::Stale { stored_generation } => {
+                state.last_saved_generation = Some(stored_generation);
+                return Ok(PersistenceSaveOutcome::SkippedStale { stored_generation });
+            }
+            SessionWriteOutcome::Superseded => {
+                state.superseded = true;
+                return Ok(PersistenceSaveOutcome::Superseded);
+            }
+        };
         state.last_saved_generation = Some(capture.generation);
         if let Some(writer) = &self.catalog_writer {
             writer.enqueue_saved(write);
@@ -821,11 +876,15 @@ impl SessionPersistence {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.deleted {
+        if state.deleted || state.superseded {
             return Ok(false);
         }
-        let deleted = match self.store.delete(&self.session_id) {
-            Ok(deleted) => deleted,
+        let deleted = match self.store.delete_writer(&self.writer) {
+            Ok(Some(deleted)) => deleted,
+            Ok(None) => {
+                state.deleted = true;
+                return Ok(false);
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "daimonos::session_core",
@@ -1270,10 +1329,12 @@ impl SessionCore {
                         .mark_clean_if_fully_handled(handled_request, &self.persistence_requested);
                     return;
                 }
-                Ok(PersistenceSaveOutcome::SkippedStale) => {
+                Ok(PersistenceSaveOutcome::SkippedStale { stored_generation }) => {
                     // A newer generation was already written. Production gate
                     // ownership makes this unreachable, but synthetic test
                     // captures can race it; recapture instead of claiming clean.
+                    self.persistence_generation
+                        .fetch_max(stored_generation, Ordering::AcqRel);
                     persistence.mark_dirty();
                     if attempts >= policy.attempts {
                         tracing::warn!(
@@ -1291,6 +1352,16 @@ impl SessionCore {
                 Ok(PersistenceSaveOutcome::SkippedDeleted) => {
                     self.persistence_completed
                         .fetch_max(handled_request, Ordering::AcqRel);
+                    return;
+                }
+                Ok(PersistenceSaveOutcome::Superseded) => {
+                    self.persistence_completed
+                        .fetch_max(handled_request, Ordering::AcqRel);
+                    tracing::warn!(
+                        target: "daimonos::session_core",
+                        event = "session_writer_superseded",
+                        "session persistence stopped because a newer runtime claimed ownership"
+                    );
                     return;
                 }
                 Err(error) => {
@@ -1355,6 +1426,11 @@ impl SessionCore {
         self.persistence
             .as_ref()
             .map_or(PersistenceHealth::Clean, SessionPersistence::health)
+    }
+
+    pub(crate) fn initialize_persistence_generation(&self, generation: u64) {
+        self.persistence_generation
+            .store(generation, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -4417,7 +4493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_stale_captures_are_bounded_and_remain_dirty() {
+    async fn stale_generation_fast_forwards_and_recaptures() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = SessionPersistence::new(
             "session-1",
@@ -4429,9 +4505,63 @@ mod tests {
 
         core.persist_current().await;
 
-        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
-        assert_eq!(core.persistence_health(), PersistenceHealth::Dirty);
-        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 0);
+        assert_eq!(core.persistence_generation.load(Ordering::Acquire), 101);
+        assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
+        assert_eq!(core.persistence_completed.load(Ordering::Acquire), 1);
+        assert_eq!(
+            SessionStore::new(directory.path().join("sessions"))
+                .load_result("session-1")
+                .unwrap()
+                .generation,
+            101
+        );
+    }
+
+    #[tokio::test]
+    async fn reopened_writer_epoch_rejects_delayed_old_core_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let old_persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let old_core = persistence_test_core(directory.path(), old_persistence.clone());
+        old_core.persist_current().await;
+        let (save_started, release_save) = old_persistence.pause_next_save();
+        let delayed_core = Arc::clone(&old_core);
+        let delayed = tokio::spawn(async move { delayed_core.persist_current().await });
+        tokio::task::spawn_blocking(move || {
+            save_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let new_persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let new_core = persistence_test_core(directory.path(), new_persistence);
+        new_core.initialize_persistence_generation(1);
+        new_core
+            .session
+            .lock()
+            .await
+            .set_history(vec![Message::user("new runtime")]);
+        release_save.send(()).unwrap();
+        delayed.await.unwrap();
+        new_core.persist_current().await;
+
+        assert_eq!(old_core.persistence_health(), PersistenceHealth::Superseded);
+        let loaded = store.load_result("session-1").unwrap();
+        assert_eq!(loaded.generation, 2);
+        assert!(matches!(
+            loaded.messages[0].content.as_slice(),
+            [crate::providers::ContentBlock::Text(text)] if text == "new runtime"
+        ));
     }
 
     #[tokio::test]
@@ -4501,7 +4631,9 @@ mod tests {
             persistence
                 .save(&persistence_capture(1, directory.path(), "stale"))
                 .unwrap(),
-            PersistenceSaveOutcome::SkippedStale
+            PersistenceSaveOutcome::SkippedStale {
+                stored_generation: 2
+            }
         );
         let loaded = store.load("session-1").unwrap();
         assert!(matches!(
@@ -4525,20 +4657,22 @@ mod tests {
     #[test]
     fn failed_write_does_not_advance_sequence_watermark() {
         let directory = tempfile::tempdir().unwrap();
-        let store_path = directory.path().join("not-a-directory");
-        std::fs::write(&store_path, b"file").unwrap();
+        let store_path = directory.path().join("sessions");
+        let displaced_store_path = directory.path().join("sessions-displaced");
         let store = SessionStore::new(store_path.clone());
         let persistence = SessionPersistence::new(
             "session-1",
             store.clone(),
             PersistenceRetryPolicy::single_attempt(),
         );
+        std::fs::rename(&store_path, &displaced_store_path).unwrap();
+        std::fs::write(&store_path, b"file").unwrap();
 
         assert!(persistence
             .save(&persistence_capture(2, directory.path(), "failed"))
             .is_err());
         std::fs::remove_file(&store_path).unwrap();
-        std::fs::create_dir(&store_path).unwrap();
+        std::fs::rename(&displaced_store_path, &store_path).unwrap();
         assert_eq!(
             persistence
                 .save(&persistence_capture(1, directory.path(), "accepted"))
@@ -4555,9 +4689,9 @@ mod tests {
     #[tokio::test]
     async fn failed_payload_write_never_enters_catalog() {
         let directory = tempfile::tempdir().unwrap();
-        let invalid_store_path = directory.path().join("not-a-directory");
-        std::fs::write(&invalid_store_path, b"file").unwrap();
-        let store = SessionStore::new(invalid_store_path);
+        let store_path = directory.path().join("sessions");
+        let displaced_store_path = directory.path().join("sessions-displaced");
+        let store = SessionStore::new(store_path.clone());
         let catalog = match crate::session_catalog::SessionCatalog::open(
             directory.path().join("catalog.sqlite"),
             std::time::Duration::from_secs(1),
@@ -4577,6 +4711,8 @@ mod tests {
         let persistence =
             SessionPersistence::new("session-1", store, PersistenceRetryPolicy::single_attempt())
                 .with_catalog_writer(Arc::clone(&writer));
+        std::fs::rename(&store_path, &displaced_store_path).unwrap();
+        std::fs::write(&store_path, b"file").unwrap();
         assert!(persistence
             .save(&persistence_capture(1, directory.path(), "hello"))
             .is_err());
@@ -4591,8 +4727,8 @@ mod tests {
     #[tokio::test]
     async fn failed_payload_delete_does_not_commit_state_or_tombstone() {
         let directory = tempfile::tempdir().unwrap();
-        let invalid_store_path = directory.path().join("not-a-directory");
-        std::fs::write(&invalid_store_path, b"file").unwrap();
+        let store_path = directory.path().join("sessions");
+        let displaced_store_path = directory.path().join("sessions-displaced");
         let catalog = match crate::session_catalog::SessionCatalog::open(
             directory.path().join("catalog.sqlite"),
             std::time::Duration::from_secs(1),
@@ -4609,19 +4745,21 @@ mod tests {
             4,
             64,
         );
-        let store = SessionStore::new(invalid_store_path.clone());
+        let store = SessionStore::new(store_path.clone());
         let persistence = SessionPersistence::new(
             "session-1",
             store.clone(),
             PersistenceRetryPolicy::single_attempt(),
         )
         .with_catalog_writer(Arc::clone(&writer));
+        std::fs::rename(&store_path, &displaced_store_path).unwrap();
+        std::fs::write(&store_path, b"file").unwrap();
 
         assert!(persistence.delete().is_err());
         assert!(writer.catalog().row("session-1").unwrap().is_none());
 
-        std::fs::remove_file(&invalid_store_path).unwrap();
-        std::fs::create_dir(&invalid_store_path).unwrap();
+        std::fs::remove_file(&store_path).unwrap();
+        std::fs::rename(&displaced_store_path, &store_path).unwrap();
         assert!(!persistence.delete().unwrap());
         assert!(
             writer

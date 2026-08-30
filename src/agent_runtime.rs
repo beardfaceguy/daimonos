@@ -464,8 +464,14 @@ pub async fn run_chat(
     } = args;
     let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("chat-sessions"));
     if list {
+        let busy_timeout =
+            std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
         let sessions = sessions_dir
-            .map(|directory| session_store::SessionStore::new(directory).list())
+            .map(|directory| {
+                session_store::SessionStore::new(directory)
+                    .with_busy_timeout(busy_timeout)
+                    .list()
+            })
             .unwrap_or_default();
         println!("{}", chat_cmd::format_session_list(&sessions));
         return Ok(());
@@ -655,7 +661,9 @@ pub async fn run_session_daemon(
     };
     let sessions_dir = paths::daemon_sessions_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for session persistence"))?;
-    let session_store = session_store::SessionStore::new(sessions_dir.clone());
+    let session_store = session_store::SessionStore::new(sessions_dir.clone()).with_busy_timeout(
+        std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms),
+    );
     let workspace_identity =
         session_factory::canonical_session_workspace(workspace, cfg.session.max_label_bytes);
     let catalog = match crate::session_catalog::SessionCatalog::open(

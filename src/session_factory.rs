@@ -118,6 +118,29 @@ impl SessionFactory for AgentSessionFactory {
                 return Err(SessionOpenError::WorkspaceMismatch);
             }
         }
+        let persistence = SessionPersistence::claim(
+            session_id.to_string(),
+            self.store.clone(),
+            persisted.as_ref().map(|record| record.generation),
+            PersistenceRetryPolicy::new(
+                self.config.session.persistence_retry_attempts,
+                std::time::Duration::from_millis(
+                    self.config.session.persistence_retry_initial_backoff_ms,
+                ),
+                std::time::Duration::from_millis(
+                    self.config.session.persistence_retry_max_backoff_ms,
+                ),
+            ),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                target: "daimonos::session_factory",
+                event = "session_writer_claim_failed",
+                session_id,
+                error = %error,
+            );
+            SessionOpenError::Io
+        })?;
         let workspace = self.workspace.clone();
         let model = persisted
             .as_ref()
@@ -237,28 +260,16 @@ impl SessionFactory for AgentSessionFactory {
             self.compaction.clone(),
             context_windows,
             approvals,
-            Some({
-                let persistence = SessionPersistence::new(
-                    session_id.to_string(),
-                    self.store.clone(),
-                    PersistenceRetryPolicy::new(
-                        self.config.session.persistence_retry_attempts,
-                        std::time::Duration::from_millis(
-                            self.config.session.persistence_retry_initial_backoff_ms,
-                        ),
-                        std::time::Duration::from_millis(
-                            self.config.session.persistence_retry_max_backoff_ms,
-                        ),
-                    ),
-                );
-                match &self.catalog_writer {
-                    Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
-                    None => persistence,
-                }
+            Some(match &self.catalog_writer {
+                Some(writer) => persistence.with_catalog_writer(Arc::clone(writer)),
+                None => persistence,
             }),
             events,
             tool_lifecycle,
         ));
+        if let Some(record) = persisted.as_ref() {
+            core.initialize_persistence_generation(record.generation);
+        }
         core.set_runtime_options(runtime_options(
             &self.models,
             &core.current_model(),
@@ -347,12 +358,17 @@ impl From<SessionStoreErrorKind> for SessionOpenError {
     fn from(kind: SessionStoreErrorKind) -> Self {
         match kind {
             SessionStoreErrorKind::UnsafeId => Self::UnsafeId,
+            SessionStoreErrorKind::AlreadyExists => {
+                debug_assert!(false, "session open cannot produce duplicate-import errors");
+                Self::Internal
+            }
+            SessionStoreErrorKind::WriterChanged => Self::Io,
             SessionStoreErrorKind::NotFound => Self::NotFound,
             SessionStoreErrorKind::FutureVersion => Self::FutureVersion,
             SessionStoreErrorKind::UnsupportedVersion => Self::UnsupportedVersion,
             SessionStoreErrorKind::Corrupt => Self::Corrupt,
             SessionStoreErrorKind::Permission => Self::Permission,
-            SessionStoreErrorKind::Io => Self::Io,
+            SessionStoreErrorKind::Database | SessionStoreErrorKind::Io => Self::Io,
         }
     }
 }
@@ -639,11 +655,10 @@ mod tests {
             factory.open("foreign-session", SessionOpenMode::Load).await,
             Err(SessionOpenError::WorkspaceMismatch)
         ));
-        std::fs::write(
-            directory.path().join("sessions").join("corrupt.json"),
-            b"{not-json",
-        )
-        .unwrap();
+        store.save("corrupt", "saved-model", &[]);
+        store
+            .replace_payload_for_test("corrupt", b"{not-json")
+            .unwrap();
         assert!(matches!(
             factory.open("corrupt", SessionOpenMode::Load).await,
             Err(SessionOpenError::Corrupt)

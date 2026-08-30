@@ -339,8 +339,10 @@ the local TUI/UDS client, and future remote clients.
 | `session_list_snapshot_entries` | `1000` | Maximum rows retained in one connection-bound listing snapshot. |
 | `session_list_snapshot_global_capacity` | `256` | Maximum live listing snapshots per trust domain across all connections; the oldest same-domain snapshot is invalidated first. |
 | `session_list_snapshot_ttl_secs` | `60` | Lifetime of one connection-bound listing snapshot. |
-| `session_catalog_path` | beside daemon JSON | Optional shared SQLite metadata catalog path. |
+| `session_catalog_path` | beside daemon database | Optional shared SQLite metadata catalog path. |
 | `session_catalog_busy_timeout_ms` | `5000` | SQLite writer wait under multiprocess contention. |
+| `session_store_busy_timeout_ms` | `5000` | SQLite writer wait for canonical session payload operations. |
+| `session_archive_max_bytes` | `67108864` | Maximum bytes accepted from one imported session archive. |
 | `session_catalog_pending_entries` | `1024` | Maximum distinct latest-wins pending catalog mutations per daemon. |
 | `session_catalog_write_batch` | `64` | Maximum mutations applied by one blocking worker batch. |
 | `session_catalog_query_timeout_ms` | `6000` | Maximum catalog query/reconciliation wait; must exceed the SQLite busy timeout. |
@@ -387,6 +389,22 @@ Idle eviction runs on the `idle_retention_secs` interval, so a forced eviction
 can occur up to one sweep interval after `persistence_eviction_extension_secs`
 expires.
 
+Canonical session payloads live in `sessions.sqlite3`. Portable archives use a
+versioned Daimonos envelope because ACP, MCP, and provider APIs do not define a
+session-export standard:
+
+```bash
+daimonos session import session.json
+daimonos session export <session-id> --format json
+daimonos session export <session-id> --format json --output session.json
+```
+
+Import requires a top-level `session_id` and rejects an existing id. Export
+refuses to overwrite an existing output file.
+Daemon and ACP runtimes claim a new writer epoch when opening a session.
+SQLite rejects delayed saves and deletes from every superseded epoch regardless
+of their numeric capture generation.
+
 Automatic reconnect treats only typed `event_queue_lagged` revocation and
 transport loss as resumable. `session_stopped`, `attachment_replaced`, and
 reason-only revocations from older daemons are terminal; core logic never
@@ -413,6 +431,8 @@ session_list_snapshot_entries = 1000
 session_list_snapshot_global_capacity = 256
 session_list_snapshot_ttl_secs = 60
 session_catalog_busy_timeout_ms = 5000
+session_store_busy_timeout_ms = 5000
+session_archive_max_bytes = 67108864
 session_catalog_pending_entries = 1024
 session_catalog_write_batch = 64
 session_catalog_query_timeout_ms = 6000

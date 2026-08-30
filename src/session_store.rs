@@ -1,12 +1,12 @@
-//! On-disk persistence for agent conversations, shared by the ACP engine
-//! (`src/acp_cmd.rs`, vikunja #961) and the chat REPL (`src/chat_cmd.rs`,
-//! vikunja #963). One versioned JSON file per session, keyed by a plain
-//! string id, written atomically (temp + rename) so a crash mid-write can't
-//! leave a truncated file. Mirrors how Zed's native providers restore full
-//! history from a local store.
+//! SQLite persistence for agent conversations, shared by every agent frontend.
+//! SQL stays private to this module so a future tamper-evident mutation ledger
+//! can cover one stable transactional boundary (Vikunja #1410, #1411).
 
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{ContentBlock, Message, Role};
@@ -15,14 +15,19 @@ use crate::session_protocol::AssistantOutcome;
 /// Version tag on the persisted-session JSON, so a future on-disk format
 /// change can be detected and old files ignored rather than mis-parsed.
 pub const SESSION_PERSIST_VERSION: u32 = 1;
+const SESSION_STORE_SCHEMA_VERSION: i64 = 1;
+const SESSION_DATABASE_NAME: &str = "sessions.sqlite3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStoreErrorKind {
     UnsafeId,
+    AlreadyExists,
+    WriterChanged,
     NotFound,
     FutureVersion,
     UnsupportedVersion,
     Corrupt,
+    Database,
     Permission,
     Io,
 }
@@ -30,10 +35,13 @@ pub enum SessionStoreErrorKind {
 #[derive(Debug)]
 pub enum SessionStoreError {
     UnsafeId,
+    AlreadyExists,
+    WriterChanged { expected: u64, found: Option<u64> },
     NotFound,
     FutureVersion { found: u32, supported: u32 },
     UnsupportedVersion { found: u32, supported: u32 },
     Corrupt(serde_json::Error),
+    Database(rusqlite::Error),
     Io(std::io::Error),
 }
 
@@ -41,10 +49,13 @@ impl SessionStoreError {
     pub fn kind(&self) -> SessionStoreErrorKind {
         match self {
             Self::UnsafeId => SessionStoreErrorKind::UnsafeId,
+            Self::AlreadyExists => SessionStoreErrorKind::AlreadyExists,
+            Self::WriterChanged { .. } => SessionStoreErrorKind::WriterChanged,
             Self::NotFound => SessionStoreErrorKind::NotFound,
             Self::FutureVersion { .. } => SessionStoreErrorKind::FutureVersion,
             Self::UnsupportedVersion { .. } => SessionStoreErrorKind::UnsupportedVersion,
             Self::Corrupt(_) => SessionStoreErrorKind::Corrupt,
+            Self::Database(_) => SessionStoreErrorKind::Database,
             Self::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 SessionStoreErrorKind::Permission
             }
@@ -57,6 +68,11 @@ impl std::fmt::Display for SessionStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsafeId => formatter.write_str("session id is not a safe path component"),
+            Self::AlreadyExists => formatter.write_str("session id already exists"),
+            Self::WriterChanged { expected, found } => write!(
+                formatter,
+                "session changed while claiming writer epoch: expected generation {expected}, found {found:?}"
+            ),
             Self::NotFound => formatter.write_str("persisted session was not found"),
             Self::FutureVersion { found, supported } => write!(
                 formatter,
@@ -67,6 +83,7 @@ impl std::fmt::Display for SessionStoreError {
                 "persisted session version {found} is older than supported version {supported}"
             ),
             Self::Corrupt(error) => write!(formatter, "persisted session JSON is invalid: {error}"),
+            Self::Database(error) => write!(formatter, "session database failed: {error}"),
             Self::Io(error) => write!(formatter, "session store I/O failed: {error}"),
         }
     }
@@ -76,8 +93,11 @@ impl std::error::Error for SessionStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Corrupt(error) => Some(error),
+            Self::Database(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::UnsafeId
+            | Self::AlreadyExists
+            | Self::WriterChanged { .. }
             | Self::NotFound
             | Self::FutureVersion { .. }
             | Self::UnsupportedVersion { .. } => None,
@@ -90,6 +110,8 @@ impl std::error::Error for SessionStoreError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub version: u32,
+    #[serde(default)]
+    pub generation: u64,
     pub session_id: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +145,19 @@ pub struct PersistedWrite {
     pub updated_at_unix_ns: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWriter {
+    session_id: String,
+    epoch: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionWriteOutcome {
+    Saved(PersistedWrite),
+    Stale { stored_generation: u64 },
+    Superseded,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummaryScan {
     pub summaries: Vec<SessionSummary>,
@@ -134,26 +169,177 @@ pub struct SessionSummaryScan {
 #[derive(Clone)]
 pub struct SessionStore {
     dir: PathBuf,
+    busy_timeout: Duration,
 }
 
 impl SessionStore {
     pub fn new(dir: PathBuf) -> Self {
-        SessionStore { dir }
+        SessionStore {
+            dir,
+            busy_timeout: Duration::ZERO,
+        }
     }
 
-    /// Filename for a session id, or `None` if the id has characters unsafe as
-    /// a path component. Minted ids are UUIDs; this only guards a hostile or
-    /// malformed id against path traversal / collisions.
-    fn file_name(id: &str) -> Option<String> {
-        let safe = !id.is_empty()
+    pub fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
+        self.busy_timeout = busy_timeout;
+        self
+    }
+
+    fn valid_id(id: &str) -> bool {
+        !id.is_empty()
             && id
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        safe.then(|| format!("{id}.json"))
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
-    /// Persist a session's history. Best-effort: a write failure is logged to
-    /// stderr and never fails the caller's turn.
+    fn connection(&self) -> Result<Connection, SessionStoreError> {
+        std::fs::create_dir_all(&self.dir).map_err(SessionStoreError::Io)?;
+        let metadata = std::fs::metadata(&self.dir).map_err(SessionStoreError::Io)?;
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(SessionStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session store directory is not owned by the current user",
+            )));
+        }
+        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(SessionStoreError::Io)?;
+        let path = self.dir.join(SESSION_DATABASE_NAME);
+        let mut connection = Connection::open(&path).map_err(SessionStoreError::Database)?;
+        connection
+            .busy_timeout(self.busy_timeout)
+            .map_err(SessionStoreError::Database)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(SessionStoreError::Database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SessionStoreError::Database)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL
+                 );
+                 INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, 1);",
+            )
+            .map_err(SessionStoreError::Database)?;
+        let schema_version = transaction
+            .query_row("SELECT version FROM schema_meta WHERE id = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(SessionStoreError::Database)?;
+        if schema_version > SESSION_STORE_SCHEMA_VERSION {
+            transaction
+                .rollback()
+                .map_err(SessionStoreError::Database)?;
+            return Err(SessionStoreError::FutureVersion {
+                found: schema_version as u32,
+                supported: SESSION_STORE_SCHEMA_VERSION as u32,
+            });
+        }
+        if schema_version < SESSION_STORE_SCHEMA_VERSION {
+            transaction
+                .rollback()
+                .map_err(SessionStoreError::Database)?;
+            return Err(SessionStoreError::UnsupportedVersion {
+                found: schema_version.max(0) as u32,
+                supported: SESSION_STORE_SCHEMA_VERSION as u32,
+            });
+        }
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    record_version INTEGER NOT NULL,
+                    generation INTEGER NOT NULL,
+                    payload BLOB NOT NULL,
+                    model TEXT NOT NULL,
+                    cwd TEXT,
+                    message_count INTEGER NOT NULL,
+                    preview TEXT,
+                    updated_at_unix_ns INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_writers (
+                    session_id TEXT PRIMARY KEY,
+                    writer_epoch TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS sessions_updated
+                    ON sessions(updated_at_unix_ns DESC, session_id ASC);",
+            )
+            .map_err(SessionStoreError::Database)?;
+        transaction.commit().map_err(SessionStoreError::Database)?;
+        for database_file in [
+            path.clone(),
+            path.with_extension("sqlite3-wal"),
+            path.with_extension("sqlite3-shm"),
+        ] {
+            if database_file.exists() {
+                std::fs::set_permissions(database_file, std::fs::Permissions::from_mode(0o600))
+                    .map_err(SessionStoreError::Io)?;
+            }
+        }
+        Ok(connection)
+    }
+
+    pub fn claim_writer(
+        &self,
+        session_id: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<SessionWriter, SessionStoreError> {
+        if !Self::valid_id(session_id) {
+            return Err(SessionStoreError::UnsafeId);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SessionStoreError::Database)?;
+        let found_generation = transaction
+            .query_row(
+                "SELECT generation FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(SessionStoreError::Database)?;
+        match expected_generation {
+            Some(expected) if found_generation != Some(expected) => {
+                transaction
+                    .rollback()
+                    .map_err(SessionStoreError::Database)?;
+                return Err(SessionStoreError::WriterChanged {
+                    expected,
+                    found: found_generation,
+                });
+            }
+            None if found_generation.is_some() => {
+                transaction
+                    .rollback()
+                    .map_err(SessionStoreError::Database)?;
+                return Err(SessionStoreError::AlreadyExists);
+            }
+            _ => {}
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "INSERT INTO session_writers (session_id, writer_epoch)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    writer_epoch = excluded.writer_epoch",
+                params![session_id, epoch],
+            )
+            .map_err(SessionStoreError::Database)?;
+        transaction.commit().map_err(SessionStoreError::Database)?;
+        Ok(SessionWriter {
+            session_id: session_id.to_string(),
+            epoch,
+        })
+    }
+
+    /// Persist a single-writer chat session. Generation is assigned inside the
+    /// transaction; callers must not concurrently edit the same session id.
+    /// Best-effort failures are logged and never fail the caller's turn.
     pub fn save(&self, id: &str, model: &str, messages: &[Message]) {
         self.save_record(id, model, None, messages, None, &[], &[]);
     }
@@ -168,6 +354,7 @@ impl SessionStore {
 
     /// Persist an ACP/daemon session including its provider-neutral effort
     /// level so every caller makes runtime-state ownership explicit.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn save_acp(
         &self,
@@ -193,6 +380,7 @@ impl SessionStore {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn save_acp_result(
         &self,
@@ -205,7 +393,7 @@ impl SessionStore {
         assistant_outcomes: &[AssistantOutcome],
         max_preview_bytes: usize,
     ) -> std::io::Result<PersistedWrite> {
-        self.save_record_result(
+        match self.save_record_result(
             id,
             model,
             Some(thinking.to_string()),
@@ -214,6 +402,43 @@ impl SessionStore {
             client_user_message_ids,
             assistant_outcomes,
             max_preview_bytes,
+            None,
+            None,
+        )? {
+            SessionWriteOutcome::Saved(write) => Ok(write),
+            SessionWriteOutcome::Stale { .. } => Err(std::io::Error::other(
+                "automatic session generation was stale",
+            )),
+            SessionWriteOutcome::Superseded => Err(std::io::Error::other(
+                "automatic session writer was superseded",
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_acp_generation_result(
+        &self,
+        writer: &SessionWriter,
+        generation: u64,
+        model: &str,
+        thinking: &str,
+        messages: &[Message],
+        cwd: &Path,
+        client_user_message_ids: &[String],
+        assistant_outcomes: &[AssistantOutcome],
+        max_preview_bytes: usize,
+    ) -> std::io::Result<SessionWriteOutcome> {
+        self.save_record_result(
+            &writer.session_id,
+            model,
+            Some(thinking.to_string()),
+            messages,
+            Some(cwd.to_path_buf()),
+            client_user_message_ids,
+            assistant_outcomes,
+            max_preview_bytes,
+            Some(generation),
+            Some(writer),
         )
     }
 
@@ -228,11 +453,12 @@ impl SessionStore {
         client_user_message_ids: &[String],
         assistant_outcomes: &[AssistantOutcome],
     ) {
-        let Some(name) = Self::file_name(id) else {
+        if !Self::valid_id(id) {
             return;
-        };
+        }
         let record = PersistedSession {
             version: SESSION_PERSIST_VERSION,
+            generation: 0,
             session_id: id.to_string(),
             model: model.to_string(),
             thinking,
@@ -241,7 +467,7 @@ impl SessionStore {
             assistant_outcomes: assistant_outcomes.to_vec(),
             messages: messages.to_vec(),
         };
-        if let Err(e) = self.write_atomic(&name, &record) {
+        if let Err(e) = self.write_record(record, usize::MAX, None, None) {
             eprintln!("session store: failed to persist session {id}: {e}");
         }
     }
@@ -257,11 +483,15 @@ impl SessionStore {
         client_user_message_ids: &[String],
         assistant_outcomes: &[AssistantOutcome],
         max_preview_bytes: usize,
-    ) -> std::io::Result<PersistedWrite> {
-        let name = Self::file_name(id)
-            .ok_or_else(|| std::io::Error::other("session id is not a safe path component"))?;
+        generation: Option<u64>,
+        writer: Option<&SessionWriter>,
+    ) -> std::io::Result<SessionWriteOutcome> {
+        if !Self::valid_id(id) {
+            return Err(std::io::Error::other("session id is invalid"));
+        }
         let record = PersistedSession {
             version: SESSION_PERSIST_VERSION,
+            generation: generation.unwrap_or_default(),
             session_id: id.to_string(),
             model: model.to_string(),
             thinking,
@@ -270,51 +500,122 @@ impl SessionStore {
             assistant_outcomes: assistant_outcomes.to_vec(),
             messages: messages.to_vec(),
         };
-        let updated_at = self.write_atomic(&name, &record)?;
-        Ok(PersistedWrite {
-            summary: SessionSummary {
-                id: id.to_string(),
-                model: model.to_string(),
-                message_count: messages.len(),
-                cwd,
-                updated_at: Some(updated_at),
-                first_user_line: first_user_preview(messages, max_preview_bytes),
-            },
-            updated_at_unix_ns: system_time_unix_ns(updated_at),
-        })
+        self.write_record(record, max_preview_bytes, generation, writer)
     }
 
-    fn write_atomic(
+    fn write_record(
         &self,
-        name: &str,
-        record: &PersistedSession,
-    ) -> std::io::Result<std::time::SystemTime> {
-        std::fs::create_dir_all(&self.dir)?;
-        let json = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-        // Write to a temp file then rename, so a crash mid-write can't leave a
-        // truncated JSON file that would fail to load.
-        let tmp = self
-            .dir
-            .join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
-        std::fs::write(&tmp, &json)?;
-        let path = self.dir.join(name);
-        if let Err(error) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
+        mut record: PersistedSession,
+        max_preview_bytes: usize,
+        requested_generation: Option<u64>,
+        writer: Option<&SessionWriter>,
+    ) -> std::io::Result<SessionWriteOutcome> {
+        let mut connection = self.connection().map_err(std::io::Error::other)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let active_epoch = transaction
+            .query_row(
+                "SELECT writer_epoch FROM session_writers WHERE session_id = ?1",
+                [&record.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let epoch_matches = match writer {
+            Some(writer) => {
+                debug_assert_eq!(writer.session_id, record.session_id);
+                active_epoch.as_deref() == Some(writer.epoch.as_str())
+            }
+            None => active_epoch.is_none(),
+        };
+        if !epoch_matches {
+            transaction.rollback().map_err(std::io::Error::other)?;
+            return Ok(SessionWriteOutcome::Superseded);
         }
-        std::fs::metadata(path)?.modified()
+        let stored_generation = transaction
+            .query_row(
+                "SELECT generation FROM sessions WHERE session_id = ?1",
+                [&record.session_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let generation = requested_generation
+            .unwrap_or_else(|| stored_generation.unwrap_or_default().saturating_add(1));
+        if stored_generation.is_some_and(|stored| generation <= stored) {
+            transaction.rollback().map_err(std::io::Error::other)?;
+            return Ok(SessionWriteOutcome::Stale {
+                stored_generation: stored_generation.unwrap_or_default(),
+            });
+        }
+        record.generation = generation;
+        let payload = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        let updated_at = std::time::SystemTime::now();
+        let updated_at_unix_ns = system_time_unix_ns(updated_at);
+        let preview = first_user_preview(&record.messages, max_preview_bytes);
+        transaction
+            .execute(
+                "INSERT INTO sessions (
+                    session_id, record_version, generation, payload, model, cwd,
+                    message_count, preview, updated_at_unix_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    record_version = excluded.record_version,
+                    generation = excluded.generation,
+                    payload = excluded.payload,
+                    model = excluded.model,
+                    cwd = excluded.cwd,
+                    message_count = excluded.message_count,
+                    preview = excluded.preview,
+                    updated_at_unix_ns = excluded.updated_at_unix_ns",
+                params![
+                    record.session_id,
+                    record.version,
+                    record.generation,
+                    payload,
+                    record.model,
+                    record.cwd.as_ref().map(|path| path.to_string_lossy()),
+                    record.messages.len() as u64,
+                    preview,
+                    updated_at_unix_ns,
+                ],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(SessionWriteOutcome::Saved(PersistedWrite {
+            summary: SessionSummary {
+                id: record.session_id,
+                model: record.model,
+                message_count: record.messages.len(),
+                cwd: record.cwd,
+                updated_at: Some(updated_at),
+                first_user_line: preview,
+            },
+            updated_at_unix_ns,
+        }))
     }
 
     pub fn load_result(&self, id: &str) -> Result<PersistedSession, SessionStoreError> {
-        let name = Self::file_name(id).ok_or(SessionStoreError::UnsafeId)?;
-        let bytes = std::fs::read(self.dir.join(name)).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                SessionStoreError::NotFound
-            } else {
-                SessionStoreError::Io(error)
-            }
-        })?;
-        decode_persisted_session(&bytes)
+        if !Self::valid_id(id) {
+            return Err(SessionStoreError::UnsafeId);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT payload, generation FROM sessions WHERE session_id = ?1",
+                [id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()
+            .map_err(SessionStoreError::Database)?
+            .ok_or(SessionStoreError::NotFound)?;
+        let mut record = decode_persisted_session(&row.0)?;
+        if record.session_id != id {
+            return Err(SessionStoreError::Database(rusqlite::Error::InvalidQuery));
+        }
+        record.generation = row.1;
+        Ok(record)
     }
 
     /// Compatibility projection for chat/ACP callers that still treat every
@@ -337,17 +638,142 @@ impl SessionStore {
         }
     }
 
+    pub fn import_if_absent(
+        &self,
+        mut record: PersistedSession,
+        max_preview_bytes: usize,
+    ) -> Result<(), SessionStoreError> {
+        validate_persisted_session(&record)?;
+        if !Self::valid_id(&record.session_id) {
+            return Err(SessionStoreError::UnsafeId);
+        }
+        // Import starts a new local persistence lineage. Archive generations
+        // are descriptive and must not be trusted to pin future local writes.
+        record.generation = 1;
+        let payload = serde_json::to_vec(&record).map_err(SessionStoreError::Corrupt)?;
+        let preview = first_user_preview(&record.messages, max_preview_bytes);
+        let updated_at_unix_ns = system_time_unix_ns(std::time::SystemTime::now());
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SessionStoreError::Database)?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions WHERE session_id = ?1
+                    UNION ALL
+                    SELECT 1 FROM session_writers WHERE session_id = ?1
+                 )",
+                [&record.session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(SessionStoreError::Database)?;
+        if exists {
+            return Err(SessionStoreError::AlreadyExists);
+        }
+        transaction
+            .execute(
+                "INSERT INTO sessions (
+                    session_id, record_version, generation, payload, model, cwd,
+                    message_count, preview, updated_at_unix_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.session_id,
+                    record.version,
+                    record.generation,
+                    payload,
+                    record.model,
+                    record.cwd.as_ref().map(|path| path.to_string_lossy()),
+                    record.messages.len() as u64,
+                    preview,
+                    updated_at_unix_ns,
+                ],
+            )
+            .map_err(SessionStoreError::Database)?;
+        transaction.commit().map_err(SessionStoreError::Database)
+    }
+
     /// Delete a persisted session. Missing and unsafe ids are treated as
     /// already deleted so ACP session/delete remains idempotent.
-    pub fn delete(&self, id: &str) -> std::io::Result<bool> {
-        let Some(name) = Self::file_name(id) else {
+    /// Administrative deletion by id. This intentionally revokes any active
+    /// writer epoch; live runtime deletion should use [`Self::delete_writer`].
+    pub fn delete_unconditionally(&self, id: &str) -> std::io::Result<bool> {
+        if !Self::valid_id(id) {
             return Ok(false);
-        };
-        match std::fs::remove_file(self.dir.join(name)) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
         }
+        let mut connection = self.connection().map_err(std::io::Error::other)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let revokes_writer = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_writers WHERE session_id = ?1
+                 )",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(std::io::Error::other)?;
+        if revokes_writer {
+            tracing::warn!(
+                target: "daimonos::session_store",
+                event = "session_writer_epoch_revoked",
+                session_id = id,
+            );
+        }
+        let changed = transaction
+            .execute("DELETE FROM sessions WHERE session_id = ?1", [id])
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute("DELETE FROM session_writers WHERE session_id = ?1", [id])
+            .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_writer(&self, writer: &SessionWriter) -> std::io::Result<Option<bool>> {
+        let mut connection = self.connection().map_err(std::io::Error::other)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let active_epoch = transaction
+            .query_row(
+                "SELECT writer_epoch FROM session_writers WHERE session_id = ?1",
+                [&writer.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        if active_epoch.as_deref() != Some(writer.epoch.as_str()) {
+            transaction.rollback().map_err(std::io::Error::other)?;
+            return Ok(None);
+        }
+        let changed = transaction
+            .execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [&writer.session_id],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute(
+                "DELETE FROM session_writers WHERE session_id = ?1",
+                [&writer.session_id],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(Some(changed > 0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_payload_for_test(&self, id: &str, payload: &[u8]) -> std::io::Result<()> {
+        let connection = self.connection().map_err(std::io::Error::other)?;
+        connection
+            .execute(
+                "UPDATE sessions SET payload = ?1 WHERE session_id = ?2",
+                params![payload, id],
+            )
+            .map(|_| ())
+            .map_err(std::io::Error::other)
     }
 
     /// Summaries of all saved sessions, most-recently-modified first. Files
@@ -359,31 +785,42 @@ impl SessionStore {
     /// Listing variant whose normalized first-user preview is UTF-8 byte
     /// bounded before it leaves the blocking store scan.
     pub fn list_with_preview_limit(&self, max_preview_bytes: usize) -> Vec<SessionSummary> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        let connection = match self.connection() {
+            Ok(connection) => connection,
             Err(error) => {
-                log_store_error("session_list_failed", &SessionStoreError::Io(error));
+                log_store_error("session_list_failed", &error);
                 return Vec::new();
             }
         };
-        let mut rows: Vec<(std::time::SystemTime, SessionSummary)> = Vec::new();
-        for entry in entries {
-            match entry
-                .map_err(SessionStoreError::Io)
-                .and_then(|entry| summary_from_path(entry.path(), max_preview_bytes))
-            {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
-                Err(error) => log_store_error("session_list_entry_failed", &error),
+        let mut statement = match connection.prepare(
+            "SELECT session_id, model, message_count, cwd, preview, updated_at_unix_ns, payload
+             FROM sessions ORDER BY updated_at_unix_ns DESC, session_id ASC",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                log_store_error("session_list_failed", &SessionStoreError::Database(error));
+                return Vec::new();
             }
-        }
-        rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
-            b_time
-                .cmp(a_time)
-                .then_with(|| a_summary.id.cmp(&b_summary.id))
-        });
-        rows.into_iter().map(|(_, s)| s).collect()
+        };
+        let result = match statement.query_map([], |row| summary_from_row(row, max_preview_bytes)) {
+            Ok(rows) => rows
+                .filter_map(|row| match row {
+                    Ok(summary) => Some(summary),
+                    Err(error) => {
+                        log_store_error(
+                            "session_list_entry_failed",
+                            &SessionStoreError::Database(error),
+                        );
+                        None
+                    }
+                })
+                .collect(),
+            Err(error) => {
+                log_store_error("session_list_failed", &SessionStoreError::Database(error));
+                Vec::new()
+            }
+        };
+        result
     }
 
     /// Bounded stable-name batch for reconciliation and incomplete fallback.
@@ -396,17 +833,17 @@ impl SessionStore {
         max_entries: usize,
         deadline: std::time::Instant,
     ) -> SessionSummaryScan {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return SessionSummaryScan {
-                    summaries: Vec::new(),
-                    next_cursor: None,
-                    complete: true,
-                };
-            }
+        if std::time::Instant::now() >= deadline {
+            return SessionSummaryScan {
+                summaries: Vec::new(),
+                next_cursor: after_name.map(str::to_string),
+                complete: false,
+            };
+        }
+        let connection = match self.connection() {
+            Ok(connection) => connection,
             Err(error) => {
-                log_store_error("session_scan_failed", &SessionStoreError::Io(error));
+                log_store_error("session_scan_failed", &error);
                 return SessionSummaryScan {
                     summaries: Vec::new(),
                     next_cursor: None,
@@ -415,100 +852,101 @@ impl SessionStore {
             }
         };
         let max_entries = max_entries.max(1);
-        let mut names = std::collections::BTreeMap::new();
-        let mut walk_complete = true;
-        for entry in entries {
-            if std::time::Instant::now() >= deadline {
-                walk_complete = false;
-                break;
+        let after = after_name
+            .and_then(|after| after.strip_suffix(".json").or(Some(after)))
+            .unwrap_or_default();
+        let limit = max_entries.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut statement = match connection.prepare(
+            "SELECT session_id, model, message_count, cwd, preview, updated_at_unix_ns, payload
+             FROM sessions WHERE session_id > ?1 ORDER BY session_id ASC LIMIT ?2",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                log_store_error("session_scan_failed", &SessionStoreError::Database(error));
+                return SessionSummaryScan {
+                    summaries: Vec::new(),
+                    next_cursor: None,
+                    complete: false,
+                };
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    walk_complete = false;
-                    log_store_error("session_scan_entry_failed", &SessionStoreError::Io(error));
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            let Some(name_text) = name.to_str() else {
-                continue;
-            };
-            if !name_text.ends_with(".json") || after_name.is_some_and(|after| name_text <= after) {
-                continue;
+        };
+        let (mut rows, payload_complete) = match statement.query_map(params![after, limit], |row| {
+            summary_from_row(row, max_preview_bytes)
+        }) {
+            Ok(rows) => {
+                let mut complete = true;
+                let rows = rows
+                    .filter_map(|row| match row {
+                        Ok(summary) => Some(summary),
+                        Err(error) => {
+                            complete = false;
+                            log_store_error(
+                                "session_scan_payload_failed",
+                                &SessionStoreError::Database(error),
+                            );
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (rows, complete)
             }
-            names.insert(name_text.to_string(), entry.path());
-            if names.len() > max_entries.saturating_add(1) {
-                names.pop_last();
+            Err(error) => {
+                log_store_error("session_scan_failed", &SessionStoreError::Database(error));
+                return SessionSummaryScan {
+                    summaries: Vec::new(),
+                    next_cursor: None,
+                    complete: false,
+                };
             }
-        }
-        let has_more = !walk_complete || names.len() > max_entries;
-        while names.len() > max_entries {
-            names.pop_last();
-        }
+        };
+        let has_more = rows.len() > max_entries;
+        rows.truncate(max_entries);
         let next_cursor = has_more
-            .then(|| names.last_key_value().map(|(name, _)| name.clone()))
+            .then(|| rows.last().map(|summary| summary.id.clone()))
             .flatten();
-        let mut payload_complete = true;
-        let mut rows = Vec::new();
-        for path in names.into_values() {
-            match summary_from_path(path, max_preview_bytes) {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
-                Err(error) => {
-                    payload_complete = false;
-                    log_store_error("session_scan_payload_failed", &error);
-                }
-            }
-        }
-        rows.sort_by(|(a_time, a_summary), (b_time, b_summary)| {
-            b_time
-                .cmp(a_time)
-                .then_with(|| a_summary.id.cmp(&b_summary.id))
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
         });
         SessionSummaryScan {
-            summaries: rows.into_iter().map(|(_, summary)| summary).collect(),
+            summaries: rows,
             next_cursor,
-            complete: !has_more && payload_complete,
+            complete: !has_more && payload_complete && std::time::Instant::now() < deadline,
         }
     }
 }
 
-fn summary_from_path(
-    path: PathBuf,
+fn summary_from_row(
+    row: &rusqlite::Row<'_>,
     max_preview_bytes: usize,
-) -> Result<Option<(std::time::SystemTime, SessionSummary)>, SessionStoreError> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).map_err(SessionStoreError::Io)?;
-    let record = decode_persisted_session(&bytes)?;
-    let modified = match std::fs::metadata(&path).and_then(|metadata| metadata.modified()) {
-        Ok(modified) => modified,
-        Err(error) => {
-            log_store_error(
-                "session_summary_timestamp_failed",
-                &SessionStoreError::Io(error),
-            );
-            std::time::UNIX_EPOCH
-        }
-    };
-    Ok(Some((
-        modified,
-        SessionSummary {
-            id: record.session_id,
-            model: record.model,
-            message_count: record.messages.len(),
-            cwd: record.cwd,
-            updated_at: Some(modified),
-            first_user_line: first_user_preview(&record.messages, max_preview_bytes),
-        },
-    )))
+) -> rusqlite::Result<SessionSummary> {
+    let updated_at_unix_ns = row.get::<_, u64>(5)?;
+    let updated_at =
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(updated_at_unix_ns));
+    let payload = row.get::<_, Vec<u8>>(6)?;
+    let record = decode_persisted_session(&payload).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Blob, Box::new(error))
+    })?;
+    let preview = first_user_preview(&record.messages, max_preview_bytes);
+    Ok(SessionSummary {
+        id: record.session_id,
+        model: record.model,
+        message_count: record.messages.len(),
+        cwd: record.cwd,
+        updated_at,
+        first_user_line: preview,
+    })
 }
 
 fn decode_persisted_session(bytes: &[u8]) -> Result<PersistedSession, SessionStoreError> {
     let record: PersistedSession =
         serde_json::from_slice(bytes).map_err(SessionStoreError::Corrupt)?;
+    validate_persisted_session(&record)?;
+    Ok(record)
+}
+
+fn validate_persisted_session(record: &PersistedSession) -> Result<(), SessionStoreError> {
     if record.version > SESSION_PERSIST_VERSION {
         return Err(SessionStoreError::FutureVersion {
             found: record.version,
@@ -521,7 +959,7 @@ fn decode_persisted_session(bytes: &[u8]) -> Result<PersistedSession, SessionSto
             supported: SESSION_PERSIST_VERSION,
         });
     }
-    Ok(record)
+    Ok(())
 }
 
 fn log_store_error(event: &'static str, error: &SessionStoreError) {
@@ -609,6 +1047,186 @@ mod tests {
     }
 
     #[test]
+    fn transactional_generation_rejects_late_stale_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let writer = store.claim_writer("ordered", None).unwrap();
+        let saved = store
+            .save_acp_generation_result(
+                &writer,
+                2,
+                "new-model",
+                "medium",
+                &[Message::user("new")],
+                workspace.path(),
+                &[],
+                &[],
+                64,
+            )
+            .unwrap();
+        assert!(matches!(saved, SessionWriteOutcome::Saved(_)));
+
+        let stale = store
+            .save_acp_generation_result(
+                &writer,
+                1,
+                "old-model",
+                "medium",
+                &[Message::user("old")],
+                workspace.path(),
+                &[],
+                &[],
+                64,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            stale,
+            SessionWriteOutcome::Stale {
+                stored_generation: 2
+            }
+        ));
+        let loaded = store.load_result("ordered").unwrap();
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.model, "new-model");
+    }
+
+    #[test]
+    fn reopened_writer_epoch_rejects_old_save_and_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let old_writer = store.claim_writer("epoch", None).unwrap();
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &old_writer,
+                    1,
+                    "old",
+                    "medium",
+                    &[Message::user("old state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
+        let reopened = store.load_result("epoch").unwrap();
+        let new_writer = store
+            .claim_writer("epoch", Some(reopened.generation))
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &old_writer,
+                    99,
+                    "stale",
+                    "medium",
+                    &[Message::user("stale state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Superseded
+        ));
+        assert_eq!(store.delete_writer(&old_writer).unwrap(), None);
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &new_writer,
+                    2,
+                    "new",
+                    "medium",
+                    &[Message::user("new state")],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
+        assert_eq!(store.load_result("epoch").unwrap().model, "new");
+        assert_eq!(store.delete_writer(&new_writer).unwrap(), Some(true));
+        assert!(matches!(
+            store.load_result("epoch"),
+            Err(SessionStoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn writer_only_reservation_can_be_reclaimed_after_failed_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let abandoned = store.claim_writer("unpersisted", None).unwrap();
+        let replacement = store.claim_writer("unpersisted", None).unwrap();
+
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &abandoned,
+                    1,
+                    "old",
+                    "medium",
+                    &[],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Superseded
+        ));
+        assert!(matches!(
+            store
+                .save_acp_generation_result(
+                    &replacement,
+                    1,
+                    "new",
+                    "medium",
+                    &[],
+                    workspace.path(),
+                    &[],
+                    &[],
+                    64,
+                )
+                .unwrap(),
+            SessionWriteOutcome::Saved(_)
+        ));
+    }
+
+    #[test]
+    fn import_rejects_duplicate_without_replacing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("duplicate", "original", &msgs());
+        let replacement = PersistedSession {
+            version: SESSION_PERSIST_VERSION,
+            generation: 99,
+            session_id: "duplicate".to_string(),
+            model: "replacement".to_string(),
+            thinking: None,
+            cwd: None,
+            client_user_message_ids: Vec::new(),
+            assistant_outcomes: Vec::new(),
+            messages: Vec::new(),
+        };
+
+        assert_eq!(
+            store.import_if_absent(replacement, 64).unwrap_err().kind(),
+            SessionStoreErrorKind::AlreadyExists
+        );
+        assert_eq!(store.load_result("duplicate").unwrap().model, "original");
+    }
+
+    #[test]
     fn save_with_cwd_round_trips_and_lists_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -647,22 +1265,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_record_without_cwd_remains_readable() {
+    fn record_without_cwd_remains_readable() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
-        let json = serde_json::json!({
-            "version": SESSION_PERSIST_VERSION,
-            "session_id": "legacy",
-            "model": "m",
-            "messages": [],
-        });
-        std::fs::write(
-            dir.path().join("legacy.json"),
-            serde_json::to_vec(&json).unwrap(),
-        )
-        .unwrap();
+        store.save("without-cwd", "m", &[]);
 
-        let loaded = store.load("legacy").expect("legacy record should load");
+        let loaded = store
+            .load("without-cwd")
+            .expect("record without cwd should load");
         assert_eq!(loaded.cwd, None);
         assert!(loaded.client_user_message_ids.is_empty());
         assert_eq!(store.list()[0].cwd, None);
@@ -700,15 +1310,20 @@ mod tests {
         // Hand-write a record with a future version.
         let json = serde_json::json!({
             "version": SESSION_PERSIST_VERSION + 1,
+            "generation": 1,
             "session_id": "future",
             "model": "m",
             "messages": [],
         });
-        std::fs::write(
-            dir.path().join("future.json"),
-            serde_json::to_vec(&json).unwrap(),
-        )
-        .unwrap();
+        store.save("future", "m", &[]);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET payload = ?1 WHERE session_id = 'future'",
+                [serde_json::to_vec(&json).unwrap()],
+            )
+            .unwrap();
         assert!(
             store.load("future").is_none(),
             "an unrecognized version must not be loaded"
@@ -722,8 +1337,16 @@ mod tests {
     #[test]
     fn corrupt_and_io_failures_remain_distinct() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("corrupt.json"), b"{not-json").unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
+        store.save("corrupt", "m", &[]);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET payload = ?1 WHERE session_id = 'corrupt'",
+                [b"{not-json".as_slice()],
+            )
+            .unwrap();
         assert_eq!(
             store.load_result("corrupt").unwrap_err().kind(),
             SessionStoreErrorKind::Corrupt
@@ -748,7 +1371,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         store.save("valid", "model", &msgs());
-        std::fs::write(dir.path().join("corrupt.json"), b"{not-json").unwrap();
+        store.save("corrupt", "model", &msgs());
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET payload = ?1 WHERE session_id = 'corrupt'",
+                [b"{not-json".as_slice()],
+            )
+            .unwrap();
 
         let scan = store.scan_summaries(
             64,
@@ -789,16 +1420,14 @@ mod tests {
     fn list_breaks_equal_mtime_ties_by_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
-        let same_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         for id in ["session-b", "session-a"] {
             store.save(id, "model", &[]);
-            std::fs::File::options()
-                .write(true)
-                .open(dir.path().join(format!("{id}.json")))
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(same_time))
-                .unwrap();
         }
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE sessions SET updated_at_unix_ns = 1000", [])
+            .unwrap();
 
         assert_eq!(
             store
@@ -816,10 +1445,10 @@ mod tests {
         let store = SessionStore::new(dir.path().to_path_buf());
         store.save("s1", "m", &msgs());
 
-        assert!(store.delete("s1").unwrap());
+        assert!(store.delete_unconditionally("s1").unwrap());
         assert!(store.load("s1").is_none());
-        assert!(!store.delete("s1").unwrap());
-        assert!(!store.delete("../../etc/passwd").unwrap());
+        assert!(!store.delete_unconditionally("s1").unwrap());
+        assert!(!store.delete_unconditionally("../../etc/passwd").unwrap());
     }
 
     #[test]
@@ -841,7 +1470,8 @@ mod tests {
     #[test]
     fn concurrent_atomic_writers_never_share_temporary_path() {
         let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(directory.path().to_path_buf());
+        let store = SessionStore::new(directory.path().to_path_buf())
+            .with_busy_timeout(std::time::Duration::from_secs(1));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let workers = (0..8)
             .map(|index| {
@@ -868,6 +1498,43 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_database_and_wal_sidecars_remain_private() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().to_path_buf());
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    session_id, record_version, generation, payload, model,
+                    message_count, updated_at_unix_ns
+                 ) VALUES ('private', 1, 1, X'7B7D', 'm', 0, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(directory.path()).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(SESSION_DATABASE_NAME)
+            {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bounded_summary_scan_advances_stable_filename_cursor() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().to_path_buf());
@@ -881,7 +1548,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
         assert!(!first.complete);
-        assert_eq!(first.next_cursor.as_deref(), Some("b.json"));
+        assert_eq!(first.next_cursor.as_deref(), Some("b"));
         let mut ids = first
             .summaries
             .into_iter()

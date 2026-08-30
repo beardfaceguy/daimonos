@@ -51,6 +51,7 @@ def test_help_lists_normalized_runtime_subcommands(daimonos_binary):
     assert "mcp " in completed.stdout
     assert "daemon " in completed.stdout
     assert "session-daemon " in completed.stdout
+    assert "session " in completed.stdout
 
 
 def test_agent_help_lists_explicit_interactive_and_print_modes(daimonos_binary):
