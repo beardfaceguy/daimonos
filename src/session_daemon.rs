@@ -3373,6 +3373,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
             8,
         );
@@ -3530,6 +3531,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
         core.persist(
@@ -3570,6 +3572,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
         let daemon = SessionDaemon::new(1, 1, 8, 32);
@@ -3612,6 +3615,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
         core.persist(
@@ -3638,6 +3642,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
         let daemon = SessionDaemon::new(1, 1, 8, 32);
@@ -4291,6 +4296,7 @@ mod tests {
             Some(crate::session_core::SessionPersistence::new(
                 "session-1",
                 store.clone(),
+                crate::session_core::PersistenceRetryPolicy::single_attempt(),
             )),
         );
         core.session

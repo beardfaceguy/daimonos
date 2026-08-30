@@ -480,6 +480,12 @@ pub struct SessionRuntimeConfig {
     pub session_catalog_full_rescan_secs: u64,
     /// Minimum age before a confirmed tombstone may be purged.
     pub session_catalog_tombstone_retention_secs: u64,
+    /// Total payload-save attempts before persistence remains degraded.
+    pub persistence_retry_attempts: usize,
+    /// Initial delay between retryable payload-save failures.
+    pub persistence_retry_initial_backoff_ms: u64,
+    /// Maximum exponential payload-save retry delay.
+    pub persistence_retry_max_backoff_ms: u64,
     /// Grace period for daemon-owned prompt/client tasks during shutdown.
     pub shutdown_grace_secs: u64,
     /// Maximum wait for a daemon command result in a local frontend.
@@ -563,6 +569,9 @@ impl Default for SessionRuntimeConfig {
             session_catalog_reconcile_interval_ms: 100,
             session_catalog_full_rescan_secs: 60,
             session_catalog_tombstone_retention_secs: 300,
+            persistence_retry_attempts: 3,
+            persistence_retry_initial_backoff_ms: 50,
+            persistence_retry_max_backoff_ms: 1_000,
             shutdown_grace_secs: 5,
             client_command_timeout_secs: 10,
             bootstrap_timeout_secs: 15,
@@ -698,6 +707,20 @@ impl SessionRuntimeConfig {
         if self.session_catalog_query_timeout_ms <= self.session_catalog_busy_timeout_ms {
             return Err("session.session_catalog_query_timeout_ms must exceed \
                  session_catalog_busy_timeout_ms"
+                .to_string());
+        }
+        if self.persistence_retry_attempts == 0 {
+            return Err("session.persistence_retry_attempts must be greater than zero".to_string());
+        }
+        if self.persistence_retry_initial_backoff_ms == 0 {
+            return Err(
+                "session.persistence_retry_initial_backoff_ms must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.persistence_retry_max_backoff_ms < self.persistence_retry_initial_backoff_ms {
+            return Err("session.persistence_retry_max_backoff_ms must be at least \
+                 persistence_retry_initial_backoff_ms"
                 .to_string());
         }
         if self.shutdown_grace_secs == 0 {
@@ -2093,6 +2116,9 @@ mod tests {
         assert_eq!(cfg.session.session_catalog_reconcile_interval_ms, 100);
         assert_eq!(cfg.session.session_catalog_full_rescan_secs, 60);
         assert_eq!(cfg.session.session_catalog_tombstone_retention_secs, 300);
+        assert_eq!(cfg.session.persistence_retry_attempts, 3);
+        assert_eq!(cfg.session.persistence_retry_initial_backoff_ms, 50);
+        assert_eq!(cfg.session.persistence_retry_max_backoff_ms, 1_000);
         assert_eq!(cfg.session.shutdown_grace_secs, 5);
         assert_eq!(cfg.session.client_command_timeout_secs, 10);
         assert_eq!(cfg.session.bootstrap_timeout_secs, 15);
@@ -2505,6 +2531,25 @@ mod tests {
             .validate()
             .expect_err("catalog query timeout must exceed SQLite busy timeout")
             .contains("session.session_catalog_query_timeout_ms"));
+        for field in [
+            "persistence_retry_attempts",
+            "persistence_retry_initial_backoff_ms",
+        ] {
+            let invalid: Config = toml::from_str(&format!("[session]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero persistence retry limit must be rejected")
+                .contains(&format!("session.{field}")));
+        }
+        let invalid: Config = toml::from_str(
+            "[session]\npersistence_retry_initial_backoff_ms = 100\n\
+             persistence_retry_max_backoff_ms = 99\n",
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .expect_err("persistence retry max must cover initial delay")
+            .contains("session.persistence_retry_max_backoff_ms"));
         let invalid: Config =
             toml::from_str("[session]\nclient_command_timeout_secs = 0\n").unwrap();
         assert!(invalid

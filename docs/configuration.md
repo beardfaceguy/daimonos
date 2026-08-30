@@ -350,6 +350,9 @@ the local TUI/UDS client, and future remote clients.
 | `session_catalog_reconcile_interval_ms` | `100` | Shared minimum interval between reconciliation passes across daemon processes. |
 | `session_catalog_full_rescan_secs` | `60` | Interval between full drift sweeps after a workspace catalog reaches completeness. |
 | `session_catalog_tombstone_retention_secs` | `300` | Minimum retention for confirmed materialized deletion rows. |
+| `persistence_retry_attempts` | `3` | Total payload-save attempts before persistence remains degraded. |
+| `persistence_retry_initial_backoff_ms` | `50` | Initial delay between retryable payload-save failures. |
+| `persistence_retry_max_backoff_ms` | `1000` | Maximum exponential payload-save retry delay. The serialized gate is held for every configured delay plus each blocking write attempt. |
 | `shutdown_grace_secs` | `5` | Maximum wait for daemon-owned prompt and client tasks during shutdown. |
 | `client_command_timeout_secs` | `10` | Maximum wait for a local frontend to receive a daemon command result. |
 | `bootstrap_timeout_secs` | `15` | Maximum wait for an automatically started session daemon to accept connections. |
@@ -413,6 +416,9 @@ session_catalog_reconcile_entries = 128
 session_catalog_reconcile_interval_ms = 100
 session_catalog_full_rescan_secs = 60
 session_catalog_tombstone_retention_secs = 300
+persistence_retry_attempts = 3
+persistence_retry_initial_backoff_ms = 50
+persistence_retry_max_backoff_ms = 1000
 shutdown_grace_secs = 5
 client_command_timeout_secs = 10
 bootstrap_timeout_secs = 15

@@ -61,8 +61,9 @@ use crate::providers::{
 use crate::session::Session;
 use crate::session_core::{
     align_client_user_message_ids, canonical_assistant_outcome_with_logging, tool_call_title,
-    ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventHandler,
-    SessionEventRouter, SessionPersistence, SessionPromptError, SessionPromptOutcome, TurnError,
+    ApprovalBroker, CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
+    SessionEventHandler, SessionEventRouter, SessionPersistence, SessionPromptError,
+    SessionPromptOutcome, TurnError,
 };
 #[cfg(test)]
 use crate::session_core::{
@@ -2237,10 +2238,17 @@ async fn build_session_handle(
             context_windows.insert(state.default_model.clone(), policy.context_window);
         }
     }
-    let persistence = state
-        .store
-        .clone()
-        .map(|store| SessionPersistence::new(session_id.to_string(), store));
+    let persistence = state.store.clone().map(|store| {
+        SessionPersistence::new(
+            session_id.to_string(),
+            store,
+            PersistenceRetryPolicy::new(
+                cfg.session.persistence_retry_attempts,
+                std::time::Duration::from_millis(cfg.session.persistence_retry_initial_backoff_ms),
+                std::time::Duration::from_millis(cfg.session.persistence_retry_max_backoff_ms),
+            ),
+        )
+    });
     let core = SessionCore::new(
         AgentSession::new(provider, tool_session, config),
         state.default_model.clone(),
