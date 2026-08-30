@@ -371,8 +371,9 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         val pending = pendingPrompt ?: return
         if (snapshot.seq < pending.sentAtSeq) return
         val accepted = snapshot.seq > pending.sentAtSeq &&
-            snapshot.transcript
-                .lastOrNull { it.role == dev.daimonos.remote.protocol.TranscriptRole.USER }
+            snapshot.timeline
+                .filterIsInstance<dev.daimonos.remote.protocol.TimelineEntry.User>()
+                .lastOrNull()
                 ?.text == pending.text
         releasePendingPrompt(accepted)
     }

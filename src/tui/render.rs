@@ -19,7 +19,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::session_protocol::{
-    RuntimeOption, RuntimeOptionSpec, RuntimeValue, ToolCallStateStatus, TranscriptRole, TurnStatus,
+    AssistantOutcome, RuntimeOption, RuntimeOptionSpec, RuntimeValue, TimelineEntryKind,
+    ToolCallStateStatus, TranscriptRole, TurnStatus,
 };
 use crate::tui::state::ViewState;
 
@@ -128,37 +129,48 @@ pub fn tui_layout(area: Rect) -> std::rc::Rc<[Rect]> {
 fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_from_bottom: usize) {
     let mut lines: Vec<Line> = Vec::new();
 
-    for entry in state.transcript() {
-        let (prefix, style) = role_prefix(entry.role);
-        let text = sanitize(&entry.text);
-        let mut first = true;
-        // Split on newlines ourselves so continuation lines stay aligned and a
-        // stray '\n' can never smuggle a control sequence past the sanitizer.
-        for part in text.split('\n') {
-            if first {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, style),
-                    Span::raw(part.to_string()),
-                ]));
-                first = false;
-            } else {
-                lines.push(Line::from(format!("    {part}")));
+    for entry in state.timeline() {
+        match &entry.entry {
+            TimelineEntryKind::User { text, .. } => {
+                push_text_lines(&mut lines, TranscriptRole::User, text);
+            }
+            TimelineEntryKind::Assistant { text, .. } => {
+                push_text_lines(&mut lines, TranscriptRole::Assistant, text);
+            }
+            TimelineEntryKind::Thought { text, .. } => {
+                push_text_lines(&mut lines, TranscriptRole::Thought, text);
+            }
+            TimelineEntryKind::System { text, .. } => {
+                push_text_lines(&mut lines, TranscriptRole::System, text);
+            }
+            TimelineEntryKind::Outcome { outcome } => {
+                if let Some(note) = outcome_render_note(outcome) {
+                    push_text_lines(&mut lines, TranscriptRole::System, &note);
+                }
+            }
+            TimelineEntryKind::Tool {
+                name,
+                title,
+                status,
+                output,
+                ..
+            } => {
+                let symbol = status_symbol(*status);
+                let style = status_style(*status);
+                let mut spans = vec![Span::styled(
+                    format!("  {symbol} {} ", sanitize(title)),
+                    style,
+                )];
+                spans.push(Span::styled(
+                    format!("({})", sanitize(name)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.push(Line::from(spans));
+                if let Some(output) = output {
+                    push_text_lines(&mut lines, TranscriptRole::System, output);
+                }
             }
         }
-    }
-
-    for call in state.tool_calls() {
-        let symbol = status_symbol(call.status);
-        let style = status_style(call.status);
-        let mut spans = vec![Span::styled(
-            format!("  {symbol} {} ", sanitize(&call.title)),
-            style,
-        )];
-        spans.push(Span::styled(
-            format!("({})", sanitize(&call.name)),
-            Style::default().fg(Color::DarkGray),
-        ));
-        lines.push(Line::from(spans));
     }
 
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -169,6 +181,31 @@ fn render_transcript(state: &ViewState, area: Rect, buf: &mut Buffer, scroll_fro
     paragraph
         .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
         .render(area, buf);
+}
+
+fn push_text_lines(lines: &mut Vec<Line<'static>>, role: TranscriptRole, raw: &str) {
+    let (prefix, style) = role_prefix(role);
+    let text = sanitize(raw);
+    for (index, part) in text.split('\n').enumerate() {
+        if index == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::raw(part.to_string()),
+            ]));
+        } else {
+            lines.push(Line::from(format!("    {part}")));
+        }
+    }
+}
+
+fn outcome_render_note(outcome: &AssistantOutcome) -> Option<String> {
+    match outcome {
+        AssistantOutcome::Completed => None,
+        AssistantOutcome::Errored { message, .. } => Some(format!("[turn errored: {message}]")),
+        AssistantOutcome::Refused => Some("[turn refused]".to_string()),
+        AssistantOutcome::Aborted => Some("[turn interrupted]".to_string()),
+        AssistantOutcome::MaxTokens => Some("[turn hit the output token limit]".to_string()),
+    }
 }
 
 /// Vim's `-- MODE --` habit: a right-aligned indicator on the status line

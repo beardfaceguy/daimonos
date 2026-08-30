@@ -605,24 +605,32 @@ mod tests {
             .unwrap();
         let snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
 
-        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.timeline.len(), 4);
         assert!(snapshot.runtime_options.iter().any(|option| {
             option.id == "thinking" && option.value == RuntimeValue::String("high".to_string())
         }));
-        assert_eq!(snapshot.transcript[0].text, "first");
-        assert_eq!(snapshot.transcript[1].text, "second");
         assert!(matches!(
-            snapshot.transcript[1].outcome,
-            Some(crate::session_protocol::AssistantOutcome::Errored {
-                ref message,
-                ..
-            }) if message == "saved failure"
+            &snapshot.timeline[0].entry,
+            crate::session_protocol::TimelineEntryKind::User { text, .. } if text == "first"
         ));
-        assert_eq!(snapshot.tool_calls.len(), 1);
-        assert_eq!(
-            snapshot.tool_calls[0].status,
-            crate::session_protocol::ToolCallStateStatus::Cancelled
-        );
+        assert!(matches!(
+            &snapshot.timeline[1].entry,
+            crate::session_protocol::TimelineEntryKind::Assistant { text, .. } if text == "second"
+        ));
+        assert!(matches!(
+            snapshot.timeline[2].entry,
+            crate::session_protocol::TimelineEntryKind::Tool {
+                status: crate::session_protocol::ToolCallStateStatus::Cancelled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &snapshot.timeline[3].entry,
+            crate::session_protocol::TimelineEntryKind::Outcome {
+                outcome: crate::session_protocol::AssistantOutcome::Errored { message, .. }
+            } if message == "saved failure"
+        ));
+        assert!(snapshot.active_tools.is_empty());
         assert_eq!(
             core.current_model
                 .lock()

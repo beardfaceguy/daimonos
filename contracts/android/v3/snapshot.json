@@ -5,30 +5,52 @@
     "session_id": "session-fixture",
     "seq": 4,
     "turn_status": "waiting_for_approval",
-    "transcript": [
+    "timeline": [
       {
         "id": 1,
-        "role": "user",
+        "order": 1,
+        "kind": "user",
         "text": "Run the tests"
       },
       {
         "id": 2,
-        "role": "assistant",
-        "text": "I will run them.",
+        "order": 2,
+        "kind": "assistant",
+        "text": "I will run them."
+      },
+      {
+        "id": 3,
+        "order": 3,
+        "kind": "tool",
+        "tool_call_id": "tool-1",
+        "name": "exec",
+        "title": "exec",
+        "status": "pending",
+        "output": null
+      },
+      {
+        "id": 4,
+        "order": 4,
+        "kind": "outcome",
         "outcome": {
           "type": "completed"
         }
       }
     ],
-    "tool_calls": [
+    "active_tools": [
       {
-        "id": "tool-1",
+        "occurrence_id": 3,
+        "tool_call_id": "tool-1",
         "name": "exec",
         "title": "exec",
-        "status": "pending",
-        "output": null
+        "status": "pending"
       }
     ],
+    "history_window": {
+      "truncated_before": 0,
+      "retained": 4,
+      "total": 4
+    },
     "pending_approvals": [
       {
         "id": "approval-1",
@@ -47,7 +69,6 @@
       "utilization_basis_points": 2500,
       "compaction_high_water_tokens": null,
       "budget_error": null
-    },
-    "history_truncated": false
+    }
   }
 }

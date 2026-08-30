@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn android_remote_auth_fixture_matches_gateway_envelopes() {
         let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../contracts/android/v2/remote_auth.json")).unwrap();
+            serde_json::from_str(include_str!("../contracts/android/v3/remote_auth.json")).unwrap();
         for field in [
             "server_challenge",
             "pairing_pending",

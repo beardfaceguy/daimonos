@@ -1469,52 +1469,82 @@ impl SessionCore {
         max_entries: usize,
     ) -> crate::session_protocol::SessionSnapshot {
         use crate::providers::{ContentBlock, Role};
-        use crate::session_protocol::{
-            ToolCallState, ToolCallStateStatus, TranscriptEntry, TranscriptRole,
-        };
+        use crate::session_protocol::{TimelineEntryKind, ToolCallStateStatus};
+        use crate::session_timeline::TimelineReducer;
 
         let session = self.session.lock().await;
-        let mut transcript = Vec::new();
-        let mut tool_calls: Vec<ToolCallState> = Vec::new();
-        let mut next_transcript_id = 1_u64;
+        let outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut timeline = TimelineReducer::new(max_entries);
+        let mut outcome_index = 0;
+        let mut turn_started = false;
         for message in session.history() {
+            let starts_turn = message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text(_)));
+            if starts_turn {
+                if turn_started {
+                    if let Some(outcome) = outcomes.get(outcome_index) {
+                        timeline.push_reconstructed(TimelineEntryKind::Outcome {
+                            outcome: outcome.clone(),
+                        });
+                    }
+                    outcome_index += 1;
+                }
+                turn_started = true;
+            }
+
+            let mut pending_text: Option<(ReconstructedTextKind, String)> = None;
+            let flush_text = |pending: &mut Option<(ReconstructedTextKind, String)>,
+                              timeline: &mut TimelineReducer| {
+                if let Some((kind, text)) = pending.take() {
+                    timeline.push_reconstructed(kind.into_entry(text));
+                }
+            };
             for block in &message.content {
                 match block {
                     ContentBlock::Text(text) => {
-                        transcript.push(TranscriptEntry {
-                            id: next_transcript_id,
-                            role: match message.role {
-                                Role::User => TranscriptRole::User,
-                                Role::Assistant => TranscriptRole::Assistant,
-                            },
-                            text: text.clone(),
-                            outcome: None,
-                        });
-                        next_transcript_id = next_transcript_id.saturating_add(1);
+                        let kind = match message.role {
+                            Role::User => ReconstructedTextKind::User,
+                            Role::Assistant => ReconstructedTextKind::Assistant,
+                        };
+                        match &mut pending_text {
+                            Some((pending_kind, pending)) if *pending_kind == kind => {
+                                pending.push_str(text);
+                            }
+                            _ => {
+                                flush_text(&mut pending_text, &mut timeline);
+                                pending_text = Some((kind, text.clone()));
+                            }
+                        }
                     }
                     ContentBlock::Thinking(text) => {
-                        transcript.push(TranscriptEntry {
-                            id: next_transcript_id,
-                            role: TranscriptRole::Thought,
-                            text: text.clone(),
-                            outcome: None,
-                        });
-                        next_transcript_id = next_transcript_id.saturating_add(1);
+                        let kind = ReconstructedTextKind::Thought;
+                        match &mut pending_text {
+                            Some((pending_kind, pending)) if *pending_kind == kind => {
+                                pending.push_str(text);
+                            }
+                            _ => {
+                                flush_text(&mut pending_text, &mut timeline);
+                                pending_text = Some((kind, text.clone()));
+                            }
+                        }
                     }
                     ContentBlock::ToolCall { id, name, .. } => {
-                        tool_calls.push(ToolCallState {
-                            id: id.clone(),
-                            name: name.clone(),
-                            title: name.clone(),
-                            status: ToolCallStateStatus::InProgress,
-                            output: None,
-                        });
+                        flush_text(&mut pending_text, &mut timeline);
+                        timeline.start_reconstructed_tool(id.clone(), name.clone(), name.clone());
                     }
                     ContentBlock::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
                     } => {
+                        flush_text(&mut pending_text, &mut timeline);
                         let status = if content == crate::agent::INTERRUPTED_TOOL_RESULT {
                             ToolCallStateStatus::Cancelled
                         } else if *is_error {
@@ -1522,31 +1552,29 @@ impl SessionCore {
                         } else {
                             ToolCallStateStatus::Completed
                         };
-                        apply_restored_tool_result(
-                            &mut tool_calls,
+                        timeline.update_reconstructed_tool(
                             tool_use_id,
                             status,
                             self.tool_lifecycle.project_output(content),
                         );
                     }
-                    ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {}
+                    ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {
+                        flush_text(&mut pending_text, &mut timeline);
+                    }
                 }
             }
+            flush_text(&mut pending_text, &mut timeline);
         }
         drop(session);
-        let outcomes = self
-            .assistant_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        apply_persisted_outcomes(&mut transcript, &outcomes);
-        for call in &mut tool_calls {
-            if call.status == ToolCallStateStatus::InProgress {
-                call.status = ToolCallStateStatus::Cancelled;
+        if turn_started {
+            if let Some(outcome) = outcomes.get(outcome_index) {
+                timeline.push_reconstructed(TimelineEntryKind::Outcome {
+                    outcome: outcome.clone(),
+                });
             }
         }
-        trim_oldest(&mut transcript, max_entries.max(1));
-        trim_oldest(&mut tool_calls, max_entries.max(1));
+        timeline.cancel_reconstructed_active_tools();
+        let (timeline, active_tools, history_window) = timeline.into_parts();
         crate::session_protocol::SessionSnapshot {
             session_id,
             seq: self.events.latest_sequence(),
@@ -1555,8 +1583,9 @@ impl SessionCore {
             } else {
                 TurnStatus::Idle
             },
-            transcript,
-            tool_calls,
+            timeline,
+            active_tools,
+            history_window,
             pending_approvals: self.approvals.pending(),
             runtime_options: self.runtime_options(),
             context_usage: self
@@ -1564,7 +1593,6 @@ impl SessionCore {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
-            history_truncated: false,
         }
     }
 
@@ -1750,89 +1778,30 @@ fn usd_to_micros(value: f64) -> u64 {
     (value * 1_000_000.0).round().min(u64::MAX as f64) as u64
 }
 
-fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
-    let excess = entries.len().saturating_sub(max_entries);
-    if excess > 0 {
-        entries.drain(..excess);
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconstructedTextKind {
+    User,
+    Assistant,
+    Thought,
 }
 
-fn apply_persisted_outcomes(
-    transcript: &mut Vec<crate::session_protocol::TranscriptEntry>,
-    outcomes: &[AssistantOutcome],
-) {
-    use crate::session_protocol::{TranscriptEntry, TranscriptRole};
-
-    let mut rebuilt = Vec::with_capacity(transcript.len() + outcomes.len());
-    let mut turn_start = None;
-    let mut outcome_index = 0;
-    let mut next_id = transcript
-        .iter()
-        .map(|entry| entry.id)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let finalize = |entries: &mut Vec<TranscriptEntry>,
-                    start: usize,
-                    outcome: Option<&AssistantOutcome>,
-                    next_id: &mut u64| {
-        let Some(outcome) = outcome else {
-            return;
-        };
-        if let Some(entry) = entries[start..]
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.role == TranscriptRole::Assistant)
-        {
-            entry.outcome = Some(outcome.clone());
-        } else {
-            entries.push(TranscriptEntry {
-                id: *next_id,
-                role: TranscriptRole::Assistant,
-                text: String::new(),
-                outcome: Some(outcome.clone()),
-            });
-            *next_id = next_id.saturating_add(1);
+impl ReconstructedTextKind {
+    fn into_entry(self, text: String) -> crate::session_protocol::TimelineEntryKind {
+        use crate::session_protocol::TimelineEntryKind;
+        match self {
+            Self::User => TimelineEntryKind::User {
+                text,
+                content_truncated: false,
+            },
+            Self::Assistant => TimelineEntryKind::Assistant {
+                text,
+                content_truncated: false,
+            },
+            Self::Thought => TimelineEntryKind::Thought {
+                text,
+                content_truncated: false,
+            },
         }
-    };
-    for entry in transcript.drain(..) {
-        if entry.role == TranscriptRole::User {
-            if let Some(start) = turn_start.take() {
-                finalize(
-                    &mut rebuilt,
-                    start,
-                    outcomes.get(outcome_index),
-                    &mut next_id,
-                );
-                outcome_index += 1;
-            }
-            turn_start = Some(rebuilt.len());
-        }
-        rebuilt.push(entry);
-    }
-    if let Some(start) = turn_start {
-        finalize(
-            &mut rebuilt,
-            start,
-            outcomes.get(outcome_index),
-            &mut next_id,
-        );
-    }
-    *transcript = rebuilt;
-}
-
-fn apply_restored_tool_result(
-    tool_calls: &mut [crate::session_protocol::ToolCallState],
-    tool_use_id: &str,
-    status: crate::session_protocol::ToolCallStateStatus,
-    output: String,
-) {
-    if let Some(call) = tool_calls.iter_mut().find(|call| {
-        call.id == tool_use_id
-            && call.status == crate::session_protocol::ToolCallStateStatus::InProgress
-    }) {
-        call.status = status;
-        call.output = Some(output);
     }
 }
 
@@ -4019,37 +3988,30 @@ mod tests {
     }
 
     #[test]
-    fn restored_duplicate_tool_ids_pair_results_in_occurrence_order() {
-        let mut calls = vec![
-            crate::session_protocol::ToolCallState {
-                id: "duplicate".to_string(),
-                name: "first".to_string(),
-                title: "first".to_string(),
-                status: crate::session_protocol::ToolCallStateStatus::InProgress,
-                output: None,
-            },
-            crate::session_protocol::ToolCallState {
-                id: "duplicate".to_string(),
-                name: "second".to_string(),
-                title: "second".to_string(),
-                status: crate::session_protocol::ToolCallStateStatus::InProgress,
-                output: None,
-            },
-        ];
-        apply_restored_tool_result(
-            &mut calls,
+    fn restored_duplicate_tool_ids_update_newest_nonterminal_occurrence() {
+        let mut timeline = crate::session_timeline::TimelineReducer::new(8);
+        timeline.start_reconstructed_tool(
+            "duplicate".to_string(),
+            "first".to_string(),
+            "first".to_string(),
+        );
+        timeline.start_reconstructed_tool(
+            "duplicate".to_string(),
+            "second".to_string(),
+            "second".to_string(),
+        );
+        timeline.update_reconstructed_tool(
             "duplicate",
             crate::session_protocol::ToolCallStateStatus::Completed,
             "first output".to_string(),
         );
-        apply_restored_tool_result(
-            &mut calls,
-            "duplicate",
-            crate::session_protocol::ToolCallStateStatus::Completed,
-            "second output".to_string(),
-        );
-        assert_eq!(calls[0].output.as_deref(), Some("first output"));
-        assert_eq!(calls[1].output.as_deref(), Some("second output"));
+        assert!(matches!(
+            &timeline.timeline()[1].entry,
+            crate::session_protocol::TimelineEntryKind::Tool {
+                output: Some(output),
+                ..
+            } if output == "first output"
+        ));
     }
 
     #[test]
@@ -4319,6 +4281,91 @@ mod tests {
             events,
             lifecycle,
         ))
+    }
+
+    #[tokio::test]
+    async fn reconstructed_timeline_matches_live_event_fold() {
+        use crate::providers::{ContentBlock, Message, Role};
+        use crate::session_protocol::{AssistantOutcome, SessionEvent, ToolCallStateStatus};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store,
+            PersistenceRetryPolicy::new(
+                3,
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+            ),
+        );
+        let core = persistence_test_core(directory.path(), persistence);
+        core.session.lock().await.set_history(vec![
+            Message::user("question"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("before".to_string()),
+                    ContentBlock::ToolCall {
+                        id: "call_0".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_0".to_string(),
+                    content: "ok".to_string(),
+                    is_error: false,
+                }],
+            },
+            Message::assistant("after"),
+        ]);
+        core.assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(AssistantOutcome::Completed);
+
+        let restored = core.initial_snapshot("session-1".to_string(), 32).await;
+        let mut live = crate::session_timeline::TimelineReducer::new(32);
+        for event in [
+            SessionEvent::UserMessage {
+                text: "question".to_string(),
+                request_id: None,
+            },
+            SessionEvent::AssistantDelta {
+                text: "before".to_string(),
+            },
+            SessionEvent::ToolCallStarted {
+                id: "call_0".to_string(),
+                name: "read".to_string(),
+                title: "read".to_string(),
+                input_summary: None,
+            },
+            SessionEvent::ToolCallUpdated {
+                id: "call_0".to_string(),
+                status: ToolCallStateStatus::InProgress,
+            },
+            SessionEvent::ToolCallFinished {
+                id: "call_0".to_string(),
+                status: ToolCallStateStatus::Completed,
+                output: "ok".to_string(),
+            },
+            SessionEvent::AssistantDelta {
+                text: "after".to_string(),
+            },
+            SessionEvent::AssistantDone {
+                outcome: AssistantOutcome::Completed,
+            },
+        ] {
+            live.apply(event);
+        }
+
+        assert_eq!(restored.timeline, live.timeline());
+        assert_eq!(restored.active_tools, live.active_tools());
+        assert_eq!(restored.history_window, *live.history_window());
     }
 
     #[tokio::test]

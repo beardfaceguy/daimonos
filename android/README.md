@@ -17,7 +17,7 @@ cd android
 
 The app accepts only `wss://` daemon endpoints. The reverse proxy terminates
 TLS; Daimonos itself remains bound to loopback. Protocol contract tests read
-the canonical fixtures from `contracts/android/v2` directly so Rust and Kotlin
+the canonical fixtures from `contracts/android/v3` directly so Rust and Kotlin
 wire models cannot drift independently.
 
 See [RELEASE.md](RELEASE.md) for CI artifacts, release signing, verification,

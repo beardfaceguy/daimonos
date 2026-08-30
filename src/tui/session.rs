@@ -877,10 +877,10 @@ mod tests {
     };
     use crate::session_controller::{ReconnectPolicy, SessionControllerHandle};
     use crate::session_protocol::{
-        ApprovalDecision, AssistantOutcome, ClientCapability, ClientInfo, ClientKind,
-        ClientMessage, ContextUsage, RevocationCode, RuntimeOption, ServerMessage, SessionEvent,
-        SessionSnapshot, SessionUsage, ToolCallState, ToolCallStateStatus, TranscriptEntry,
-        TranscriptRole, TurnStatus, PROTOCOL_VERSION,
+        ActiveToolState, ApprovalDecision, AssistantOutcome, ClientCapability, ClientInfo,
+        ClientKind, ClientMessage, ContextUsage, HistoryWindow, RevocationCode, RuntimeOption,
+        ServerMessage, SessionEvent, SessionSnapshot, SessionUsage, TimelineEntry,
+        TimelineEntryKind, ToolCallStateStatus, TurnStatus, PROTOCOL_VERSION,
     };
     use tokio::net::UnixStream;
 
@@ -942,12 +942,12 @@ mod tests {
             session_id: session_id.to_string(),
             seq: 0,
             turn_status: TurnStatus::Idle,
-            transcript: Vec::new(),
-            tool_calls: Vec::new(),
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: Some(ContextUsage::new(0, Some(100), 0, None)),
-            history_truncated: false,
         }
     }
 
@@ -1143,12 +1143,15 @@ mod tests {
             .await
             .unwrap();
         let mut oversized = snapshot("session-a");
-        oversized.transcript.push(TranscriptEntry {
+        oversized.timeline.push(TimelineEntry {
             id: 1,
-            role: TranscriptRole::User,
-            text: "x".repeat(1_000),
-            outcome: None,
+            order: 1,
+            entry: TimelineEntryKind::User {
+                text: "x".repeat(1_000),
+                content_truncated: false,
+            },
         });
+        oversized.history_window = HistoryWindow::complete(1);
         server
             .send(&ServerMessage::Snapshot {
                 seq: 0,
@@ -1389,6 +1392,19 @@ mod tests {
         };
         let mut state = snapshot("session-a");
         state.pending_approvals = vec![request("one"), request("two")];
+        state.active_tools = state
+            .pending_approvals
+            .iter()
+            .enumerate()
+            .map(|(index, approval)| ActiveToolState {
+                occurrence_id: index as u64 + 1,
+                tool_call_id: approval.tool_call_id.clone(),
+                name: approval.tool.clone(),
+                title: approval.detail.clone(),
+                status: ToolCallStateStatus::Pending,
+                content_truncated: false,
+            })
+            .collect();
         server
             .send(&ServerMessage::Snapshot { seq: 0, state })
             .await
@@ -1552,19 +1568,42 @@ mod tests {
                     session_id: "session-b".to_string(),
                     seq: 7,
                     turn_status: TurnStatus::Cancelled,
-                    transcript: vec![TranscriptEntry {
-                        id: 41,
-                        role: TranscriptRole::Assistant,
-                        text: "canonical answer".to_string(),
-                        outcome: Some(AssistantOutcome::Aborted),
-                    }],
-                    tool_calls: vec![ToolCallState {
-                        id: "tool-1".to_string(),
-                        name: "read_file".to_string(),
-                        title: "Read canonical file".to_string(),
-                        status: ToolCallStateStatus::Completed,
-                        output: Some("canonical output".to_string()),
-                    }],
+                    timeline: vec![
+                        TimelineEntry {
+                            id: 41,
+                            order: 41,
+                            entry: TimelineEntryKind::Assistant {
+                                text: "canonical answer".to_string(),
+                                content_truncated: false,
+                            },
+                        },
+                        TimelineEntry {
+                            id: 42,
+                            order: 42,
+                            entry: TimelineEntryKind::Tool {
+                                tool_call_id: "tool-1".to_string(),
+                                name: "read_file".to_string(),
+                                title: "Read canonical file".to_string(),
+                                status: ToolCallStateStatus::Completed,
+                                output: Some("canonical output".to_string()),
+                                content_truncated: false,
+                            },
+                        },
+                        TimelineEntry {
+                            id: 43,
+                            order: 43,
+                            entry: TimelineEntryKind::Outcome {
+                                outcome: AssistantOutcome::Aborted,
+                            },
+                        },
+                    ],
+                    active_tools: Vec::new(),
+                    history_window: HistoryWindow {
+                        truncated_before: 1,
+                        retained: 3,
+                        total: Some(4),
+                        continuation: None,
+                    },
                     pending_approvals: Vec::new(),
                     runtime_options: vec![RuntimeOption::boolean(
                         "thinking",
@@ -1572,7 +1611,6 @@ mod tests {
                         RuntimeValue::Bool(true),
                     )],
                     context_usage: Some(ContextUsage::new(42, Some(1_000), 10, None)),
-                    history_truncated: true,
                 },
             })
             .await

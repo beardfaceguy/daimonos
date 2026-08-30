@@ -19,7 +19,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.longOrNull
 
-const val PROTOCOL_VERSION: Int = 2
+const val PROTOCOL_VERSION: Int = 3
 
 @Serializable
 enum class ClientCapability {
@@ -327,6 +327,88 @@ data class ToolCallState(
 )
 
 @Serializable
+data class ActiveToolState(
+    @SerialName("occurrence_id") val occurrenceId: Long,
+    @SerialName("tool_call_id") val toolCallId: String,
+    val name: String,
+    val title: String,
+    val status: ToolCallStatus,
+    @SerialName("content_truncated") val contentTruncated: Boolean = false,
+)
+
+@Serializable
+@JsonClassDiscriminator("kind")
+sealed interface TimelineEntry {
+    val id: Long
+    val order: Long
+
+    @Serializable
+    @SerialName("user")
+    data class User(
+        override val id: Long,
+        override val order: Long,
+        val text: String,
+        @SerialName("content_truncated") val contentTruncated: Boolean = false,
+    ) : TimelineEntry
+
+    @Serializable
+    @SerialName("assistant")
+    data class Assistant(
+        override val id: Long,
+        override val order: Long,
+        val text: String,
+        @SerialName("content_truncated") val contentTruncated: Boolean = false,
+    ) : TimelineEntry
+
+    @Serializable
+    @SerialName("thought")
+    data class Thought(
+        override val id: Long,
+        override val order: Long,
+        val text: String,
+        @SerialName("content_truncated") val contentTruncated: Boolean = false,
+    ) : TimelineEntry
+
+    @Serializable
+    @SerialName("system")
+    data class System(
+        override val id: Long,
+        override val order: Long,
+        val text: String,
+        @SerialName("content_truncated") val contentTruncated: Boolean = false,
+    ) : TimelineEntry
+
+    @Serializable
+    @SerialName("outcome")
+    data class Outcome(
+        override val id: Long,
+        override val order: Long,
+        val outcome: AssistantOutcome,
+    ) : TimelineEntry
+
+    @Serializable
+    @SerialName("tool")
+    data class Tool(
+        override val id: Long,
+        override val order: Long,
+        @SerialName("tool_call_id") val toolCallId: String,
+        val name: String,
+        val title: String,
+        val status: ToolCallStatus,
+        val output: String? = null,
+        @SerialName("content_truncated") val contentTruncated: Boolean = false,
+    ) : TimelineEntry
+}
+
+@Serializable
+data class HistoryWindow(
+    @SerialName("truncated_before") val truncatedBefore: Long,
+    val retained: Int,
+    val total: Long? = null,
+    val continuation: String? = null,
+)
+
+@Serializable
 data class ApprovalRequest(
     val id: String,
     @SerialName("tool_call_id") val toolCallId: String,
@@ -456,12 +538,12 @@ data class SessionSnapshot(
     @SerialName("session_id") val sessionId: String,
     val seq: Long,
     @SerialName("turn_status") val turnStatus: TurnStatus,
-    val transcript: List<TranscriptEntry>,
-    @SerialName("tool_calls") val toolCalls: List<ToolCallState>,
+    val timeline: List<TimelineEntry>,
+    @SerialName("active_tools") val activeTools: List<ActiveToolState>,
+    @SerialName("history_window") val historyWindow: HistoryWindow,
     @SerialName("pending_approvals") val pendingApprovals: List<ApprovalRequest>,
     @SerialName("runtime_options") val runtimeOptions: List<RuntimeOption>,
     @SerialName("context_usage") val contextUsage: ContextUsage? = null,
-    @SerialName("history_truncated") val historyTruncated: Boolean = false,
 )
 
 @Serializable

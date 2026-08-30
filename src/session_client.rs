@@ -128,13 +128,10 @@ fn validate_snapshot_ids(snapshot: &SessionSnapshot) -> Result<(), SessionClient
         Ok(())
     }
 
+    require_unique("timeline", snapshot.timeline.iter().map(|entry| entry.id))?;
     require_unique(
-        "transcript",
-        snapshot.transcript.iter().map(|entry| entry.id),
-    )?;
-    require_unique(
-        "tool call",
-        snapshot.tool_calls.iter().map(|call| call.id.as_str()),
+        "active tool occurrence",
+        snapshot.active_tools.iter().map(|tool| tool.occurrence_id),
     )?;
     require_unique(
         "approval",
@@ -143,9 +140,38 @@ fn validate_snapshot_ids(snapshot: &SessionSnapshot) -> Result<(), SessionClient
             .iter()
             .map(|approval| approval.id.as_str()),
     )?;
-    // A bounded snapshot may legitimately trim the tool card referenced by an
-    // active approval; task 1338's HistoryWindow will preserve mandatory live
-    // tool state. Validate identity uniqueness here, not cross-reference presence.
+    if snapshot.history_window.retained != snapshot.timeline.len()
+        || snapshot.history_window.total
+            != Some(
+                snapshot
+                    .history_window
+                    .truncated_before
+                    .saturating_add(snapshot.timeline.len() as u64),
+            )
+    {
+        return Err(SessionClientError::Protocol(
+            "snapshot history window does not match timeline".to_string(),
+        ));
+    }
+    if snapshot
+        .active_tools
+        .iter()
+        .any(|tool| tool.status.is_terminal())
+    {
+        return Err(SessionClientError::Protocol(
+            "snapshot active_tools contains terminal tool".to_string(),
+        ));
+    }
+    if snapshot.pending_approvals.iter().any(|approval| {
+        !snapshot
+            .active_tools
+            .iter()
+            .any(|tool| tool.tool_call_id == approval.tool_call_id)
+    }) {
+        return Err(SessionClientError::Protocol(
+            "snapshot approval references missing active tool".to_string(),
+        ));
+    }
     require_unique(
         "runtime option",
         snapshot
@@ -595,7 +621,8 @@ mod tests {
     use super::*;
     use crate::client_transport::{in_memory_transport_pair, ClientTransport};
     use crate::session_protocol::{
-        ClientKind, ContextUsage, SessionEvent, SessionSnapshot, TurnStatus,
+        ActiveToolState, ClientKind, ContextUsage, HistoryWindow, SessionEvent, SessionSnapshot,
+        ToolCallStateStatus, TurnStatus,
     };
 
     fn client() -> ClientInfo {
@@ -611,12 +638,12 @@ mod tests {
             session_id: session_id.to_string(),
             seq,
             turn_status: TurnStatus::Idle,
-            transcript: Vec::new(),
-            tool_calls: Vec::new(),
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: Some(ContextUsage::new(1, Some(100), 0, None)),
-            history_truncated: false,
         }
     }
 
@@ -626,6 +653,24 @@ mod tests {
         assert_eq!(error.frame_limit_mismatch(), Some(512));
         assert!(error.to_string().starts_with("frame_limit_mismatch:"));
         assert!(error.to_string().contains("max_frame_bytes=512"));
+    }
+
+    #[test]
+    fn snapshot_accepts_distinct_active_occurrences_with_reused_provider_id() {
+        let mut state = snapshot("session-1", 0);
+        state.active_tools = [1, 2]
+            .into_iter()
+            .map(|occurrence_id| ActiveToolState {
+                occurrence_id,
+                tool_call_id: "provider-reused".to_string(),
+                name: "exec".to_string(),
+                title: format!("occurrence {occurrence_id}"),
+                status: ToolCallStateStatus::InProgress,
+                content_truncated: false,
+            })
+            .collect();
+
+        validate_snapshot_ids(&state).unwrap();
     }
 
     #[tokio::test]
@@ -718,15 +763,18 @@ mod tests {
                 .await
                 .unwrap();
             let mut invalid = snapshot("session-1", 0);
-            invalid.transcript = ["first", "second"]
+            invalid.timeline = ["first", "second"]
                 .into_iter()
-                .map(|text| crate::session_protocol::TranscriptEntry {
+                .map(|text| crate::session_protocol::TimelineEntry {
                     id: 1,
-                    role: crate::session_protocol::TranscriptRole::User,
-                    text: text.to_string(),
-                    outcome: None,
+                    order: 1,
+                    entry: crate::session_protocol::TimelineEntryKind::User {
+                        text: text.to_string(),
+                        content_truncated: false,
+                    },
                 })
                 .collect();
+            invalid.history_window = HistoryWindow::complete(2);
             server
                 .send(&ServerMessage::Snapshot {
                     seq: 0,
@@ -742,7 +790,7 @@ mod tests {
             100,
         );
         let error = frontend.attach(None).await.unwrap_err();
-        assert!(error.to_string().contains("duplicate transcript id"));
+        assert!(error.to_string().contains("duplicate timeline id"));
         assert!(!frontend.is_attached());
         server_task.await.unwrap();
     }
@@ -1160,15 +1208,19 @@ mod tests {
                 .await
                 .unwrap();
             let mut stale = snapshot("session-1", 0);
-            stale.transcript = ["obsolete-a", "obsolete-b"]
+            stale.timeline = ["obsolete-a", "obsolete-b"]
                 .into_iter()
-                .map(|text| crate::session_protocol::TranscriptEntry {
+                .enumerate()
+                .map(|(index, text)| crate::session_protocol::TimelineEntry {
                     id: 1,
-                    role: crate::session_protocol::TranscriptRole::User,
-                    text: text.to_string(),
-                    outcome: None,
+                    order: index as u64 + 1,
+                    entry: crate::session_protocol::TimelineEntryKind::User {
+                        text: text.to_string(),
+                        content_truncated: false,
+                    },
                 })
                 .collect();
+            stale.history_window = HistoryWindow::complete(2);
             server
                 .send(&ServerMessage::Snapshot {
                     seq: 0,
@@ -1232,13 +1284,16 @@ mod tests {
                 .unwrap();
             let mut canonical = snapshot("session-1", 1);
             canonical
-                .transcript
-                .push(crate::session_protocol::TranscriptEntry {
+                .timeline
+                .push(crate::session_protocol::TimelineEntry {
                     id: 7,
-                    role: crate::session_protocol::TranscriptRole::Assistant,
-                    text: "canonical".to_string(),
-                    outcome: None,
+                    order: 7,
+                    entry: crate::session_protocol::TimelineEntryKind::Assistant {
+                        text: "canonical".to_string(),
+                        content_truncated: false,
+                    },
                 });
+            canonical.history_window = HistoryWindow::complete(1);
             server
                 .send(&ServerMessage::Snapshot {
                     seq: 1,

@@ -674,8 +674,9 @@ mod tests {
 
     use crate::client_transport::{in_memory_transport_pair, ClientTransport, InMemoryClient};
     use crate::session_protocol::{
-        ClientKind, ClientMessage, ContextUsage, RevocationCode, ServerMessage, SessionEvent,
-        SessionSnapshot, TranscriptEntry, TranscriptRole, TurnStatus, PROTOCOL_VERSION,
+        ClientKind, ClientMessage, ContextUsage, HistoryWindow, RevocationCode, ServerMessage,
+        SessionEvent, SessionSnapshot, TimelineEntry, TimelineEntryKind, TurnStatus,
+        PROTOCOL_VERSION,
     };
 
     fn info(id: &str) -> ClientInfo {
@@ -691,12 +692,12 @@ mod tests {
             session_id: session_id.to_string(),
             seq,
             turn_status: TurnStatus::Idle,
-            transcript: Vec::new(),
-            tool_calls: Vec::new(),
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: Some(ContextUsage::new(0, Some(100), 0, None)),
-            history_truncated: false,
         }
     }
 
@@ -833,12 +834,15 @@ mod tests {
             .await
             .unwrap();
         let mut recovered = snapshot(&session_id, 5);
-        recovered.transcript.push(TranscriptEntry {
+        recovered.timeline.push(TimelineEntry {
             id: 7,
-            role: TranscriptRole::Assistant,
-            text: "recovered snapshot".to_string(),
-            outcome: None,
+            order: 7,
+            entry: TimelineEntryKind::Assistant {
+                text: "recovered snapshot".to_string(),
+                content_truncated: false,
+            },
         });
+        recovered.history_window = HistoryWindow::complete(1);
         reconnect_server
             .send(&ServerMessage::Snapshot {
                 seq: 5,

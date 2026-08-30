@@ -739,7 +739,7 @@ pub async fn run_session_daemon(
         cfg.session.max_sessions,
         cfg.session.max_clients_per_session,
         cfg.session.event_queue_capacity,
-        cfg.session.snapshot_entries,
+        cfg.session.timeline_entries,
         (cfg.session.idle_retention_secs > 0)
             .then(|| std::time::Duration::from_secs(cfg.session.idle_retention_secs)),
         cfg.session.session_list_page_size,

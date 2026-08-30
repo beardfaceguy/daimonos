@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -268,6 +268,99 @@ pub struct ToolCallState {
     pub output: Option<String>,
 }
 
+impl ToolCallStateStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveToolState {
+    /// Fold-minted occurrence identity. Provider tool ids may be reused.
+    pub occurrence_id: u64,
+    pub tool_call_id: String,
+    pub name: String,
+    pub title: String,
+    pub status: ToolCallStateStatus,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub content_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimelineEntryKind {
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        content_truncated: bool,
+    },
+    Assistant {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        content_truncated: bool,
+    },
+    Thought {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        content_truncated: bool,
+    },
+    /// Frontend-local notices. Daemon reconstruction does not mint these.
+    System {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        content_truncated: bool,
+    },
+    Outcome {
+        outcome: AssistantOutcome,
+    },
+    Tool {
+        tool_call_id: String,
+        name: String,
+        title: String,
+        status: ToolCallStateStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        content_truncated: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineEntry {
+    /// Incarnation-local fold identity; never a provider tool id.
+    pub id: u64,
+    /// Stable chronological position. Updates never change this value.
+    pub order: u64,
+    #[serde(flatten)]
+    pub entry: TimelineEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryWindow {
+    pub truncated_before: u64,
+    pub retained: usize,
+    /// When present, equals `truncated_before + retained`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+impl HistoryWindow {
+    pub fn complete(retained: usize) -> Self {
+        Self {
+            truncated_before: 0,
+            retained,
+            total: Some(retained as u64),
+            continuation: None,
+        }
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated_before > 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
@@ -386,13 +479,13 @@ pub struct SessionSnapshot {
     pub session_id: String,
     pub seq: u64,
     pub turn_status: TurnStatus,
-    pub transcript: Vec<TranscriptEntry>,
-    pub tool_calls: Vec<ToolCallState>,
+    pub timeline: Vec<TimelineEntry>,
+    /// Mandatory non-terminal control state, independent of history trimming.
+    pub active_tools: Vec<ActiveToolState>,
+    pub history_window: HistoryWindow,
     pub pending_approvals: Vec<ApprovalRequest>,
     pub runtime_options: Vec<RuntimeOption>,
     pub context_usage: Option<ContextUsage>,
-    #[serde(default)]
-    pub history_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1184,29 +1277,31 @@ mod tests {
             session_id: "s1".to_string(),
             seq: 9,
             turn_status: TurnStatus::Idle,
-            transcript: vec![TranscriptEntry {
+            timeline: vec![TimelineEntry {
                 id: 1,
-                role: TranscriptRole::Assistant,
-                text: "done".to_string(),
-                outcome: Some(AssistantOutcome::Completed),
+                order: 1,
+                entry: TimelineEntryKind::Assistant {
+                    text: "done".to_string(),
+                    content_truncated: false,
+                },
             }],
-            tool_calls: vec![ToolCallState {
-                id: "t1".to_string(),
-                name: "exec".to_string(),
-                title: "cargo test".to_string(),
-                status: ToolCallStateStatus::Completed,
-                output: Some("ok".to_string()),
-            }],
+            active_tools: vec![],
+            history_window: HistoryWindow::complete(1),
             pending_approvals: vec![],
             runtime_options: vec![],
             context_usage: Some(ContextUsage::new(50, Some(200), 0, None)),
-            history_truncated: false,
         };
         let message = ServerMessage::Snapshot {
             seq: snapshot.seq,
             state: snapshot,
         };
         let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains("\"timeline\""));
+        assert!(encoded.contains("\"active_tools\""));
+        assert!(encoded.contains("\"history_window\""));
+        assert!(!encoded.contains("\"transcript\""));
+        assert!(!encoded.contains("\"tool_calls\""));
+        assert!(!encoded.contains("\"history_truncated\""));
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&encoded).unwrap(),
             message
@@ -1434,9 +1529,9 @@ mod tests {
     }
 
     #[test]
-    fn android_v2_contract_fixtures_match_canonical_wire_types() {
+    fn android_v3_contract_fixtures_match_canonical_wire_types() {
         let attach: ClientMessage =
-            serde_json::from_str(include_str!("../contracts/android/v2/attach_request.json"))
+            serde_json::from_str(include_str!("../contracts/android/v3/attach_request.json"))
                 .unwrap();
         assert!(matches!(
             attach,
@@ -1451,7 +1546,7 @@ mod tests {
         ));
 
         let snapshot: ServerMessage =
-            serde_json::from_str(include_str!("../contracts/android/v2/snapshot.json")).unwrap();
+            serde_json::from_str(include_str!("../contracts/android/v3/snapshot.json")).unwrap();
         assert!(matches!(
             &snapshot,
             ServerMessage::Snapshot {
@@ -1464,7 +1559,7 @@ mod tests {
         ));
 
         let events: Vec<ServerMessage> =
-            serde_json::from_str(include_str!("../contracts/android/v2/event_stream.json"))
+            serde_json::from_str(include_str!("../contracts/android/v3/event_stream.json"))
                 .unwrap();
         assert_eq!(events.len(), 7);
         assert!(events
@@ -1489,7 +1584,7 @@ mod tests {
         assert!(view.transcript().is_empty());
 
         let commands: Vec<ClientMessage> =
-            serde_json::from_str(include_str!("../contracts/android/v2/client_commands.json"))
+            serde_json::from_str(include_str!("../contracts/android/v3/client_commands.json"))
                 .unwrap();
         assert_eq!(commands.len(), 8);
         assert!(matches!(commands.last(), Some(ClientMessage::Detach)));
