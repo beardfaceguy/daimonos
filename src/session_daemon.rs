@@ -1202,7 +1202,21 @@ impl SessionDaemon {
         let Some(entry) = entry else {
             return Ok(false);
         };
-        let admission = entry.admission.lock().await;
+        let admission = if delete_persisted {
+            entry.admission.lock().await
+        } else {
+            match tokio::time::timeout(self.shutdown_grace, entry.admission.lock()).await {
+                Ok(admission) => admission,
+                Err(_) => {
+                    tracing::error!(
+                        target: "daimonos::session_daemon",
+                        event = "daemon_shutdown_admission_timeout",
+                        session_id,
+                    );
+                    return Ok(false);
+                }
+            }
+        };
         let still_current = self
             .sessions
             .lock()
@@ -1391,30 +1405,12 @@ impl SessionDaemon {
             .keys()
             .cloned()
             .collect();
-        let finalization_budget = self
-            .shutdown_grace
-            .saturating_add(self.persistence_final_save_timeout.unwrap_or_default());
-        if tokio::time::timeout(
-            finalization_budget,
-            futures_util::future::join_all(
-                session_ids
-                    .iter()
-                    .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
-            ),
+        futures_util::future::join_all(
+            session_ids
+                .iter()
+                .map(|session_id| self.end_session(session_id, "daemon_shutdown", false)),
         )
-        .await
-        .is_err()
-        {
-            tracing::error!(
-                target: "daimonos::session_daemon",
-                event = "daemon_shutdown_finalization_timeout",
-                remaining_sessions = self
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .len(),
-            );
-        }
+        .await;
         let _ = tokio::time::timeout(self.shutdown_grace, async {
             loop {
                 let changed = self.client_tasks_changed.notified();
