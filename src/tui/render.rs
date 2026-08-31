@@ -46,6 +46,12 @@ pub struct RenderOptions {
     pub allow_always_granted: bool,
     /// UTF-8 byte offset of the insertion cursor; defaults to the text end.
     pub composer_cursor: Option<usize>,
+    /// True when the terminal accepted the Kitty keyboard enhancement, so
+    /// modified Enter (Shift-Enter) is actually reported. Drives the composer
+    /// hint: Shift-Enter is only advertised when the terminal can deliver it,
+    /// while Ctrl-J (a distinct control byte) is always offered as the
+    /// universal newline fallback (vikunja #1424).
+    pub keyboard_enhanced: bool,
 }
 
 /// Render the whole TUI frame for `state` into `area` of `buf`.
@@ -73,6 +79,7 @@ pub fn render_with_options(
     render_composer(
         composer,
         options.composer_cursor.unwrap_or(composer.len()),
+        options.keyboard_enhanced,
         chunks[2],
         buf,
     );
@@ -381,10 +388,25 @@ fn render_approval_modal(
         .render(modal, buf);
 }
 
-fn render_composer(composer: &str, cursor: usize, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("message (Enter sends · Ctrl-J newline · Ctrl-C interrupts · /help for help)");
+fn render_composer(
+    composer: &str,
+    cursor: usize,
+    keyboard_enhanced: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    // Ctrl-J is a distinct control byte that every terminal delivers, so it is
+    // always the advertised newline. Shift-Enter is only reported when the
+    // terminal accepted the Kitty enhancement, so it is added to the hint only
+    // then — never promise a gesture the terminal cannot send (vikunja #1424).
+    let newline_hint = if keyboard_enhanced {
+        "Shift-Enter/Ctrl-J newline"
+    } else {
+        "Ctrl-J newline"
+    };
+    let title =
+        format!("message (Enter sends · {newline_hint} · Ctrl-C interrupts · /help for help)");
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     let (wrapped, viewport) = wrapped_composer(composer, cursor, inner);
     let visible = viewport
@@ -652,6 +674,50 @@ mod tests {
             },
         );
         buffer_to_string(&buf)
+    }
+
+    /// vikunja #1424: the composer hint must always offer Ctrl-J (works on every
+    /// terminal) and must advertise Shift-Enter ONLY when the terminal accepted
+    /// the Kitty enhancement — promising Shift-Enter on Konsole 25.12.3 / xterm,
+    /// where it is silently swallowed, is exactly the trap being fixed.
+    #[test]
+    fn composer_hint_advertises_shift_enter_only_when_enhanced() {
+        let state = ViewState::new("sess");
+        let area = Rect::new(0, 0, 100, 8);
+        let hint = |enhanced: bool| {
+            let mut buf = Buffer::empty(area);
+            render_with_options(
+                &state,
+                "",
+                area,
+                &mut buf,
+                RenderOptions {
+                    keyboard_enhanced: enhanced,
+                    ..RenderOptions::default()
+                },
+            );
+            buffer_to_string(&buf)
+        };
+
+        let enhanced = hint(true);
+        assert!(
+            enhanced.contains("Ctrl-J"),
+            "Ctrl-J is the universal fallback and is always shown: {enhanced}"
+        );
+        assert!(
+            enhanced.contains("Shift-Enter"),
+            "an enhanced terminal advertises Shift-Enter: {enhanced}"
+        );
+
+        let plain = hint(false);
+        assert!(
+            plain.contains("Ctrl-J"),
+            "Ctrl-J is shown regardless of enhancement: {plain}"
+        );
+        assert!(
+            !plain.contains("Shift-Enter"),
+            "an unsupported terminal must not promise Shift-Enter: {plain}"
+        );
     }
 
     /// Screen row of the composer's Nth text row, derived from the live layout.

@@ -19,10 +19,19 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 
 static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the Kitty keyboard enhancement is currently active — i.e. the
+/// terminal probed as supporting it and the push succeeded. The composer hint
+/// reads this to advertise Shift-Enter only where it can actually be delivered
+/// (vikunja #1424).
+pub fn keyboard_enhancement_active() -> bool {
+    KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::Acquire)
+}
 
 /// Guards the terminal's raw/alternate-screen state for the lifetime of a TUI
 /// session. Construct with [`TerminalGuard::enter`]; drop (or call
@@ -54,14 +63,24 @@ impl TerminalGuard {
             restore_terminal(&mut out);
             return Err(err);
         }
-        if let Err(err) = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        ) {
-            restore_terminal(&mut out);
-            return Err(err);
+        // Only push the Kitty enhancement when the terminal actually reports it
+        // (vikunja #1424). Pushing unconditionally puts terminals with partial
+        // support — notably Konsole 25.12.3 (KDE bug 519627) — into a state
+        // where modified Enter (Shift-Enter/Alt-Enter) is swallowed, leaving no
+        // newline gesture but Ctrl-J. Gating restores legacy modified-Enter on
+        // those terminals and still enables Shift-Enter where it works. A probe
+        // error is treated as "unsupported" — never worse than not pushing.
+        let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+        if enhanced {
+            if let Err(err) = execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            ) {
+                restore_terminal(&mut out);
+                return Err(err);
+            }
+            KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::Release);
         }
-        KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::Release);
         Ok(Self { active: true })
     }
 
