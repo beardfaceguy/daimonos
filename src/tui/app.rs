@@ -346,6 +346,7 @@ fn draw_tui(
                 scroll_mode: mode == InputMode::Scroll,
                 allow_always_granted: session.has_capability(ClientCapability::ApproveAlways),
                 composer_cursor: Some(composer.cursor()),
+                keyboard_enhanced: super::terminal::keyboard_enhancement_active(),
             },
         );
         if session.state().active_approval().is_none() {
