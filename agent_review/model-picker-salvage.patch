@@ -1,0 +1,593 @@
+diff --git a/src/agent_runtime.rs b/src/agent_runtime.rs
+index d0889ac..f9d9177 100644
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@ -94,6 +94,67 @@ async fn discover_models(
+     models
+ }
+ 
++async fn discover_model_catalogs(
++    llm: &dyn providers::LlmProvider,
++    agent: &agent_env::AgentEnv,
++    effective_provider: &str,
++    effective_model: &str,
++) -> Vec<(String, Vec<String>)> {
++    let mut catalogs = if models_discovery_disabled() {
++        Vec::new()
++    } else {
++        tokio::time::timeout(std::time::Duration::from_secs(5), llm.list_model_catalogs())
++            .await
++            .ok()
++            .flatten()
++            .unwrap_or_default()
++    };
++    if catalogs.is_empty() {
++        catalogs.push((effective_provider.to_string(), agent.models.clone()));
++    }
++    let current_slug = effective_model
++        .strip_prefix(&format!("{effective_provider}:"))
++        .unwrap_or(effective_model);
++    if let Some((_, models)) = catalogs
++        .iter_mut()
++        .find(|(name, _)| name == effective_provider)
++    {
++        if !models.iter().any(|model| model == current_slug) {
++            models.insert(0, current_slug.to_string());
++        }
++    } else {
++        catalogs.insert(
++            0,
++            (
++                effective_provider.to_string(),
++                vec![current_slug.to_string()],
++            ),
++        );
++    }
++    catalogs
++}
++
++fn flatten_model_catalogs(catalogs: &[(String, Vec<String>)], current: &str) -> Vec<String> {
++    let multi = catalogs.len() > 1;
++    let mut models = Vec::new();
++    for (provider, slugs) in catalogs {
++        for slug in slugs {
++            let model = if multi {
++                format!("{provider}:{slug}")
++            } else {
++                slug.clone()
++            };
++            if !models.contains(&model) {
++                models.push(model);
++            }
++        }
++    }
++    if !models.iter().any(|model| model == current) {
++        models.insert(0, current.to_string());
++    }
++    models
++}
++
+ /// `DAIMONOS_AGENT_MODELS_DISCOVER=off|false|no|0` skips the startup catalog
+ /// fetch (air-gapped setups, deterministic tests).
+ fn models_discovery_disabled() -> bool {
+@@ -282,7 +343,10 @@ pub async fn run_agent(
+             .await
+             .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
+         let compaction = prompts::apply_summary_override(compaction, &cfg).await;
+-        let models = discover_models(Some(llm.as_ref()), &agent.models, &effective_model).await;
++        let model_catalogs =
++            discover_model_catalogs(llm.as_ref(), &agent, &effective_provider, &effective_model)
++                .await;
++        let models = flatten_model_catalogs(&model_catalogs, &effective_model);
+         return tui::run_tui(
+             llm,
+             workspace,
+@@ -292,6 +356,7 @@ pub async fn run_agent(
+                 no_color,
+                 model: effective_model,
+                 models,
++                model_catalogs,
+                 safety: agent.to_safety_policy(None),
+                 token_log,
+                 compaction,
+diff --git a/src/providers/anthropic.rs b/src/providers/anthropic.rs
+index 5e2ca90..d456839 100644
+--- a/src/providers/anthropic.rs
++++ b/src/providers/anthropic.rs
+@@ -688,6 +688,9 @@ impl AnthropicProvider {
+ 
+ #[async_trait]
+ impl LlmProvider for AnthropicProvider {
++    fn provider_name(&self) -> &'static str {
++        "anthropic"
++    }
+     fn supports_images(&self) -> bool {
+         true
+     }
+diff --git a/src/providers/mod.rs b/src/providers/mod.rs
+index 1e0820d..3237b49 100644
+--- a/src/providers/mod.rs
++++ b/src/providers/mod.rs
+@@ -504,6 +504,20 @@ pub trait LlmProvider: Send + Sync {
+     async fn list_models(&self) -> Option<Vec<String>> {
+         None
+     }
++
++    /// Provider-labelled model catalogs for frontends that present models by
++    /// provider. Single-provider adapters inherit this implementation; routers
++    /// override it to preserve adapter ownership instead of flattening it.
++    async fn list_model_catalogs(&self) -> Option<Vec<(String, Vec<String>)>> {
++        self.list_models()
++            .await
++            .map(|models| vec![(self.provider_name().to_string(), models)])
++    }
++
++    /// Stable provider namespace used in model selectors and explicit routes.
++    fn provider_name(&self) -> &'static str {
++        "provider"
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/providers/openai.rs b/src/providers/openai.rs
+index 20fad02..955b83a 100644
+--- a/src/providers/openai.rs
++++ b/src/providers/openai.rs
+@@ -64,6 +64,9 @@ impl OpenAiProvider {
+ 
+ #[async_trait]
+ impl LlmProvider for OpenAiProvider {
++    fn provider_name(&self) -> &'static str {
++        "openai"
++    }
+     async fn list_models(&self) -> Option<Vec<String>> {
+         // /models mixes chat, embedding, and audio models; the caller only
+         // needs slugs, so no filtering here — sorted newest-first by `created`
+diff --git a/src/providers/openrouter.rs b/src/providers/openrouter.rs
+index a10aa1e..7a009ce 100644
+--- a/src/providers/openrouter.rs
++++ b/src/providers/openrouter.rs
+@@ -38,6 +38,9 @@ impl OpenRouterProvider {
+ 
+ #[async_trait]
+ impl LlmProvider for OpenRouterProvider {
++    fn provider_name(&self) -> &'static str {
++        "openrouter"
++    }
+     fn supports_images(&self) -> bool {
+         true
+     }
+diff --git a/src/providers/router.rs b/src/providers/router.rs
+index b7b70a0..d1526c9 100644
+--- a/src/providers/router.rs
++++ b/src/providers/router.rs
+@@ -150,6 +150,18 @@ impl LlmProvider for MultiProvider {
+     /// Merged catalog in adapter order (primary's models first), deduped
+     /// first-wins — the same precedence the routing table uses. `None` only
+     /// when every adapter's catalog is unavailable.
++    async fn list_model_catalogs(&self) -> Option<Vec<(String, Vec<String>)>> {
++        let routes = self.routes().await;
++        let catalogs: Vec<_> = self
++            .adapters
++            .iter()
++            .zip(&routes.catalogs)
++            .filter(|(_, models)| !models.is_empty())
++            .map(|((name, _), models)| (name.clone(), models.clone()))
++            .collect();
++        (!catalogs.is_empty()).then_some(catalogs)
++    }
++
+     async fn list_models(&self) -> Option<Vec<String>> {
+         // Building the routing table performs the fetches; reuse its cached
+         // result so startup discovery and routing agree and cost one fetch
+diff --git a/src/tui/app.rs b/src/tui/app.rs
+index e0af64a..c8d2fb0 100644
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -46,6 +46,7 @@ pub struct TuiOptions {
+     pub no_color: bool,
+     pub model: String,
+     pub models: Vec<String>,
++    pub model_catalogs: Vec<(String, Vec<String>)>,
+     pub safety: SafetyPolicy,
+     pub token_log: Option<PathBuf>,
+     pub compaction: Option<CompactionPolicy>,
+@@ -57,6 +58,91 @@ struct PendingApproval {
+     sender: oneshot::Sender<ApprovalDecision>,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum ModelPickerFocus {
++    Providers,
++    Models,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct ModelPickerState {
++    pub catalogs: Vec<(String, Vec<String>)>,
++    pub provider_index: usize,
++    pub model_index: usize,
++    pub focus: ModelPickerFocus,
++}
++
++impl ModelPickerState {
++    fn new(catalogs: Vec<(String, Vec<String>)>, current: &str) -> Self {
++        let current_slug = current.split_once(':').map_or(current, |(_, slug)| slug);
++        let provider_index = catalogs
++            .iter()
++            .position(|(provider, models)| {
++                current.starts_with(&format!("{provider}:"))
++                    || models.iter().any(|model| model == current_slug)
++            })
++            .unwrap_or(0);
++        let model_index = catalogs
++            .get(provider_index)
++            .and_then(|(_, models)| models.iter().position(|model| model == current_slug))
++            .unwrap_or(0);
++        Self {
++            catalogs,
++            provider_index,
++            model_index,
++            focus: ModelPickerFocus::Providers,
++        }
++    }
++
++    fn move_up(&mut self) {
++        let index = match self.focus {
++            ModelPickerFocus::Providers => &mut self.provider_index,
++            ModelPickerFocus::Models => &mut self.model_index,
++        };
++        *index = index.saturating_sub(1);
++        if self.focus == ModelPickerFocus::Providers {
++            self.model_index = 0;
++        }
++    }
++
++    fn move_down(&mut self) {
++        match self.focus {
++            ModelPickerFocus::Providers => {
++                self.provider_index =
++                    (self.provider_index + 1).min(self.catalogs.len().saturating_sub(1));
++                self.model_index = 0;
++            }
++            ModelPickerFocus::Models => {
++                let last = self
++                    .catalogs
++                    .get(self.provider_index)
++                    .map_or(0, |(_, models)| models.len().saturating_sub(1));
++                self.model_index = (self.model_index + 1).min(last);
++            }
++        }
++    }
++
++    fn toggle_focus(&mut self) {
++        self.focus = match self.focus {
++            ModelPickerFocus::Providers => ModelPickerFocus::Models,
++            ModelPickerFocus::Models => ModelPickerFocus::Providers,
++        };
++    }
++
++    fn selected_model(&self) -> Option<String> {
++        if self.focus == ModelPickerFocus::Providers {
++            return None;
++        }
++        let (provider, models) = self.catalogs.get(self.provider_index)?;
++        let model = models.get(self.model_index)?;
++        Some(if self.catalogs.len() > 1 {
++            format!("{provider}:{model}")
++        } else {
++            model.clone()
++        })
++    }
++}
++
+ type SharedView = Arc<StdMutex<ViewState>>;
+ type SharedApproval = Arc<StdMutex<Option<PendingApproval>>>;
+ 
+@@ -205,6 +291,7 @@ pub async fn run(
+         &compaction_for_usage,
+         &mut turn,
+         &options.models,
++        &options.model_catalogs,
+     )
+     .await;
+ 
+@@ -242,11 +329,13 @@ async fn run_event_loop(
+     compaction: &Option<CompactionPolicy>,
+     turn: &mut Option<tokio::task::JoinHandle<()>>,
+     models: &[String],
++    model_catalogs: &[(String, Vec<String>)],
+ ) -> anyhow::Result<()> {
+     // Vim-style modality (process-local, never part of session state): Insert
+     // feeds the composer, Scroll hands keys to the transcript. Esc toggles.
+     let mut mode = InputMode::Insert;
+     let mut vim_keys = VimScrollKeys::default();
++    let mut model_picker: Option<ModelPickerState> = None;
+     loop {
+         if turn
+             .as_ref()
+@@ -271,7 +360,10 @@ async fn run_event_loop(
+                         scroll_mode: mode == InputMode::Scroll,
+                     },
+                 );
+-                if view.active_approval().is_none() {
++                if let Some(picker) = &model_picker {
++                    super::render_model_picker(picker, frame.area(), frame.buffer_mut(), no_color);
++                }
++                if view.active_approval().is_none() && model_picker.is_none() {
+                     if let Some(position) = super::composer_cursor_position(composer, frame.area())
+                     {
+                         frame.set_cursor_position(position);
+@@ -292,6 +384,25 @@ async fn run_event_loop(
+                 if resolve_approval_key(key, view, pending_approval) {
+                     continue;
+                 }
++                if let Some(picker) = &mut model_picker {
++                    match key.code {
++                        KeyCode::Esc => model_picker = None,
++                        KeyCode::Tab | KeyCode::BackTab => picker.toggle_focus(),
++                        KeyCode::Up => picker.move_up(),
++                        KeyCode::Down => picker.move_down(),
++                        KeyCode::Enter => {
++                            if let Some(model) = picker.selected_model() {
++                                session.lock().await.set_model(model.clone());
++                                let _ = events.emit(SessionEvent::RuntimeOptionsChanged {
++                                    options: model_runtime_options(models, &model),
++                                });
++                                model_picker = None;
++                            }
++                        }
++                        _ => {}
++                    }
++                    continue;
++                }
+                 if key.code == KeyCode::Esc {
+                     // Insert -> Scroll copies vim's Esc-to-normal; Scroll ->
+                     // Insert is the pragmatic escape hatch (vim's `i` also
+@@ -400,8 +511,14 @@ async fn run_event_loop(
+                                     options: model_runtime_options(models, &model),
+                                 });
+                             }
++                            UiCommand::Model(None) if turn.is_none() => {
++                                model_picker = Some(ModelPickerState::new(
++                                    model_catalogs.to_vec(),
++                                    session.lock().await.model(),
++                                ));
++                            }
+                             UiCommand::Model(None) => {
+-                                push_notice(view, format!("models: {}", models.join(", ")));
++                                push_notice(view, "command unavailable while a turn is running");
+                             }
+                             UiCommand::Compact => {
+                                 let message = if compaction.is_some() {
+@@ -796,6 +913,43 @@ mod tests {
+         }
+     }
+ 
++    fn picker() -> ModelPickerState {
++        ModelPickerState::new(
++            vec![
++                ("anthropic".into(), vec!["opus".into(), "sonnet".into()]),
++                ("openai".into(), vec!["gpt-5".into(), "o3".into()]),
++            ],
++            "anthropic:sonnet",
++        )
++    }
++
++    #[test]
++    fn model_picker_switches_provider_and_resets_model_cursor() {
++        let mut picker = picker();
++        assert_eq!(picker.provider_index, 0);
++        assert_eq!(picker.model_index, 1);
++        picker.move_down();
++        assert_eq!(picker.provider_index, 1);
++        assert_eq!(picker.model_index, 0);
++    }
++
++    #[test]
++    fn model_picker_enter_is_disabled_in_provider_pane() {
++        let mut picker = picker();
++        assert_eq!(picker.selected_model(), None);
++        picker.toggle_focus();
++        picker.move_down();
++        assert_eq!(picker.selected_model().as_deref(), Some("anthropic:sonnet"));
++    }
++
++    #[test]
++    fn single_provider_picker_returns_unqualified_model() {
++        let mut picker =
++            ModelPickerState::new(vec![("anthropic".into(), vec!["opus".into()])], "opus");
++        picker.toggle_focus();
++        assert_eq!(picker.selected_model().as_deref(), Some("opus"));
++    }
++
+     #[test]
+     fn stream_events_use_the_canonical_projection() {
+         assert_eq!(
+diff --git a/src/tui/mod.rs b/src/tui/mod.rs
+index 9b1a432..e4bf882 100644
+--- a/src/tui/mod.rs
++++ b/src/tui/mod.rs
+@@ -35,6 +35,7 @@ pub mod terminal;
+ pub use agent_mode::{resolve_agent_mode, AgentMode};
+ pub use app::{run as run_tui, TuiOptions};
+ pub use commands::{approval_from_key, parse_command, UiCommand};
++pub(crate) use render::render_model_picker;
+ pub use render::{
+     composer_cursor_position, render, render_with_options, tui_layout, RenderOptions,
+ };
+diff --git a/src/tui/render.rs b/src/tui/render.rs
+index 45cfd20..176c21c 100644
+--- a/src/tui/render.rs
++++ b/src/tui/render.rs
+@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
+ use crate::session_protocol::{
+     RuntimeOption, RuntimeOptionSpec, RuntimeValue, ToolCallStateStatus, TranscriptRole, TurnStatus,
+ };
++use crate::tui::app::{ModelPickerFocus, ModelPickerState};
+ use crate::tui::state::ViewState;
+ 
+ pub const STATUS_HEIGHT: u16 = 1;
+@@ -306,6 +307,108 @@ fn render_approval_modal(state: &ViewState, area: Rect, buf: &mut Buffer) {
+         .render(modal, buf);
+ }
+ 
++pub(crate) fn render_model_picker(
++    picker: &ModelPickerState,
++    area: Rect,
++    buf: &mut Buffer,
++    no_color: bool,
++) {
++    let modal = centered_rect(64, 24, area);
++    Clear.render(modal, buf);
++    let outer = Block::default()
++        .borders(Borders::ALL)
++        .title("Select model · Tab switches pane · Enter selects · Esc cancels")
++        .border_style(
++            Style::default()
++                .fg(Color::Cyan)
++                .add_modifier(Modifier::BOLD),
++        );
++    let inner = outer.inner(modal);
++    outer.render(modal, buf);
++    let panes = Layout::default()
++        .direction(Direction::Vertical)
++        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
++        .split(inner);
++    let provider_lines = picker
++        .catalogs
++        .iter()
++        .enumerate()
++        .map(|(index, (name, _))| {
++            selectable_line(
++                name,
++                index == picker.provider_index,
++                picker.focus == ModelPickerFocus::Providers,
++            )
++        })
++        .collect::<Vec<_>>();
++    Paragraph::new(provider_lines)
++        .block(picker_block(
++            "Providers",
++            picker.focus == ModelPickerFocus::Providers,
++        ))
++        .render(panes[0], buf);
++    let model_lines = picker
++        .catalogs
++        .get(picker.provider_index)
++        .map(|(_, models)| {
++            models
++                .iter()
++                .enumerate()
++                .map(|(index, model)| {
++                    selectable_line(
++                        model,
++                        index == picker.model_index,
++                        picker.focus == ModelPickerFocus::Models,
++                    )
++                })
++                .collect::<Vec<_>>()
++        })
++        .unwrap_or_default();
++    Paragraph::new(model_lines)
++        .block(picker_block(
++            "Models",
++            picker.focus == ModelPickerFocus::Models,
++        ))
++        .render(panes[1], buf);
++    if no_color {
++        for y in modal.y..modal.bottom() {
++            for x in modal.x..modal.right() {
++                buf[(x, y)].set_fg(Color::Reset).set_bg(Color::Reset);
++            }
++        }
++    }
++}
++
++fn picker_block(title: &'static str, focused: bool) -> Block<'static> {
++    Block::default()
++        .borders(Borders::ALL)
++        .title(title)
++        .border_style(if focused {
++            Style::default()
++                .fg(Color::Yellow)
++                .add_modifier(Modifier::BOLD)
++        } else {
++            Style::default().fg(Color::DarkGray)
++        })
++}
++
++fn selectable_line(text: &str, selected: bool, focused: bool) -> Line<'static> {
++    let prefix = if selected { "▶ " } else { "  " };
++    let style = if selected && focused {
++        Style::default()
++            .fg(Color::Black)
++            .bg(Color::Yellow)
++            .add_modifier(Modifier::BOLD)
++    } else if selected {
++        Style::default()
++            .fg(Color::Cyan)
++            .add_modifier(Modifier::BOLD)
++    } else {
++        Style::default()
++    };
++    Line::styled(format!("{prefix}{}", sanitize(text)), style)
++}
++
+ fn render_composer(composer: &str, area: Rect, buf: &mut Buffer) {
+     let block = Block::default()
+         .borders(Borders::ALL)
+@@ -1042,6 +1145,53 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn model_picker_renders_split_provider_and_model_panes() {
++        let picker = ModelPickerState {
++            catalogs: vec![
++                ("anthropic".into(), vec!["opus".into(), "sonnet".into()]),
++                ("openai".into(), vec!["gpt-5".into()]),
++            ],
++            provider_index: 1,
++            model_index: 0,
++            focus: ModelPickerFocus::Models,
++        };
++        let area = Rect::new(0, 0, 80, 30);
++        let mut buf = Buffer::empty(area);
++        render_model_picker(&picker, area, &mut buf, false);
++        let out = buffer_to_string(&buf);
++        assert!(
++            out.contains("Providers"),
++            "provider pane missing:
++{out}"
++        );
++        assert!(
++            out.contains("Models"),
++            "model pane missing:
++{out}"
++        );
++        assert!(
++            out.contains("anthropic"),
++            "provider missing:
++{out}"
++        );
++        assert!(
++            out.contains("openai"),
++            "selected provider missing:
++{out}"
++        );
++        assert!(
++            out.contains("gpt-5"),
++            "selected catalog missing:
++{out}"
++        );
++        assert!(
++            !out.contains("opus"),
++            "inactive provider models leaked:
++{out}"
++        );
++    }
++
+     #[test]
+     fn approval_modal_sanitizes_detail() {
+         let state = approval_state(true, "danger \x1b[2J wipe");
