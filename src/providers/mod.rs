@@ -344,12 +344,17 @@ pub fn is_retryable_status(status: u16) -> bool {
 ///
 /// This is reached only *after* a successful 2xx header response, once the event
 /// stream is established (a bad request would already have failed at the status
-/// check). A [`EventStreamError::Transport`] fault is therefore the socket
+/// check). An [`EventStreamError::Transport`] fault is therefore the socket
 /// breaking under an open stream — an HTTP/2 `CANCEL`, a connection reset, an
 /// abrupt idle disconnect — which is transient: re-issuing the request usually
 /// succeeds, so core's #1240 retry/failover/resume path should absorb it. A
 /// `Utf8` or `Parser` fault is the server emitting bytes we cannot decode;
 /// re-issuing the same request yields the same undecodable bytes, so it is fatal.
+///
+/// This classifies only the *transport* framing of the SSE stream. An in-band
+/// error the server sends as a well-formed SSE `error` event (e.g. OpenAI's
+/// `response.error`) is a decoded payload, not a transport fault, and must be
+/// classified by the adapter on its own terms — do not funnel such events here.
 ///
 /// Lives in the provider layer for the same ADR-001 reason as
 /// [`is_retryable_status`]: SSE framing is a standard, not provider phrasing, so
