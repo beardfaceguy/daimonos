@@ -356,6 +356,10 @@ impl SessionEventRouter {
             .dispatch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.emit_locked(event)
+    }
+
+    fn emit_locked(&self, event: SessionEvent) -> Result<u64, SessionEventError> {
         let sequence = {
             let mut current = self
                 .sequence
@@ -399,6 +403,43 @@ impl SessionEventRouter {
             return Err(SessionEventError::HandlerPanicked);
         }
         Ok(sequence)
+    }
+
+    fn transition_durability(
+        &self,
+        current: &AtomicU8,
+        status: crate::session_protocol::DurabilityStatus,
+    ) {
+        use crate::session_protocol::DurabilityStatus;
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = durability_status_from_code(current.load(Ordering::Acquire));
+        let blocked = previous == DurabilityStatus::Superseded
+            || (previous == DurabilityStatus::Degraded
+                && !matches!(
+                    status,
+                    DurabilityStatus::Saved | DurabilityStatus::Superseded
+                ))
+            || (previous == DurabilityStatus::Saving && status == DurabilityStatus::Unsaved);
+        if previous == status || blocked {
+            return;
+        }
+        current.store(durability_status_code(status), Ordering::Release);
+        let _ = self.emit_locked(SessionEvent::DurabilityStatusChanged { status });
+    }
+
+    fn capture_sequence<T>(&self, capture: impl FnOnce() -> T) -> (u64, T) {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = *self
+            .sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (sequence, capture())
     }
 
     pub fn subscribe(
@@ -628,6 +669,32 @@ pub(crate) enum PersistenceHealth {
     Dirty,
     Degraded { retryable: bool },
     Superseded,
+}
+
+fn durability_status_code(status: crate::session_protocol::DurabilityStatus) -> u8 {
+    use crate::session_protocol::DurabilityStatus;
+    match status {
+        DurabilityStatus::Saved => 0,
+        DurabilityStatus::Unsaved => 1,
+        DurabilityStatus::Saving => 2,
+        DurabilityStatus::Degraded => 3,
+        DurabilityStatus::Superseded => 4,
+    }
+}
+
+fn durability_status_from_code(code: u8) -> crate::session_protocol::DurabilityStatus {
+    use crate::session_protocol::DurabilityStatus;
+    match code {
+        1 => DurabilityStatus::Unsaved,
+        2 => DurabilityStatus::Saving,
+        3 => DurabilityStatus::Degraded,
+        4 => DurabilityStatus::Superseded,
+        0 => DurabilityStatus::Saved,
+        _ => {
+            debug_assert!(false, "unknown durability status code {code}");
+            DurabilityStatus::Degraded
+        }
+    }
 }
 
 struct SessionPersistenceState {
@@ -930,6 +997,7 @@ pub struct SessionCore {
     persistence_gate: tokio::sync::Mutex<()>,
     persistence_requested: AtomicU64,
     persistence_completed: AtomicU64,
+    durability_status: AtomicU8,
     persistence: Option<SessionPersistence>,
 }
 
@@ -1076,6 +1144,9 @@ impl SessionCore {
             persistence_gate: tokio::sync::Mutex::new(()),
             persistence_requested: AtomicU64::new(0),
             persistence_completed: AtomicU64::new(0),
+            durability_status: AtomicU8::new(durability_status_code(
+                crate::session_protocol::DurabilityStatus::Saved,
+            )),
             persistence,
         }
     }
@@ -1303,11 +1374,15 @@ impl SessionCore {
             return;
         };
         let request = self.persistence_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.durability_status() != crate::session_protocol::DurabilityStatus::Saving {
+            self.publish_durability_status(crate::session_protocol::DurabilityStatus::Unsaved);
+        }
         let _gate = self.persistence_gate.lock().await;
         if self.persistence_completed.load(Ordering::Acquire) >= request {
             return;
         }
         persistence.mark_dirty();
+        self.publish_durability_status(crate::session_protocol::DurabilityStatus::Saving);
 
         let policy = persistence.retry_policy;
         let handled_request = self.persistence_requested.load(Ordering::Acquire);
@@ -1327,6 +1402,7 @@ impl SessionCore {
                         .fetch_max(handled_request, Ordering::AcqRel);
                     persistence
                         .mark_clean_if_fully_handled(handled_request, &self.persistence_requested);
+                    self.publish_completed_durability(persistence);
                     return;
                 }
                 Ok(PersistenceSaveOutcome::SkippedStale { stored_generation }) => {
@@ -1343,6 +1419,9 @@ impl SessionCore {
                             attempts,
                             "session payload remains dirty after repeated stale captures"
                         );
+                        self.publish_durability_status(
+                            crate::session_protocol::DurabilityStatus::Unsaved,
+                        );
                         return;
                     }
                     tokio::time::sleep(delay).await;
@@ -1352,6 +1431,7 @@ impl SessionCore {
                 Ok(PersistenceSaveOutcome::SkippedDeleted) => {
                     self.persistence_completed
                         .fetch_max(handled_request, Ordering::AcqRel);
+                    self.publish_completed_durability(persistence);
                     return;
                 }
                 Ok(PersistenceSaveOutcome::Superseded) => {
@@ -1361,6 +1441,9 @@ impl SessionCore {
                         target: "daimonos::session_core",
                         event = "session_writer_superseded",
                         "session persistence stopped because a newer runtime claimed ownership"
+                    );
+                    self.publish_durability_status(
+                        crate::session_protocol::DurabilityStatus::Superseded,
                     );
                     return;
                 }
@@ -1377,6 +1460,9 @@ impl SessionCore {
                             retryable,
                             error = %error,
                             "session payload remains degraded after bounded save attempts"
+                        );
+                        self.publish_durability_status(
+                            crate::session_protocol::DurabilityStatus::Degraded,
                         );
                         return;
                     }
@@ -1428,6 +1514,27 @@ impl SessionCore {
             .map_or(PersistenceHealth::Clean, SessionPersistence::health)
     }
 
+    pub fn durability_status(&self) -> crate::session_protocol::DurabilityStatus {
+        durability_status_from_code(self.durability_status.load(Ordering::Acquire))
+    }
+
+    fn publish_durability_status(&self, status: crate::session_protocol::DurabilityStatus) {
+        self.events
+            .transition_durability(&self.durability_status, status);
+    }
+
+    fn publish_completed_durability(&self, persistence: &SessionPersistence) {
+        let status = if self.persistence_requested.load(Ordering::Acquire)
+            <= self.persistence_completed.load(Ordering::Acquire)
+            && persistence.health() == PersistenceHealth::Clean
+        {
+            crate::session_protocol::DurabilityStatus::Saved
+        } else {
+            crate::session_protocol::DurabilityStatus::Unsaved
+        };
+        self.publish_durability_status(status);
+    }
+
     pub(crate) fn initialize_persistence_generation(&self, generation: u64) {
         self.persistence_generation
             .store(generation, Ordering::Release);
@@ -1469,52 +1576,82 @@ impl SessionCore {
         max_entries: usize,
     ) -> crate::session_protocol::SessionSnapshot {
         use crate::providers::{ContentBlock, Role};
-        use crate::session_protocol::{
-            ToolCallState, ToolCallStateStatus, TranscriptEntry, TranscriptRole,
-        };
+        use crate::session_protocol::{TimelineEntryKind, ToolCallStateStatus};
+        use crate::session_timeline::TimelineReducer;
 
         let session = self.session.lock().await;
-        let mut transcript = Vec::new();
-        let mut tool_calls: Vec<ToolCallState> = Vec::new();
-        let mut next_transcript_id = 1_u64;
+        let outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut timeline = TimelineReducer::new(max_entries);
+        let mut outcome_index = 0;
+        let mut turn_started = false;
         for message in session.history() {
+            let starts_turn = message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text(_)));
+            if starts_turn {
+                if turn_started {
+                    if let Some(outcome) = outcomes.get(outcome_index) {
+                        timeline.push_reconstructed(TimelineEntryKind::Outcome {
+                            outcome: outcome.clone(),
+                        });
+                    }
+                    outcome_index += 1;
+                }
+                turn_started = true;
+            }
+
+            let mut pending_text: Option<(ReconstructedTextKind, String)> = None;
+            let flush_text = |pending: &mut Option<(ReconstructedTextKind, String)>,
+                              timeline: &mut TimelineReducer| {
+                if let Some((kind, text)) = pending.take() {
+                    timeline.push_reconstructed(kind.into_entry(text));
+                }
+            };
             for block in &message.content {
                 match block {
                     ContentBlock::Text(text) => {
-                        transcript.push(TranscriptEntry {
-                            id: next_transcript_id,
-                            role: match message.role {
-                                Role::User => TranscriptRole::User,
-                                Role::Assistant => TranscriptRole::Assistant,
-                            },
-                            text: text.clone(),
-                            outcome: None,
-                        });
-                        next_transcript_id = next_transcript_id.saturating_add(1);
+                        let kind = match message.role {
+                            Role::User => ReconstructedTextKind::User,
+                            Role::Assistant => ReconstructedTextKind::Assistant,
+                        };
+                        match &mut pending_text {
+                            Some((pending_kind, pending)) if *pending_kind == kind => {
+                                pending.push_str(text);
+                            }
+                            _ => {
+                                flush_text(&mut pending_text, &mut timeline);
+                                pending_text = Some((kind, text.clone()));
+                            }
+                        }
                     }
                     ContentBlock::Thinking(text) => {
-                        transcript.push(TranscriptEntry {
-                            id: next_transcript_id,
-                            role: TranscriptRole::Thought,
-                            text: text.clone(),
-                            outcome: None,
-                        });
-                        next_transcript_id = next_transcript_id.saturating_add(1);
+                        let kind = ReconstructedTextKind::Thought;
+                        match &mut pending_text {
+                            Some((pending_kind, pending)) if *pending_kind == kind => {
+                                pending.push_str(text);
+                            }
+                            _ => {
+                                flush_text(&mut pending_text, &mut timeline);
+                                pending_text = Some((kind, text.clone()));
+                            }
+                        }
                     }
                     ContentBlock::ToolCall { id, name, .. } => {
-                        tool_calls.push(ToolCallState {
-                            id: id.clone(),
-                            name: name.clone(),
-                            title: name.clone(),
-                            status: ToolCallStateStatus::InProgress,
-                            output: None,
-                        });
+                        flush_text(&mut pending_text, &mut timeline);
+                        timeline.start_reconstructed_tool(id.clone(), name.clone(), name.clone());
                     }
                     ContentBlock::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
                     } => {
+                        flush_text(&mut pending_text, &mut timeline);
                         let status = if content == crate::agent::INTERRUPTED_TOOL_RESULT {
                             ToolCallStateStatus::Cancelled
                         } else if *is_error {
@@ -1522,41 +1659,43 @@ impl SessionCore {
                         } else {
                             ToolCallStateStatus::Completed
                         };
-                        apply_restored_tool_result(
-                            &mut tool_calls,
+                        timeline.update_reconstructed_tool(
                             tool_use_id,
                             status,
                             self.tool_lifecycle.project_output(content),
                         );
                     }
-                    ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {}
+                    ContentBlock::Image { .. } | ContentBlock::ProviderState { .. } => {
+                        flush_text(&mut pending_text, &mut timeline);
+                    }
                 }
             }
+            flush_text(&mut pending_text, &mut timeline);
         }
         drop(session);
-        let outcomes = self
-            .assistant_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        apply_persisted_outcomes(&mut transcript, &outcomes);
-        for call in &mut tool_calls {
-            if call.status == ToolCallStateStatus::InProgress {
-                call.status = ToolCallStateStatus::Cancelled;
+        if turn_started {
+            if let Some(outcome) = outcomes.get(outcome_index) {
+                timeline.push_reconstructed(TimelineEntryKind::Outcome {
+                    outcome: outcome.clone(),
+                });
             }
         }
-        trim_oldest(&mut transcript, max_entries.max(1));
-        trim_oldest(&mut tool_calls, max_entries.max(1));
+        timeline.cancel_reconstructed_active_tools();
+        let (timeline, active_tools, history_window) = timeline.into_parts();
+        let (snapshot_seq, durability_status) =
+            self.events.capture_sequence(|| self.durability_status());
         crate::session_protocol::SessionSnapshot {
             session_id,
-            seq: self.events.latest_sequence(),
+            seq: snapshot_seq,
             turn_status: if self.turn.is_active() {
                 TurnStatus::Running
             } else {
                 TurnStatus::Idle
             },
-            transcript,
-            tool_calls,
+            durability_status,
+            timeline,
+            active_tools,
+            history_window,
             pending_approvals: self.approvals.pending(),
             runtime_options: self.runtime_options(),
             context_usage: self
@@ -1564,7 +1703,6 @@ impl SessionCore {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
-            history_truncated: false,
         }
     }
 
@@ -1651,6 +1789,9 @@ impl SessionCore {
             .prepare_model(&mut agent_session, &model)
             .await
             .map_err(SessionPromptError::Model)?;
+        if self.persistence.is_some() {
+            self.publish_durability_status(crate::session_protocol::DurabilityStatus::Unsaved);
+        }
         let _ = self.events.emit(SessionEvent::UserMessage {
             text: canonical_user_text,
             request_id: event_request_id,
@@ -1750,89 +1891,30 @@ fn usd_to_micros(value: f64) -> u64 {
     (value * 1_000_000.0).round().min(u64::MAX as f64) as u64
 }
 
-fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) {
-    let excess = entries.len().saturating_sub(max_entries);
-    if excess > 0 {
-        entries.drain(..excess);
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconstructedTextKind {
+    User,
+    Assistant,
+    Thought,
 }
 
-fn apply_persisted_outcomes(
-    transcript: &mut Vec<crate::session_protocol::TranscriptEntry>,
-    outcomes: &[AssistantOutcome],
-) {
-    use crate::session_protocol::{TranscriptEntry, TranscriptRole};
-
-    let mut rebuilt = Vec::with_capacity(transcript.len() + outcomes.len());
-    let mut turn_start = None;
-    let mut outcome_index = 0;
-    let mut next_id = transcript
-        .iter()
-        .map(|entry| entry.id)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let finalize = |entries: &mut Vec<TranscriptEntry>,
-                    start: usize,
-                    outcome: Option<&AssistantOutcome>,
-                    next_id: &mut u64| {
-        let Some(outcome) = outcome else {
-            return;
-        };
-        if let Some(entry) = entries[start..]
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.role == TranscriptRole::Assistant)
-        {
-            entry.outcome = Some(outcome.clone());
-        } else {
-            entries.push(TranscriptEntry {
-                id: *next_id,
-                role: TranscriptRole::Assistant,
-                text: String::new(),
-                outcome: Some(outcome.clone()),
-            });
-            *next_id = next_id.saturating_add(1);
+impl ReconstructedTextKind {
+    fn into_entry(self, text: String) -> crate::session_protocol::TimelineEntryKind {
+        use crate::session_protocol::TimelineEntryKind;
+        match self {
+            Self::User => TimelineEntryKind::User {
+                text,
+                content_truncated: false,
+            },
+            Self::Assistant => TimelineEntryKind::Assistant {
+                text,
+                content_truncated: false,
+            },
+            Self::Thought => TimelineEntryKind::Thought {
+                text,
+                content_truncated: false,
+            },
         }
-    };
-    for entry in transcript.drain(..) {
-        if entry.role == TranscriptRole::User {
-            if let Some(start) = turn_start.take() {
-                finalize(
-                    &mut rebuilt,
-                    start,
-                    outcomes.get(outcome_index),
-                    &mut next_id,
-                );
-                outcome_index += 1;
-            }
-            turn_start = Some(rebuilt.len());
-        }
-        rebuilt.push(entry);
-    }
-    if let Some(start) = turn_start {
-        finalize(
-            &mut rebuilt,
-            start,
-            outcomes.get(outcome_index),
-            &mut next_id,
-        );
-    }
-    *transcript = rebuilt;
-}
-
-fn apply_restored_tool_result(
-    tool_calls: &mut [crate::session_protocol::ToolCallState],
-    tool_use_id: &str,
-    status: crate::session_protocol::ToolCallStateStatus,
-    output: String,
-) {
-    if let Some(call) = tool_calls.iter_mut().find(|call| {
-        call.id == tool_use_id
-            && call.status == crate::session_protocol::ToolCallStateStatus::InProgress
-    }) {
-        call.status = status;
-        call.output = Some(output);
     }
 }
 
@@ -3919,6 +4001,10 @@ mod tests {
                 "emit(CoreSessionEvent::ContextUsageChanged",
             ),
             ("TurnStatusChanged", "emit(SessionEvent::TurnStatusChanged"),
+            (
+                "DurabilityStatusChanged",
+                "emit_locked(SessionEvent::DurabilityStatusChanged",
+            ),
             ("SessionEnding", "emit(CoreSessionEvent::SessionEnding"),
         ] {
             assert!(
@@ -4019,37 +4105,30 @@ mod tests {
     }
 
     #[test]
-    fn restored_duplicate_tool_ids_pair_results_in_occurrence_order() {
-        let mut calls = vec![
-            crate::session_protocol::ToolCallState {
-                id: "duplicate".to_string(),
-                name: "first".to_string(),
-                title: "first".to_string(),
-                status: crate::session_protocol::ToolCallStateStatus::InProgress,
-                output: None,
-            },
-            crate::session_protocol::ToolCallState {
-                id: "duplicate".to_string(),
-                name: "second".to_string(),
-                title: "second".to_string(),
-                status: crate::session_protocol::ToolCallStateStatus::InProgress,
-                output: None,
-            },
-        ];
-        apply_restored_tool_result(
-            &mut calls,
+    fn restored_duplicate_tool_ids_update_newest_nonterminal_occurrence() {
+        let mut timeline = crate::session_timeline::TimelineReducer::new(8);
+        timeline.start_reconstructed_tool(
+            "duplicate".to_string(),
+            "first".to_string(),
+            "first".to_string(),
+        );
+        timeline.start_reconstructed_tool(
+            "duplicate".to_string(),
+            "second".to_string(),
+            "second".to_string(),
+        );
+        timeline.update_reconstructed_tool(
             "duplicate",
             crate::session_protocol::ToolCallStateStatus::Completed,
             "first output".to_string(),
         );
-        apply_restored_tool_result(
-            &mut calls,
-            "duplicate",
-            crate::session_protocol::ToolCallStateStatus::Completed,
-            "second output".to_string(),
-        );
-        assert_eq!(calls[0].output.as_deref(), Some("first output"));
-        assert_eq!(calls[1].output.as_deref(), Some("second output"));
+        assert!(matches!(
+            &timeline.timeline()[1].entry,
+            crate::session_protocol::TimelineEntryKind::Tool {
+                output: Some(output),
+                ..
+            } if output == "first output"
+        ));
     }
 
     #[test]
@@ -4322,6 +4401,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconstructed_timeline_matches_live_event_fold() {
+        use crate::providers::{ContentBlock, Message, Role};
+        use crate::session_protocol::{AssistantOutcome, SessionEvent, ToolCallStateStatus};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store,
+            PersistenceRetryPolicy::new(
+                3,
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+            ),
+        );
+        let core = persistence_test_core(directory.path(), persistence);
+        core.session.lock().await.set_history(vec![
+            Message::user("question"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("before".to_string()),
+                    ContentBlock::ToolCall {
+                        id: "call_0".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_0".to_string(),
+                    content: "ok".to_string(),
+                    is_error: false,
+                }],
+            },
+            Message::assistant("after"),
+        ]);
+        core.assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(AssistantOutcome::Completed);
+
+        let restored = core.initial_snapshot("session-1".to_string(), 32).await;
+        let mut live = crate::session_timeline::TimelineReducer::new(32);
+        for event in [
+            SessionEvent::UserMessage {
+                text: "question".to_string(),
+                request_id: None,
+            },
+            SessionEvent::AssistantDelta {
+                text: "before".to_string(),
+            },
+            SessionEvent::ToolCallStarted {
+                id: "call_0".to_string(),
+                name: "read".to_string(),
+                title: "read".to_string(),
+                input_summary: None,
+            },
+            SessionEvent::ToolCallUpdated {
+                id: "call_0".to_string(),
+                status: ToolCallStateStatus::InProgress,
+            },
+            SessionEvent::ToolCallFinished {
+                id: "call_0".to_string(),
+                status: ToolCallStateStatus::Completed,
+                output: "ok".to_string(),
+            },
+            SessionEvent::AssistantDelta {
+                text: "after".to_string(),
+            },
+            SessionEvent::AssistantDone {
+                outcome: AssistantOutcome::Completed,
+            },
+        ] {
+            live.apply(event);
+        }
+
+        assert_eq!(restored.timeline, live.timeline());
+        assert_eq!(restored.active_tools, live.active_tools());
+        assert_eq!(restored.history_window, *live.history_window());
+    }
+
+    #[tokio::test]
     async fn retryable_save_failure_recaptures_and_recovers() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions"));
@@ -4342,6 +4506,198 @@ mod tests {
         assert_eq!(core.persistence_generation.load(Ordering::Acquire), 2);
         assert_eq!(core.persistence_health(), PersistenceHealth::Clean);
         assert!(store.load("session-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn durability_events_emit_only_visible_success_transitions() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Saved,
+            ]
+        );
+        assert_eq!(core.durability_status(), DurabilityStatus::Saved);
+    }
+
+    #[test]
+    fn durability_snapshot_and_event_share_sequence_ordering() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let core = persistence_test_core(
+            directory.path(),
+            SessionPersistence::new(
+                "session-1",
+                SessionStore::new(directory.path().join("sessions")),
+                PersistenceRetryPolicy::single_attempt(),
+            ),
+        );
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |seq, event| captured.lock().unwrap().push((seq, event))),
+            )
+            .unwrap();
+        let dispatch = core
+            .events
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let publishing = Arc::clone(&core);
+        let publish = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            publishing.publish_durability_status(DurabilityStatus::Degraded);
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(core.durability_status(), DurabilityStatus::Saved);
+        drop(dispatch);
+        publish.join().unwrap();
+
+        let (seq, status) = core.events.capture_sequence(|| core.durability_status());
+        assert_eq!(seq, 1);
+        assert_eq!(status, DurabilityStatus::Degraded);
+        assert!(matches!(
+            observed.lock().unwrap().as_slice(),
+            [(
+                1,
+                SessionEvent::DurabilityStatusChanged {
+                    status: DurabilityStatus::Degraded
+                }
+            )]
+        ));
+    }
+
+    #[test]
+    fn durability_transition_policy_preserves_inflight_and_terminal_truth() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let core = persistence_test_core(
+            directory.path(),
+            SessionPersistence::new(
+                "session-1",
+                SessionStore::new(directory.path().join("sessions")),
+                PersistenceRetryPolicy::single_attempt(),
+            ),
+        );
+        core.publish_durability_status(DurabilityStatus::Saving);
+        core.publish_durability_status(DurabilityStatus::Unsaved);
+        assert_eq!(core.durability_status(), DurabilityStatus::Saving);
+
+        core.publish_durability_status(DurabilityStatus::Degraded);
+        core.publish_durability_status(DurabilityStatus::Unsaved);
+        core.publish_durability_status(DurabilityStatus::Saving);
+        assert_eq!(core.durability_status(), DurabilityStatus::Degraded);
+
+        core.publish_durability_status(DurabilityStatus::Superseded);
+        core.publish_durability_status(DurabilityStatus::Saved);
+        assert_eq!(core.durability_status(), DurabilityStatus::Superseded);
+    }
+
+    #[tokio::test]
+    async fn durability_retry_exhaustion_emits_degraded_once() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::new(2, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.fail_saves([
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+        ]);
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Degraded,
+            ]
+        );
+        assert_eq!(core.durability_status(), DurabilityStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn durability_retry_does_not_publish_transient_degraded_state() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::new(2, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Saved,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -4556,6 +4912,10 @@ mod tests {
         new_core.persist_current().await;
 
         assert_eq!(old_core.persistence_health(), PersistenceHealth::Superseded);
+        assert_eq!(
+            old_core.durability_status(),
+            crate::session_protocol::DurabilityStatus::Superseded
+        );
         let loaded = store.load_result("session-1").unwrap();
         assert_eq!(loaded.generation, 2);
         assert!(matches!(

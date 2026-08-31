@@ -1,7 +1,7 @@
 [
   {
     "type": "resume",
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "session-fixture",
     "last_seen_seq": 8,
     "ticket": null,

@@ -16,9 +16,11 @@
 //! ADR-010 and keeps every rendering layer a pure function of `ViewState`.
 
 use crate::session_protocol::{
-    ApprovalRequest, AssistantOutcome, ContextUsage, RuntimeOption, SessionEvent, SessionSnapshot,
-    ToolCallState, ToolCallStateStatus, TranscriptEntry, TranscriptRole, TurnStatus,
+    ActiveToolState, ApprovalRequest, AssistantOutcome, ContextUsage, DurabilityStatus,
+    HistoryWindow, RuntimeOption, SessionEvent, SessionSnapshot, TimelineEntry, TimelineEntryKind,
+    ToolCallState, TranscriptRole, TurnStatus,
 };
+use crate::session_timeline::TimelineReducer;
 
 /// One rendered line of the conversation transcript.
 ///
@@ -66,12 +68,14 @@ pub struct ViewState {
     /// (sequence numbers from the router are 1-based).
     last_seq: u64,
     turn_status: TurnStatus,
+    durability_status: DurabilityStatus,
+    timeline: TimelineReducer,
+    // Temporary compatibility projections for callers not yet timeline-aware.
     transcript: Vec<ViewLine>,
     tool_calls: Vec<ToolCallState>,
     pending_approvals: Vec<ApprovalRequest>,
     runtime_options: Vec<RuntimeOption>,
     context_usage: Option<ContextUsage>,
-    history_truncated: bool,
     max_scrollback_entries: usize,
     /// Set once a `SessionEnding` event arrives; a renderer can surface this
     /// and stop accepting input.
@@ -92,12 +96,13 @@ impl ViewState {
             session_id: session_id.into(),
             last_seq: 0,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
+            timeline: TimelineReducer::new(max_scrollback_entries),
             transcript: Vec::new(),
             tool_calls: Vec::new(),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: false,
             max_scrollback_entries: max_scrollback_entries.max(1),
             ending_reason: None,
         }
@@ -113,6 +118,18 @@ impl ViewState {
     }
     pub fn turn_status(&self) -> TurnStatus {
         self.turn_status
+    }
+    pub fn durability_status(&self) -> DurabilityStatus {
+        self.durability_status
+    }
+    pub fn timeline(&self) -> &[TimelineEntry] {
+        self.timeline.timeline()
+    }
+    pub fn active_tools(&self) -> &[ActiveToolState] {
+        self.timeline.active_tools()
+    }
+    pub fn history_window(&self) -> &HistoryWindow {
+        self.timeline.history_window()
     }
     pub fn transcript(&self) -> &[ViewLine] {
         &self.transcript
@@ -130,7 +147,7 @@ impl ViewState {
         self.context_usage.as_ref()
     }
     pub fn history_truncated(&self) -> bool {
-        self.history_truncated
+        self.timeline.history_window().is_truncated()
     }
     pub fn ending_reason(&self) -> Option<&str> {
         self.ending_reason.as_deref()
@@ -145,19 +162,16 @@ impl ViewState {
     /// Session identity, runtime options, usage, and sequence ordering remain
     /// intact; the backing [`AgentSession`] clears its model history separately.
     pub fn clear_transcript(&mut self) {
-        self.transcript.clear();
-        self.tool_calls.clear();
+        self.timeline.clear();
+        self.sync_projection();
     }
 
     /// Append a committed frontend-local notice without changing session
     /// sequencing. Slash-command help and validation use this for information
     /// that is intentionally not sent to the model or daemon.
     pub fn push_system_message(&mut self, text: impl Into<String>) {
-        self.close_open_line();
-        self.transcript
-            .push(ViewLine::committed(TranscriptRole::System, text.into()));
-        let truncated = self.trim_scrollback();
-        self.history_truncated |= truncated;
+        self.timeline.push_system(text.into());
+        self.sync_projection();
     }
 
     // ---- snapshot application (attach / reconnect) -----------------------
@@ -168,12 +182,13 @@ impl ViewState {
         self.session_id = session_id;
         self.last_seq = seq;
         self.turn_status = TurnStatus::Idle;
+        self.durability_status = DurabilityStatus::Saved;
+        self.timeline.clear();
         self.transcript.clear();
         self.tool_calls.clear();
         self.pending_approvals.clear();
         self.runtime_options.clear();
         self.context_usage = None;
-        self.history_truncated = false;
         self.ending_reason = None;
     }
 
@@ -186,20 +201,17 @@ impl ViewState {
         self.session_id = snapshot.session_id;
         self.last_seq = snapshot.seq;
         self.turn_status = snapshot.turn_status;
-        self.transcript = snapshot
-            .transcript
-            .into_iter()
-            .flat_map(transcript_entry_to_lines)
-            .collect();
-        self.tool_calls = snapshot.tool_calls;
+        self.durability_status = snapshot.durability_status;
+        self.timeline = TimelineReducer::from_parts(
+            snapshot.timeline,
+            snapshot.active_tools,
+            snapshot.history_window,
+            self.max_scrollback_entries,
+        );
         self.pending_approvals = snapshot.pending_approvals;
         self.runtime_options = snapshot.runtime_options;
         self.context_usage = snapshot.context_usage;
-        // Preserve either source of omitted history: daemon-side snapshot
-        // bounding and this frontend's independently configured scrollback.
-        self.history_truncated = snapshot.history_truncated;
-        let truncated = self.trim_scrollback();
-        self.history_truncated |= truncated;
+        self.sync_projection();
         // A snapshot is a full canonical resync of live session state, so any
         // `ending_reason` observed before a reconnect must clear: if the
         // session were really ending, that would arrive again as a fresh
@@ -225,61 +237,21 @@ impl ViewState {
             };
         }
         self.last_seq = seq;
+        self.timeline.apply(event.clone());
         self.apply_event_body(event);
-        let truncated = self.trim_scrollback();
-        self.history_truncated |= truncated;
+        self.sync_projection();
         ApplyOutcome::Applied
     }
 
     fn apply_event_body(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::UserMessage { text, .. } => {
-                self.close_open_line();
-                self.transcript
-                    .push(ViewLine::committed(TranscriptRole::User, text));
-            }
-            SessionEvent::AssistantDelta { text } => {
-                self.append_streaming(TranscriptRole::Assistant, &text);
-            }
-            SessionEvent::ThoughtDelta { text } => {
-                self.append_streaming(TranscriptRole::Thought, &text);
-            }
-            SessionEvent::AssistantDone { outcome } => {
-                self.close_open_line();
-                if let Some(note) = outcome_note(&outcome) {
-                    self.transcript
-                        .push(ViewLine::committed(TranscriptRole::System, note));
-                }
-            }
-            SessionEvent::ToolCallStarted {
-                id,
-                name,
-                title,
-                input_summary: _,
-            } => {
-                let call = ToolCallState {
-                    id: id.clone(),
-                    name,
-                    title,
-                    status: ToolCallStateStatus::Pending,
-                    output: None,
-                };
-                match self.tool_calls.iter_mut().find(|c| c.id == id) {
-                    Some(existing) => *existing = call,
-                    None => self.tool_calls.push(call),
-                }
-            }
-            SessionEvent::ToolCallUpdated { id, status } => {
-                if let Some(call) = self.tool_calls.iter_mut().find(|c| c.id == id) {
-                    call.status = status;
-                }
-            }
-            SessionEvent::ToolCallFinished { id, status, output } => {
-                if let Some(call) = self.tool_calls.iter_mut().find(|c| c.id == id) {
-                    call.status = status;
-                    call.output = Some(output);
-                }
-            }
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantDelta { .. }
+            | SessionEvent::ThoughtDelta { .. }
+            | SessionEvent::AssistantDone { .. }
+            | SessionEvent::ToolCallStarted { .. }
+            | SessionEvent::ToolCallUpdated { .. }
+            | SessionEvent::ToolCallFinished { .. } => {}
             SessionEvent::ApprovalRequested { request } => {
                 if !self.pending_approvals.iter().any(|a| a.id == request.id) {
                     self.pending_approvals.push(request);
@@ -309,71 +281,71 @@ impl ViewState {
                 self.context_usage = Some(usage);
             }
             SessionEvent::ConversationCleared => {
-                self.transcript.clear();
-                self.tool_calls.clear();
                 self.pending_approvals.clear();
-                self.history_truncated = false;
                 self.ending_reason = None;
             }
             SessionEvent::TurnStatusChanged { status } => {
                 self.turn_status = status;
             }
+            SessionEvent::DurabilityStatusChanged { status } => {
+                self.durability_status = status;
+            }
             SessionEvent::SessionEnding { reason } => {
-                self.close_open_line();
                 self.ending_reason = Some(reason);
             }
         }
     }
 
-    /// Append streamed text to the trailing open line if it matches `role`;
-    /// otherwise close any open line and start a new open one.
-    fn append_streaming(&mut self, role: TranscriptRole, text: &str) {
-        if let Some(last) = self.transcript.last_mut() {
-            if last.open && last.role == role {
-                last.text.push_str(text);
-                return;
-            }
-        }
-        self.close_open_line();
-        self.transcript.push(ViewLine {
-            role,
-            text: text.to_string(),
-            open: true,
-        });
+    fn sync_projection(&mut self) {
+        self.transcript = self
+            .timeline
+            .timeline()
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                TimelineEntryKind::User { text, .. } => {
+                    Some(ViewLine::committed(TranscriptRole::User, text.clone()))
+                }
+                TimelineEntryKind::Assistant { text, .. } => Some(ViewLine {
+                    role: TranscriptRole::Assistant,
+                    text: text.clone(),
+                    open: self.timeline.is_open(entry.id),
+                }),
+                TimelineEntryKind::Thought { text, .. } => Some(ViewLine {
+                    role: TranscriptRole::Thought,
+                    text: text.clone(),
+                    open: self.timeline.is_open(entry.id),
+                }),
+                TimelineEntryKind::System { text, .. } => {
+                    Some(ViewLine::committed(TranscriptRole::System, text.clone()))
+                }
+                TimelineEntryKind::Outcome { outcome } => outcome_note(outcome)
+                    .map(|note| ViewLine::committed(TranscriptRole::System, note)),
+                TimelineEntryKind::Tool { .. } => None,
+            })
+            .collect();
+        self.tool_calls = self
+            .timeline
+            .timeline()
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                TimelineEntryKind::Tool {
+                    tool_call_id,
+                    name,
+                    title,
+                    status,
+                    output,
+                    ..
+                } => Some(ToolCallState {
+                    id: tool_call_id.clone(),
+                    name: name.clone(),
+                    title: title.clone(),
+                    status: *status,
+                    output: output.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
     }
-
-    /// Mark the trailing line committed if it is currently open. Only the last
-    /// line can ever be open, so this is sufficient to "seal" streaming state.
-    fn close_open_line(&mut self) {
-        if let Some(last) = self.transcript.last_mut() {
-            last.open = false;
-        }
-    }
-
-    fn trim_scrollback(&mut self) -> bool {
-        trim_oldest(&mut self.transcript, self.max_scrollback_entries)
-            | trim_oldest(&mut self.tool_calls, self.max_scrollback_entries)
-    }
-}
-
-fn trim_oldest<T>(entries: &mut Vec<T>, max_entries: usize) -> bool {
-    let excess = entries.len().saturating_sub(max_entries);
-    if excess > 0 {
-        entries.drain(..excess);
-    }
-    excess > 0
-}
-
-fn transcript_entry_to_lines(entry: TranscriptEntry) -> Vec<ViewLine> {
-    let mut lines = if entry.role == TranscriptRole::Assistant && entry.text.is_empty() {
-        Vec::new()
-    } else {
-        vec![ViewLine::committed(entry.role, entry.text)]
-    };
-    if let Some(note) = entry.outcome.as_ref().and_then(outcome_note) {
-        lines.push(ViewLine::committed(TranscriptRole::System, note));
-    }
-    lines
 }
 
 /// A privacy-safe system note appended to the transcript when a turn ends in a
@@ -391,7 +363,7 @@ fn outcome_note(outcome: &AssistantOutcome) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_protocol::ContextUsage;
+    use crate::session_protocol::{ContextUsage, ToolCallStateStatus};
 
     fn ev(state: &mut ViewState, seq: u64, event: SessionEvent) -> ApplyOutcome {
         state.apply_event(seq, event)
@@ -496,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_limit_keeps_newest_transcript_and_tool_entries() {
+    fn scrollback_limit_keeps_newest_ordered_timeline_entries() {
         let mut state = ViewState::with_scrollback_limit("sess-1", 2);
         for (seq, text) in [(1, "one"), (2, "two"), (3, "three")] {
             ev(
@@ -521,12 +493,12 @@ mod tests {
             );
         }
 
-        assert_eq!(state.transcript().len(), 2);
-        assert_eq!(state.transcript()[0].text, "two");
-        assert_eq!(state.transcript()[1].text, "three");
+        assert!(state.transcript().is_empty());
         assert_eq!(state.tool_calls().len(), 2);
         assert_eq!(state.tool_calls()[0].id, "t2");
         assert_eq!(state.tool_calls()[1].id, "t3");
+        assert_eq!(state.history_window().truncated_before, 4);
+        assert_eq!(state.history_window().retained, 2);
         assert!(state.history_truncated());
     }
 
@@ -836,25 +808,35 @@ mod tests {
             session_id: "sess-42".into(),
             seq: 10,
             turn_status: TurnStatus::Idle,
-            transcript: vec![
-                TranscriptEntry {
+            durability_status: DurabilityStatus::Saved,
+            timeline: vec![
+                TimelineEntry {
                     id: 1,
-                    role: TranscriptRole::User,
-                    text: "question".into(),
-                    outcome: None,
+                    order: 1,
+                    entry: TimelineEntryKind::User {
+                        text: "question".into(),
+                        content_truncated: false,
+                    },
                 },
-                TranscriptEntry {
+                TimelineEntry {
                     id: 2,
-                    role: TranscriptRole::Assistant,
-                    text: "answer".into(),
-                    outcome: None,
+                    order: 2,
+                    entry: TimelineEntryKind::Assistant {
+                        text: "answer".into(),
+                        content_truncated: false,
+                    },
                 },
             ],
-            tool_calls: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow {
+                truncated_before: 1,
+                retained: 2,
+                total: Some(3),
+                continuation: None,
+            },
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: true,
         };
         s.apply_snapshot(snap);
         assert_eq!(s.session_id(), "sess-42");
@@ -897,25 +879,30 @@ mod tests {
             session_id: "session".to_string(),
             seq: 2,
             turn_status: TurnStatus::Idle,
-            transcript: vec![
-                TranscriptEntry {
+            durability_status: DurabilityStatus::Saved,
+            timeline: vec![
+                TimelineEntry {
                     id: 1,
-                    role: TranscriptRole::User,
-                    text: "old".to_string(),
-                    outcome: None,
+                    order: 1,
+                    entry: TimelineEntryKind::User {
+                        text: "old".to_string(),
+                        content_truncated: false,
+                    },
                 },
-                TranscriptEntry {
+                TimelineEntry {
                     id: 2,
-                    role: TranscriptRole::Assistant,
-                    text: "new".to_string(),
-                    outcome: None,
+                    order: 2,
+                    entry: TimelineEntryKind::Assistant {
+                        text: "new".to_string(),
+                        content_truncated: false,
+                    },
                 },
             ],
-            tool_calls: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(2),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: false,
         });
         assert_eq!(state.transcript().len(), 1);
         assert_eq!(state.transcript()[0].text, "new");
@@ -949,17 +936,27 @@ mod tests {
             session_id: "session".to_string(),
             seq: 2,
             turn_status: TurnStatus::Idle,
-            transcript: vec![TranscriptEntry {
-                id: 1,
-                role: TranscriptRole::Assistant,
-                text: "partial".to_string(),
-                outcome: Some(outcome),
-            }],
-            tool_calls: Vec::new(),
+            durability_status: DurabilityStatus::Saved,
+            timeline: vec![
+                TimelineEntry {
+                    id: 1,
+                    order: 1,
+                    entry: TimelineEntryKind::Assistant {
+                        text: "partial".to_string(),
+                        content_truncated: false,
+                    },
+                },
+                TimelineEntry {
+                    id: 2,
+                    order: 2,
+                    entry: TimelineEntryKind::Outcome { outcome },
+                },
+            ],
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(2),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: false,
         });
 
         assert_eq!(restored.transcript(), live.transcript());
@@ -984,17 +981,17 @@ mod tests {
             session_id: "session".to_string(),
             seq: 1,
             turn_status: TurnStatus::Idle,
-            transcript: vec![TranscriptEntry {
+            durability_status: DurabilityStatus::Saved,
+            timeline: vec![TimelineEntry {
                 id: 1,
-                role: TranscriptRole::Assistant,
-                text: String::new(),
-                outcome: Some(outcome),
+                order: 1,
+                entry: TimelineEntryKind::Outcome { outcome },
             }],
-            tool_calls: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(1),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: false,
         });
         assert_eq!(restored.transcript(), live.transcript());
     }
@@ -1017,12 +1014,13 @@ mod tests {
             session_id: "sess-1".into(),
             seq: 9,
             turn_status: TurnStatus::Idle,
-            transcript: Vec::new(),
-            tool_calls: Vec::new(),
+            durability_status: DurabilityStatus::Saved,
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
             pending_approvals: Vec::new(),
             runtime_options: Vec::new(),
             context_usage: None,
-            history_truncated: false,
         };
         s.apply_snapshot(snap);
         assert_eq!(
@@ -1030,5 +1028,37 @@ mod tests {
             None,
             "stale ending_reason survived resync"
         );
+    }
+
+    #[test]
+    fn durability_status_applies_from_events_and_snapshot() {
+        let mut state = ViewState::new("session");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::DurabilityStatusChanged {
+                status: DurabilityStatus::Unsaved,
+            },
+        );
+        assert_eq!(state.durability_status(), DurabilityStatus::Unsaved);
+
+        let mut snapshot = SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 2,
+            turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Superseded,
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+        };
+        state.apply_snapshot(snapshot.clone());
+        assert_eq!(state.durability_status(), DurabilityStatus::Superseded);
+
+        snapshot.durability_status = DurabilityStatus::Degraded;
+        state.apply_snapshot(snapshot);
+        assert_eq!(state.durability_status(), DurabilityStatus::Degraded);
     }
 }

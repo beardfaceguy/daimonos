@@ -16,10 +16,10 @@ use crate::session_core::{
 };
 use crate::session_protocol::{
     AttachDeniedCode, ClientCapability, ClientInfo, ClientMessage, ProtocolLimits, ServerMessage,
-    SessionEvent, SessionListEntry, SessionSnapshot, SessionWorkspace, ToolCallState,
-    ToolCallStateStatus, TranscriptEntry, TranscriptRole,
+    SessionEvent, SessionListEntry, SessionSnapshot, SessionWorkspace, TimelineEntryKind,
 };
 use crate::session_store::{SessionSummary, SessionSummaryScan};
+use crate::session_timeline::TimelineReducer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOpenMode {
@@ -934,10 +934,13 @@ impl SessionDaemon {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let preview = snapshot
                     .snapshot
-                    .transcript
+                    .timeline
                     .iter()
-                    .find(|entry| entry.role == TranscriptRole::User)
-                    .and_then(|entry| entry.text.lines().next())
+                    .find_map(|entry| match &entry.entry {
+                        TimelineEntryKind::User { text, .. } => Some(text),
+                        _ => None,
+                    })
+                    .and_then(|text| text.lines().next())
                     .and_then(|line| {
                         crate::session_store::normalize_preview(
                             line,
@@ -2751,7 +2754,7 @@ fn accept_error_is_recoverable(error: &std::io::Error) -> bool {
 struct SnapshotState {
     snapshot: SessionSnapshot,
     max_entries: usize,
-    next_transcript_id: u64,
+    timeline: TimelineReducer,
 }
 
 impl SnapshotState {
@@ -2762,111 +2765,50 @@ impl SnapshotState {
                 session_id,
                 seq: 0,
                 turn_status: crate::session_protocol::TurnStatus::Idle,
-                transcript: Vec::new(),
-                tool_calls: Vec::new(),
+                durability_status: crate::session_protocol::DurabilityStatus::Saved,
+                timeline: Vec::new(),
+                active_tools: Vec::new(),
+                history_window: crate::session_protocol::HistoryWindow::complete(0),
                 pending_approvals: Vec::new(),
                 runtime_options: Vec::new(),
                 context_usage: None,
-                history_truncated: false,
             },
-            max_entries,
-            next_transcript_id: 1,
+            max_entries: max_entries.max(1),
+            timeline: TimelineReducer::new(max_entries),
         }
     }
 
     fn from_snapshot(mut snapshot: SessionSnapshot, max_entries: usize) -> Self {
         let max_entries = max_entries.max(1);
-        snapshot.history_truncated |= trim_oldest(&mut snapshot.transcript, max_entries);
-        snapshot.history_truncated |= trim_oldest(&mut snapshot.tool_calls, max_entries);
         // Runtime-option bounding does not omit conversation history.
         let _ = trim_oldest(&mut snapshot.runtime_options, max_entries);
-        let next_transcript_id = snapshot
-            .transcript
-            .iter()
-            .map(|entry| entry.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        Self {
+        let timeline = TimelineReducer::from_parts(
+            std::mem::take(&mut snapshot.timeline),
+            std::mem::take(&mut snapshot.active_tools),
+            snapshot.history_window.clone(),
+            max_entries,
+        );
+        let mut state = Self {
             snapshot,
             max_entries,
-            next_transcript_id,
-        }
+            timeline,
+        };
+        state.sync_timeline();
+        state
     }
 
     fn apply(&mut self, seq: u64, event: SessionEvent) {
         self.snapshot.seq = seq;
+        self.timeline.apply(event.clone());
         match event {
-            SessionEvent::UserMessage { text, .. } => {
-                self.push_transcript(TranscriptRole::User, text);
-            }
-            SessionEvent::AssistantDelta { text } => {
-                self.append_transcript(TranscriptRole::Assistant, text);
-            }
-            SessionEvent::ThoughtDelta { text } => {
-                self.append_transcript(TranscriptRole::Thought, text);
-            }
-            SessionEvent::AssistantDone { outcome } => {
-                if self
-                    .snapshot
-                    .transcript
-                    .last()
-                    .is_none_or(|entry| entry.role != TranscriptRole::Assistant)
-                {
-                    self.push_transcript(TranscriptRole::Assistant, String::new());
-                }
-                if let Some(entry) = self.snapshot.transcript.last_mut() {
-                    entry.outcome = Some(outcome);
-                }
-            }
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantDelta { .. }
+            | SessionEvent::ThoughtDelta { .. }
+            | SessionEvent::AssistantDone { .. }
+            | SessionEvent::ToolCallStarted { .. }
+            | SessionEvent::ToolCallUpdated { .. }
+            | SessionEvent::ToolCallFinished { .. } => {}
             SessionEvent::SessionEnding { .. } => {}
-            SessionEvent::ToolCallStarted {
-                id,
-                name,
-                title,
-                input_summary: _,
-            } => {
-                let call = ToolCallState {
-                    id: id.clone(),
-                    name,
-                    title,
-                    status: ToolCallStateStatus::Pending,
-                    output: None,
-                };
-                if let Some(existing) = self
-                    .snapshot
-                    .tool_calls
-                    .iter_mut()
-                    .find(|existing| existing.id == id)
-                {
-                    *existing = call;
-                } else {
-                    self.snapshot.tool_calls.push(call);
-                    self.snapshot.history_truncated |=
-                        trim_oldest(&mut self.snapshot.tool_calls, self.max_entries);
-                }
-            }
-            SessionEvent::ToolCallUpdated { id, status } => {
-                if let Some(call) = self
-                    .snapshot
-                    .tool_calls
-                    .iter_mut()
-                    .find(|call| call.id == id)
-                {
-                    call.status = status;
-                }
-            }
-            SessionEvent::ToolCallFinished { id, status, output } => {
-                if let Some(call) = self
-                    .snapshot
-                    .tool_calls
-                    .iter_mut()
-                    .find(|call| call.id == id)
-                {
-                    call.status = status;
-                    call.output = Some(output);
-                }
-            }
             SessionEvent::ApprovalRequested { request } => {
                 if !self
                     .snapshot
@@ -2906,38 +2848,22 @@ impl SnapshotState {
                 self.snapshot.context_usage = Some(usage);
             }
             SessionEvent::ConversationCleared => {
-                self.snapshot.transcript.clear();
-                self.snapshot.tool_calls.clear();
                 self.snapshot.pending_approvals.clear();
-                self.snapshot.history_truncated = false;
             }
             SessionEvent::TurnStatusChanged { status } => {
                 self.snapshot.turn_status = status;
             }
-        }
-    }
-
-    fn push_transcript(&mut self, role: TranscriptRole, text: String) {
-        let id = self.next_transcript_id;
-        self.next_transcript_id = self.next_transcript_id.saturating_add(1);
-        self.snapshot.transcript.push(TranscriptEntry {
-            id,
-            role,
-            text,
-            outcome: None,
-        });
-        self.snapshot.history_truncated |=
-            trim_oldest(&mut self.snapshot.transcript, self.max_entries);
-    }
-
-    fn append_transcript(&mut self, role: TranscriptRole, text: String) {
-        if let Some(last) = self.snapshot.transcript.last_mut() {
-            if last.role == role {
-                last.text.push_str(&text);
-                return;
+            SessionEvent::DurabilityStatusChanged { status } => {
+                self.snapshot.durability_status = status;
             }
         }
-        self.push_transcript(role, text);
+        self.sync_timeline();
+    }
+
+    fn sync_timeline(&mut self) {
+        self.snapshot.timeline = self.timeline.timeline().to_vec();
+        self.snapshot.active_tools = self.timeline.active_tools().to_vec();
+        self.snapshot.history_window = self.timeline.history_window().clone();
     }
 }
 
@@ -3009,55 +2935,82 @@ fn fit_snapshot_to_frame(
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
-    snapshot.history_truncated = true;
-    let mut stripped_output = false;
-    for call in &mut snapshot.tool_calls {
-        if tool_call_is_terminal(call) {
-            stripped_output |= call.output.is_some();
-            call.output = None;
+
+    // Payload-first fitting preserves the ordered window whenever possible.
+    // Every destructive content edit is explicit on the affected entry.
+    for entry in &mut snapshot.timeline {
+        match &mut entry.entry {
+            TimelineEntryKind::Tool {
+                output,
+                content_truncated,
+                ..
+            } if output.is_some() => {
+                *output = None;
+                *content_truncated = true;
+            }
+            _ => {}
         }
     }
-    snapshot.history_truncated |= stripped_output;
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
 
-    let transcript = std::mem::take(&mut snapshot.transcript);
+    for entry in &mut snapshot.timeline {
+        match &mut entry.entry {
+            TimelineEntryKind::User {
+                text,
+                content_truncated,
+            }
+            | TimelineEntryKind::Assistant {
+                text,
+                content_truncated,
+            }
+            | TimelineEntryKind::Thought {
+                text,
+                content_truncated,
+            }
+            | TimelineEntryKind::System {
+                text,
+                content_truncated,
+            } if !text.is_empty() => {
+                text.clear();
+                *content_truncated = true;
+            }
+            TimelineEntryKind::Tool {
+                name,
+                title,
+                content_truncated,
+                ..
+            } if !name.is_empty() || !title.is_empty() => {
+                name.clear();
+                title.clear();
+                *content_truncated = true;
+            }
+            _ => {}
+        }
+    }
+    if fits(&snapshot)? {
+        return Ok(snapshot);
+    }
+
+    let timeline = std::mem::take(&mut snapshot.timeline);
+    let truncated_before = snapshot.history_window.truncated_before;
     let mut low = 0;
-    let mut high = transcript.len();
+    let mut high = timeline.len();
     while low < high {
         let middle = low + (high - low) / 2;
-        snapshot.transcript = transcript[middle..].to_vec();
+        snapshot.timeline = timeline[middle..].to_vec();
+        snapshot.history_window.truncated_before = truncated_before.saturating_add(middle as u64);
+        sync_history_window(&mut snapshot);
         if fits(&snapshot)? {
             high = middle;
         } else {
             low = middle + 1;
         }
     }
-    snapshot.transcript = transcript[low..].to_vec();
-    snapshot.history_truncated |= low > 0;
-    if fits(&snapshot)? {
-        return Ok(snapshot);
-    }
-
-    let tool_calls = std::mem::take(&mut snapshot.tool_calls);
-    let terminal_count = tool_calls
-        .iter()
-        .filter(|call| tool_call_is_terminal(call))
-        .count();
-    let mut low = 0;
-    let mut high = terminal_count;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        snapshot.tool_calls = tool_calls_without_oldest_terminal(&tool_calls, middle);
-        if fits(&snapshot)? {
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
-    }
-    snapshot.tool_calls = tool_calls_without_oldest_terminal(&tool_calls, low);
-    snapshot.history_truncated |= low > 0;
+    snapshot.timeline = timeline[low..].to_vec();
+    snapshot.history_window.truncated_before = truncated_before.saturating_add(low as u64);
+    sync_history_window(&mut snapshot);
     if fits(&snapshot)? {
         Ok(snapshot)
     } else {
@@ -3067,31 +3020,14 @@ fn fit_snapshot_to_frame(
     }
 }
 
-fn tool_call_is_terminal(call: &ToolCallState) -> bool {
-    matches!(
-        call.status,
-        ToolCallStateStatus::Completed
-            | ToolCallStateStatus::Failed
-            | ToolCallStateStatus::Cancelled
-    )
-}
-
-fn tool_calls_without_oldest_terminal(
-    tool_calls: &[ToolCallState],
-    drop_count: usize,
-) -> Vec<ToolCallState> {
-    let mut terminal_seen = 0;
-    tool_calls
-        .iter()
-        .filter_map(|call| {
-            if tool_call_is_terminal(call) && terminal_seen < drop_count {
-                terminal_seen += 1;
-                None
-            } else {
-                Some(call.clone())
-            }
-        })
-        .collect()
+fn sync_history_window(snapshot: &mut SessionSnapshot) {
+    snapshot.history_window.retained = snapshot.timeline.len();
+    snapshot.history_window.total = Some(
+        snapshot
+            .history_window
+            .truncated_before
+            .saturating_add(snapshot.timeline.len() as u64),
+    );
 }
 
 fn fit_session_list_to_frame(
@@ -3281,7 +3217,9 @@ mod tests {
     use crate::session_core::{
         ApprovalBroker, CanonicalToolLifecycle, SessionCompaction, SessionCore, SessionEventRouter,
     };
-    use crate::session_protocol::{ClientCapability, ClientInfo, ClientKind};
+    use crate::session_protocol::{
+        ClientCapability, ClientInfo, ClientKind, HistoryWindow, ToolCallStateStatus,
+    };
     use crate::{
         client_transport::in_memory_transport_pair,
         session_protocol::{ClientMessage, ProtocolLimits, ServerMessage},
@@ -3642,8 +3580,8 @@ mod tests {
         assert!(persisted.client_user_message_ids.is_empty());
         assert!(persisted.assistant_outcomes.is_empty());
         let snapshot = core.initial_snapshot("session-1".to_string(), 32).await;
-        assert!(snapshot.transcript.is_empty());
-        assert!(snapshot.tool_calls.is_empty());
+        assert!(snapshot.timeline.is_empty());
+        assert!(snapshot.active_tools.is_empty());
         assert!(matches!(
             core.events.replay_since(0),
             SessionReplay::Available { events, .. }
@@ -4437,7 +4375,7 @@ mod tests {
         let mut saw_context = false;
         let mut saw_model = false;
         let mut saw_result = false;
-        for _ in 0..3 {
+        for _ in 0..6 {
             match client.recv().await {
                 Some(ServerMessage::Event {
                     event: SessionEvent::ContextUsageChanged { usage },
@@ -4462,6 +4400,9 @@ mod tests {
                     saw_result = request_id == "model-change" && operation == "set_config";
                 }
                 _ => {}
+            }
+            if saw_context && saw_model && saw_result {
+                break;
             }
         }
         assert!(saw_context && saw_model && saw_result);
@@ -4558,7 +4499,7 @@ mod tests {
         let Some(ServerMessage::Snapshot { state, .. }) = client.recv().await else {
             panic!("expected snapshot");
         };
-        let initial_transcript_id = state.transcript[0].id;
+        let initial_timeline_id = state.timeline[0].id;
 
         client
             .send(ClientMessage::GetUsage {
@@ -4584,7 +4525,7 @@ mod tests {
         let mut saw_clear = false;
         let mut saw_context = false;
         let mut saw_result = false;
-        for _ in 0..3 {
+        for _ in 0..6 {
             match client.recv().await {
                 Some(ServerMessage::Event {
                     event: SessionEvent::ConversationCleared,
@@ -4602,6 +4543,9 @@ mod tests {
                     saw_result = request_id == "clear-1" && operation == "clear_history";
                 }
                 _ => {}
+            }
+            if saw_clear && saw_context && saw_result {
+                break;
             }
         }
         assert!(saw_clear && saw_context && saw_result);
@@ -4629,7 +4573,7 @@ mod tests {
             .unwrap()
             .snapshot
             .clone();
-        assert!(snapshot.transcript[0].id > initial_transcript_id);
+        assert!(snapshot.timeline[0].id > initial_timeline_id);
 
         client.send(ClientMessage::Detach).await.unwrap();
         serve.await.unwrap().unwrap();
@@ -4760,14 +4704,17 @@ mod tests {
     #[test]
     fn oversized_snapshot_is_trimmed_to_transport_frame() {
         let mut snapshot = SnapshotState::new("session-1".to_string(), 100).snapshot;
-        snapshot.transcript = (0..100)
-            .map(|id| TranscriptEntry {
+        snapshot.timeline = (0..100)
+            .map(|id| crate::session_protocol::TimelineEntry {
                 id,
-                role: TranscriptRole::Assistant,
-                text: "x".repeat(100),
-                outcome: None,
+                order: id,
+                entry: TimelineEntryKind::Assistant {
+                    text: "x".repeat(100),
+                    content_truncated: false,
+                },
             })
             .collect();
+        snapshot.history_window = HistoryWindow::complete(100);
 
         let fitted = fit_snapshot_to_frame(snapshot, 1_024).unwrap();
         let encoded = serde_json::to_vec(&ServerMessage::Snapshot {
@@ -4777,8 +4724,50 @@ mod tests {
         .unwrap();
 
         assert!(encoded.len() <= 1_024);
-        assert!(fitted.transcript.len() < 100);
-        assert!(fitted.history_truncated);
+        assert!(fitted.timeline.len() <= 100);
+        assert!(
+            fitted.history_window.is_truncated()
+                || fitted.timeline.iter().any(|entry| matches!(
+                    entry.entry,
+                    TimelineEntryKind::Assistant {
+                        content_truncated: true,
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn frame_fitting_never_drops_authoritative_active_tools() {
+        let mut maintained = SnapshotState::new("session-1".to_string(), 200);
+        maintained.apply(
+            1,
+            SessionEvent::ToolCallStarted {
+                id: "long-running".to_string(),
+                name: "exec".to_string(),
+                title: "long running".to_string(),
+                input_summary: None,
+            },
+        );
+        for seq in 2..=101 {
+            maintained.apply(
+                seq,
+                SessionEvent::UserMessage {
+                    text: "x".repeat(100),
+                    request_id: None,
+                },
+            );
+        }
+
+        let fitted = fit_snapshot_to_frame(maintained.snapshot, 1_024).unwrap();
+        assert_eq!(fitted.active_tools.len(), 1);
+        assert_eq!(fitted.active_tools[0].tool_call_id, "long-running");
+        assert_eq!(fitted.active_tools[0].status, ToolCallStateStatus::Pending);
+        assert_eq!(fitted.history_window.retained, fitted.timeline.len());
+        assert_eq!(
+            fitted.history_window.total,
+            Some(fitted.history_window.truncated_before + fitted.timeline.len() as u64)
+        );
     }
 
     #[test]
@@ -4798,8 +4787,24 @@ mod tests {
                 request_id: None,
             },
         );
-        assert_eq!(snapshot.snapshot.transcript.len(), 1);
-        assert!(snapshot.snapshot.history_truncated);
+        assert_eq!(snapshot.snapshot.timeline.len(), 1);
+        assert!(snapshot.snapshot.history_window.is_truncated());
+    }
+
+    #[test]
+    fn maintained_snapshot_tracks_durability_class_transitions() {
+        let mut snapshot = SnapshotState::new("session-1".to_string(), 1);
+        snapshot.apply(
+            1,
+            SessionEvent::DurabilityStatusChanged {
+                status: crate::session_protocol::DurabilityStatus::Degraded,
+            },
+        );
+
+        assert_eq!(
+            snapshot.snapshot.durability_status,
+            crate::session_protocol::DurabilityStatus::Degraded
+        );
     }
 
     #[tokio::test]
@@ -5351,12 +5356,20 @@ mod tests {
         }
 
         assert_eq!(snapshots[0], snapshots[1]);
-        assert_eq!(snapshots[0].transcript.len(), 2);
-        assert_eq!(snapshots[0].transcript[0].text, "ping");
-        assert_eq!(snapshots[0].transcript[1].text, "pong");
+        assert_eq!(snapshots[0].timeline.len(), 3);
         assert!(matches!(
-            snapshots[0].transcript[1].outcome,
-            Some(crate::session_protocol::AssistantOutcome::Errored { .. })
+            &snapshots[0].timeline[0].entry,
+            TimelineEntryKind::User { text, .. } if text == "ping"
+        ));
+        assert!(matches!(
+            &snapshots[0].timeline[1].entry,
+            TimelineEntryKind::Assistant { text, .. } if text == "pong"
+        ));
+        assert!(matches!(
+            snapshots[0].timeline[2].entry,
+            TimelineEntryKind::Outcome {
+                outcome: crate::session_protocol::AssistantOutcome::Errored { .. }
+            }
         ));
     }
 
@@ -5978,7 +5991,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .snapshot
-                    .transcript
+                    .timeline
                     .is_empty()
                 {
                     break;

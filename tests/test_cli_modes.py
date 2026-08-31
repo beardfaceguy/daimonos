@@ -116,7 +116,7 @@ def test_session_daemon_serves_local_attach_and_cleans_socket(
             json.dumps(
                 {
                     "type": "attach",
-                    "protocol_version": 2,
+                    "protocol_version": 3,
                     "client": {
                         "id": "pytest",
                         "kind": "headless",

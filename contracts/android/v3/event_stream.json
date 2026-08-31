@@ -60,6 +60,30 @@
     "type": "event",
     "seq": 11,
     "event": {
+      "type": "durability_status_changed",
+      "status": "saving"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 12,
+    "event": {
+      "type": "durability_status_changed",
+      "status": "degraded"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 13,
+    "event": {
+      "type": "durability_status_changed",
+      "status": "superseded"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 14,
+    "event": {
       "type": "conversation_cleared"
     }
   }

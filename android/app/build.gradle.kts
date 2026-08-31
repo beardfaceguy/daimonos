@@ -11,7 +11,7 @@ plugins {
 
 val protocolFixturesDir = layout.buildDirectory.dir("generated/protocolFixtures")
 val syncProtocolFixtures by tasks.registering(Sync::class) {
-    from(rootProject.layout.projectDirectory.dir("../contracts/android/v2"))
+    from(rootProject.layout.projectDirectory.dir("../contracts/android/v3"))
     into(protocolFixturesDir)
 }
 val releaseKeystore = providers.environmentVariable("DAIMONOS_ANDROID_KEYSTORE").orNull

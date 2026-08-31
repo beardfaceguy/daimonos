@@ -32,7 +32,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.daimonos.remote.protocol.ApprovalDecision
 import dev.daimonos.remote.protocol.ClientCapability
-import dev.daimonos.remote.protocol.TranscriptEntry
+import dev.daimonos.remote.protocol.DurabilityStatus
+import dev.daimonos.remote.protocol.TimelineEntry
 import dev.daimonos.remote.protocol.TurnStatus
 import dev.daimonos.remote.session.displayText
 
@@ -184,6 +185,10 @@ private fun SessionScreen(
                 append(if (state.connected) "Connected" else "Reconnecting")
                 append(" · ")
                 append(state.session.turnStatus.name.lowercase())
+                state.session.durabilityStatus.statusLabel()?.let { durability ->
+                    append(" · ")
+                    append(durability)
+                }
                 state.session.contextUsage?.utilizationBasisPoints?.let {
                     append(" · context ")
                     append(it / 100.0)
@@ -193,7 +198,7 @@ private fun SessionScreen(
             style = MaterialTheme.typography.labelLarge,
         )
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        if (state.session.historyTruncated) {
+        if (state.session.historyWindow.truncatedBefore > 0) {
             Text(
                 "Earlier history was truncated.",
                 color = MaterialTheme.colorScheme.tertiary,
@@ -204,22 +209,45 @@ private fun SessionScreen(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(state.session.transcript, key = TranscriptEntry::id) { entry ->
+            items(state.session.timeline, key = TimelineEntry::id) { entry ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
-                        Text(entry.role.name.lowercase(), style = MaterialTheme.typography.labelSmall)
-                        Text(entry.text)
-                        entry.outcome?.let {
-                            Text(it.displayText(), style = MaterialTheme.typography.labelSmall)
+                        when (entry) {
+                            is TimelineEntry.User -> {
+                                Text("user", style = MaterialTheme.typography.labelSmall)
+                                Text(entry.text)
+                            }
+                            is TimelineEntry.Assistant -> {
+                                Text("assistant", style = MaterialTheme.typography.labelSmall)
+                                Text(entry.text)
+                            }
+                            is TimelineEntry.Thought -> {
+                                Text("thought", style = MaterialTheme.typography.labelSmall)
+                                Text(entry.text)
+                            }
+                            is TimelineEntry.System -> {
+                                Text("system", style = MaterialTheme.typography.labelSmall)
+                                Text(entry.text)
+                            }
+                            is TimelineEntry.Outcome ->
+                                Text(entry.outcome.displayText(), style = MaterialTheme.typography.labelSmall)
+                            is TimelineEntry.Tool -> {
+                                Text("${entry.title} · ${entry.status.name.lowercase()}")
+                                entry.output?.let { Text(it) }
+                            }
                         }
                     }
                 }
             }
-            items(state.session.toolCalls, key = { "tool:${it.id}" }) { tool ->
+            items(
+                state.session.activeTools.filterNot { active ->
+                    state.session.timeline.any { it.id == active.occurrenceId }
+                },
+                key = { "active-tool:${it.occurrenceId}" },
+            ) { tool ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
                         Text("${tool.title} · ${tool.status.name.lowercase()}")
-                        tool.output?.let { Text(it) }
                     }
                 }
             }
@@ -294,4 +322,12 @@ private fun SessionScreen(
             }
         }
     }
+}
+
+private fun DurabilityStatus.statusLabel(): String? = when (this) {
+    DurabilityStatus.SAVED -> null
+    DurabilityStatus.UNSAVED -> "unsaved"
+    DurabilityStatus.SAVING -> "saving"
+    DurabilityStatus.DEGRADED -> "save degraded"
+    DurabilityStatus.SUPERSEDED -> "persistence superseded"
 }
