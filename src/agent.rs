@@ -5130,6 +5130,90 @@ mod tests {
         );
     }
 
+    /// A streaming provider that fails mid-stream on its first attempt: it emits
+    /// partial deltas, then returns the transport-classified retryable error the
+    /// #1418 classifier produces. Every later attempt streams the full turn.
+    struct MidStreamFailureProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MidStreamFailureProvider {
+        async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+            panic!("MidStreamFailureProvider expects stream(), not complete()");
+        }
+
+        async fn stream(
+            &self,
+            _ctx: &Context,
+            _opts: &CompleteOpts,
+            on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> LlmResponse {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                // Partial output reaches the frontend, then the socket breaks.
+                on_event(StreamEvent::TextDelta("The answer ".into()));
+                return LlmResponse::retryable_error(
+                    "stream error: Transport error: http/2 stream closed with error code CANCEL (0x8)",
+                );
+            }
+            on_event(StreamEvent::TextDelta("The answer is 42".into()));
+            end_turn_resp_with_text("The answer is 42")
+        }
+    }
+
+    /// vikunja #1418: a mid-stream HTTP/2 CANCEL is retryable, so the in-generation
+    /// retry loop restarts the stream with bounded backoff and the turn completes
+    /// instead of dead-stopping. The partial output already streamed before the
+    /// break is preserved (delivered to the hook), and the retry then streams the
+    /// full turn.
+    #[tokio::test]
+    async fn mid_stream_transport_break_resumes_and_completes_the_turn() {
+        let provider = MidStreamFailureProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            on_stream_event: Some(Box::new(move |ev| seen_clone.lock().unwrap().push(ev))),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("what is 6 times 7")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            result.stop_reason,
+            StopReason::EndTurn,
+            "the transport break must be absorbed and the turn completed"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one retry after the mid-stream break"
+        );
+        // The partial delta from the failed attempt was delivered (preserved),
+        // and the successful retry then streamed the full turn.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                StreamEvent::TextDelta("The answer ".into()),
+                StreamEvent::TextDelta("The answer is 42".into()),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn run_without_hook_still_calls_stream_and_ignores_events() {
         let dir = tempfile::tempdir().unwrap();

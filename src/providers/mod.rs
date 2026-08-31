@@ -339,6 +339,35 @@ pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429) || (500..600).contains(&status)
 }
 
+/// Classify a mid-stream SSE read failure and build the provider error response
+/// (vikunja #1418).
+///
+/// This is reached only *after* a successful 2xx header response, once the event
+/// stream is established (a bad request would already have failed at the status
+/// check). A [`EventStreamError::Transport`] fault is therefore the socket
+/// breaking under an open stream — an HTTP/2 `CANCEL`, a connection reset, an
+/// abrupt idle disconnect — which is transient: re-issuing the request usually
+/// succeeds, so core's #1240 retry/failover/resume path should absorb it. A
+/// `Utf8` or `Parser` fault is the server emitting bytes we cannot decode;
+/// re-issuing the same request yields the same undecodable bytes, so it is fatal.
+///
+/// Lives in the provider layer for the same ADR-001 reason as
+/// [`is_retryable_status`]: SSE framing is a standard, not provider phrasing, so
+/// one classifier serves every adapter instead of three tables that could drift.
+/// The message names only the provider prefix and the transport phrasing — never
+/// the request body, headers, or key.
+pub fn stream_error_response<E: std::fmt::Display>(
+    prefix: &str,
+    error: eventsource_stream::EventStreamError<E>,
+) -> LlmResponse {
+    use eventsource_stream::EventStreamError;
+    let message = format!("{prefix}: {error}");
+    match error {
+        EventStreamError::Transport(_) => LlmResponse::retryable_error(message),
+        EventStreamError::Utf8(_) | EventStreamError::Parser(_) => LlmResponse::error(message),
+    }
+}
+
 pub struct Context {
     pub messages: Vec<Message>,
     pub system: Option<String>,
@@ -563,6 +592,44 @@ mod tests {
                 "{status} must not be retryable"
             );
         }
+    }
+
+    /// vikunja #1418: a mid-stream socket break (HTTP/2 CANCEL, reset, abrupt
+    /// idle disconnect) surfaces as a `Transport` fault after a healthy 2xx, and
+    /// must be classified retryable so the #1240 path resumes the turn instead
+    /// of dead-stopping it.
+    #[test]
+    fn a_transport_stream_error_is_retryable() {
+        use eventsource_stream::EventStreamError;
+        let broken = EventStreamError::<String>::Transport(
+            "http/2 stream closed with error code CANCEL (0x8)".to_string(),
+        );
+        let resp = stream_error_response("stream error", broken);
+        assert!(resp.retryable, "a broken transport is transient");
+        assert!(!resp.context_overflow);
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        let msg = resp.error_message.unwrap_or_default();
+        assert!(msg.contains("stream error"), "names the phase: {msg}");
+        assert!(
+            msg.contains("CANCEL"),
+            "carries the transport phrasing: {msg}"
+        );
+    }
+
+    /// The other half: an undecodable-bytes fault is deterministic. Re-issuing
+    /// the request yields the same bad bytes, so retrying would only burn tokens
+    /// — it must stay fatal.
+    #[test]
+    fn an_undecodable_stream_error_is_fatal() {
+        use eventsource_stream::EventStreamError;
+        let bad_utf8 = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
+        let resp =
+            stream_error_response::<String>("stream error", EventStreamError::Utf8(bad_utf8));
+        assert!(
+            !resp.retryable,
+            "malformed bytes cannot be fixed by a retry"
+        );
+        assert_eq!(resp.stop_reason, StopReason::Error);
     }
 
     #[test]
