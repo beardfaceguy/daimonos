@@ -227,7 +227,9 @@ impl LlmProvider for OpenRouterProvider {
             let Some(event) = next else { break };
             let event = match event {
                 Ok(e) => e,
-                Err(e) => return LlmResponse::error(format!("openrouter stream error: {e}")),
+                // #1418: a mid-stream socket break is transport, not phrasing —
+                // classify it retryable so core resumes the turn (ADR-001).
+                Err(e) => return super::stream_error_response("openrouter stream error", e),
             };
             if event.data == "[DONE]" {
                 break;
@@ -611,6 +613,21 @@ pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u6
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// vikunja #1418: the OpenRouter adapter's mid-stream read-error path must
+    /// classify a broken transport (HTTP/2 CANCEL) retryable so the turn resumes.
+    #[test]
+    fn openrouter_mid_stream_transport_break_is_retryable() {
+        let broken = eventsource_stream::EventStreamError::<String>::Transport(
+            "http/2 stream closed with error code CANCEL (0x8)".to_string(),
+        );
+        let resp = crate::providers::stream_error_response("openrouter stream error", broken);
+        assert!(resp.retryable);
+        assert!(resp
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("openrouter stream error") && m.contains("CANCEL")));
+    }
 
     // --- messages_to_wire ---
 

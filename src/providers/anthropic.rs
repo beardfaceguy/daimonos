@@ -832,7 +832,9 @@ impl LlmProvider for AnthropicProvider {
             let Some(event) = next else { break };
             let event = match event {
                 Ok(e) => e,
-                Err(e) => return LlmResponse::error(format!("stream error: {e}")),
+                // #1418: a mid-stream socket break is transport, not phrasing —
+                // classify it retryable so core resumes the turn (ADR-001).
+                Err(e) => return super::stream_error_response("stream error", e),
             };
             if event.event == "ping" {
                 continue;
@@ -904,6 +906,22 @@ mod tests {
     use super::*;
     use crate::providers::ToolSchema;
     use serde_json::json;
+
+    /// vikunja #1418: the Anthropic adapter's mid-stream read-error path must
+    /// classify a broken transport (the reported HTTP/2 CANCEL) retryable so the
+    /// turn resumes rather than dead-stopping.
+    #[test]
+    fn anthropic_mid_stream_transport_break_is_retryable() {
+        let broken = eventsource_stream::EventStreamError::<String>::Transport(
+            "http/2 stream closed with error code CANCEL (0x8)".to_string(),
+        );
+        let resp = crate::providers::stream_error_response("stream error", broken);
+        assert!(resp.retryable);
+        assert!(resp
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("stream error") && m.contains("CANCEL")));
+    }
 
     // --- map_stop_reason ---
 

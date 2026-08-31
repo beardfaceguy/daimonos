@@ -196,7 +196,11 @@ impl LlmProvider for OpenAiProvider {
             let Some(event) = next else { break };
             let event = match event {
                 Ok(event) => event,
-                Err(error) => return LlmResponse::error(format!("openai stream error: {error}")),
+                // #1418: a mid-stream socket break is transport, not phrasing —
+                // classify it retryable so core resumes the turn (ADR-001).
+                Err(error) => {
+                    return crate::providers::stream_error_response("openai stream error", error)
+                }
             };
             if event.data == "[DONE]" {
                 break;
@@ -749,6 +753,21 @@ mod tests {
     /// completes fine; it is the wait for headers that hung. The outer
     /// `tokio::time::timeout` is a test guard: before the fix this call never
     /// returns, and a hanging test is worse than a failing one.
+    /// vikunja #1418: the OpenAI adapter's mid-stream read-error path must
+    /// classify a broken transport (HTTP/2 CANCEL) retryable so the turn resumes.
+    #[test]
+    fn openai_mid_stream_transport_break_is_retryable() {
+        let broken = eventsource_stream::EventStreamError::<String>::Transport(
+            "http/2 stream closed with error code CANCEL (0x8)".to_string(),
+        );
+        let resp = crate::providers::stream_error_response("openai stream error", broken);
+        assert!(resp.retryable);
+        assert!(resp
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("openai stream error") && m.contains("CANCEL")));
+    }
+
     #[tokio::test]
     async fn a_server_that_never_sends_headers_is_bounded_not_infinite() {
         use tokio::net::TcpListener;
