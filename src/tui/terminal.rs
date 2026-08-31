@@ -71,6 +71,13 @@ impl TerminalGuard {
         // those terminals and still enables Shift-Enter where it works. A probe
         // error is treated as "unsupported" — never worse than not pushing.
         let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+        // Record the probe outcome so terminal-specific newline reports (e.g.
+        // KDE bug 519627) are diagnosable from logs without a live repro.
+        tracing::debug!(
+            target: "daimonos::tui",
+            keyboard_enhancement_supported = enhanced,
+            "kitty keyboard enhancement probe"
+        );
         if enhanced {
             if let Err(err) = execute!(
                 out,
