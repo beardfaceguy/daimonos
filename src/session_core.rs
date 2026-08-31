@@ -356,6 +356,10 @@ impl SessionEventRouter {
             .dispatch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.emit_locked(event)
+    }
+
+    fn emit_locked(&self, event: SessionEvent) -> Result<u64, SessionEventError> {
         let sequence = {
             let mut current = self
                 .sequence
@@ -399,6 +403,43 @@ impl SessionEventRouter {
             return Err(SessionEventError::HandlerPanicked);
         }
         Ok(sequence)
+    }
+
+    fn transition_durability(
+        &self,
+        current: &AtomicU8,
+        status: crate::session_protocol::DurabilityStatus,
+    ) {
+        use crate::session_protocol::DurabilityStatus;
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = durability_status_from_code(current.load(Ordering::Acquire));
+        let blocked = previous == DurabilityStatus::Superseded
+            || (previous == DurabilityStatus::Degraded
+                && !matches!(
+                    status,
+                    DurabilityStatus::Saved | DurabilityStatus::Superseded
+                ))
+            || (previous == DurabilityStatus::Saving && status == DurabilityStatus::Unsaved);
+        if previous == status || blocked {
+            return;
+        }
+        current.store(durability_status_code(status), Ordering::Release);
+        let _ = self.emit_locked(SessionEvent::DurabilityStatusChanged { status });
+    }
+
+    fn capture_sequence<T>(&self, capture: impl FnOnce() -> T) -> (u64, T) {
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = *self
+            .sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (sequence, capture())
     }
 
     pub fn subscribe(
@@ -628,6 +669,32 @@ pub(crate) enum PersistenceHealth {
     Dirty,
     Degraded { retryable: bool },
     Superseded,
+}
+
+fn durability_status_code(status: crate::session_protocol::DurabilityStatus) -> u8 {
+    use crate::session_protocol::DurabilityStatus;
+    match status {
+        DurabilityStatus::Saved => 0,
+        DurabilityStatus::Unsaved => 1,
+        DurabilityStatus::Saving => 2,
+        DurabilityStatus::Degraded => 3,
+        DurabilityStatus::Superseded => 4,
+    }
+}
+
+fn durability_status_from_code(code: u8) -> crate::session_protocol::DurabilityStatus {
+    use crate::session_protocol::DurabilityStatus;
+    match code {
+        1 => DurabilityStatus::Unsaved,
+        2 => DurabilityStatus::Saving,
+        3 => DurabilityStatus::Degraded,
+        4 => DurabilityStatus::Superseded,
+        0 => DurabilityStatus::Saved,
+        _ => {
+            debug_assert!(false, "unknown durability status code {code}");
+            DurabilityStatus::Degraded
+        }
+    }
 }
 
 struct SessionPersistenceState {
@@ -930,6 +997,7 @@ pub struct SessionCore {
     persistence_gate: tokio::sync::Mutex<()>,
     persistence_requested: AtomicU64,
     persistence_completed: AtomicU64,
+    durability_status: AtomicU8,
     persistence: Option<SessionPersistence>,
 }
 
@@ -1076,6 +1144,9 @@ impl SessionCore {
             persistence_gate: tokio::sync::Mutex::new(()),
             persistence_requested: AtomicU64::new(0),
             persistence_completed: AtomicU64::new(0),
+            durability_status: AtomicU8::new(durability_status_code(
+                crate::session_protocol::DurabilityStatus::Saved,
+            )),
             persistence,
         }
     }
@@ -1303,11 +1374,15 @@ impl SessionCore {
             return;
         };
         let request = self.persistence_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.durability_status() != crate::session_protocol::DurabilityStatus::Saving {
+            self.publish_durability_status(crate::session_protocol::DurabilityStatus::Unsaved);
+        }
         let _gate = self.persistence_gate.lock().await;
         if self.persistence_completed.load(Ordering::Acquire) >= request {
             return;
         }
         persistence.mark_dirty();
+        self.publish_durability_status(crate::session_protocol::DurabilityStatus::Saving);
 
         let policy = persistence.retry_policy;
         let handled_request = self.persistence_requested.load(Ordering::Acquire);
@@ -1327,6 +1402,7 @@ impl SessionCore {
                         .fetch_max(handled_request, Ordering::AcqRel);
                     persistence
                         .mark_clean_if_fully_handled(handled_request, &self.persistence_requested);
+                    self.publish_completed_durability(persistence);
                     return;
                 }
                 Ok(PersistenceSaveOutcome::SkippedStale { stored_generation }) => {
@@ -1343,6 +1419,9 @@ impl SessionCore {
                             attempts,
                             "session payload remains dirty after repeated stale captures"
                         );
+                        self.publish_durability_status(
+                            crate::session_protocol::DurabilityStatus::Unsaved,
+                        );
                         return;
                     }
                     tokio::time::sleep(delay).await;
@@ -1352,6 +1431,7 @@ impl SessionCore {
                 Ok(PersistenceSaveOutcome::SkippedDeleted) => {
                     self.persistence_completed
                         .fetch_max(handled_request, Ordering::AcqRel);
+                    self.publish_completed_durability(persistence);
                     return;
                 }
                 Ok(PersistenceSaveOutcome::Superseded) => {
@@ -1361,6 +1441,9 @@ impl SessionCore {
                         target: "daimonos::session_core",
                         event = "session_writer_superseded",
                         "session persistence stopped because a newer runtime claimed ownership"
+                    );
+                    self.publish_durability_status(
+                        crate::session_protocol::DurabilityStatus::Superseded,
                     );
                     return;
                 }
@@ -1377,6 +1460,9 @@ impl SessionCore {
                             retryable,
                             error = %error,
                             "session payload remains degraded after bounded save attempts"
+                        );
+                        self.publish_durability_status(
+                            crate::session_protocol::DurabilityStatus::Degraded,
                         );
                         return;
                     }
@@ -1426,6 +1512,27 @@ impl SessionCore {
         self.persistence
             .as_ref()
             .map_or(PersistenceHealth::Clean, SessionPersistence::health)
+    }
+
+    pub fn durability_status(&self) -> crate::session_protocol::DurabilityStatus {
+        durability_status_from_code(self.durability_status.load(Ordering::Acquire))
+    }
+
+    fn publish_durability_status(&self, status: crate::session_protocol::DurabilityStatus) {
+        self.events
+            .transition_durability(&self.durability_status, status);
+    }
+
+    fn publish_completed_durability(&self, persistence: &SessionPersistence) {
+        let status = if self.persistence_requested.load(Ordering::Acquire)
+            <= self.persistence_completed.load(Ordering::Acquire)
+            && persistence.health() == PersistenceHealth::Clean
+        {
+            crate::session_protocol::DurabilityStatus::Saved
+        } else {
+            crate::session_protocol::DurabilityStatus::Unsaved
+        };
+        self.publish_durability_status(status);
     }
 
     pub(crate) fn initialize_persistence_generation(&self, generation: u64) {
@@ -1575,14 +1682,17 @@ impl SessionCore {
         }
         timeline.cancel_reconstructed_active_tools();
         let (timeline, active_tools, history_window) = timeline.into_parts();
+        let (snapshot_seq, durability_status) =
+            self.events.capture_sequence(|| self.durability_status());
         crate::session_protocol::SessionSnapshot {
             session_id,
-            seq: self.events.latest_sequence(),
+            seq: snapshot_seq,
             turn_status: if self.turn.is_active() {
                 TurnStatus::Running
             } else {
                 TurnStatus::Idle
             },
+            durability_status,
             timeline,
             active_tools,
             history_window,
@@ -1679,6 +1789,9 @@ impl SessionCore {
             .prepare_model(&mut agent_session, &model)
             .await
             .map_err(SessionPromptError::Model)?;
+        if self.persistence.is_some() {
+            self.publish_durability_status(crate::session_protocol::DurabilityStatus::Unsaved);
+        }
         let _ = self.events.emit(SessionEvent::UserMessage {
             text: canonical_user_text,
             request_id: event_request_id,
@@ -3888,6 +4001,10 @@ mod tests {
                 "emit(CoreSessionEvent::ContextUsageChanged",
             ),
             ("TurnStatusChanged", "emit(SessionEvent::TurnStatusChanged"),
+            (
+                "DurabilityStatusChanged",
+                "emit_locked(SessionEvent::DurabilityStatusChanged",
+            ),
             ("SessionEnding", "emit(CoreSessionEvent::SessionEnding"),
         ] {
             assert!(
@@ -4392,6 +4509,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durability_events_emit_only_visible_success_transitions() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Saved,
+            ]
+        );
+        assert_eq!(core.durability_status(), DurabilityStatus::Saved);
+    }
+
+    #[test]
+    fn durability_snapshot_and_event_share_sequence_ordering() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let core = persistence_test_core(
+            directory.path(),
+            SessionPersistence::new(
+                "session-1",
+                SessionStore::new(directory.path().join("sessions")),
+                PersistenceRetryPolicy::single_attempt(),
+            ),
+        );
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |seq, event| captured.lock().unwrap().push((seq, event))),
+            )
+            .unwrap();
+        let dispatch = core
+            .events
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let publishing = Arc::clone(&core);
+        let publish = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            publishing.publish_durability_status(DurabilityStatus::Degraded);
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(core.durability_status(), DurabilityStatus::Saved);
+        drop(dispatch);
+        publish.join().unwrap();
+
+        let (seq, status) = core.events.capture_sequence(|| core.durability_status());
+        assert_eq!(seq, 1);
+        assert_eq!(status, DurabilityStatus::Degraded);
+        assert!(matches!(
+            observed.lock().unwrap().as_slice(),
+            [(
+                1,
+                SessionEvent::DurabilityStatusChanged {
+                    status: DurabilityStatus::Degraded
+                }
+            )]
+        ));
+    }
+
+    #[test]
+    fn durability_transition_policy_preserves_inflight_and_terminal_truth() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let core = persistence_test_core(
+            directory.path(),
+            SessionPersistence::new(
+                "session-1",
+                SessionStore::new(directory.path().join("sessions")),
+                PersistenceRetryPolicy::single_attempt(),
+            ),
+        );
+        core.publish_durability_status(DurabilityStatus::Saving);
+        core.publish_durability_status(DurabilityStatus::Unsaved);
+        assert_eq!(core.durability_status(), DurabilityStatus::Saving);
+
+        core.publish_durability_status(DurabilityStatus::Degraded);
+        core.publish_durability_status(DurabilityStatus::Unsaved);
+        core.publish_durability_status(DurabilityStatus::Saving);
+        assert_eq!(core.durability_status(), DurabilityStatus::Degraded);
+
+        core.publish_durability_status(DurabilityStatus::Superseded);
+        core.publish_durability_status(DurabilityStatus::Saved);
+        assert_eq!(core.durability_status(), DurabilityStatus::Superseded);
+    }
+
+    #[tokio::test]
+    async fn durability_retry_exhaustion_emits_degraded_once() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::new(2, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.fail_saves([
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Interrupted,
+        ]);
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Degraded,
+            ]
+        );
+        assert_eq!(core.durability_status(), DurabilityStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn durability_retry_does_not_publish_transient_degraded_state() {
+        use crate::session_protocol::DurabilityStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = SessionPersistence::new(
+            "session-1",
+            SessionStore::new(directory.path().join("sessions")),
+            PersistenceRetryPolicy::new(2, std::time::Duration::ZERO, std::time::Duration::ZERO),
+        );
+        persistence.fail_saves([std::io::ErrorKind::Interrupted]);
+        let core = persistence_test_core(directory.path(), persistence);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        let _subscription = core
+            .events
+            .subscribe(
+                1,
+                Arc::new(move |_, event| {
+                    if let SessionEvent::DurabilityStatusChanged { status } = event {
+                        captured.lock().unwrap().push(status);
+                    }
+                }),
+            )
+            .unwrap();
+
+        core.persist_current().await;
+
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                DurabilityStatus::Unsaved,
+                DurabilityStatus::Saving,
+                DurabilityStatus::Saved,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn nonretryable_save_failure_remains_degraded() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions"));
@@ -4603,6 +4912,10 @@ mod tests {
         new_core.persist_current().await;
 
         assert_eq!(old_core.persistence_health(), PersistenceHealth::Superseded);
+        assert_eq!(
+            old_core.durability_status(),
+            crate::session_protocol::DurabilityStatus::Superseded
+        );
         let loaded = store.load_result("session-1").unwrap();
         assert_eq!(loaded.generation, 2);
         assert!(matches!(

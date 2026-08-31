@@ -196,6 +196,16 @@ pub enum TurnStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DurabilityStatus {
+    Saved,
+    Unsaved,
+    Saving,
+    Degraded,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptRole {
     User,
     Assistant,
@@ -469,6 +479,9 @@ pub enum SessionEvent {
     TurnStatusChanged {
         status: TurnStatus,
     },
+    DurabilityStatusChanged {
+        status: DurabilityStatus,
+    },
     SessionEnding {
         reason: String,
     },
@@ -479,6 +492,7 @@ pub struct SessionSnapshot {
     pub session_id: String,
     pub seq: u64,
     pub turn_status: TurnStatus,
+    pub durability_status: DurabilityStatus,
     pub timeline: Vec<TimelineEntry>,
     /// Mandatory non-terminal control state, independent of history trimming.
     pub active_tools: Vec<ActiveToolState>,
@@ -1277,6 +1291,7 @@ mod tests {
             session_id: "s1".to_string(),
             seq: 9,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: vec![TimelineEntry {
                 id: 1,
                 order: 1,
@@ -1561,7 +1576,7 @@ mod tests {
         let events: Vec<ServerMessage> =
             serde_json::from_str(include_str!("../contracts/android/v3/event_stream.json"))
                 .unwrap();
-        assert_eq!(events.len(), 7);
+        assert_eq!(events.len(), 10);
         assert!(events
             .iter()
             .all(|message| matches!(message, ServerMessage::Event { .. })));
@@ -1582,6 +1597,7 @@ mod tests {
         assert!(view.pending_approvals().is_empty());
         assert!(view.tool_calls().is_empty());
         assert!(view.transcript().is_empty());
+        assert_eq!(view.durability_status(), DurabilityStatus::Superseded);
 
         let commands: Vec<ClientMessage> =
             serde_json::from_str(include_str!("../contracts/android/v3/client_commands.json"))

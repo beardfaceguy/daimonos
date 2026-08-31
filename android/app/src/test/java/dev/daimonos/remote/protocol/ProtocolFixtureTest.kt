@@ -36,6 +36,7 @@ class ProtocolFixtureTest {
 
         assertEquals("session-fixture", snapshot.state.sessionId)
         assertEquals(TurnStatus.WAITING_FOR_APPROVAL, snapshot.state.turnStatus)
+        assertEquals(DurabilityStatus.SAVED, snapshot.state.durabilityStatus)
         assertEquals(4, snapshot.state.timeline.size)
         assertEquals(ToolCallStatus.PENDING, snapshot.state.activeTools.single().status)
         assertEquals(2500, snapshot.state.contextUsage?.utilizationBasisPoints)
@@ -53,7 +54,7 @@ class ProtocolFixtureTest {
             .jsonArray
             .map { ProtocolCodec.json.decodeFromJsonElement<ClientMessage>(it) }
 
-        assertEquals(7, events.size)
+        assertEquals(10, events.size)
         assertEquals(8, commands.size)
         assertTrue(events.last() is ServerMessage.Event)
         assertTrue((events.last() as ServerMessage.Event).event is SessionEvent.ConversationCleared)

@@ -5,6 +5,7 @@
     "session_id": "session-fixture",
     "seq": 4,
     "turn_status": "waiting_for_approval",
+    "durability_status": "saved",
     "timeline": [
       {
         "id": 1,

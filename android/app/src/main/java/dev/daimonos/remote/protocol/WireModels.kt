@@ -264,6 +264,15 @@ enum class TurnStatus {
 }
 
 @Serializable
+enum class DurabilityStatus {
+    @SerialName("saved") SAVED,
+    @SerialName("unsaved") UNSAVED,
+    @SerialName("saving") SAVING,
+    @SerialName("degraded") DEGRADED,
+    @SerialName("superseded") SUPERSEDED,
+}
+
+@Serializable
 enum class TranscriptRole {
     @SerialName("user") USER,
     @SerialName("assistant") ASSISTANT,
@@ -529,6 +538,10 @@ sealed interface SessionEvent {
     data class TurnStatusChanged(val status: TurnStatus) : SessionEvent
 
     @Serializable
+    @SerialName("durability_status_changed")
+    data class DurabilityStatusChanged(val status: DurabilityStatus) : SessionEvent
+
+    @Serializable
     @SerialName("session_ending")
     data class SessionEnding(val reason: String) : SessionEvent
 }
@@ -538,6 +551,7 @@ data class SessionSnapshot(
     @SerialName("session_id") val sessionId: String,
     val seq: Long,
     @SerialName("turn_status") val turnStatus: TurnStatus,
+    @SerialName("durability_status") val durabilityStatus: DurabilityStatus,
     val timeline: List<TimelineEntry>,
     @SerialName("active_tools") val activeTools: List<ActiveToolState>,
     @SerialName("history_window") val historyWindow: HistoryWindow,

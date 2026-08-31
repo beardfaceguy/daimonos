@@ -942,6 +942,7 @@ mod tests {
             session_id: session_id.to_string(),
             seq: 0,
             turn_status: TurnStatus::Idle,
+            durability_status: crate::session_protocol::DurabilityStatus::Saved,
             timeline: Vec::new(),
             active_tools: Vec::new(),
             history_window: HistoryWindow::complete(0),
@@ -1568,6 +1569,7 @@ mod tests {
                     session_id: "session-b".to_string(),
                     seq: 7,
                     turn_status: TurnStatus::Cancelled,
+                    durability_status: crate::session_protocol::DurabilityStatus::Saved,
                     timeline: vec![
                         TimelineEntry {
                             id: 41,

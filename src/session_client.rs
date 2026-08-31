@@ -638,6 +638,7 @@ mod tests {
             session_id: session_id.to_string(),
             seq,
             turn_status: TurnStatus::Idle,
+            durability_status: crate::session_protocol::DurabilityStatus::Saved,
             timeline: Vec::new(),
             active_tools: Vec::new(),
             history_window: HistoryWindow::complete(0),

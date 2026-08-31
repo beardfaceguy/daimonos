@@ -2765,6 +2765,7 @@ impl SnapshotState {
                 session_id,
                 seq: 0,
                 turn_status: crate::session_protocol::TurnStatus::Idle,
+                durability_status: crate::session_protocol::DurabilityStatus::Saved,
                 timeline: Vec::new(),
                 active_tools: Vec::new(),
                 history_window: crate::session_protocol::HistoryWindow::complete(0),
@@ -2851,6 +2852,9 @@ impl SnapshotState {
             }
             SessionEvent::TurnStatusChanged { status } => {
                 self.snapshot.turn_status = status;
+            }
+            SessionEvent::DurabilityStatusChanged { status } => {
+                self.snapshot.durability_status = status;
             }
         }
         self.sync_timeline();
@@ -2985,43 +2989,27 @@ fn fit_snapshot_to_frame(
             _ => {}
         }
     }
-    for tool in &mut snapshot.active_tools {
-        if !tool.name.is_empty() || !tool.title.is_empty() {
-            tool.name.clear();
-            tool.title.clear();
-            tool.content_truncated = true;
-        }
-    }
     if fits(&snapshot)? {
         return Ok(snapshot);
     }
 
     let timeline = std::mem::take(&mut snapshot.timeline);
+    let truncated_before = snapshot.history_window.truncated_before;
     let mut low = 0;
     let mut high = timeline.len();
     while low < high {
         let middle = low + (high - low) / 2;
         snapshot.timeline = timeline[middle..].to_vec();
-        snapshot.history_window.truncated_before = snapshot
-            .history_window
-            .truncated_before
-            .saturating_add(middle as u64);
+        snapshot.history_window.truncated_before = truncated_before.saturating_add(middle as u64);
         sync_history_window(&mut snapshot);
         if fits(&snapshot)? {
             high = middle;
         } else {
             low = middle + 1;
         }
-        snapshot.history_window.truncated_before = snapshot
-            .history_window
-            .truncated_before
-            .saturating_sub(middle as u64);
     }
     snapshot.timeline = timeline[low..].to_vec();
-    snapshot.history_window.truncated_before = snapshot
-        .history_window
-        .truncated_before
-        .saturating_add(low as u64);
+    snapshot.history_window.truncated_before = truncated_before.saturating_add(low as u64);
     sync_history_window(&mut snapshot);
     if fits(&snapshot)? {
         Ok(snapshot)
@@ -4387,7 +4375,7 @@ mod tests {
         let mut saw_context = false;
         let mut saw_model = false;
         let mut saw_result = false;
-        for _ in 0..3 {
+        for _ in 0..6 {
             match client.recv().await {
                 Some(ServerMessage::Event {
                     event: SessionEvent::ContextUsageChanged { usage },
@@ -4412,6 +4400,9 @@ mod tests {
                     saw_result = request_id == "model-change" && operation == "set_config";
                 }
                 _ => {}
+            }
+            if saw_context && saw_model && saw_result {
+                break;
             }
         }
         assert!(saw_context && saw_model && saw_result);
@@ -4534,7 +4525,7 @@ mod tests {
         let mut saw_clear = false;
         let mut saw_context = false;
         let mut saw_result = false;
-        for _ in 0..3 {
+        for _ in 0..6 {
             match client.recv().await {
                 Some(ServerMessage::Event {
                     event: SessionEvent::ConversationCleared,
@@ -4552,6 +4543,9 @@ mod tests {
                     saw_result = request_id == "clear-1" && operation == "clear_history";
                 }
                 _ => {}
+            }
+            if saw_clear && saw_context && saw_result {
+                break;
             }
         }
         assert!(saw_clear && saw_context && saw_result);
@@ -4795,6 +4789,22 @@ mod tests {
         );
         assert_eq!(snapshot.snapshot.timeline.len(), 1);
         assert!(snapshot.snapshot.history_window.is_truncated());
+    }
+
+    #[test]
+    fn maintained_snapshot_tracks_durability_class_transitions() {
+        let mut snapshot = SnapshotState::new("session-1".to_string(), 1);
+        snapshot.apply(
+            1,
+            SessionEvent::DurabilityStatusChanged {
+                status: crate::session_protocol::DurabilityStatus::Degraded,
+            },
+        );
+
+        assert_eq!(
+            snapshot.snapshot.durability_status,
+            crate::session_protocol::DurabilityStatus::Degraded
+        );
     }
 
     #[tokio::test]

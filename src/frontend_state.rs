@@ -16,9 +16,9 @@
 //! ADR-010 and keeps every rendering layer a pure function of `ViewState`.
 
 use crate::session_protocol::{
-    ActiveToolState, ApprovalRequest, AssistantOutcome, ContextUsage, HistoryWindow, RuntimeOption,
-    SessionEvent, SessionSnapshot, TimelineEntry, TimelineEntryKind, ToolCallState, TranscriptRole,
-    TurnStatus,
+    ActiveToolState, ApprovalRequest, AssistantOutcome, ContextUsage, DurabilityStatus,
+    HistoryWindow, RuntimeOption, SessionEvent, SessionSnapshot, TimelineEntry, TimelineEntryKind,
+    ToolCallState, TranscriptRole, TurnStatus,
 };
 use crate::session_timeline::TimelineReducer;
 
@@ -68,6 +68,7 @@ pub struct ViewState {
     /// (sequence numbers from the router are 1-based).
     last_seq: u64,
     turn_status: TurnStatus,
+    durability_status: DurabilityStatus,
     timeline: TimelineReducer,
     // Temporary compatibility projections for callers not yet timeline-aware.
     transcript: Vec<ViewLine>,
@@ -95,6 +96,7 @@ impl ViewState {
             session_id: session_id.into(),
             last_seq: 0,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: TimelineReducer::new(max_scrollback_entries),
             transcript: Vec::new(),
             tool_calls: Vec::new(),
@@ -116,6 +118,9 @@ impl ViewState {
     }
     pub fn turn_status(&self) -> TurnStatus {
         self.turn_status
+    }
+    pub fn durability_status(&self) -> DurabilityStatus {
+        self.durability_status
     }
     pub fn timeline(&self) -> &[TimelineEntry] {
         self.timeline.timeline()
@@ -177,6 +182,7 @@ impl ViewState {
         self.session_id = session_id;
         self.last_seq = seq;
         self.turn_status = TurnStatus::Idle;
+        self.durability_status = DurabilityStatus::Saved;
         self.timeline.clear();
         self.transcript.clear();
         self.tool_calls.clear();
@@ -195,6 +201,7 @@ impl ViewState {
         self.session_id = snapshot.session_id;
         self.last_seq = snapshot.seq;
         self.turn_status = snapshot.turn_status;
+        self.durability_status = snapshot.durability_status;
         self.timeline = TimelineReducer::from_parts(
             snapshot.timeline,
             snapshot.active_tools,
@@ -279,6 +286,9 @@ impl ViewState {
             }
             SessionEvent::TurnStatusChanged { status } => {
                 self.turn_status = status;
+            }
+            SessionEvent::DurabilityStatusChanged { status } => {
+                self.durability_status = status;
             }
             SessionEvent::SessionEnding { reason } => {
                 self.ending_reason = Some(reason);
@@ -798,6 +808,7 @@ mod tests {
             session_id: "sess-42".into(),
             seq: 10,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: vec![
                 TimelineEntry {
                     id: 1,
@@ -868,6 +879,7 @@ mod tests {
             session_id: "session".to_string(),
             seq: 2,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: vec![
                 TimelineEntry {
                     id: 1,
@@ -924,6 +936,7 @@ mod tests {
             session_id: "session".to_string(),
             seq: 2,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: vec![
                 TimelineEntry {
                     id: 1,
@@ -968,6 +981,7 @@ mod tests {
             session_id: "session".to_string(),
             seq: 1,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: vec![TimelineEntry {
                 id: 1,
                 order: 1,
@@ -1000,6 +1014,7 @@ mod tests {
             session_id: "sess-1".into(),
             seq: 9,
             turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Saved,
             timeline: Vec::new(),
             active_tools: Vec::new(),
             history_window: HistoryWindow::complete(0),
@@ -1013,5 +1028,37 @@ mod tests {
             None,
             "stale ending_reason survived resync"
         );
+    }
+
+    #[test]
+    fn durability_status_applies_from_events_and_snapshot() {
+        let mut state = ViewState::new("session");
+        ev(
+            &mut state,
+            1,
+            SessionEvent::DurabilityStatusChanged {
+                status: DurabilityStatus::Unsaved,
+            },
+        );
+        assert_eq!(state.durability_status(), DurabilityStatus::Unsaved);
+
+        let mut snapshot = SessionSnapshot {
+            session_id: "session".to_string(),
+            seq: 2,
+            turn_status: TurnStatus::Idle,
+            durability_status: DurabilityStatus::Superseded,
+            timeline: Vec::new(),
+            active_tools: Vec::new(),
+            history_window: HistoryWindow::complete(0),
+            pending_approvals: Vec::new(),
+            runtime_options: Vec::new(),
+            context_usage: None,
+        };
+        state.apply_snapshot(snapshot.clone());
+        assert_eq!(state.durability_status(), DurabilityStatus::Superseded);
+
+        snapshot.durability_status = DurabilityStatus::Degraded;
+        state.apply_snapshot(snapshot);
+        assert_eq!(state.durability_status(), DurabilityStatus::Degraded);
     }
 }

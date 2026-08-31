@@ -19,8 +19,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::session_protocol::{
-    AssistantOutcome, RuntimeOption, RuntimeOptionSpec, RuntimeValue, TimelineEntryKind,
-    ToolCallStateStatus, TranscriptRole, TurnStatus,
+    AssistantOutcome, DurabilityStatus, RuntimeOption, RuntimeOptionSpec, RuntimeValue,
+    TimelineEntryKind, ToolCallStateStatus, TranscriptRole, TurnStatus,
 };
 use crate::tui::state::ViewState;
 
@@ -249,7 +249,14 @@ fn render_status(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let model = current_model(state)
         .map(|m| format!("{m} · "))
         .unwrap_or_default();
-    let text = format!(" {turn} · {model}{usage} · session {session} ");
+    let durability = match state.durability_status() {
+        DurabilityStatus::Saved => "",
+        DurabilityStatus::Unsaved => " · unsaved",
+        DurabilityStatus::Saving => " · saving…",
+        DurabilityStatus::Degraded => " · save degraded",
+        DurabilityStatus::Superseded => " · persistence superseded",
+    };
+    let text = format!(" {turn}{durability} · {model}{usage} · session {session} ");
     Paragraph::new(Line::from(sanitize(&text)))
         .style(Style::default().fg(Color::White).bg(Color::Blue))
         .render(area, buf);
@@ -757,6 +764,23 @@ mod tests {
 
         let out = render_to_string(&state, "", 60, 12);
         assert!(out.contains("ctx ~50%"), "estimate marker missing:\n{out}");
+    }
+
+    #[test]
+    fn status_bar_persistently_surfaces_durability_failure() {
+        let mut state = ViewState::new("sess");
+        state.apply_event(
+            1,
+            SessionEvent::DurabilityStatusChanged {
+                status: DurabilityStatus::Degraded,
+            },
+        );
+
+        let out = render_to_string(&state, "", 60, 12);
+        assert!(
+            out.contains("save degraded"),
+            "durability warning missing:\n{out}"
+        );
     }
 
     #[test]

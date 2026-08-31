@@ -32,6 +32,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.daimonos.remote.protocol.ApprovalDecision
 import dev.daimonos.remote.protocol.ClientCapability
+import dev.daimonos.remote.protocol.DurabilityStatus
 import dev.daimonos.remote.protocol.TimelineEntry
 import dev.daimonos.remote.protocol.TurnStatus
 import dev.daimonos.remote.session.displayText
@@ -184,6 +185,10 @@ private fun SessionScreen(
                 append(if (state.connected) "Connected" else "Reconnecting")
                 append(" · ")
                 append(state.session.turnStatus.name.lowercase())
+                state.session.durabilityStatus.statusLabel()?.let { durability ->
+                    append(" · ")
+                    append(durability)
+                }
                 state.session.contextUsage?.utilizationBasisPoints?.let {
                     append(" · context ")
                     append(it / 100.0)
@@ -317,4 +322,12 @@ private fun SessionScreen(
             }
         }
     }
+}
+
+private fun DurabilityStatus.statusLabel(): String? = when (this) {
+    DurabilityStatus.SAVED -> null
+    DurabilityStatus.UNSAVED -> "unsaved"
+    DurabilityStatus.SAVING -> "saving"
+    DurabilityStatus.DEGRADED -> "save degraded"
+    DurabilityStatus.SUPERSEDED -> "persistence superseded"
 }

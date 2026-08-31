@@ -127,6 +127,7 @@ impl TimelineReducer {
             | SessionEvent::RuntimeOptionsChanged { .. }
             | SessionEvent::ContextUsageChanged { .. }
             | SessionEvent::TurnStatusChanged { .. }
+            | SessionEvent::DurabilityStatusChanged { .. }
             | SessionEvent::SessionEnding { .. } => {}
         }
         self.sync_window();

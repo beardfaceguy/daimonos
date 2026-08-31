@@ -3,6 +3,7 @@ package dev.daimonos.remote.session
 import dev.daimonos.remote.protocol.ActiveToolState
 import dev.daimonos.remote.protocol.ApprovalRequest
 import dev.daimonos.remote.protocol.AssistantOutcome
+import dev.daimonos.remote.protocol.DurabilityStatus
 import dev.daimonos.remote.protocol.HistoryWindow
 import dev.daimonos.remote.protocol.SessionEvent
 import dev.daimonos.remote.protocol.SessionSnapshot
@@ -125,6 +126,7 @@ class SessionReducerTest {
                 sessionId = "session",
                 seq = 2,
                 turnStatus = TurnStatus.IDLE,
+                durabilityStatus = DurabilityStatus.SAVED,
                 timeline = listOf(
                     TimelineEntry.User(1, 1, "one"),
                     TimelineEntry.User(2, 2, "two"),
@@ -152,6 +154,18 @@ class SessionReducerTest {
         assertTrue(reducer.state.timeline.isEmpty())
         assertEquals(0, reducer.state.historyWindow.truncatedBefore)
         assertEquals(3, reducer.state.seq)
+    }
+
+    @Test
+    fun durabilityTransitionRemainsVisibleAcrossConversationEvents() {
+        val reducer = SessionReducer()
+        reducer.applyEvent(
+            1,
+            SessionEvent.DurabilityStatusChanged(DurabilityStatus.DEGRADED),
+        )
+        reducer.applyEvent(2, SessionEvent.UserMessage("still usable"))
+
+        assertEquals(DurabilityStatus.DEGRADED, reducer.state.durabilityStatus)
     }
 
     private fun approval(id: String) = ApprovalRequest(

@@ -4,6 +4,7 @@ import dev.daimonos.remote.protocol.ActiveToolState
 import dev.daimonos.remote.protocol.ApprovalRequest
 import dev.daimonos.remote.protocol.AssistantOutcome
 import dev.daimonos.remote.protocol.ContextUsage
+import dev.daimonos.remote.protocol.DurabilityStatus
 import dev.daimonos.remote.protocol.HistoryWindow
 import dev.daimonos.remote.protocol.RuntimeOption
 import dev.daimonos.remote.protocol.SessionEvent
@@ -16,6 +17,7 @@ data class SessionViewState(
     val sessionId: String? = null,
     val seq: Long = 0,
     val turnStatus: TurnStatus = TurnStatus.IDLE,
+    val durabilityStatus: DurabilityStatus = DurabilityStatus.SAVED,
     val timeline: List<TimelineEntry> = emptyList(),
     val activeTools: List<ActiveToolState> = emptyList(),
     val historyWindow: HistoryWindow = HistoryWindow(0, 0, 0),
@@ -57,6 +59,7 @@ class SessionReducer(
                 sessionId = snapshot.sessionId,
                 seq = snapshot.seq,
                 turnStatus = snapshot.turnStatus,
+                durabilityStatus = snapshot.durabilityStatus,
                 timeline = snapshot.timeline,
                 activeTools = snapshot.activeTools,
                 historyWindow = snapshot.historyWindow,
@@ -151,6 +154,8 @@ class SessionReducer(
                 )
             }
             is SessionEvent.TurnStatusChanged -> previous.copy(seq = seq, turnStatus = event.status)
+            is SessionEvent.DurabilityStatusChanged ->
+                previous.copy(seq = seq, durabilityStatus = event.status)
             is SessionEvent.SessionEnding -> {
                 closeOpen()
                 previous.copy(seq = seq, endingReason = event.reason)
