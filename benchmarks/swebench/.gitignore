@@ -1,0 +1,8 @@
+.venv/
+repos/
+worktrees/
+results/
+logs/
+__pycache__/
+instances.jsonl
+/*.json
