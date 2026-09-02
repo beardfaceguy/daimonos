@@ -101,6 +101,41 @@ edit, run tests, git operations):
 Remote benchmarks on AWS (same hardware, same model, same tasks) showed
 **20.3% cost reduction** and **14.0% faster** task completion.
 
+### SWE-bench Verified (mini) — three-way harness comparison
+
+Five instances from [swe-bench-verified-mini](https://huggingface.co/datasets/MariusHobbhahn/swe-bench-verified-mini),
+same model (Claude Opus 4.8) across all three harnesses, each agent running
+inside the official SWE-bench Docker image for its instance (real test
+environment), scored with the official `swebench` evaluation harness:
+
+| Instance | daimonos tokens (LLM calls) | mini-swe-agent tokens (LLM calls) | cursor-agent tokens |
+|---|---:|---:|---:|
+| django__django-11815 | 54,755 (4) | 38,305 (9) | 113,242 |
+| django__django-12155 | 53,773 (4) | 33,095 (9) | 348,425 |
+| django__django-12708 | 88,765 (6) | 196,492 (22) | 451,349 |
+| sphinx-doc__sphinx-8035 | 172,729 (10) | 342,108 (30) | 930,495 |
+| sphinx-doc__sphinx-9367 | 66,812 (5) | 18,611 (6) | 230,223 |
+| **Total tokens** | **436,834** | **628,611** | **2,073,734** |
+| **Total wall time** | **84 s** | **247 s** | **279 s** |
+| **Resolved** | **5/5** | **5/5** | **5/5** |
+
+Conclusions:
+
+- **Correctness parity**: all three harnesses resolved 5/5 at this sample
+  size, so daimonos's token savings did not cost any resolutions.
+- **daimonos was cheapest and fastest**: ~30% fewer tokens than
+  mini-swe-agent (the minimal open-source baseline) and ~4.8x fewer than
+  cursor-agent, with ~3x less wall time than either.
+- **Caveats**: n=5, and run-to-run variance is real (daimonos spent 503k
+  tokens on sphinx-8035 in an earlier identical-config run vs 173k here).
+  cursor-agent's total is mostly cache-read tokens billed at a fraction of
+  input price, so its raw token count overstates its relative cost.
+  Measured API spend for the batch (OpenRouter): daimonos $1.53,
+  mini-swe-agent $1.66; cursor-agent bills via Cursor's backend.
+
+See [benchmarks/swebench/](benchmarks/swebench/) for the runners and
+methodology.
+
 ## 60-second demo
 
 Use this script for README readers, release notes, and social posts:
