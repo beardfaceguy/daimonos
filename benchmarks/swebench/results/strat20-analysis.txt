@@ -1,0 +1,28 @@
+instance                         daim tok calls  ok |   mini tok calls  ok | ratio d/m
+--------------------------------------------------------------------------------------------
+django__django-11880               40,521     3   Y |     11,936     4   Y |      3.39
+django__django-12143               40,662     3   Y |     11,867     4   Y |      3.43
+django__django-11951               40,908     3   Y |     13,422     4   Y |      3.05
+sphinx-doc__sphinx-10466           45,821     3   Y |     36,220     7   Y |      1.27
+django__django-9296                53,682     4   Y |     14,336     5   Y |      3.74
+django__django-12155               53,771     4   Y |     33,287     9   Y |      1.62
+django__django-12050               53,822     4   Y |     31,278     8   Y |      1.72
+django__django-11999               53,897     4   Y |     38,052     9   Y |      1.42
+django__django-11964               58,099     4   Y |     32,782     7   Y |      1.77
+django__django-12193               63,082     4   n |     15,802     5   Y |      3.99
+sphinx-doc__sphinx-10323           63,194     4   Y |    129,199    16   Y |      0.49
+sphinx-doc__sphinx-10435           63,485     4   n |    398,447    33   Y |      0.16
+django__django-12304               69,849     5   Y |     47,720    10   Y |      1.46
+django__django-12774               84,472     6   Y |     39,829     9   Y |      2.12
+django__django-12406              584,853    24   Y |    594,483    39   n |      0.98
+sphinx-doc__sphinx-7590           756,822    32   n |    555,051    38   n |      1.36
+django__django-11885              812,855    27   n |  1,933,526    59   Y |      0.42
+sphinx-doc__sphinx-10673          852,358    34   Y |    632,857    38   Y |      1.35
+sphinx-doc__sphinx-11510          885,598    31   n |    256,321    21   Y |      3.46
+django__django-12273            1,410,568    39   n |    389,736    27   n |      3.62
+--------------------------------------------------------------------------------------------
+TOTAL                           6,088,319       14/20 |  5,216,151       17/20 |      1.17
+
+easy8: daimonos cheaper on 0/8 | tokens d=383,084 m=190,398 (d/m 2.01) | resolved d=8/8 m=8/8
+mid6: daimonos cheaper on 2/6 | tokens d=402,181 m=663,779 (d/m 0.61) | resolved d=4/6 m=6/6
+tail6: daimonos cheaper on 2/6 | tokens d=5,303,054 m=4,361,974 (d/m 1.22) | resolved d=2/6 m=3/6

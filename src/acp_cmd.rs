@@ -417,6 +417,8 @@ struct SessionHandle {
     /// session/delete.
     bridge: BridgeSlot,
     mcp_specs: tokio::sync::Mutex<Vec<ServerSpec>>,
+    /// Portable Agent Skills discovered for this session's workspace.
+    skills: Vec<crate::skills::Skill>,
 }
 
 type BridgeSlot = Arc<tokio::sync::RwLock<Arc<McpBridge>>>;
@@ -530,6 +532,11 @@ enum AcpCommand {
     Help,
 }
 
+fn skill_command_name(text: &str) -> Option<&str> {
+    let command = text.trim().strip_prefix('/')?;
+    (!command.is_empty() && !command.chars().any(char::is_whitespace)).then_some(command)
+}
+
 fn parse_acp_command(text: &str) -> Option<AcpCommand> {
     match text.trim() {
         "/clear" => Some(AcpCommand::Clear),
@@ -539,22 +546,34 @@ fn parse_acp_command(text: &str) -> Option<AcpCommand> {
     }
 }
 
-fn available_commands() -> Vec<AvailableCommand> {
-    vec![
+fn available_commands(skills: &[crate::skills::Skill]) -> Vec<AvailableCommand> {
+    let mut commands = vec![
         AvailableCommand::new(
             "clear",
             "Reset conversation history; cumulative usage is kept",
         ),
         AvailableCommand::new("usage", "Show cumulative token usage and cost"),
         AvailableCommand::new("help", "Show available Daimonos commands"),
-    ]
+    ];
+    commands.extend(
+        skills
+            .iter()
+            .map(|skill| AvailableCommand::new(skill.name.clone(), skill.description.clone())),
+    );
+    commands
 }
 
-fn send_available_commands(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
+fn send_available_commands(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    skills: &[crate::skills::Skill],
+) {
     send_notification(
         cx,
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
+            skills,
+        ))),
     );
 }
 
@@ -1887,11 +1906,19 @@ async fn run_prompt_turn(
     handle: &Arc<SessionHandle>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    user_message: CoreMessage,
+    mut user_message: CoreMessage,
     client_user_message_id: Option<String>,
     assistant_prefix: Option<String>,
 ) -> Result<AcpStopReason, TurnError> {
-    if let Some(command) = direct_command_text(&user_message).and_then(parse_acp_command) {
+    let direct_text = direct_command_text(&user_message).map(str::to_string);
+    if let Some(skill) = direct_text
+        .as_deref()
+        .and_then(skill_command_name)
+        .and_then(|name| handle.skills.iter().find(|skill| skill.name == name))
+    {
+        user_message = CoreMessage::user(crate::skills::render(skill));
+    }
+    if let Some(command) = direct_text.as_deref().and_then(parse_acp_command) {
         return run_acp_direct_command(
             handle,
             cx,
@@ -2190,6 +2217,9 @@ async fn build_session_handle(
         cfg.session.max_active_tool_calls,
         cfg.session.max_tool_event_output_bytes,
     ));
+    let skills = crate::skills::discover(&session_workspace);
+    let mut system_prompt = crate::prompts::agent_system(cfg).await;
+    system_prompt.push_str(&crate::skills::catalog(&skills));
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),
@@ -2201,7 +2231,7 @@ async fn build_session_handle(
         Arc::clone(&tool_lifecycle),
         token_log,
         state.compaction.policy.clone(),
-        crate::prompts::agent_system(cfg).await,
+        system_prompt,
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
@@ -2257,6 +2287,7 @@ async fn build_session_handle(
         connection,
         bridge: bridge_slot,
         mcp_specs: tokio::sync::Mutex::new(mcp_specs),
+        skills,
     });
 
     // Idle human-visible agent-mail notification poller (#1063). A Weak handle
@@ -2958,7 +2989,7 @@ fn build_agent_with_state(
                             NewSessionResponse::new(session_id.clone())
                                 .config_options(Some(config_options)),
                         )?;
-                        send_available_commands(&cx, &session_id);
+                        send_available_commands(&cx, &session_id, &handle.skills);
                         send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
                         tracing::info!(
                             target: "daimonos::acp",
@@ -3168,7 +3199,7 @@ fn build_agent_with_state(
                         responder.respond(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
-                        send_available_commands(&cx, &session_id);
+                        send_available_commands(&cx, &session_id, &active_handle.skills);
                         // Notifications must follow a successfully queued load
                         // response: Zed registers the session while handling
                         // that response, then accepts its session updates.
@@ -4344,7 +4375,10 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(command_names, vec!["clear", "usage", "help"]);
+        assert!(
+            command_names.starts_with(&["clear", "usage", "help"]),
+            "built-in commands must precede any host-installed skills: {command_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -7320,7 +7354,12 @@ mod tests {
             replayed.iter().any(|update| matches!(
                 update,
                 SessionUpdate::AvailableCommandsUpdate(commands)
-                    if commands.available_commands.len() == 3
+                    if commands
+                        .available_commands
+                        .iter()
+                        .map(|command| command.name.as_str())
+                        .take(3)
+                        .eq(["clear", "usage", "help"])
             )),
             "session/load must re-advertise slash commands: {replayed:?}"
         );

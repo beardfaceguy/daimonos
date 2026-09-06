@@ -130,6 +130,11 @@ the equivalent notice.
    image-capable providers.
 7. Foreground `exec` calls show stdout/stderr live in a terminal card, followed
    by the command's exit status.
+8. Type `/` in a newly created Daimonos thread. Portable Agent Skills from
+   `~/.agents/skills/*/SKILL.md` and `<project>/.agents/skills/*/SKILL.md`
+   appear alongside Daimonos's built-in commands. Project-local skills override
+   global skills with the same name. Invoking `/skill-name` loads that skill's
+   instructions for the turn. Restart the thread after adding or editing skills.
 
 ## Scope
 

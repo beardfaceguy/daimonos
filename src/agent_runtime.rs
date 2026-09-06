@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::cli::{AcpArgs, AgentArgs, ChatArgs, SessionDaemonArgs};
 use crate::{
-    acp_cmd, agent, agent_cmd, agent_env, analytics, chat_cmd, config, paths, prompts, providers,
-    safety, session_daemon, session_factory, session_store, tui,
+    acp_cmd, agent, agent_cmd, agent_env, analytics, chat_cmd, config, herdr, paths, prompts,
+    providers, safety, session_daemon, session_factory, session_store, tui,
 };
 
 fn try_build_provider(
@@ -429,10 +429,13 @@ pub async fn run_agent(
     };
 
     let task = require_agent_task(task, mode, false)?;
+    // Under herdr (HERDR_ENV=1 in the pane), report semantic state so the
+    // supervisor never has to screen-scrape; no-op otherwise.
+    let herdr_reporter = herdr::HerdrReporter::from_env().map(Arc::new);
     let approve_fn = if agent.approval_mode == "auto" {
         None
     } else {
-        Some(safety::SafetyPolicy::stdin_approve_fn())
+        Some(wrap_stdin_approve(&herdr_reporter))
     };
     let args = agent_cmd::AgentCmdArgs {
         task,
@@ -444,9 +447,27 @@ pub async fn run_agent(
         thought_log,
         thinking: agent.thinking.clone(),
     };
+    if let Some(reporter) = &herdr_reporter {
+        reporter.report(herdr::AgentState::Working, None);
+    }
     let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
-    check_agent_result(&result)
+        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await;
+    // One-shot run over (successfully or not): hand lifecycle authority back
+    // before exit, per the herdr contract.
+    if let Some(reporter) = &herdr_reporter {
+        reporter.release();
+    }
+    check_agent_result(&result?)
+}
+
+/// stdin approval prompt, additionally reporting blocked/working to herdr
+/// when running under it.
+fn wrap_stdin_approve(herdr_reporter: &Option<Arc<herdr::HerdrReporter>>) -> safety::ApproveFn {
+    let stdin = safety::SafetyPolicy::stdin_approve_fn();
+    match herdr_reporter {
+        Some(reporter) => herdr::wrap_approve_fn(stdin, Arc::clone(reporter)),
+        None => stdin,
+    }
 }
 
 pub async fn run_chat(
@@ -491,10 +512,11 @@ pub async fn run_chat(
         .await
         .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
+    let herdr_reporter = herdr::HerdrReporter::from_env().map(Arc::new);
     let approve_fn = if agent.approval_mode == "auto" {
         None
     } else {
-        Some(safety::SafetyPolicy::stdin_approve_fn())
+        Some(wrap_stdin_approve(&herdr_reporter))
     };
     let safety = agent.to_safety_policy(approve_fn);
     chat_cmd::run_chat(
@@ -508,6 +530,7 @@ pub async fn run_chat(
         sessions_dir,
         resume,
         compaction,
+        herdr_reporter,
     )
     .await
 }

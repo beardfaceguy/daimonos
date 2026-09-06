@@ -187,7 +187,8 @@ daimonos/
 │   ├── aws-nitro-kernel-config.md # Distro kernel requirements on AWS Nitro
 │   └── *-setup.md                 # Per-client integration guides: zed, zed-acp,
 │                                  #   cursor, claude-code, copilot, cline,
-│                                  #   windsurf, gemini-cli, discord, other-tools
+│                                  #   windsurf, gemini-cli, discord, herdr,
+│                                  #   other-tools
 ├── tests/                         # pytest MCP conformance suite (~40 modules)
 │   ├── conftest.py                # Fixture: builds binary, MCP handshake, DaimonosClient
 │   ├── requirements.txt
@@ -214,6 +215,7 @@ daimonos/
     ├── chat_cmd.rs                # Interactive `chat` REPL (reedline)
     ├── acp_cmd.rs                 # Native ACP engine over stdio (Zed & other ACP clients)
     ├── agent_env.rs               # Agent env file: provider, model, keys, approvals, compaction
+    ├── herdr.rs                   # Herdr pane supervision: semantic state reports from chat/agent
     ├── compaction.rs              # Context-window compaction (ADR-002)
     ├── safety.rs                  # Approval modes, allow/deny gates, persisted approvals
     ├── session_store.rs           # On-disk conversation persistence (chat + ACP sessions)

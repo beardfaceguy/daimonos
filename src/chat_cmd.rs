@@ -231,6 +231,7 @@ pub async fn run_chat(
     sessions_dir: Option<PathBuf>,
     resume: Option<String>,
     compaction: Option<CompactionPolicy>,
+    herdr: Option<Arc<crate::herdr::HerdrReporter>>,
 ) -> anyhow::Result<()> {
     let system_prompt = crate::prompts::agent_system(&cfg).await;
     let mut config = build_agent_config_with_descriptions(
@@ -278,7 +279,9 @@ pub async fn run_chat(
         println!("[resumed session {id} (model: {resolved})]");
     }
 
-    let mut line_editor = Reedline::create();
+    // Bracketed paste keeps multiline prompts intact — supervisors like herdr
+    // deliver prompts as one bracketed paste followed by Enter.
+    let mut line_editor = Reedline::create().use_bracketed_paste(true);
     // Distinct "*D*" left segment so the REPL prompt is never mistaken for a
     // regular shell prompt (which the default reedline cwd-based prompt resembles).
     let prompt = DefaultPrompt::new(
@@ -287,6 +290,13 @@ pub async fn run_chat(
     );
 
     println!("daimonos chat [{session_id}] — type /help for commands, Ctrl-D to quit.");
+
+    // Under herdr, publish the session id (manual restore path is
+    // `daimonos chat --resume <id>`) and the initial ready-for-input state.
+    if let Some(reporter) = &herdr {
+        reporter.set_session_id(&session_id);
+        reporter.report(crate::herdr::AgentState::Idle, None);
+    }
 
     loop {
         match line_editor.read_line(&prompt) {
@@ -310,6 +320,9 @@ pub async fn run_chat(
                 ChatCommand::Prompt(text) => {
                     if text.is_empty() {
                         continue;
+                    }
+                    if let Some(reporter) = &herdr {
+                        reporter.report(crate::herdr::AgentState::Working, None);
                     }
                     let prompt_span = PromptSpan::new(PromptMetadata {
                         mode: "chat",
@@ -362,6 +375,10 @@ pub async fn run_chat(
                             store.save(&session_id, session.model(), session.history());
                         }
                     }
+                    // Completed or aborted, the REPL is back at the prompt.
+                    if let Some(reporter) = &herdr {
+                        reporter.report(crate::herdr::AgentState::Idle, None);
+                    }
                 }
             },
             Ok(Signal::CtrlC) => {
@@ -377,6 +394,10 @@ pub async fn run_chat(
         }
     }
 
+    // Hand lifecycle authority back before exiting the pane (herdr contract).
+    if let Some(reporter) = &herdr {
+        reporter.release();
+    }
     if let Some(mcp) = agent_mcp {
         mcp.shutdown().await;
     }

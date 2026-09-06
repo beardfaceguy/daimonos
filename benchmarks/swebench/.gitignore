@@ -1,0 +1,10 @@
+.venv/
+repos/
+worktrees/
+results/*
+!results/*.md
+!results/*.txt
+logs/
+__pycache__/
+instances.jsonl
+/*.json
