@@ -7,6 +7,19 @@ __pycache__/
 !/benchmarks/results/*.md
 /benchmarks/workspace/
 /benchmarks/server-bench/results/
+
+# SWE-bench local artifacts: reproducible but large (~1 GB on a populated run).
+# Keep only the committed harness and human-readable summaries.
+/benchmarks/swebench/.venv/
+/benchmarks/swebench/repos/
+/benchmarks/swebench/worktrees/
+/benchmarks/swebench/logs/
+/benchmarks/swebench/results/*
+!/benchmarks/swebench/results/*.md
+!/benchmarks/swebench/results/*.txt
+/benchmarks/swebench/instances.jsonl
+/benchmarks/swebench/*.json
+
 claude_api_key.env
 .env
 .env.*
