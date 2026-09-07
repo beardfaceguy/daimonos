@@ -1,7 +1,11 @@
 # Benchmark correctness-gate audit (2026-08-04)
 
-Triggered by discovering that two `07-snapshot-rollback` runs were graded **correct**
-while doing no work at all (0 snapshot ops, 0 edit ops in `~/.daimonos/analytics.db`).
+Triggered by discovering that the `07-snapshot-rollback` gate was **vacuous** — it
+passes on a pristine tree, so it cannot distinguish a real run from one that did
+nothing. Two runs also showed 0 snapshot/edit ops in `~/.daimonos/analytics.db`,
+which first looked like silent failures; that reading was later **withdrawn** (see
+the re-grade section below — agent-mode `analytics.db` under-records direct tool
+calls, Vikunja #136).
 
 ## Method
 Reset `benchmarks/workspace` to pristine, then execute every task's `workspace` checks
@@ -36,7 +40,7 @@ count, or the test count).
 ### 1. `07-snapshot-rollback` had a vacuous gate
 `! grep -qi toys src/config.rs` asserts the file does **not** contain `toys` — but the
 pristine file doesn't either. Success is byte-identical to never-started, so the check
-passed for runs that did nothing. The companion response check (`snapshot`, `restor`)
+would pass even for a run that did nothing. The companion response check (`snapshot`, `restor`)
 is keyword-only and satisfied by merely saying the words.
 
 **Fix:** added `test -n "$(ls -A .daimonos/snapshots 2>/dev/null)"`. This works because
@@ -62,14 +66,28 @@ full rebuild every task. Snapshots therefore accumulated across tasks and runs, 
 
 **Fix:** explicit `rm -rf .daimonos` in `reset_workspace`.
 
-## Retroactive re-grade of task 07 (from analytics)
-| verdict under fixed gate | runs |
+## Retroactive re-grade of task 07 — WITHDRAWN
+
+An earlier version of this section inferred a retroactive grade from
+`~/.daimonos/analytics.db` op counts:
+
+| verdict inferred from analytics op counts | runs |
 |---|---|
 | would PASS (real snapshot created) | 8 |
-| **would now FAIL (no snapshot)** | **2** |
+| would FAIL (0 ops recorded) | 2 |
 
-**True correctness on task 07 was 80%, not 100%.** Lineage stages F0-F4 all report
-"33/33 correct"; that figure is **overstated**. Token and cost numbers are unaffected.
+and concluded "true correctness on task 07 was 80%, not 100%".
+
+**That conclusion is withdrawn.** In agent mode `~/.daimonos/analytics.db` does not
+record *direct* (non-scripted) tool calls — only microcompaction bookkeeping and
+`script:<name>` / MCP-bridge calls are logged (Vikunja #136). A run that created a
+snapshot and edited through direct tool calls would show **0 ops** here, so the two
+"0 op" runs do **not** demonstrate that no work was done.
+
+What is established is narrower: the old gate was **vacuous** and could not verify the
+work. The historical pass/fail rate for task 07 under that gate is therefore
+**unknown**. Lineage stages F0-F4 report "33/33 correct"; for task 07 that figure is
+**unverified** (not necessarily wrong). Token and cost numbers are unaffected.
 
 ---
 
