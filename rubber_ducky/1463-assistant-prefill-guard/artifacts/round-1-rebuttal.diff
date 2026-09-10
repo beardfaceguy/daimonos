@@ -1,0 +1,317 @@
+diff --git i/src/agent.rs w/src/agent.rs
+index 928c76a..98e5f42 100644
+--- i/src/agent.rs
++++ w/src/agent.rs
+@@ -1071,6 +1071,11 @@ async fn run_inner(
+                 tokio::time::sleep(delay).await;
+             }
+         };
++        // One provider-neutral enforcement boundary: never let a malformed
++        // ToolUse-without-ToolCall response enter history and create an
++        // assistant-prefill request on the next loop iteration (#1463).
++        let malformed_tool_use = crate::providers::tool_use_missing_structured_call(&resp);
++        resp = crate::providers::validate_response_shape(resp);
+         // Providers report reasoning tokens inconsistently, but every adapter
+         // crosses this shared stream boundary. Count exact UTF-8 bytes here so
+         // the metric is provider-neutral and never guessed from token ratios.
+@@ -1108,11 +1113,16 @@ async fn run_inner(
+             );
+         }
+ 
+-        // Assistant turn appended BEFORE tool results (Anthropic API requirement)
+-        messages.push(Message {
+-            role: Role::Assistant,
+-            content: resp.content.clone(),
+-        });
++        // Assistant turn appended BEFORE tool results (Anthropic API
++        // requirement). Only the malformed response identified above is
++        // excluded; preserve existing history semantics for unrelated empty
++        // assistant responses.
++        if !malformed_tool_use {
++            messages.push(Message {
++                role: Role::Assistant,
++                content: resp.content.clone(),
++            });
++        }
+ 
+         match resp.stop_reason {
+             StopReason::MaxTokens
+@@ -3301,6 +3311,82 @@ mod tests {
+         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
+     }
+ 
++    #[tokio::test]
++    async fn malformed_tool_use_never_continues_with_assistant_prefill() {
++        let malformed_usage = Usage {
++            input: 200,
++            output: 30,
++            cost: Cost {
++                total_usd: 0.0123,
++                ..Cost::default()
++            },
++            ..Usage::default()
++        };
++        let provider = MockProvider::new(vec![
++            LlmResponse {
++                content: vec![ContentBlock::Text(
++                    "call\n<invoke name=\"read_file\"></invoke>".into(),
++                )],
++                stop_reason: StopReason::ToolUse,
++                error_message: None,
++                context_overflow: false,
++                retryable: false,
++                usage: malformed_usage,
++            },
++            end_turn_resp_with_text("must not be requested"),
++        ]);
++        let dir = tempfile::tempdir().unwrap();
++
++        let result = run(
++            &provider,
++            shared(session_in(dir.path())),
++            vec![Message::user("inspect the file")],
++            &AgentConfig::default(),
++        )
++        .await;
++
++        assert_eq!(result.stop_reason, StopReason::Error);
++        assert_eq!(
++            result.error_message.as_deref(),
++            Some("provider declared tool use but returned no structured tool call")
++        );
++        assert_eq!(result.messages.len(), 1);
++        assert_eq!(result.messages[0].role, Role::User);
++        assert_eq!(result.usage.input, 200);
++        assert!((result.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
++        assert_eq!(
++            provider.responses.lock().unwrap().len(),
++            1,
++            "the malformed assistant turn must not trigger another provider call"
++        );
++    }
++
++    #[tokio::test]
++    async fn unrelated_empty_end_turn_still_appends_assistant_history() {
++        let provider = MockProvider::new(vec![LlmResponse {
++            content: vec![],
++            stop_reason: StopReason::EndTurn,
++            error_message: None,
++            context_overflow: false,
++            retryable: false,
++            usage: mock_usage(100, 0),
++        }]);
++        let dir = tempfile::tempdir().unwrap();
++
++        let result = run(
++            &provider,
++            shared(session_in(dir.path())),
++            vec![Message::user("answer")],
++            &AgentConfig::default(),
++        )
++        .await;
++
++        assert_eq!(result.stop_reason, StopReason::EndTurn);
++        assert_eq!(result.messages.len(), 2);
++        assert_eq!(result.messages[1].role, Role::Assistant);
++        assert!(result.messages[1].content.is_empty());
++    }
++
+     fn bounded_session_in(dir: &std::path::Path) -> Session {
+         let mut cfg = Config::default();
+         cfg.tool_output.directory = Some(dir.join("tool-output").to_string_lossy().to_string());
+diff --git i/src/providers/mod.rs w/src/providers/mod.rs
+index 6ccadae..c6533a3 100644
+--- i/src/providers/mod.rs
++++ w/src/providers/mod.rs
+@@ -256,6 +256,37 @@ impl LlmResponse {
+     }
+ }
+ 
++pub const MISSING_STRUCTURED_TOOL_CALL: &str =
++    "provider declared tool use but returned no structured tool call";
++
++pub fn tool_use_missing_structured_call(response: &LlmResponse) -> bool {
++    response.stop_reason == StopReason::ToolUse
++        && !response
++            .content
++            .iter()
++            .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
++}
++
++/// Enforce the provider-neutral tool-use response invariant.
++///
++/// A `ToolUse` stop without a `ToolCall` cannot be dispatched or paired with a
++/// user-role `ToolResult`. Continuing would leave assistant text at the end of
++/// history, which Anthropic-compatible routes interpret as unsupported
++/// assistant prefill. Preserve accounting from the malformed attempt, but
++/// clear its pseudo-tool content and fail before it enters durable history.
++pub fn validate_response_shape(mut response: LlmResponse) -> LlmResponse {
++    if tool_use_missing_structured_call(&response) {
++        response.content.clear();
++        response.stop_reason = StopReason::Error;
++        response
++            .error_message
++            .get_or_insert_with(|| MISSING_STRUCTURED_TOOL_CALL.to_string());
++        response.context_overflow = false;
++        response.retryable = false;
++    }
++    response
++}
++
+ /// Resolved provider deadlines, in the form the adapters need (vikunja #1107).
+ ///
+ /// Lives in the provider layer and is shared by all three adapters for the same
+@@ -544,6 +575,77 @@ pub trait LlmProvider: Send + Sync {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn valid_tool_use_shape_is_preserved() {
++        let response = LlmResponse {
++            content: vec![ContentBlock::ToolCall {
++                id: "call-1".into(),
++                name: "read_file".into(),
++                input: serde_json::json!({"path": "src/main.rs"}),
++            }],
++            stop_reason: StopReason::ToolUse,
++            error_message: None,
++            context_overflow: false,
++            retryable: false,
++            usage: Usage {
++                input: 12,
++                ..Usage::default()
++            },
++        };
++
++        let validated = validate_response_shape(response);
++
++        assert_eq!(validated.stop_reason, StopReason::ToolUse);
++        assert_eq!(validated.content.len(), 1);
++        assert_eq!(validated.usage.input, 12);
++        assert!(validated.error_message.is_none());
++    }
++
++    #[test]
++    fn mixed_text_and_structured_tool_use_shape_is_preserved() {
++        let response = LlmResponse {
++            content: vec![
++                ContentBlock::Text("I will inspect it.".into()),
++                ContentBlock::ToolCall {
++                    id: "call-1".into(),
++                    name: "read_file".into(),
++                    input: serde_json::json!({"path": "src/main.rs"}),
++                },
++            ],
++            stop_reason: StopReason::ToolUse,
++            error_message: None,
++            context_overflow: false,
++            retryable: false,
++            usage: Usage::default(),
++        };
++
++        let validated = validate_response_shape(response);
++
++        assert_eq!(validated.stop_reason, StopReason::ToolUse);
++        assert_eq!(validated.content.len(), 2);
++    }
++
++    #[test]
++    fn malformed_tool_use_preserves_existing_provider_error() {
++        let response = LlmResponse {
++            content: vec![ContentBlock::Text("pseudo tool syntax".into())],
++            stop_reason: StopReason::ToolUse,
++            error_message: Some("provider-specific detail".into()),
++            context_overflow: false,
++            retryable: false,
++            usage: Usage::default(),
++        };
++
++        let validated = validate_response_shape(response);
++
++        assert_eq!(validated.stop_reason, StopReason::Error);
++        assert_eq!(
++            validated.error_message.as_deref(),
++            Some("provider-specific detail")
++        );
++        assert!(validated.content.is_empty());
++    }
++
+     /// vikunja #1240: a transient provider failure must be distinguishable from
+     /// a fatal one *at the provider boundary*, so core can retry without ever
+     /// reading provider phrasing (ADR-001). Status codes are a standard, not
+diff --git i/src/providers/openrouter.rs w/src/providers/openrouter.rs
+index 85b2427..770a646 100644
+--- i/src/providers/openrouter.rs
++++ w/src/providers/openrouter.rs
+@@ -860,6 +860,36 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn parse_tool_finish_without_structured_call_is_error() {
++        let body = json!({
++            "choices": [{
++                "message": {
++                    "role": "assistant",
++                    "content": "call\n<invoke name=\"read_file\"></invoke>"
++                },
++                "finish_reason": "tool_calls"
++            }],
++            "usage": {
++                "prompt_tokens": 200,
++                "completion_tokens": 30,
++                "cost": 0.0123
++            }
++        });
++
++        let response = crate::providers::validate_response_shape(parse_response(&body));
++
++        assert_eq!(response.stop_reason, StopReason::Error);
++        assert_eq!(
++            response.error_message.as_deref(),
++            Some("provider declared tool use but returned no structured tool call")
++        );
++        assert!(response.content.is_empty());
++        assert!(!response.retryable);
++        assert_eq!(response.usage.input, 200);
++        assert!((response.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
++    }
++
+     #[test]
+     fn parse_max_tokens_response() {
+         let body = json!({
+@@ -1118,6 +1148,34 @@ mod tests {
+         assert!((resp.usage.cost.total_usd - 0.00042).abs() < f64::EPSILON);
+     }
+ 
++    #[test]
++    fn stream_tool_finish_without_structured_call_is_error() {
++        let mut state = StreamState::default();
++        state.on_chunk(&json!({
++            "choices": [{
++                "delta": {"content": "call\n<invoke name=\"read_file\"></invoke>"},
++                "finish_reason": "tool_calls"
++            }],
++            "usage": {
++                "prompt_tokens": 200,
++                "completion_tokens": 30,
++                "cost": 0.0123
++            }
++        }));
++
++        let response = crate::providers::validate_response_shape(state.finish());
++
++        assert_eq!(response.stop_reason, StopReason::Error);
++        assert_eq!(
++            response.error_message.as_deref(),
++            Some("provider declared tool use but returned no structured tool call")
++        );
++        assert!(response.content.is_empty());
++        assert!(!response.retryable);
++        assert_eq!(response.usage.input, 200);
++        assert!((response.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
++    }
++
+     #[test]
+     fn stream_empty_content_delta_not_emitted() {
+         let mut state = StreamState::default();

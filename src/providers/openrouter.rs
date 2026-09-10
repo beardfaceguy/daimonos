@@ -861,6 +861,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_finish_without_structured_call_is_error() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "call\n<invoke name=\"read_file\"></invoke>"
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 30,
+                "cost": 0.0123
+            }
+        });
+
+        let response = crate::providers::validate_response_shape(parse_response(&body));
+
+        assert_eq!(response.stop_reason, StopReason::Error);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("provider declared tool use but returned no structured tool call")
+        );
+        assert!(response.content.is_empty());
+        assert!(!response.retryable);
+        assert_eq!(response.usage.input, 200);
+        assert!((response.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn parse_max_tokens_response() {
         let body = json!({
             "choices": [{"message": {"content": "partial"}, "finish_reason": "max_tokens"}],
@@ -1116,6 +1146,34 @@ mod tests {
         assert_eq!(resp.usage.input, 10);
         assert_eq!(resp.usage.output, 2);
         assert!((resp.usage.cost.total_usd - 0.00042).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stream_tool_finish_without_structured_call_is_error() {
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({
+            "choices": [{
+                "delta": {"content": "call\n<invoke name=\"read_file\"></invoke>"},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 30,
+                "cost": 0.0123
+            }
+        }));
+
+        let response = crate::providers::validate_response_shape(state.finish());
+
+        assert_eq!(response.stop_reason, StopReason::Error);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("provider declared tool use but returned no structured tool call")
+        );
+        assert!(response.content.is_empty());
+        assert!(!response.retryable);
+        assert_eq!(response.usage.input, 200);
+        assert!((response.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
     }
 
     #[test]
