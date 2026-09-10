@@ -10,6 +10,7 @@ pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    prompt_cache: bool,
     /// Bounded HTTP/SSE deadlines (#1107).
     timeouts: super::ProviderTimeouts,
 }
@@ -24,8 +25,14 @@ impl OpenRouterProvider {
             api_key,
             base_url,
             client,
+            prompt_cache: false,
             timeouts,
         })
+    }
+
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = enabled;
+        self
     }
 
     /// Override the bounded HTTP/SSE deadlines (#1107).
@@ -74,7 +81,10 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
-        let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        let mut messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        if self.prompt_cache && supports_explicit_prompt_cache(&opts.model) {
+            apply_prompt_cache(&mut messages);
+        }
         let tools = tools_to_wire(&ctx.tools);
 
         let mut body = json!({
@@ -147,7 +157,10 @@ impl LlmProvider for OpenRouterProvider {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
-        let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        let mut messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        if self.prompt_cache && supports_explicit_prompt_cache(&opts.model) {
+            apply_prompt_cache(&mut messages);
+        }
         let tools = tools_to_wire(&ctx.tools);
 
         // No `stream_options`: OpenRouter deprecated `include_usage` (usage
@@ -480,6 +493,39 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
     wire
 }
 
+/// Place one Anthropic-compatible ephemeral cache breakpoint on the final
+/// cacheable content block. This avoids the upstream-routing restriction of
+/// OpenRouter's top-level automatic cache control.
+fn apply_prompt_cache(messages: &mut [Value]) {
+    let Some(message) = messages.last_mut() else {
+        return;
+    };
+    let marker = json!({"type": "ephemeral"});
+
+    match message.get_mut("content") {
+        Some(Value::String(text)) => {
+            let text = std::mem::take(text);
+            message["content"] = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": marker,
+            }]);
+        }
+        Some(Value::Array(blocks)) => {
+            if let Some(block) = blocks.last_mut() {
+                block["cache_control"] = marker;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn supports_explicit_prompt_cache(model: &str) -> bool {
+    // Conservative initial scope: this wire extension is documented for
+    // Anthropic-compatible requests. Widen only with provider-backed tests.
+    model.starts_with("anthropic/")
+}
+
 /// Serialize tool schemas to the OpenAI `tools` array format.
 pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
     tools
@@ -620,7 +666,158 @@ pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_support::mock_http_server;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn stream_prompt_cache_marks_latest_tool_result() {
+        let terminal = json!({
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        });
+        let sse = format!("data: {terminal}\n\ndata: [DONE]\n\n");
+        let (base_url, captured) = mock_http_server("200 OK", "text/event-stream", sse).await;
+        let provider = OpenRouterProvider::new("key".into(), base_url)
+            .unwrap()
+            .with_prompt_cache(true);
+        let ctx = Context {
+            messages: vec![
+                Message::user("inspect"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "src/main.rs"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "file contents".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let mut events = Vec::new();
+        let options = CompleteOpts {
+            model: "anthropic/claude-opus-4.8".into(),
+            ..CompleteOpts::default()
+        };
+        let response = provider
+            .stream(&ctx, &options, &mut |event| events.push(event))
+            .await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let request = captured.await.unwrap();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "tool");
+        assert_eq!(
+            messages.last().unwrap()["content"][0],
+            json!({
+                "type": "text",
+                "text": "file contents",
+                "cache_control": {"type": "ephemeral"}
+            })
+        );
+        assert!(messages.last().unwrap().get("cache_control").is_none());
+        assert_eq!(request.matches("\"cache_control\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_prompt_cache_marks_latest_text_message() {
+        let response = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })
+        .to_string();
+        let (base_url, captured) = mock_http_server("200 OK", "application/json", response).await;
+        let provider = OpenRouterProvider::new("key".into(), base_url)
+            .unwrap()
+            .with_prompt_cache(true);
+        let ctx = Context {
+            messages: vec![Message::user("inspect")],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let options = CompleteOpts {
+            model: "anthropic/claude-opus-4.8".into(),
+            ..CompleteOpts::default()
+        };
+        let response = provider.complete(&ctx, &options).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let request = captured.await.unwrap();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({
+                "type": "text",
+                "text": "inspect",
+                "cache_control": {"type": "ephemeral"}
+            })
+        );
+        assert_eq!(request.matches("\"cache_control\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_does_not_mark_non_anthropic_openrouter_models() {
+        let response = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })
+        .to_string();
+        let (base_url, captured) = mock_http_server("200 OK", "application/json", response).await;
+        let provider = OpenRouterProvider::new("key".into(), base_url)
+            .unwrap()
+            .with_prompt_cache(true);
+        let ctx = Context {
+            messages: vec![Message::user("inspect")],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let options = CompleteOpts {
+            model: "openai/gpt-5".into(),
+            ..CompleteOpts::default()
+        };
+
+        let response = provider.complete(&ctx, &options).await;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let request = captured.await.unwrap();
+        assert!(!request.contains("\"cache_control\""));
+    }
+
+    #[test]
+    fn prompt_cache_skips_messages_without_cacheable_content() {
+        for content in [Value::Null, json!([])] {
+            let mut messages = vec![json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [{"id": "call_1"}]
+            })];
+
+            apply_prompt_cache(&mut messages);
+
+            assert!(!messages[0].to_string().contains("cache_control"));
+        }
+    }
 
     /// vikunja #1418: the OpenRouter adapter's mid-stream read-error path must
     /// classify a broken transport (HTTP/2 CANCEL) retryable so the turn resumes.

@@ -31,7 +31,10 @@ fn try_build_provider(
                 base_url.to_string()
             },
         )
-        .map(|p| Box::new(p.with_timeouts(timeouts)) as Box<dyn providers::LlmProvider>),
+        .map(|p| {
+            Box::new(p.with_prompt_cache(prompt_cache).with_timeouts(timeouts))
+                as Box<dyn providers::LlmProvider>
+        }),
         "anthropic" => {
             let mut p = providers::anthropic::AnthropicProvider::new(api_key.to_string())
                 .with_prompt_cache(prompt_cache)
@@ -1053,6 +1056,74 @@ fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mock_openrouter() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })
+        .to_string();
+        providers::test_support::mock_http_server("200 OK", "application/json", body).await
+    }
+
+    #[tokio::test]
+    async fn runtime_openrouter_prompt_cache_flag_reaches_request() {
+        let (base_url, captured) = mock_openrouter().await;
+        let provider = try_build_provider(
+            "openrouter",
+            "key",
+            &base_url,
+            true,
+            providers::ProviderTimeouts::default(),
+        )
+        .unwrap();
+        let context = providers::Context {
+            messages: vec![providers::Message::user("inspect")],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let options = providers::CompleteOpts {
+            model: "anthropic/claude-opus-4.8".into(),
+            ..providers::CompleteOpts::default()
+        };
+        let response = provider.complete(&context, &options).await;
+
+        assert_eq!(response.stop_reason, providers::StopReason::EndTurn);
+        let request = captured.await.unwrap();
+        assert_eq!(request.matches("\"cache_control\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_openrouter_prompt_cache_remains_opt_in() {
+        let (base_url, captured) = mock_openrouter().await;
+        let provider = try_build_provider(
+            "openrouter",
+            "key",
+            &base_url,
+            false,
+            providers::ProviderTimeouts::default(),
+        )
+        .unwrap();
+        let context = providers::Context {
+            messages: vec![providers::Message::user("inspect")],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+
+        let response = provider
+            .complete(&context, &providers::CompleteOpts::default())
+            .await;
+
+        assert_eq!(response.stop_reason, providers::StopReason::EndTurn);
+        let request = captured.await.unwrap();
+        assert!(!request.contains("\"cache_control\""));
+    }
 
     /// Stub provider whose `list_models` answer is scripted.
     struct CatalogStub(Option<Vec<String>>);

@@ -26,10 +26,11 @@ No model/provider-specific code in core, ever.
 
 This keeps provider-specific features out of core:
 
-- **Caching:** core marks *which prompt parts are stable* (provider-neutral "cacheable prefix
-  boundary"); the Anthropic provider turns that into a `cache_control` breakpoint, OpenAI-style
-  providers ignore it (they have automatic prefix caching), others no-op. Core never names
-  `cache_control`.
+- **Caching:** core expresses provider-neutral cache intent and may expose stable-prefix
+  information. Anthropic marks its stable tool/prompt boundary. OpenRouter applies a
+  provider-local latest-cacheable-message strategy because its Chat Completions request
+  shape differs and agent turns currently provide no message boundary. Native OpenAI
+  relies on automatic prefix caching. Core never names `cache_control`.
 - **Usage telemetry:** neutral `Usage` uses provider-neutral field names (`cache_read`,
   `cache_write`, `input`, `output`, nested `cost` struct). Each provider maps its own response
   fields in — no Anthropic field name (`cache_read_input_tokens`, etc.) crosses the trait

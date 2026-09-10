@@ -90,8 +90,8 @@ pub struct AgentEnv {
     pub base_url: String,
     pub approval_mode: String,
     pub api_key: String,
-    /// Explicit provider prompt caching. Optional and default-off until the
-    /// broader native-agent benchmark establishes the one-call trade-off.
+    /// Explicit prompt caching for direct Anthropic and Anthropic models through
+    /// OpenRouter. Optional and default-off because one call may pay only a write.
     pub prompt_cache: bool,
     pub allowed_commands: Vec<String>,
     pub denied_commands: Vec<String>,
