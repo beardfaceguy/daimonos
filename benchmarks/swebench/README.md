@@ -66,9 +66,10 @@ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.
 mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
-through `extract_mini.py` before cross-harness token analysis. Cursor uses its
-own backend, so token/correctness comparisons are available but USD cost parity
-is not.
+through `extract_mini.py` before cross-harness analysis. The normalizer sums
+OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
+uses; LiteLLM's aggregate is not used for ranking. Cursor uses its own backend,
+so token/correctness comparisons are available but USD cost parity is not.
 
 Delete incomplete smoke directories created before dataset enrichment before
 treating `results/` as a baseline; a valid run contains `preds.jsonl`, a

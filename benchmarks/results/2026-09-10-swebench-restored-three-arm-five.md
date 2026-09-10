@@ -41,12 +41,19 @@ Daimonos used 36.00% fewer raw tokens and 64.63% less agent wall time than
 mini-swe-agent, and 63.01% fewer raw tokens and 63.84% less agent wall time than
 Cursor in this repetition.
 
-Those token ratios are not cost ratios. mini-swe-agent explicitly used
-`set_cache_control=default_end`, Cursor reported 1,164,639 cache-read tokens,
-and Daimonos reported no cache reads. mini-swe-agent therefore cost 56.76% less
-than Daimonos despite using more raw tokens. Cursor bills through Cursor's
-backend, so its USD cost is unavailable. Cache policy is a harness-default
-confound and must be controlled before making a cost-efficiency claim.
+Those token ratios are not cost ratios. Daimonos and mini-swe-agent costs both
+sum OpenRouter's provider-returned per-generation `usage.cost`; mini's summed
+value also equals its trajectory-level `model_stats.instance_cost`. In this
+single, provisional matched repetition under the tested harness defaults,
+mini-swe-agent therefore cost 56.76% less than Daimonos despite using more raw
+tokens.
+
+Caching explains the divergence rather than invalidating that default-harness
+cost comparison: mini-swe-agent used `set_cache_control=default_end`, Cursor
+reported 1,164,639 cache-read tokens, and Daimonos reported no cache reads.
+A cache-controlled experiment is required to attribute the difference, but not
+to answer which OpenRouter arm cost more as configured. Cursor bills through
+Cursor's backend, so its USD cost remains unavailable.
 
 ## Per-instance results
 
@@ -76,8 +83,10 @@ OpenRouter HTTP 402 `in_flight_budget_exhausted`; it consumed zero tokens and
 zero cost. The replacement ran after the stated 120-second settlement window.
 
 Cursor's extractor currently reports no LLM-call/tool-call count, so those
-fields must not be treated as zero. mini-swe-agent cost comes from each
-trajectory's `model_stats.instance_cost`.
+fields must not be treated as zero. mini-swe-agent cost comes from summing the
+same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
+retained only as a consistency check.
 
-At least two more matched repetitions, plus an explicit cache-policy decision,
-are needed before interpreting relative efficiency.
+At least two more matched repetitions are needed before publishing relative
+efficiency. An explicit cache-policy decision is needed only for causal
+attribution, not for the harness-default cost ranking above.

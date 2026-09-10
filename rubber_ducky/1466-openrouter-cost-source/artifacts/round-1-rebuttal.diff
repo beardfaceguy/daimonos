@@ -1,0 +1,354 @@
+diff --git i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+index 8202ba5..1ccc212 100644
+--- i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
++++ w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+@@ -41,12 +41,19 @@ Daimonos used 36.00% fewer raw tokens and 64.63% less agent wall time than
+ mini-swe-agent, and 63.01% fewer raw tokens and 63.84% less agent wall time than
+ Cursor in this repetition.
+ 
+-Those token ratios are not cost ratios. mini-swe-agent explicitly used
+-`set_cache_control=default_end`, Cursor reported 1,164,639 cache-read tokens,
+-and Daimonos reported no cache reads. mini-swe-agent therefore cost 56.76% less
+-than Daimonos despite using more raw tokens. Cursor bills through Cursor's
+-backend, so its USD cost is unavailable. Cache policy is a harness-default
+-confound and must be controlled before making a cost-efficiency claim.
++Those token ratios are not cost ratios. Daimonos and mini-swe-agent costs both
++sum OpenRouter's provider-returned per-generation `usage.cost`; mini's summed
++value also equals its trajectory-level `model_stats.instance_cost`. In this
++single, provisional matched repetition under the tested harness defaults,
++mini-swe-agent therefore cost 56.76% less than Daimonos despite using more raw
++tokens.
++
++Caching explains the divergence rather than invalidating that default-harness
++cost comparison: mini-swe-agent used `set_cache_control=default_end`, Cursor
++reported 1,164,639 cache-read tokens, and Daimonos reported no cache reads.
++A cache-controlled experiment is required to attribute the difference, but not
++to answer which OpenRouter arm cost more as configured. Cursor bills through
++Cursor's backend, so its USD cost remains unavailable.
+ 
+ ## Per-instance results
+ 
+@@ -76,8 +83,10 @@ OpenRouter HTTP 402 `in_flight_budget_exhausted`; it consumed zero tokens and
+ zero cost. The replacement ran after the stated 120-second settlement window.
+ 
+ Cursor's extractor currently reports no LLM-call/tool-call count, so those
+-fields must not be treated as zero. mini-swe-agent cost comes from each
+-trajectory's `model_stats.instance_cost`.
++fields must not be treated as zero. mini-swe-agent cost comes from summing the
++same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
++retained only as a consistency check.
+ 
+-At least two more matched repetitions, plus an explicit cache-policy decision,
+-are needed before interpreting relative efficiency.
++At least two more matched repetitions are needed before publishing relative
++efficiency. An explicit cache-policy decision is needed only for causal
++attribution, not for the harness-default cost ranking above.
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 54ad763..237ecfe 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -66,9 +66,10 @@ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
+ (same schema as the in-house suite — `../analyze.py results/` works),
+ `.patch` files, raw transcripts, and `preds.jsonl`.
+ mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
+-through `extract_mini.py` before cross-harness token analysis. Cursor uses its
+-own backend, so token/correctness comparisons are available but USD cost parity
+-is not.
++through `extract_mini.py` before cross-harness analysis. The normalizer sums
++OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
++uses; LiteLLM's aggregate is not used for ranking. Cursor uses its own backend,
++so token/correctness comparisons are available but USD cost parity is not.
+ 
+ Delete incomplete smoke directories created before dataset enrichment before
+ treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
+diff --git i/benchmarks/swebench/extract_mini.py w/benchmarks/swebench/extract_mini.py
+index f880e57..c323736 100644
+--- i/benchmarks/swebench/extract_mini.py
++++ w/benchmarks/swebench/extract_mini.py
+@@ -6,6 +6,7 @@ can be compared with one script.
+ Usage: extract_mini.py TRAJ_JSON INSTANCE_ID REPO MODEL OUT_JSON
+ """
+ import json
++import math
+ import sys
+ 
+ 
+@@ -13,18 +14,50 @@ def main():
+     traj_path, iid, repo, model, out_path = sys.argv[1:6]
+     t = json.load(open(traj_path))
+     tot_in = tot_out = calls = 0
++    costs = []
++    cost_complete = True
+     timestamps = []
+     for m in t.get("messages", []):
+         extra = m.get("extra") or {}
+-        u = (extra.get("response") or {}).get("usage")
+-        if u:
++        if "response" in extra:
+             calls += 1
++            response = extra.get("response")
++            usage = response.get("usage") if isinstance(response, dict) else None
++            if not isinstance(usage, dict) or not usage:
++                cost_complete = False
++                usage = {}
++
++            u = usage
+             tot_in += u.get("prompt_tokens", 0) or 0
+             tot_out += u.get("completion_tokens", 0) or 0
++            cost = u.get("cost")
++            if (
++                isinstance(cost, (int, float))
++                and not isinstance(cost, bool)
++                and cost >= 0
++            ):
++                costs.append(cost)
++            else:
++                cost_complete = False
+         if "timestamp" in extra:
+             timestamps.append(extra["timestamp"])
+     wall_ms = int((max(timestamps) - min(timestamps)) * 1000) if len(timestamps) > 1 else 0
+     exit_status = (t.get("info") or {}).get("exit_status")
++    provider_cost = math.fsum(costs) if calls and cost_complete else None
++    model_stats_cost = (
++        (t.get("info") or {}).get("model_stats") or {}
++    ).get("instance_cost")
++    if not (
++        isinstance(model_stats_cost, (int, float))
++        and not isinstance(model_stats_cost, bool)
++        and model_stats_cost >= 0
++    ):
++        model_stats_cost = None
++    cost_matches_model_stats = (
++        math.isclose(provider_cost, model_stats_cost, rel_tol=1e-9, abs_tol=1e-12)
++        if provider_cost is not None and model_stats_cost is not None
++        else None
++    )
+     summary = {
+         "task_id": iid,
+         "task_name": repo,
+@@ -37,7 +70,12 @@ def main():
+         "total_tokens": tot_in + tot_out,
+         "prompt_tokens": tot_in,
+         "llm_calls": calls,
+-        "cost_usd": None,
++        # Same accounting source as Daimonos: OpenRouter's per-generation
++        # usage.cost, not mini-swe-agent/LiteLLM's model-price estimate.
++        "cost_usd": provider_cost,
++        "cost_source": "openrouter_usage" if provider_cost is not None else None,
++        "model_stats_cost_usd": model_stats_cost,
++        "cost_matches_model_stats": cost_matches_model_stats,
+         "exit_code": 0 if exit_status == "Submitted" else 1,
+         "is_error": exit_status != "Submitted",
+         "success": exit_status == "Submitted",
+diff --git 1/tests/test_swebench_extract_mini.py 2/tests/test_swebench_extract_mini.py
+new file mode 100644
+index 0000000..e40ee34
+--- /dev/null
++++ 2/tests/test_swebench_extract_mini.py
+@@ -0,0 +1,206 @@
++"""Tests for mini-swe-agent SWE-bench summary normalization."""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++SCRIPT = (
++    Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "extract_mini.py"
++)
++
++
++def _extract(tmp_path, payload):
++    trajectory = tmp_path / "trajectory.json"
++    output = tmp_path / "summary.json"
++    trajectory.write_text(json.dumps(payload))
++    subprocess.run(
++        [
++            sys.executable,
++            str(SCRIPT),
++            str(trajectory),
++            "django__django-11815",
++            "django/django",
++            "openrouter/anthropic/claude-opus-4.8",
++            str(output),
++        ],
++        check=True,
++        capture_output=True,
++        text=True,
++        timeout=30,
++    )
++    return json.loads(output.read_text())
++
++
++def test_extract_mini_sums_openrouter_reported_cost(tmp_path):
++    summary = _extract(
++        tmp_path,
++        {
++            "messages": [
++                {
++                    "extra": {
++                        "timestamp": 10.0,
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 100,
++                                "completion_tokens": 10,
++                                "cost": 0.0125,
++                            }
++                        },
++                    }
++                },
++                {
++                    "extra": {
++                        "timestamp": 12.5,
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 120,
++                                "completion_tokens": 20,
++                                "cost": 0.0175,
++                            }
++                        },
++                    }
++                },
++            ],
++            "info": {
++                "exit_status": "Submitted",
++                "model_stats": {"instance_cost": 0.03},
++            },
++        },
++    )
++
++    assert summary["total_tokens"] == 250
++    assert summary["llm_calls"] == 2
++    assert summary["cost_usd"] == pytest.approx(0.03)
++    assert summary["cost_source"] == "openrouter_usage"
++    assert summary["model_stats_cost_usd"] == pytest.approx(0.03)
++    assert summary["cost_matches_model_stats"] is True
++    assert summary["wall_ms"] == 2500
++
++
++def test_extract_mini_rejects_partial_provider_cost(tmp_path):
++    summary = _extract(
++        tmp_path,
++        {
++            "messages": [
++                {
++                    "extra": {
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 100,
++                                "completion_tokens": 10,
++                                "cost": 0.0125,
++                            }
++                        }
++                    }
++                },
++                {
++                    "extra": {
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 120,
++                                "completion_tokens": 20,
++                            }
++                        }
++                    }
++                },
++            ],
++            "info": {"exit_status": "Submitted"},
++        },
++    )
++
++    assert summary["cost_usd"] is None
++    assert summary["cost_source"] is None
++
++
++@pytest.mark.parametrize("bad_cost", [True, -0.01])
++def test_extract_mini_rejects_invalid_provider_cost(tmp_path, bad_cost):
++    summary = _extract(
++        tmp_path,
++        {
++            "messages": [
++                {
++                    "extra": {
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 100,
++                                "completion_tokens": 10,
++                                "cost": bad_cost,
++                            }
++                        }
++                    }
++                }
++            ],
++            "info": {"exit_status": "Submitted"},
++        },
++    )
++
++    assert summary["llm_calls"] == 1
++    assert summary["cost_usd"] is None
++
++
++def test_extract_mini_rejects_generation_without_usage(tmp_path):
++    summary = _extract(
++        tmp_path,
++        {
++            "messages": [
++                {
++                    "extra": {
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 100,
++                                "completion_tokens": 10,
++                                "cost": 0.0125,
++                            }
++                        }
++                    }
++                },
++                {"extra": {"response": {}}},
++            ],
++            "info": {"exit_status": "Submitted"},
++        },
++    )
++
++    assert summary["llm_calls"] == 2
++    assert summary["cost_usd"] is None
++
++
++def test_extract_mini_reports_no_cost_without_generations(tmp_path):
++    summary = _extract(
++        tmp_path,
++        {"messages": [{"role": "user", "content": "task"}], "info": {}},
++    )
++
++    assert summary["llm_calls"] == 0
++    assert summary["cost_usd"] is None
++    assert summary["cost_source"] is None
++
++
++def test_extract_mini_flags_model_stats_cost_mismatch(tmp_path):
++    summary = _extract(
++        tmp_path,
++        {
++            "messages": [
++                {
++                    "extra": {
++                        "response": {
++                            "usage": {
++                                "prompt_tokens": 100,
++                                "completion_tokens": 10,
++                                "cost": 0.0125,
++                            }
++                        }
++                    }
++                }
++            ],
++            "info": {"model_stats": {"instance_cost": 0.02}},
++        },
++    )
++
++    assert summary["model_stats_cost_usd"] == pytest.approx(0.02)
++    assert summary["cost_matches_model_stats"] is False
