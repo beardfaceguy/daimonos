@@ -1,0 +1,5 @@
+/target/
+/.daimonos/
+.DS_Store
+*.swp
+*~

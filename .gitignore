@@ -53,6 +53,10 @@ graphify-out/
 # Local Vikunja reconciliation log (per-developer; offline progress tracking)
 VIKUNJA_TRACKING.md
 
+# Rubber Ducky review state is local; Markdown transcripts under this directory
+# are the durable audit artifacts that may be committed.
+rubber_ducky/reviews.sqlite
+
 # Third-party reference clone (analyzed for project #178; not our code)
 ponytail/
 

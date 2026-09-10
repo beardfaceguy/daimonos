@@ -1,0 +1,7 @@
+sku,name,category,quantity,unit_price
+ELEC-001,Wireless Mouse,electronics,12,24.99
+ELEC-002,Mechanical Keyboard,electronics,4,89.50
+HOME-001,Desk Lamp,home,7,34.00
+HOME-002,Storage Basket,home,3,18.75
+BOOK-001,Rust in Action,books,9,39.95
+BOOK-002,The Pragmatic Programmer,books,2,44.99

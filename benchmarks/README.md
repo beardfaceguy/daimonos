@@ -20,7 +20,9 @@ keep current.
 | `analyze.py` | Aggregates one or more result dirs, grouped by model, correctness-gated. |
 | `context_compare.py` | Separates call-count and mean-context effects and ranks context components. |
 | `tasks/*.json` | The task suite (prompt + machine-checkable `checks`). |
-| `workspace/` | A git repo the agent operates in; reset (`git checkout` + `clean`) before each task. |
+| `workspace-template/` | Tracked source for the inventory-app fixture. |
+| `rebuild_workspace.py` | Recreates the ignored fixture with its deterministic seven-commit history. |
+| `workspace/` | Generated git repo the agent operates in; reset (`git checkout` + `clean`) before each task. |
 | `check_task.py` | Correctness gate: runs each task's `checks` against the response + workspace. |
 | `extract_tokens.py` | Normalizes the `--debug-tokens` log delta into a per-task summary JSON. |
 | `summarize.py` | Prints the end-of-run per-task summary table (shared by the runners). |
@@ -47,6 +49,9 @@ To benchmark a different model, change `DAIMONOS_AGENT_MODEL` in `agent.env`
 ## Quick start
 
 ```sh
+# Recreate the local fixture after cloning or reinstalling:
+python3 rebuild_workspace.py
+
 # Single-task smoke test FIRST — confirm plumbing, output, and billing before
 # spending on the full suite (the OpenRouter account has no hard spend cap):
 ./bench-agent.sh 01
@@ -58,6 +63,22 @@ To benchmark a different model, change `DAIMONOS_AGENT_MODEL` in `agent.env`
 python3 analyze.py results/
 python3 analyze.py results/ sol
 ```
+
+`workspace/` remains gitignored because benchmark tasks intentionally mutate
+and reset its nested Git repository. Its source is tracked in
+`workspace-template/`; `rebuild_workspace.py --force` replaces a stale or
+modified fixture. `workspace-template.commit` is the single source of truth for
+the generated fixture commit. This is a new fixture lineage identity, not a
+substitute for historical fixture commits recorded below. The six deterministic
+marker commits preserve the facts exercised by tasks 06, 09, and 11: total
+commit count, recent subjects, and the final commit's changed-file list. No task
+depends on blame or per-file introduction history.
+
+The generated repository intentionally tracks
+`.daimonos-benchmark-fixture`. The rebuild script requires that sentinel and a
+nested `.git/` before `--force` will remove any existing destination. The
+fixture also pins Rust 1.96.0 in `rust-toolchain.toml`; rustup may download that
+toolchain on the first `cargo test` or `cargo clippy` run.
 
 ## Controlled tool-output benchmark
 
