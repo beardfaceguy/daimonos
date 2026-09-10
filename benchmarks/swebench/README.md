@@ -15,7 +15,8 @@ FAIL_TO_PASS / PASS_TO_PASS tests in a per-instance Docker image.
 
 ```sh
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python 'swebench==5.0.2'
+uv pip install --python .venv/bin/python \
+  'swebench==5.0.2' 'mini-swe-agent==2.4.6'
 .venv/bin/python fetch_dataset.py      # writes instances.jsonl (50 rows)
 ```
 
@@ -49,11 +50,25 @@ Model/provider/key come from `~/.config/daimonos/agent.env`, exactly like
 
 # Full 50-instance run:
 .venv/bin/python run_agent.py --docker --tag <label>
+
+# Cursor arm (requires cursor-agent login):
+.venv/bin/python run_cursor.py --docker \
+  --model claude-opus-4-8-medium --tag <label>
+
+# mini-swe-agent arm (expects OPENROUTER_API_KEY in the environment):
+OPENROUTER_API_KEY=... .venv/bin/mini-extra swebench \
+  --subset MariusHobbhahn/swe-bench-verified-mini --split test \
+  --model openrouter/anthropic/claude-opus-4.8 \
+  --environment-class docker --workers 1 --output results/mini-<label>
 ```
 
 Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.
+mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
+through `extract_mini.py` before cross-harness token analysis. Cursor uses its
+own backend, so token/correctness comparisons are available but USD cost parity
+is not.
 
 Delete incomplete smoke directories created before dataset enrichment before
 treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
