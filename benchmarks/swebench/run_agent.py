@@ -52,8 +52,19 @@ external test harness.
 """
 
 
+def run_text(args, **kw):
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **kw,
+    )
+
+
 def sh(args, **kw):
-    return subprocess.run(args, check=True, capture_output=True, text=True, **kw)
+    return run_text(args, check=True, **kw)
 
 
 def utcnow() -> str:
@@ -100,13 +111,13 @@ def collect_patch(workdir: pathlib.Path) -> str:
     sh(["git", "-C", str(workdir), "add", "-N", "."])
     # Force standard a/-b/ prefixes: the SWE-bench applier rejects the
     # mnemonic i/-w/ prefixes a user gitconfig may enable.
-    return subprocess.run(
+    return run_text(
         [
             "git", "-C", str(workdir),
             "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false",
-            "diff", "--src-prefix=a/", "--dst-prefix=b/",
+            "diff", "--binary", "--src-prefix=a/", "--dst-prefix=b/",
         ],
-        check=True, capture_output=True, text=True,
+        check=True,
     ).stdout
 
 
@@ -135,7 +146,7 @@ exec daimonos --debug-tokens -w /testbed agent "$(cat /bench/prompt.txt)" \
 
 
 def docker(args, **kw):
-    return subprocess.run(["docker", *args], capture_output=True, text=True, **kw)
+    return run_text(["docker", *args], **kw)
 
 
 def run_instance_docker(inst, run_dir, bench_env, model, timeout, keep):
@@ -200,7 +211,7 @@ def run_instance_docker(inst, run_dir, bench_env, model, timeout, keep):
         patch = docker([
             "exec", "-w", "/testbed", cname, "git",
             "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false",
-            "diff", "--src-prefix=a/", "--dst-prefix=b/",
+            "diff", "--binary", "--src-prefix=a/", "--dst-prefix=b/",
         ]).stdout
     finally:
         docker(["rm", "-f", cname])
