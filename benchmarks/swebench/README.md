@@ -68,8 +68,12 @@ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
 through `extract_mini.py` before cross-harness analysis. The normalizer sums
 OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
-uses; LiteLLM's aggregate is not used for ranking. Cursor uses its own backend,
+uses, and separates fresh/cache-write/cache-read prompt tokens; LiteLLM's
+aggregate is retained only as a consistency check. Cursor uses its own backend,
 so token/correctness comparisons are available but USD cost parity is not.
+
+Current default-harness result:
+[`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).
 
 Delete incomplete smoke directories created before dataset enrichment before
 treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
