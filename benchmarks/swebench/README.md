@@ -14,13 +14,27 @@ FAIL_TO_PASS / PASS_TO_PASS tests in a per-instance Docker image.
 ## One-time setup
 
 ```sh
-uv venv .venv
-uv pip install --python .venv/bin/python swebench
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python 'swebench==5.0.2'
 .venv/bin/python fetch_dataset.py      # writes instances.jsonl (50 rows)
 ```
 
 Evaluation additionally needs a working Docker daemon your user can talk to
 (`docker info` must succeed without sudo).
+After adding yourself to the `docker` group, log out and back in before testing
+access from an existing desktop session.
+
+Restoration reference (2026-09-09): uv 0.12.10, CPython 3.12.14,
+and SWE-bench 5.0.2. `fetch_dataset.py` verifies the canonical source rows
+before atomically replacing `instances.jsonl`:
+
+- source mini-dataset SHA-256:
+  `93185a2cce684b2b99592edeb83e16a47806c456fe335931cc92747601584a88`;
+- enriched `instances.jsonl` SHA-256:
+  `6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3`.
+
+The tracked fetch step uses SWE-bench's own pinned image-name helper to add the
+official evaluator image required by each Docker runner.
 
 ## Running
 
@@ -30,15 +44,20 @@ Model/provider/key come from `~/.config/daimonos/agent.env`, exactly like
 
 ```sh
 # Single-instance smoke test FIRST (same cost policy as ../README.md):
-.venv/bin/python run_agent.py --filter astropy__astropy-14309 --tag smoke
+.venv/bin/python run_agent.py --docker \
+  --instance-ids django__django-11815 --tag smoke
 
 # Full 50-instance run:
-.venv/bin/python run_agent.py --tag <label>
+.venv/bin/python run_agent.py --docker --tag <label>
 ```
 
 Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.
+
+Delete incomplete smoke directories created before dataset enrichment before
+treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
+per-instance summary, token log, raw transcript, and non-empty patch.
 
 Repo checkouts are cached as bare clones under `repos/` (first run downloads
 each project once; django/astropy/sympy etc. total a few GB).
@@ -58,7 +77,7 @@ Zero-LLM-cost plumbing check (evaluates the dataset's own gold patches):
 .venv/bin/python -m swebench.harness.run_evaluation \
   --dataset_name SWE-bench/SWE-bench_Verified \
   --predictions_path gold \
-  --instance_ids astropy__astropy-14309 \
+  --instance_ids django__django-11815 \
   --max_workers 1 --run_id gold-smoke
 ```
 

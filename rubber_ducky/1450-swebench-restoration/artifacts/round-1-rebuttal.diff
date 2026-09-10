@@ -1,0 +1,283 @@
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 543960e..d3d228c 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -14,13 +14,27 @@ FAIL_TO_PASS / PASS_TO_PASS tests in a per-instance Docker image.
+ ## One-time setup
+ 
+ ```sh
+-uv venv .venv
+-uv pip install --python .venv/bin/python swebench
++uv venv --python 3.12 .venv
++uv pip install --python .venv/bin/python 'swebench==5.0.2'
+ .venv/bin/python fetch_dataset.py      # writes instances.jsonl (50 rows)
+ ```
+ 
+ Evaluation additionally needs a working Docker daemon your user can talk to
+ (`docker info` must succeed without sudo).
++After adding yourself to the `docker` group, log out and back in before testing
++access from an existing desktop session.
++
++Restoration reference (2026-09-09): uv 0.12.10, CPython 3.12.14,
++and SWE-bench 5.0.2. `fetch_dataset.py` verifies the canonical source rows
++before atomically replacing `instances.jsonl`:
++
++- source mini-dataset SHA-256:
++  `93185a2cce684b2b99592edeb83e16a47806c456fe335931cc92747601584a88`;
++- enriched `instances.jsonl` SHA-256:
++  `6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3`.
++
++The tracked fetch step uses SWE-bench's own pinned image-name helper to add the
++official evaluator image required by each Docker runner.
+ 
+ ## Running
+ 
+@@ -30,16 +44,21 @@ Model/provider/key come from `~/.config/daimonos/agent.env`, exactly like
+ 
+ ```sh
+ # Single-instance smoke test FIRST (same cost policy as ../README.md):
+-.venv/bin/python run_agent.py --filter astropy__astropy-14309 --tag smoke
++.venv/bin/python run_agent.py --docker \
++  --instance-ids django__django-11815 --tag smoke
+ 
+ # Full 50-instance run:
+-.venv/bin/python run_agent.py --tag <label>
++.venv/bin/python run_agent.py --docker --tag <label>
+ ```
+ 
+ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
+ (same schema as the in-house suite — `../analyze.py results/` works),
+ `.patch` files, raw transcripts, and `preds.jsonl`.
+ 
++Delete incomplete smoke directories created before dataset enrichment before
++treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
++per-instance summary, token log, raw transcript, and non-empty patch.
++
+ Repo checkouts are cached as bare clones under `repos/` (first run downloads
+ each project once; django/astropy/sympy etc. total a few GB).
+ 
+@@ -58,7 +77,7 @@ Zero-LLM-cost plumbing check (evaluates the dataset's own gold patches):
+ .venv/bin/python -m swebench.harness.run_evaluation \
+   --dataset_name SWE-bench/SWE-bench_Verified \
+   --predictions_path gold \
+-  --instance_ids astropy__astropy-14309 \
++  --instance_ids django__django-11815 \
+   --max_workers 1 --run_id gold-smoke
+ ```
+ 
+diff --git i/benchmarks/swebench/fetch_dataset.py w/benchmarks/swebench/fetch_dataset.py
+index 1dbaeb7..2954f56 100644
+--- i/benchmarks/swebench/fetch_dataset.py
++++ w/benchmarks/swebench/fetch_dataset.py
+@@ -3,24 +3,85 @@
+ 
+ Run with the local venv: .venv/bin/python fetch_dataset.py
+ """
++import hashlib
+ import json
+ import pathlib
+ import sys
+ 
+-from datasets import load_dataset
+-
+ DATASET = "MariusHobbhahn/swe-bench-verified-mini"
+ OUT = pathlib.Path(__file__).parent / "instances.jsonl"
++EXPECTED_INSTANCES = 50
++EXPECTED_SOURCE_FINGERPRINT = (
++    "93185a2cce684b2b99592edeb83e16a47806c456fe335931cc92747601584a88"
++)
++
++
++def evaluator_image(instance_id: str) -> str:
++    """Return the official SWE-bench image name for one instance."""
++    from swebench.task.checks import expected_image
++
++    return expected_image(instance_id)
++
++
++def enrich_instances(rows: list[dict]) -> list[dict]:
++    """Add runner metadata omitted by the source mini dataset."""
++    enriched = []
++    for row in rows:
++        item = dict(row)
++        item["image"] = evaluator_image(item["instance_id"])
++        enriched.append(item)
++    return enriched
++
++
++def dataset_bytes(rows: list[dict]) -> bytes:
++    return "".join(
++        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
++    ).encode()
++
++
++def dataset_fingerprint(rows: list[dict]) -> str:
++    return hashlib.sha256(dataset_bytes(rows)).hexdigest()
++
++
++def write_dataset(
++    source_rows: list[dict],
++    output: pathlib.Path,
++    *,
++    expected_count: int = EXPECTED_INSTANCES,
++    expected_source_fingerprint: str = EXPECTED_SOURCE_FINGERPRINT,
++) -> tuple[str, str]:
++    if len(source_rows) != expected_count:
++        raise ValueError(f"expected {expected_count} instances, got {len(source_rows)}")
++    source_fingerprint = dataset_fingerprint(source_rows)
++    if source_fingerprint != expected_source_fingerprint:
++        raise ValueError(
++            "source dataset fingerprint changed: "
++            f"expected {expected_source_fingerprint}, got {source_fingerprint}"
++        )
++
++    enriched = enrich_instances(source_rows)
++    enriched_fingerprint = dataset_fingerprint(enriched)
++    temporary = output.with_suffix(output.suffix + ".tmp")
++    try:
++        temporary.write_bytes(dataset_bytes(enriched))
++        temporary.replace(output)
++    finally:
++        temporary.unlink(missing_ok=True)
++    return source_fingerprint, enriched_fingerprint
+ 
+ 
+ def main() -> None:
++    from datasets import load_dataset
++
+     ds = load_dataset(DATASET, split="test")
+-    with OUT.open("w") as f:
+-        for row in ds:
+-            f.write(json.dumps(row) + "\n")
+-    print(f"wrote {len(ds)} instances to {OUT}")
+-    if len(ds) != 50:
+-        sys.exit(f"expected 50 instances, got {len(ds)}")
++    source_rows = [dict(row) for row in ds]
++    try:
++        source_fingerprint, enriched_fingerprint = write_dataset(source_rows, OUT)
++    except ValueError as error:
++        sys.exit(str(error))
++    print(f"wrote {len(source_rows)} instances to {OUT}")
++    print(f"source sha256:   {source_fingerprint}")
++    print(f"enriched sha256: {enriched_fingerprint}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git 1/tests/test_swebench_setup.py 2/tests/test_swebench_setup.py
+new file mode 100644
+index 0000000..c470106
+--- /dev/null
++++ 2/tests/test_swebench_setup.py
+@@ -0,0 +1,112 @@
++"""Tests for reproducible SWE-bench dataset preparation."""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++from pathlib import Path
++
++import pytest
++
++
++FETCH_SCRIPT = (
++    Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "fetch_dataset.py"
++)
++
++
++def load_fetch_module():
++    spec = importlib.util.spec_from_file_location("fetch_dataset", FETCH_SCRIPT)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_enrich_instances_adds_image_to_every_row(monkeypatch):
++    fetch_dataset = load_fetch_module()
++    monkeypatch.setattr(
++        fetch_dataset,
++        "evaluator_image",
++        lambda instance_id: f"official/{instance_id}",
++    )
++
++    enriched = fetch_dataset.enrich_instances(
++        [
++            {"instance_id": "django__django-11815"},
++            {"instance_id": "sphinx-doc__sphinx-8035"},
++        ]
++    )
++
++    assert [row["image"] for row in enriched] == [
++        "official/django__django-11815",
++        "official/sphinx-doc__sphinx-8035",
++    ]
++
++
++def test_evaluator_image_matches_pinned_swebench_helper():
++    checks = pytest.importorskip("swebench.task.checks")
++    fetch_dataset = load_fetch_module()
++
++    assert fetch_dataset.evaluator_image("django__django-11815") == checks.expected_image(
++        "django__django-11815"
++    )
++
++
++def test_write_dataset_rejects_invalid_source_before_replacing(tmp_path):
++    fetch_dataset = load_fetch_module()
++    output = tmp_path / "instances.jsonl"
++    output.write_text("existing\n")
++    row = {
++        "instance_id": "django__django-11815",
++        "repo": "django/django",
++    }
++
++    with pytest.raises(ValueError, match="expected 2 instances"):
++        fetch_dataset.write_dataset(
++            [row],
++            output,
++            expected_count=2,
++            expected_source_fingerprint=fetch_dataset.dataset_fingerprint([row]),
++        )
++    assert output.read_text() == "existing\n"
++
++    with pytest.raises(ValueError, match="source dataset fingerprint changed"):
++        fetch_dataset.write_dataset(
++            [row],
++            output,
++            expected_count=1,
++            expected_source_fingerprint="not-the-source-fingerprint",
++        )
++    assert output.read_text() == "existing\n"
++
++
++def test_write_dataset_is_atomic_and_reports_both_fingerprints(tmp_path, monkeypatch):
++    fetch_dataset = load_fetch_module()
++    monkeypatch.setattr(
++        fetch_dataset,
++        "evaluator_image",
++        lambda instance_id: f"official/{instance_id}",
++    )
++    output = tmp_path / "instances.jsonl"
++    source = [
++        {
++            "instance_id": "django__django-11815",
++            "repo": "django/django",
++        }
++    ]
++    source_fingerprint = fetch_dataset.dataset_fingerprint(source)
++
++    fingerprints = fetch_dataset.write_dataset(
++        source,
++        output,
++        expected_count=1,
++        expected_source_fingerprint=source_fingerprint,
++    )
++
++    written = [json.loads(line) for line in output.read_text().splitlines()]
++    assert written[0]["image"] == "official/django__django-11815"
++    assert fingerprints == (
++        source_fingerprint,
++        fetch_dataset.dataset_fingerprint(written),
++    )
++    assert not output.with_suffix(".jsonl.tmp").exists()
