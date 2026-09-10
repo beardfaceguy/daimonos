@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,15 +28,30 @@ HAS_CLIPPY = bool(
 )
 
 
-def run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+def run(
+    *args: str,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [*args],
         cwd=cwd,
+        env=env,
         check=True,
         capture_output=True,
         text=True,
         timeout=120,
     )
+
+
+def cargo_environment(**overrides: str) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}
+    }
+    env.update(overrides)
+    return env
 
 
 def test_rebuild_workspace_restores_benchmark_contract(tmp_path):
@@ -88,7 +103,9 @@ def test_rebuild_workspace_restores_benchmark_contract(tmp_path):
 
 
 @pytest.mark.skipif(CARGO is None, reason="Rust toolchain is not installed")
-def test_rebuilt_workspace_preserves_rust_task_contract(tmp_path):
+def test_rebuilt_workspace_preserves_rust_task_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUSTFLAGS", "-D warnings")
+    monkeypatch.setenv("CARGO_ENCODED_RUSTFLAGS", "-D\u001fwarnings")
     workspace = tmp_path / "workspace"
     run(
         sys.executable,
@@ -98,13 +115,22 @@ def test_rebuilt_workspace_preserves_rust_task_contract(tmp_path):
         cwd=REPO_ROOT,
     )
 
-    tests = run(CARGO, "test", "--quiet", "--locked", cwd=workspace)
+    tests = run(
+        CARGO,
+        "test",
+        "--quiet",
+        "--locked",
+        cwd=workspace,
+        env=cargo_environment(),
+    )
     assert "15 passed" in tests.stdout + tests.stderr
     assert run("git", "status", "--porcelain", cwd=workspace).stdout == ""
 
 
 @pytest.mark.skipif(not HAS_CLIPPY, reason="cargo-clippy is not installed")
-def test_rebuilt_workspace_preserves_clippy_task_contract(tmp_path):
+def test_rebuilt_workspace_preserves_clippy_task_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUSTFLAGS", "-D warnings")
+    monkeypatch.setenv("CARGO_ENCODED_RUSTFLAGS", "-D\u001fwarnings")
     workspace = tmp_path / "workspace"
     run(
         sys.executable,
@@ -121,7 +147,7 @@ def test_rebuilt_workspace_preserves_clippy_task_contract(tmp_path):
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "CARGO_TARGET_DIR": str(clippy_target)},
+        env=cargo_environment(CARGO_TARGET_DIR=str(clippy_target)),
     )
     diagnostics = clippy.stdout + clippy.stderr
     assert "apply_discount" in diagnostics
