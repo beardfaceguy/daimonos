@@ -1,5 +1,9 @@
 # Restored SWE-bench five-instance three-arm comparison
 
+This one-repetition restoration report is retained as the original record.
+The OpenRouter cost conclusion is superseded by the
+[three-repetition comparison](2026-09-10-swebench-openrouter-three-repetitions.md).
+
 ## Scope
 
 All arms ran the same five mini-suite instances inside their official

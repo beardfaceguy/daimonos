@@ -10,10 +10,17 @@ import math
 import sys
 
 
+def token_count(value, field):
+    value = value or 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
 def main():
     traj_path, iid, repo, model, out_path = sys.argv[1:6]
     t = json.load(open(traj_path))
-    tot_in = tot_out = calls = 0
+    tot_in = tot_out = cache_write = cache_read = calls = 0
     costs = []
     cost_complete = True
     timestamps = []
@@ -28,8 +35,28 @@ def main():
                 usage = {}
 
             u = usage
-            tot_in += u.get("prompt_tokens", 0) or 0
-            tot_out += u.get("completion_tokens", 0) or 0
+            call_input = token_count(u.get("prompt_tokens"), "prompt_tokens")
+            call_output = token_count(
+                u.get("completion_tokens"), "completion_tokens"
+            )
+            prompt_details = u.get("prompt_tokens_details") or {}
+            if not isinstance(prompt_details, dict):
+                raise ValueError("prompt_tokens_details must be an object")
+            call_cache_write = token_count(
+                prompt_details.get("cache_write_tokens"), "cache_write_tokens"
+            )
+            call_cache_read = token_count(
+                prompt_details.get("cached_tokens"), "cached_tokens"
+            )
+            if call_cache_write + call_cache_read > call_input:
+                raise ValueError(
+                    "cache token subsets exceed prompt_tokens "
+                    f"on generation {calls}"
+                )
+            tot_in += call_input
+            tot_out += call_output
+            cache_write += call_cache_write
+            cache_read += call_cache_read
             cost = u.get("cost")
             if (
                 isinstance(cost, (int, float))
@@ -58,6 +85,7 @@ def main():
         if provider_cost is not None and model_stats_cost is not None
         else None
     )
+    fresh_input = max(0, tot_in - cache_write - cache_read)
     summary = {
         "task_id": iid,
         "task_name": repo,
@@ -65,10 +93,16 @@ def main():
         "canon_model": model,
         "model_slug": model,
         "wall_ms": wall_ms,
-        "input": tot_in,
+        "input": fresh_input,
+        "cache_write": cache_write,
+        "cache_read": cache_read,
         "output": tot_out,
         "total_tokens": tot_in + tot_out,
         "prompt_tokens": tot_in,
+        "fresh_input_tokens": fresh_input,
+        "mean_prompt_tokens_per_call": tot_in / calls if calls else None,
+        "mean_cache_read_per_call": cache_read / calls if calls else None,
+        "cache_hit_ratio": cache_read / tot_in if tot_in else None,
         "llm_calls": calls,
         # Same accounting source as Daimonos: OpenRouter's per-generation
         # usage.cost, not mini-swe-agent/LiteLLM's model-price estimate.

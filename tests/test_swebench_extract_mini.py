@@ -50,6 +50,10 @@ def test_extract_mini_sums_openrouter_reported_cost(tmp_path):
                                 "prompt_tokens": 100,
                                 "completion_tokens": 10,
                                 "cost": 0.0125,
+                                "prompt_tokens_details": {
+                                    "cache_write_tokens": 90,
+                                    "cached_tokens": 0,
+                                },
                             }
                         },
                     }
@@ -62,6 +66,10 @@ def test_extract_mini_sums_openrouter_reported_cost(tmp_path):
                                 "prompt_tokens": 120,
                                 "completion_tokens": 20,
                                 "cost": 0.0175,
+                                "prompt_tokens_details": {
+                                    "cache_write_tokens": 0,
+                                    "cached_tokens": 100,
+                                },
                             }
                         },
                     }
@@ -75,6 +83,12 @@ def test_extract_mini_sums_openrouter_reported_cost(tmp_path):
     )
 
     assert summary["total_tokens"] == 250
+    assert summary["prompt_tokens"] == 220
+    assert summary["input"] == 30
+    assert summary["fresh_input_tokens"] == 30
+    assert summary["cache_write"] == 90
+    assert summary["cache_read"] == 100
+    assert summary["cache_hit_ratio"] == pytest.approx(100 / 220)
     assert summary["llm_calls"] == 2
     assert summary["cost_usd"] == pytest.approx(0.03)
     assert summary["cost_source"] == "openrouter_usage"
@@ -204,3 +218,57 @@ def test_extract_mini_flags_model_stats_cost_mismatch(tmp_path):
 
     assert summary["model_stats_cost_usd"] == pytest.approx(0.02)
     assert summary["cost_matches_model_stats"] is False
+
+
+def test_extract_mini_defaults_missing_cache_details_to_fresh_input(tmp_path):
+    summary = _extract(
+        tmp_path,
+        {
+            "messages": [
+                {
+                    "extra": {
+                        "response": {
+                            "usage": {
+                                "prompt_tokens": 100,
+                                "completion_tokens": 10,
+                                "cost": 0.0125,
+                            }
+                        }
+                    }
+                }
+            ],
+            "info": {},
+        },
+    )
+
+    assert summary["input"] == 100
+    assert summary["cache_write"] == 0
+    assert summary["cache_read"] == 0
+    assert summary["total_tokens"] == 110
+
+
+def test_extract_mini_rejects_cache_subsets_larger_than_prompt(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError):
+        _extract(
+            tmp_path,
+            {
+                "messages": [
+                    {
+                        "extra": {
+                            "response": {
+                                "usage": {
+                                    "prompt_tokens": 100,
+                                    "completion_tokens": 10,
+                                    "cost": 0.0125,
+                                    "prompt_tokens_details": {
+                                        "cache_write_tokens": 60,
+                                        "cached_tokens": 50,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ],
+                "info": {},
+            },
+        )
