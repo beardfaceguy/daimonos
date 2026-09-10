@@ -256,6 +256,37 @@ impl LlmResponse {
     }
 }
 
+pub const MISSING_STRUCTURED_TOOL_CALL: &str =
+    "provider declared tool use but returned no structured tool call";
+
+pub fn tool_use_missing_structured_call(response: &LlmResponse) -> bool {
+    response.stop_reason == StopReason::ToolUse
+        && !response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
+}
+
+/// Enforce the provider-neutral tool-use response invariant.
+///
+/// A `ToolUse` stop without a `ToolCall` cannot be dispatched or paired with a
+/// user-role `ToolResult`. Continuing would leave assistant text at the end of
+/// history, which Anthropic-compatible routes interpret as unsupported
+/// assistant prefill. Preserve accounting from the malformed attempt, but
+/// clear its pseudo-tool content and fail before it enters durable history.
+pub fn validate_response_shape(mut response: LlmResponse) -> LlmResponse {
+    if tool_use_missing_structured_call(&response) {
+        response.content.clear();
+        response.stop_reason = StopReason::Error;
+        response
+            .error_message
+            .get_or_insert_with(|| MISSING_STRUCTURED_TOOL_CALL.to_string());
+        response.context_overflow = false;
+        response.retryable = false;
+    }
+    response
+}
+
 /// Resolved provider deadlines, in the form the adapters need (vikunja #1107).
 ///
 /// Lives in the provider layer and is shared by all three adapters for the same
@@ -543,6 +574,77 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_tool_use_shape_is_preserved() {
+        let response = LlmResponse {
+            content: vec![ContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/main.rs"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            context_overflow: false,
+            retryable: false,
+            usage: Usage {
+                input: 12,
+                ..Usage::default()
+            },
+        };
+
+        let validated = validate_response_shape(response);
+
+        assert_eq!(validated.stop_reason, StopReason::ToolUse);
+        assert_eq!(validated.content.len(), 1);
+        assert_eq!(validated.usage.input, 12);
+        assert!(validated.error_message.is_none());
+    }
+
+    #[test]
+    fn mixed_text_and_structured_tool_use_shape_is_preserved() {
+        let response = LlmResponse {
+            content: vec![
+                ContentBlock::Text("I will inspect it.".into()),
+                ContentBlock::ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "src/main.rs"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            context_overflow: false,
+            retryable: false,
+            usage: Usage::default(),
+        };
+
+        let validated = validate_response_shape(response);
+
+        assert_eq!(validated.stop_reason, StopReason::ToolUse);
+        assert_eq!(validated.content.len(), 2);
+    }
+
+    #[test]
+    fn malformed_tool_use_preserves_existing_provider_error() {
+        let response = LlmResponse {
+            content: vec![ContentBlock::Text("pseudo tool syntax".into())],
+            stop_reason: StopReason::ToolUse,
+            error_message: Some("provider-specific detail".into()),
+            context_overflow: false,
+            retryable: false,
+            usage: Usage::default(),
+        };
+
+        let validated = validate_response_shape(response);
+
+        assert_eq!(validated.stop_reason, StopReason::Error);
+        assert_eq!(
+            validated.error_message.as_deref(),
+            Some("provider-specific detail")
+        );
+        assert!(validated.content.is_empty());
+    }
 
     /// vikunja #1240: a transient provider failure must be distinguishable from
     /// a fatal one *at the provider boundary*, so core can retry without ever

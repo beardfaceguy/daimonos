@@ -1071,6 +1071,11 @@ async fn run_inner(
                 tokio::time::sleep(delay).await;
             }
         };
+        // One provider-neutral enforcement boundary: never let a malformed
+        // ToolUse-without-ToolCall response enter history and create an
+        // assistant-prefill request on the next loop iteration (#1463).
+        let malformed_tool_use = crate::providers::tool_use_missing_structured_call(&resp);
+        resp = crate::providers::validate_response_shape(resp);
         // Providers report reasoning tokens inconsistently, but every adapter
         // crosses this shared stream boundary. Count exact UTF-8 bytes here so
         // the metric is provider-neutral and never guessed from token ratios.
@@ -1108,11 +1113,16 @@ async fn run_inner(
             );
         }
 
-        // Assistant turn appended BEFORE tool results (Anthropic API requirement)
-        messages.push(Message {
-            role: Role::Assistant,
-            content: resp.content.clone(),
-        });
+        // Assistant turn appended BEFORE tool results (Anthropic API
+        // requirement). Only the malformed response identified above is
+        // excluded; preserve existing history semantics for unrelated empty
+        // assistant responses.
+        if !malformed_tool_use {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: resp.content.clone(),
+            });
+        }
 
         match resp.stop_reason {
             StopReason::MaxTokens
@@ -3299,6 +3309,82 @@ mod tests {
 
     fn session_in(dir: &std::path::Path) -> Session {
         Session::new(dir.to_path_buf(), Arc::new(Config::default()))
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_use_never_continues_with_assistant_prefill() {
+        let malformed_usage = Usage {
+            input: 200,
+            output: 30,
+            cost: Cost {
+                total_usd: 0.0123,
+                ..Cost::default()
+            },
+            ..Usage::default()
+        };
+        let provider = MockProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::Text(
+                    "call\n<invoke name=\"read_file\"></invoke>".into(),
+                )],
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                context_overflow: false,
+                retryable: false,
+                usage: malformed_usage,
+            },
+            end_turn_resp_with_text("must not be requested"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("inspect the file")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("provider declared tool use but returned no structured tool call")
+        );
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, Role::User);
+        assert_eq!(result.usage.input, 200);
+        assert!((result.usage.cost.total_usd - 0.0123).abs() < f64::EPSILON);
+        assert_eq!(
+            provider.responses.lock().unwrap().len(),
+            1,
+            "the malformed assistant turn must not trigger another provider call"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_empty_end_turn_still_appends_assistant_history() {
+        let provider = MockProvider::new(vec![LlmResponse {
+            content: vec![],
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            context_overflow: false,
+            retryable: false,
+            usage: mock_usage(100, 0),
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("answer")],
+            &AgentConfig::default(),
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[1].role, Role::Assistant);
+        assert!(result.messages[1].content.is_empty());
     }
 
     fn bounded_session_in(dir: &std::path::Path) -> Session {
