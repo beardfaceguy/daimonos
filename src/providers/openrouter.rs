@@ -572,9 +572,17 @@ fn parse_usage(usage: &Value) -> Usage {
         thinking_bytes: 0,
         cache_read,
         cache_write,
-        // OpenRouter does not return cost in the usage object; left at zero.
-        // Fetch from /api/v1/generation?id={id} if per-run cost is needed.
-        cost: Cost::default(),
+        // OpenRouter reports the total account charge in the final usage frame
+        // for both streaming and non-streaming responses. It does not split
+        // that charge into our neutral input/output/cache buckets, so preserve
+        // the authoritative total and leave those optional components at zero.
+        cost: Cost {
+            total_usd: usage["cost"]
+                .as_f64()
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                .unwrap_or(0.0),
+            ..Cost::default()
+        },
     }
 }
 
@@ -900,7 +908,8 @@ mod tests {
                 "prompt_tokens": 194,
                 "completion_tokens": 50,
                 "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 20},
-                "completion_tokens_details": {"reasoning_tokens": 0}
+                "completion_tokens_details": {"reasoning_tokens": 0},
+                "cost": 0.0015
             }
         });
         let resp = parse_response(&body);
@@ -912,6 +921,7 @@ mod tests {
         assert_eq!(resp.usage.reasoning_output, Some(0));
         assert_eq!(resp.usage.cache_read, 30);
         assert_eq!(resp.usage.cache_write, 20);
+        assert!((resp.usage.cost.total_usd - 0.0015).abs() < f64::EPSILON);
         assert_eq!(
             resp.usage.prompt_tokens(),
             194,
@@ -1069,6 +1079,7 @@ mod tests {
         assert_eq!(resp.usage.output, 0);
         assert_eq!(resp.usage.cache_read, 0);
         assert_eq!(resp.usage.cache_write, 0);
+        assert_eq!(resp.usage.cost.total_usd, 0.0);
     }
 
     // --- map_finish_reason ---
@@ -1098,12 +1109,13 @@ mod tests {
             .on_chunk(&json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": null}]}));
         assert_eq!(e1, vec![StreamEvent::TextDelta("hel".to_string())]);
         assert_eq!(e2, vec![StreamEvent::TextDelta("lo".to_string())]);
-        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}}));
+        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00042}}));
         let resp = state.finish();
         assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "hello"));
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert_eq!(resp.usage.input, 10);
         assert_eq!(resp.usage.output, 2);
+        assert!((resp.usage.cost.total_usd - 0.00042).abs() < f64::EPSILON);
     }
 
     #[test]
