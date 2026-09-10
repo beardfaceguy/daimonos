@@ -1,0 +1,131 @@
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 543960e..172187f 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -14,13 +14,21 @@ FAIL_TO_PASS / PASS_TO_PASS tests in a per-instance Docker image.
+ ## One-time setup
+ 
+ ```sh
+-uv venv .venv
+-uv pip install --python .venv/bin/python swebench
++uv venv --python 3.12 .venv
++uv pip install --python .venv/bin/python 'swebench==5.0.2'
+ .venv/bin/python fetch_dataset.py      # writes instances.jsonl (50 rows)
+ ```
+ 
+ Evaluation additionally needs a working Docker daemon your user can talk to
+ (`docker info` must succeed without sudo).
++After adding yourself to the `docker` group, log out and back in before testing
++access from an existing desktop session.
++
++Restoration reference (2026-09-09): uv 0.12.10, CPython 3.12.14,
++SWE-bench 5.0.2, and mini-dataset SHA-256
++`ea5be657c14d3377657de79fe175218f82d02670dc1ba8a14d3825687c3ce9e3`.
++`fetch_dataset.py` enriches every source row with the official evaluator image
++name required by the Docker runners.
+ 
+ ## Running
+ 
+@@ -30,10 +38,11 @@ Model/provider/key come from `~/.config/daimonos/agent.env`, exactly like
+ 
+ ```sh
+ # Single-instance smoke test FIRST (same cost policy as ../README.md):
+-.venv/bin/python run_agent.py --filter astropy__astropy-14309 --tag smoke
++.venv/bin/python run_agent.py --docker \
++  --instance-ids django__django-11815 --tag smoke
+ 
+ # Full 50-instance run:
+-.venv/bin/python run_agent.py --tag <label>
++.venv/bin/python run_agent.py --docker --tag <label>
+ ```
+ 
+ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
+@@ -58,7 +67,7 @@ Zero-LLM-cost plumbing check (evaluates the dataset's own gold patches):
+ .venv/bin/python -m swebench.harness.run_evaluation \
+   --dataset_name SWE-bench/SWE-bench_Verified \
+   --predictions_path gold \
+-  --instance_ids astropy__astropy-14309 \
++  --instance_ids django__django-11815 \
+   --max_workers 1 --run_id gold-smoke
+ ```
+ 
+diff --git i/benchmarks/swebench/fetch_dataset.py w/benchmarks/swebench/fetch_dataset.py
+index 1dbaeb7..ab6ba7d 100644
+--- i/benchmarks/swebench/fetch_dataset.py
++++ w/benchmarks/swebench/fetch_dataset.py
+@@ -7,17 +7,30 @@ import json
+ import pathlib
+ import sys
+ 
+-from datasets import load_dataset
+-
+ DATASET = "MariusHobbhahn/swe-bench-verified-mini"
+ OUT = pathlib.Path(__file__).parent / "instances.jsonl"
+ 
+ 
++def evaluator_image(instance_id: str) -> str:
++    """Return the official SWE-bench image name for one instance."""
++    key = f"sweb.eval.x86_64.{instance_id}:latest".lower()
++    return f"swebench/{key}".replace("__", "_1776_")
++
++
++def enrich_instance(row: dict) -> dict:
++    """Add runner metadata omitted by the source mini dataset."""
++    enriched = dict(row)
++    enriched["image"] = evaluator_image(enriched["instance_id"])
++    return enriched
++
++
+ def main() -> None:
++    from datasets import load_dataset
++
+     ds = load_dataset(DATASET, split="test")
+     with OUT.open("w") as f:
+         for row in ds:
+-            f.write(json.dumps(row) + "\n")
++            f.write(json.dumps(enrich_instance(row)) + "\n")
+     print(f"wrote {len(ds)} instances to {OUT}")
+     if len(ds) != 50:
+         sys.exit(f"expected 50 instances, got {len(ds)}")
+diff --git 1/tests/test_swebench_setup.py 2/tests/test_swebench_setup.py
+new file mode 100644
+index 0000000..597fad7
+--- /dev/null
++++ 2/tests/test_swebench_setup.py
+@@ -0,0 +1,36 @@
++"""Tests for reproducible SWE-bench dataset preparation."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++
++FETCH_SCRIPT = (
++    Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "fetch_dataset.py"
++)
++
++
++def load_fetch_module():
++    spec = importlib.util.spec_from_file_location("fetch_dataset", FETCH_SCRIPT)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_enrich_instance_adds_official_evaluator_image():
++    fetch_dataset = load_fetch_module()
++
++    enriched = fetch_dataset.enrich_instance(
++        {
++            "instance_id": "django__django-11815",
++            "repo": "django/django",
++        }
++    )
++
++    assert enriched == {
++        "instance_id": "django__django-11815",
++        "repo": "django/django",
++        "image": "swebench/sweb.eval.x86_64.django_1776_django-11815:latest",
++    }
