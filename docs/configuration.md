@@ -112,19 +112,30 @@ provider (pick `xhigh` unless you specifically want `max` to mean the
 maximum on a provider that exposes a distinct level). Provider defaults and
 the Anthropic adaptive thinking behavior are unchanged by this key.
 
-### Anthropic tool-prefix caching (`DAIMONOS_AGENT_PROMPT_CACHE`)
+### Provider prompt caching (`DAIMONOS_AGENT_PROMPT_CACHE`)
 
-Optional and default-off. Set `DAIMONOS_AGENT_PROMPT_CACHE=on` to place an
-ephemeral Anthropic prompt-cache breakpoint on the final tool definition,
-caching the complete stable tool-schema prefix. Other providers ignore this
-setting.
+Optional and default-off. Set `DAIMONOS_AGENT_PROMPT_CACHE=on` to enable an
+explicit ephemeral cache breakpoint:
 
-The first request pays Anthropic's cache-write premium. Repeated requests with
-the same tools then use cheaper cache reads, so this favors tool-loop turns and
-can cost more for a one-call response. A four-run Opus 4.8 Task 04 experiment
-reduced fresh input 75.3% and cost 43.1% overall; at matched three-call behavior,
-warm-cache cost fell approximately 54.7%. Keep it opt-in until the broader
-native-agent suite confirms the one-call trade-off.
+- Anthropic marks the final tool definition, caching the stable tool-schema
+  prefix.
+- OpenRouter marks the final cacheable content block in the latest conversation
+  message for `anthropic/*` models. The explicit marker keeps OpenRouter's
+  normal upstream routing; Daimonos does not use the top-level cache option that
+  restricts routing to direct Anthropic. Other OpenRouter model families are
+  left unchanged.
+- Native OpenAI ignores this setting because its prefix caching is automatic.
+
+The first request can pay a cache-write premium. Repeated requests with the
+same prefix then use cheaper cache reads, so this favors tool-loop turns and
+can cost more for a one-call response. A four-run direct-Anthropic Opus 4.8
+Task 04 experiment reduced fresh input 75.3% and cost 43.1% overall; at matched
+three-call behavior, warm-cache cost fell approximately 54.7%.
+
+OpenRouter advances its breakpoint to the latest cacheable message each turn.
+The prior prefix can be read from cache, while the newly appended suffix is
+written as the next cache entry and can incur the provider's write premium.
+This differs from direct Anthropic's fixed tool-schema breakpoint.
 
 ```dotenv
 DAIMONOS_AGENT_PROMPT_CACHE=on
