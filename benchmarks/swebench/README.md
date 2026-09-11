@@ -87,6 +87,12 @@ OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
 uses, and separates fresh/cache-write/cache-read prompt tokens; LiteLLM's
 aggregate is retained only as a consistency check. Cursor uses its own backend,
 so token/correctness comparisons are available but USD cost parity is not.
+For current Cursor stream-json, the normalizer counts distinct `model_call_id`
+values plus at most one terminal assistant call. `tool_calls` counts distinct
+attempted `call_id` values across lifecycle events; `completed_tool_calls`
+counts the completed subset. A lifecycle with missing identifiers reports null
+instead of a misleading partial count, and `call_count_source` records the
+recognized schema.
 
 Current default-harness result:
 [`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).

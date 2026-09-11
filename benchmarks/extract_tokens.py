@@ -84,6 +84,57 @@ def count_tool_calls(events):
     return n
 
 
+def cursor_call_counts(events):
+    """Count Cursor's current stream-json model and tool lifecycle ids.
+
+    A tool emits started/completed events with the same call_id, so attempted
+    and completed calls are deduplicated separately. Tool-producing model calls
+    carry a model_call_id on assistant/tool events; one or more id-less
+    assistant chunks collectively represent at most one terminal model call.
+    """
+    model_call_ids = {
+        event["model_call_id"]
+        for event in events
+        if isinstance(event.get("model_call_id"), str)
+        and event["model_call_id"]
+    }
+    terminal_call = any(
+        event.get("type") == "assistant" and not event.get("model_call_id")
+        for event in events
+    )
+    llm_calls = (
+        len(model_call_ids) + int(terminal_call)
+        if model_call_ids or terminal_call
+        else None
+    )
+    tool_events = [event for event in events if event.get("type") == "tool_call"]
+    tool_call_ids = {
+        event["call_id"]
+        for event in tool_events
+        if isinstance(event.get("call_id"), str) and event["call_id"]
+    }
+    lifecycle_ids_complete = all(
+        isinstance(event.get("call_id"), str) and event["call_id"]
+        for event in tool_events
+    )
+    tool_calls = len(tool_call_ids) if lifecycle_ids_complete else None
+    completed_tool_calls = (
+        len({
+            event["call_id"]
+            for event in tool_events
+            if event.get("subtype") == "completed"
+        })
+        if lifecycle_ids_complete
+        else None
+    )
+    source = (
+        "cursor_stream_model_call_id_v1"
+        if model_call_ids
+        else "cursor_stream_terminal_only_v1" if terminal_call else None
+    )
+    return llm_calls, tool_calls, completed_tool_calls, source
+
+
 def parse_ms(ts):
     """Parse an ISO-8601 Z timestamp to epoch milliseconds, or None (mirrors
     JS Date.parse returning NaN -> treated as absent)."""
@@ -123,6 +174,8 @@ def main(argv):
     m = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "cost": 0}
     tool_calls = 0
     llm_calls = None
+    completed_tool_calls = None
+    call_count_source = None
     is_error = True
     cost = None  # null = unknown (Cursor: comes from admin CSV later)
     context_estimates = []
@@ -159,7 +212,12 @@ def main(argv):
         m["cache_read"] = usage.get("cacheReadTokens") or 0
         m["output"] = usage.get("outputTokens") or 0
         cost = None  # cursor-agent does not emit cost; joined from admin CSV
-        tool_calls = count_tool_calls(events)
+        (
+            llm_calls,
+            tool_calls,
+            completed_tool_calls,
+            call_count_source,
+        ) = cursor_call_counts(events)
         is_error = exit_code != 0 or (
             (result.get("is_error", True) if result else True)
         )
@@ -383,6 +441,8 @@ def main(argv):
         "cost_usd": cost,
         "tool_calls": tool_calls,
         "llm_calls": llm_calls,
+        "completed_tool_calls": completed_tool_calls,
+        "call_count_source": call_count_source,
         "exit_code": exit_code,
         "is_error": is_error,
         "success": not is_error,  # upgraded to correctness-gated by check_task.py

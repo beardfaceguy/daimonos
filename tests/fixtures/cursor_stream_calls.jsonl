@@ -1,0 +1,12 @@
+{"type":"system","subtype":"init","session_id":"redacted"}
+{"type":"user","session_id":"redacted","message":{"role":"user","content":[{"type":"text","text":"redacted"}]}}
+{"type":"assistant","session_id":"redacted","model_call_id":"redacted-0","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
+{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1}}
+{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1,"completedAtMs":2}}
+{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3}}
+{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3,"completedAtMs":4}}
+{"type":"assistant","session_id":"redacted","model_call_id":"redacted-2","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
+{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5}}
+{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5,"completedAtMs":6}}
+{"type":"assistant","session_id":"redacted","model_call_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"redacted","usage":{"inputTokens":10,"cacheWriteTokens":20,"cacheReadTokens":300,"outputTokens":40}}

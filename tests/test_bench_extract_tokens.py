@@ -16,6 +16,7 @@ EXTRACTOR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "benchmarks", "extract_tokens.py",
 )
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
 def run_extractor(tmp_path, runtime, raw_text, tokenlog_text=None,
@@ -74,7 +75,78 @@ def test_cursor_camelcase_usage_cost_null(tmp_path):
     assert (s["input"], s["cache_write"], s["cache_read"], s["output"]) == (5, 10, 200, 7)
     assert s["total_tokens"] == 222
     assert s["cost_usd"] is None  # cursor emits no per-run cost
+    assert s["llm_calls"] is None
+    assert s["tool_calls"] == 0
     assert s["is_error"] is False
+
+
+def test_cursor_counts_model_and_tool_calls_from_captured_stream(tmp_path):
+    with open(
+        os.path.join(FIXTURES, "cursor_stream_calls.jsonl"),
+        encoding="utf-8",
+    ) as fixture:
+        summary = run_extractor(tmp_path, "cursor", fixture.read())
+
+    assert summary["llm_calls"] == 4
+    assert summary["tool_calls"] == 3
+    assert summary["completed_tool_calls"] == 3
+    assert summary["call_count_source"] == "cursor_stream_model_call_id_v1"
+
+
+def test_cursor_counts_terminal_assistant_chunks_as_one_call(tmp_path):
+    raw = "\n".join([
+        json.dumps({
+            "type": "tool_call",
+            "subtype": "started",
+            "model_call_id": "model-1",
+            "call_id": "tool-1",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "subtype": "completed",
+            "model_call_id": "model-1",
+            "call_id": "tool-1",
+        }),
+        json.dumps({"type": "assistant", "model_call_id": None}),
+        json.dumps({"type": "assistant", "model_call_id": None}),
+        json.dumps({"type": "result", "is_error": False, "usage": {}}),
+    ]) + "\n"
+
+    summary = run_extractor(tmp_path, "cursor", raw)
+
+    assert summary["llm_calls"] == 2
+
+
+def test_cursor_unknown_tool_lifecycle_ids_report_null_count(tmp_path):
+    raw = "\n".join([
+        json.dumps({
+            "type": "tool_call",
+            "subtype": "started",
+            "model_call_id": "model-1",
+        }),
+        json.dumps({"type": "result", "is_error": False, "usage": {}}),
+    ]) + "\n"
+
+    summary = run_extractor(tmp_path, "cursor", raw)
+
+    assert summary["llm_calls"] == 1
+    assert summary["tool_calls"] is None
+    assert summary["completed_tool_calls"] is None
+    assert summary["call_count_source"] == "cursor_stream_model_call_id_v1"
+
+
+def test_cursor_model_ids_without_terminal_event_are_still_deduplicated(tmp_path):
+    raw = "\n".join([
+        json.dumps({"type": "assistant", "model_call_id": "model-1"}),
+        json.dumps({"type": "assistant", "model_call_id": "model-1"}),
+        json.dumps({"type": "result", "is_error": False, "usage": {}}),
+    ]) + "\n"
+
+    summary = run_extractor(tmp_path, "cursor", raw)
+
+    assert summary["llm_calls"] == 1
+    assert summary["tool_calls"] == 0
+    assert summary["completed_tool_calls"] == 0
 
 
 def test_codex_turn_completed_usage_and_fresh_input(tmp_path):

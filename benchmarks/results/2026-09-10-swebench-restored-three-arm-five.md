@@ -39,11 +39,14 @@ optimization-lineage stage or publishable aggregate claim.
 |---|---:|---:|---:|---:|---:|
 | Daimonos | 483,581 | 32 | $2.521245 | 94.638 s | 5/5 |
 | mini-swe-agent | 755,633 | 88 | $1.090288 | 267.544 s | 5/5 |
-| Cursor | 1,307,205 | unavailable | unavailable | 261.703 s | 5/5 |
+| Cursor | 1,307,205 | 48 | unavailable | 261.703 s | 5/5 |
 
 Daimonos used 36.00% fewer raw tokens and 64.63% less agent wall time than
 mini-swe-agent, and 63.01% fewer raw tokens and 63.84% less agent wall time than
 Cursor in this repetition.
+Under each harness's own emitted call evidence, Daimonos made 63.64% fewer
+model calls than mini-swe-agent and 33.33% fewer than Cursor. This diagnostic
+ratio is not a provider-level apples-to-apples counter.
 
 Those token ratios are not cost ratios. Daimonos and mini-swe-agent costs both
 sum OpenRouter's provider-returned per-generation `usage.cost`; mini's summed
@@ -86,10 +89,14 @@ The first Daimonos `sphinx-9367` attempt was rejected before inference with
 OpenRouter HTTP 402 `in_flight_budget_exhausted`; it consumed zero tokens and
 zero cost. The replacement ran after the stated 120-second settlement window.
 
-Cursor's extractor currently reports no LLM-call/tool-call count, so those
-fields must not be treated as zero. mini-swe-agent cost comes from summing the
-same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
-retained only as a consistency check.
+Cursor's current stream schema reports 48 model calls: 43 distinct
+`model_call_id` values plus one id-less terminal assistant call for each of the
+five tasks. It reports 43 attempted and 43 completed tool calls after
+deduplicating started/completed lifecycle events by `call_id`. Daimonos counts
+provider usage frames; mini counts preserved provider responses, so the
+cross-harness call ratio remains diagnostic. mini-swe-agent cost comes from
+summing the same OpenRouter `usage.cost` field Daimonos records; LiteLLM's
+aggregate is retained only as a consistency check.
 
 At least two more matched repetitions are needed before publishing relative
 efficiency. An explicit cache-policy decision is needed only for causal
