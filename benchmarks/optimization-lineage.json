@@ -1734,6 +1734,134 @@
           "kind": "comparison"
         }
       ]
+    },
+    {
+      "id": "SWO0",
+      "parent": null,
+      "feature": "Full-50 source attempts for dominant Daimonos outliers",
+      "scope_fingerprint": "swebench-outliers-8638-9229-v1|openrouter|anthropic/claude-opus-4.8|explicit-prompt-cache|official-docker",
+      "task_set_fingerprint": "sphinx-doc__sphinx-8638|sphinx-doc__sphinx-9229",
+      "benchmark_kind": "diagnostic",
+      "provider": "openrouter",
+      "model": "anthropic/claude-opus-4.8",
+      "thinking": "provider-default",
+      "task_ids": [
+        "sphinx-doc__sphinx-8638",
+        "sphinx-doc__sphinx-9229"
+      ],
+      "binary_sha256": "0c8843a01605111777737518e17161e6e65526802ad7a9d017dc37ecf017c316",
+      "git_commit": "780b272807b0df77cac796ae803dc677692b3698",
+      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
+      "created_at": "2026-09-11T00:53:26Z",
+      "raw_run_dirs": [
+        "benchmarks/swebench/results/20260911-swebench-docker-openrouter-cache-full50-r1-merged"
+      ],
+      "metrics": {
+        "task_runs": [
+          2,
+          "count"
+        ],
+        "total_tokens": [
+          10091478,
+          "tokens"
+        ],
+        "llm_calls": [
+          155,
+          "count"
+        ],
+        "cost_usd": [
+          9.368654,
+          "usd"
+        ],
+        "wall_ms": [
+          1022266,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          2,
+          "count"
+        ]
+      },
+      "notes": "Diagnostic baseline selected after the full-50 run because these two tasks contributed 34.79% of scoreable Daimonos cost.",
+      "report_path": "benchmarks/results/2026-09-11-swebench-outlier-tool-traces.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-09-11-swebench-outlier-tool-traces.md",
+          "sha256": "af20fe2714af72e2f56ee598975bf928be9c99935487626ea9993c029b221aaa",
+          "kind": "diagnostic"
+        }
+      ]
+    },
+    {
+      "id": "SWO1",
+      "parent": "SWO0",
+      "feature": "Trace-enabled reruns of dominant Daimonos outliers",
+      "scope_fingerprint": "swebench-outliers-8638-9229-v1|openrouter|anthropic/claude-opus-4.8|explicit-prompt-cache|official-docker",
+      "task_set_fingerprint": "sphinx-doc__sphinx-8638|sphinx-doc__sphinx-9229",
+      "benchmark_kind": "diagnostic",
+      "provider": "openrouter",
+      "model": "anthropic/claude-opus-4.8",
+      "thinking": "provider-default",
+      "task_ids": [
+        "sphinx-doc__sphinx-8638",
+        "sphinx-doc__sphinx-9229"
+      ],
+      "binary_sha256": "0c8843a01605111777737518e17161e6e65526802ad7a9d017dc37ecf017c316",
+      "git_commit": "113af7f83c765a8aeb72a947dd0ed4f39bed2fdc",
+      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
+      "created_at": "2026-09-11T22:42:12Z",
+      "raw_run_dirs": [
+        "benchmarks/swebench/results/20260911-154212-swebench-docker-outlier-trace-8638",
+        "benchmarks/swebench/results/20260911-154722-swebench-docker-outlier-trace-9229"
+      ],
+      "metrics": {
+        "task_runs": [
+          2,
+          "count"
+        ],
+        "total_tokens": [
+          3821051,
+          "tokens"
+        ],
+        "llm_calls": [
+          77,
+          "count"
+        ],
+        "cost_usd": [
+          3.54932,
+          "usd"
+        ],
+        "wall_ms": [
+          579949,
+          "milliseconds"
+        ],
+        "correct_task_runs": [
+          1,
+          "count"
+        ],
+        "tool_trace_rows": [
+          92,
+          "count"
+        ]
+      },
+      "per_task_regressions": [
+        {
+          "task_id": "sphinx-doc__sphinx-9229",
+          "metric": "correct",
+          "baseline": 1,
+          "candidate": 0,
+          "delta_pct": -100
+        }
+      ],
+      "notes": "No aggregate savings claim: correctness regressed from 2/2 to 1/2. sphinx-8638 reproduced as a normal-cost successful run; sphinx-9229 remained long and failed after iterative debugging. Tool traces are private local SQLite artifacts.",
+      "report_path": "benchmarks/results/2026-09-11-swebench-outlier-tool-traces.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-09-11-swebench-outlier-tool-traces.md",
+          "sha256": "af20fe2714af72e2f56ee598975bf928be9c99935487626ea9993c029b221aaa",
+          "kind": "diagnostic"
+        }
+      ]
     }
   ]
 }
