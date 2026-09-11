@@ -62,6 +62,16 @@ OPENROUTER_API_KEY=... .venv/bin/mini-extra swebench \
   --environment-class docker --workers 1 --output results/mini-<label>
 ```
 
+Docker runs retry OpenRouter's exact `in_flight_budget_exhausted` response once,
+after the response's own `Retry-After` delay. `--in-flight-retries` changes the
+attempt bound; `--max-retry-after` rejects unexpectedly long provider delays.
+Before retrying, the disposable testbed is reset and untracked files are
+removed, so a later-generation rejection cannot inherit partial edits. The
+final transcript replaces the rejected attempt's stdout; stderr retains each
+attempt boundary. Per-instance `wall_ms` includes settlement waits and
+`in_flight_retries` records the retry count. Other HTTP 402 billing failures are
+never retried.
+
 Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.

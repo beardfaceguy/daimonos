@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 RUNNER = (
     Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "run_agent.py"
@@ -56,3 +58,141 @@ def test_collect_patch_encodes_binary_files(tmp_path):
 
     assert "GIT binary patch" in patch
     assert "\ufffd" not in patch
+
+
+def test_in_flight_budget_retries_after_provider_settlement_delay():
+    runner = load_runner()
+    responses = iter(
+        [
+            (
+                subprocess.CompletedProcess([], 1),
+                'Error: agent error: openrouter 402 Payment Required: '
+                '{"error":{"message":"settling","code":402,"metadata":{"reason":'
+                '"in_flight_budget_exhausted","headers":{"Retry-After":"120"}}}}',
+            ),
+            (subprocess.CompletedProcess([], 0), ""),
+        ]
+    )
+    attempts = []
+    sleeps = []
+
+    def run_once(attempt):
+        attempts.append(attempt)
+        return next(responses)
+
+    completed, retry_count = runner.run_with_in_flight_retry(
+        run_once,
+        max_retries=1,
+        max_retry_after=300,
+        sleep=sleeps.append,
+    )
+
+    assert completed.returncode == 0
+    assert retry_count == 1
+    assert attempts == [0, 1]
+    assert sleeps == [120]
+
+
+@pytest.mark.parametrize(
+    "error_text",
+    [
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"message":"insufficient credits","code":402,"metadata":'
+        '{"headers":{"Retry-After":"120"}}}}',
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"code":402,"metadata":{"reason":'
+        '"in_flight_budget_exhausted"}}}',
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"code":402,"metadata":{"reason":'
+        '"in_flight_budget_exhausted","headers":{"Retry-After":"999"}}}}',
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"metadata":{"reason":"in_flight_budget_exhausted"}}} '
+        '{"headers":{"Retry-After":"120"}}',
+    ],
+)
+def test_other_billing_errors_and_unsafe_delays_are_not_retried(error_text):
+    runner = load_runner()
+    attempts = []
+    sleeps = []
+
+    def run_once(attempt):
+        attempts.append(attempt)
+        return subprocess.CompletedProcess([], 1), error_text
+
+    completed, retry_count = runner.run_with_in_flight_retry(
+        run_once,
+        max_retries=1,
+        max_retry_after=300,
+        sleep=sleeps.append,
+    )
+
+    assert completed.returncode == 1
+    assert retry_count == 0
+    assert attempts == [0]
+    assert sleeps == []
+
+
+def test_in_flight_retry_exhaustion_is_bounded():
+    runner = load_runner()
+    error = (
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"code":402,"metadata":{"reason":'
+        '"in_flight_budget_exhausted","headers":{"Retry-After":"1"}}}}'
+    )
+    attempts = []
+    sleeps = []
+
+    def run_once(attempt):
+        attempts.append(attempt)
+        return subprocess.CompletedProcess([], 1), error
+
+    completed, retry_count = runner.run_with_in_flight_retry(
+        run_once,
+        max_retries=2,
+        max_retry_after=300,
+        sleep=sleeps.append,
+    )
+
+    assert completed.returncode == 1
+    assert retry_count == 2
+    assert attempts == [0, 1, 2]
+    assert sleeps == [1, 1]
+
+
+def test_in_flight_retry_accepts_immediate_provider_hint():
+    runner = load_runner()
+    error = (
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"code":402,"metadata":{"reason":'
+        '"in_flight_budget_exhausted","headers":{"Retry-After":"0"}}}}'
+    )
+
+    assert runner.in_flight_retry_after(error, max_retry_after=300) == 0
+
+
+@pytest.mark.parametrize("returncode", [124, 137])
+def test_in_flight_retry_does_not_retry_killed_attempts(returncode):
+    runner = load_runner()
+    error = (
+        'Error: agent error: openrouter 402 Payment Required: '
+        '{"error":{"code":402,"metadata":{"reason":'
+        '"in_flight_budget_exhausted","headers":{"Retry-After":"120"}}}}'
+    )
+    attempts = []
+    sleeps = []
+
+    def run_once(attempt):
+        attempts.append(attempt)
+        return subprocess.CompletedProcess([], returncode), error
+
+    completed, retry_count = runner.run_with_in_flight_retry(
+        run_once,
+        max_retries=2,
+        max_retry_after=300,
+        sleep=sleeps.append,
+    )
+
+    assert completed.returncode == returncode
+    assert retry_count == 0
+    assert attempts == [0]
+    assert sleeps == []
