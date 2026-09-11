@@ -211,3 +211,27 @@ candidate regressions:
 
 The separately recorded within-TTL warm run is not part of SW1. Report:
 [`2026-09-10-swebench-openrouter-cache-parity.md`](2026-09-10-swebench-openrouter-cache-parity.md).
+
+## SWE-bench full-50 harness lineage
+
+Scope fingerprint: `swebench-mini50-v1 / OpenRouter /
+anthropic/claude-opus-4.8 / explicit prompt cache / official Docker /
+one repetition`.
+
+Task-set fingerprint:
+`6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3`.
+This is separate from SW0/SW1 because the task scope changed from five to all
+50 instances. Metrics use the 37 tasks where both harnesses resolved.
+
+| Stage | Parent | Harness | Paired tasks | Tokens | Calls | Cost | Wall | Paired correct | Immediate delta | Cumulative vs SWF0 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| SWF0 | — | mini-swe-agent 2.4.6 | 37 | 6,016,050 | 514 | $7.858095 | 1,766.831s | 37/37 | baseline | baseline |
+| SWF1 | SWF0 | cached Daimonos | 37 | 7,169,536 | 335 | $9.886105 | 1,283.254s | 37/37 | tokens +19.17%; calls -34.82%; cost +25.81%; wall -27.37% | same |
+
+As-run correctness was 45/50 for SWF0 and 41/50 for SWF1. Eight tasks were
+Daimonos-only failures, four were mini-only failures, and both failed
+`sphinx-doc__sphinx-7748`. The report's complete 50-row table preserves every
+per-task cost, token, call, wall-time, and correctness regression.
+
+Report:
+[`2026-09-11-swebench-openrouter-full50-r1.md`](2026-09-11-swebench-openrouter-full50-r1.md).
