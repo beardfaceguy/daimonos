@@ -1,0 +1,486 @@
+# Agent Review Log
+**Protocol:** review-protocol.md v1.3
+<!-- review thread_id="1467-cursor-call-counts" -->
+
+<!-- event id="request" artifact path="1467-cursor-call-counts/artifacts/round-1-review-request.diff" sha256="ceffb673b22c7b2061667d8f473556205be3dfa1cf334b113ea592c65255a38b" -->
+## Review Request — Round 1
+**Task:** 1467 — Capture Cursor model and tool call counts
+**Protocol:** review-protocol.md v1.3 — respond using the Review Response format.
+
+### Proposed Solution
+For current Cursor stream-json, count unique non-empty model_call_id values across assistant/tool events plus assistant events without an id (the terminal model call). Count distinct call_id values across started/completed tool_call lifecycle events. Return llm_calls null when an older stream has no count evidence, and zero tool calls when no tool lifecycle exists. Validate with a redacted captured fixture and re-normalize the existing five-arm artifacts.
+
+### Relevant Code / Diff
+diff --git i/benchmarks/extract_tokens.py w/benchmarks/extract_tokens.py
+index 348ecb6..ce1eaff 100755
+--- i/benchmarks/extract_tokens.py
++++ w/benchmarks/extract_tokens.py
+@@ -84,6 +84,39 @@ def count_tool_calls(events):
+     return n
+ 
+ 
++def cursor_call_counts(events):
++    """Count Cursor's current stream-json model and tool lifecycle ids.
++
++    A tool emits started/completed events with the same call_id, so tool calls
++    are unique ids rather than event count. Tool-producing model calls carry a
++    model_call_id on assistant/tool events; the terminal assistant message has
++    no id and represents one additional model call.
++    """
++    model_call_ids = {
++        event["model_call_id"]
++        for event in events
++        if isinstance(event.get("model_call_id"), str)
++        and event["model_call_id"]
++    }
++    terminal_calls = sum(
++        event.get("type") == "assistant" and not event.get("model_call_id")
++        for event in events
++    )
++    llm_calls = (
++        len(model_call_ids) + terminal_calls
++        if model_call_ids or terminal_calls
++        else None
++    )
++    tool_call_ids = {
++        event["call_id"]
++        for event in events
++        if event.get("type") == "tool_call"
++        and isinstance(event.get("call_id"), str)
++        and event["call_id"]
++    }
++    return llm_calls, len(tool_call_ids)
++
++
+ def parse_ms(ts):
+     """Parse an ISO-8601 Z timestamp to epoch milliseconds, or None (mirrors
+     JS Date.parse returning NaN -> treated as absent)."""
+@@ -159,7 +192,7 @@ def main(argv):
+         m["cache_read"] = usage.get("cacheReadTokens") or 0
+         m["output"] = usage.get("outputTokens") or 0
+         cost = None  # cursor-agent does not emit cost; joined from admin CSV
+-        tool_calls = count_tool_calls(events)
++        llm_calls, tool_calls = cursor_call_counts(events)
+         is_error = exit_code != 0 or (
+             (result.get("is_error", True) if result else True)
+         )
+diff --git i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+index dba6fe4..ff838fa 100644
+--- i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
++++ w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+@@ -39,11 +39,13 @@ optimization-lineage stage or publishable aggregate claim.
+ |---|---:|---:|---:|---:|---:|
+ | Daimonos | 483,581 | 32 | $2.521245 | 94.638 s | 5/5 |
+ | mini-swe-agent | 755,633 | 88 | $1.090288 | 267.544 s | 5/5 |
+-| Cursor | 1,307,205 | unavailable | unavailable | 261.703 s | 5/5 |
++| Cursor | 1,307,205 | 48 | unavailable | 261.703 s | 5/5 |
+ 
+ Daimonos used 36.00% fewer raw tokens and 64.63% less agent wall time than
+ mini-swe-agent, and 63.01% fewer raw tokens and 63.84% less agent wall time than
+ Cursor in this repetition.
++Daimonos made 63.64% fewer model calls than mini-swe-agent and 33.33% fewer
++than Cursor.
+ 
+ Those token ratios are not cost ratios. Daimonos and mini-swe-agent costs both
+ sum OpenRouter's provider-returned per-generation `usage.cost`; mini's summed
+@@ -86,9 +88,10 @@ The first Daimonos `sphinx-9367` attempt was rejected before inference with
+ OpenRouter HTTP 402 `in_flight_budget_exhausted`; it consumed zero tokens and
+ zero cost. The replacement ran after the stated 120-second settlement window.
+ 
+-Cursor's extractor currently reports no LLM-call/tool-call count, so those
+-fields must not be treated as zero. mini-swe-agent cost comes from summing the
+-same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
++Cursor's current stream schema reports 48 model calls (distinct
++`model_call_id` values plus terminal assistant calls) and 43 tool calls
++(distinct lifecycle `call_id` values). mini-swe-agent cost comes from summing
++the same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
+ retained only as a consistency check.
+ 
+ At least two more matched repetitions are needed before publishing relative
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 0fdeb5a..278b41c 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -87,6 +87,10 @@ OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
+ uses, and separates fresh/cache-write/cache-read prompt tokens; LiteLLM's
+ aggregate is retained only as a consistency check. Cursor uses its own backend,
+ so token/correctness comparisons are available but USD cost parity is not.
++For current Cursor stream-json, the normalizer counts distinct `model_call_id`
++values plus the terminal assistant call, and deduplicates tool lifecycle events
++by `call_id`. Older streams without those identifiers keep `llm_calls` null
++rather than reporting a misleading zero.
+ 
+ Current default-harness result:
+ [`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).
+diff --git i/tests/test_bench_extract_tokens.py w/tests/test_bench_extract_tokens.py
+index 63c8bed..dd52df6 100644
+--- i/tests/test_bench_extract_tokens.py
++++ w/tests/test_bench_extract_tokens.py
+@@ -16,6 +16,7 @@ EXTRACTOR = os.path.join(
+     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+     "benchmarks", "extract_tokens.py",
+ )
++FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+ 
+ 
+ def run_extractor(tmp_path, runtime, raw_text, tokenlog_text=None,
+@@ -74,9 +75,22 @@ def test_cursor_camelcase_usage_cost_null(tmp_path):
+     assert (s["input"], s["cache_write"], s["cache_read"], s["output"]) == (5, 10, 200, 7)
+     assert s["total_tokens"] == 222
+     assert s["cost_usd"] is None  # cursor emits no per-run cost
++    assert s["llm_calls"] is None
++    assert s["tool_calls"] == 0
+     assert s["is_error"] is False
+ 
+ 
++def test_cursor_counts_model_and_tool_calls_from_captured_stream(tmp_path):
++    with open(
++        os.path.join(FIXTURES, "cursor_stream_calls.jsonl"),
++        encoding="utf-8",
++    ) as fixture:
++        summary = run_extractor(tmp_path, "cursor", fixture.read())
++
++    assert summary["llm_calls"] == 4
++    assert summary["tool_calls"] == 3
++
++
+ def test_codex_turn_completed_usage_and_fresh_input(tmp_path):
+     # Codex reports usage on turn.completed; input_tokens is the prompt TOTAL
+     # (includes cached), so fresh input = total - cache_write - cache_read.
+diff --git 1/tests/fixtures/cursor_stream_calls.jsonl 2/tests/fixtures/cursor_stream_calls.jsonl
+new file mode 100644
+index 0000000..03e7ea9
+--- /dev/null
++++ 2/tests/fixtures/cursor_stream_calls.jsonl
+@@ -0,0 +1,12 @@
++{"type":"system","subtype":"init","session_id":"redacted"}
++{"type":"user","session_id":"redacted","message":{"role":"user","content":[{"type":"text","text":"redacted"}]}}
++{"type":"assistant","session_id":"redacted","model_call_id":"redacted-0","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1,"completedAtMs":2}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3,"completedAtMs":4}}
++{"type":"assistant","session_id":"redacted","model_call_id":"redacted-2","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5,"completedAtMs":6}}
++{"type":"assistant","session_id":"redacted","model_call_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"result","subtype":"success","is_error":false,"session_id":"redacted","usage":{"inputTokens":10,"cacheWriteTokens":20,"cacheReadTokens":300,"outputTokens":40}}
+
+### Known Concerns
+1. The terminal assistant event currently omits model_call_id; a future schema with multiple unidentified assistant chunks could require revision.
+2. Tool calls count attempted unique call ids, including started calls without a completed event.
+3. Cursor USD remains unavailable and unchanged.
+
+### Specific Questions for Reviewer
+1. Does distinct model_call_id plus terminal assistant accurately represent current Cursor model calls?
+2. Is call_id deduplication correct for started/completed lifecycle pairs?
+3. Does null-on-no-evidence preserve backward compatibility?
+4. Are the restored report conclusions correctly updated?
+
+<!-- event id="review-1" reviewer.model="anthropic/claude-fable-5" reviewer.provider="openrouter" reviewer.validation_attempts="1" -->
+## Review Response — Round 1
+**Position:** PARTIAL
+
+### Blocking Concerns
+B1. The terminal-assistant heuristic counts EVERY assistant event lacking a model_call_id as a separate model call. Cursor stream-json can emit multiple assistant delta/chunk events for a single terminal message (the docstring itself acknowledges only one terminal call exists). If the terminal message streams as N chunks, llm_calls is inflated by N-1. Either dedupe terminal assistant events (e.g., cap terminal_calls at 1 for current schema, or group by session/message identity) or provide evidence (captured multi-chunk stream) that Cursor emits exactly one id-less assistant event per run. The single-fixture test with exactly one terminal event does not exercise this risk.
+B2. The restored-report table updates Cursor's call count to 48 but the surrounding claim 'Daimonos made ... 33.33% fewer than Cursor' mixes counts computed under two different methodologies without stating that Cursor's 48 includes the terminal-assistant heuristic and attempted (started-only) tool calls, while Daimonos/mini counts come from different accounting. Given the report's own caveat that these are not publishable aggregates, the new cross-arm model-call comparison sentence needs a methodological caveat (or the report should show how 48 decomposes: distinct model_call_ids vs terminal calls) so readers can't misread it as an apples-to-apples ratio.
+
+### Non-Blocking Suggestions
+S1. Add a fixture/test case covering the older-schema fallback more thoroughly: a stream with tool_call events but no call_id (should yield tool_calls == 0 or fall back?) and a stream with model_call_ids but zero terminal assistant events, to lock in the null-on-no-evidence and dedupe semantics against regressions.
+S2. Document (in README or docstring) that tool_calls counts attempted calls including started-without-completed lifecycles, and consider also emitting a completed-only count if failed/abandoned tool calls could skew cross-arm comparisons.
+S3. In cursor_call_counts, consider warning (or recording a schema-version marker) when model_call_ids is empty but tool_call events exist, since that indicates an older/unknown schema where llm_calls=null but tool counting may also be unreliable.
+
+**Verdict:** REVISE
+
+<!-- event id="rebuttal-1" artifact path="1467-cursor-call-counts/artifacts/round-1-rebuttal.diff" sha256="aa1a3112a8a80934c33c6ae39b1014bb5c51549f573433e8b681399cbd44d04f" -->
+## Rebuttal — Round 1
+**Position:** AGREE
+
+### Responses to Blocking Concerns
+Re B1: ACCEPT — Multiple id-less assistant events now contribute at most one terminal call. A regression test emits two chunks and verifies one terminal contribution.
+Re B2: ACCEPT — Report now decomposes 48 as 43 distinct model_call_id values plus five terminal calls, records 43 attempted/completed tools, identifies each other harness source, and labels ratios diagnostic rather than provider-level apples-to-apples.
+
+### Revised Code / Diff
+diff --git i/benchmarks/extract_tokens.py w/benchmarks/extract_tokens.py
+index 348ecb6..0ac9a61 100755
+--- i/benchmarks/extract_tokens.py
++++ w/benchmarks/extract_tokens.py
+@@ -84,6 +84,57 @@ def count_tool_calls(events):
+     return n
+ 
+ 
++def cursor_call_counts(events):
++    """Count Cursor's current stream-json model and tool lifecycle ids.
++
++    A tool emits started/completed events with the same call_id, so attempted
++    and completed calls are deduplicated separately. Tool-producing model calls
++    carry a model_call_id on assistant/tool events; one or more id-less
++    assistant chunks collectively represent at most one terminal model call.
++    """
++    model_call_ids = {
++        event["model_call_id"]
++        for event in events
++        if isinstance(event.get("model_call_id"), str)
++        and event["model_call_id"]
++    }
++    terminal_call = any(
++        event.get("type") == "assistant" and not event.get("model_call_id")
++        for event in events
++    )
++    llm_calls = (
++        len(model_call_ids) + int(terminal_call)
++        if model_call_ids or terminal_call
++        else None
++    )
++    tool_events = [event for event in events if event.get("type") == "tool_call"]
++    tool_call_ids = {
++        event["call_id"]
++        for event in tool_events
++        if isinstance(event.get("call_id"), str) and event["call_id"]
++    }
++    lifecycle_ids_complete = all(
++        isinstance(event.get("call_id"), str) and event["call_id"]
++        for event in tool_events
++    )
++    tool_calls = len(tool_call_ids) if lifecycle_ids_complete else None
++    completed_tool_calls = (
++        len({
++            event["call_id"]
++            for event in tool_events
++            if event.get("subtype") == "completed"
++        })
++        if lifecycle_ids_complete
++        else None
++    )
++    source = (
++        "cursor_stream_model_call_id_v1"
++        if model_call_ids
++        else "cursor_stream_terminal_only_v1" if terminal_call else None
++    )
++    return llm_calls, tool_calls, completed_tool_calls, source
++
++
+ def parse_ms(ts):
+     """Parse an ISO-8601 Z timestamp to epoch milliseconds, or None (mirrors
+     JS Date.parse returning NaN -> treated as absent)."""
+@@ -123,6 +174,8 @@ def main(argv):
+     m = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "cost": 0}
+     tool_calls = 0
+     llm_calls = None
++    completed_tool_calls = None
++    call_count_source = None
+     is_error = True
+     cost = None  # null = unknown (Cursor: comes from admin CSV later)
+     context_estimates = []
+@@ -159,7 +212,12 @@ def main(argv):
+         m["cache_read"] = usage.get("cacheReadTokens") or 0
+         m["output"] = usage.get("outputTokens") or 0
+         cost = None  # cursor-agent does not emit cost; joined from admin CSV
+-        tool_calls = count_tool_calls(events)
++        (
++            llm_calls,
++            tool_calls,
++            completed_tool_calls,
++            call_count_source,
++        ) = cursor_call_counts(events)
+         is_error = exit_code != 0 or (
+             (result.get("is_error", True) if result else True)
+         )
+@@ -383,6 +441,8 @@ def main(argv):
+         "cost_usd": cost,
+         "tool_calls": tool_calls,
+         "llm_calls": llm_calls,
++        "completed_tool_calls": completed_tool_calls,
++        "call_count_source": call_count_source,
+         "exit_code": exit_code,
+         "is_error": is_error,
+         "success": not is_error,  # upgraded to correctness-gated by check_task.py
+diff --git i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+index dba6fe4..cbcc502 100644
+--- i/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
++++ w/benchmarks/results/2026-09-10-swebench-restored-three-arm-five.md
+@@ -39,11 +39,14 @@ optimization-lineage stage or publishable aggregate claim.
+ |---|---:|---:|---:|---:|---:|
+ | Daimonos | 483,581 | 32 | $2.521245 | 94.638 s | 5/5 |
+ | mini-swe-agent | 755,633 | 88 | $1.090288 | 267.544 s | 5/5 |
+-| Cursor | 1,307,205 | unavailable | unavailable | 261.703 s | 5/5 |
++| Cursor | 1,307,205 | 48 | unavailable | 261.703 s | 5/5 |
+ 
+ Daimonos used 36.00% fewer raw tokens and 64.63% less agent wall time than
+ mini-swe-agent, and 63.01% fewer raw tokens and 63.84% less agent wall time than
+ Cursor in this repetition.
++Under each harness's own emitted call evidence, Daimonos made 63.64% fewer
++model calls than mini-swe-agent and 33.33% fewer than Cursor. This diagnostic
++ratio is not a provider-level apples-to-apples counter.
+ 
+ Those token ratios are not cost ratios. Daimonos and mini-swe-agent costs both
+ sum OpenRouter's provider-returned per-generation `usage.cost`; mini's summed
+@@ -86,10 +89,14 @@ The first Daimonos `sphinx-9367` attempt was rejected before inference with
+ OpenRouter HTTP 402 `in_flight_budget_exhausted`; it consumed zero tokens and
+ zero cost. The replacement ran after the stated 120-second settlement window.
+ 
+-Cursor's extractor currently reports no LLM-call/tool-call count, so those
+-fields must not be treated as zero. mini-swe-agent cost comes from summing the
+-same OpenRouter `usage.cost` field Daimonos records; LiteLLM's aggregate is
+-retained only as a consistency check.
++Cursor's current stream schema reports 48 model calls: 43 distinct
++`model_call_id` values plus one id-less terminal assistant call for each of the
++five tasks. It reports 43 attempted and 43 completed tool calls after
++deduplicating started/completed lifecycle events by `call_id`. Daimonos counts
++provider usage frames; mini counts preserved provider responses, so the
++cross-harness call ratio remains diagnostic. mini-swe-agent cost comes from
++summing the same OpenRouter `usage.cost` field Daimonos records; LiteLLM's
++aggregate is retained only as a consistency check.
+ 
+ At least two more matched repetitions are needed before publishing relative
+ efficiency. An explicit cache-policy decision is needed only for causal
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 0fdeb5a..b5052c2 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -87,6 +87,12 @@ OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
+ uses, and separates fresh/cache-write/cache-read prompt tokens; LiteLLM's
+ aggregate is retained only as a consistency check. Cursor uses its own backend,
+ so token/correctness comparisons are available but USD cost parity is not.
++For current Cursor stream-json, the normalizer counts distinct `model_call_id`
++values plus at most one terminal assistant call. `tool_calls` counts distinct
++attempted `call_id` values across lifecycle events; `completed_tool_calls`
++counts the completed subset. A lifecycle with missing identifiers reports null
++instead of a misleading partial count, and `call_count_source` records the
++recognized schema.
+ 
+ Current default-harness result:
+ [`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).
+diff --git i/tests/test_bench_extract_tokens.py w/tests/test_bench_extract_tokens.py
+index 63c8bed..2a6252f 100644
+--- i/tests/test_bench_extract_tokens.py
++++ w/tests/test_bench_extract_tokens.py
+@@ -16,6 +16,7 @@ EXTRACTOR = os.path.join(
+     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+     "benchmarks", "extract_tokens.py",
+ )
++FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+ 
+ 
+ def run_extractor(tmp_path, runtime, raw_text, tokenlog_text=None,
+@@ -74,9 +75,80 @@ def test_cursor_camelcase_usage_cost_null(tmp_path):
+     assert (s["input"], s["cache_write"], s["cache_read"], s["output"]) == (5, 10, 200, 7)
+     assert s["total_tokens"] == 222
+     assert s["cost_usd"] is None  # cursor emits no per-run cost
++    assert s["llm_calls"] is None
++    assert s["tool_calls"] == 0
+     assert s["is_error"] is False
+ 
+ 
++def test_cursor_counts_model_and_tool_calls_from_captured_stream(tmp_path):
++    with open(
++        os.path.join(FIXTURES, "cursor_stream_calls.jsonl"),
++        encoding="utf-8",
++    ) as fixture:
++        summary = run_extractor(tmp_path, "cursor", fixture.read())
++
++    assert summary["llm_calls"] == 4
++    assert summary["tool_calls"] == 3
++    assert summary["completed_tool_calls"] == 3
++    assert summary["call_count_source"] == "cursor_stream_model_call_id_v1"
++
++
++def test_cursor_counts_terminal_assistant_chunks_as_one_call(tmp_path):
++    raw = "\n".join([
++        json.dumps({
++            "type": "tool_call",
++            "subtype": "started",
++            "model_call_id": "model-1",
++            "call_id": "tool-1",
++        }),
++        json.dumps({
++            "type": "tool_call",
++            "subtype": "completed",
++            "model_call_id": "model-1",
++            "call_id": "tool-1",
++        }),
++        json.dumps({"type": "assistant", "model_call_id": None}),
++        json.dumps({"type": "assistant", "model_call_id": None}),
++        json.dumps({"type": "result", "is_error": False, "usage": {}}),
++    ]) + "\n"
++
++    summary = run_extractor(tmp_path, "cursor", raw)
++
++    assert summary["llm_calls"] == 2
++
++
++def test_cursor_unknown_tool_lifecycle_ids_report_null_count(tmp_path):
++    raw = "\n".join([
++        json.dumps({
++            "type": "tool_call",
++            "subtype": "started",
++            "model_call_id": "model-1",
++        }),
++        json.dumps({"type": "result", "is_error": False, "usage": {}}),
++    ]) + "\n"
++
++    summary = run_extractor(tmp_path, "cursor", raw)
++
++    assert summary["llm_calls"] == 1
++    assert summary["tool_calls"] is None
++    assert summary["completed_tool_calls"] is None
++    assert summary["call_count_source"] == "cursor_stream_model_call_id_v1"
++
++
++def test_cursor_model_ids_without_terminal_event_are_still_deduplicated(tmp_path):
++    raw = "\n".join([
++        json.dumps({"type": "assistant", "model_call_id": "model-1"}),
++        json.dumps({"type": "assistant", "model_call_id": "model-1"}),
++        json.dumps({"type": "result", "is_error": False, "usage": {}}),
++    ]) + "\n"
++
++    summary = run_extractor(tmp_path, "cursor", raw)
++
++    assert summary["llm_calls"] == 1
++    assert summary["tool_calls"] == 0
++    assert summary["completed_tool_calls"] == 0
++
++
+ def test_codex_turn_completed_usage_and_fresh_input(tmp_path):
+     # Codex reports usage on turn.completed; input_tokens is the prompt TOTAL
+     # (includes cached), so fresh input = total - cache_write - cache_read.
+diff --git 1/tests/fixtures/cursor_stream_calls.jsonl 2/tests/fixtures/cursor_stream_calls.jsonl
+new file mode 100644
+index 0000000..03e7ea9
+--- /dev/null
++++ 2/tests/fixtures/cursor_stream_calls.jsonl
+@@ -0,0 +1,12 @@
++{"type":"system","subtype":"init","session_id":"redacted"}
++{"type":"user","session_id":"redacted","message":{"role":"user","content":[{"type":"text","text":"redacted"}]}}
++{"type":"assistant","session_id":"redacted","model_call_id":"redacted-0","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-0","call_id":"tool-1","tool_call":{"grepToolCall":{"pattern":"redacted"},"toolCallId":"tool-1","startedAtMs":1,"completedAtMs":2}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-1","call_id":"tool-2","tool_call":{"readToolCall":{"path":"redacted"},"toolCallId":"tool-2","startedAtMs":3,"completedAtMs":4}}
++{"type":"assistant","session_id":"redacted","model_call_id":"redacted-2","message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"tool_call","subtype":"started","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5}}
++{"type":"tool_call","subtype":"completed","session_id":"redacted","model_call_id":"redacted-2","call_id":"tool-3","tool_call":{"editToolCall":{"path":"redacted"},"toolCallId":"tool-3","startedAtMs":5,"completedAtMs":6}}
++{"type":"assistant","session_id":"redacted","model_call_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"redacted"}]}}
++{"type":"result","subtype":"success","is_error":false,"session_id":"redacted","usage":{"inputTokens":10,"cacheWriteTokens":20,"cacheReadTokens":300,"outputTokens":40}}
+
+### New Points
+R1. Applied all suggestions: unknown tool lifecycles with missing call_id return null; model ids without terminal events are tested; attempted and completed tool counts are emitted separately; call_count_source labels the recognized schema.
+
+**Requesting:** RE-REVIEW
+
+<!-- event id="review-2" reviewer.model="anthropic/claude-fable-5" reviewer.provider="openrouter" reviewer.validation_attempts="1" -->
+## Review Response — Round 2
+**Position:** AGREE
+
+### Blocking Concerns
+None.
+
+### Non-Blocking Suggestions
+S4. The docstring's claim that id-less assistant chunks 'collectively represent at most one terminal model call' is a schema assumption; if Cursor ever emits mid-run id-less assistant events (not just terminal chunks), any(...) would undercount. Consider noting this assumption where call_count_source is documented so a future schema bump revisits it.
+
+### Responses to Prior Points
+Re R1: Verified against the revised diff. Unknown lifecycles missing call_id now yield tool_calls=None and completed_tool_calls=None (test_cursor_unknown_tool_lifecycle_ids_report_null_count); model ids without a terminal event are deduplicated to one call (test_cursor_model_ids_without_terminal_event_are_still_deduplicated); completed_tool_calls is emitted alongside attempted tool_calls; and call_count_source records the recognized schema variant. This addresses S1, S2, and S3 as claimed.
+B1: resolved
+B2: resolved
+
+**Verdict:** APPROVE
