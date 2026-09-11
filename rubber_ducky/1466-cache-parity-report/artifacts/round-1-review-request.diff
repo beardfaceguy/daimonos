@@ -1,0 +1,487 @@
+diff --git i/benchmarks/optimization-lineage.json w/benchmarks/optimization-lineage.json
+index d4e6c49..f890b00 100644
+--- i/benchmarks/optimization-lineage.json
++++ w/benchmarks/optimization-lineage.json
+@@ -1251,6 +1251,263 @@
+           "kind": "report"
+         }
+       ]
++    },
++    {
++      "id": "SW0",
++      "parent": null,
++      "feature": "SWE-bench five-instance OpenRouter cold-cache baseline",
++      "scope_fingerprint": "swebench-five-v1|openrouter|anthropic/claude-opus-4.8|thinking-provider-default|compaction-off|official-docker|cold-cache",
++      "task_set_fingerprint": "3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5",
++      "benchmark_kind": "targeted",
++      "provider": "openrouter",
++      "model": "anthropic/claude-opus-4.8",
++      "thinking": "provider-default",
++      "task_ids": [
++        "django__django-11815",
++        "django__django-12155",
++        "django__django-12708",
++        "sphinx-doc__sphinx-8035",
++        "sphinx-doc__sphinx-9367"
++      ],
++      "repetitions_by_task": {
++        "django__django-11815": 3,
++        "django__django-12155": 3,
++        "django__django-12708": 3,
++        "sphinx-doc__sphinx-8035": 3,
++        "sphinx-doc__sphinx-9367": 3
++      },
++      "binary_sha256": "bfd61ce4edea4e118c3a1a56fd7e250a31dd60bc89b9a4d5d2c8538bbc0983c2",
++      "git_commit": "827d461c006d0d91af7e6a4b9c94ef2d54549534",
++      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
++      "created_at": "2026-09-10T20:00:53Z",
++      "raw_run_dirs": [
++        "benchmarks/swebench/results/20260910-130053-swebench-docker-compare-five-r1",
++        "benchmarks/swebench/results/20260910-130512-swebench-docker-compare-five-r1-retry9367",
++        "benchmarks/swebench/results/20260910-135741-swebench-docker-compare-five-r2",
++        "benchmarks/swebench/results/20260910-140920-swebench-docker-compare-five-r3",
++        "benchmarks/swebench/results/20260910-141753-swebench-docker-compare-five-r3-retry-sphinx"
++      ],
++      "metrics": {
++        "paired_task_runs": [
++          14,
++          "count"
++        ],
++        "paired_total_tokens": [
++          1577361,
++          "tokens"
++        ],
++        "paired_llm_calls": [
++          94,
++          "count"
++        ],
++        "paired_cost_usd": [
++          8.174165,
++          "usd"
++        ],
++        "paired_wall_ms": [
++          262242,
++          "milliseconds"
++        ],
++        "as_run_correct_task_runs": [
++          15,
++          "count"
++        ]
++      },
++      "notes": "Correctness-gated baseline for SW1. The paired scope excludes both arms of cached repetition two sphinx-doc__sphinx-8035.",
++      "report_path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
++      "artifacts": [
++        {
++          "path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
++          "sha256": "7f549343eab8401271f2e9be93acae372dc4458428b37122e7d6eb4dedf8ee4c",
++          "kind": "comparison"
++        }
++      ]
++    },
++    {
++      "id": "SW1",
++      "parent": "SW0",
++      "feature": "Explicit OpenRouter latest-message prompt caching",
++      "scope_fingerprint": "swebench-five-v1|openrouter|anthropic/claude-opus-4.8|thinking-provider-default|compaction-off|official-docker|cold-cache",
++      "task_set_fingerprint": "3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5",
++      "benchmark_kind": "targeted",
++      "provider": "openrouter",
++      "model": "anthropic/claude-opus-4.8",
++      "thinking": "provider-default",
++      "task_ids": [
++        "django__django-11815",
++        "django__django-12155",
++        "django__django-12708",
++        "sphinx-doc__sphinx-8035",
++        "sphinx-doc__sphinx-9367"
++      ],
++      "repetitions_by_task": {
++        "django__django-11815": 3,
++        "django__django-12155": 3,
++        "django__django-12708": 3,
++        "sphinx-doc__sphinx-8035": 3,
++        "sphinx-doc__sphinx-9367": 3
++      },
++      "binary_sha256": "0c8843a01605111777737518e17161e6e65526802ad7a9d017dc37ecf017c316",
++      "git_commit": "780b272807b0df77cac796ae803dc677692b3698",
++      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
++      "created_at": "2026-09-11T00:12:43Z",
++      "raw_run_dirs": [
++        "benchmarks/swebench/results/20260910-171243-swebench-docker-openrouter-cache-five-smoke-r1",
++        "benchmarks/swebench/results/20260910-172456-swebench-docker-openrouter-cache-five-cold-r2",
++        "benchmarks/swebench/results/20260910-173233-swebench-docker-openrouter-cache-five-cold-r3"
++      ],
++      "excluded_run_dirs": [
++        "benchmarks/swebench/results/20260910-171731-swebench-docker-openrouter-cache-five-r2"
++      ],
++      "metrics": {
++        "paired_task_runs": [
++          14,
++          "count"
++        ],
++        "paired_total_tokens": [
++          1747557,
++          "tokens"
++        ],
++        "paired_llm_calls": [
++          103,
++          "count"
++        ],
++        "paired_cost_usd": [
++          2.698824,
++          "usd"
++        ],
++        "paired_wall_ms": [
++          322296,
++          "milliseconds"
++        ],
++        "as_run_correct_task_runs": [
++          14,
++          "count"
++        ]
++      },
++      "deltas": {
++        "immediate": {
++          "paired_total_tokens_pct": 10.7899206333,
++          "paired_llm_calls_pct": 9.5744680851,
++          "paired_cost_usd_pct": -66.9834900568,
++          "paired_wall_ms_pct": 22.9002219324
++        },
++        "cumulative_from_SW0": {
++          "paired_total_tokens_pct": 10.7899206333,
++          "paired_llm_calls_pct": 9.5744680851,
++          "paired_cost_usd_pct": -66.9834900568,
++          "paired_wall_ms_pct": 22.9002219324
++        }
++      },
++      "per_task_regressions": [
++        {
++          "task_id": "django__django-11815",
++          "metric": "mean_total_tokens",
++          "baseline": 54795.6666666667,
++          "candidate": 59277,
++          "delta_pct": 8.1782622713
++        },
++        {
++          "task_id": "django__django-11815",
++          "metric": "mean_llm_calls",
++          "baseline": 4,
++          "candidate": 4.3333333333,
++          "delta_pct": 8.3333333333
++        },
++        {
++          "task_id": "django__django-11815",
++          "metric": "mean_output_tokens",
++          "baseline": 450.3333333333,
++          "candidate": 478.3333333333,
++          "delta_pct": 6.2176165803
++        },
++        {
++          "task_id": "django__django-11815",
++          "metric": "mean_wall_ms",
++          "baseline": 9187.6666666667,
++          "candidate": 9974.3333333333,
++          "delta_pct": 8.5622029532
++        },
++        {
++          "task_id": "django__django-12155",
++          "metric": "mean_wall_ms",
++          "baseline": 9231,
++          "candidate": 9433,
++          "delta_pct": 2.1882786264
++        },
++        {
++          "task_id": "django__django-12708",
++          "metric": "mean_total_tokens",
++          "baseline": 89315.3333333333,
++          "candidate": 134475,
++          "delta_pct": 50.5620535481
++        },
++        {
++          "task_id": "django__django-12708",
++          "metric": "mean_llm_calls",
++          "baseline": 6,
++          "candidate": 8.3333333333,
++          "delta_pct": 38.8888888889
++        },
++        {
++          "task_id": "django__django-12708",
++          "metric": "mean_output_tokens",
++          "baseline": 844,
++          "candidate": 2042,
++          "delta_pct": 141.9431279621
++        },
++        {
++          "task_id": "django__django-12708",
++          "metric": "mean_wall_ms",
++          "baseline": 15670.6666666667,
++          "candidate": 31971.3333333333,
++          "delta_pct": 104.0202501489
++        },
++        {
++          "task_id": "sphinx-doc__sphinx-8035",
++          "metric": "mean_total_tokens",
++          "baseline": 402385.6666666667,
++          "candidate": 406655,
++          "delta_pct": 1.0610053208
++        },
++        {
++          "task_id": "sphinx-doc__sphinx-8035",
++          "metric": "mean_llm_calls",
++          "baseline": 19.3333333333,
++          "candidate": 20.3333333333,
++          "delta_pct": 5.1724137931
++        },
++        {
++          "task_id": "sphinx-doc__sphinx-8035",
++          "metric": "mean_output_tokens",
++          "baseline": 3821,
++          "candidate": 4070.6666666667,
++          "delta_pct": 6.5340661258
++        },
++        {
++          "task_id": "sphinx-doc__sphinx-8035",
++          "metric": "mean_wall_ms",
++          "baseline": 63326,
++          "candidate": 69550.3333333333,
++          "delta_pct": 9.8290328354
++        },
++        {
++          "task_id": "sphinx-doc__sphinx-8035",
++          "metric": "correct_task_runs",
++          "baseline": 3,
++          "candidate": 2,
++          "delta_pct": -33.3333333333
++        }
++      ],
++      "notes": "Correctness-gated 14/14 paired cost comparison. As-run correctness is 14/15 versus SW0 15/15; cached repetition two sphinx-doc__sphinx-8035 is preserved as a regression. The separately recorded within-TTL warm run is excluded.",
++      "report_path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
++      "artifacts": [
++        {
++          "path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
++          "sha256": "7f549343eab8401271f2e9be93acae372dc4458428b37122e7d6eb4dedf8ee4c",
++          "kind": "comparison"
++        }
++      ]
+     }
+   ]
+ }
+diff --git i/benchmarks/results/optimization-lineage.md w/benchmarks/results/optimization-lineage.md
+index f030435..94f8d45 100644
+--- i/benchmarks/results/optimization-lineage.md
++++ w/benchmarks/results/optimization-lineage.md
+@@ -180,3 +180,34 @@ metrics, and deltas.
+ 
+ Report:
+ [`2026-08-14-1230-phase2-read-transform-write.md`](2026-08-14-1230-phase2-read-transform-write.md).
++
++## SWE-bench OpenRouter cache targeted lineage
++
++Scope fingerprint: `swebench-five-v1 / OpenRouter /
++anthropic/claude-opus-4.8 / thinking=provider-default / compaction=off /
++official Docker / cold cache / three repetitions`.
++
++Task-set fingerprint:
++`3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5`.
++This lineage is separate from the in-house agent suites above. Metrics use the
++14 paired instance-repetitions where both cache modes resolved; the candidate's
++unresolved Sphinx sample is excluded from both arms.
++
++| Stage | Parent | Change | Paired runs | Tokens | Calls | Cost | Wall | Correct | Immediate delta | Cumulative vs SW0 |
++|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
++| SW0 | — | OpenRouter prompt cache off | 14 | 1,577,361 | 94 | $8.174165 | 262.242s | 14/14 | baseline | baseline |
++| SW1 | SW0 | Explicit latest-message cache breakpoint | 14 | 1,747,557 | 103 | $2.698824 | 322.296s | 14/14 | tokens +10.79%; calls +9.57%; cost **-66.98%**; wall +22.90% | same |
++
++Across all samples, SW0 resolved 15/15 and SW1 resolved 14/15. Retained
++candidate regressions:
++
++- `django__django-11815`: mean tokens +8.18%, calls +8.33%, output +6.22%,
++  wall +8.56%;
++- `django__django-12155`: mean wall +2.19%;
++- `django__django-12708`: mean tokens +50.56%, calls +38.89%, output +141.94%,
++  wall +104.02%;
++- `sphinx-doc__sphinx-8035`: mean tokens +1.06%, calls +5.17%, output +6.53%,
++  wall +9.83%, plus one correctness failure.
++
++The separately recorded within-TTL warm run is not part of SW1. Report:
++[`2026-09-10-swebench-openrouter-cache-parity.md`](2026-09-10-swebench-openrouter-cache-parity.md).
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index a8231b8..6a50a3e 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -84,6 +84,8 @@ so token/correctness comparisons are available but USD cost parity is not.
+ 
+ Current default-harness result:
+ [`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).
++OpenRouter cache experiment:
++[`2026-09-10-swebench-openrouter-cache-parity.md`](../results/2026-09-10-swebench-openrouter-cache-parity.md).
+ 
+ Delete incomplete smoke directories created before dataset enrichment before
+ treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
+diff --git 1/benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md 2/benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md
+new file mode 100644
+index 0000000..a38133d
+--- /dev/null
++++ 2/benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md
+@@ -0,0 +1,161 @@
++# OpenRouter prompt-cache parity on SWE-bench
++
++## Result
++
++Explicit OpenRouter prompt caching reduced Daimonos cost by **66.98%** on the
++14 instance-repetitions where both the cached and uncached patches resolved:
++
++- uncached Daimonos: 1,577,361 tokens, 94 calls, **$8.174165**, 262.242s;
++- cached Daimonos: 1,747,557 tokens, 103 calls, **$2.698824**, 322.296s.
++
++The cost reduction is correctness-gated, but the other metrics regressed:
++cached runs used 10.79% more raw tokens, made 9.57% more calls, and took 22.90%
++more agent wall time. Across all attempts, uncached Daimonos resolved 15/15
++while cached Daimonos resolved 14/15; the cached failure is retained below.
++
++Caching also closed the previous 3.5x mini-swe-agent cost gap. On the 13
++instance-repetitions where both cached Daimonos and mini-swe-agent resolved:
++
++- cached Daimonos: 1,692,783 tokens, 99 calls, **$2.579491**, 313.548s;
++- mini-swe-agent: 1,634,520 tokens, 201 calls, **$2.479946**, 612.259s.
++
++Cached Daimonos cost 4.01% more while making 50.75% fewer calls and taking
++48.79% less agent wall time. Raw tokens were 3.56% higher. As-run totals,
++including each arm's different unresolved sample, were $3.117109 for cached
++Daimonos and $2.948874 for mini-swe-agent (Daimonos 5.71% higher); both resolved
++14/15.
++
++## Scope and identity
++
++All cold repetitions used the same five instances:
++
++- `django__django-11815`
++- `django__django-12155`
++- `django__django-12708`
++- `sphinx-doc__sphinx-8035`
++- `sphinx-doc__sphinx-9367`
++
++Comparison fingerprint:
++
++- task-set SHA-256:
++  `3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5`;
++- enriched 50-instance dataset SHA-256:
++  `6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3`;
++- evaluator: SWE-bench 5.0.2 official Docker images;
++- provider and exact model: OpenRouter `anthropic/claude-opus-4.8`;
++- cost source: OpenRouter's per-generation `usage.cost`;
++- thinking: provider/model default;
++- compaction: off;
++- worker count: one;
++- cache mode: explicit ephemeral content-block breakpoint on the latest
++  cacheable OpenRouter message;
++- cold-run separation: more than the five-minute ephemeral cache TTL.
++
++Cached binary:
++
++- commit: `780b272807b0df77cac796ae803dc677692b3698`;
++- musl SHA-256:
++  `0c8843a01605111777737518e17161e6e65526802ad7a9d017dc37ecf017c316`.
++
++Uncached baseline:
++
++- agent commit: `827d461c006d0d91af7e6a4b9c94ef2d54549534`;
++- musl SHA-256:
++  `bfd61ce4edea4e118c3a1a56fd7e250a31dd60bc89b9a4d5d2c8538bbc0983c2`.
++
++## Cold-run aggregates
++
++| Mode | Rep | Tokens | Calls | Cost | Agent wall | Resolved |
++|---|---:|---:|---:|---:|---:|---:|
++| uncached | 1 | 483,581 | 32 | $2.521245 | 94.638s | 5/5 |
++| uncached | 2 | 668,154 | 38 | $3.456970 | 104.504s | 5/5 |
++| uncached | 3 | 839,498 | 44 | $4.339410 | 125.395s | 5/5 |
++| cached | 1 | 743,265 | 42 | $1.089280 | 135.884s | 5/5 |
++| cached | 2 | 639,945 | 38 | $0.935098 | 111.870s | 4/5 |
++| cached | 3 | 749,785 | 43 | $1.092731 | 143.857s | 5/5 |
++| mini | 1 | 755,633 | 88 | $1.090288 | 267.544s | 5/5 |
++| mini | 2 | 543,229 | 70 | $0.922993 | 234.902s | 4/5 |
++| mini | 3 | 653,770 | 80 | $0.935593 | 225.661s | 5/5 |
++
++Mean per five-instance cold run:
++
++| Mode | Tokens | Calls | Cost | Agent wall |
++|---|---:|---:|---:|---:|
++| uncached Daimonos | 663,744 | 38.0 | $3.439208 | 108.179s |
++| cached Daimonos | 710,998 | 41.0 | $1.039036 | 130.537s |
++| mini-swe-agent | 650,877 | 79.3 | $0.982958 | 242.702s |
++
++The cached Daimonos prompt total comprised 246 fresh tokens, 261,077 cache-write
++tokens, and 1,849,292 cache-read tokens. The three cold runs had zero automatic
++settlement retries.
++
++## Correctness and pairing
++
++Cached Daimonos failed `sphinx-doc__sphinx-8035` in cold repetition two.
++mini-swe-agent failed `django__django-11815` in repetition two. Because these
++are different samples:
++
++- cache-versus-uncached uses 14 paired resolved samples, removing the cached
++  Sphinx failure from both Daimonos arms;
++- cached-Daimonos-versus-mini uses 13 paired resolved samples, removing both
++  arms of both unresolved pairs.
++
++No failed sample contributes to a savings or parity percentage.
++
++## Retained regressions
++
++Mean cached-versus-uncached increases by task:
++
++- `django__django-11815`: tokens +8.18%, calls +8.33%, output +6.22%, wall
++  +8.56%;
++- `django__django-12155`: wall +2.19%;
++- `django__django-12708`: tokens +50.56%, calls +38.89%, output +141.94%, wall
++  +104.02%;
++- `sphinx-doc__sphinx-8035`: tokens +1.06%, calls +5.17%, output +6.53%, wall
++  +9.83%, plus one correctness failure;
++- `sphinx-doc__sphinx-9367`: no upward mean metric.
++
++Cost decreased for every task despite those stochastic trajectory increases.
++The feature therefore improves charged cost, not model determinism, raw-token
++use, call count, or latency.
++
++## Warm-cache observation
++
++One additional run started inside repetition one's cache TTL and is deliberately
++excluded from the cold lineage:
++
++- run: `20260910-171731-swebench-docker-openrouter-cache-five-r2`;
++- 554,159 tokens, 35 calls, $0.485256, 97.607s, 4/5 resolved;
++- cache composition: 70 fresh, 12,268 write, 536,216 read, 5,605 output.
++
++This shows the potential cross-session warm-cache floor, but mixing it into the
++cold mean would overstate reproducible savings. Its unresolved task was also
++`sphinx-doc__sphinx-8035`.
++
++## Raw artifacts
++
++Cached cold:
++
++- `swebench/results/20260910-171243-swebench-docker-openrouter-cache-five-smoke-r1`
++- `swebench/results/20260910-172456-swebench-docker-openrouter-cache-five-cold-r2`
++- `swebench/results/20260910-173233-swebench-docker-openrouter-cache-five-cold-r3`
++
++Cached warm, excluded:
++
++- `swebench/results/20260910-171731-swebench-docker-openrouter-cache-five-r2`
++
++The uncached and mini raw directories are listed in
++[`2026-09-10-swebench-openrouter-three-repetitions.md`](2026-09-10-swebench-openrouter-three-repetitions.md).
++All cold runs have evaluator JSON reports in `benchmarks/swebench/`.
++
++## Full-50 decision
++
++A full 50-instance comparison is now technically justified: caching moved
++Daimonos from 3.5x mini's cost to within 4.01% on correctness-matched samples,
++while retaining a large call-count and wall-time advantage. A linear estimate
++is approximately $10.39 for one cached Daimonos repetition and $9.83 for one
++mini repetition, but the five-instance task mix is too narrow for that to be a
++budget guarantee.
++
++Run full 50 only as a new, separately fingerprinted lineage after approving an
++estimated $20–$25 OpenRouter spend for one repetition of both arms.
