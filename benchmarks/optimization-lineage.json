@@ -1251,6 +1251,263 @@
           "kind": "report"
         }
       ]
+    },
+    {
+      "id": "SW0",
+      "parent": null,
+      "feature": "SWE-bench five-instance OpenRouter cold-cache baseline",
+      "scope_fingerprint": "swebench-five-v1|openrouter|anthropic/claude-opus-4.8|thinking-provider-default|compaction-off|official-docker|cold-cache",
+      "task_set_fingerprint": "3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5",
+      "benchmark_kind": "targeted",
+      "provider": "openrouter",
+      "model": "anthropic/claude-opus-4.8",
+      "thinking": "provider-default",
+      "task_ids": [
+        "django__django-11815",
+        "django__django-12155",
+        "django__django-12708",
+        "sphinx-doc__sphinx-8035",
+        "sphinx-doc__sphinx-9367"
+      ],
+      "repetitions_by_task": {
+        "django__django-11815": 3,
+        "django__django-12155": 3,
+        "django__django-12708": 3,
+        "sphinx-doc__sphinx-8035": 3,
+        "sphinx-doc__sphinx-9367": 3
+      },
+      "binary_sha256": "bfd61ce4edea4e118c3a1a56fd7e250a31dd60bc89b9a4d5d2c8538bbc0983c2",
+      "git_commit": "827d461c006d0d91af7e6a4b9c94ef2d54549534",
+      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
+      "created_at": "2026-09-10T20:00:53Z",
+      "raw_run_dirs": [
+        "benchmarks/swebench/results/20260910-130053-swebench-docker-compare-five-r1",
+        "benchmarks/swebench/results/20260910-130512-swebench-docker-compare-five-r1-retry9367",
+        "benchmarks/swebench/results/20260910-135741-swebench-docker-compare-five-r2",
+        "benchmarks/swebench/results/20260910-140920-swebench-docker-compare-five-r3",
+        "benchmarks/swebench/results/20260910-141753-swebench-docker-compare-five-r3-retry-sphinx"
+      ],
+      "metrics": {
+        "paired_task_runs": [
+          14,
+          "count"
+        ],
+        "paired_total_tokens": [
+          1577361,
+          "tokens"
+        ],
+        "paired_llm_calls": [
+          94,
+          "count"
+        ],
+        "paired_cost_usd": [
+          8.174165,
+          "usd"
+        ],
+        "paired_wall_ms": [
+          262242,
+          "milliseconds"
+        ],
+        "as_run_correct_task_runs": [
+          15,
+          "count"
+        ]
+      },
+      "notes": "Correctness-gated baseline for SW1. The paired scope excludes both arms of cached repetition two sphinx-doc__sphinx-8035.",
+      "report_path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
+          "sha256": "7f549343eab8401271f2e9be93acae372dc4458428b37122e7d6eb4dedf8ee4c",
+          "kind": "comparison"
+        }
+      ]
+    },
+    {
+      "id": "SW1",
+      "parent": "SW0",
+      "feature": "Explicit OpenRouter latest-message prompt caching",
+      "scope_fingerprint": "swebench-five-v1|openrouter|anthropic/claude-opus-4.8|thinking-provider-default|compaction-off|official-docker|cold-cache",
+      "task_set_fingerprint": "3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5",
+      "benchmark_kind": "targeted",
+      "provider": "openrouter",
+      "model": "anthropic/claude-opus-4.8",
+      "thinking": "provider-default",
+      "task_ids": [
+        "django__django-11815",
+        "django__django-12155",
+        "django__django-12708",
+        "sphinx-doc__sphinx-8035",
+        "sphinx-doc__sphinx-9367"
+      ],
+      "repetitions_by_task": {
+        "django__django-11815": 3,
+        "django__django-12155": 3,
+        "django__django-12708": 3,
+        "sphinx-doc__sphinx-8035": 3,
+        "sphinx-doc__sphinx-9367": 3
+      },
+      "binary_sha256": "0c8843a01605111777737518e17161e6e65526802ad7a9d017dc37ecf017c316",
+      "git_commit": "780b272807b0df77cac796ae803dc677692b3698",
+      "fixture_commit": "6ce05e6b926c91faecdbb4243014ac85dca471dfad30ccdb69453343b75267c3",
+      "created_at": "2026-09-11T00:12:43Z",
+      "raw_run_dirs": [
+        "benchmarks/swebench/results/20260910-171243-swebench-docker-openrouter-cache-five-smoke-r1",
+        "benchmarks/swebench/results/20260910-172456-swebench-docker-openrouter-cache-five-cold-r2",
+        "benchmarks/swebench/results/20260910-173233-swebench-docker-openrouter-cache-five-cold-r3"
+      ],
+      "excluded_run_dirs": [
+        "benchmarks/swebench/results/20260910-171731-swebench-docker-openrouter-cache-five-r2"
+      ],
+      "metrics": {
+        "paired_task_runs": [
+          14,
+          "count"
+        ],
+        "paired_total_tokens": [
+          1747557,
+          "tokens"
+        ],
+        "paired_llm_calls": [
+          103,
+          "count"
+        ],
+        "paired_cost_usd": [
+          2.698824,
+          "usd"
+        ],
+        "paired_wall_ms": [
+          322296,
+          "milliseconds"
+        ],
+        "as_run_correct_task_runs": [
+          14,
+          "count"
+        ]
+      },
+      "deltas": {
+        "immediate": {
+          "paired_total_tokens_pct": 10.7899206333,
+          "paired_llm_calls_pct": 9.5744680851,
+          "paired_cost_usd_pct": -66.9834900568,
+          "paired_wall_ms_pct": 22.9002219324
+        },
+        "cumulative_from_SW0": {
+          "paired_total_tokens_pct": 10.7899206333,
+          "paired_llm_calls_pct": 9.5744680851,
+          "paired_cost_usd_pct": -66.9834900568,
+          "paired_wall_ms_pct": 22.9002219324
+        }
+      },
+      "per_task_regressions": [
+        {
+          "task_id": "django__django-11815",
+          "metric": "mean_total_tokens",
+          "baseline": 54795.6666666667,
+          "candidate": 59277,
+          "delta_pct": 8.1782622713
+        },
+        {
+          "task_id": "django__django-11815",
+          "metric": "mean_llm_calls",
+          "baseline": 4,
+          "candidate": 4.3333333333,
+          "delta_pct": 8.3333333333
+        },
+        {
+          "task_id": "django__django-11815",
+          "metric": "mean_output_tokens",
+          "baseline": 450.3333333333,
+          "candidate": 478.3333333333,
+          "delta_pct": 6.2176165803
+        },
+        {
+          "task_id": "django__django-11815",
+          "metric": "mean_wall_ms",
+          "baseline": 9187.6666666667,
+          "candidate": 9974.3333333333,
+          "delta_pct": 8.5622029532
+        },
+        {
+          "task_id": "django__django-12155",
+          "metric": "mean_wall_ms",
+          "baseline": 9231,
+          "candidate": 9433,
+          "delta_pct": 2.1882786264
+        },
+        {
+          "task_id": "django__django-12708",
+          "metric": "mean_total_tokens",
+          "baseline": 89315.3333333333,
+          "candidate": 134475,
+          "delta_pct": 50.5620535481
+        },
+        {
+          "task_id": "django__django-12708",
+          "metric": "mean_llm_calls",
+          "baseline": 6,
+          "candidate": 8.3333333333,
+          "delta_pct": 38.8888888889
+        },
+        {
+          "task_id": "django__django-12708",
+          "metric": "mean_output_tokens",
+          "baseline": 844,
+          "candidate": 2042,
+          "delta_pct": 141.9431279621
+        },
+        {
+          "task_id": "django__django-12708",
+          "metric": "mean_wall_ms",
+          "baseline": 15670.6666666667,
+          "candidate": 31971.3333333333,
+          "delta_pct": 104.0202501489
+        },
+        {
+          "task_id": "sphinx-doc__sphinx-8035",
+          "metric": "mean_total_tokens",
+          "baseline": 402385.6666666667,
+          "candidate": 406655,
+          "delta_pct": 1.0610053208
+        },
+        {
+          "task_id": "sphinx-doc__sphinx-8035",
+          "metric": "mean_llm_calls",
+          "baseline": 19.3333333333,
+          "candidate": 20.3333333333,
+          "delta_pct": 5.1724137931
+        },
+        {
+          "task_id": "sphinx-doc__sphinx-8035",
+          "metric": "mean_output_tokens",
+          "baseline": 3821,
+          "candidate": 4070.6666666667,
+          "delta_pct": 6.5340661258
+        },
+        {
+          "task_id": "sphinx-doc__sphinx-8035",
+          "metric": "mean_wall_ms",
+          "baseline": 63326,
+          "candidate": 69550.3333333333,
+          "delta_pct": 9.8290328354
+        },
+        {
+          "task_id": "sphinx-doc__sphinx-8035",
+          "metric": "correct_task_runs",
+          "baseline": 3,
+          "candidate": 2,
+          "delta_pct": -33.3333333333
+        }
+      ],
+      "notes": "Correctness-gated 14/14 paired cost comparison. As-run correctness is 14/15 versus SW0 15/15; cached repetition two sphinx-doc__sphinx-8035 is preserved as a regression. The separately recorded within-TTL warm run is excluded.",
+      "report_path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
+      "artifacts": [
+        {
+          "path": "benchmarks/results/2026-09-10-swebench-openrouter-cache-parity.md",
+          "sha256": "7f549343eab8401271f2e9be93acae372dc4458428b37122e7d6eb4dedf8ee4c",
+          "kind": "comparison"
+        }
+      ]
     }
   ]
 }

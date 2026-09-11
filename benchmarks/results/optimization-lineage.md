@@ -180,3 +180,34 @@ metrics, and deltas.
 
 Report:
 [`2026-08-14-1230-phase2-read-transform-write.md`](2026-08-14-1230-phase2-read-transform-write.md).
+
+## SWE-bench OpenRouter cache targeted lineage
+
+Scope fingerprint: `swebench-five-v1 / OpenRouter /
+anthropic/claude-opus-4.8 / thinking=provider-default / compaction=off /
+official Docker / cold cache / three repetitions`.
+
+Task-set fingerprint:
+`3cc9e346383b65ff688e1e7987143acde96ea1fc1097ae59e3e2384a78a83fd5`.
+This lineage is separate from the in-house agent suites above. Metrics use the
+14 paired instance-repetitions where both cache modes resolved; the candidate's
+unresolved Sphinx sample is excluded from both arms.
+
+| Stage | Parent | Change | Paired runs | Tokens | Calls | Cost | Wall | Correct | Immediate delta | Cumulative vs SW0 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| SW0 | — | OpenRouter prompt cache off | 14 | 1,577,361 | 94 | $8.174165 | 262.242s | 14/14 | baseline | baseline |
+| SW1 | SW0 | Explicit latest-message cache breakpoint | 14 | 1,747,557 | 103 | $2.698824 | 322.296s | 14/14 | tokens +10.79%; calls +9.57%; cost **-66.98%**; wall +22.90% | same |
+
+Across all samples, SW0 resolved 15/15 and SW1 resolved 14/15. Retained
+candidate regressions:
+
+- `django__django-11815`: mean tokens +8.18%, calls +8.33%, output +6.22%,
+  wall +8.56%;
+- `django__django-12155`: mean wall +2.19%;
+- `django__django-12708`: mean tokens +50.56%, calls +38.89%, output +141.94%,
+  wall +104.02%;
+- `sphinx-doc__sphinx-8035`: mean tokens +1.06%, calls +5.17%, output +6.53%,
+  wall +9.83%, plus one correctness failure.
+
+The separately recorded within-TTL warm run is not part of SW1. Report:
+[`2026-09-10-swebench-openrouter-cache-parity.md`](2026-09-10-swebench-openrouter-cache-parity.md).
