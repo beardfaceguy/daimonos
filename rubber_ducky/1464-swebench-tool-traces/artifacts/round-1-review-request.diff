@@ -1,0 +1,152 @@
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 964ac98..0fdeb5a 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -75,6 +75,12 @@ never retried.
+ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
+ (same schema as the in-house suite — `../analyze.py results/` works),
+ `.patch` files, raw transcripts, and `preds.jsonl`.
++Docker runs additionally copy the instance-local analytics store into a private
++`<instance>.tooltrace.sqlite` snapshot. Its ordered `tool_calls` rows retain
++tool names, anonymized command prefixes, timings, token-size estimates,
++filter/dedup flags, and batch sizes for loop diagnosis; full tool output and
++secrets are not stored. The summary's `tool_trace_rows` and `tool_trace_file`
++are null when analytics is disabled or the snapshot cannot be read.
+ mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
+ through `extract_mini.py` before cross-harness analysis. The normalizer sums
+ OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
+diff --git i/benchmarks/swebench/run_agent.py w/benchmarks/swebench/run_agent.py
+index adadd19..5820f45 100644
+--- i/benchmarks/swebench/run_agent.py
++++ w/benchmarks/swebench/run_agent.py
+@@ -20,6 +20,7 @@ import json
+ import os
+ import pathlib
+ import shutil
++import sqlite3
+ import subprocess
+ import sys
+ import tempfile
+@@ -150,6 +151,23 @@ def docker(args, **kw):
+     return run_text(["docker", *args], **kw)
+ 
+ 
++def snapshot_tool_trace(source, destination):
++    if not source.exists():
++        return None
++    try:
++        destination.unlink(missing_ok=True)
++        uri = f"{source.resolve().as_uri()}?mode=ro"
++        with sqlite3.connect(uri, uri=True) as live:
++            with sqlite3.connect(destination) as snapshot:
++                live.backup(snapshot)
++        os.chmod(destination, 0o600)
++        with sqlite3.connect(destination) as snapshot:
++            return snapshot.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
++    except (OSError, sqlite3.Error):
++        destination.unlink(missing_ok=True)
++        return None
++
++
+ def in_flight_retry_after(error_text, max_retry_after):
+     prefix = "Error: agent error: openrouter 402 Payment Required: "
+     for line in error_text.splitlines():
+@@ -231,6 +249,8 @@ def run_instance_docker(
+     )
+     tokenhome = benchdir / "confighome"
+     tokenhome.mkdir()
++    statehome = benchdir / "statehome"
++    statehome.mkdir()
+ 
+     cname = f"daimonos-bench-{iid}"
+     docker(["rm", "-f", cname])
+@@ -282,6 +302,7 @@ def run_instance_docker(
+                         "timeout", "--kill-after=10s", str(timeout),
+                         "docker", "exec", "-w", "/testbed",
+                         "-e", f"BENCH_MODEL={model}",
++                        "-e", f"DAIMONOS_AGENT_SESSION_ID={iid}",
+                         cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
+                     ],
+                     stdout=out,
+@@ -315,6 +336,18 @@ def run_instance_docker(
+         else:
+             tokenlog.write_text("")
+ 
++        trace_path = run_dir / f"{iid}.tooltrace.sqlite"
++        copied = docker([
++            "cp",
++            f"{cname}:/root/.daimonos/analytics.db",
++            str(statehome / "analytics.db"),
++        ])
++        trace_rows = (
++            snapshot_tool_trace(statehome / "analytics.db", trace_path)
++            if copied.returncode == 0
++            else None
++        )
++
+         docker(["exec", "-w", "/testbed", cname, "git", "add", "-N", "."])
+         patch = docker([
+             "exec", "-w", "/testbed", cname, "git",
+@@ -342,6 +375,8 @@ def run_instance_docker(
+     data["empty_patch"] = not patch.strip()
+     data["runner_mode"] = "docker"
+     data["in_flight_retries"] = retry_count
++    data["tool_trace_file"] = trace_path.name if trace_rows is not None else None
++    data["tool_trace_rows"] = trace_rows
+     summary.write_text(json.dumps(data, indent=2))
+     if not keep:
+         shutil.rmtree(benchdir, ignore_errors=True)
+diff --git i/tests/test_swebench_runner.py w/tests/test_swebench_runner.py
+index a16cfe2..8a32ddb 100644
+--- i/tests/test_swebench_runner.py
++++ w/tests/test_swebench_runner.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import sqlite3
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -196,3 +197,41 @@ def test_in_flight_retry_does_not_retry_killed_attempts(returncode):
+     assert retry_count == 0
+     assert attempts == [0]
+     assert sleeps == []
++
++
++def test_snapshot_tool_trace_creates_private_standalone_database(tmp_path):
++    runner = load_runner()
++    source = tmp_path / "state" / "analytics.db"
++    source.parent.mkdir()
++    with sqlite3.connect(source) as connection:
++        connection.execute("PRAGMA journal_mode=WAL")
++        connection.execute(
++            "CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, tool_name TEXT)"
++        )
++        connection.execute(
++            "INSERT INTO tool_calls (tool_name) VALUES (?)",
++            ("read_file",),
++        )
++    destination = tmp_path / "trace.sqlite"
++
++    row_count = runner.snapshot_tool_trace(source, destination)
++
++    assert row_count == 1
++    assert destination.stat().st_mode & 0o777 == 0o600
++    with sqlite3.connect(destination) as connection:
++        assert connection.execute(
++            "SELECT tool_name FROM tool_calls"
++        ).fetchall() == [("read_file",)]
++
++
++def test_snapshot_tool_trace_missing_source_leaves_no_artifact(tmp_path):
++    runner = load_runner()
++    destination = tmp_path / "trace.sqlite"
++
++    row_count = runner.snapshot_tool_trace(
++        tmp_path / "missing-analytics.db",
++        destination,
++    )
++
++    assert row_count is None
++    assert not destination.exists()

@@ -75,6 +75,12 @@ never retried.
 Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.
+Docker runs additionally copy the instance-local analytics store into a private
+`<instance>.tooltrace.sqlite` snapshot. Its ordered `tool_calls` rows retain
+tool names, anonymized command prefixes, timings, token-size estimates,
+filter/dedup flags, and batch sizes for loop diagnosis; full tool output and
+secrets are not stored. The summary's `tool_trace_rows` and `tool_trace_file`
+are null when analytics is disabled or the snapshot cannot be read.
 mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
 through `extract_mini.py` before cross-harness analysis. The normalizer sums
 OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos

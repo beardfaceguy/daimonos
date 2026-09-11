@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -196,3 +197,77 @@ def test_in_flight_retry_does_not_retry_killed_attempts(returncode):
     assert retry_count == 0
     assert attempts == [0]
     assert sleeps == []
+
+
+def test_snapshot_tool_trace_creates_private_standalone_database(tmp_path):
+    runner = load_runner()
+    source = tmp_path / "state" / "analytics.db"
+    source.parent.mkdir()
+    with sqlite3.connect(source) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, tool_name TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO tool_calls (tool_name) VALUES (?)",
+            ("read_file",),
+        )
+        connection.commit()
+        destination = tmp_path / "trace.sqlite"
+
+        row_count = runner.snapshot_tool_trace(source, destination)
+
+    assert row_count == 1
+    assert destination.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute(
+            "SELECT tool_name FROM tool_calls"
+        ).fetchall() == [("read_file",)]
+
+
+def test_snapshot_tool_trace_missing_source_leaves_no_artifact(tmp_path):
+    runner = load_runner()
+    destination = tmp_path / "trace.sqlite"
+
+    row_count = runner.snapshot_tool_trace(
+        tmp_path / "missing-analytics.db",
+        destination,
+    )
+
+    assert row_count is None
+    assert not destination.exists()
+
+
+def test_snapshot_tool_trace_keeps_unknown_schema_snapshot(tmp_path):
+    runner = load_runner()
+    source = tmp_path / "analytics.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE future_schema (value TEXT)")
+    destination = tmp_path / "trace.sqlite"
+
+    row_count = runner.snapshot_tool_trace(source, destination)
+
+    assert row_count is None
+    assert destination.exists()
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_tool_trace_summary_exposes_missing_and_unknown_snapshots():
+    runner = load_runner()
+
+    summary = runner.summarize_tool_traces(
+        [
+            {"tool_trace_file": "a.sqlite", "tool_trace_rows": 7},
+            {"tool_trace_file": "b.sqlite", "tool_trace_rows": None},
+            {"tool_trace_file": None, "tool_trace_rows": None},
+        ],
+        expected=3,
+    )
+
+    assert summary == {
+        "expected": 3,
+        "captured": 2,
+        "missing": 1,
+        "unknown_schema": 1,
+        "total_rows": 7,
+    }
