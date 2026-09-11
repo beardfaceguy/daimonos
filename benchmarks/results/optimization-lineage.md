@@ -235,3 +235,21 @@ per-task cost, token, call, wall-time, and correctness regression.
 
 Report:
 [`2026-09-11-swebench-openrouter-full50-r1.md`](2026-09-11-swebench-openrouter-full50-r1.md).
+
+## SWE-bench outlier diagnostic lineage
+
+Scope fingerprint: `swebench-outliers-8638-9229-v1 / OpenRouter /
+anthropic/claude-opus-4.8 / explicit prompt cache / official Docker`.
+
+| Stage | Parent | Run | Tokens | Calls | Cost | Wall | Correct | Delta |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| SWO0 | — | Full-50 source attempts | 10,091,478 | 155 | $9.368654 | 1,022.266s | 2/2 | baseline |
+| SWO1 | SWO0 | Traced reruns | 3,821,051 | 77 | $3.549320 | 579.949s | 1/2 | not comparable: correctness regressed |
+
+No aggregate savings are claimed from SWO1. `sphinx-8638` preserved
+correctness while cost fell 79.57%; `sphinx-9229` cost fell 51.21% but failed.
+The traces show stochastic trajectory length and iterative debugging rather
+than a deterministic identical-tool loop.
+
+Report:
+[`2026-09-11-swebench-outlier-tool-traces.md`](2026-09-11-swebench-outlier-tool-traces.md).
