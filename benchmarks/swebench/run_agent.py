@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).parent
 BENCH_ROOT = HERE.parent
@@ -149,7 +150,73 @@ def docker(args, **kw):
     return run_text(["docker", *args], **kw)
 
 
-def run_instance_docker(inst, run_dir, bench_env, model, timeout, keep):
+def in_flight_retry_after(error_text, max_retry_after):
+    prefix = "Error: agent error: openrouter 402 Payment Required: "
+    for line in error_text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(line.removeprefix(prefix))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            continue
+        metadata = error.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if error.get("code") != 402:
+            continue
+        if metadata.get("reason") != "in_flight_budget_exhausted":
+            continue
+        # OpenRouter's embedded Retry-After is currently integer seconds. Do
+        # not guess at HTTP-date forms without an actual provider example.
+        headers = metadata.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        delay = headers.get("Retry-After")
+        if isinstance(delay, str) and delay.isdigit():
+            delay = int(delay)
+        if isinstance(delay, int) and not isinstance(delay, bool):
+            return delay if 0 <= delay <= max_retry_after else None
+    return None
+
+
+def run_with_in_flight_retry(
+    run_once,
+    *,
+    max_retries,
+    max_retry_after,
+    sleep=time.sleep,
+):
+    attempt = 0
+    while True:
+        completed, error_text = run_once(attempt)
+        if completed.returncode in (0, 124, 137) or attempt >= max_retries:
+            return completed, attempt
+        delay = in_flight_retry_after(error_text, max_retry_after)
+        if delay is None:
+            return completed, attempt
+        attempt += 1
+        print(
+            "       WARN: OpenRouter in-flight budget is settling; "
+            f"retrying in {delay}s ({attempt}/{max_retries})"
+        )
+        sleep(delay)
+
+
+def run_instance_docker(
+    inst,
+    run_dir,
+    bench_env,
+    model,
+    timeout,
+    keep,
+    in_flight_retries,
+    max_retry_after,
+):
     iid = inst["instance_id"]
     image = inst.get("image")
     if not image:
@@ -185,16 +252,57 @@ def run_instance_docker(inst, run_dir, bench_env, model, timeout, keep):
     started = utcnow()
     t0 = dt.datetime.now()
     try:
-        with raw.open("w") as out, err.open("w") as errf:
-            proc = subprocess.run(
-                [
-                    "timeout", "--kill-after=10s", str(timeout),
-                    "docker", "exec", "-w", "/testbed",
-                    "-e", f"BENCH_MODEL={model}",
-                    cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
-                ],
-                stdout=out, stderr=errf, check=False,
-            )
+        def run_once(attempt):
+            if attempt:
+                for cleanup_args in (
+                    ["exec", "-w", "/testbed", cname, "git", "reset", "--hard", "HEAD"],
+                    ["exec", "-w", "/testbed", cname, "git", "clean", "-fd"],
+                ):
+                    cleanup = docker(cleanup_args)
+                    if cleanup.returncode != 0:
+                        current_error = (
+                            "benchmark retry cleanup failed: "
+                            f"{cleanup.stderr or cleanup.stdout}"
+                        )
+                        with err.open("a") as errf:
+                            errf.write(
+                                f"\n--- in-flight budget retry {attempt} ---\n"
+                                f"{current_error}\n"
+                            )
+                        return (
+                            subprocess.CompletedProcess([], cleanup.returncode),
+                            current_error,
+                        )
+            # The rejected attempt is represented by stderr and retry_count.
+            # Keep only the successful/final transcript so JSON-event parsers
+            # never see concatenated agent processes.
+            with raw.open("w") as out:
+                completed = subprocess.run(
+                    [
+                        "timeout", "--kill-after=10s", str(timeout),
+                        "docker", "exec", "-w", "/testbed",
+                        "-e", f"BENCH_MODEL={model}",
+                        cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
+                    ],
+                    stdout=out,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            current_error = completed.stderr or ""
+            with err.open("w" if attempt == 0 else "a") as errf:
+                if attempt:
+                    errf.write(f"\n--- in-flight budget retry {attempt} ---\n")
+                errf.write(current_error)
+            return completed, current_error
+
+        proc, retry_count = run_with_in_flight_retry(
+            run_once,
+            max_retries=in_flight_retries,
+            max_retry_after=max_retry_after,
+        )
         proc_rc = proc.returncode
         if proc_rc in (124, 137):
             print(f"       WARN: {iid} hit timeout ({timeout}s) — killed")
@@ -233,6 +341,7 @@ def run_instance_docker(inst, run_dir, bench_env, model, timeout, keep):
     data["patch_bytes"] = len(patch)
     data["empty_patch"] = not patch.strip()
     data["runner_mode"] = "docker"
+    data["in_flight_retries"] = retry_count
     summary.write_text(json.dumps(data, indent=2))
     if not keep:
         shutil.rmtree(benchdir, ignore_errors=True)
@@ -315,6 +424,18 @@ def main():
     ap.add_argument("--tag", default="", help="label folded into run dir name")
     ap.add_argument("--model", default=None, help="override agent.env model")
     ap.add_argument("--timeout", type=int, default=900, help="per-instance seconds")
+    ap.add_argument(
+        "--in-flight-retries",
+        type=int,
+        default=1,
+        help="retries after OpenRouter in-flight-budget settlement responses",
+    )
+    ap.add_argument(
+        "--max-retry-after",
+        type=int,
+        default=300,
+        help="maximum accepted OpenRouter Retry-After delay in seconds",
+    )
     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
     ap.add_argument(
         "--docker", action="store_true",
@@ -322,6 +443,10 @@ def main():
              "(runnable test env; requires the musl daimonos build)",
     )
     args = ap.parse_args()
+    if args.in_flight_retries < 0:
+        ap.error("--in-flight-retries must be non-negative")
+    if args.max_retry_after <= 0:
+        ap.error("--max-retry-after must be positive")
 
     if not INSTANCES.exists():
         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
@@ -374,12 +499,23 @@ def main():
 
     preds_path = run_dir / "preds.jsonl"
     try:
-        runner = run_instance_docker if args.docker else run_instance
         with preds_path.open("w") as preds:
             for inst in instances:
-                patch = runner(
-                    inst, run_dir, bench_env, model, args.timeout, args.keep
-                )
+                if args.docker:
+                    patch = run_instance_docker(
+                        inst,
+                        run_dir,
+                        bench_env,
+                        model,
+                        args.timeout,
+                        args.keep,
+                        args.in_flight_retries,
+                        args.max_retry_after,
+                    )
+                else:
+                    patch = run_instance(
+                        inst, run_dir, bench_env, model, args.timeout, args.keep
+                    )
                 preds.write(json.dumps({
                     "instance_id": inst["instance_id"],
                     "model_name_or_path": f"daimonos-{model}",
