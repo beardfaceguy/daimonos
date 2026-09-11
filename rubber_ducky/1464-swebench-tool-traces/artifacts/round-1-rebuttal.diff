@@ -1,0 +1,253 @@
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 964ac98..0fdeb5a 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -75,6 +75,12 @@ never retried.
+ Each run writes `results/<run-id>/` with per-instance token/cost JSONs
+ (same schema as the in-house suite — `../analyze.py results/` works),
+ `.patch` files, raw transcripts, and `preds.jsonl`.
++Docker runs additionally copy the instance-local analytics store into a private
++`<instance>.tooltrace.sqlite` snapshot. Its ordered `tool_calls` rows retain
++tool names, anonymized command prefixes, timings, token-size estimates,
++filter/dedup flags, and batch sizes for loop diagnosis; full tool output and
++secrets are not stored. The summary's `tool_trace_rows` and `tool_trace_file`
++are null when analytics is disabled or the snapshot cannot be read.
+ mini-swe-agent writes trajectories plus `preds.json`; normalize each trajectory
+ through `extract_mini.py` before cross-harness analysis. The normalizer sums
+ OpenRouter's per-generation `usage.cost`, the same accounting source Daimonos
+diff --git i/benchmarks/swebench/run_agent.py w/benchmarks/swebench/run_agent.py
+index adadd19..f3ed176 100644
+--- i/benchmarks/swebench/run_agent.py
++++ w/benchmarks/swebench/run_agent.py
+@@ -20,6 +20,7 @@ import json
+ import os
+ import pathlib
+ import shutil
++import sqlite3
+ import subprocess
+ import sys
+ import tempfile
+@@ -144,12 +145,53 @@ source /opt/miniconda3/bin/activate testbed
+ exec daimonos --debug-tokens -w /testbed agent "$(cat /bench/prompt.txt)" \
+   --model "$BENCH_MODEL" --agent-env /bench/agent.env
+ """
++ANALYTICS_CHECKPOINT_SCRIPT = """\
++import sqlite3
++db = sqlite3.connect("file:/root/.daimonos/analytics.db?mode=rw", uri=True)
++db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++db.close()
++"""
+ 
+ 
+ def docker(args, **kw):
+     return run_text(["docker", *args], **kw)
+ 
+ 
++def snapshot_tool_trace(source, destination):
++    if not source.exists():
++        return None
++    try:
++        destination.unlink(missing_ok=True)
++        uri = f"{source.resolve().as_uri()}?mode=ro"
++        with sqlite3.connect(uri, uri=True) as live:
++            with sqlite3.connect(destination) as snapshot:
++                live.backup(snapshot)
++        os.chmod(destination, 0o600)
++    except (OSError, sqlite3.Error):
++        destination.unlink(missing_ok=True)
++        return None
++    try:
++        with sqlite3.connect(destination) as snapshot:
++            return snapshot.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
++    except sqlite3.Error:
++        # Keep a valid backup across analytics schema changes even when this
++        # runner version cannot count its rows.
++        return None
++
++
++def summarize_tool_traces(summaries, expected):
++    captured = [row for row in summaries if row.get("tool_trace_file")]
++    return {
++        "expected": expected,
++        "captured": len(captured),
++        "missing": expected - len(captured),
++        "unknown_schema": sum(
++            row.get("tool_trace_rows") is None for row in captured
++        ),
++        "total_rows": sum(row.get("tool_trace_rows") or 0 for row in captured),
++    }
++
++
+ def in_flight_retry_after(error_text, max_retry_after):
+     prefix = "Error: agent error: openrouter 402 Payment Required: "
+     for line in error_text.splitlines():
+@@ -231,6 +273,8 @@ def run_instance_docker(
+     )
+     tokenhome = benchdir / "confighome"
+     tokenhome.mkdir()
++    statehome = benchdir / "statehome"
++    statehome.mkdir()
+ 
+     cname = f"daimonos-bench-{iid}"
+     docker(["rm", "-f", cname])
+@@ -248,6 +292,8 @@ def run_instance_docker(
+     err = run_dir / f"{iid}.stderr.log"
+     tokenlog = run_dir / f"{iid}.tokenlog.jsonl"
+     summary = run_dir / f"{iid}.json"
++    trace_path = run_dir / f"{iid}.tooltrace.sqlite"
++    trace_rows = None
+ 
+     started = utcnow()
+     t0 = dt.datetime.now()
+@@ -282,6 +328,7 @@ def run_instance_docker(
+                         "timeout", "--kill-after=10s", str(timeout),
+                         "docker", "exec", "-w", "/testbed",
+                         "-e", f"BENCH_MODEL={model}",
++                        "-e", f"DAIMONOS_AGENT_SESSION_ID={iid}",
+                         cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
+                     ],
+                     stdout=out,
+@@ -315,6 +362,26 @@ def run_instance_docker(
+         else:
+             tokenlog.write_text("")
+ 
++        checkpointed = docker([
++            "exec",
++            cname,
++            "/opt/miniconda3/bin/python",
++            "-c",
++            ANALYTICS_CHECKPOINT_SCRIPT,
++        ])
++        if checkpointed.returncode == 0:
++            copied = docker([
++                "cp",
++                f"{cname}:/root/.daimonos/analytics.db",
++                str(statehome / "analytics.db"),
++            ])
++            if copied.returncode == 0:
++                trace_rows = snapshot_tool_trace(
++                    statehome / "analytics.db",
++                    trace_path,
++                )
++        shutil.rmtree(statehome, ignore_errors=True)
++
+         docker(["exec", "-w", "/testbed", cname, "git", "add", "-N", "."])
+         patch = docker([
+             "exec", "-w", "/testbed", cname, "git",
+@@ -342,6 +409,8 @@ def run_instance_docker(
+     data["empty_patch"] = not patch.strip()
+     data["runner_mode"] = "docker"
+     data["in_flight_retries"] = retry_count
++    data["tool_trace_file"] = trace_path.name if trace_path.exists() else None
++    data["tool_trace_rows"] = trace_rows
+     summary.write_text(json.dumps(data, indent=2))
+     if not keep:
+         shutil.rmtree(benchdir, ignore_errors=True)
+@@ -525,6 +594,17 @@ def main():
+     finally:
+         bench_env.unlink(missing_ok=True)
+ 
++    if args.docker:
++        summaries = [
++            json.loads((run_dir / f"{inst['instance_id']}.json").read_text())
++            for inst in instances
++        ]
++        trace_summary = summarize_tool_traces(summaries, len(instances))
++        (run_dir / "tooltrace-summary.json").write_text(
++            json.dumps(trace_summary, indent=2) + "\n"
++        )
++        print(f"Tool traces: {trace_summary}")
++
+     print(f"\nPredictions: {preds_path}")
+     print("Evaluate with (needs docker):")
+     print(
+diff --git i/tests/test_swebench_runner.py w/tests/test_swebench_runner.py
+index a16cfe2..e8ea036 100644
+--- i/tests/test_swebench_runner.py
++++ w/tests/test_swebench_runner.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import sqlite3
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -196,3 +197,77 @@ def test_in_flight_retry_does_not_retry_killed_attempts(returncode):
+     assert retry_count == 0
+     assert attempts == [0]
+     assert sleeps == []
++
++
++def test_snapshot_tool_trace_creates_private_standalone_database(tmp_path):
++    runner = load_runner()
++    source = tmp_path / "state" / "analytics.db"
++    source.parent.mkdir()
++    with sqlite3.connect(source) as connection:
++        connection.execute("PRAGMA journal_mode=WAL")
++        connection.execute(
++            "CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, tool_name TEXT)"
++        )
++        connection.execute(
++            "INSERT INTO tool_calls (tool_name) VALUES (?)",
++            ("read_file",),
++        )
++        connection.commit()
++        destination = tmp_path / "trace.sqlite"
++
++        row_count = runner.snapshot_tool_trace(source, destination)
++
++    assert row_count == 1
++    assert destination.stat().st_mode & 0o777 == 0o600
++    with sqlite3.connect(destination) as connection:
++        assert connection.execute(
++            "SELECT tool_name FROM tool_calls"
++        ).fetchall() == [("read_file",)]
++
++
++def test_snapshot_tool_trace_missing_source_leaves_no_artifact(tmp_path):
++    runner = load_runner()
++    destination = tmp_path / "trace.sqlite"
++
++    row_count = runner.snapshot_tool_trace(
++        tmp_path / "missing-analytics.db",
++        destination,
++    )
++
++    assert row_count is None
++    assert not destination.exists()
++
++
++def test_snapshot_tool_trace_keeps_unknown_schema_snapshot(tmp_path):
++    runner = load_runner()
++    source = tmp_path / "analytics.db"
++    with sqlite3.connect(source) as connection:
++        connection.execute("CREATE TABLE future_schema (value TEXT)")
++    destination = tmp_path / "trace.sqlite"
++
++    row_count = runner.snapshot_tool_trace(source, destination)
++
++    assert row_count is None
++    assert destination.exists()
++    assert destination.stat().st_mode & 0o777 == 0o600
++
++
++def test_tool_trace_summary_exposes_missing_and_unknown_snapshots():
++    runner = load_runner()
++
++    summary = runner.summarize_tool_traces(
++        [
++            {"tool_trace_file": "a.sqlite", "tool_trace_rows": 7},
++            {"tool_trace_file": "b.sqlite", "tool_trace_rows": None},
++            {"tool_trace_file": None, "tool_trace_rows": None},
++        ],
++        expected=3,
++    )
++
++    assert summary == {
++        "expected": 3,
++        "captured": 2,
++        "missing": 1,
++        "unknown_schema": 1,
++        "total_rows": 7,
++    }

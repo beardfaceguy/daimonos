@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -144,10 +145,51 @@ source /opt/miniconda3/bin/activate testbed
 exec daimonos --debug-tokens -w /testbed agent "$(cat /bench/prompt.txt)" \
   --model "$BENCH_MODEL" --agent-env /bench/agent.env
 """
+ANALYTICS_CHECKPOINT_SCRIPT = """\
+import sqlite3
+db = sqlite3.connect("file:/root/.daimonos/analytics.db?mode=rw", uri=True)
+db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+db.close()
+"""
 
 
 def docker(args, **kw):
     return run_text(["docker", *args], **kw)
+
+
+def snapshot_tool_trace(source, destination):
+    if not source.exists():
+        return None
+    try:
+        destination.unlink(missing_ok=True)
+        uri = f"{source.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as live:
+            with sqlite3.connect(destination) as snapshot:
+                live.backup(snapshot)
+        os.chmod(destination, 0o600)
+    except (OSError, sqlite3.Error):
+        destination.unlink(missing_ok=True)
+        return None
+    try:
+        with sqlite3.connect(destination) as snapshot:
+            return snapshot.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
+    except sqlite3.Error:
+        # Keep a valid backup across analytics schema changes even when this
+        # runner version cannot count its rows.
+        return None
+
+
+def summarize_tool_traces(summaries, expected):
+    captured = [row for row in summaries if row.get("tool_trace_file")]
+    return {
+        "expected": expected,
+        "captured": len(captured),
+        "missing": expected - len(captured),
+        "unknown_schema": sum(
+            row.get("tool_trace_rows") is None for row in captured
+        ),
+        "total_rows": sum(row.get("tool_trace_rows") or 0 for row in captured),
+    }
 
 
 def in_flight_retry_after(error_text, max_retry_after):
@@ -231,6 +273,8 @@ def run_instance_docker(
     )
     tokenhome = benchdir / "confighome"
     tokenhome.mkdir()
+    statehome = benchdir / "statehome"
+    statehome.mkdir()
 
     cname = f"daimonos-bench-{iid}"
     docker(["rm", "-f", cname])
@@ -248,6 +292,8 @@ def run_instance_docker(
     err = run_dir / f"{iid}.stderr.log"
     tokenlog = run_dir / f"{iid}.tokenlog.jsonl"
     summary = run_dir / f"{iid}.json"
+    trace_path = run_dir / f"{iid}.tooltrace.sqlite"
+    trace_rows = None
 
     started = utcnow()
     t0 = dt.datetime.now()
@@ -282,6 +328,7 @@ def run_instance_docker(
                         "timeout", "--kill-after=10s", str(timeout),
                         "docker", "exec", "-w", "/testbed",
                         "-e", f"BENCH_MODEL={model}",
+                        "-e", f"DAIMONOS_AGENT_SESSION_ID={iid}",
                         cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
                     ],
                     stdout=out,
@@ -315,6 +362,26 @@ def run_instance_docker(
         else:
             tokenlog.write_text("")
 
+        checkpointed = docker([
+            "exec",
+            cname,
+            "/opt/miniconda3/bin/python",
+            "-c",
+            ANALYTICS_CHECKPOINT_SCRIPT,
+        ])
+        if checkpointed.returncode == 0:
+            copied = docker([
+                "cp",
+                f"{cname}:/root/.daimonos/analytics.db",
+                str(statehome / "analytics.db"),
+            ])
+            if copied.returncode == 0:
+                trace_rows = snapshot_tool_trace(
+                    statehome / "analytics.db",
+                    trace_path,
+                )
+        shutil.rmtree(statehome, ignore_errors=True)
+
         docker(["exec", "-w", "/testbed", cname, "git", "add", "-N", "."])
         patch = docker([
             "exec", "-w", "/testbed", cname, "git",
@@ -342,6 +409,8 @@ def run_instance_docker(
     data["empty_patch"] = not patch.strip()
     data["runner_mode"] = "docker"
     data["in_flight_retries"] = retry_count
+    data["tool_trace_file"] = trace_path.name if trace_path.exists() else None
+    data["tool_trace_rows"] = trace_rows
     summary.write_text(json.dumps(data, indent=2))
     if not keep:
         shutil.rmtree(benchdir, ignore_errors=True)
@@ -524,6 +593,17 @@ def main():
                 preds.flush()
     finally:
         bench_env.unlink(missing_ok=True)
+
+    if args.docker:
+        summaries = [
+            json.loads((run_dir / f"{inst['instance_id']}.json").read_text())
+            for inst in instances
+        ]
+        trace_summary = summarize_tool_traces(summaries, len(instances))
+        (run_dir / "tooltrace-summary.json").write_text(
+            json.dumps(trace_summary, indent=2) + "\n"
+        )
+        print(f"Tool traces: {trace_summary}")
 
     print(f"\nPredictions: {preds_path}")
     print("Evaluate with (needs docker):")
