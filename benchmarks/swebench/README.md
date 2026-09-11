@@ -86,6 +86,8 @@ Current default-harness result:
 [`2026-09-10-swebench-openrouter-three-repetitions.md`](../results/2026-09-10-swebench-openrouter-three-repetitions.md).
 OpenRouter cache experiment:
 [`2026-09-10-swebench-openrouter-cache-parity.md`](../results/2026-09-10-swebench-openrouter-cache-parity.md).
+Full-50 comparison:
+[`2026-09-11-swebench-openrouter-full50-r1.md`](../results/2026-09-11-swebench-openrouter-full50-r1.md).
 
 Delete incomplete smoke directories created before dataset enrichment before
 treating `results/` as a baseline; a valid run contains `preds.jsonl`, a
