@@ -253,3 +253,20 @@ than a deterministic identical-tool loop.
 
 Report:
 [`2026-09-11-swebench-outlier-tool-traces.md`](2026-09-11-swebench-outlier-tool-traces.md).
+
+## SWE-bench guard calibration lineage
+
+Scope fingerprint: `swebench-guard-calibration-p95-v1 / four tasks /
+OpenRouter / anthropic/claude-opus-4.8 / explicit prompt cache / report-only`.
+
+| Stage | Parent | Run | Tokens | Calls | Cost | Wall | Correct | Triggered |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| SWG0 | — | Full-50 source attempts | 5,800,748 | 173 | $6.050365 | 1,054.480s | 2/4 | 0/4 |
+| SWG1 | SWG0 | Calibration reruns | 5,501,581 | 164 | $5.599461 | 879.703s | 1/4 | 2/4 |
+
+No cost delta is claimed because correctness regressed. The configured
+$2/300s report policy triggered two incorrect calibration patches, but replay
+over the full-50 run triggered two correct outliers. It remains report-only.
+
+Report:
+[`2026-09-12-swebench-guard-calibration.md`](2026-09-12-swebench-guard-calibration.md).
