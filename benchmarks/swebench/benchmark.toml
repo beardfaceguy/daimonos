@@ -18,4 +18,4 @@ max_instance_wall_seconds = 300
 max_total_cost_usd = 70.0
 # Includes known spend plus the documented reserve for the unrecoverable mini
 # attempt, traced outlier reruns, and the interrupted calibration attempt.
-planning_spend_to_date_usd = 62.189458
+planning_spend_to_date_usd = 64.384317
