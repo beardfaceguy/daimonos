@@ -1,0 +1,21 @@
+# Active SWE-bench execution and guard policy. Operational limits belong here,
+# not as Python literals. CLI flags are explicit one-run overrides.
+
+[runner]
+instance_timeout_seconds = 900
+termination_grace_seconds = 10
+in_flight_retries = 1
+max_retry_after_seconds = 300
+
+[guard]
+mode = "off"
+max_instance_cost_usd = 2.0
+max_instance_wall_seconds = 300
+
+[experiment]
+# OpenRouter-only planning cap. Cursor bills through Cursor's backend and does
+# not consume or enforce this value.
+max_total_cost_usd = 70.0
+# Includes known spend plus the documented reserve for the unrecoverable mini
+# attempt, traced outlier reruns, and the interrupted calibration attempt.
+planning_spend_to_date_usd = 62.189458

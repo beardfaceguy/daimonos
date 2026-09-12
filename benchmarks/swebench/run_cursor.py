@@ -51,7 +51,7 @@ def docker(args, **kw):
     return subprocess.run(["docker", *args], capture_output=True, text=True, **kw)
 
 
-def run_instance_docker(inst, run_dir, model, timeout, keep):
+def run_instance_docker(inst, run_dir, model, timeout, termination_grace, keep):
     iid = inst["instance_id"]
     image = inst.get("image")
     if not image:
@@ -89,7 +89,9 @@ def run_instance_docker(inst, run_dir, model, timeout, keep):
         with raw.open("w") as out, err.open("w") as errf:
             proc = subprocess.run(
                 [
-                    "timeout", "--kill-after=10s", str(timeout),
+                    "timeout",
+                    f"--kill-after={termination_grace}s",
+                    str(timeout),
                     "docker", "exec", "-e", f"BENCH_MODEL={model}",
                     cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
                 ],
@@ -133,7 +135,7 @@ def run_instance_docker(inst, run_dir, model, timeout, keep):
     return patch
 
 
-def run_instance(inst, run_dir, model, timeout, keep):
+def run_instance(inst, run_dir, model, timeout, termination_grace, keep):
     iid = inst["instance_id"]
     print(f"  RUN  {iid} ({inst['repo']})", flush=True)
     workdir = run_agent.checkout(inst)
@@ -150,7 +152,9 @@ def run_instance(inst, run_dir, model, timeout, keep):
     with raw.open("w") as out, err.open("w") as errf:
         proc = subprocess.run(
             [
-                "timeout", "--kill-after=10s", str(timeout),
+                "timeout",
+                f"--kill-after={termination_grace}s",
+                str(timeout),
                 CURSOR_BIN, "-p", prompt,
                 "--output-format", "stream-json", "--model", model, "--force",
                 "--workspace", str(workdir),
@@ -190,6 +194,12 @@ def run_instance(inst, run_dir, model, timeout, keep):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--benchmark-config",
+        type=pathlib.Path,
+        default=run_agent.BENCHMARK_CONFIG,
+        help="tracked runner and guard configuration",
+    )
     ap.add_argument("--model", required=True, help="cursor-agent model slug")
     ap.add_argument("--filter", default="", help="instance_id prefix filter")
     ap.add_argument(
@@ -197,13 +207,39 @@ def main():
         help="comma-separated exact instance ids (overrides --filter)",
     )
     ap.add_argument("--tag", default="", help="label folded into run dir name")
-    ap.add_argument("--timeout", type=int, default=900, help="per-instance seconds")
+    ap.add_argument("--timeout", type=int, default=None, help="per-instance seconds")
+    ap.add_argument(
+        "--termination-grace",
+        type=int,
+        default=None,
+        help="seconds between timeout SIGTERM and SIGKILL",
+    )
     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
     ap.add_argument(
         "--docker", action="store_true",
         help="run cursor-agent inside each instance's official SWE-bench image",
     )
     args = ap.parse_args()
+    try:
+        benchmark_config = run_agent.load_benchmark_config(args.benchmark_config)
+    except (OSError, ValueError) as error:
+        ap.error(f"invalid benchmark config: {error}")
+    args.timeout = int(run_agent.configured(
+        args.timeout,
+        benchmark_config,
+        "runner",
+        "instance_timeout_seconds",
+    ))
+    args.termination_grace = int(run_agent.configured(
+        args.termination_grace,
+        benchmark_config,
+        "runner",
+        "termination_grace_seconds",
+    ))
+    if args.timeout <= 0:
+        ap.error("--timeout must be positive")
+    if args.termination_grace <= 0:
+        ap.error("--termination-grace must be positive")
 
     if not run_agent.INSTANCES.exists():
         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
@@ -240,7 +276,14 @@ def main():
     runner = run_instance_docker if args.docker else run_instance
     with preds_path.open("w") as preds:
         for inst in instances:
-            patch = runner(inst, run_dir, args.model, args.timeout, args.keep)
+            patch = runner(
+                inst,
+                run_dir,
+                args.model,
+                args.timeout,
+                args.termination_grace,
+                args.keep,
+            )
             preds.write(json.dumps({
                 "instance_id": inst["instance_id"],
                 "model_name_or_path": f"cursor-{args.model}",

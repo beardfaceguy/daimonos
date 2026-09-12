@@ -1,0 +1,674 @@
+diff --git i/benchmarks/swebench/README.md w/benchmarks/swebench/README.md
+index 5057254..62b7af7 100644
+--- i/benchmarks/swebench/README.md
++++ w/benchmarks/swebench/README.md
+@@ -76,10 +76,18 @@ Report-only guard calibration never terminates a task:
+ 
+ ```sh
+ .venv/bin/python run_agent.py --docker \
+-  --guard-mode report --max-instance-cost 2 --max-instance-wall 300 \
++  --benchmark-config benchmark.toml \
++  --guard-mode report \
+   --instance-ids <ids> --tag guard-calibration
+ ```
+ 
++`benchmark.toml` is the single source for runner timeout/grace, settlement
++retries, per-instance report thresholds, the total experiment cost cap, and
++planning spend to date. CLI flags are explicit one-run overrides; operational
++defaults do not live in Python literals. After a run or interrupted paid
++attempt, update `experiment.planning_spend_to_date_usd` from the emitted
++`experiment-budget-summary.json` plus any separately measured partial cost.
++
+ Each instance summary records cost/wall crossings and the run writes
+ `guard-summary.json`. Replay the same policy over existing summaries, joining
+ an evaluator report when `correct` is not already embedded. Run from
+@@ -87,7 +95,7 @@ an evaluator report when `correct` is not already embedded. Run from
+ 
+ ```sh
+ .venv/bin/python analyze_guards.py \
+-  --cost-limit 2 --wall-limit 300 \
++  --benchmark-config benchmark.toml \
+   --evaluator-report <evaluator.json> results/<run-id>
+ ```
+ 
+diff --git i/benchmarks/swebench/analyze_guards.py w/benchmarks/swebench/analyze_guards.py
+index a206d40..f869699 100644
+--- i/benchmarks/swebench/analyze_guards.py
++++ w/benchmarks/swebench/analyze_guards.py
+@@ -10,8 +10,13 @@ import run_agent
+ 
+ def main():
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--cost-limit", type=float, required=True)
+-    parser.add_argument("--wall-limit", type=int, required=True)
++    parser.add_argument(
++        "--benchmark-config",
++        type=pathlib.Path,
++        default=run_agent.BENCHMARK_CONFIG,
++    )
++    parser.add_argument("--cost-limit", type=float, default=None)
++    parser.add_argument("--wall-limit", type=int, default=None)
+     parser.add_argument(
+         "--evaluator-report",
+         action="append",
+@@ -20,6 +25,22 @@ def main():
+     )
+     parser.add_argument("run_dirs", nargs="+", type=pathlib.Path)
+     args = parser.parse_args()
++    try:
++        config = run_agent.load_benchmark_config(args.benchmark_config)
++    except (OSError, ValueError) as error:
++        parser.error(f"invalid benchmark config: {error}")
++    args.cost_limit = float(run_agent.configured(
++        args.cost_limit,
++        config,
++        "guard",
++        "max_instance_cost_usd",
++    ))
++    args.wall_limit = int(run_agent.configured(
++        args.wall_limit,
++        config,
++        "guard",
++        "max_instance_wall_seconds",
++    ))
+     if args.cost_limit <= 0:
+         parser.error("--cost-limit must be positive")
+     if args.wall_limit <= 0:
+diff --git i/benchmarks/swebench/run_agent.py w/benchmarks/swebench/run_agent.py
+index f29966b..fc170ce 100644
+--- i/benchmarks/swebench/run_agent.py
++++ w/benchmarks/swebench/run_agent.py
+@@ -25,6 +25,7 @@ import subprocess
+ import sys
+ import tempfile
+ import time
++import tomllib
+ 
+ HERE = pathlib.Path(__file__).parent
+ BENCH_ROOT = HERE.parent
+@@ -32,12 +33,67 @@ INSTANCES = HERE / "instances.jsonl"
+ REPOS_DIR = HERE / "repos"
+ WORK_DIR = HERE / "worktrees"
+ RESULTS_DIR = HERE / "results"
++BENCHMARK_CONFIG = HERE / "benchmark.toml"
+ DAIMONOS_BIN = pathlib.Path(
+     os.environ.get("DAIMONOS_BIN", BENCH_ROOT.parent / "target/release/daimonos")
+ )
+ TOKEN_LOG = pathlib.Path.home() / ".config/daimonos/token-debug.log"
+ EXTRACT = BENCH_ROOT / "extract_tokens.py"
+ 
++
++def load_benchmark_config(path):
++    with path.open("rb") as handle:
++        config = tomllib.load(handle)
++    required_positive = [
++        ("runner", "instance_timeout_seconds"),
++        ("runner", "termination_grace_seconds"),
++        ("runner", "max_retry_after_seconds"),
++        ("guard", "max_instance_cost_usd"),
++        ("guard", "max_instance_wall_seconds"),
++        ("experiment", "max_total_cost_usd"),
++    ]
++    for section, field in required_positive:
++        value = (config.get(section) or {}).get(field)
++        if (
++            not isinstance(value, (int, float))
++            or isinstance(value, bool)
++            or value <= 0
++        ):
++            raise ValueError(f"{section}.{field} must be positive")
++    retries = (config.get("runner") or {}).get("in_flight_retries")
++    if not isinstance(retries, int) or isinstance(retries, bool) or retries < 0:
++        raise ValueError("runner.in_flight_retries must be a non-negative integer")
++    mode = (config.get("guard") or {}).get("mode")
++    if mode not in ("off", "report"):
++        raise ValueError("guard.mode must be off or report")
++    spend = (config.get("experiment") or {}).get("planning_spend_to_date_usd")
++    if (
++        not isinstance(spend, (int, float))
++        or isinstance(spend, bool)
++        or spend < 0
++    ):
++        raise ValueError(
++            "experiment.planning_spend_to_date_usd must be non-negative"
++        )
++    return config
++
++
++def configured(cli_value, config, section, field):
++    return cli_value if cli_value is not None else config[section][field]
++
++
++def experiment_budget_report(max_total_cost, spend_at_start, observed_run_cost):
++    planning_total = spend_at_start + observed_run_cost
++    return {
++        "max_total_cost_usd": max_total_cost,
++        "planning_spend_at_start_usd": spend_at_start,
++        "observed_run_cost_usd": observed_run_cost,
++        "planning_total_cost_usd": planning_total,
++        "remaining_usd": max_total_cost - planning_total,
++        "cap_reached": planning_total >= max_total_cost,
++    }
++
++
+ PROMPT_TEMPLATE = """You are working in a checked-out git repository (the current \
+ workspace root). Solve the following GitHub issue by modifying the source code.
+ 
+@@ -311,6 +367,7 @@ def run_instance_docker(
+     bench_env,
+     model,
+     timeout,
++    termination_grace,
+     keep,
+     in_flight_retries,
+     max_retry_after,
+@@ -384,7 +441,9 @@ def run_instance_docker(
+             with raw.open("w") as out:
+                 completed = subprocess.run(
+                     [
+-                        "timeout", "--kill-after=10s", str(timeout),
++                        "timeout",
++                        f"--kill-after={termination_grace}s",
++                        str(timeout),
+                         "docker", "exec", "-w", "/testbed",
+                         "-e", f"BENCH_MODEL={model}",
+                         "-e", f"DAIMONOS_AGENT_SESSION_ID={iid}",
+@@ -485,7 +544,15 @@ def run_instance_docker(
+     return patch
+ 
+ 
+-def run_instance(inst, run_dir, bench_env, model, timeout, keep):
++def run_instance(
++    inst,
++    run_dir,
++    bench_env,
++    model,
++    timeout,
++    termination_grace,
++    keep,
++):
+     iid = inst["instance_id"]
+     print(f"  RUN  {iid} ({inst['repo']})")
+     workdir = checkout(inst)
+@@ -503,7 +570,9 @@ def run_instance(inst, run_dir, bench_env, model, timeout, keep):
+         with raw.open("w") as out, err.open("w") as errf:
+             proc = subprocess.run(
+                 [
+-                    "timeout", "--kill-after=10s", str(timeout),
++                    "timeout",
++                    f"--kill-after={termination_grace}s",
++                    str(timeout),
+                     str(DAIMONOS_BIN), "--debug-tokens", "-w", str(workdir),
+                     "agent", prompt, "--model", model,
+                     "--agent-env", str(bench_env),
+@@ -553,6 +622,12 @@ def run_instance(inst, run_dir, bench_env, model, timeout, keep):
+ 
+ def main():
+     ap = argparse.ArgumentParser()
++    ap.add_argument(
++        "--benchmark-config",
++        type=pathlib.Path,
++        default=BENCHMARK_CONFIG,
++        help="tracked runner, guard, and experiment budget configuration",
++    )
+     ap.add_argument("--filter", default="", help="instance_id prefix filter")
+     ap.add_argument(
+         "--instance-ids", default="",
+@@ -560,23 +635,29 @@ def main():
+     )
+     ap.add_argument("--tag", default="", help="label folded into run dir name")
+     ap.add_argument("--model", default=None, help="override agent.env model")
+-    ap.add_argument("--timeout", type=int, default=900, help="per-instance seconds")
++    ap.add_argument("--timeout", type=int, default=None, help="per-instance seconds")
++    ap.add_argument(
++        "--termination-grace",
++        type=int,
++        default=None,
++        help="seconds between timeout SIGTERM and SIGKILL",
++    )
+     ap.add_argument(
+         "--in-flight-retries",
+         type=int,
+-        default=1,
++        default=None,
+         help="retries after OpenRouter in-flight-budget settlement responses",
+     )
+     ap.add_argument(
+         "--max-retry-after",
+         type=int,
+-        default=300,
++        default=None,
+         help="maximum accepted OpenRouter Retry-After delay in seconds",
+     )
+     ap.add_argument(
+         "--guard-mode",
+         choices=("off", "report"),
+-        default="off",
++        default=None,
+         help="annotate threshold crossings without stopping (report) or disable",
+     )
+     ap.add_argument(
+@@ -591,6 +672,18 @@ def main():
+         default=None,
+         help="report-only per-instance total wall threshold in seconds",
+     )
++    ap.add_argument(
++        "--max-experiment-cost",
++        type=float,
++        default=None,
++        help="total experiment planning cap in USD",
++    )
++    ap.add_argument(
++        "--planning-spend-to-date",
++        type=float,
++        default=None,
++        help="known spend plus explicit reserves before this run",
++    )
+     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
+     ap.add_argument(
+         "--docker", action="store_true",
+@@ -598,17 +691,83 @@ def main():
+              "(runnable test env; requires the musl daimonos build)",
+     )
+     args = ap.parse_args()
++    try:
++        benchmark_config = load_benchmark_config(args.benchmark_config)
++    except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
++        ap.error(f"invalid benchmark config: {error}")
++    args.timeout = int(configured(
++        args.timeout,
++        benchmark_config,
++        "runner",
++        "instance_timeout_seconds",
++    ))
++    args.termination_grace = int(configured(
++        args.termination_grace,
++        benchmark_config,
++        "runner",
++        "termination_grace_seconds",
++    ))
++    args.in_flight_retries = int(configured(
++        args.in_flight_retries,
++        benchmark_config,
++        "runner",
++        "in_flight_retries",
++    ))
++    args.max_retry_after = int(configured(
++        args.max_retry_after,
++        benchmark_config,
++        "runner",
++        "max_retry_after_seconds",
++    ))
++    args.guard_mode = configured(
++        args.guard_mode,
++        benchmark_config,
++        "guard",
++        "mode",
++    )
++    args.max_instance_cost = float(configured(
++        args.max_instance_cost,
++        benchmark_config,
++        "guard",
++        "max_instance_cost_usd",
++    ))
++    args.max_instance_wall = int(configured(
++        args.max_instance_wall,
++        benchmark_config,
++        "guard",
++        "max_instance_wall_seconds",
++    ))
++    args.max_experiment_cost = float(configured(
++        args.max_experiment_cost,
++        benchmark_config,
++        "experiment",
++        "max_total_cost_usd",
++    ))
++    args.planning_spend_to_date = float(configured(
++        args.planning_spend_to_date,
++        benchmark_config,
++        "experiment",
++        "planning_spend_to_date_usd",
++    ))
++    if args.timeout <= 0:
++        ap.error("--timeout must be positive")
++    if args.termination_grace <= 0:
++        ap.error("--termination-grace must be positive")
+     if args.in_flight_retries < 0:
+         ap.error("--in-flight-retries must be non-negative")
+     if args.max_retry_after <= 0:
+         ap.error("--max-retry-after must be positive")
+     if args.guard_mode == "report":
+-        if args.max_instance_cost is None or args.max_instance_cost <= 0:
++        if args.max_instance_cost <= 0:
+             ap.error("--guard-mode=report requires positive --max-instance-cost")
+-        if args.max_instance_wall is None or args.max_instance_wall <= 0:
++        if args.max_instance_wall <= 0:
+             ap.error("--guard-mode=report requires positive --max-instance-wall")
+         if not args.docker:
+             ap.error("--guard-mode=report currently requires --docker")
++    if args.max_experiment_cost <= 0:
++        ap.error("--max-experiment-cost must be positive")
++    if args.planning_spend_to_date < 0:
++        ap.error("--planning-spend-to-date must be non-negative")
+ 
+     if not INSTANCES.exists():
+         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
+@@ -658,11 +817,30 @@ def main():
+     bench_env = make_bench_env(src_env)
+     print(f"=== daimonos swe-bench runner ===\nModel: {model}\nRun dir: {run_dir}")
+     print(f"Instances: {len(instances)}\n")
++    initial_budget = experiment_budget_report(
++        args.max_experiment_cost,
++        args.planning_spend_to_date,
++        0,
++    )
++    print(f"Experiment budget: {initial_budget}")
+ 
+     preds_path = run_dir / "preds.jsonl"
++    observed_run_cost = 0.0
++    completed_instances = []
+     try:
+         with preds_path.open("w") as preds:
+             for inst in instances:
++                current_budget = experiment_budget_report(
++                    args.max_experiment_cost,
++                    args.planning_spend_to_date,
++                    observed_run_cost,
++                )
++                if current_budget["cap_reached"]:
++                    print(
++                        "       STOP: configured experiment cost cap reached "
++                        f"before {inst['instance_id']}"
++                    )
++                    break
+                 if args.docker:
+                     patch = run_instance_docker(
+                         inst,
+@@ -670,6 +848,7 @@ def main():
+                         bench_env,
+                         model,
+                         args.timeout,
++                        args.termination_grace,
+                         args.keep,
+                         args.in_flight_retries,
+                         args.max_retry_after,
+@@ -679,7 +858,13 @@ def main():
+                     )
+                 else:
+                     patch = run_instance(
+-                        inst, run_dir, bench_env, model, args.timeout, args.keep
++                        inst,
++                        run_dir,
++                        bench_env,
++                        model,
++                        args.timeout,
++                        args.termination_grace,
++                        args.keep,
+                     )
+                 preds.write(json.dumps({
+                     "instance_id": inst["instance_id"],
+@@ -687,15 +872,44 @@ def main():
+                     "model_patch": patch,
+                 }) + "\n")
+                 preds.flush()
++                completed_instances.append(inst)
++                summary = json.loads(
++                    (run_dir / f"{inst['instance_id']}.json").read_text()
++                )
++                cost = summary.get("cost_usd")
++                if (
++                    isinstance(cost, (int, float))
++                    and not isinstance(cost, bool)
++                ):
++                    observed_run_cost += cost
+     finally:
+         bench_env.unlink(missing_ok=True)
+ 
++    budget_summary = experiment_budget_report(
++        args.max_experiment_cost,
++        args.planning_spend_to_date,
++        observed_run_cost,
++    )
++    budget_summary.update({
++        "config_file": str(args.benchmark_config),
++        "selected_instances": len(instances),
++        "completed_instances": len(completed_instances),
++        "unstarted_instances": len(instances) - len(completed_instances),
++    })
++    (run_dir / "experiment-budget-summary.json").write_text(
++        json.dumps(budget_summary, indent=2) + "\n"
++    )
++    print(f"Experiment budget final: {budget_summary}")
++
+     if args.docker:
+         summaries = [
+             json.loads((run_dir / f"{inst['instance_id']}.json").read_text())
+-            for inst in instances
++            for inst in completed_instances
+         ]
+-        trace_summary = summarize_tool_traces(summaries, len(instances))
++        trace_summary = summarize_tool_traces(
++            summaries,
++            len(completed_instances),
++        )
+         (run_dir / "tooltrace-summary.json").write_text(
+             json.dumps(trace_summary, indent=2) + "\n"
+         )
+diff --git i/benchmarks/swebench/run_cursor.py w/benchmarks/swebench/run_cursor.py
+index 33e4e74..73d3280 100644
+--- i/benchmarks/swebench/run_cursor.py
++++ w/benchmarks/swebench/run_cursor.py
+@@ -51,7 +51,7 @@ def docker(args, **kw):
+     return subprocess.run(["docker", *args], capture_output=True, text=True, **kw)
+ 
+ 
+-def run_instance_docker(inst, run_dir, model, timeout, keep):
++def run_instance_docker(inst, run_dir, model, timeout, termination_grace, keep):
+     iid = inst["instance_id"]
+     image = inst.get("image")
+     if not image:
+@@ -89,7 +89,9 @@ def run_instance_docker(inst, run_dir, model, timeout, keep):
+         with raw.open("w") as out, err.open("w") as errf:
+             proc = subprocess.run(
+                 [
+-                    "timeout", "--kill-after=10s", str(timeout),
++                    "timeout",
++                    f"--kill-after={termination_grace}s",
++                    str(timeout),
+                     "docker", "exec", "-e", f"BENCH_MODEL={model}",
+                     cname, "bash", "-c", DOCKER_EXEC_SCRIPT,
+                 ],
+@@ -133,7 +135,7 @@ def run_instance_docker(inst, run_dir, model, timeout, keep):
+     return patch
+ 
+ 
+-def run_instance(inst, run_dir, model, timeout, keep):
++def run_instance(inst, run_dir, model, timeout, termination_grace, keep):
+     iid = inst["instance_id"]
+     print(f"  RUN  {iid} ({inst['repo']})", flush=True)
+     workdir = run_agent.checkout(inst)
+@@ -150,7 +152,9 @@ def run_instance(inst, run_dir, model, timeout, keep):
+     with raw.open("w") as out, err.open("w") as errf:
+         proc = subprocess.run(
+             [
+-                "timeout", "--kill-after=10s", str(timeout),
++                "timeout",
++                f"--kill-after={termination_grace}s",
++                str(timeout),
+                 CURSOR_BIN, "-p", prompt,
+                 "--output-format", "stream-json", "--model", model, "--force",
+                 "--workspace", str(workdir),
+@@ -190,6 +194,12 @@ def run_instance(inst, run_dir, model, timeout, keep):
+ 
+ def main():
+     ap = argparse.ArgumentParser()
++    ap.add_argument(
++        "--benchmark-config",
++        type=pathlib.Path,
++        default=run_agent.BENCHMARK_CONFIG,
++        help="tracked runner and guard configuration",
++    )
+     ap.add_argument("--model", required=True, help="cursor-agent model slug")
+     ap.add_argument("--filter", default="", help="instance_id prefix filter")
+     ap.add_argument(
+@@ -197,13 +207,39 @@ def main():
+         help="comma-separated exact instance ids (overrides --filter)",
+     )
+     ap.add_argument("--tag", default="", help="label folded into run dir name")
+-    ap.add_argument("--timeout", type=int, default=900, help="per-instance seconds")
++    ap.add_argument("--timeout", type=int, default=None, help="per-instance seconds")
++    ap.add_argument(
++        "--termination-grace",
++        type=int,
++        default=None,
++        help="seconds between timeout SIGTERM and SIGKILL",
++    )
+     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
+     ap.add_argument(
+         "--docker", action="store_true",
+         help="run cursor-agent inside each instance's official SWE-bench image",
+     )
+     args = ap.parse_args()
++    try:
++        benchmark_config = run_agent.load_benchmark_config(args.benchmark_config)
++    except (OSError, ValueError) as error:
++        ap.error(f"invalid benchmark config: {error}")
++    args.timeout = int(run_agent.configured(
++        args.timeout,
++        benchmark_config,
++        "runner",
++        "instance_timeout_seconds",
++    ))
++    args.termination_grace = int(run_agent.configured(
++        args.termination_grace,
++        benchmark_config,
++        "runner",
++        "termination_grace_seconds",
++    ))
++    if args.timeout <= 0:
++        ap.error("--timeout must be positive")
++    if args.termination_grace <= 0:
++        ap.error("--termination-grace must be positive")
+ 
+     if not run_agent.INSTANCES.exists():
+         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
+@@ -240,7 +276,14 @@ def main():
+     runner = run_instance_docker if args.docker else run_instance
+     with preds_path.open("w") as preds:
+         for inst in instances:
+-            patch = runner(inst, run_dir, args.model, args.timeout, args.keep)
++            patch = runner(
++                inst,
++                run_dir,
++                args.model,
++                args.timeout,
++                args.termination_grace,
++                args.keep,
++            )
+             preds.write(json.dumps({
+                 "instance_id": inst["instance_id"],
+                 "model_name_or_path": f"cursor-{args.model}",
+diff --git i/tests/test_swebench_guards.py w/tests/test_swebench_guards.py
+index b37f53c..08a889f 100644
+--- i/tests/test_swebench_guards.py
++++ w/tests/test_swebench_guards.py
+@@ -53,10 +53,6 @@ def test_guard_analysis_reports_correctness_tradeoff(tmp_path):
+         [
+             sys.executable,
+             str(SCRIPT),
+-            "--cost-limit",
+-            "2",
+-            "--wall-limit",
+-            "300",
+             "--evaluator-report",
+             str(evaluator),
+             str(tmp_path),
+@@ -93,10 +89,6 @@ def test_guard_analysis_rejects_conflicting_correctness(tmp_path):
+         [
+             sys.executable,
+             str(SCRIPT),
+-            "--cost-limit",
+-            "2",
+-            "--wall-limit",
+-            "300",
+             "--evaluator-report",
+             str(evaluator),
+             str(tmp_path),
+diff --git i/tests/test_swebench_runner.py w/tests/test_swebench_runner.py
+index beebb24..e118f74 100644
+--- i/tests/test_swebench_runner.py
++++ w/tests/test_swebench_runner.py
+@@ -14,6 +14,12 @@ import pytest
+ RUNNER = (
+     Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "run_agent.py"
+ )
++BENCHMARK_CONFIG = (
++    Path(__file__).resolve().parents[1]
++    / "benchmarks"
++    / "swebench"
++    / "benchmark.toml"
++)
+ 
+ 
+ def load_runner():
+@@ -24,6 +30,35 @@ def load_runner():
+     return module
+ 
+ 
++def test_guard_limits_load_from_tracked_benchmark_config():
++    runner = load_runner()
++
++    config = runner.load_benchmark_config(BENCHMARK_CONFIG)
++
++    assert config["experiment"]["max_total_cost_usd"] == 70.0
++    assert config["experiment"]["planning_spend_to_date_usd"] == 62.189458
++    assert config["guard"]["max_instance_cost_usd"] == 2.0
++    assert config["guard"]["max_instance_wall_seconds"] == 300
++    assert config["runner"]["instance_timeout_seconds"] == 900
++    assert config["runner"]["termination_grace_seconds"] == 10
++
++
++def test_experiment_budget_uses_named_config_values():
++    runner = load_runner()
++    config = runner.load_benchmark_config(BENCHMARK_CONFIG)
++
++    report = runner.experiment_budget_report(
++        config["experiment"]["max_total_cost_usd"],
++        config["experiment"]["planning_spend_to_date_usd"],
++        1.0,
++    )
++
++    assert report["max_total_cost_usd"] == 70.0
++    assert report["planning_total_cost_usd"] == pytest.approx(63.189458)
++    assert report["remaining_usd"] == pytest.approx(6.810542)
++    assert report["cap_reached"] is False
++
++
+ def test_run_text_replaces_non_utf8_subprocess_output():
+     runner = load_runner()
+ 
+diff --git 1/benchmarks/swebench/benchmark.toml 2/benchmarks/swebench/benchmark.toml
+new file mode 100644
+index 0000000..48e18bd
+--- /dev/null
++++ 2/benchmarks/swebench/benchmark.toml
+@@ -0,0 +1,19 @@
++# Active SWE-bench execution and guard policy. Operational limits belong here,
++# not as Python literals. CLI flags are explicit one-run overrides.
++
++[runner]
++instance_timeout_seconds = 900
++termination_grace_seconds = 10
++in_flight_retries = 1
++max_retry_after_seconds = 300
++
++[guard]
++mode = "off"
++max_instance_cost_usd = 2.0
++max_instance_wall_seconds = 300
++
++[experiment]
++max_total_cost_usd = 70.0
++# Includes known spend plus the documented reserve for the unrecoverable mini
++# attempt, traced outlier reruns, and the interrupted calibration attempt.
++planning_spend_to_date_usd = 62.189458

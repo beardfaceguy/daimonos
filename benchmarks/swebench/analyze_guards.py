@@ -10,8 +10,13 @@ import run_agent
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cost-limit", type=float, required=True)
-    parser.add_argument("--wall-limit", type=int, required=True)
+    parser.add_argument(
+        "--benchmark-config",
+        type=pathlib.Path,
+        default=run_agent.BENCHMARK_CONFIG,
+    )
+    parser.add_argument("--cost-limit", type=float, default=None)
+    parser.add_argument("--wall-limit", type=int, default=None)
     parser.add_argument(
         "--evaluator-report",
         action="append",
@@ -20,6 +25,22 @@ def main():
     )
     parser.add_argument("run_dirs", nargs="+", type=pathlib.Path)
     args = parser.parse_args()
+    try:
+        config = run_agent.load_benchmark_config(args.benchmark_config)
+    except (OSError, ValueError) as error:
+        parser.error(f"invalid benchmark config: {error}")
+    args.cost_limit = float(run_agent.configured(
+        args.cost_limit,
+        config,
+        "guard",
+        "max_instance_cost_usd",
+    ))
+    args.wall_limit = int(run_agent.configured(
+        args.wall_limit,
+        config,
+        "guard",
+        "max_instance_wall_seconds",
+    ))
     if args.cost_limit <= 0:
         parser.error("--cost-limit must be positive")
     if args.wall_limit <= 0:
