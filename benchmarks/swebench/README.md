@@ -76,9 +76,24 @@ Report-only guard calibration never terminates a task:
 
 ```sh
 .venv/bin/python run_agent.py --docker \
-  --guard-mode report --max-instance-cost 2 --max-instance-wall 300 \
+  --benchmark-config benchmark.toml \
+  --guard-mode report \
   --instance-ids <ids> --tag guard-calibration
 ```
+
+`benchmark.toml` is the single source for runner timeout/grace, settlement
+retries, per-instance report thresholds, the total experiment cost cap, and
+planning spend to date. CLI flags are explicit one-run overrides; operational
+defaults do not live in Python literals. The OpenRouter runner refuses to start
+another instance when remaining experiment budget is below the configured
+per-instance cost reserve. Cursor uses the shared timeout/grace but not the
+OpenRouter spend cap because it bills through Cursor's backend.
+
+After a normal run or handled interruption, update
+`experiment.planning_spend_to_date_usd` from the emitted
+`experiment-budget-summary.json`. A process/OS crash cannot execute Python's
+`finally`; reconcile any surviving partial token log before updating the
+tracked value.
 
 Each instance summary records cost/wall crossings and the run writes
 `guard-summary.json`. Replay the same policy over existing summaries, joining
@@ -87,7 +102,7 @@ an evaluator report when `correct` is not already embedded. Run from
 
 ```sh
 .venv/bin/python analyze_guards.py \
-  --cost-limit 2 --wall-limit 300 \
+  --benchmark-config benchmark.toml \
   --evaluator-report <evaluator.json> results/<run-id>
 ```
 

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 HERE = pathlib.Path(__file__).parent
 BENCH_ROOT = HERE.parent
@@ -32,11 +33,130 @@ INSTANCES = HERE / "instances.jsonl"
 REPOS_DIR = HERE / "repos"
 WORK_DIR = HERE / "worktrees"
 RESULTS_DIR = HERE / "results"
+BENCHMARK_CONFIG = HERE / "benchmark.toml"
 DAIMONOS_BIN = pathlib.Path(
     os.environ.get("DAIMONOS_BIN", BENCH_ROOT.parent / "target/release/daimonos")
 )
 TOKEN_LOG = pathlib.Path.home() / ".config/daimonos/token-debug.log"
 EXTRACT = BENCH_ROOT / "extract_tokens.py"
+
+
+def load_benchmark_config(path):
+    with path.open("rb") as handle:
+        config = tomllib.load(handle)
+    allowed = {
+        "runner": {
+            "instance_timeout_seconds",
+            "termination_grace_seconds",
+            "in_flight_retries",
+            "max_retry_after_seconds",
+        },
+        "guard": {
+            "mode",
+            "max_instance_cost_usd",
+            "max_instance_wall_seconds",
+        },
+        "experiment": {
+            "max_total_cost_usd",
+            "planning_spend_to_date_usd",
+        },
+    }
+    unknown_sections = set(config) - set(allowed)
+    if unknown_sections:
+        raise ValueError(
+            "unknown benchmark config section: "
+            + ", ".join(sorted(unknown_sections))
+        )
+    for section, fields in allowed.items():
+        unknown_fields = set(config.get(section) or {}) - fields
+        if unknown_fields:
+            raise ValueError(
+                f"unknown {section} config field: "
+                + ", ".join(sorted(unknown_fields))
+            )
+    required_positive = [
+        ("runner", "instance_timeout_seconds"),
+        ("runner", "termination_grace_seconds"),
+        ("runner", "max_retry_after_seconds"),
+        ("guard", "max_instance_cost_usd"),
+        ("guard", "max_instance_wall_seconds"),
+        ("experiment", "max_total_cost_usd"),
+    ]
+    for section, field in required_positive:
+        value = (config.get(section) or {}).get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value <= 0
+        ):
+            raise ValueError(f"{section}.{field} must be positive")
+    retries = (config.get("runner") or {}).get("in_flight_retries")
+    if not isinstance(retries, int) or isinstance(retries, bool) or retries < 0:
+        raise ValueError("runner.in_flight_retries must be a non-negative integer")
+    mode = (config.get("guard") or {}).get("mode")
+    if mode not in ("off", "report"):
+        raise ValueError("guard.mode must be off or report")
+    spend = (config.get("experiment") or {}).get("planning_spend_to_date_usd")
+    if (
+        not isinstance(spend, (int, float))
+        or isinstance(spend, bool)
+        or spend < 0
+    ):
+        raise ValueError(
+            "experiment.planning_spend_to_date_usd must be non-negative"
+        )
+    return config
+
+
+def configured(cli_value, config, section, field):
+    return cli_value if cli_value is not None else config[section][field]
+
+
+def experiment_budget_report(max_total_cost, spend_at_start, observed_run_cost):
+    planning_total = spend_at_start + observed_run_cost
+    return {
+        "max_total_cost_usd": max_total_cost,
+        "planning_spend_at_start_usd": spend_at_start,
+        "observed_run_cost_usd": observed_run_cost,
+        "planning_total_cost_usd": planning_total,
+        "remaining_usd": max_total_cost - planning_total,
+        "cap_reached": planning_total >= max_total_cost,
+    }
+
+
+def recover_run_cost(run_dir):
+    observed = 0.0
+    accounted_tasks = set()
+    for path in run_dir.glob("*.json"):
+        try:
+            summary = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        task_id = summary.get("task_id")
+        cost = summary.get("cost_usd")
+        if (
+            isinstance(task_id, str)
+            and isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+        ):
+            accounted_tasks.add(task_id)
+            observed += cost
+    for path in run_dir.glob("*.bench/confighome/token-debug.log"):
+        task_id = path.parents[1].name.removesuffix(".bench")
+        if task_id in accounted_tasks:
+            continue
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                cost = json.loads(line).get("cost_usd")
+                observed += float(cost)
+            except (AttributeError, TypeError, ValueError):
+                continue
+    return observed
+
 
 PROMPT_TEMPLATE = """You are working in a checked-out git repository (the current \
 workspace root). Solve the following GitHub issue by modifying the source code.
@@ -311,6 +431,7 @@ def run_instance_docker(
     bench_env,
     model,
     timeout,
+    termination_grace,
     keep,
     in_flight_retries,
     max_retry_after,
@@ -384,7 +505,9 @@ def run_instance_docker(
             with raw.open("w") as out:
                 completed = subprocess.run(
                     [
-                        "timeout", "--kill-after=10s", str(timeout),
+                        "timeout",
+                        f"--kill-after={termination_grace}s",
+                        str(timeout),
                         "docker", "exec", "-w", "/testbed",
                         "-e", f"BENCH_MODEL={model}",
                         "-e", f"DAIMONOS_AGENT_SESSION_ID={iid}",
@@ -485,7 +608,15 @@ def run_instance_docker(
     return patch
 
 
-def run_instance(inst, run_dir, bench_env, model, timeout, keep):
+def run_instance(
+    inst,
+    run_dir,
+    bench_env,
+    model,
+    timeout,
+    termination_grace,
+    keep,
+):
     iid = inst["instance_id"]
     print(f"  RUN  {iid} ({inst['repo']})")
     workdir = checkout(inst)
@@ -503,7 +634,9 @@ def run_instance(inst, run_dir, bench_env, model, timeout, keep):
         with raw.open("w") as out, err.open("w") as errf:
             proc = subprocess.run(
                 [
-                    "timeout", "--kill-after=10s", str(timeout),
+                    "timeout",
+                    f"--kill-after={termination_grace}s",
+                    str(timeout),
                     str(DAIMONOS_BIN), "--debug-tokens", "-w", str(workdir),
                     "agent", prompt, "--model", model,
                     "--agent-env", str(bench_env),
@@ -553,6 +686,12 @@ def run_instance(inst, run_dir, bench_env, model, timeout, keep):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--benchmark-config",
+        type=pathlib.Path,
+        default=BENCHMARK_CONFIG,
+        help="tracked runner, guard, and experiment budget configuration",
+    )
     ap.add_argument("--filter", default="", help="instance_id prefix filter")
     ap.add_argument(
         "--instance-ids", default="",
@@ -560,23 +699,29 @@ def main():
     )
     ap.add_argument("--tag", default="", help="label folded into run dir name")
     ap.add_argument("--model", default=None, help="override agent.env model")
-    ap.add_argument("--timeout", type=int, default=900, help="per-instance seconds")
+    ap.add_argument("--timeout", type=int, default=None, help="per-instance seconds")
+    ap.add_argument(
+        "--termination-grace",
+        type=int,
+        default=None,
+        help="seconds between timeout SIGTERM and SIGKILL",
+    )
     ap.add_argument(
         "--in-flight-retries",
         type=int,
-        default=1,
+        default=None,
         help="retries after OpenRouter in-flight-budget settlement responses",
     )
     ap.add_argument(
         "--max-retry-after",
         type=int,
-        default=300,
+        default=None,
         help="maximum accepted OpenRouter Retry-After delay in seconds",
     )
     ap.add_argument(
         "--guard-mode",
         choices=("off", "report"),
-        default="off",
+        default=None,
         help="annotate threshold crossings without stopping (report) or disable",
     )
     ap.add_argument(
@@ -591,6 +736,18 @@ def main():
         default=None,
         help="report-only per-instance total wall threshold in seconds",
     )
+    ap.add_argument(
+        "--max-experiment-cost",
+        type=float,
+        default=None,
+        help="total experiment planning cap in USD",
+    )
+    ap.add_argument(
+        "--planning-spend-to-date",
+        type=float,
+        default=None,
+        help="known spend plus explicit reserves before this run",
+    )
     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
     ap.add_argument(
         "--docker", action="store_true",
@@ -598,17 +755,83 @@ def main():
              "(runnable test env; requires the musl daimonos build)",
     )
     args = ap.parse_args()
+    try:
+        benchmark_config = load_benchmark_config(args.benchmark_config)
+    except (OSError, ValueError) as error:
+        ap.error(f"invalid benchmark config: {error}")
+    args.timeout = int(configured(
+        args.timeout,
+        benchmark_config,
+        "runner",
+        "instance_timeout_seconds",
+    ))
+    args.termination_grace = int(configured(
+        args.termination_grace,
+        benchmark_config,
+        "runner",
+        "termination_grace_seconds",
+    ))
+    args.in_flight_retries = int(configured(
+        args.in_flight_retries,
+        benchmark_config,
+        "runner",
+        "in_flight_retries",
+    ))
+    args.max_retry_after = int(configured(
+        args.max_retry_after,
+        benchmark_config,
+        "runner",
+        "max_retry_after_seconds",
+    ))
+    args.guard_mode = configured(
+        args.guard_mode,
+        benchmark_config,
+        "guard",
+        "mode",
+    )
+    args.max_instance_cost = float(configured(
+        args.max_instance_cost,
+        benchmark_config,
+        "guard",
+        "max_instance_cost_usd",
+    ))
+    args.max_instance_wall = int(configured(
+        args.max_instance_wall,
+        benchmark_config,
+        "guard",
+        "max_instance_wall_seconds",
+    ))
+    args.max_experiment_cost = float(configured(
+        args.max_experiment_cost,
+        benchmark_config,
+        "experiment",
+        "max_total_cost_usd",
+    ))
+    args.planning_spend_to_date = float(configured(
+        args.planning_spend_to_date,
+        benchmark_config,
+        "experiment",
+        "planning_spend_to_date_usd",
+    ))
+    if args.timeout <= 0:
+        ap.error("--timeout must be positive")
+    if args.termination_grace <= 0:
+        ap.error("--termination-grace must be positive")
     if args.in_flight_retries < 0:
         ap.error("--in-flight-retries must be non-negative")
     if args.max_retry_after <= 0:
         ap.error("--max-retry-after must be positive")
     if args.guard_mode == "report":
-        if args.max_instance_cost is None or args.max_instance_cost <= 0:
+        if args.max_instance_cost <= 0:
             ap.error("--guard-mode=report requires positive --max-instance-cost")
-        if args.max_instance_wall is None or args.max_instance_wall <= 0:
+        if args.max_instance_wall <= 0:
             ap.error("--guard-mode=report requires positive --max-instance-wall")
         if not args.docker:
             ap.error("--guard-mode=report currently requires --docker")
+    if args.max_experiment_cost <= 0:
+        ap.error("--max-experiment-cost must be positive")
+    if args.planning_spend_to_date < 0:
+        ap.error("--planning-spend-to-date must be non-negative")
 
     if not INSTANCES.exists():
         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
@@ -658,11 +881,37 @@ def main():
     bench_env = make_bench_env(src_env)
     print(f"=== daimonos swe-bench runner ===\nModel: {model}\nRun dir: {run_dir}")
     print(f"Instances: {len(instances)}\n")
+    initial_budget = experiment_budget_report(
+        args.max_experiment_cost,
+        args.planning_spend_to_date,
+        0,
+    )
+    print(f"Experiment budget: {initial_budget}")
 
     preds_path = run_dir / "preds.jsonl"
+    observed_run_cost = 0.0
+    completed_instances = []
     try:
         with preds_path.open("w") as preds:
             for inst in instances:
+                current_budget = experiment_budget_report(
+                    args.max_experiment_cost,
+                    args.planning_spend_to_date,
+                    observed_run_cost,
+                )
+                if current_budget["cap_reached"]:
+                    print(
+                        "       STOP: configured experiment cost cap reached "
+                        f"before {inst['instance_id']}"
+                    )
+                    break
+                if current_budget["remaining_usd"] < args.max_instance_cost:
+                    print(
+                        "       STOP: remaining experiment budget is below "
+                        "the configured per-instance cost reserve before "
+                        f"{inst['instance_id']}"
+                    )
+                    break
                 if args.docker:
                     patch = run_instance_docker(
                         inst,
@@ -670,6 +919,7 @@ def main():
                         bench_env,
                         model,
                         args.timeout,
+                        args.termination_grace,
                         args.keep,
                         args.in_flight_retries,
                         args.max_retry_after,
@@ -679,7 +929,13 @@ def main():
                     )
                 else:
                     patch = run_instance(
-                        inst, run_dir, bench_env, model, args.timeout, args.keep
+                        inst,
+                        run_dir,
+                        bench_env,
+                        model,
+                        args.timeout,
+                        args.termination_grace,
+                        args.keep,
                     )
                 preds.write(json.dumps({
                     "instance_id": inst["instance_id"],
@@ -687,15 +943,44 @@ def main():
                     "model_patch": patch,
                 }) + "\n")
                 preds.flush()
+                completed_instances.append(inst)
+                summary = json.loads(
+                    (run_dir / f"{inst['instance_id']}.json").read_text()
+                )
+                cost = summary.get("cost_usd")
+                if (
+                    isinstance(cost, (int, float))
+                    and not isinstance(cost, bool)
+                ):
+                    observed_run_cost += cost
     finally:
+        observed_run_cost = recover_run_cost(run_dir)
+        budget_summary = experiment_budget_report(
+            args.max_experiment_cost,
+            args.planning_spend_to_date,
+            observed_run_cost,
+        )
+        budget_summary.update({
+            "config_file": str(args.benchmark_config),
+            "selected_instances": len(instances),
+            "completed_instances": len(completed_instances),
+            "unstarted_instances": len(instances) - len(completed_instances),
+        })
+        (run_dir / "experiment-budget-summary.json").write_text(
+            json.dumps(budget_summary, indent=2) + "\n"
+        )
+        print(f"Experiment budget final: {budget_summary}")
         bench_env.unlink(missing_ok=True)
 
     if args.docker:
         summaries = [
             json.loads((run_dir / f"{inst['instance_id']}.json").read_text())
-            for inst in instances
+            for inst in completed_instances
         ]
-        trace_summary = summarize_tool_traces(summaries, len(instances))
+        trace_summary = summarize_tool_traces(
+            summaries,
+            len(completed_instances),
+        )
         (run_dir / "tooltrace-summary.json").write_text(
             json.dumps(trace_summary, indent=2) + "\n"
         )

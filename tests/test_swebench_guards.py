@@ -53,10 +53,6 @@ def test_guard_analysis_reports_correctness_tradeoff(tmp_path):
         [
             sys.executable,
             str(SCRIPT),
-            "--cost-limit",
-            "2",
-            "--wall-limit",
-            "300",
             "--evaluator-report",
             str(evaluator),
             str(tmp_path),
@@ -93,10 +89,6 @@ def test_guard_analysis_rejects_conflicting_correctness(tmp_path):
         [
             sys.executable,
             str(SCRIPT),
-            "--cost-limit",
-            "2",
-            "--wall-limit",
-            "300",
             "--evaluator-report",
             str(evaluator),
             str(tmp_path),

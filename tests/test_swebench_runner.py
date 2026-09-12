@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,12 @@ import pytest
 RUNNER = (
     Path(__file__).resolve().parents[1] / "benchmarks" / "swebench" / "run_agent.py"
 )
+BENCHMARK_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "benchmarks"
+    / "swebench"
+    / "benchmark.toml"
+)
 
 
 def load_runner():
@@ -22,6 +29,59 @@ def load_runner():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_guard_limits_load_from_tracked_benchmark_config():
+    runner = load_runner()
+
+    config = runner.load_benchmark_config(BENCHMARK_CONFIG)
+
+    assert config.keys() == {"runner", "guard", "experiment"}
+    assert config["experiment"]["max_total_cost_usd"] > 0
+    assert config["experiment"]["planning_spend_to_date_usd"] >= 0
+    assert config["guard"]["max_instance_cost_usd"] > 0
+    assert config["guard"]["max_instance_wall_seconds"] > 0
+    assert config["runner"]["instance_timeout_seconds"] > 0
+    assert config["runner"]["termination_grace_seconds"] > 0
+
+
+def test_experiment_budget_reports_remaining_capacity():
+    runner = load_runner()
+
+    report = runner.experiment_budget_report(
+        10.0,
+        3.0,
+        1.0,
+    )
+
+    assert report["max_total_cost_usd"] == 10.0
+    assert report["planning_total_cost_usd"] == 4.0
+    assert report["remaining_usd"] == 6.0
+    assert report["cap_reached"] is False
+
+
+def test_benchmark_config_rejects_unknown_keys(tmp_path):
+    runner = load_runner()
+    config = tmp_path / "benchmark.toml"
+    config.write_text(BENCHMARK_CONFIG.read_text() + "\n[typo]\nlimit = 1\n")
+
+    with pytest.raises(ValueError, match="unknown benchmark config section"):
+        runner.load_benchmark_config(config)
+
+
+def test_recover_run_cost_includes_partial_logs_without_double_counting(tmp_path):
+    runner = load_runner()
+    (tmp_path / "a.json").write_text(
+        json.dumps({"task_id": "a", "cost_usd": 1.0})
+    )
+    for task_id, cost in (("a", "9.0"), ("b", "0.4")):
+        log = tmp_path / f"{task_id}.bench" / "confighome" / "token-debug.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(json.dumps({"cost_usd": cost}) + "\n")
+
+    cost = runner.recover_run_cost(tmp_path)
+
+    assert cost == pytest.approx(1.4)
 
 
 def test_run_text_replaces_non_utf8_subprocess_output():
