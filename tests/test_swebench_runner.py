@@ -271,3 +271,75 @@ def test_tool_trace_summary_exposes_missing_and_unknown_snapshots():
         "unknown_schema": 1,
         "total_rows": 7,
     }
+
+
+def test_guard_report_marks_cost_without_stopping_the_run():
+    runner = load_runner()
+
+    report = runner.guard_report(
+        {"cost_usd": 2.5, "wall_ms": 250_000, "correct": True},
+        cost_limit=2.0,
+        wall_limit_seconds=300,
+    )
+
+    assert report == {
+        "mode": "report",
+        "cost_limit_usd": 2.0,
+        "wall_limit_ms": 300_000,
+        "cost_observed_usd": 2.5,
+        "wall_observed_ms": 250_000,
+        "cost_would_trigger": True,
+        "wall_would_trigger": False,
+        "would_trigger": True,
+    }
+
+
+def test_guard_report_accepts_float_wall_at_exact_boundaries():
+    runner = load_runner()
+
+    report = runner.guard_report(
+        {"cost_usd": 2.0, "wall_ms": 300_000.0},
+        cost_limit=2.0,
+        wall_limit_seconds=300,
+    )
+
+    assert report["cost_would_trigger"] is True
+    assert report["wall_would_trigger"] is True
+    assert report["would_trigger"] is True
+
+
+def test_guard_report_preserves_unknown_observations():
+    runner = load_runner()
+
+    report = runner.guard_report(
+        {"cost_usd": None, "wall_ms": None},
+        cost_limit=2.0,
+        wall_limit_seconds=300,
+    )
+
+    assert report["cost_would_trigger"] is None
+    assert report["wall_would_trigger"] is None
+    assert report["would_trigger"] is False
+
+
+def test_guard_summary_exposes_missing_report_coverage():
+    runner = load_runner()
+
+    summary = runner.summarize_guard_reports(
+        [
+            {
+                "task_id": "a",
+                "guard": {
+                    "would_trigger": True,
+                    "cost_would_trigger": True,
+                    "wall_would_trigger": False,
+                },
+            },
+            {"task_id": "b", "guard": None},
+        ]
+    )
+
+    assert summary["instances"] == 2
+    assert summary["reported"] == 1
+    assert summary["missing_guard_data"] == 1
+    assert summary["would_trigger"] == ["a"]

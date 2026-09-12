@@ -192,6 +192,62 @@ def summarize_tool_traces(summaries, expected):
     }
 
 
+def guard_report(summary, *, cost_limit, wall_limit_seconds):
+    observed_cost = summary.get("cost_usd")
+    cost_would_trigger = (
+        observed_cost >= cost_limit
+        if isinstance(observed_cost, (int, float))
+        and not isinstance(observed_cost, bool)
+        else None
+    )
+    observed_wall = summary.get("wall_ms")
+    wall_limit_ms = wall_limit_seconds * 1000
+    wall_would_trigger = (
+        observed_wall >= wall_limit_ms
+        if isinstance(observed_wall, (int, float))
+        and not isinstance(observed_wall, bool)
+        else None
+    )
+    return {
+        "mode": "report",
+        "cost_limit_usd": cost_limit,
+        "wall_limit_ms": wall_limit_ms,
+        "cost_observed_usd": observed_cost,
+        "wall_observed_ms": observed_wall,
+        "cost_would_trigger": cost_would_trigger,
+        "wall_would_trigger": wall_would_trigger,
+        "would_trigger": cost_would_trigger is True or wall_would_trigger is True,
+    }
+
+
+def summarize_guard_reports(summaries):
+    guard_rows = [
+        (row["task_id"], row["guard"])
+        for row in summaries
+        if isinstance(row.get("guard"), dict)
+    ]
+    return {
+        "instances": len(summaries),
+        "reported": len(guard_rows),
+        "missing_guard_data": len(summaries) - len(guard_rows),
+        "would_trigger": [
+            task_id
+            for task_id, guard in guard_rows
+            if guard["would_trigger"]
+        ],
+        "cost_would_trigger": [
+            task_id
+            for task_id, guard in guard_rows
+            if guard["cost_would_trigger"] is True
+        ],
+        "wall_would_trigger": [
+            task_id
+            for task_id, guard in guard_rows
+            if guard["wall_would_trigger"] is True
+        ],
+    }
+
+
 def in_flight_retry_after(error_text, max_retry_after):
     prefix = "Error: agent error: openrouter 402 Payment Required: "
     for line in error_text.splitlines():
@@ -258,6 +314,9 @@ def run_instance_docker(
     keep,
     in_flight_retries,
     max_retry_after,
+    guard_mode,
+    max_instance_cost,
+    max_instance_wall,
 ):
     iid = inst["instance_id"]
     image = inst.get("image")
@@ -411,6 +470,15 @@ def run_instance_docker(
     data["in_flight_retries"] = retry_count
     data["tool_trace_file"] = trace_path.name if trace_path.exists() else None
     data["tool_trace_rows"] = trace_rows
+    data["guard"] = (
+        guard_report(
+            data,
+            cost_limit=max_instance_cost,
+            wall_limit_seconds=max_instance_wall,
+        )
+        if guard_mode == "report"
+        else None
+    )
     summary.write_text(json.dumps(data, indent=2))
     if not keep:
         shutil.rmtree(benchdir, ignore_errors=True)
@@ -505,6 +573,24 @@ def main():
         default=300,
         help="maximum accepted OpenRouter Retry-After delay in seconds",
     )
+    ap.add_argument(
+        "--guard-mode",
+        choices=("off", "report"),
+        default="off",
+        help="annotate threshold crossings without stopping (report) or disable",
+    )
+    ap.add_argument(
+        "--max-instance-cost",
+        type=float,
+        default=None,
+        help="report-only per-instance cost threshold in USD",
+    )
+    ap.add_argument(
+        "--max-instance-wall",
+        type=int,
+        default=None,
+        help="report-only per-instance total wall threshold in seconds",
+    )
     ap.add_argument("--keep", action="store_true", help="keep worktrees after run")
     ap.add_argument(
         "--docker", action="store_true",
@@ -516,6 +602,13 @@ def main():
         ap.error("--in-flight-retries must be non-negative")
     if args.max_retry_after <= 0:
         ap.error("--max-retry-after must be positive")
+    if args.guard_mode == "report":
+        if args.max_instance_cost is None or args.max_instance_cost <= 0:
+            ap.error("--guard-mode=report requires positive --max-instance-cost")
+        if args.max_instance_wall is None or args.max_instance_wall <= 0:
+            ap.error("--guard-mode=report requires positive --max-instance-wall")
+        if not args.docker:
+            ap.error("--guard-mode=report currently requires --docker")
 
     if not INSTANCES.exists():
         sys.exit("instances.jsonl missing — run fetch_dataset.py first")
@@ -580,6 +673,9 @@ def main():
                         args.keep,
                         args.in_flight_retries,
                         args.max_retry_after,
+                        args.guard_mode,
+                        args.max_instance_cost,
+                        args.max_instance_wall,
                     )
                 else:
                     patch = run_instance(
@@ -604,6 +700,17 @@ def main():
             json.dumps(trace_summary, indent=2) + "\n"
         )
         print(f"Tool traces: {trace_summary}")
+        if args.guard_mode == "report":
+            guard_summary = summarize_guard_reports(summaries)
+            guard_summary.update({
+                "mode": "report",
+                "cost_limit_usd": args.max_instance_cost,
+                "wall_limit_ms": args.max_instance_wall * 1000,
+            })
+            (run_dir / "guard-summary.json").write_text(
+                json.dumps(guard_summary, indent=2) + "\n"
+            )
+            print(f"Guard report: {guard_summary}")
 
     print(f"\nPredictions: {preds_path}")
     print("Evaluate with (needs docker):")

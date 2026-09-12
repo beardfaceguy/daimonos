@@ -72,6 +72,28 @@ attempt boundary. Per-instance `wall_ms` includes settlement waits and
 `in_flight_retries` records the retry count. Other HTTP 402 billing failures are
 never retried.
 
+Report-only guard calibration never terminates a task:
+
+```sh
+.venv/bin/python run_agent.py --docker \
+  --guard-mode report --max-instance-cost 2 --max-instance-wall 300 \
+  --instance-ids <ids> --tag guard-calibration
+```
+
+Each instance summary records cost/wall crossings and the run writes
+`guard-summary.json`. Replay the same policy over existing summaries, joining
+an evaluator report when `correct` is not already embedded. Run from
+`benchmarks/swebench/`:
+
+```sh
+.venv/bin/python analyze_guards.py \
+  --cost-limit 2 --wall-limit 300 \
+  --evaluator-report <evaluator.json> results/<run-id>
+```
+
+Report-only crossings are not savings claims; they identify which correct and
+incorrect tasks an enforcing guard would have interrupted.
+
 Each run writes `results/<run-id>/` with per-instance token/cost JSONs
 (same schema as the in-house suite — `../analyze.py results/` works),
 `.patch` files, raw transcripts, and `preds.jsonl`.
