@@ -270,3 +270,20 @@ over the full-50 run triggered two correct outliers. It remains report-only.
 
 Report:
 [`2026-09-12-swebench-guard-calibration.md`](2026-09-12-swebench-guard-calibration.md).
+
+## SWE-bench persistent-miss diagnosis (no stage)
+
+Zero-API replay of the three instances Daimonos repeatedly failed in the
+full-50 run, against the official tests with gold-patch controls. No stage is
+appended because no optimization delta is claimed and no provider calls were
+made.
+
+The finding relevant to this lineage: all three failures sit inside a normal
+cost and wall envelope, so no per-instance guard threshold would have improved
+any outcome. They are correctness reasoning failures with three unrelated
+causes — a fix applied in the wrong propagation direction, a correct approach
+missing its domain-side hunk, and a patch whose measured effect equals applying
+no patch at all.
+
+Report:
+[`2026-09-12-swebench-persistent-miss-replay.md`](2026-09-12-swebench-persistent-miss-replay.md).
