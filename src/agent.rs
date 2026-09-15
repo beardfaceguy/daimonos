@@ -307,6 +307,9 @@ pub struct AgentResult {
     /// The final call failed as a classified context-window overflow; the
     /// reactive compaction path keys off this to compact and retry once.
     pub context_overflow: bool,
+    /// What this turn was observed to do: whether the workspace changed and
+    /// whether a verifier passed afterwards (vikunja #1198). Report-only.
+    pub evidence: crate::evidence::EvidenceLedger,
 }
 
 // --- Pure helpers ---
@@ -942,6 +945,18 @@ async fn run_inner(
             (None, 0)
         }
     };
+    // #1198: observed-evidence ledger. Mutations are detected by comparing
+    // worktree fingerprints around each tool call rather than by classifying
+    // tool names, so `exec`-mediated edits and reverts are caught too. The
+    // baseline is taken lazily before the first tool call, so a turn that never
+    // calls a tool pays nothing.
+    let evidence_tree = {
+        let guard = session.lock().await;
+        crate::evidence::Worktree::new(guard.workspace.clone(), &crate::paths::state_dir())
+    };
+    let mut evidence = crate::evidence::EvidenceLedger::default();
+    let mut evidence_fingerprint: Option<String> = None;
+    let mut evidence_degraded = false;
 
     loop {
         // Deterministically shed old successful tool context before every
@@ -1268,6 +1283,7 @@ async fn run_inner(
                     error_message: resp.error_message,
                     last_call_usage: resp.usage,
                     context_overflow: resp.context_overflow,
+                    evidence,
                 };
             }
             StopReason::ToolUse => {
@@ -1290,6 +1306,18 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+
+                // Baseline for this turn's first tool call. Taken here so
+                // read-only turns never shell out to git at all.
+                if evidence_fingerprint.is_none() && !evidence_degraded {
+                    match evidence_tree.fingerprint().await {
+                        Some(fingerprint) => evidence_fingerprint = Some(fingerprint),
+                        None => {
+                            evidence_degraded = true;
+                            evidence.mark_fingerprint_unavailable();
+                        }
+                    }
+                }
 
                 for (id, name, input) in calls {
                     let info = ToolCallInfo {
@@ -1612,6 +1640,30 @@ async fn run_inner(
                             }
                         }
                     };
+                    // #1198: record what this call was observed to do, using the
+                    // raw result — the verifier's exit status must be read
+                    // before output bounding can truncate it away.
+                    let verifier = crate::evidence::verifier_exit(&name, &input, &content);
+                    if !evidence_degraded {
+                        match evidence_tree.fingerprint().await {
+                            Some(after) => {
+                                let changed =
+                                    evidence_fingerprint.as_deref().is_some_and(|b| b != after);
+                                evidence.record_call(changed, verifier);
+                                evidence_fingerprint = Some(after);
+                            }
+                            None => {
+                                evidence_degraded = true;
+                                evidence.mark_fingerprint_unavailable();
+                                evidence.record_call(false, verifier);
+                            }
+                        }
+                    } else {
+                        // Verifier outcome remains observable even if later
+                        // mutation fingerprinting has degraded.
+                        evidence.record_call(false, verifier);
+                    }
+
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
                         if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
@@ -1803,6 +1855,7 @@ async fn run_inner(
                         error_message: Some("terminated by after_tool_call hook".to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: false,
+                        evidence,
                     };
                 }
 
@@ -1844,6 +1897,7 @@ async fn run_inner(
                                 error_message: Some(message),
                                 last_call_usage: resp.usage,
                                 context_overflow: false,
+                                evidence,
                             };
                         }
                     }
@@ -1867,6 +1921,8 @@ pub struct TurnResult {
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
     pub context_overflow: bool,
+    /// Observed evidence for this turn (vikunja #1198).
+    pub evidence: crate::evidence::EvidenceLedger,
 }
 
 /// A stateful, re-promptable agent conversation wrapping the one-shot [`run`]
@@ -2132,6 +2188,7 @@ impl AgentSession {
             stop_reason: result.stop_reason,
             error_message: result.error_message,
             context_overflow: result.context_overflow,
+            evidence: result.evidence,
         }
     }
 
@@ -6517,5 +6574,181 @@ mod tests {
                 }] if tool_use_id == "c1"
             )
         }));
+    }
+
+    /// A stub verifier named so `exec_filter::classify` sees a test runner:
+    /// it strips the directory, so `<dir>/pytest` classifies as `TestRunner`
+    /// without needing pytest installed.
+    fn stub_verifier(dir: &std::path::Path, name: &str, exit_code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn evidence_reports_verified_when_mutation_precedes_passing_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let verifier = stub_verifier(dir.path(), "pytest", 0);
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "m1",
+                "write_file",
+                json!({"path": "fix.txt", "content": "fixed"}),
+            ),
+            tool_call_resp("v1", "exec", json!({"command": verifier})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("fix it and prove it").await;
+
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Verified,
+            "a mutation followed by a passing verifier is verified"
+        );
+    }
+
+    /// The shape both `sphinx-9229` and `django-12273` produced in the
+    /// 2026-09-11 full-50 run: the workspace changed and the turn ended with a
+    /// confident summary, but nothing verified the change.
+    #[tokio::test]
+    async fn evidence_reports_unverified_when_mutation_has_no_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "m1",
+                "write_file",
+                json!({"path": "fix.txt", "content": "fixed"}),
+            ),
+            end_turn_resp_with_text("All relevant test suites pass."),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("fix it").await;
+
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Unverified,
+            "a claim of passing tests must not be backed by an absent verifier"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_reports_unverified_when_mutation_follows_passing_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let verifier = stub_verifier(dir.path(), "pytest", 0);
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("v1", "exec", json!({"command": verifier})),
+            tool_call_resp(
+                "m1",
+                "write_file",
+                json!({"path": "late.txt", "content": "edited after the green run"}),
+            ),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("test then edit").await;
+
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Unverified,
+            "a verifier cannot vouch for an edit made after it ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_does_not_count_a_failing_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let verifier = stub_verifier(dir.path(), "pytest", 1);
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "m1",
+                "write_file",
+                json!({"path": "fix.txt", "content": "fixed"}),
+            ),
+            tool_call_resp("v1", "exec", json!({"command": verifier})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("fix it").await;
+
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Unverified,
+            "a red verifier is not evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_reports_no_mutations_for_a_read_only_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp("r1", "read_file", json!({"path": "f.txt"})),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("what does f.txt say?").await;
+
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::NoMutations
+        );
+    }
+
+    /// The case a mutating-tool allowlist cannot see, and the reason #1239
+    /// rejected one: the edit arrives through `exec`, not through `write_file`.
+    #[tokio::test]
+    async fn evidence_detects_a_mutation_made_through_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "m1",
+                "exec",
+                json!({"command": "echo patched > via_exec.txt"}),
+            ),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("patch it with a shell redirect").await;
+
+        assert!(
+            dir.path().join("via_exec.txt").exists(),
+            "precondition: the shell redirect must have landed"
+        );
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Unverified,
+            "an exec-mediated edit is still a mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_does_not_treat_an_install_as_a_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let installer = stub_verifier(dir.path(), "pip", 0);
+        let provider = Box::new(MockProvider::new(vec![
+            tool_call_resp(
+                "m1",
+                "write_file",
+                json!({"path": "fix.txt", "content": "fixed"}),
+            ),
+            tool_call_resp(
+                "i1",
+                "exec",
+                json!({"command": format!("{installer} install x")}),
+            ),
+            end_turn_resp(),
+        ]));
+        let mut sess = AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+        let turn = sess.prompt("fix it").await;
+
+        assert_eq!(
+            turn.evidence.status(),
+            crate::evidence::EvidenceStatus::Unverified,
+            "a successful install proves nothing about the code"
+        );
     }
 }

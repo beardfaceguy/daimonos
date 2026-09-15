@@ -136,6 +136,7 @@ pub async fn run_agent(
             error_message: Some("dry-run".to_string()),
             last_call_usage: Default::default(),
             context_overflow: false,
+            evidence: Default::default(),
         });
     }
 
