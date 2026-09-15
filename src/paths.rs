@@ -24,6 +24,22 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Global Daimonos state directory. Uses `~/.daimonos`, with a per-user temp
+/// fallback when HOME is unavailable so evidence stores are never put inside
+/// the workspace they fingerprint.
+pub(crate) fn state_dir() -> PathBuf {
+    if let Some(home) = home_dir() {
+        return home.join(".daimonos");
+    }
+    let user = std::env::var("UID")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    // The per-process suffix avoids sharing a predictable directory when the
+    // platform exposes neither UID nor USER. Evidence state is ephemeral.
+    std::env::temp_dir().join(format!("daimonos-{user}-{}", std::process::id()))
+}
+
 /// Canonical durable store shared by ACP and daemon-owned agent sessions.
 pub(crate) fn agent_sessions_dir() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".daimonos").join("acp-sessions"))
