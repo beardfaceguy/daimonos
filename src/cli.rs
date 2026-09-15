@@ -116,6 +116,31 @@ pub struct McpArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct McpConfigArgs {
+    #[command(subcommand)]
+    pub command: McpConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpConfigCommand {
+    /// Translate Zed context_servers into a harness mcpServers file.
+    Sync {
+        /// Zed settings.json source (defaults to the platform Zed path).
+        #[arg(long, value_name = "FILE")]
+        source: Option<PathBuf>,
+        /// Harness MCP file to replace atomically.
+        #[arg(long, value_name = "FILE", default_value = "~/.cursor/mcp.json")]
+        target: PathBuf,
+        /// Print the generated document without writing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// After a successful sync, replace this process with COMMAND.
+        #[arg(last = true, num_args = 1.., value_name = "COMMAND")]
+        exec: Vec<String>,
+    },
+}
+
+#[derive(Debug, Args)]
 pub struct SessionArgs {
     #[command(subcommand)]
     pub command: SessionCommand,
@@ -156,6 +181,8 @@ pub enum Command {
     Session(SessionArgs),
     /// Run the MCP tool server over stdio or a Unix socket.
     Mcp(McpArgs),
+    /// Synchronize Zed's MCP servers into harness-specific configuration.
+    McpConfig(McpConfigArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
     Daemon,
 }
@@ -169,6 +196,7 @@ pub enum RuntimeMode {
     Session,
     McpStdio,
     McpSocket(PathBuf),
+    McpConfig,
     Daemon,
     Stats,
 }
@@ -183,6 +211,7 @@ impl RuntimeMode {
             Self::Session => "session",
             Self::McpStdio => "mcp_stdio",
             Self::McpSocket(_) => "mcp_socket",
+            Self::McpConfig => "mcp_config",
             Self::Daemon => "socket",
             Self::Stats => "stats",
         }
@@ -270,6 +299,7 @@ impl Cli {
             Some(Command::Acp(_)) => RuntimeMode::Acp,
             Some(Command::SessionDaemon(_)) => RuntimeMode::SessionDaemon,
             Some(Command::Session(_)) => RuntimeMode::Session,
+            Some(Command::McpConfig(_)) => RuntimeMode::McpConfig,
             Some(Command::Mcp(args)) => args
                 .socket
                 .clone()

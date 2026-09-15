@@ -43,10 +43,14 @@ pub fn context_server_specs(override_path: Option<&str>) -> anyhow::Result<Vec<S
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
-    let json = strip_trailing_commas(&strip_jsonc(&raw));
+    let json = clean_jsonc(&raw);
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     Ok(specs_from_settings(&value))
+}
+
+pub(crate) fn default_settings_path() -> PathBuf {
+    settings_path(None).unwrap_or_else(|| PathBuf::from("~/.config/zed/settings.json"))
 }
 
 fn settings_path(override_path: Option<&str>) -> Option<PathBuf> {
@@ -61,7 +65,7 @@ fn settings_path(override_path: Option<&str>) -> Option<PathBuf> {
 
 /// Map the `context_servers` object of a parsed Zed settings document to
 /// [`ServerSpec`]s. Unknown/incomplete entries are skipped.
-fn specs_from_settings(value: &serde_json::Value) -> Vec<ServerSpec> {
+pub(crate) fn specs_from_settings(value: &serde_json::Value) -> Vec<ServerSpec> {
     let Some(servers) = value.get("context_servers").and_then(|v| v.as_object()) else {
         return Vec::new();
     };
@@ -117,6 +121,12 @@ fn string_map(value: Option<&serde_json::Value>) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Normalize Zed JSONC into strict JSON for both direct fallback and shared
+/// `[agent.mcp].servers_file` consumption.
+pub(crate) fn clean_jsonc(input: &str) -> String {
+    strip_trailing_commas(&strip_jsonc(input))
 }
 
 /// Remove `//` line comments and `/* */` block comments from a JSONC document,

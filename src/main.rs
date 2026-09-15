@@ -14,6 +14,7 @@ mod config;
 mod context_metrics;
 mod coordination;
 mod env_file;
+mod evidence;
 mod frontend_state;
 mod headless_frontend;
 mod index;
@@ -23,6 +24,7 @@ mod loop_detector;
 mod managed_process;
 mod mcp;
 mod mcp_bridge;
+mod mcp_config_cmd;
 mod observability;
 mod ops;
 mod paths;
@@ -243,7 +245,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Agent(args)) => !args.dry_run,
         Some(Command::Chat(args)) => !args.list,
         Some(Command::Acp(_) | Command::SessionDaemon(_)) => true,
-        Some(Command::Session(_) | Command::Mcp(_) | Command::Daemon) | None => false,
+        Some(Command::Session(_) | Command::Mcp(_) | Command::McpConfig(_) | Command::Daemon)
+        | None => false,
     };
     if uses_agent_prompt {
         cfg.prompts.additional_agent_instructions =
@@ -336,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
             agent_runtime::run_session_daemon(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::Session(args)) => session_interchange::run(args, &cfg),
+        Some(Command::McpConfig(args)) => mcp_config_cmd::run(args),
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
@@ -481,6 +485,7 @@ async fn run_tool_service(
         | RuntimeMode::Acp
         | RuntimeMode::Session
         | RuntimeMode::SessionDaemon
+        | RuntimeMode::McpConfig
         | RuntimeMode::Stats => {
             unreachable!("early-return runtime reached service dispatch")
         }

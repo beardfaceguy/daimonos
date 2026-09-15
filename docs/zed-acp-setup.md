@@ -13,6 +13,60 @@ used together.
   `daimonos acp` loads it the same way `daimonos agent`/`daimonos chat` do
 - Zed editor installed, with agent-panel support for custom `agent_servers`
 
+## Shared MCP configuration
+
+Daimonos treats Zed as the primary MCP configuration by default. Non-ACP
+agents read `~/.config/zed/settings.json` directly, including its JSONC
+`context_servers`. ACP sessions resolve servers in this order:
+
+1. Servers forwarded by the current ACP harness.
+2. If—and only if—ACP initialize identifies the harness as Zed and it forwards
+   an empty list, Zed `context_servers`.
+3. For that same Zed recovery case, `[agent.mcp].servers_file` as the final
+   Daimonos fallback.
+
+An empty list from Cursor or any unknown/non-Zed ACP harness remains
+authoritative and produces no MCP servers.
+
+To select a Claude/Cursor-style shared file instead:
+
+```toml
+[agent.mcp]
+servers_file = "~/.config/mcp/servers.json"
+```
+
+The selected file may contain either `mcpServers` or `context_servers`; if it
+contains both, `context_servers` takes precedence. A harness that cannot select a path may symlink its standalone MCP file to the
+shared file. Do not symlink all of Zed's `settings.json` over a harness file
+that only accepts a standalone `mcpServers` document. While Zed's file is being
+edited, invalid JSONC causes Daimonos to skip configured MCP servers and emit a
+warning rather than failing the agent session.
+
+### Cursor ACP and other file-only harnesses
+
+Cursor ACP currently ignores ACP-forwarded MCP servers and reads
+`~/.cursor/mcp.json`, whose required `mcpServers` shape is incompatible with
+Zed's full `settings.json`. Use the built-in translator and launch wrapper:
+
+```sh
+daimonos mcp-config sync --target ~/.cursor/mcp.json -- cursor-agent acp
+```
+
+The command reads Zed at process start, atomically regenerates Cursor's file,
+and then replaces itself with Cursor ACP. Configure Zed's `agent_servers.cursor`
+as `type = "custom"` with that command/argument sequence if the registry entry
+cannot be wrapped. This guarantees each new Cursor ACP sees Zed's MCP list as of launch without
+manually copying settings. Changes made while a Cursor session is running take
+effect on its next launch. `--dry-run` prints the generated JSON; omit
+`-- COMMAND` to perform a one-time sync.
+
+Because the formats differ, a direct symlink is unsafe. The generated file is
+mode `0600`; if an old Cursor file exists it is atomically replaced. Disabled
+Zed servers and Zed-only metadata such as `timeout` are omitted. The target
+is fully owned by synchronization and must not be edited manually; a valid Zed
+configuration containing zero enabled servers intentionally produces an empty
+Cursor list.
+
 ## Setup
 
 Add daimonos under the `agent_servers` key in Zed's `settings.json`. The

@@ -68,7 +68,7 @@ impl Default for AgentMcpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            servers_file: "~/.config/daimonos/mcp_servers.json".to_string(),
+            servers_file: "~/.config/zed/settings.json".to_string(),
         }
     }
 }
@@ -1043,10 +1043,10 @@ pub struct AcpMcpConfig {
     /// settings directly and bridge those. Only triggers on an empty forwarded
     /// list — never overrides servers Zed did forward.
     ///
-    /// **Opt-in (default false):** it reads an external app's config file and
-    /// spawns that config's stdio servers, so it must not fire for non-Zed ACP
-    /// clients or in tests. Enable it only when running daimonos as Zed's ACP
-    /// agent on an unpatched Zed.
+    /// This is gated on ACP initialize identifying the client as Zed, so an
+    /// empty list from another harness remains authoritative. When enabled for
+    /// Zed, this flag gates the whole recovery chain; `[agent.mcp].servers_file`
+    /// is the final fallback if this file has no usable servers.
     pub zed_config_fallback: bool,
     /// Path to Zed's `settings.json` for `zed_config_fallback`. `None` derives
     /// it from `$XDG_CONFIG_HOME`/`$HOME` (`~/.config/zed/settings.json`).
@@ -1067,7 +1067,7 @@ impl Default for AcpMcpConfig {
             max_servers: 32,
             max_concurrent_connects: 8,
             max_tools_per_server: 128,
-            zed_config_fallback: false,
+            zed_config_fallback: true,
             zed_settings_path: None,
         }
     }

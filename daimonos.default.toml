@@ -348,8 +348,9 @@ session_list_page_size = 50
 # Outbound MCP servers for daimonos's own agent frontends — interactive TUI,
 # one-shot `agent`, `chat` REPL, and the session daemon (#1289). The ACP path
 # is unaffected (there the client forwards the server list per session).
-# Reads a Claude-style `mcpServers` JSON file — the same format Claude
-# Desktop / Claude Code use — so one file can feed every harness:
+# Reads either Zed's JSONC `context_servers` settings or a Claude/Cursor-style
+# `mcpServers` JSON file. The default points directly at Zed, making it the
+# primary system configuration without copies or symlinks:
 #   { "mcpServers": {
 #       "linear":   { "command": "npx", "args": ["-y", "linear-mcp"] },
 #       "repowise": { "url": "http://127.0.0.1:8931/mcp" } } }
@@ -357,7 +358,7 @@ session_list_page_size = 50
 # Bridge tuning (timeouts, caps, allow_stdio/allow_http, self-connection
 # refusal) is shared with [acp.mcp] below.
 enabled = true
-servers_file = "~/.config/daimonos/mcp_servers.json"
+servers_file = "~/.config/zed/settings.json"
 
 [acp.mcp]
 # MCP-server bridge (ADR-003, #990). Zed forwards every configured context
@@ -399,12 +400,10 @@ max_tools_per_server = 128
 # Fallback for unpatched Zed: when Zed forwards an EMPTY MCP server list at
 # session start (a cold-start race where its context-server store isn't
 # populated yet, and it never re-forwards to a live session), read Zed's own
-# `context_servers` settings directly and bridge those. Off by default because
-# it reads an external app's config and spawns that config's stdio servers, so
-# it must not fire for non-Zed ACP clients. Enable it only when running
-# daimonos as Zed's ACP agent on an unpatched Zed. Only triggers on an empty
-# forwarded list — servers Zed did forward are never overridden.
-zed_config_fallback = false
+# `context_servers` settings directly and bridge those. This is considered
+# only when initialize identifies the ACP client as Zed; an empty list from any
+# other harness remains authoritative. Harness-forwarded servers always win.
+zed_config_fallback = true
 # Path to Zed's settings.json for the fallback above. Empty/unset derives it
 # from $XDG_CONFIG_HOME/$HOME (~/.config/zed/settings.json).
 # zed_settings_path = "/home/you/.config/zed/settings.json"

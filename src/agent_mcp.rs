@@ -24,19 +24,27 @@ use crate::config::Config;
 use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
 use crate::providers::ToolSchema;
 
-/// Parse a Claude-style config: `{"mcpServers": {name: {command, args?, env?}
-/// | {url, headers?}}}`. Entries are sorted by name so bridge order (and thus
-/// the `max_servers` cap) is deterministic — JSON object order is not
-/// preserved. Unknown per-server keys are ignored for forward compatibility;
-/// a `type` field, when present, must agree with the transport implied by
-/// `command`/`url`.
+/// Parse either a Claude/Cursor-style `mcpServers` file or Zed's
+/// `settings.json` (`context_servers`). This lets `[agent.mcp].servers_file`
+/// point directly at the system's primary Zed configuration instead of
+/// maintaining a translated copy. If both top-level keys exist,
+/// `context_servers` takes precedence. Entries are sorted by name so bridge
+/// order (and thus the `max_servers` cap) is deterministic.
 pub fn parse_servers_json(content: &str) -> Result<Vec<ServerSpec>, String> {
+    // Zed settings are JSONC. Reuse its reader's string-aware cleanup before
+    // parsing; ordinary JSON passes through unchanged.
+    let cleaned = crate::zed_config::clean_jsonc(content);
     let root: Value =
-        serde_json::from_str(content).map_err(|error| format!("invalid JSON: {error}"))?;
+        serde_json::from_str(&cleaned).map_err(|error| format!("invalid JSON/JSONC: {error}"))?;
+    if root.get("context_servers").is_some() {
+        return Ok(crate::zed_config::specs_from_settings(&root));
+    }
     let servers = root
         .get("mcpServers")
         .and_then(Value::as_object)
-        .ok_or_else(|| "missing top-level \"mcpServers\" object".to_string())?;
+        .ok_or_else(|| {
+            "missing top-level \"mcpServers\" or \"context_servers\" object".to_string()
+        })?;
     let mut names: Vec<&String> = servers.keys().collect();
     names.sort();
     names
@@ -156,6 +164,32 @@ impl AgentMcp {
     }
 }
 
+/// Load the system/user MCP configuration selected by `[agent.mcp]`.
+/// Both Claude/Cursor and Zed settings formats are accepted.
+pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
+    if !cfg.agent.mcp.enabled {
+        return Vec::new();
+    }
+    let path = crate::paths::expand_tilde(&cfg.agent.mcp.servers_file);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(target: "daimonos::agent_mcp", path = %path.display(), %error,
+                "mcp servers file unreadable; continuing without configured MCP servers");
+            return Vec::new();
+        }
+    };
+    match parse_servers_json(&content) {
+        Ok(specs) => specs,
+        Err(error) => {
+            tracing::warn!(target: "daimonos::agent_mcp", path = %path.display(), %error,
+                "mcp servers file invalid; continuing without configured MCP servers");
+            Vec::new()
+        }
+    }
+}
+
 /// Read `[agent.mcp] servers_file` and connect. `None` when disabled, the
 /// file is absent or empty, or it fails to read/parse (logged) — the agent
 /// then runs with native tools only.
@@ -164,35 +198,7 @@ pub async fn connect(
     native_tool_names: &HashSet<String>,
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> Option<AgentMcp> {
-    if !cfg.agent.mcp.enabled {
-        return None;
-    }
-    let path = crate::paths::expand_tilde(&cfg.agent.mcp.servers_file);
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            tracing::warn!(
-                target: "daimonos::agent_mcp",
-                path = %path.display(),
-                %error,
-                "mcp servers file unreadable; continuing with native tools only"
-            );
-            return None;
-        }
-    };
-    let specs = match parse_servers_json(&content) {
-        Ok(specs) => specs,
-        Err(error) => {
-            tracing::warn!(
-                target: "daimonos::agent_mcp",
-                path = %path.display(),
-                %error,
-                "mcp servers file invalid; continuing with native tools only"
-            );
-            return None;
-        }
-    };
+    let specs = load_configured_specs(cfg).await;
     if specs.is_empty() {
         return None;
     }
@@ -258,6 +264,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_zed_jsonc_context_servers() {
+        let jsonc = r#"{
+          // one primary config for Zed and Daimonos
+          "context_servers": {
+            "zed-http": { "url": "https://example.test/mcp", },
+            "off": { "enabled": false, "command": "nope" },
+          },
+        }"#;
+        let specs = parse_servers_json(jsonc).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "zed-http"));
+    }
+
+    #[test]
     fn type_field_is_validated_but_optional() {
         let ok = r#"{"mcpServers": {"a": {"type": "stdio", "command": "x"},
                                      "b": {"type": "sse", "url": "http://h/mcp"}}}"#;
@@ -276,7 +296,7 @@ mod tests {
     fn rejects_malformed_documents_legibly() {
         assert!(parse_servers_json("not json")
             .unwrap_err()
-            .contains("invalid JSON"));
+            .contains("invalid JSON/JSONC"));
         assert!(parse_servers_json("{}").unwrap_err().contains("mcpServers"));
         assert!(parse_servers_json(r#"{"mcpServers": {"a": {}}}"#)
             .unwrap_err()

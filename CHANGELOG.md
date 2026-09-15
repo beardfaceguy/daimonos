@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- MCP configuration can use Zed's JSONC `context_servers` directly, and
+  `daimonos mcp-config sync -- COMMAND` adapts it for file-only harnesses such
+  as Cursor ACP on every launch. Zed is now the default MCP source for new and
+  default-only Daimonos configurations. Existing users who want to retain
+  `~/.config/daimonos/mcp_servers.json` must set
+  `[agent.mcp].servers_file` explicitly. ACP empty-list recovery is limited to
+  clients identifying as Zed and is controlled by
+  `[acp.mcp].zed_config_fallback`.
+
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
