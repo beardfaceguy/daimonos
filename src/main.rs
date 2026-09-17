@@ -14,7 +14,6 @@ mod config;
 mod context_metrics;
 mod coordination;
 mod env_file;
-mod evidence;
 mod frontend_state;
 mod headless_frontend;
 mod index;
