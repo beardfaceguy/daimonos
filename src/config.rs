@@ -996,6 +996,56 @@ impl AcpConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpOAuthServer {
+    pub url: String,
+    #[serde(default = "default_oauth_profile")]
+    pub profile: String,
+    pub client_id: Option<String>,
+    pub scope: Option<String>,
+}
+
+fn default_oauth_profile() -> String {
+    "default".into()
+}
+
+impl AcpMcpConfig {
+    fn validate_oauth(&self) -> Result<(), String> {
+        let mut identities = HashSet::new();
+        for (name, server) in &self.oauth_servers {
+            if name.is_empty()
+                || server.profile.is_empty()
+                || server.profile.contains('/')
+                || server.profile.contains('\\')
+            {
+                return Err("mcp_oauth: server name/profile must be nonempty and profile cannot contain separators".into());
+            }
+            let identity = crate::mcp_oauth::canonical_endpoint(&server.url)
+                .map_err(|_| format!("mcp_oauth.servers.{name}: invalid HTTPS endpoint"))?;
+            if !identities.insert((identity, server.profile.clone())) {
+                return Err(format!(
+                    "mcp_oauth.servers.{name}: duplicate endpoint/profile"
+                ));
+            }
+            if server
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.trim().is_empty())
+            {
+                return Err(format!("mcp_oauth.servers.{name}: empty scope"));
+            }
+            if server
+                .client_id
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty())
+            {
+                return Err(format!("mcp_oauth.servers.{name}: empty client_id"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the ACP MCP-server bridge (ADR-003, vikunja #990). Zed
 /// forwards every configured context server on session/new and session/load;
 /// when enabled, daimonos connects to each as an MCP client, discovers its
@@ -1051,6 +1101,8 @@ pub struct AcpMcpConfig {
     /// Path to Zed's `settings.json` for `zed_config_fallback`. `None` derives
     /// it from `$XDG_CONFIG_HOME`/`$HOME` (`~/.config/zed/settings.json`).
     pub zed_settings_path: Option<String>,
+    /// Explicit endpoint/profile OAuth policy for outbound HTTP MCP.
+    pub oauth_servers: HashMap<String, McpOAuthServer>,
 }
 
 impl Default for AcpMcpConfig {
@@ -1069,12 +1121,14 @@ impl Default for AcpMcpConfig {
             max_tools_per_server: 128,
             zed_config_fallback: true,
             zed_settings_path: None,
+            oauth_servers: HashMap::new(),
         }
     }
 }
 
 impl AcpMcpConfig {
     fn validate(&self) -> Result<(), String> {
+        self.validate_oauth()?;
         if !self.enabled {
             return Ok(());
         }
@@ -2731,6 +2785,23 @@ mod tests {
         assert_eq!(cfg.acp.mcp.max_servers, 4);
         assert_eq!(cfg.acp.mcp.max_concurrent_connects, 2);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn oauth_policy_parses_and_requires_unique_https_identity() {
+        let source = "[acp.mcp.oauth_servers.notion]\nurl = \"https://mcp.notion.com/mcp\"\nprofile = \"meetalix\"\n";
+        let cfg: Config = toml::from_str(source).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.acp.mcp.oauth_servers["notion"].profile, "meetalix");
+        let duplicate: Config = toml::from_str(&format!("{source}[acp.mcp.oauth_servers.alias]\nurl = \"https://mcp.notion.com/mcp/\"\nprofile = \"meetalix\"\n")).unwrap();
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .contains("duplicate endpoint/profile"));
+        let insecure: Config =
+            toml::from_str("[acp.mcp.oauth_servers.local]\nurl = \"http://example.com/mcp\"\n")
+                .unwrap();
+        assert!(insecure.validate().is_err());
     }
 
     #[test]

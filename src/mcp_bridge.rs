@@ -82,6 +82,10 @@ enum ServerKey {
         url: String,
         headers: Vec<(String, String)>,
     },
+    OAuth {
+        url: String,
+        profile: String,
+    },
 }
 
 impl From<&ServerSpec> for ServerKey {
@@ -116,10 +120,15 @@ struct PoolLease {
     client: Arc<ClientRuntime>,
     tools: Arc<Vec<Tool>>,
     shutdown_timeout: Duration,
+    _oauth_proxy: Option<Arc<crate::mcp_oauth::OAuthProxy>>,
 }
 
 enum ConnectOutcome {
-    Ready(Arc<ClientRuntime>, Vec<Tool>),
+    Ready(
+        Arc<ClientRuntime>,
+        Vec<Tool>,
+        Option<Arc<crate::mcp_oauth::OAuthProxy>>,
+    ),
     RejectedSelf(Arc<ClientRuntime>),
 }
 
@@ -138,6 +147,7 @@ enum PoolSlotState {
         client: Arc<ClientRuntime>,
         tools: Arc<Vec<Tool>>,
         leases: usize,
+        oauth_proxy: Option<Arc<crate::mcp_oauth::OAuthProxy>>,
     },
 }
 
@@ -166,7 +176,30 @@ impl McpClientPool {
         init_timeout: Duration,
         reject_daimonos: bool,
     ) -> Result<Option<PoolLease>, String> {
-        let key = ServerKey::from(spec);
+        // Reject conflicted credentials before pooling, and never key pooled
+        // clients by a bearer token. OAuth profiles are nonsecret identities.
+        if let ServerSpec::Http { url, headers, .. } = spec {
+            if let Some((name, _policy)) = crate::mcp_oauth::policy_for(&cfg.oauth_servers, url) {
+                if !headers.is_empty() {
+                    return Err(format!(
+                        "MCP OAuth server '{name}': remove forwarded headers before enabling OAuth"
+                    ));
+                }
+            }
+        }
+        let key = match spec {
+            ServerSpec::Http { url, .. } => {
+                if let Some((_, policy)) = crate::mcp_oauth::policy_for(&cfg.oauth_servers, url) {
+                    ServerKey::OAuth {
+                        url: crate::mcp_oauth::canonical_endpoint(url)?,
+                        profile: policy.profile.clone(),
+                    }
+                } else {
+                    ServerKey::from(spec)
+                }
+            }
+            _ => ServerKey::from(spec),
+        };
         let slot = {
             let mut slots = self.inner.slots.lock().await;
             // A Weak whose strong count reached zero cannot be resurrected, so
@@ -187,6 +220,7 @@ impl McpClientPool {
                 client,
                 tools,
                 leases,
+                oauth_proxy,
             } = &mut *state
             {
                 *leases += 1;
@@ -195,6 +229,7 @@ impl McpClientPool {
                     client: Arc::clone(client),
                     tools: Arc::clone(tools),
                     shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
+                    _oauth_proxy: oauth_proxy.clone(),
                 }));
             }
             if matches!(*state, PoolSlotState::ShuttingDown) {
@@ -210,31 +245,34 @@ impl McpClientPool {
             break state;
         };
 
-        let (client, tools) = match connect(spec, cfg, init_timeout, reject_daimonos).await? {
-            ConnectOutcome::Ready(client, tools) => (client, tools),
-            ConnectOutcome::RejectedSelf(client) => {
-                *state = PoolSlotState::ShuttingDown;
-                drop(state);
-                shutdown_slot_client(
-                    Arc::clone(&slot),
-                    client,
-                    Duration::from_secs(cfg.shutdown_timeout_secs),
-                )
-                .await;
-                return Ok(None);
-            }
-        };
+        let (client, tools, oauth_proxy) =
+            match connect(spec, cfg, init_timeout, reject_daimonos).await? {
+                ConnectOutcome::Ready(client, tools, proxy) => (client, tools, proxy),
+                ConnectOutcome::RejectedSelf(client) => {
+                    *state = PoolSlotState::ShuttingDown;
+                    drop(state);
+                    shutdown_slot_client(
+                        Arc::clone(&slot),
+                        client,
+                        Duration::from_secs(cfg.shutdown_timeout_secs),
+                    )
+                    .await;
+                    return Ok(None);
+                }
+            };
         let tools = Arc::new(tools);
         *state = PoolSlotState::Ready {
             client: Arc::clone(&client),
             tools: Arc::clone(&tools),
             leases: 1,
+            oauth_proxy: oauth_proxy.clone(),
         };
         Ok(Some(PoolLease {
             slot: Arc::clone(&slot),
             client,
             tools,
             shutdown_timeout: Duration::from_secs(cfg.shutdown_timeout_secs),
+            _oauth_proxy: oauth_proxy,
         }))
     }
 
@@ -985,10 +1023,27 @@ async fn connect(
     init_timeout: Duration,
     reject_daimonos: bool,
 ) -> Result<ConnectOutcome, String> {
-    let client = create_client(spec, cfg)?;
     let deadline = tokio::time::Instant::now() + init_timeout;
+    let proxy = match spec {
+        ServerSpec::Http { url, .. }
+            if crate::mcp_oauth::policy_for(&cfg.oauth_servers, url).is_some() =>
+        {
+            let (_, policy) =
+                crate::mcp_oauth::policy_for(&cfg.oauth_servers, url).expect("matched policy");
+            Some(Arc::new(
+                tokio::time::timeout_at(
+                    deadline,
+                    crate::mcp_oauth::start_proxy(url, &policy.profile),
+                )
+                .await
+                .map_err(|_| "OAuth proxy startup timed out")??,
+            ))
+        }
+        _ => None,
+    };
+    let client = create_client_with_proxy(spec, cfg, proxy.as_deref())?;
     match handshake(&client, deadline, reject_daimonos).await {
-        Ok(Some(tools)) => Ok(ConnectOutcome::Ready(client, tools)),
+        Ok(Some(tools)) => Ok(ConnectOutcome::Ready(client, tools, proxy)),
         Ok(None) => Ok(ConnectOutcome::RejectedSelf(client)),
         Err(e) => {
             shutdown_rejected_client(client, cfg).await;
@@ -1044,7 +1099,16 @@ fn client_details() -> InitializeRequestParams {
     }
 }
 
+#[cfg(test)]
 fn create_client(spec: &ServerSpec, cfg: &AcpMcpConfig) -> Result<Arc<ClientRuntime>, String> {
+    create_client_with_proxy(spec, cfg, None)
+}
+
+fn create_client_with_proxy(
+    spec: &ServerSpec,
+    cfg: &AcpMcpConfig,
+    proxy: Option<&crate::mcp_oauth::OAuthProxy>,
+) -> Result<Arc<ClientRuntime>, String> {
     match spec {
         ServerSpec::Stdio {
             command, args, env, ..
@@ -1077,13 +1141,27 @@ fn create_client(spec: &ServerSpec, cfg: &AcpMcpConfig) -> Result<Arc<ClientRunt
             if !cfg.allow_http {
                 return Err("http transport disabled by config".to_string());
             }
+            let mut headers = headers.clone();
+            let mut effective_url = url.clone();
+            if let Some((name, _)) = crate::mcp_oauth::policy_for(&cfg.oauth_servers, url) {
+                if !headers.is_empty() {
+                    return Err(format!(
+                        "MCP OAuth server '{name}': remove forwarded headers"
+                    ));
+                }
+                let proxy = proxy.ok_or_else(|| {
+                    format!("auth_required: MCP server '{name}' requires a Daimonos OAuth grant")
+                })?;
+                effective_url = proxy.url.clone();
+                headers.insert("x-daimonos-proxy-key".into(), proxy.capability.clone());
+            }
             let options = StreamableTransportOptions {
-                mcp_url: url.clone(),
+                mcp_url: effective_url,
                 request_options: RequestOptions {
                     custom_headers: if headers.is_empty() {
                         None
                     } else {
-                        Some(headers.clone())
+                        Some(headers)
                     },
                     ..RequestOptions::default()
                 },
@@ -1223,6 +1301,56 @@ mod tests {
             ]),
         };
         assert!(ServerKey::from(&first) != ServerKey::from(&different_credentials));
+    }
+
+    #[test]
+    fn oauth_pool_identity_separates_profiles_without_tokens() {
+        let url = "https://example.com/mcp".to_string();
+        let first = ServerKey::OAuth {
+            url: url.clone(),
+            profile: "personal".into(),
+        };
+        let second = ServerKey::OAuth {
+            url,
+            profile: "work".into(),
+        };
+        assert!(first != second);
+    }
+
+    #[test]
+    fn oauth_policy_fails_closed_without_forwarding_credentials() {
+        let spec = ServerSpec::Http {
+            name: "notion".into(),
+            url: "https://mcp.notion.com/mcp".into(),
+            headers: HashMap::new(),
+        };
+        let mut cfg = AcpMcpConfig::default();
+        cfg.oauth_servers.insert(
+            "notion".into(),
+            crate::config::McpOAuthServer {
+                url: "https://mcp.notion.com/mcp".into(),
+                profile: "default".into(),
+                client_id: None,
+                scope: None,
+            },
+        );
+        let message = match create_client(&spec, &cfg) {
+            Err(message) => message,
+            Ok(_) => panic!("OAuth transport must fail closed until supported"),
+        };
+        assert!(message.contains("auth_required"));
+        assert!(!message.contains("Bearer"));
+        let with_auth = ServerSpec::Http {
+            name: "notion".into(),
+            url: "https://mcp.notion.com/mcp".into(),
+            headers: HashMap::from([("authorization".into(), "secret".into())]),
+        };
+        let message = match create_client(&with_auth, &cfg) {
+            Err(message) => message,
+            Ok(_) => panic!("static authorization cannot mix with OAuth"),
+        };
+        assert!(message.contains("remove forwarded headers"));
+        assert!(!message.contains("secret"));
     }
 
     #[tokio::test]

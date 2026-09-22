@@ -113,6 +113,27 @@ pub struct McpArgs {
     /// Serve MCP over this Unix socket instead of stdio.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Authorize, inspect, or remove a Daimonos-owned OAuth grant.
+    Auth {
+        #[command(subcommand)]
+        command: McpAuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpAuthCommand {
+    /// Authorize a server in the browser, displaying the URL as a fallback.
+    Login { server: String },
+    /// Show nonsecret grant status for a configured server.
+    Status { server: String },
+    /// Remove a Daimonos-owned grant; does not touch Zed's keychain.
+    Logout { server: String },
 }
 
 #[derive(Debug, Args)]
@@ -197,6 +218,7 @@ pub enum RuntimeMode {
     McpStdio,
     McpSocket(PathBuf),
     McpConfig,
+    McpAuth,
     Daemon,
     Stats,
 }
@@ -212,6 +234,7 @@ impl RuntimeMode {
             Self::McpStdio => "mcp_stdio",
             Self::McpSocket(_) => "mcp_socket",
             Self::McpConfig => "mcp_config",
+            Self::McpAuth => "mcp_auth",
             Self::Daemon => "socket",
             Self::Stats => "stats",
         }
@@ -300,6 +323,7 @@ impl Cli {
             Some(Command::SessionDaemon(_)) => RuntimeMode::SessionDaemon,
             Some(Command::Session(_)) => RuntimeMode::Session,
             Some(Command::McpConfig(_)) => RuntimeMode::McpConfig,
+            Some(Command::Mcp(args)) if args.command.is_some() => RuntimeMode::McpAuth,
             Some(Command::Mcp(args)) => args
                 .socket
                 .clone()

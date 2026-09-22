@@ -397,6 +397,13 @@ max_concurrent_connects = 8
 # Upper bound on tools registered from any single server (bounds the exposed
 # tool set). Extra tools are ignored.
 max_tools_per_server = 128
+
+# Explicit outbound OAuth policy. Zed forwards only URL/headers; credentials
+# are owned by Daimonos under ~/.blue_rose/mcp-oauth, never Zed. Run
+# `daimonos mcp auth login <name>` to authorize before reconnecting ACP.
+# [acp.mcp.oauth_servers.notion]
+# url = "https://mcp.notion.com/mcp"
+# profile = "meetalix"
 # Fallback for unpatched Zed: when Zed forwards an EMPTY MCP server list at
 # session start (a cold-start race where its context-server store isn't
 # populated yet, and it never re-forwards to a live session), read Zed's own

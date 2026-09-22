@@ -24,6 +24,7 @@ mod managed_process;
 mod mcp;
 mod mcp_bridge;
 mod mcp_config_cmd;
+mod mcp_oauth;
 mod observability;
 mod ops;
 mod paths;
@@ -339,6 +340,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Session(args)) => session_interchange::run(args, &cfg),
         Some(Command::McpConfig(args)) => mcp_config_cmd::run(args),
+        Some(Command::Mcp(cli::McpArgs {
+            command: Some(cli::McpCommand::Auth { command }),
+            ..
+        })) => mcp_oauth::run_command(command, &cfg.acp.mcp).await,
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
@@ -485,6 +490,7 @@ async fn run_tool_service(
         | RuntimeMode::Session
         | RuntimeMode::SessionDaemon
         | RuntimeMode::McpConfig
+        | RuntimeMode::McpAuth
         | RuntimeMode::Stats => {
             unreachable!("early-return runtime reached service dispatch")
         }
