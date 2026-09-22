@@ -10,6 +10,7 @@ PROMPT_FILES = {
     "summary": "summary.md",
     "loop_steer": "loop_steer.md",
     "cancelled_turn": "cancelled_turn.md",
+    "skill_catalog": "skill_catalog.md",
     "tool_descriptions": "tool_descriptions.toml",
 }
 

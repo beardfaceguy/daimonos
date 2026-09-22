@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::AgentSession;
 use crate::compaction::CompactionPolicy;
-use crate::providers::{Message, ThinkingLevel};
+use crate::providers::{ContentBlock, Message, Role, ThinkingLevel};
 use crate::session_protocol::{
     ApprovalDecision, ApprovalRequest, AssistantOutcome, ClientCapability, ContextUsage,
     RuntimeOption, RuntimeValue, SessionEvent, SessionUsage, TurnStatus,
@@ -1770,6 +1770,20 @@ impl SessionCore {
         M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
     {
         let mut agent_session = self.session.lock().await;
+        let mut user_message = user_message;
+        let direct_text = match (&user_message.role, user_message.content.as_slice()) {
+            (Role::User, [ContentBlock::Text(text)]) => Some(text.as_str()),
+            _ => None,
+        };
+        if let Some(text) = direct_text {
+            let expanded = agent_session
+                .expand_skill_invocation(text)
+                .await
+                .map_err(SessionPromptError::Model)?;
+            if expanded != text {
+                user_message = Message::user(expanded);
+            }
+        }
         {
             let mut client_ids = self.client_user_message_ids.lock().await;
             align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());

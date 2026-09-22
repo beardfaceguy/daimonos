@@ -17,6 +17,7 @@ recompiling** by pointing the matching key in your `daimonos.toml` at a file:
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
 # cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
+# skill_catalog    = "~/.config/daimonos/prompts/skill_catalog.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
@@ -48,8 +49,9 @@ Because the defaults are embedded in the binary, you can recover them at runtime
 daimonos --print-prompt <name>       # print one default to stdout (name is one
                                      #   of: agent_system, mcp_instructions,
                                      #   kgl_hint, summary, loop_steer,
-                                     #   cancelled_turn, tool_descriptions)
-daimonos --dump-prompts              # scaffold all seven resources into
+                                     #   cancelled_turn, skill_catalog,
+                                     #   tool_descriptions)
+daimonos --dump-prompts              # scaffold all eight resources into
                                      #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/dir    # ...into a custom directory
 daimonos --dump-prompts --force      # overwrite existing files
@@ -93,6 +95,7 @@ does not affect `daimonos --mcp`, whose host-facing prompt is
 | `summary.md` | context compaction (all interactive runtimes) | System prompt for the one-shot summarizer that replaces evicted turns. |
 | `loop_steer.md` | `daimonos agent`, `chat`, ACP | Corrective steer rotated by the deterministic loop detector. |
 | `cancelled_turn.md` | `daimonos chat`, ACP | Safety note retained after cancellation and used for unresolved tool results. |
+| `skill_catalog.md` | `daimonos agent`, `chat`, ACP | Introduction prepended to the bounded metadata-only Agent Skills catalog. |
 | `tool_descriptions.toml` | MCP, agent, chat, ACP | Full descriptions for all tools, curated terse variants, and top-level parameter descriptions injected into JSON Schemas. |
 
 ## WARNING
