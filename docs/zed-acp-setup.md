@@ -13,6 +13,41 @@ used together.
   `daimonos acp` loads it the same way `daimonos agent`/`daimonos chat` do
 - Zed editor installed, with agent-panel support for custom `agent_servers`
 
+## Hosted MCP OAuth
+
+A Zed OAuth grant in Zed's keychain is **not** forwarded to a custom ACP
+agent. Daimonos must own a separate OAuth grant for hosted servers such as
+`https://mcp.notion.com/mcp`. Configure a non-secret endpoint policy in Daimonos as described in
+[configuration.md](configuration.md#acpmcpoauth_serversname--outbound-oauth-policy).
+For Notion, use `url = "https://mcp.notion.com/mcp"` and `profile = "meetalix"`.
+The native flow requires Zed's `context_servers.notion` entry to use a
+**direct remote URL**, not a `command` launching `mcp-remote`:
+
+```jsonc
+"notion": { "enabled": true, "url": "https://mcp.notion.com/mcp" }
+```
+
+Remove the previous `command`/`args`/`env` fields *from this entry only* when
+switching. Keep a backup of Zed settings so the working stdio workaround can
+be restored if needed. Do not include an `Authorization` header or remove
+Zed's existing keychain grant.
+
+From a terminal, run `daimonos mcp auth login notion`. Daimonos prints the
+URL *and* attempts to open your browser. Select **MeetAlix** on Notion's
+consent screen. Then run `daimonos mcp auth status notion` and open a new
+Daimonos ACP session in Zed (or reconnect the current session) so the bridge
+rediscovers `mcp__notion__*` tools. Fetch the roadmap page with a Notion MCP
+tool, not web search. If the authenticated tool returns a page-level 404,
+check Notion workspace/page permissions separately. Token refresh is automatic;
+`daimonos mcp auth logout notion` removes only Daimonos's grant.
+
+Daimonos uses a private loopback proxy for authenticated HTTP, so bearer
+tokens stay out of Zed's keychain/config and ACP messages. A missing grant is
+reported as `auth_required`; unrelated servers continue to work. No live
+Notion authorization or page fetch has been performed by this implementation
+work. Do not remove Zed's existing grant. The `mcp-remote` stdio workaround
+remains available if this native flow is incompatible with the server.
+
 ## Shared MCP configuration
 
 Daimonos treats Zed as the primary MCP configuration by default. Non-ACP

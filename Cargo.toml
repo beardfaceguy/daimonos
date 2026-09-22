@@ -8,6 +8,8 @@ description = "Daimonos — an agent-optimized OS layer for remote LLM agents"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+fs2 = "0.4"
 glob = "0.3"
 regex = "1"
 grep-regex = "0.1"
@@ -46,7 +48,7 @@ allocative = ">=0.3.4, <0.3.6"
 # the trailing partial line, so large multi-chunk responses assemble. Return
 # to crates.io once these land upstream (rust-mcp-stack/rust-mcp-sdk#215 +
 # follow-ups).
-rust-mcp-sdk = { git = "https://github.com/beardfaceguy/rust-mcp-sdk", rev = "0d9ecb4f9adb275d25a29e84c79635431f6fbd8d", default-features = false, features = ["server", "client", "stdio", "streamable-http", "sse"] }
+rust-mcp-sdk = { git = "https://github.com/beardfaceguy/rust-mcp-sdk", rev = "0d9ecb4f9adb275d25a29e84c79635431f6fbd8d", default-features = false, features = ["server", "client", "stdio", "streamable-http", "sse", "auth"] }
 similar = "3"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"

@@ -523,6 +523,44 @@ These settings apply to native ACP integrations such as Zed.
 session_list_page_size = 50
 ```
 
+#### `[acp.mcp.oauth_servers.<name>]` — outbound OAuth policy
+
+A *non-secret policy* is routing/configuration metadata: the endpoint URL,
+OAuth opt-in and local profile, optional public client ID and scopes. It does
+**not** include access/refresh tokens or client secrets. Policies belong in
+Daimonos config; grants belong in `~/.blue_rose/mcp-oauth/`.
+
+Outbound MCP OAuth is opt-in per endpoint. `mcp auth login` performs
+protected-resource and authorization-server discovery, authorization-code +
+PKCE in a browser with a localhost callback, and writes a private grant.
+When ACP starts (or a new session rebuilds its bridge), a capability-protected
+loopback proxy forwards MCP traffic to the configured HTTPS endpoint, refreshes
+expiring grants, and prevents bearer tokens from reaching the SDK, Zed, tool
+schemas, or redirect targets. Other servers remain available when one requires
+authorization. A live Notion consent/fetch test still requires the user's
+workspace selection and has **not** been run.
+
+```toml
+[acp.mcp.oauth_servers.notion]
+url = "https://mcp.notion.com/mcp"
+profile = "meetalix"
+# client_id = "..." # Daimonos client ID, never assumed to be Zed's
+# scope = "..."
+```
+
+Policies match canonical HTTPS endpoint URLs, require unique URL/profile
+pairs, and reject **all** forwarded headers on OAuth-enabled endpoints.
+Keep server-specific headers in non-OAuth configurations; this boundary prevents
+an arbitrary upstream header from carrying sensitive data past the proxy. `daimonos mcp auth login
+notion` displays an authorization URL and attempts to open it in the browser;
+select the intended workspace in the consent screen. `daimonos mcp auth status
+notion` reports nonsecret grant status; `daimonos mcp auth logout notion`
+removes *only Daimonos's* local grant. Private files under
+`~/.blue_rose/mcp-oauth/` use a mode `0700` directory and mode `0600` files
+with atomic replacement; they are not encrypted at rest. Never put a token in
+Zed settings or the TOML policy. Authorization must be initiated outside an ACP
+agent turn. Reconnect or start a new ACP session after login to discover tools.
+
 #### `[acp.mcp]` — MCP-server bridge
 
 Zed forwards every configured context server to the ACP agent on `session/new`
