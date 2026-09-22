@@ -212,7 +212,9 @@ impl SessionFactory for AgentSessionFactory {
             tools.extend(mcp.tools());
         }
         let agent_config = AgentConfig {
-            system: Some(crate::prompts::agent_system(&self.config).await),
+            system: Some(
+                crate::prompts::agent_system_for_workspace(&self.config, Some(&workspace)).await,
+            ),
             tools,
             opts: CompleteOpts {
                 model: model.clone(),

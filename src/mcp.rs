@@ -425,6 +425,15 @@ async fn dispatch_tool_inner(
 
     // Special tools that need session access or custom handling
     match name {
+        "skill" => {
+            let Some(name) = args.get("name").and_then(Value::as_str) else {
+                return err_text("skill requires a string 'name'".into());
+            };
+            match crate::skills::activation_envelope(&session.workspace, name) {
+                Ok(body) => ok_text(body),
+                Err(error) => err_text(error),
+            }
+        }
         "get_tool_schema" => {
             let names = match args.get("tools").and_then(|v| v.as_array()) {
                 Some(arr) => arr

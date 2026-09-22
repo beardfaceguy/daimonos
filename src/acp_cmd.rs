@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context as TaskContext, Poll};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost, DeleteSessionRequest,
-    DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource, ImageContent,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    CancelNotification, ContentBlock as AcpContentBlock, ContentChunk, Cost as AcpCost,
+    DeleteSessionRequest, DeleteSessionResponse, Diff as AcpDiff, EmbeddedResourceResource,
+    ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
     NewSessionResponse, PermissionOption, PermissionOptionKind, Plan as AcpPlan,
     PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
@@ -34,7 +34,7 @@ use agent_client_protocol::schema::v1::{
     SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
     TextContent, ToolCall, ToolCallContent as AcpToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgentRole, ByteStreams, Client as AcpClientRole, ConnectTo, ConnectionTo, Dispatch,
@@ -542,7 +542,11 @@ fn parse_acp_command(text: &str) -> Option<AcpCommand> {
     }
 }
 
-fn available_commands() -> Vec<AvailableCommand> {
+const ACP_SKILL_META_KIND: &str = "io.daimonos.skill";
+const ACP_SKILL_META_SOURCE: &str = "io.daimonos.skill.source";
+const ACP_SKILL_META_PATH: &str = "io.daimonos.skill.path";
+
+fn builtin_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new(
             "clear",
@@ -553,11 +557,49 @@ fn available_commands() -> Vec<AvailableCommand> {
     ]
 }
 
-fn send_available_commands(cx: &ConnectionTo<AcpClientRole>, session_id: &SessionId) {
+fn available_commands(workspace: &Path) -> Vec<AvailableCommand> {
+    let mut commands = builtin_commands();
+    let reserved: HashSet<String> = commands
+        .iter()
+        .map(|command| command.name.clone())
+        .collect();
+    commands.extend(
+        crate::skills::discover(workspace)
+            .skills
+            .into_iter()
+            .filter(|skill| !reserved.contains(skill.metadata.name.as_str()))
+            .map(|skill| {
+                AvailableCommand::new(&skill.metadata.name, &skill.metadata.description)
+                    .input(AvailableCommandInput::Unstructured(
+                        UnstructuredCommandInput::new("<arguments>"),
+                    ))
+                    .meta(Meta::from_iter([
+                        (ACP_SKILL_META_KIND.into(), serde_json::json!(true)),
+                        (
+                            ACP_SKILL_META_SOURCE.into(),
+                            serde_json::json!(skill.source.label()),
+                        ),
+                        (
+                            ACP_SKILL_META_PATH.into(),
+                            serde_json::json!(skill.file.to_string_lossy()),
+                        ),
+                    ]))
+            }),
+    );
+    commands
+}
+
+fn send_available_commands(
+    cx: &ConnectionTo<AcpClientRole>,
+    session_id: &SessionId,
+    workspace: &Path,
+) {
     send_notification(
         cx,
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
+            workspace,
+        ))),
     );
 }
 
@@ -1886,7 +1928,7 @@ async fn run_prompt_turn(
     handle: &Arc<SessionHandle>,
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    user_message: CoreMessage,
+    mut user_message: CoreMessage,
     client_user_message_id: Option<String>,
     assistant_prefix: Option<String>,
 ) -> Result<AcpStopReason, TurnError> {
@@ -1899,6 +1941,14 @@ async fn run_prompt_turn(
             client_user_message_id.as_deref(),
         )
         .await;
+    }
+
+    if let Some(text) = direct_command_text(&user_message) {
+        if let Ok(expanded) = crate::skills::expand_manual_invocation(&handle.core.cwd, text) {
+            if expanded != text {
+                user_message = CoreMessage::user(expanded);
+            }
+        }
     }
 
     *handle
@@ -2222,7 +2272,7 @@ async fn build_session_handle(
         Arc::clone(&tool_lifecycle),
         token_log,
         state.compaction.policy.clone(),
-        crate::prompts::agent_system(cfg).await,
+        crate::prompts::agent_system_for_workspace(cfg, Some(&session_workspace)).await,
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
@@ -2989,7 +3039,7 @@ fn build_agent_with_state(
                             NewSessionResponse::new(session_id.clone())
                                 .config_options(Some(config_options)),
                         )?;
-                        send_available_commands(&cx, &session_id);
+                        send_available_commands(&cx, &session_id, &handle.core.cwd);
                         send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
                         tracing::info!(
                             target: "daimonos::acp",
@@ -3204,7 +3254,7 @@ fn build_agent_with_state(
                         responder.respond(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
-                        send_available_commands(&cx, &session_id);
+                        send_available_commands(&cx, &session_id, &active_handle.core.cwd);
                         // Notifications must follow a successfully queued load
                         // response: Zed registers the session while handling
                         // that response, then accepts its session updates.
@@ -4402,7 +4452,8 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(command_names, vec!["clear", "usage", "help"]);
+        assert_eq!(&command_names[..3], &["clear", "usage", "help"]);
+        assert!(command_names.contains(&"vik"));
     }
 
     #[tokio::test]
@@ -5304,6 +5355,62 @@ mod tests {
         assert!(
             persisted.messages.is_empty(),
             "/clear must persist empty history"
+        );
+    }
+
+    #[test]
+    fn skill_commands_are_advertised_with_arguments_and_namespaced_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = workspace.path().join(".agents/skills/deploy");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Deploy the app\n---\n\nDo it safely.\n",
+        )
+        .unwrap();
+
+        let commands = available_commands(workspace.path());
+        let deploy = commands
+            .iter()
+            .find(|command| command.name == "deploy")
+            .unwrap();
+        assert!(matches!(
+            deploy.input,
+            Some(AvailableCommandInput::Unstructured(_))
+        ));
+        let meta = deploy.meta.as_ref().unwrap();
+        assert_eq!(
+            meta.get(ACP_SKILL_META_KIND),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            meta.get(ACP_SKILL_META_SOURCE),
+            Some(&serde_json::json!("workspace"))
+        );
+        assert_eq!(
+            meta.get(ACP_SKILL_META_PATH),
+            Some(&serde_json::json!(skill_dir
+                .join("SKILL.md")
+                .to_string_lossy())),
+        );
+    }
+
+    #[test]
+    fn skill_commands_do_not_shadow_builtin_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = workspace.path().join(".agents/skills/help");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: help\ndescription: Shadow help\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            available_commands(workspace.path())
+                .iter()
+                .filter(|command| command.name == "help")
+                .count(),
+            1,
         );
     }
 
@@ -7378,7 +7485,7 @@ mod tests {
             replayed.iter().any(|update| matches!(
                 update,
                 SessionUpdate::AvailableCommandsUpdate(commands)
-                    if commands.available_commands.len() == 3
+                    if commands.available_commands.iter().take(3).map(|command| command.name.as_str()).eq(["clear", "usage", "help"])
             )),
             "session/load must re-advertise slash commands: {replayed:?}"
         );

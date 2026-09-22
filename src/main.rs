@@ -50,6 +50,7 @@ mod session_interchange;
 mod session_protocol;
 mod session_store;
 mod session_timeline;
+mod skills;
 mod snapshot;
 mod tool_descriptions;
 mod tool_facade;

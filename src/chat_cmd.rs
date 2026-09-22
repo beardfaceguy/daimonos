@@ -232,7 +232,7 @@ pub async fn run_chat(
     resume: Option<String>,
     compaction: Option<CompactionPolicy>,
 ) -> anyhow::Result<()> {
-    let system_prompt = crate::prompts::agent_system(&cfg).await;
+    let system_prompt = crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await;
     let mut config = build_agent_config_with_descriptions(
         workspace,
         model.clone(),
@@ -311,6 +311,8 @@ pub async fn run_chat(
                     if text.is_empty() {
                         continue;
                     }
+                    let text = crate::skills::expand_manual_invocation(workspace, &text)
+                        .unwrap_or_else(|error| format!("Agent skill activation error: {error}"));
                     let prompt_span = PromptSpan::new(PromptMetadata {
                         mode: "chat",
                         session_id: Some(&session_id),

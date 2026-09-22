@@ -174,7 +174,7 @@ pub async fn run_agent(
         }) as crate::agent::StreamHook
     });
     let config = AgentConfig {
-        system: Some(crate::prompts::agent_system(&cfg).await),
+        system: Some(crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await),
         tools,
         opts: CompleteOpts {
             model,
@@ -202,7 +202,9 @@ pub async fn run_agent(
     let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
     crate::provisioning::provision_session(&mut tool_session, &services);
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));
-    let initial = vec![Message::user(&args.task)];
+    let task = crate::skills::expand_manual_invocation(workspace, &args.task)
+        .map_err(anyhow::Error::msg)?;
+    let initial = vec![Message::user(task)];
     let external_session_id = crate::analytics::read_agent_session_id_env();
     let prompt_span = PromptSpan::new(PromptMetadata {
         mode: "agent",

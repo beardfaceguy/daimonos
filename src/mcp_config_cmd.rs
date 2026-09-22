@@ -35,7 +35,7 @@ fn sync(
     }
     let source = source
         .map(|p| crate::paths::expand_tilde(p.to_string_lossy().as_ref()))
-        .unwrap_or_else(|| crate::zed_config::default_settings_path());
+        .unwrap_or_else(crate::zed_config::default_settings_path);
     let target = crate::paths::expand_tilde(target.to_string_lossy().as_ref());
     let specs = crate::zed_config::context_server_specs(Some(source.to_string_lossy().as_ref()))?;
     let document = render_mcp_servers(&specs)?;
