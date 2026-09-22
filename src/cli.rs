@@ -223,7 +223,11 @@ impl RuntimeMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
+#[command(
+    name = "daimonos",
+    about = "Daimonos — agent-optimized OS layer",
+    version
+)]
 pub struct Cli {
     /// Unix socket path used by `daemon` and the legacy default mode.
     #[arg(short, long, default_value = "/tmp/daimonos.sock")]
@@ -323,6 +327,17 @@ mod tests {
 
     fn mode(args: &[&str]) -> RuntimeMode {
         Cli::try_parse_from(args).unwrap().runtime_mode()
+    }
+
+    #[test]
+    fn version_flag_reports_package_version() {
+        let error = Cli::try_parse_from(["daimonos", "--version"])
+            .expect_err("--version exits after printing version");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("daimonos {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

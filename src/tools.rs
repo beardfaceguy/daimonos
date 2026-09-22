@@ -409,6 +409,20 @@ pub fn all_tools() -> Vec<ToolDef> {
             context_check: None,
         },
         ToolDef {
+            name: "skill",
+            tier: ToolTier::AgentOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            to_request: None,
+            context_check: None,
+        },
+        ToolDef {
             name: crate::agent::UPDATE_PLAN_TOOL,
             tier: ToolTier::AgentOnly,
             schema: json!({
@@ -1384,7 +1398,7 @@ mod tests {
         assert!(terse.contains(&"snapshot"));
         assert!(on_demand.contains(&"diff_files"));
         assert!(on_demand.contains(&"tool_pipeline"));
-        assert_eq!(agent_only, vec![crate::agent::UPDATE_PLAN_TOOL]);
+        assert_eq!(agent_only, vec!["skill", crate::agent::UPDATE_PLAN_TOOL]);
         assert!(!tool_definitions(&descriptions())
             .iter()
             .any(|tool| tool.name == crate::agent::UPDATE_PLAN_TOOL));

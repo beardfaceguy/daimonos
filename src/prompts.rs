@@ -253,18 +253,43 @@ async fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> Str
 /// optional user instructions loaded during startup. The additional file is
 /// appended verbatim with only a blank-line separator — no hidden instruction
 /// text is injected around it.
+#[allow(dead_code)]
 pub async fn agent_system(cfg: &Config) -> String {
+    agent_system_for_workspace(cfg, None).await
+}
+
+/// Build the agent system prompt with a compact metadata-only Agent Skills
+/// catalog for `workspace`. Skill bodies remain on disk until the `skill` tool
+/// is invoked.
+pub async fn agent_system_for_workspace(
+    cfg: &Config,
+    workspace: Option<&std::path::Path>,
+) -> String {
     let mut prompt = resolve(
         "agent_system",
         cfg.prompts.agent_system.as_deref(),
         AGENT_SYSTEM_DEFAULT,
     )
     .await;
-    let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() else {
-        return prompt;
-    };
-    if additional.is_empty() {
-        return prompt;
+    if let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() {
+        append_prompt_section(&mut prompt, additional);
+    }
+    if let Some(workspace) = workspace {
+        let discovery = crate::skills::discover(workspace);
+        for warning in &discovery.warnings {
+            eprintln!("daimonos: agent skill warning: {warning}");
+        }
+        if let Some(catalog) = crate::skills::catalog(&discovery, crate::skills::CATALOG_MAX_BYTES)
+        {
+            append_prompt_section(&mut prompt, &catalog);
+        }
+    }
+    prompt
+}
+
+fn append_prompt_section(prompt: &mut String, section: &str) {
+    if section.is_empty() {
+        return;
     }
     if !prompt.ends_with('\n') {
         prompt.push('\n');
@@ -272,8 +297,7 @@ pub async fn agent_system(cfg: &Config) -> String {
     if !prompt.ends_with("\n\n") {
         prompt.push('\n');
     }
-    prompt.push_str(additional);
-    prompt
+    prompt.push_str(section);
 }
 
 /// Static MCP server instructions (before dynamic workspace context is appended).

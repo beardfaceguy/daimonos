@@ -60,6 +60,13 @@ terse = """Run Starlark (no `import` or top-level `for`/control flow); use `def 
 [execute_script.parameters]
 code = "Starlark source (not Python): no imports or top-level control flow. Set `result`; wrap loops/conditionals in a function."
 timeout = "Max seconds (default: 60)"
+[skill]
+full = """Load one discovered Agent Skill by name on demand. The tool accepts a validated skill name, never a filesystem path, and returns the selected skill's instructions plus source context. Project-local skills override same-named global skills."""
+terse = """Load a discovered Agent Skill by validated name; paths are not accepted."""
+
+[skill.parameters]
+name = "Discovered skill name; filesystem paths are not accepted"
+
 [update_plan]
 full = """Replace the current execution plan for a multi-step task. Send the complete list each time statuses change. Use an empty list to clear the plan."""
 terse = """Replace the complete multi-step execution plan and statuses."""

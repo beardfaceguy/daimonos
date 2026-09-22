@@ -77,6 +77,46 @@ DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
 DAIMONOS_AGENT_API_KEY=sk-...
 ```
 
+### Agent Skills (`DAIMONOS_SKILL_DIR`)
+
+Daimonos discovers portable Agent Skills from `~/.agents/skills` by default.
+Override that global root in `~/.config/daimonos/agent.env` (or the selected
+agent env file):
+
+```dotenv
+DAIMONOS_SKILL_DIR=/absolute/path/to/skills
+```
+
+The value must be absolute; `~/...` is expanded. An unset or blank value uses
+the default. Relative values are rejected with a warning and no global skills
+are loaded. Project skills are also discovered from
+`<workspace>/.agents/skills`; a project skill overrides a same-named global
+skill.
+
+Each skill is `<root>/<name>/SKILL.md`: Markdown with YAML frontmatter. Only
+`name` and `description` are required. Unknown frontmatter keys are tolerated
+for cross-harness portability; `disable-model-invocation: true` is an optional
+Zed-compatible extension that hides the skill from the model catalog while
+leaving manual `/name` activation available. Names use lowercase ASCII letters,
+digits, and hyphens, with a 64-byte limit. A `SKILL.md` may be at most 100 KiB.
+Supporting files should use paths relative to the skill directory.
+
+```markdown
+---
+name: code-review
+description: Review a change for correctness and security.
+---
+
+# Code review
+
+Review the requested change and report findings by severity.
+```
+
+At session startup Daimonos adds only eligible names and descriptions to the
+system prompt; bodies remain on disk until the model calls `skill` or the user
+enters `/code-review [arguments]`. This is separate from
+`agent-instructions.md`, which remains always-on.
+
 For `gpt-5.6-sol`, daimonos reports the documented 1,050,000-token context
 window and 128,000-token maximum output capability. The model is text-only;
 ACP image prompts are rejected before provider dispatch. OpenAI tool loops

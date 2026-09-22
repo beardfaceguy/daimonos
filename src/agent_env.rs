@@ -139,7 +139,7 @@ impl AgentEnv {
         let process_vars: HashMap<String, String> = std::env::vars_os()
             .filter_map(|(key, value)| {
                 let key = key.into_string().ok()?;
-                if !key.starts_with("DAIMONOS_AGENT_") {
+                if !key.starts_with("DAIMONOS_AGENT_") && key != crate::skills::SKILL_DIR_ENV {
                     return None;
                 }
                 Some((key, value.into_string().ok()?))
@@ -169,6 +169,16 @@ impl AgentEnv {
         })?;
         let mut vars = parse_dotenv(&content);
         merge_process_overrides(&mut vars, process_vars);
+        if let Some(skill_dir) = vars
+            .get(crate::skills::SKILL_DIR_ENV)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            // Agent Skills discovery is shared by all harness frontends. Publish
+            // the selected agent.env value so the discovery layer sees it; a
+            // non-empty process value already won during the merge above.
+            std::env::set_var(crate::skills::SKILL_DIR_ENV, skill_dir);
+        }
         Self::from_vars(&vars, &path)
     }
 
@@ -500,7 +510,7 @@ fn merge_process_overrides(
     process_vars: &HashMap<String, String>,
 ) {
     for (key, value) in process_vars {
-        if key.starts_with("DAIMONOS_AGENT_")
+        if (key.starts_with("DAIMONOS_AGENT_") || key == crate::skills::SKILL_DIR_ENV)
             && key != "DAIMONOS_AGENT_ENV"
             && !value.trim().is_empty()
         {
