@@ -8,6 +8,8 @@ PROMPT_FILES = {
     "mcp_instructions": "mcp_instructions.md",
     "kgl_hint": "kgl_hint.md",
     "summary": "summary.md",
+    "loop_steer": "loop_steer.md",
+    "cancelled_turn": "cancelled_turn.md",
     "tool_descriptions": "tool_descriptions.toml",
 }
 

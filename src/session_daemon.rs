@@ -5210,25 +5210,24 @@ mod tests {
             .await
             .unwrap();
 
-        let mut cancelled = false;
-        for _ in 0..4 {
-            let message = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv())
-                .await
-                .expect("cancellation event timeout")
-                .expect("daemon response");
-            if matches!(
-                message,
-                ServerMessage::Event {
-                    event: crate::session_protocol::SessionEvent::TurnStatusChanged {
-                        status: crate::session_protocol::TurnStatus::Cancelled
-                    },
-                    ..
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let message = client.recv().await.expect("daemon response");
+                if matches!(
+                    message,
+                    ServerMessage::Event {
+                        event: crate::session_protocol::SessionEvent::TurnStatusChanged {
+                            status: crate::session_protocol::TurnStatus::Cancelled
+                        },
+                        ..
+                    }
+                ) {
+                    break true;
                 }
-            ) {
-                cancelled = true;
-                break;
             }
-        }
+        })
+        .await
+        .expect("cancellation event timeout");
         assert!(cancelled);
         assert!(daemon.session("session-1").is_some());
 

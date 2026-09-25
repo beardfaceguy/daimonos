@@ -544,6 +544,8 @@ poll_interval_ms = 1500
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# loop_steer       = "~/.config/daimonos/prompts/loop_steer.md"
+# cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 # Note: `summary` is also overridable via the agent-env DAIMONOS_AGENT_SUMMARY_PROMPT,
 # which takes precedence over the path above.

@@ -200,6 +200,9 @@ pub struct AgentConfig {
     /// tools bridged into an ACP session — ADR-003). `None` = ACP bridge off.
     pub remote_tool_dispatch: Option<RemoteToolHook>,
     pub on_stream_event: Option<StreamHook>,
+    /// Model-facing note used to close a cancelled turn and unresolved calls.
+    /// `None` falls back to the embedded `prompts/cancelled_turn.md` default.
+    pub cancelled_turn_message: Option<String>,
     pub token_log: Option<TokenLogConfig>,
     /// Context/window compaction (ADR-002). `None` = off.
     pub compaction: Option<CompactionPolicy>,
@@ -849,8 +852,18 @@ pub async fn run(
     initial_messages: Vec<Message>,
     config: &AgentConfig,
 ) -> AgentResult {
+    run_with_journal(provider, session, initial_messages, config, None).await
+}
+
+async fn run_with_journal(
+    provider: &dyn LlmProvider,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    initial_messages: Vec<Message>,
+    config: &AgentConfig,
+    journal: Option<TurnJournalWriter>,
+) -> AgentResult {
     let drain_session = std::sync::Arc::clone(&session);
-    let result = run_inner(provider, session, initial_messages, config).await;
+    let result = run_inner(provider, session, initial_messages, config, journal).await;
     drain_analytics(&drain_session).await;
     result
 }
@@ -879,9 +892,13 @@ async fn run_inner(
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
     initial_messages: Vec<Message>,
     config: &AgentConfig,
+    journal: Option<TurnJournalWriter>,
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+    if let Some(journal) = &journal {
+        journal.checkpoint(&messages);
+    }
 
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
     // once per turn — explicit config wins, then the env override, then the
@@ -969,6 +986,9 @@ async fn run_inner(
             if let Some(detector) = loop_detector.as_mut() {
                 detector.on_context_pruned();
             }
+        }
+        if let Some(journal) = &journal {
+            journal.checkpoint(&messages);
         }
 
         // Safe boundary: no provider stream or tool call is active here. This
@@ -1105,6 +1125,9 @@ async fn run_inner(
             }
         }
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
+        if let Some(journal) = &journal {
+            journal.record_usage(&total_usage, &resp.usage);
+        }
         if let Some(log_cfg) = &config.token_log {
             let context_composition = crate::context_metrics::measure_context(&ctx);
             let response_tool_calls = resp
@@ -1137,6 +1160,9 @@ async fn run_inner(
                 role: Role::Assistant,
                 content: resp.content.clone(),
             });
+            if let Some(journal) = &journal {
+                journal.checkpoint(&messages);
+            }
         }
 
         match resp.stop_reason {
@@ -1173,6 +1199,9 @@ async fn run_inner(
                 messages = close_orphan_tool_calls(messages);
                 if text_only_truncation {
                     messages.push(Message::user(AUTO_CONTINUE_NUDGE));
+                }
+                if let Some(journal) = &journal {
+                    journal.checkpoint(&messages);
                 }
                 continue;
             }
@@ -1269,6 +1298,9 @@ async fn run_inner(
                 if text_only && messages.last().is_some_and(|m| m.role == Role::Assistant) {
                     messages.push(Message::user(ERROR_RESUME_NUDGE));
                 }
+                if let Some(journal) = &journal {
+                    journal.checkpoint(&messages);
+                }
                 continue;
             }
             StopReason::EndTurn
@@ -1340,6 +1372,9 @@ async fn run_inner(
                                     content: format!("blocked: {reason}"),
                                     is_error: true,
                                 });
+                                if let Some(journal) = &journal {
+                                    journal.checkpoint_tool_results(&messages, &tool_results);
+                                }
                                 continue;
                             }
                         }
@@ -1800,6 +1835,10 @@ async fn run_inner(
                         content,
                         is_error,
                     });
+                    if let Some(journal) = &journal {
+                        journal.checkpoint_tool_results(&messages, &tool_results);
+                        journal.record_usage(&total_usage, &resp.usage);
+                    }
                 }
 
                 if !tool_results.is_empty() {
@@ -1807,6 +1846,9 @@ async fn run_inner(
                         role: Role::User,
                         content: tool_results,
                     });
+                    if let Some(journal) = &journal {
+                        journal.checkpoint(&messages);
+                    }
                 }
 
                 // #1239: record the workspace after this turn's tools ran.
@@ -1909,6 +1951,64 @@ async fn run_inner(
 
 // --- Stateful multi-turn session (project #183, task #956) ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelledTurnKind {
+    New,
+    Retry,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TurnJournalMode {
+    Append,
+    ReplaceFrom(usize),
+}
+
+struct TurnJournalState {
+    mode: TurnJournalMode,
+    suffix: Vec<Message>,
+    usage: Usage,
+    last_call_usage: Usage,
+}
+
+#[derive(Clone)]
+struct TurnJournalWriter {
+    state: std::sync::Arc<std::sync::Mutex<TurnJournalState>>,
+    base_len: usize,
+}
+
+impl TurnJournalWriter {
+    fn checkpoint(&self, messages: &[Message]) {
+        let suffix = messages.get(self.base_len..).unwrap_or_default().to_vec();
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .suffix = suffix;
+    }
+
+    fn checkpoint_tool_results(&self, messages: &[Message], tool_results: &[ContentBlock]) {
+        let mut suffix = messages.get(self.base_len..).unwrap_or_default().to_vec();
+        if !tool_results.is_empty() {
+            suffix.push(Message {
+                role: Role::User,
+                content: tool_results.to_vec(),
+            });
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .suffix = suffix;
+    }
+
+    fn record_usage(&self, usage: &Usage, last_call_usage: &Usage) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.usage = usage.clone();
+        state.last_call_usage = last_call_usage.clone();
+    }
+}
+
 /// One turn's outcome from [`AgentSession::prompt`].
 pub struct TurnResult {
     /// Concatenated text of the final assistant message this turn.
@@ -1946,6 +2046,8 @@ pub struct AgentSession {
     /// provider returned no usage) — the trigger falls back to a chars/4
     /// estimate then.
     last_prompt_tokens: u64,
+    /// Cancellation-surviving provider-neutral suffix for the active turn.
+    inflight_turn: Option<std::sync::Arc<std::sync::Mutex<TurnJournalState>>>,
 }
 
 impl AgentSession {
@@ -1965,16 +2067,13 @@ impl AgentSession {
             messages: Vec::new(),
             total_usage: Usage::default(),
             last_prompt_tokens: 0,
+            inflight_turn: None,
         }
     }
 
     /// Send a user message, run the tool loop to completion, and return this
     /// turn's assistant text + usage. History and accumulated usage persist for
     /// the next prompt.
-    ///
-    /// Cancel-safe: `self.messages` is only overwritten after `run` completes,
-    /// so dropping this future mid-await (e.g. a REPL Ctrl-C abort) leaves the
-    /// session's history untouched instead of losing it to a half-finished turn.
     pub async fn prompt(&mut self, user_text: impl Into<String>) -> TurnResult {
         self.prompt_message(Message::user(user_text)).await
     }
@@ -1983,7 +2082,24 @@ impl AgentSession {
     /// user-role message so ACP images and embedded context survive provider
     /// serialization, history persistence, and retries.
     pub async fn prompt_message(&mut self, user_message: Message) -> TurnResult {
+        let result = self.staged_prompt_message(user_message).await;
+        self.commit_staged(result, true)
+    }
+
+    /// Begin a cancellable prompt synchronously, then return its staged future.
+    ///
+    /// The journal exists before the future is first polled, so cancellation
+    /// that is already ready still retains the external user message.
+    pub(crate) fn staged_prompt_message(
+        &mut self,
+        user_message: Message,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + '_>> {
         debug_assert_eq!(user_message.role, Role::User);
+        self.begin_turn_journal(TurnJournalMode::Append, user_message.clone());
+        Box::pin(async move { self.run_prompt_attempt(user_message).await })
+    }
+
+    async fn run_prompt_attempt(&mut self, user_message: Message) -> AgentResult {
         self.config
             .generation_ordinal
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2023,6 +2139,7 @@ impl AgentSession {
                 .generation_ordinal
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .checked_sub(1);
+            self.reset_turn_journal(user_message.clone());
             if self.compact("reactive_overflow").await.is_some() {
                 let retry =
                     crate::observability::RetrySpan::new("context_overflow", failed_ordinal);
@@ -2033,13 +2150,13 @@ impl AgentSession {
                 retry.finish(retry_error_type(&retried));
                 retried
             } else {
+                self.restore_turn_journal_from_result(&result);
                 result
             }
         } else {
             result
         };
-
-        self.commit(result)
+        result
     }
 
     /// Run one turn attempt against the current history without committing
@@ -2055,12 +2172,16 @@ impl AgentSession {
         mut history: Vec<Message>,
         user_message: &Message,
     ) -> AgentResult {
+        let base_len = history.len();
         history.push(user_message.clone());
-        let result = run(
+        self.reset_turn_journal(user_message.clone());
+        let writer = self.turn_journal_writer(base_len);
+        let result = run_with_journal(
             self.provider.as_ref(),
             std::sync::Arc::clone(&self.tool_session),
             history,
             &self.config,
+            writer,
         )
         .await;
         self.total_usage =
@@ -2070,18 +2191,150 @@ impl AgentSession {
     }
 
     pub async fn retry_last_turn(&mut self) -> Result<TurnResult, String> {
+        let result = self.staged_retry_last_turn()?.await;
+        Ok(self.commit_staged(result, true))
+    }
+
+    pub(crate) fn staged_retry_last_turn(
+        &mut self,
+    ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + '_>>, String>
+    {
         let Some(user_index) = self.messages.iter().rposition(is_user_turn_message) else {
             return Err("cannot retry: session has no user turn".to_string());
         };
         let user_message = self.messages[user_index].clone();
         let base_history = self.messages[..user_index].to_vec();
-        let retry = crate::observability::RetrySpan::new("explicit", None);
-        let result = self
-            .attempt_with_history(base_history, &user_message)
-            .instrument(retry.span().clone())
-            .await;
-        retry.finish(retry_error_type(&result));
-        Ok(self.commit(result))
+        self.begin_turn_journal(
+            TurnJournalMode::ReplaceFrom(user_index),
+            user_message.clone(),
+        );
+        Ok(Box::pin(async move {
+            let retry = crate::observability::RetrySpan::new("explicit", None);
+            let result = self
+                .attempt_with_history(base_history, &user_message)
+                .instrument(retry.span().clone())
+                .await;
+            retry.finish(retry_error_type(&result));
+            result
+        }))
+    }
+
+    fn begin_turn_journal(&mut self, mode: TurnJournalMode, user_message: Message) {
+        if self.inflight_turn.is_some() {
+            tracing::warn!(
+                target: "daimonos::agent",
+                event = "stale_turn_journal_finalized",
+                "finalizing a previously dropped turn before starting another"
+            );
+            let _ = self.finalize_cancelled_turn(false);
+        }
+        self.inflight_turn = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            TurnJournalState {
+                mode,
+                suffix: vec![user_message],
+                usage: Usage::default(),
+                last_call_usage: Usage::default(),
+            },
+        )));
+    }
+
+    fn reset_turn_journal(&mut self, user_message: Message) {
+        let Some(journal) = &self.inflight_turn else {
+            return;
+        };
+        let mut state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.suffix = vec![user_message];
+        state.usage = Usage::default();
+        state.last_call_usage = Usage::default();
+    }
+
+    fn restore_turn_journal_from_result(&mut self, result: &AgentResult) {
+        let Some(journal) = &self.inflight_turn else {
+            return;
+        };
+        let mut state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = match state.mode {
+            TurnJournalMode::Append => self.messages.len(),
+            TurnJournalMode::ReplaceFrom(index) => index,
+        };
+        state.suffix = result.messages.get(start..).unwrap_or_default().to_vec();
+        state.usage = result.usage.clone();
+        state.last_call_usage = result.last_call_usage.clone();
+    }
+
+    fn turn_journal_writer(&self, base_len: usize) -> Option<TurnJournalWriter> {
+        self.inflight_turn.as_ref().map(|state| TurnJournalWriter {
+            state: std::sync::Arc::clone(state),
+            base_len,
+        })
+    }
+
+    /// Commit a staged result after the caller won the turn-completion claim.
+    ///
+    /// Passing `false` is a lifecycle protocol violation: cancellation owns
+    /// the journal and must finalize it instead of allowing this result to
+    /// overwrite canonical history.
+    pub(crate) fn commit_staged(
+        &mut self,
+        result: AgentResult,
+        completion_claimed: bool,
+    ) -> TurnResult {
+        debug_assert!(
+            completion_claimed,
+            "staged turn committed without winning completion"
+        );
+        self.inflight_turn = None;
+        self.commit(result)
+    }
+
+    /// Promote the latest authoritative journal checkpoint after cancellation.
+    ///
+    /// `usage_already_applied` is true only when the staged future returned but
+    /// cancellation won the final outcome claim before commit.
+    pub(crate) fn finalize_cancelled_turn(
+        &mut self,
+        usage_already_applied: bool,
+    ) -> Option<CancelledTurnKind> {
+        let journal = self.inflight_turn.take()?;
+        let state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mode = state.mode;
+        let usage = state.usage.clone();
+        let last_call_usage = state.last_call_usage.clone();
+        let suffix = materialize_cancelled_suffix(
+            state.suffix.clone(),
+            self.config
+                .cancelled_turn_message
+                .as_deref()
+                .unwrap_or(crate::prompts::CANCELLED_TURN_DEFAULT)
+                .trim(),
+        );
+        drop(state);
+
+        let kind = match mode {
+            TurnJournalMode::Append => {
+                self.messages.extend(suffix);
+                CancelledTurnKind::New
+            }
+            TurnJournalMode::ReplaceFrom(index) => {
+                self.messages.truncate(index);
+                self.messages.extend(suffix);
+                CancelledTurnKind::Retry
+            }
+        };
+        if !usage_already_applied {
+            self.total_usage = accumulate_usage(std::mem::take(&mut self.total_usage), usage);
+            let prompt_tokens = last_call_usage.prompt_tokens();
+            if prompt_tokens > 0 {
+                self.last_prompt_tokens = prompt_tokens;
+            }
+        }
+        Some(kind)
     }
 
     /// Poll unread agent mail for a human-visible ACP notice. Called by the
@@ -2393,6 +2646,7 @@ impl AgentSession {
     ///
     /// History is repaired on the way in — see [`close_orphan_tool_calls`].
     pub fn set_history(&mut self, messages: Vec<Message>) {
+        self.inflight_turn = None;
         self.messages = close_orphan_tool_calls(messages);
     }
 
@@ -2403,6 +2657,7 @@ impl AgentSession {
 
     /// Reset the conversation (e.g. REPL `/clear`); cumulative usage is kept.
     pub fn clear(&mut self) {
+        self.inflight_turn = None;
         self.messages.clear();
     }
 
@@ -2454,6 +2709,89 @@ impl AgentSession {
 pub(crate) const INTERRUPTED_TOOL_RESULT: &str =
     "Tool call interrupted: the assistant turn ended before this tool ran, so it produced \
      no result and changed nothing. Re-issue it if it is still needed.";
+
+pub(crate) fn materialize_cancelled_suffix(
+    messages: Vec<Message>,
+    cancellation_note: &str,
+) -> Vec<Message> {
+    let mut materialized = Vec::with_capacity(messages.len() + 2);
+    let mut messages = messages.into_iter().peekable();
+
+    while let Some(message) = messages.next() {
+        let call_ids: Vec<String> = if message.role == Role::Assistant {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        materialized.push(message);
+        if call_ids.is_empty() {
+            continue;
+        }
+
+        let next_is_result_message = messages.peek().is_some_and(|next| {
+            next.role == Role::User
+                && !next.content.is_empty()
+                && next
+                    .content
+                    .iter()
+                    .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        });
+        let existing_results = if next_is_result_message {
+            messages.next().expect("peeked result message").content
+        } else {
+            Vec::new()
+        };
+
+        let mut ordered_results = Vec::with_capacity(call_ids.len());
+        for id in &call_ids {
+            let existing = existing_results.iter().find(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                )
+            });
+            ordered_results.push(
+                existing
+                    .cloned()
+                    .unwrap_or_else(|| ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: cancellation_note.to_string(),
+                        is_error: true,
+                    }),
+            );
+        }
+        ordered_results.extend(existing_results.into_iter().filter(|block| {
+            !matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. }
+                    if call_ids.iter().any(|id| id == tool_use_id)
+            )
+        }));
+        materialized.push(Message {
+            role: Role::User,
+            content: ordered_results,
+        });
+    }
+
+    if !cancellation_note.is_empty() {
+        match materialized.last_mut() {
+            Some(message) if message.role == Role::Assistant => {
+                message
+                    .content
+                    .push(ContentBlock::Text(cancellation_note.to_string()));
+            }
+            _ => materialized.push(Message::assistant(cancellation_note)),
+        }
+    }
+    materialized
+}
 
 fn has_orphan_tool_calls(messages: &[Message]) -> bool {
     if !messages
@@ -4168,6 +4506,426 @@ mod tests {
             2,
             "tool loop must assign one ordinal per provider generation"
         );
+        assert!(
+            sess.inflight_turn.is_none(),
+            "normal completion must release the turn journal"
+        );
+    }
+
+    /// Regression for #1515: cancellation is allowed to stop future work, but
+    /// it must not erase authorization and an already-completed side effect.
+    #[tokio::test]
+    async fn cancelled_session_retains_completed_tool_round() {
+        struct ToolThenWaitProvider {
+            calls: std::sync::atomic::AtomicUsize,
+            waiting_after_tool: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for ToolThenWaitProvider {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return tool_call_resp(
+                        "mutate-1",
+                        "write_file",
+                        json!({"path": "changed.txt", "content": "changed\n"}),
+                    );
+                }
+                self.waiting_after_tool.notify_one();
+                std::future::pending::<LlmResponse>().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let waiting_after_tool = Arc::new(tokio::sync::Notify::new());
+        let provider = Box::new(ToolThenWaitProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            waiting_after_tool: Arc::clone(&waiting_after_tool),
+        });
+        let mut session =
+            AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+
+        {
+            let prompt = session.prompt("authorized mutation");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = waiting_after_tool.notified() => {}
+                _ = &mut prompt => panic!("turn unexpectedly completed"),
+            }
+        }
+        assert_eq!(
+            session.finalize_cancelled_turn(false),
+            Some(CancelledTurnKind::New)
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
+            "changed\n",
+            "the side effect proves rollback cannot make the turn disappear"
+        );
+        assert!(
+            session.history().iter().any(|message| {
+                message.role == Role::User
+                    && message.content.iter().any(
+                        |block| matches!(block, ContentBlock::Text(text) if text == "authorized mutation"),
+                    )
+            }),
+            "the cancelled user authorization must remain in canonical history"
+        );
+        assert!(
+            session.history().iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            is_error: false,
+                            ..
+                        } if tool_use_id == "mutate-1"
+                    )
+                })
+            }),
+            "the completed tool result must survive cancellation"
+        );
+        assert_eq!(session.total_usage().input, 200);
+        assert_eq!(session.total_usage().output, 100);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_first_poll_still_retains_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![end_turn_resp()]));
+        let mut session =
+            AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+
+        let staged = session.staged_prompt_message(Message::user("already cancelled"));
+        drop(staged);
+        assert_eq!(
+            session.finalize_cancelled_turn(false),
+            Some(CancelledTurnKind::New)
+        );
+
+        assert!(session.history().iter().any(|message| {
+            message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text(text) if text == "already cancelled"))
+        }));
+        assert_eq!(session.total_usage().input, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_staged_completion_does_not_double_count_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Box::new(MockProvider::new(vec![end_turn_resp()]));
+        let mut session =
+            AgentSession::new(provider, session_in(dir.path()), AgentConfig::default());
+
+        let staged = session.staged_prompt_message(Message::user("race")).await;
+        assert_eq!(session.total_usage().input, 100);
+        drop(staged);
+        assert_eq!(
+            session.finalize_cancelled_turn(true),
+            Some(CancelledTurnKind::New)
+        );
+        assert_eq!(session.total_usage().input, 100);
+        assert_eq!(session.total_usage().output, 50);
+    }
+
+    #[tokio::test]
+    async fn cancelled_multi_tool_batch_keeps_completed_and_marks_unresolved() {
+        let second_call_started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&second_call_started);
+        let config = AgentConfig {
+            before_tool_call: Some(Box::new(move |info| {
+                if info.id == "pending-2" {
+                    notify.notify_one();
+                }
+                Box::pin(async { BeforeHookResult::Allow })
+            })),
+            ..AgentConfig::default()
+        };
+        let provider = Box::new(MockProvider::new(vec![LlmResponse {
+            retryable: false,
+            content: vec![
+                ContentBlock::ToolCall {
+                    id: "complete-1".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "first.txt", "content": "complete\n"}),
+                },
+                ContentBlock::ToolCall {
+                    id: "pending-2".into(),
+                    name: "exec".into(),
+                    input: json!({"command": "sleep 30"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            context_overflow: false,
+            usage: mock_usage(200, 100),
+        }]));
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(provider, session_in(dir.path()), config);
+
+        {
+            let prompt = session.prompt("run both");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = second_call_started.notified() => {}
+                _ = &mut prompt => panic!("turn unexpectedly completed"),
+            }
+        }
+        assert_eq!(
+            session.finalize_cancelled_turn(false),
+            Some(CancelledTurnKind::New)
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("first.txt")).unwrap(),
+            "complete\n"
+        );
+        let results = session
+            .history()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "every call must have one paired result");
+        assert_eq!(results[0].0, "complete-1");
+        assert!(!results[0].2, "the completed write keeps its exact result");
+        assert_eq!(results[1].0, "pending-2");
+        assert!(results[1].2, "the unjournaled call is an error result");
+        assert!(
+            results[1].1.contains("external side effects")
+                && results[1].1.contains("Inspect current state"),
+            "the unresolved result must state uncertainty: {:?}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_keeps_authoritative_blocked_result() {
+        let second_call_started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&second_call_started);
+        let config = AgentConfig {
+            before_tool_call: Some(Box::new(move |info| {
+                if info.id == "blocked-1" {
+                    Box::pin(std::future::ready(BeforeHookResult::Block(
+                        "denied by policy".into(),
+                    )))
+                } else {
+                    let notify = Arc::clone(&notify);
+                    Box::pin(async move {
+                        notify.notify_one();
+                        std::future::pending().await
+                    })
+                }
+            })),
+            ..AgentConfig::default()
+        };
+        let provider = Box::new(MockProvider::new(vec![LlmResponse {
+            retryable: false,
+            content: vec![
+                ContentBlock::ToolCall {
+                    id: "blocked-1".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "must-not-exist.txt", "content": "blocked\n"}),
+                },
+                ContentBlock::ToolCall {
+                    id: "pending-2".into(),
+                    name: "exec".into(),
+                    input: json!({"command": "sleep 30"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            context_overflow: false,
+            usage: mock_usage(200, 100),
+        }]));
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(provider, session_in(dir.path()), config);
+
+        {
+            let prompt = session.prompt("run both");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = second_call_started.notified() => {}
+                _ = &mut prompt => panic!("turn unexpectedly completed"),
+            }
+        }
+        assert_eq!(
+            session.finalize_cancelled_turn(false),
+            Some(CancelledTurnKind::New)
+        );
+        assert!(
+            session.inflight_turn.is_none(),
+            "cancel finalization must release the turn journal"
+        );
+
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+        let blocked = session
+            .history()
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: true,
+                } if tool_use_id == "blocked-1" => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("blocked call must retain its authoritative result");
+        assert_eq!(blocked, "blocked: denied by policy");
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_does_not_promote_unfinalized_stream_text() {
+        struct PartialStreamThenWait {
+            streamed: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for PartialStreamThenWait {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                panic!("stream path expected")
+            }
+
+            async fn stream(
+                &self,
+                _ctx: &Context,
+                _opts: &CompleteOpts,
+                on_event: &mut (dyn FnMut(StreamEvent) + Send),
+            ) -> LlmResponse {
+                on_event(StreamEvent::TextDelta("visible partial".into()));
+                self.streamed.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let streamed = Arc::new(tokio::sync::Notify::new());
+        let visible = Arc::new(Mutex::new(Vec::new()));
+        let visible_sink = Arc::clone(&visible);
+        let config = AgentConfig {
+            on_stream_event: Some(Box::new(move |event| {
+                visible_sink.lock().unwrap().push(event);
+            })),
+            ..AgentConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(
+            Box::new(PartialStreamThenWait {
+                streamed: Arc::clone(&streamed),
+            }),
+            session_in(dir.path()),
+            config,
+        );
+
+        {
+            let prompt = session.prompt("start");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = streamed.notified() => {}
+                _ = &mut prompt => panic!("turn unexpectedly completed"),
+            }
+        }
+        session.finalize_cancelled_turn(false);
+
+        assert!(visible.lock().unwrap().iter().any(
+            |event| matches!(event, StreamEvent::TextDelta(text) if text == "visible partial")
+        ));
+        let retained_text = session
+            .history()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !retained_text.contains(&"visible partial"),
+            "unfinalized stream text has no authoritative provider state"
+        );
+        assert!(retained_text
+            .iter()
+            .any(|text| text.contains("partial response was discarded")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_retains_completed_background_handle_result() {
+        struct BackgroundThenWait {
+            calls: std::sync::atomic::AtomicUsize,
+            waiting: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for BackgroundThenWait {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return tool_call_resp("bg-1", "mcp__jobs__start", json!({"job": "harmless"}));
+                }
+                self.waiting.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            remote_tool_dispatch: Some(Box::new(|name, _input| {
+                let handled = name == "mcp__jobs__start";
+                Box::pin(async move {
+                    handled.then(|| RemoteToolResult {
+                        content: serde_json::json!({"pid": 4242}).to_string(),
+                        is_error: false,
+                    })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+        let mut session = AgentSession::new(
+            Box::new(BackgroundThenWait {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                waiting: Arc::clone(&waiting),
+            }),
+            session_in(dir.path()),
+            config,
+        );
+        {
+            let prompt = session.prompt("start background work");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = waiting.notified() => {}
+                _ = &mut prompt => panic!("turn unexpectedly completed"),
+            }
+        }
+        session.finalize_cancelled_turn(false);
+
+        let result = session
+            .history()
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: false,
+                } if tool_use_id == "bg-1" => Some(content),
+                _ => None,
+            })
+            .expect("completed bg result survives cancellation");
+        let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
+        let pid = parsed["pid"].as_u64().expect("background pid") as u32;
+        assert_eq!(pid, 4242, "the exact completed handle must survive");
     }
 
     #[tokio::test]

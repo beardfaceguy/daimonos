@@ -213,6 +213,7 @@ impl SessionFactory for AgentSessionFactory {
         }
         let agent_config = AgentConfig {
             system: Some(crate::prompts::agent_system(&self.config).await),
+            cancelled_turn_message: Some(crate::prompts::cancelled_turn(&self.config).await),
             tools,
             opts: CompleteOpts {
                 model: model.clone(),

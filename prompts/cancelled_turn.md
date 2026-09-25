@@ -1,0 +1,1 @@
+Turn cancelled before completion. Any unfinalized partial response was discarded. Some requested work may have run or produced external side effects without an authoritative result. Inspect current state before retrying or claiming that nothing changed.

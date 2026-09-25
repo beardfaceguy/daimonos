@@ -850,6 +850,8 @@ inside them. See `prompts/README.md` for the committed defaults and guidance.
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# loop_steer       = "~/.config/daimonos/prompts/loop_steer.md"
+# cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
@@ -859,6 +861,8 @@ inside them. See `prompts/README.md` for the committed defaults and guidance.
 | `mcp_instructions` | `daimonos --mcp` | Server instructions sent to the MCP host, including the terse-output directive that affects output token cost. |
 | `kgl_hint` | `daimonos --mcp` (KGL auto-index only) | Nudge to orient via the knowledge graph before reading source. |
 | `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
+| `loop_steer` | `daimonos agent` / `chat` / ACP | Corrective steer rotated by the deterministic loop detector. |
+| `cancelled_turn` | `daimonos chat` / ACP | Safety note retained for cancelled turns and unresolved tool calls. |
 | `tool_descriptions` | MCP / `agent` / `chat` / ACP | Partial TOML overlay for full/terse tool descriptions and nested `[tool.parameters]` JSON Schema property descriptions. |
 
 **Getting the baseline defaults**: the defaults are embedded in the binary, so
@@ -866,13 +870,13 @@ you don't need the source to see or copy them:
 
 ```bash
 daimonos --print-prompt mcp_instructions      # print one default to stdout
-daimonos --dump-prompts                        # scaffold all five resources into
+daimonos --dump-prompts                        # scaffold all seven resources into
                                                #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/to/dir           # ...into a custom directory
 daimonos --dump-prompts --force                # overwrite existing files
 ```
 
-`--dump-prompts` writes the four `<name>.md` prompts and
+`--dump-prompts` writes the six `<name>.md` prompts and
 `tool_descriptions.toml` (skipping existing files unless `--force`), then prints
 a ready-to-paste `[prompts]` block. Start from these so an override begins at —
 and can be diffed against — the baseline.

@@ -1802,17 +1802,26 @@ impl SessionCore {
             });
         }
 
-        let turn = tokio::select! {
-            turn = agent_session.prompt_message(user_message) => Some(turn),
-            _ = active_turn.cancelled() => None,
+        let staged_result = {
+            let staged = agent_session.staged_prompt_message(user_message);
+            tokio::select! {
+                result = staged => Some(result),
+                _ = active_turn.cancelled() => None,
+            }
         };
-        if turn.is_some() {
-            active_turn.mark_completed();
-        } else {
+        let (turn, cancelled_kind) = match staged_result {
+            Some(result) if active_turn.mark_completed() => {
+                (Some(agent_session.commit_staged(result, true)), None)
+            }
+            Some(_) => (None, agent_session.finalize_cancelled_turn(true)),
+            None => (None, agent_session.finalize_cancelled_turn(false)),
+        };
+        if cancelled_kind.is_some() {
             self.cleanup_cancelled_turn();
             on_cancel();
         }
-        if turn.is_some() {
+        let history_committed = turn.is_some() || cancelled_kind.is_some();
+        if history_committed {
             if let Some(prefix) = assistant_prefix {
                 if let Err(error) = agent_session.insert_assistant_turn_prefix(prefix) {
                     tracing::error!(
@@ -1824,14 +1833,14 @@ impl SessionCore {
             }
         }
 
-        let should_persist = turn.is_some();
+        let should_persist = history_committed;
         let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
-        if turn.is_some() {
+        if history_committed {
             let mut client_ids = self.client_user_message_ids.lock().await;
             client_ids.push(client_user_message_id.unwrap_or_default());
             align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
         }
-        if turn.is_some() {
+        if history_committed {
             let completed_before_current = agent_session.user_turn_count().saturating_sub(1);
             let mut outcomes = self
                 .assistant_outcomes
@@ -1851,6 +1860,13 @@ impl SessionCore {
                 .saturating_add(turn.last_call_usage.output);
             self.publish_context_usage(self.context_usage(used_tokens, context_window));
             let outcome = outcome_mapper(turn);
+            self.assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(outcome.clone());
+            let _ = self.events.emit(SessionEvent::AssistantDone { outcome });
+        } else if cancelled_kind.is_some() {
+            let outcome = crate::session_protocol::AssistantOutcome::Aborted;
             self.assistant_outcomes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1942,8 +1958,8 @@ impl SessionTurn<'_> {
     /// Claim completion, so a cancel arriving during post-turn bookkeeping
     /// (persistence snapshots, id alignment) cannot relabel a finished turn as
     /// cancelled. Call as soon as the turn's work has completed.
-    pub fn mark_completed(&self) {
-        self.active.complete();
+    pub fn mark_completed(&self) -> bool {
+        self.active.complete()
     }
 }
 
@@ -2108,8 +2124,8 @@ impl ActiveTurn<'_> {
     /// Claim completion for this turn, so a later cancel cannot relabel it.
     /// Loses gracefully: if cancellation claimed first, the turn stays
     /// cancelled — the claim decides, whichever side gets there first.
-    fn complete(&self) {
-        let _ = self.signal.claim(TurnSignal::COMPLETED);
+    fn complete(&self) -> bool {
+        self.signal.claim(TurnSignal::COMPLETED)
     }
 }
 
@@ -3771,6 +3787,10 @@ mod tests {
                     status: TurnStatus::Cancelling,
                 });
             }));
+            assert!(
+                !turn.mark_completed(),
+                "cancellation owns the single terminal claim"
+            );
             tokio::time::timeout(std::time::Duration::from_millis(100), turn.cancelled())
                 .await
                 .expect("turn observes cancellation");
@@ -3808,7 +3828,10 @@ mod tests {
                 active,
                 events: &router,
             };
-            turn.mark_completed();
+            assert!(
+                turn.mark_completed(),
+                "completion must win before post-turn bookkeeping"
+            );
             // The cancel arrives during post-completion bookkeeping: it must be
             // refused, and must not emit Cancelling.
             assert!(!controller.cancel_with(|| {

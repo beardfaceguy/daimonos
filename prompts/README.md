@@ -16,6 +16,7 @@ recompiling** by pointing the matching key in your `daimonos.toml` at a file:
 # mcp_instructions = "~/.config/daimonos/prompts/mcp_instructions.md"
 # kgl_hint         = "~/.config/daimonos/prompts/kgl_hint.md"
 # summary          = "~/.config/daimonos/prompts/summary.md"
+# cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
@@ -46,8 +47,9 @@ Because the defaults are embedded in the binary, you can recover them at runtime
 ```bash
 daimonos --print-prompt <name>       # print one default to stdout (name is one
                                      #   of: agent_system, mcp_instructions,
-                                     #   kgl_hint, summary, tool_descriptions)
-daimonos --dump-prompts              # scaffold all five resources into
+                                     #   kgl_hint, summary, loop_steer,
+                                     #   cancelled_turn, tool_descriptions)
+daimonos --dump-prompts              # scaffold all seven resources into
                                      #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/dir    # ...into a custom directory
 daimonos --dump-prompts --force      # overwrite existing files
@@ -89,6 +91,8 @@ does not affect `daimonos --mcp`, whose host-facing prompt is
 | `mcp_instructions.md` | `daimonos --mcp` | Server `instructions` sent to the MCP host. Includes the **terse-output** directive that materially affects output token cost. |
 | `kgl_hint.md` | `daimonos --mcp` (only when KGL auto-index is on) | Nudge to orient via the knowledge graph before reading source. |
 | `summary.md` | context compaction (all interactive runtimes) | System prompt for the one-shot summarizer that replaces evicted turns. |
+| `loop_steer.md` | `daimonos agent`, `chat`, ACP | Corrective steer rotated by the deterministic loop detector. |
+| `cancelled_turn.md` | `daimonos chat`, ACP | Safety note retained after cancellation and used for unresolved tool results. |
 | `tool_descriptions.toml` | MCP, agent, chat, ACP | Full descriptions for all tools, curated terse variants, and top-level parameter descriptions injected into JSON Schemas. |
 
 ## WARNING
@@ -100,6 +104,8 @@ Changing these changes how the agent behaves. In particular:
 - Removing the terse directive from `mcp_instructions.md` **increases** output
   tokens.
 - A vague `summary.md` degrades what survives compaction on long sessions.
+- Weakening `cancelled_turn.md` can make a later turn repeat work whose external
+  side effects survived cancellation.
 
 Edit deliberately, and prefer overriding via `[prompts]` (leaving these
 committed defaults intact) so you can compare against the baseline.
