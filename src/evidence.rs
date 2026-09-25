@@ -83,6 +83,9 @@ impl EvidenceLedger {
 /// Verifier shape is decided by [`crate::ops::exec_filter::classify`], the same
 /// classifier that decides output filtering, so the two cannot drift. Installs
 /// are excluded: a successful `pip install` proves nothing about the code.
+/// Compound shell commands are excluded because the top-level exit status may
+/// belong to a later command (`pytest; true`) or pipeline sink (`pytest | tee`)
+/// rather than to the verifier itself.
 /// `execute_script` is intentionally not inferred from arbitrary source: its
 /// aggregate result does not preserve which nested command produced which exit
 /// status, so treating script success as test success would fabricate evidence.
@@ -91,6 +94,13 @@ pub fn verifier_exit(tool_name: &str, input: &serde_json::Value, content: &str) 
         return None;
     }
     let command = input.get("command").and_then(serde_json::Value::as_str)?;
+    if command
+        .chars()
+        .any(|c| matches!(c, ';' | '\n' | '\r' | '|' | '&' | '`'))
+        || command.contains("$(")
+    {
+        return None;
+    }
     use crate::ops::exec_filter::ExecFilter;
     match crate::ops::exec_filter::classify(command) {
         ExecFilter::TestRunner | ExecFilter::Build | ExecFilter::Linter => {}
@@ -326,6 +336,23 @@ mod tests {
         );
         assert_eq!(
             verifier_exit("exec", &json!({"command": "pytest"}), r#"{"out":"hi"}"#),
+            None
+        );
+        // A shell's final success must not launder an earlier verifier failure.
+        assert_eq!(
+            verifier_exit(
+                "exec",
+                &json!({"command": "pytest -q; true"}),
+                r#"{"exit":0}"#
+            ),
+            None
+        );
+        assert_eq!(
+            verifier_exit(
+                "exec",
+                &json!({"command": "pytest -q | tee test.log"}),
+                r#"{"exit":0}"#
+            ),
             None
         );
     }
