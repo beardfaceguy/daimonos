@@ -1949,6 +1949,28 @@ async fn run_prompt_turn(
 
     Ok(match execution.outcome {
         SessionPromptOutcome::Completed(turn) => {
+            match turn.evidence.status() {
+                crate::evidence::EvidenceStatus::Unverified => send_notification(
+                    cx,
+                    session_id,
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
+                        TextContent::new(
+                            "Warning: the workspace changed after the last successful verifier; completion is unverified.",
+                        ),
+                    ))),
+                ),
+                crate::evidence::EvidenceStatus::Unknown => send_notification(
+                    cx,
+                    session_id,
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(AcpContentBlock::Text(
+                        TextContent::new(
+                            "Warning: workspace changes could not be observed; completion evidence is unknown.",
+                        ),
+                    ))),
+                ),
+                crate::evidence::EvidenceStatus::NoMutations
+                | crate::evidence::EvidenceStatus::Verified => {}
+            }
             emit_usage_update(
                 cx,
                 session_id,
@@ -7756,6 +7778,7 @@ mod tests {
             stop_reason,
             error_message: None,
             context_overflow: false,
+            evidence: Default::default(),
         };
         assert_eq!(
             canonical_assistant_outcome(&turn(crate::providers::StopReason::EndTurn)),

@@ -1046,6 +1046,16 @@ fn require_agent_task(
 }
 
 fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
+    match result.evidence.status() {
+        crate::evidence::EvidenceStatus::Unverified => eprintln!(
+            "warning: the workspace changed after the last successful verifier; completion is unverified"
+        ),
+        crate::evidence::EvidenceStatus::Unknown => eprintln!(
+            "warning: workspace changes could not be observed; completion evidence is unknown"
+        ),
+        crate::evidence::EvidenceStatus::NoMutations
+        | crate::evidence::EvidenceStatus::Verified => {}
+    }
     if result.stop_reason == providers::StopReason::Error {
         let message = result.error_message.as_deref().unwrap_or("unknown error");
         anyhow::bail!("agent error: {message}");
@@ -1259,6 +1269,7 @@ mod tests {
             error_message: Some("provider unavailable".to_string()),
             last_call_usage: Default::default(),
             context_overflow: false,
+            evidence: Default::default(),
         };
 
         let error = check_agent_result(&result).unwrap_err();
