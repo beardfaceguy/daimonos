@@ -60,15 +60,15 @@ use crate::providers::{
 };
 use crate::session::Session;
 use crate::session_core::{
-    align_client_user_message_ids, canonical_assistant_outcome_with_logging, tool_call_title,
-    ApprovalBroker, CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
+    align_client_user_message_ids, canonical_assistant_outcome,
+    canonical_assistant_outcome_with_logging, tool_call_title, ApprovalBroker,
+    CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
     SessionEventHandler, SessionEventRouter, SessionPersistence, SessionPromptError,
     SessionPromptOutcome, TurnError,
 };
 #[cfg(test)]
 use crate::session_core::{
-    canonical_assistant_outcome, log_raw_provider_error, safe_provider_error_message,
-    sanitize_provider_error, RAW_ERROR_LOG_CAP,
+    log_raw_provider_error, safe_provider_error_message, sanitize_provider_error, RAW_ERROR_LOG_CAP,
 };
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
@@ -1454,6 +1454,7 @@ fn build_agent_config(
     token_log: Option<PathBuf>,
     compaction: Option<crate::compaction::CompactionPolicy>,
     system_prompt: String,
+    cancelled_turn_message: String,
     terminal_output: bool,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     bridge: Arc<McpBridge>,
@@ -1509,6 +1510,7 @@ fn build_agent_config(
         )),
         on_compaction: Some(build_compaction_hook(Arc::clone(&events))),
         on_stream_event: Some(build_stream_hook(Arc::clone(&events))),
+        cancelled_turn_message: Some(cancelled_turn_message),
         on_tool_progress: build_tool_progress_hook(
             Arc::clone(&connection),
             session_id.clone(),
@@ -2017,16 +2019,20 @@ async fn run_retry_turn(
         .prepare_model(&mut agent_session, &model)
         .await?;
 
-    let outcome = tokio::select! {
-        turn = agent_session.retry_last_turn() => Some(turn),
+    let staged = agent_session.staged_retry_last_turn()?;
+    let staged_result = tokio::select! {
+        result = staged => Some(result),
         _ = active_turn.cancelled() => None,
     };
-    if outcome.is_some() {
-        // Claim completion immediately; see run_prompt_turn for why.
-        active_turn.mark_completed();
-    }
+    let (outcome, cancelled_kind) = match staged_result {
+        Some(result) if active_turn.mark_completed() => {
+            (Some(Ok(agent_session.commit_staged(result, true))), None)
+        }
+        Some(_) => (None, agent_session.finalize_cancelled_turn(true)),
+        None => (None, agent_session.finalize_cancelled_turn(false)),
+    };
     let cumulative_cost_usd = agent_session.total_usage().cost.total_usd;
-    if outcome.is_none() {
+    if cancelled_kind.is_some() {
         // The retry path runs the same provider/tool loop as a prompt and must
         // perform the same pre-terminal cleanup when that future is dropped.
         cleanup_cancelled_turn(handle, cx, session_id);
@@ -2045,6 +2051,17 @@ async fn run_retry_turn(
                     usage: handle.core.context_usage(used_tokens, context_window),
                 });
             emit_assistant_done(&handle.core.events, session_id, &turn);
+            let retry_outcome = canonical_assistant_outcome(&turn);
+            let mut outcomes = handle
+                .core
+                .assistant_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(last) = outcomes.last_mut() {
+                *last = retry_outcome;
+            } else {
+                outcomes.push(retry_outcome);
+            }
             emit_usage_update(
                 cx,
                 session_id,
@@ -2055,7 +2072,28 @@ async fn run_retry_turn(
             (map_stop_reason(turn.stop_reason), true)
         }
         Some(Err(error)) => return Err(error),
-        None => (AcpStopReason::Cancelled, false),
+        None => {
+            if cancelled_kind.is_some() {
+                let outcome = crate::session_protocol::AssistantOutcome::Aborted;
+                let mut outcomes = handle
+                    .core
+                    .assistant_outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(last) = outcomes.last_mut() {
+                    *last = outcome.clone();
+                } else {
+                    outcomes.push(outcome.clone());
+                }
+                let _ = handle
+                    .core
+                    .events
+                    .emit(CoreSessionEvent::AssistantDone { outcome });
+                (AcpStopReason::Cancelled, true)
+            } else {
+                (AcpStopReason::Cancelled, false)
+            }
+        }
     };
     drop(agent_session);
 
@@ -2223,6 +2261,7 @@ async fn build_session_handle(
         token_log,
         state.compaction.policy.clone(),
         crate::prompts::agent_system(cfg).await,
+        crate::prompts::cancelled_turn(cfg).await,
         state.supports_terminal_output.load(Ordering::Acquire),
         &cfg.prompts.resolved_tool_descriptions,
         Arc::clone(&bridge),
@@ -3176,6 +3215,12 @@ fn build_agent_with_state(
                                     agent_session.user_turn_count(),
                                 );
                                 *handle.core.client_user_message_ids.lock().await = client_ids;
+                                *handle
+                                    .core
+                                    .assistant_outcomes
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    record.assistant_outcomes;
                                 replay_history(&cx, &session_id, agent_session.history());
                             }
                             *handle
@@ -4317,6 +4362,28 @@ mod tests {
         ) -> crate::providers::LlmResponse {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             end_turn_resp("too slow")
+        }
+    }
+
+    struct CancelThenCaptureProvider {
+        calls: AtomicUsize,
+        first_started: Arc<tokio::sync::Notify>,
+        follow_up_context: Arc<StdMutex<Vec<crate::providers::Message>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CancelThenCaptureProvider {
+        async fn complete(
+            &self,
+            ctx: &crate::providers::Context,
+            _opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                return std::future::pending().await;
+            }
+            *self.follow_up_context.lock().unwrap() = ctx.messages.clone();
+            end_turn_resp("follow-up saw recovered context")
         }
     }
 
@@ -5670,6 +5737,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_cancel_then_follow_up_retains_and_persists_cancelled_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let follow_up_context = Arc::new(StdMutex::new(Vec::new()));
+        let make_provider: ProviderFactory = {
+            let first_started = Arc::clone(&first_started);
+            let follow_up_context = Arc::clone(&follow_up_context);
+            Arc::new(move || {
+                Ok(Box::new(CancelThenCaptureProvider {
+                    calls: AtomicUsize::new(0),
+                    first_started: Arc::clone(&first_started),
+                    follow_up_context: Arc::clone(&follow_up_context),
+                }))
+            })
+        };
+        let agent = build_agent(
+            make_provider,
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+            None,
+        );
+
+        let workspace_path = workspace.path().to_path_buf();
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(workspace_path))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let first = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new(
+                            "authorized mutation",
+                        ))],
+                    ))
+                    .block_task();
+                first_started.notified().await;
+                connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                assert_eq!(first.await?.stop_reason, AcpStopReason::Cancelled);
+                let follow_up = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("are you stuck?"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(follow_up.stop_reason, AcpStopReason::EndTurn);
+                Ok(session_id)
+            })
+            .await
+            .unwrap();
+
+        let context = follow_up_context.lock().unwrap().clone();
+        let user_texts: Vec<&str> = context
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                CoreBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts
+                .iter()
+                .filter(|text| **text == "authorized mutation")
+                .count(),
+            1,
+            "the follow-up provider context must contain the cancelled request once"
+        );
+        assert!(
+            user_texts.iter().any(|text| {
+                text.contains("Turn cancelled before completion")
+                    && text.contains("partial response was discarded")
+            }),
+            "the follow-up must receive the cancellation safety note"
+        );
+
+        let record = SessionStore::new(sessions.path().to_path_buf())
+            .load(&session_id.to_string())
+            .expect("cancelled and follow-up turns must be persisted");
+        assert_eq!(record.client_user_message_ids, vec!["", ""]);
+        assert_eq!(
+            record.assistant_outcomes,
+            vec![
+                crate::session_protocol::AssistantOutcome::Aborted,
+                crate::session_protocol::AssistantOutcome::Completed,
+            ]
+        );
+
+        let reloaded_updates: Arc<StdMutex<Vec<SessionUpdate>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let update_sink = Arc::clone(&reloaded_updates);
+        let reloaded_agent = build_agent(
+            mock_factory(vec![]),
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+            None,
+        );
+        let reload_workspace = workspace.path().to_path_buf();
+        AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let update_sink = Arc::clone(&update_sink);
+                    async move {
+                        update_sink.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                reloaded_agent,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(session_id, reload_workspace))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let replayed_text = reloaded_updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(chunk)
+                | SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replayed_text
+                .iter()
+                .filter(|text| text.as_str() == "authorized mutation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            replayed_text
+                .iter()
+                .filter(|text| text.contains("Turn cancelled before completion"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn acp_session_cancel_closes_announced_tool_call() {
         use agent_client_protocol::schema::v1::ClientCapabilities;
 
@@ -5813,6 +6058,7 @@ mod tests {
         use agent_client_protocol::schema::v1::ClientCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
         let mut state_out = None;
         let agent = build_agent_with_state(
             mock_factory(vec![
@@ -5832,7 +6078,7 @@ mod tests {
                 ..crate::safety::SafetyPolicy::default()
             }),
             None,
-            None,
+            Some(sessions.path().to_path_buf()),
             SessionCompaction::new(None, false),
             None,
             false,
@@ -5845,7 +6091,7 @@ mod tests {
         let permission_seen = Arc::new(tokio::sync::Notify::new());
         let permission_seen_for_handler = Arc::clone(&permission_seen);
 
-        let stop_reason = AcpClientRole
+        let (session_id, stop_reason, history, client_ids, outcomes) = AcpClientRole
             .builder()
             .on_receive_notification(
                 move |notification: SessionNotification, _cx| {
@@ -5919,7 +6165,7 @@ mod tests {
                     .expect("live session handle");
                 assert_eq!(handle.core.approvals.pending().len(), 1);
 
-                connection.send_notification(CancelNotification::new(session_id))?;
+                connection.send_notification(CancelNotification::new(session_id.clone()))?;
                 let response = tokio::time::timeout(std::time::Duration::from_secs(2), retry)
                     .await
                     .expect("cancelled retry should resolve")?;
@@ -5935,12 +6181,61 @@ mod tests {
                         .is_empty(),
                     "retry cancellation must drain every announced tool id"
                 );
-                Ok(response.stop_reason)
+                let history = handle.core.session.lock().await.history().to_vec();
+                let client_ids = handle.core.client_user_message_ids.lock().await.clone();
+                let outcomes = handle
+                    .core
+                    .assistant_outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                Ok((
+                    session_id,
+                    response.stop_reason,
+                    history,
+                    client_ids,
+                    outcomes,
+                ))
             })
             .await
             .unwrap();
 
         assert_eq!(stop_reason, AcpStopReason::Cancelled);
+        assert_eq!(
+            client_ids,
+            vec![""],
+            "retry preserves the original client id"
+        );
+        assert_eq!(
+            outcomes,
+            vec![crate::session_protocol::AssistantOutcome::Aborted],
+            "cancelled retry replaces the prior outcome"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| {
+                    message.role == CoreRole::User
+                        && message
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, CoreBlock::Text(text) if text == "first"))
+                })
+                .count(),
+            1,
+            "retry must not duplicate the external user turn"
+        );
+        assert!(history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                CoreBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: true,
+                } if tool_use_id == "retry-tool" && content.contains("external side effects")
+            )));
         let updates = updates.lock().unwrap();
         assert_no_orphan_tool_updates(&updates);
         let terminal_updates = updates
@@ -5958,6 +6253,42 @@ mod tests {
             terminal_updates, 1,
             "every announced retry tool call must receive exactly one terminal update"
         );
+
+        let record = SessionStore::new(sessions.path().to_path_buf())
+            .load(&session_id.to_string())
+            .expect("cancelled retry must persist before releasing the active turn");
+        assert_eq!(record.client_user_message_ids, vec![""]);
+        assert_eq!(
+            record.assistant_outcomes,
+            vec![crate::session_protocol::AssistantOutcome::Aborted]
+        );
+        assert_eq!(
+            record
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == CoreRole::User
+                        && message
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, CoreBlock::Text(text) if text == "first"))
+                })
+                .count(),
+            1,
+            "persisted retry must not duplicate the original user turn"
+        );
+        assert!(record
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                CoreBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: true,
+                } if tool_use_id == "retry-tool" && content.contains("external side effects")
+            )));
     }
 
     #[tokio::test]

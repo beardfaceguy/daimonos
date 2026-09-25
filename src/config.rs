@@ -93,6 +93,8 @@ pub struct PromptsConfig {
     pub summary: Option<String>,
     /// Loop-detector corrective steer template (vikunja #1197).
     pub loop_steer: Option<String>,
+    /// Cancelled-turn safety note retained in provider history.
+    pub cancelled_turn: Option<String>,
     /// Top-level full/terse tool-description catalog.
     pub tool_descriptions: Option<String>,
     /// Additional user instructions loaded at startup for agent/chat/ACP and

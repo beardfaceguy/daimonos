@@ -1036,6 +1036,78 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_multi_call_history_preserves_state_and_pairs_every_call() {
+        let messages = crate::agent::materialize_cancelled_suffix(
+            vec![
+                Message::user("run both"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ProviderState {
+                            provider: "openai".into(),
+                            data: json!({
+                                "type":"reasoning",
+                                "id":"r1",
+                                "encrypted_content":"opaque",
+                                "summary":[]
+                            }),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path":"a"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c2".into(),
+                            name: "exec".into(),
+                            input: json!({"command":"work"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            "cancelled; side effects uncertain",
+        );
+
+        let input = messages_to_input(&messages);
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == "reasoning" && item["encrypted_content"] == "opaque"));
+        for id in ["c1", "c2"] {
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["type"] == "function_call" && item["call_id"] == id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == id
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert!(input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "c2"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("side effects uncertain"))
+        }));
+    }
+
+    #[test]
     fn gpt_56_output_is_clamped_to_documented_limit() {
         let ctx = Context {
             messages: vec![],

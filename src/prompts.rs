@@ -33,16 +33,19 @@ pub const SUMMARY_DEFAULT: &str = include_str!("../prompts/summary.md");
 /// Corrective steer injected by the deterministic loop detector (vikunja
 /// #1197). Sections separated by `---` lines are rotated per emission.
 pub const LOOP_STEER_DEFAULT: &str = include_str!("../prompts/loop_steer.md");
+/// Safety note retained when a turn is cancelled after work may have started.
+pub const CANCELLED_TURN_DEFAULT: &str = include_str!("../prompts/cancelled_turn.md");
 
 /// Canonical prompt keys, in a stable display order. This is the single list
 /// used by `default_by_name`, the `--print-prompt` flag, and the `--dump-prompts`
 /// scaffold, so adding a prompt means editing here and `default_by_name` only.
-pub const PROMPT_NAMES: [&str; 6] = [
+pub const PROMPT_NAMES: [&str; 7] = [
     "agent_system",
     "mcp_instructions",
     "kgl_hint",
     "summary",
     "loop_steer",
+    "cancelled_turn",
     "tool_descriptions",
 ];
 
@@ -56,6 +59,7 @@ pub fn default_by_name(name: &str) -> Option<&'static str> {
         "kgl_hint" => Some(KGL_HINT_DEFAULT),
         "summary" => Some(SUMMARY_DEFAULT),
         "loop_steer" => Some(LOOP_STEER_DEFAULT),
+        "cancelled_turn" => Some(CANCELLED_TURN_DEFAULT),
         "tool_descriptions" => Some(crate::tool_descriptions::DEFAULT_TEXT),
         _ => None,
     }
@@ -296,6 +300,16 @@ pub async fn loop_steer(cfg: &Config) -> String {
     .await
 }
 
+/// Note retained in provider history when a cancellable turn is interrupted.
+pub async fn cancelled_turn(cfg: &Config) -> String {
+    resolve(
+        "cancelled_turn",
+        cfg.prompts.cancelled_turn.as_deref(),
+        CANCELLED_TURN_DEFAULT,
+    )
+    .await
+}
+
 /// KGL orientation hint text.
 pub async fn kgl_hint(cfg: &Config) -> String {
     resolve(
@@ -494,6 +508,8 @@ mod tests {
             MCP_INSTRUCTIONS_DEFAULT,
             KGL_HINT_DEFAULT,
             SUMMARY_DEFAULT,
+            LOOP_STEER_DEFAULT,
+            CANCELLED_TURN_DEFAULT,
         ] {
             assert!(!s.trim().is_empty());
         }
@@ -507,6 +523,7 @@ mod tests {
         assert_eq!(agent_system(&cfg).await, AGENT_SYSTEM_DEFAULT);
         assert_eq!(mcp_instructions(&cfg).await, MCP_INSTRUCTIONS_DEFAULT);
         assert_eq!(kgl_hint(&cfg).await, KGL_HINT_DEFAULT);
+        assert_eq!(cancelled_turn(&cfg).await, CANCELLED_TURN_DEFAULT);
     }
 
     #[tokio::test]
@@ -524,6 +541,16 @@ mod tests {
         let mut cfg = Config::default();
         cfg.prompts.agent_system = Some(path.to_string_lossy().to_string());
         assert_eq!(agent_system(&cfg).await, "CUSTOM AGENT PROMPT");
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_override_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled.md");
+        std::fs::write(&path, "CUSTOM CANCELLATION NOTE").unwrap();
+        let mut cfg = Config::default();
+        cfg.prompts.cancelled_turn = Some(path.to_string_lossy().to_string());
+        assert_eq!(cancelled_turn(&cfg).await, "CUSTOM CANCELLATION NOTE");
     }
 
     #[tokio::test]

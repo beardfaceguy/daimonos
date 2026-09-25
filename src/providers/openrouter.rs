@@ -962,6 +962,64 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_multi_call_history_pairs_completed_and_unresolved_calls() {
+        let messages = crate::agent::materialize_cancelled_suffix(
+            vec![
+                Message::user("run both"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ProviderState {
+                            provider: "openai".into(),
+                            data: json!({"type":"reasoning","encrypted_content":"opaque"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path":"a"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c2".into(),
+                            name: "exec".into(),
+                            input: json!({"command":"work"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            "cancelled; side effects uncertain",
+        );
+        let wire = messages_to_wire(None, &messages);
+        let assistant = wire
+            .iter()
+            .find(|message| message["tool_calls"].is_array())
+            .expect("assistant tool-call message");
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
+        for id in ["c1", "c2"] {
+            assert_eq!(
+                wire.iter()
+                    .filter(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+                    .count(),
+                1
+            );
+        }
+        assert!(wire.iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "c2"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("side effects uncertain"))
+        }));
+    }
+
+    #[test]
     fn wire_assistant_with_text_and_tool_call() {
         let msgs = vec![Message {
             role: Role::Assistant,

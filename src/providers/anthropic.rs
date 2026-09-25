@@ -1527,6 +1527,86 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_multi_call_history_preserves_signature_and_pairs_every_call() {
+        let messages = crate::agent::materialize_cancelled_suffix(
+            vec![
+                Message::user("run both"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking("reasoning".into()),
+                        ContentBlock::ProviderState {
+                            provider: PROVIDER_STATE.into(),
+                            data: json!({
+                                "type": THINKING_SIGNATURE_STATE,
+                                "signature": "signed"
+                            }),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path":"a"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c2".into(),
+                            name: "exec".into(),
+                            input: json!({"command":"work"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            "cancelled; side effects uncertain",
+        );
+        let ctx = Context {
+            messages,
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let wire = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        let blocks = wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        assert!(blocks
+            .iter()
+            .any(|block| block["type"] == "thinking" && block["signature"] == "signed"));
+        for id in ["c1", "c2"] {
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "tool_use" && block["id"] == id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| {
+                        block["type"] == "tool_result" && block["tool_use_id"] == id
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert!(blocks.iter().any(|block| {
+            block["type"] == "tool_result"
+                && block["tool_use_id"] == "c2"
+                && block["is_error"] == true
+        }));
+    }
+
+    #[test]
     fn provider_advertises_image_support() {
         assert!(AnthropicProvider::new("key").supports_images());
     }

@@ -242,6 +242,7 @@ pub async fn run_chat(
         system_prompt,
         &cfg.prompts.resolved_tool_descriptions,
     );
+    config.cancelled_turn_message = Some(crate::prompts::cancelled_turn(&cfg).await);
     // Outbound MCP servers (#1289): the chat REPL reads the Claude-style
     // file named by `[agent.mcp]`.
     let native_names: std::collections::HashSet<String> =
@@ -319,13 +320,18 @@ pub async fn run_chat(
                         turn_index: session.user_turn_count(),
                         tools_exposed: session.tool_count(),
                     });
-                    let prompt = session.prompt(text).instrument(prompt_span.span().clone());
-                    let outcome = tokio::select! {
-                        turn = prompt => Some(turn),
-                        _ = tokio::signal::ctrl_c() => None,
+                    let outcome = {
+                        let prompt = session
+                            .staged_prompt_message(Message::user(text))
+                            .instrument(prompt_span.span().clone());
+                        tokio::select! {
+                            result = prompt => Some(result),
+                            _ = tokio::signal::ctrl_c() => None,
+                        }
                     };
-                    let completed = match outcome {
-                        Some(turn) => {
+                    let history_changed = match outcome {
+                        Some(result) => {
+                            let turn = session.commit_staged(result, true);
                             if let Some(err) = &turn.error_message {
                                 eprintln!("[error] {err}");
                             }
@@ -349,15 +355,13 @@ pub async fn run_chat(
                         }
                         None => {
                             eprintln!("\n[turn aborted]");
+                            let recovered = session.finalize_cancelled_turn(false).is_some();
                             prompt_span.record_cancel_reason("client");
                             prompt_span.finish("cancelled", Some("client_cancelled"));
-                            false
+                            recovered
                         }
                     };
-                    // Persist only a completed turn — an aborted one leaves
-                    // history unchanged (prompt is cancel-safe), so there's
-                    // nothing new to save.
-                    if completed {
+                    if history_changed {
                         if let Some(store) = &store {
                             store.save(&session_id, session.model(), session.history());
                         }
