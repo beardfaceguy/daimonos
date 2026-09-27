@@ -498,17 +498,22 @@ async fn run_tool_service(
     }
 }
 
+/// Bind the explicit MCP socket without replacing an existing filesystem entry.
+/// Stale socket recovery belongs to the lock-owning primary, not this mode.
+fn bind_mcp_socket(sock_path: &std::path::Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(sock_path)
+}
+
 async fn run_mcp_socket_server(
     sock_path: PathBuf,
     workspace: PathBuf,
     cfg: Arc<config::Config>,
     services: Arc<provisioning::ToolServices>,
 ) -> anyhow::Result<()> {
-    if sock_path.exists() {
-        std::fs::remove_file(&sock_path)?;
-    }
-
-    let listener = UnixListener::bind(&sock_path)?;
+    // Never unlink an existing path here: it may be a live server's socket,
+    // or even a symlink. A shared primary must arbitrate stale sockets under
+    // its per-workspace lock; the explicit --mcp-socket mode owns no such lock.
+    let listener = bind_mcp_socket(&sock_path)?;
     eprintln!(
         "daimonos MCP socket listening on {:?} (workspace: {:?})",
         sock_path, workspace
@@ -602,4 +607,47 @@ async fn handle_connection(
 
     session.shutdown_processes().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod mcp_socket_bind_tests {
+    use super::bind_mcp_socket;
+
+    #[tokio::test]
+    async fn second_bind_preserves_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.sock");
+        let first = bind_mcp_socket(&path).unwrap();
+        assert!(bind_mcp_socket(&path).is_err());
+        assert!(path.exists());
+
+        // The original listener must remain reachable at the same path.
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (_accepted, _) = first.accept().await.unwrap();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn stale_socket_is_not_removed_by_explicit_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        let listener = bind_mcp_socket(&path).unwrap();
+        drop(listener);
+        assert!(bind_mcp_socket(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_does_not_unlink_symlink_or_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("mcp.sock");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(bind_mcp_socket(&link).is_err());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    }
 }

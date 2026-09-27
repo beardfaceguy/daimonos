@@ -143,6 +143,45 @@ def mcp_socket_server(daimonos_binary, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_mcp_socket_second_server_does_not_replace_live_socket(
+    daimonos_binary, mcp_socket_server
+):
+    """An explicit socket launch must not steal an active listener's path."""
+    sock_path, workspace, original = mcp_socket_server
+    second = subprocess.run(
+        [daimonos_binary, "--mcp-socket", sock_path, "-w", workspace],
+        capture_output=True,
+        timeout=10,
+    )
+    assert second.returncode != 0
+    assert original.poll() is None
+    client = McpSocketClient(sock_path)
+    try:
+        client.handshake()
+        assert "result" in client.send_raw({
+            "jsonrpc": "2.0", "id": client._next_id(), "method": "ping", "params": {},
+        })
+    finally:
+        client.close()
+
+
+def test_mcp_socket_path_is_not_unlinked(mcp_socket_server, daimonos_binary, tmp_path):
+    """A symlink at a requested socket path must not be removed."""
+    _, workspace, _ = mcp_socket_server
+    target = tmp_path / "target"
+    target.write_text("untouched")
+    link = tmp_path / "socket-link"
+    link.symlink_to(target)
+    second = subprocess.run(
+        [daimonos_binary, "--mcp-socket", str(link), "-w", workspace],
+        capture_output=True,
+        timeout=10,
+    )
+    assert second.returncode != 0
+    assert link.is_symlink()
+    assert target.read_text() == "untouched"
+
+
 def test_mcp_socket_handshake(mcp_socket_server):
     """Client can complete MCP initialize handshake."""
     sock_path, _, _ = mcp_socket_server
@@ -306,6 +345,49 @@ def test_mcp_socket_parallel_sessions_isolated(mcp_socket_server):
     assert "from workspace B" in results.get("b", ""), f"client B got: {results.get('b')}"
     assert "from workspace B" not in results.get("a", ""), "session cross-contamination: A got B's data"
     assert "from workspace A" not in results.get("b", ""), "session cross-contamination: B got A's data"
+
+
+def test_mcp_socket_parallel_cwd_and_read_cache_isolated(mcp_socket_server):
+    """Each connection retains its own cwd and dedup cache, even for the same file."""
+    sock_path, workspace, _ = mcp_socket_server
+    first = os.path.join(workspace, "first")
+    second = os.path.join(workspace, "second")
+    os.makedirs(first)
+    os.makedirs(second)
+    with open(os.path.join(first, "value.txt"), "w") as f:
+        f.write("first session\n")
+    with open(os.path.join(second, "value.txt"), "w") as f:
+        f.write("second session\n")
+
+    a = McpSocketClient(sock_path)
+    b = McpSocketClient(sock_path)
+    try:
+        a.handshake()
+        b.handshake()
+        for client, directory in ((a, first), (b, second)):
+            result = client.call_tool("set_cwd", {"path": directory})
+            assert not result.get("isError"), result
+        a_first = json.loads(a.call_tool("read_file", {"path": "value.txt"})["content"][0]["text"])
+        b_first = json.loads(b.call_tool("read_file", {"path": "value.txt"})["content"][0]["text"])
+        assert "first session" in a_first["content"]
+        assert "second session" in b_first["content"]
+        assert json.loads(a.call_tool("read_file", {"path": "value.txt"})["content"][0]["text"])["unchanged"] is True
+        assert json.loads(b.call_tool("read_file", {"path": "value.txt"})["content"][0]["text"])["unchanged"] is True
+        # A second connection does not inherit the dedup cache or cwd.
+        c = McpSocketClient(sock_path)
+        try:
+            c.handshake()
+            result = c.call_tool("workspace_info")
+            info = json.loads(result["content"][0]["text"])
+            assert info["session"]["cwd"] == os.path.realpath(workspace)
+            fresh = c.call_tool("read_file", {"path": os.path.join(first, "value.txt")})
+            assert "first session" in fresh["content"][0]["text"]
+            assert "unchanged" not in json.loads(fresh["content"][0]["text"])
+        finally:
+            c.close()
+    finally:
+        a.close()
+        b.close()
 
 
 def test_mcp_socket_multiple_sequential_connections(mcp_socket_server):
