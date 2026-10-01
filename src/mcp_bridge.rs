@@ -448,6 +448,8 @@ fn metadata_is_executable(_metadata: &std::fs::Metadata) -> bool {
 pub struct RemoteToolOutcome {
     pub content: String,
     pub is_error: bool,
+    /// Only explicit local timeout is classified; opaque SDK/server errors stay unknown.
+    pub transient: bool,
 }
 
 /// Maps an exposed (namespaced) tool name to the client that serves it and the
@@ -882,6 +884,7 @@ impl McpBridge {
                     RemoteToolOutcome {
                         content: format!("remote MCP tool '{name}' failed: {e}"),
                         is_error: true,
+                        transient: false,
                     },
                     crate::observability::ToolStatus::Error,
                 ),
@@ -892,6 +895,7 @@ impl McpBridge {
                             self.call_timeout.as_secs()
                         ),
                         is_error: true,
+                        transient: true,
                     },
                     crate::observability::ToolStatus::Timeout,
                 ),
@@ -1252,7 +1256,11 @@ fn result_to_outcome(result: CallToolResult) -> RemoteToolOutcome {
     } else {
         serde_json::to_string(&result.content).unwrap_or_default()
     };
-    RemoteToolOutcome { content, is_error }
+    RemoteToolOutcome {
+        content,
+        is_error,
+        transient: false,
+    }
 }
 
 /// No-op client handler: daimonos is a pure tool consumer, so it declines
@@ -1531,6 +1539,26 @@ mod tests {
         };
         let outcome = result_to_outcome(result);
         assert!(outcome.is_error);
+        assert!(
+            !outcome.transient,
+            "opaque server errors are not transport timeouts"
+        );
+    }
+
+    #[test]
+    fn opaque_timeout_text_is_not_transient() {
+        use rust_mcp_sdk::schema::TextContent;
+        let result = CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent::new(
+                "connection timed out".into(),
+                None,
+                None,
+            ))],
+            is_error: Some(true),
+            meta: None,
+            structured_content: None,
+        };
+        assert!(!result_to_outcome(result).transient);
     }
 
     // --- build: fail-open + disabled ---

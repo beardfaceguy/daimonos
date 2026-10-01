@@ -1632,6 +1632,7 @@ fn build_remote_dispatch_hook(bridge_slot: BridgeSlot) -> RemoteToolHook {
                 return Some(RemoteToolResult {
                     content: reason,
                     is_error: true,
+                    transient: false,
                 });
             }
             bridge
@@ -1640,6 +1641,7 @@ fn build_remote_dispatch_hook(bridge_slot: BridgeSlot) -> RemoteToolHook {
                 .map(|outcome| RemoteToolResult {
                     content: outcome.content,
                     is_error: outcome.is_error,
+                    transient: outcome.transient,
                 })
         })
     })

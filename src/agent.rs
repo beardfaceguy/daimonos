@@ -124,6 +124,7 @@ pub type ProviderNoticeHook = Box<dyn Fn(&str) + Send + Sync>;
 pub struct RemoteToolResult {
     pub content: String,
     pub is_error: bool,
+    pub transient: bool,
 }
 
 /// Dispatches a tool the opcode facade doesn't know. Consulted only when
@@ -1413,6 +1414,7 @@ async fn run_inner(
                             crate::observability::tool_kind(&name),
                         )
                     });
+                    let mut transient = false;
                     let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
@@ -1646,7 +1648,10 @@ async fn run_inner(
                                     match served {
                                         // Remote MCP: the bridge emits the
                                         // `mcp.remote_tool` span with its server alias.
-                                        Some(r) => (r.content, r.is_error, None),
+                                        Some(r) => {
+                                            transient = r.transient;
+                                            (r.content, r.is_error, None)
+                                        }
                                         None => {
                                             // Emit a standalone span only when no
                                             // `tool_span` is open for this call
@@ -1825,9 +1830,11 @@ async fn run_inner(
                     // a repeated truncation placeholder is exactly the kind of
                     // no-progress signal the detector must see (vikunja #1197).
                     if loop_detector.is_some() {
-                        round_observations.push(crate::loop_detector::CallObservation::new(
+                        let mut observation = crate::loop_detector::CallObservation::new(
                             &name, &input, is_error, &content,
-                        ));
+                        );
+                        observation.transient = transient;
+                        round_observations.push(observation);
                     }
 
                     tool_results.push(ContentBlock::ToolResult {
@@ -3951,12 +3958,14 @@ mod tests {
                         return Some(RemoteToolResult {
                             content: format!("REMOTE_LARGE_SENTINEL\n{}", "l".repeat(60_000)),
                             is_error: false,
+                            transient: false,
                         });
                     }
                     name.strip_prefix("mcp__bench__medium_")
                         .map(|index| RemoteToolResult {
                             content: format!("MEDIUM_SENTINEL_{index}\n{}", "m".repeat(30_000)),
                             is_error: false,
+                            transient: false,
                         })
                 })
             })),
@@ -4887,6 +4896,7 @@ mod tests {
                     handled.then(|| RemoteToolResult {
                         content: serde_json::json!({"pid": 4242}).to_string(),
                         is_error: false,
+                        transient: false,
                     })
                 })
             })),
@@ -5067,6 +5077,7 @@ mod tests {
                     handled.then(|| RemoteToolResult {
                         content: "remote-output\n".repeat(200),
                         is_error: false,
+                        transient: false,
                     })
                 })
             })),
@@ -5213,6 +5224,163 @@ mod tests {
         }
     }
 
+    async fn exercise_remote_failure_budget(enabled: bool, transient: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.loop_detector.enabled = enabled;
+        let session = shared(Session::new(dir.path().to_path_buf(), Arc::new(cfg)));
+        let mut responses = Vec::new();
+        for round in 0..8 {
+            let mut response = tool_call_resp(
+                &format!("failure-{round}-a"),
+                "mcp__mock__failure",
+                json!({"query":"same"}),
+            );
+            response.content.push(ContentBlock::ToolCall {
+                id: format!("failure-{round}-b"),
+                name: "mcp__mock__failure".into(),
+                input: json!({"query":"same"}),
+            });
+            response.content.push(ContentBlock::ToolCall {
+                id: format!("lookup-{round}"),
+                name: "mcp__mock__lookup".into(),
+                input: json!({"round":round}),
+            });
+            responses.push(response);
+        }
+        responses.push(end_turn_resp());
+        let provider = BenchmarkCaptureProvider::new(responses);
+        let contexts = provider.contexts_handle();
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&dispatched);
+        let config = AgentConfig {
+            error_resume_budget: Some(0),
+            remote_tool_dispatch: Some(Box::new(move |name: &str, _input: &Value| {
+                let name = name.to_owned();
+                let observed = Arc::clone(&observed);
+                Box::pin(async move {
+                    observed.lock().unwrap().push(name.clone());
+                    Some(RemoteToolResult {
+                        is_error: name.ends_with("failure"),
+                        content: if name.ends_with("failure") {
+                            "opaque identical error"
+                        } else {
+                            "found"
+                        }
+                        .into(),
+                        transient,
+                    })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+        let result = run(
+            &provider,
+            session,
+            vec![Message::user("test failure budget")],
+            &config,
+        )
+        .await;
+        let should_stop = enabled && !transient;
+        let rounds = if should_stop { 6 } else { 8 };
+        assert_eq!(
+            contexts.lock().unwrap().len(),
+            if should_stop { 6 } else { 9 }
+        );
+        assert_eq!(
+            dispatched.lock().unwrap().len(),
+            rounds * 3,
+            "duplicates must still dispatch separately"
+        );
+        assert_eq!(
+            result.stop_reason,
+            if should_stop {
+                StopReason::Aborted
+            } else {
+                StopReason::EndTurn
+            }
+        );
+        if should_stop {
+            let reason = result.error_message.as_deref().unwrap();
+            assert!(reason.contains("mcp__mock__failure") && reason.contains("6 rounds"));
+            assert_eq!(
+                provider.responses.lock().unwrap().len(),
+                3,
+                "no seventh generation or retry"
+            );
+        }
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for message in &result.messages {
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolCall { id, .. } => calls.push(id.clone()),
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        results.push(tool_use_id.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(calls.len(), rounds * 3);
+        assert_eq!(
+            calls, results,
+            "every call including duplicate reads retains its result ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_failure_budget_stops_before_next_generation_with_paired_results() {
+        exercise_remote_failure_budget(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn remote_failure_budget_disabled_preserves_dispatch() {
+        exercise_remote_failure_budget(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn remote_failure_budget_excludes_explicit_transient_outcomes() {
+        exercise_remote_failure_budget(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn permission_failures_stop_but_budget_resets_on_next_session_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = (0..12)
+            .map(|i| tool_call_resp(&format!("denied-{i}"), "mcp__mock__denied", json!({})))
+            .collect();
+        let provider = BenchmarkCaptureProvider::new(responses);
+        let contexts = provider.contexts_handle();
+        let config = AgentConfig {
+            remote_tool_dispatch: Some(Box::new(|_, _| {
+                Box::pin(async {
+                    Some(RemoteToolResult {
+                        content: "permission denied".into(),
+                        is_error: true,
+                        transient: false,
+                    })
+                })
+            })),
+            ..AgentConfig::default()
+        };
+        let mut session = AgentSession::new(Box::new(provider), session_in(dir.path()), config);
+        for _ in 0..2 {
+            let result = session.prompt("retry after checking permissions").await;
+            assert_eq!(result.stop_reason, StopReason::Aborted);
+            assert!(result
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("6 rounds"));
+        }
+        assert_eq!(
+            contexts.lock().unwrap().len(),
+            12,
+            "each turn owns a fresh detector; no budget leak or auto-resume"
+        );
+    }
+
     #[tokio::test]
     async fn remote_tool_dispatch_serves_unknown_tool() {
         let dir = tempfile::tempdir().unwrap();
@@ -5228,6 +5396,7 @@ mod tests {
                     (name == "mcp__srv__echo").then(|| RemoteToolResult {
                         content: format!("echoed:{}", input["msg"].as_str().unwrap_or("")),
                         is_error: false,
+                        transient: false,
                     })
                 })
             })),

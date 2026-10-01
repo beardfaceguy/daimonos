@@ -144,6 +144,7 @@ impl AgentMcp {
                     return Some(RemoteToolResult {
                         content: reason,
                         is_error: true,
+                        transient: false,
                     });
                 }
                 bridge
@@ -152,6 +153,7 @@ impl AgentMcp {
                     .map(|outcome| RemoteToolResult {
                         content: outcome.content,
                         is_error: outcome.is_error,
+                        transient: outcome.transient,
                     })
             })
         })

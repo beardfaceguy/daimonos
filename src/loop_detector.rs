@@ -21,6 +21,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+const FAILURE_WARN_ROUNDS: u32 = 3;
+const FAILURE_STOP_ROUNDS: u32 = 6;
+const MAX_TRACKED_FAILURES: usize = 128;
+
 /// One executed tool call inside a model round, reduced to fingerprints.
 /// The tool-call id is deliberately excluded: providers mint a fresh id for
 /// every call, so including it would make every round look novel.
@@ -34,6 +38,8 @@ pub struct CallObservation {
     pub result_fp: u64,
     /// Whether the result was an error (repeated failures are a loop signal).
     pub is_error: bool,
+    /// Explicit transport timeout/failure, not inferred from result text.
+    pub transient: bool,
 }
 
 impl CallObservation {
@@ -43,17 +49,18 @@ impl CallObservation {
             call_fp: fingerprint_call(name, input),
             result_fp: fingerprint_result(is_error, result_content),
             is_error,
+            transient: false,
         }
     }
 }
 
-/// Hash of one tool call: the name plus its serialized arguments. serde_json
-/// serialization is deterministic for a given `Value`, which is sufficient —
-/// both occurrences being compared come from the same provider parse path.
+/// Hash a call with recursively sorted object keys; preserve array order.
 pub fn fingerprint_call(name: &str, input: &Value) -> u64 {
     let mut h = DefaultHasher::new();
     name.hash(&mut h);
-    input.to_string().hash(&mut h);
+    let mut canonical = input.clone();
+    canonical.sort_all_objects();
+    canonical.to_string().hash(&mut h);
     h.finish()
 }
 
@@ -93,6 +100,9 @@ pub struct LoopDetector {
     /// seen. Incremented at most once per round so a parallel batch of
     /// identical calls counts as one observation (one detector round).
     pair_rounds: HashMap<(u64, u64, bool), u32>,
+    /// Exact error pairs survive novelty and pruning until matching success.
+    /// Timestamp/request-id changes in error content deliberately do not aggregate.
+    failure_rounds: HashMap<(u64, u64), u32>,
     /// Rounds with zero novel `(call, result)` pairs, consecutively.
     consecutive_no_novelty: u32,
     /// Call-set fingerprint of the previous round.
@@ -119,6 +129,7 @@ impl LoopDetector {
             cfg,
             steer_sections,
             pair_rounds: HashMap::new(),
+            failure_rounds: HashMap::new(),
             consecutive_no_novelty: 0,
             last_call_set: None,
             steered_call_set: None,
@@ -148,6 +159,60 @@ impl LoopDetector {
         }
         self.stats.rounds_observed += 1;
 
+        // Matching successes reset only their own operation, never other tools.
+        // Any matching success is progress even in a mixed batch: this budget
+        // intentionally targets uninterrupted exact failures, not flaky success.
+        // The independent novelty guard still observes every mixed batch.
+        for o in round.iter().filter(|o| !o.is_error) {
+            self.failure_rounds
+                .retain(|(call, _), _| *call != o.call_fp);
+        }
+        let mut failures: Vec<_> = round
+            .iter()
+            .filter(|o| o.is_error && !o.transient)
+            .map(|o| (o.call_fp, o.result_fp))
+            .collect();
+        failures.sort_unstable();
+        failures.dedup();
+        let mut failure_steer = None;
+        // Count existing failures before admitting new keys: actionable repeat
+        // stops take precedence over state exhaustion, independent of hash order.
+        failures.sort_by_key(|pair| !self.failure_rounds.contains_key(pair));
+        for pair in failures {
+            if !self.failure_rounds.contains_key(&pair)
+                && self.failure_rounds.len() >= MAX_TRACKED_FAILURES
+            {
+                return RoundVerdict::Break(format!("exact failure budget exhausted: {MAX_TRACKED_FAILURES} distinct failed calls in this turn (tools: {}); stopping rather than evicting protection", summarize_tools(round)));
+            }
+            let count = self.failure_rounds.entry(pair).or_insert(0);
+            *count += 1;
+            let name = &round.iter().find(|o| o.call_fp == pair.0).unwrap().name;
+            if *count >= FAILURE_STOP_ROUNDS {
+                return RoundVerdict::Break(format!("exact failure budget: tool {name} returned the same error in {count} rounds. Stopping this turn; change the request or start a new turn."));
+            }
+            if *count == FAILURE_WARN_ROUNDS {
+                failure_steer = Some(format!("Tool {name} returned the same error in {FAILURE_WARN_ROUNDS} rounds. Do not repeat unchanged inputs; inspect the error or ask the user for clarification."));
+            }
+        }
+        // Always observe the legacy window, including the warning round.
+        // Prefer a legacy Break; otherwise emit at most one steer per round.
+        let legacy = self.observe_legacy(round);
+        match legacy {
+            RoundVerdict::Break(_) | RoundVerdict::Steer(_) => legacy,
+            RoundVerdict::Proceed => {
+                if let Some(text) = failure_steer {
+                    self.stats.steers_emitted += 1;
+                    self.steered_call_set = self.last_call_set;
+                    self.ignored_steers = 0;
+                    RoundVerdict::Steer(text)
+                } else {
+                    RoundVerdict::Proceed
+                }
+            }
+        }
+    }
+
+    fn observe_legacy(&mut self, round: &[CallObservation]) -> RoundVerdict {
         // A parallel batch aggregates into ONE detector round: each distinct
         // pair increments its round-count once, however many duplicates the
         // batch carried.
@@ -298,6 +363,278 @@ mod tests {
 
     fn same_round() -> Vec<CallObservation> {
         vec![obs("read_file", &json!({"path": "a.rs"}), false, "content")]
+    }
+
+    #[test]
+    fn recovered_linear_trace_stops_before_twenty_eighth_round() {
+        // Calls/errors from recovered history; successful lookup payloads redacted.
+        let trace: Vec<Vec<Value>> =
+            serde_json::from_str(include_str!("../tests/fixtures/linear_retry_loop.json")).unwrap();
+        assert_eq!(trace.len(), 28);
+        let mut d = detector();
+        let stopped = trace.iter().position(|round| {
+            let observations: Vec<_> = round
+                .iter()
+                .map(|call| {
+                    obs(
+                        call["name"].as_str().unwrap(),
+                        &call["input"],
+                        call["is_error"].as_bool().unwrap(),
+                        call["content"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            match d.observe_round(&observations) {
+                RoundVerdict::Break(text) => {
+                    assert!(
+                        text.contains("mcp__linear__list_initiatives") && text.contains("6 rounds"),
+                        "{text}"
+                    );
+                    true
+                }
+                _ => false,
+            }
+        });
+        assert_eq!(stopped, Some(18), "sixth exact-repeat occurs in round 19");
+    }
+
+    #[test]
+    fn exact_failures_survive_novel_rounds_and_pruning() {
+        let mut d = detector();
+        for i in 0..6 {
+            let failure = obs(
+                "mcp__linear__list_initiatives",
+                &json!({"customView":"/initiatives"}),
+                true,
+                "unknown custom view",
+            );
+            let verdict = d.observe_round(&[
+                failure.clone(),
+                failure,
+                obs("lookup", &json!({"query":i}), false, "found"),
+            ]);
+            if i == 5 {
+                assert!(
+                    matches!(verdict, RoundVerdict::Break(ref text) if text.contains("list_initiatives") && text.contains("6"))
+                );
+            } else {
+                assert!(!matches!(verdict, RoundVerdict::Break(_)));
+            }
+            d.on_context_pruned();
+        }
+    }
+
+    #[test]
+    fn exact_failure_success_resets_only_matching_call() {
+        let mut d = detector();
+        let failure = obs("remote", &json!({"query":"a"}), true, "error");
+        for i in 0..5 {
+            d.observe_round(&[failure.clone(), obs("novel", &json!({"i":i}), false, "ok")]);
+        }
+        d.observe_round(&[obs("remote", &json!({"query":"a"}), false, "ok")]);
+        assert!(!matches!(
+            d.observe_round(&[failure]),
+            RoundVerdict::Break(_)
+        ));
+    }
+
+    #[test]
+    fn exact_failure_changed_arguments_do_not_aggregate() {
+        let mut d = detector();
+        for i in 0..20 {
+            assert_eq!(
+                d.observe_round(&[obs("remote", &json!({"query":i}), true, "error")]),
+                RoundVerdict::Proceed
+            );
+        }
+    }
+
+    #[test]
+    fn exact_failure_transient_and_polling_do_not_accumulate() {
+        let mut d = detector();
+        for i in 0..12 {
+            let mut transient = obs("remote", &json!({}), true, "timeout");
+            transient.transient = true;
+            let verdict = d.observe_round(&[
+                transient,
+                obs("poll", &json!({}), false, "pending"),
+                obs("lookup", &json!({"i":i}), false, "ok"),
+            ]);
+            assert!(!matches!(verdict, RoundVerdict::Break(_)));
+        }
+        assert!(d.failure_rounds.is_empty());
+    }
+
+    #[test]
+    fn exact_failure_interleaved_tools_and_new_turn() {
+        let mut d = detector();
+        for i in 0..10 {
+            let name = if i % 2 == 0 { "a" } else { "b" };
+            assert!(!matches!(
+                d.observe_round(&[obs(
+                    name,
+                    &json!({}),
+                    true,
+                    "timeout text from opaque server"
+                )]),
+                RoundVerdict::Break(_)
+            ));
+        }
+        assert!(matches!(
+            d.observe_round(&[obs(
+                "a",
+                &json!({}),
+                true,
+                "timeout text from opaque server"
+            )]),
+            RoundVerdict::Break(_)
+        ));
+        assert_eq!(
+            detector().observe_round(&[obs(
+                "a",
+                &json!({}),
+                true,
+                "timeout text from opaque server"
+            )]),
+            RoundVerdict::Proceed
+        );
+    }
+
+    #[test]
+    fn exact_failure_changed_result_does_not_aggregate() {
+        let mut d = detector();
+        for i in 0..20 {
+            assert!(!matches!(
+                d.observe_round(&[obs("remote", &json!({}), true, &format!("error {i}"))]),
+                RoundVerdict::Break(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_failure_canonical_arguments_match() {
+        let a: Value = serde_json::from_str(r#"{"a":1,"b":{"c":2,"d":3}}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"b":{"d":3,"c":2},"a":1}"#).unwrap();
+        assert_eq!(
+            fingerprint_call("remote", &a),
+            fingerprint_call("remote", &b)
+        );
+    }
+
+    #[test]
+    fn exact_failure_mixed_batch_resets_then_counts_failure_once() {
+        // Results are aggregated, not a guaranteed completion chronology:
+        // a matching success clears prior rounds, then batch failures count once.
+        for success_first in [true, false] {
+            let mut d = detector();
+            let failure = obs("remote", &json!({}), true, "error");
+            for i in 0..5 {
+                d.observe_round(&[failure.clone(), obs("lookup", &json!({"i":i}), false, "ok")]);
+            }
+            let success = obs("remote", &json!({}), false, "ok");
+            let batch = if success_first {
+                vec![success, failure.clone()]
+            } else {
+                vec![failure.clone(), success]
+            };
+            assert!(!matches!(d.observe_round(&batch), RoundVerdict::Break(_)));
+            assert_eq!(
+                d.failure_rounds.get(&(failure.call_fp, failure.result_fp)),
+                Some(&1)
+            );
+            for i in 0..4 {
+                assert!(!matches!(
+                    d.observe_round(&[
+                        failure.clone(),
+                        obs("lookup", &json!({"i":i+10}), false, "ok")
+                    ]),
+                    RoundVerdict::Break(_)
+                ));
+            }
+            assert!(matches!(
+                d.observe_round(&[failure]),
+                RoundVerdict::Break(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn matching_success_each_round_keeps_exact_budget_reset() {
+        let mut d = detector();
+        for i in 0..20 {
+            assert!(!matches!(
+                d.observe_round(&[
+                    obs("remote", &json!({}), true, "error"),
+                    obs("remote", &json!({}), false, &format!("progress {i}")),
+                ]),
+                RoundVerdict::Break(_)
+            ));
+            assert_eq!(
+                d.failure_rounds.values().copied().collect::<Vec<_>>(),
+                vec![1]
+            );
+        }
+    }
+
+    #[test]
+    fn sixth_repeat_takes_precedence_over_state_cap() {
+        let mut d = detector();
+        let repeat = obs("remote", &json!({"repeat":true}), true, "error");
+        for i in 0..5 {
+            d.observe_round(&[repeat.clone(), obs("lookup", &json!({"i":i}), false, "ok")]);
+        }
+        for i in 0..127 {
+            d.observe_round(&[obs("remote", &json!({"unique":i}), true, "error")]);
+        }
+        assert!(
+            matches!(d.observe_round(&[obs("remote", &json!({"new":true}), true, "error"), repeat]), RoundVerdict::Break(text) if text.contains("6 rounds"))
+        );
+    }
+
+    #[test]
+    fn warning_round_updates_legacy_window_once() {
+        let mut d = detector();
+        let failure = obs("remote", &json!({}), true, "error");
+        d.observe_round(std::slice::from_ref(&failure));
+        d.observe_round(std::slice::from_ref(&failure));
+        assert!(matches!(
+            d.observe_round(&[failure]),
+            RoundVerdict::Steer(_)
+        ));
+        assert_eq!(d.consecutive_no_novelty, 2);
+        assert_eq!(d.pair_rounds.values().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(d.stats.steers_emitted, 1);
+        assert_eq!(d.steered_call_set, d.last_call_set);
+    }
+
+    #[test]
+    fn legacy_detector_treats_reordered_object_keys_as_same_call() {
+        // Intentional scope: canonicalization improves both detectors, not dispatch.
+        let mut d = detector();
+        for i in 0..3 {
+            let input: Value = serde_json::from_str(if i % 2 == 0 {
+                r#"{"a":1,"b":2}"#
+            } else {
+                r#"{"b":2,"a":1}"#
+            })
+            .unwrap();
+            let verdict = d.observe_round(&[obs("remote", &input, false, "pending")]);
+            assert_eq!(matches!(verdict, RoundVerdict::Steer(_)), i == 2);
+        }
+    }
+
+    #[test]
+    fn exact_failure_keys_are_bounded() {
+        let mut d = detector();
+        for i in 0..128 {
+            assert!(!matches!(
+                d.observe_round(&[obs("remote", &json!({"query":i}), true, "error")]),
+                RoundVerdict::Break(_)
+            ));
+        }
+        assert!(
+            matches!(d.observe_round(&[obs("remote", &json!({"query":128}), true, "error")]), RoundVerdict::Break(ref text) if text.contains("128"))
+        );
     }
 
     #[test]
