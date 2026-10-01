@@ -409,6 +409,15 @@ mod tests {
     }
 
     #[test]
+    fn batching_prompts_exclude_remote_mcp_tools() {
+        for prompt in [AGENT_SYSTEM_DEFAULT, MCP_INSTRUCTIONS_DEFAULT] {
+            assert!(prompt.contains("native/local"));
+            assert!(prompt.contains("remote MCP"));
+            assert!(prompt.contains("direct"));
+        }
+    }
+
+    #[test]
     fn agent_system_skips_routine_plans_and_coordination_overhead() {
         let prompt = AGENT_SYSTEM_DEFAULT.to_lowercase();
         assert!(prompt.contains("routine single-file edits"));

@@ -696,7 +696,8 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 
 /// Dispatch any native tool by name. Opcode-backed tools take the compact op
 /// path; plugin and meta tools fall through to the same shared dispatcher used
-/// by MCP and the agent loop. Keeping `tool("…")` universal prevents the model
+/// by MCP and the agent loop (not remote MCP integrations). Keeping native
+/// `tool("…")` universal prevents the model
 /// from spending retry turns learning which names require dedicated bindings.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
     let resp = match tools::build_request(name, args) {
@@ -710,6 +711,12 @@ fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Respons
                 let Some((content, is_error, meta)) =
                     crate::mcp::dispatch_local_tool(&mut session, name, args).await
                 else {
+                    if name.starts_with("mcp__") {
+                        return Err(anyhow::anyhow!(
+                            "remote MCP tool '{name}' is unavailable in execute_script: \
+                             tool() supports native/local tools only; call this tool directly"
+                        ));
+                    }
                     return Err(anyhow::anyhow!("unknown tool '{name}'"));
                 };
 
@@ -1663,6 +1670,20 @@ mod tests {
             !error.contains("not found") || error.contains("opcode"),
             "should be a dispatch error, not a Starlark variable-resolution error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_tool_in_script_explains_direct_call_boundary() {
+        let error = execute(
+            "result = tool(\"mcp__linear__get_user\", query=\"Patrick Clawson\")",
+            test_session(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("remote integrations are not script bindings");
+        assert!(error.contains("mcp__linear__get_user"));
+        assert!(error.contains("native/local"));
+        assert!(error.contains("direct"));
     }
 
     #[tokio::test]
