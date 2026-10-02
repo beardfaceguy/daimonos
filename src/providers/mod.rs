@@ -7,6 +7,7 @@ use serde_json::Value;
 pub mod anthropic;
 pub mod openai;
 pub mod openrouter;
+mod request_trace;
 pub mod router;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -945,3 +945,36 @@ the warm path index until its watcher reports a filesystem change.
 
 **Truncated exec output**: if you're losing important build output, increase
 `exec_output_max_chars`. The default of 100 KB covers most cases.
+
+### OpenRouter structural request tracing (opt-in)
+
+To retain the tool schemas sent on future OpenRouter requests, set
+`DAIMONOS_OPENROUTER_TRACE_DIR` in the **Daimonos process environment** (not
+`agent.env`) and restart the agent. For example:
+
+```sh
+export DAIMONOS_OPENROUTER_TRACE_DIR="$HOME/.local/state/daimonos/openrouter-traces"
+```
+
+The parent directory must exist. The trace directory is created with mode 0700;
+existing directories must be private and owned by the current user. Trace files
+use mode 0600. On Unix the final directory component and files cannot be
+symlinks, files cannot be hard-linked, and opens/rotation are relative to a
+validated directory handle. Parent symlinks are resolved at directory open;
+this does not isolate tracing from other processes running as the same user.
+Use a trusted local filesystem (filesystem IO itself is not time-bounded).
+Each JSONL record has a local UUID/timestamp, model, streaming flag,
+message count, and the exact outgoing `tools` array. It excludes messages,
+tool-call arguments/results, URLs, HTTP headers, and API keys. **Schemas may still
+contain private descriptions, defaults or examples: treat these files as sensitive.**
+
+`requests.jsonl` rotates into `requests.jsonl.1` at 16 MiB (at most 32 MiB of
+retained payload); oversized records are skipped, not truncated. Lock contention
+or trace IO failures skip the record and emit a generic warning without failing
+the model request. Unset the variable to disable tracing and delete both files
+to remove retained data. Rotation replaces old history; archive needed evidence
+securely before it is rotated out.
+
+This captures Daimonos's outgoing schema, not OpenRouter's downstream transformed
+request. It cannot recover older requests, prove downstream behavior, or correlate
+raw model responses; the UUID is local, not a provider request ID.

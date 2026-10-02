@@ -11,6 +11,7 @@ pub struct OpenRouterProvider {
     base_url: String,
     client: reqwest::Client,
     prompt_cache: bool,
+    request_trace: super::request_trace::RequestTrace,
     /// Bounded HTTP/SSE deadlines (#1107).
     timeouts: super::ProviderTimeouts,
 }
@@ -26,6 +27,7 @@ impl OpenRouterProvider {
             base_url,
             client,
             prompt_cache: false,
+            request_trace: super::request_trace::RequestTrace::from_env(),
             timeouts,
         })
     }
@@ -100,6 +102,7 @@ impl LlmProvider for OpenRouterProvider {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        self.request_trace.capture(&body).await;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -178,6 +181,7 @@ impl LlmProvider for OpenRouterProvider {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        self.request_trace.capture(&body).await;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -668,6 +672,155 @@ mod tests {
     use super::*;
     use crate::providers::test_support::mock_http_server;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn complete_structural_trace_matches_http_request() {
+        structural_trace_http_case(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stream_structural_trace_matches_http_request() {
+        structural_trace_http_case(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn complete_structural_trace_disabled_and_failure_are_fail_open() {
+        structural_trace_http_case(false, false, false).await;
+        structural_trace_http_case(false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn stream_structural_trace_disabled_and_failure_are_fail_open() {
+        structural_trace_http_case(true, false, false).await;
+        structural_trace_http_case(true, true, true).await;
+    }
+
+    async fn structural_trace_http_case(streaming: bool, enabled: bool, broken: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("traces");
+        if broken {
+            std::fs::write(&trace_dir, "not a directory").unwrap();
+        }
+        let terminal = json!({
+            "choices": [{"delta": {"content": "ok"},
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        });
+        let (mime, response_body) = if streaming {
+            (
+                "text/event-stream",
+                format!("data: {terminal}\n\ndata: [DONE]\n\n"),
+            )
+        } else {
+            ("application/json", terminal.to_string())
+        };
+        let (base_url, captured) = mock_http_server("200 OK", mime, response_body).await;
+        let mut provider = OpenRouterProvider::new("PRIVATE_KEY".into(), base_url.clone()).unwrap();
+        // Inject opt-in state per provider; never mutate the process environment.
+        provider.request_trace.directory = enabled.then(|| trace_dir.clone());
+        let ctx = Context {
+            system: Some("PRIVATE_SYSTEM".into()),
+            messages: vec![
+                Message::user("PRIVATE_PROMPT"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "lookup".into(),
+                        input: json!({"query": "PRIVATE_ARGUMENT"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "PRIVATE_RESULT".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![ToolSchema {
+                name: "lookup".into(),
+                description: "schema description retained".into(),
+                input_schema: json!({
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "query": {"type": "string"},
+                        "customView": {"type": "string", "minLength": 1,
+                            "default": "example-view", "examples": ["view"]}
+                    }, "required": ["query"]
+                }),
+            }],
+            stable_prefix_len: 0,
+        };
+        let opts = CompleteOpts {
+            model: "mock/model".into(),
+            ..CompleteOpts::default()
+        };
+        let mut events = Vec::new();
+        let response = if streaming {
+            provider
+                .stream(&ctx, &opts, &mut |event| events.push(event))
+                .await
+        } else {
+            provider.complete(&ctx, &opts).await
+        };
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.usage.input, 10);
+        assert_eq!(response.usage.output, 2);
+        assert!(matches!(response.content.as_slice(), [ContentBlock::Text(text)] if text == "ok"));
+        if streaming {
+            assert!(!events.is_empty());
+        }
+        let request = captured.await.unwrap();
+        for secret in [
+            "PRIVATE_KEY",
+            "PRIVATE_SYSTEM",
+            "PRIVATE_PROMPT",
+            "PRIVATE_ARGUMENT",
+            "PRIVATE_RESULT",
+        ] {
+            assert!(request.contains(secret));
+        }
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        if enabled && !broken {
+            let text = std::fs::read_to_string(trace_dir.join("requests.jsonl")).unwrap();
+            assert_eq!(text.lines().count(), 1);
+            let trace: Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(trace["tools"], body["tools"]);
+            assert_eq!(
+                trace["tools"][0]["function"]["parameters"]["required"],
+                json!(["query"])
+            );
+            assert_eq!(
+                trace["message_count"],
+                body["messages"].as_array().unwrap().len()
+            );
+            assert_eq!(trace["model"], opts.model);
+            assert_eq!(trace["stream"], streaming);
+            uuid::Uuid::parse_str(trace["request_id"].as_str().unwrap()).unwrap();
+            assert!(trace["unix_ms"].as_u64().unwrap() > 0);
+            for secret in [
+                "PRIVATE_KEY",
+                "PRIVATE_SYSTEM",
+                "PRIVATE_PROMPT",
+                "PRIVATE_ARGUMENT",
+                "PRIVATE_RESULT",
+                &base_url,
+            ] {
+                assert!(!text.contains(secret));
+            }
+            assert_eq!(trace.as_object().unwrap().len(), 8);
+        } else if broken {
+            assert_eq!(
+                std::fs::read_to_string(&trace_dir).unwrap(),
+                "not a directory"
+            );
+        } else {
+            assert!(!trace_dir.exists());
+        }
+    }
 
     #[tokio::test]
     async fn stream_prompt_cache_marks_latest_tool_result() {
