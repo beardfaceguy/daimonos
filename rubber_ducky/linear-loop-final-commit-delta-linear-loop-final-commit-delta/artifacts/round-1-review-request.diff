@@ -1,0 +1,7 @@
+In src/loop_detector.rs test warning_round_updates_legacy_window_once, approved vs committed:
+-        d.observe_round(&[failure.clone()]);
+-        d.observe_round(&[failure.clone()]);
++        d.observe_round(std::slice::from_ref(&failure));
++        d.observe_round(std::slice::from_ref(&failure));
+
+No other content changes to reviewed diff. This is borrowing the same single observation rather than cloning it into a temporary one-element array. Both forms call observe_round(&[CallObservation]) on equivalent data; observe_round does not mutate the borrowed observation.

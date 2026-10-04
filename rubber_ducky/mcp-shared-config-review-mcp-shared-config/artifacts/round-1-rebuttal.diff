@@ -1,0 +1,504 @@
+diff --git i/daimonos.default.toml w/daimonos.default.toml
+index 8e94464..7df670b 100644
+--- i/daimonos.default.toml
++++ w/daimonos.default.toml
+@@ -348,8 +348,9 @@ session_list_page_size = 50
+ # Outbound MCP servers for daimonos's own agent frontends — interactive TUI,
+ # one-shot `agent`, `chat` REPL, and the session daemon (#1289). The ACP path
+ # is unaffected (there the client forwards the server list per session).
+-# Reads a Claude-style `mcpServers` JSON file — the same format Claude
+-# Desktop / Claude Code use — so one file can feed every harness:
++# Reads either Zed's JSONC `context_servers` settings or a Claude/Cursor-style
++# `mcpServers` JSON file. The default points directly at Zed, making it the
++# primary system configuration without copies or symlinks:
+ #   { "mcpServers": {
+ #       "linear":   { "command": "npx", "args": ["-y", "linear-mcp"] },
+ #       "repowise": { "url": "http://127.0.0.1:8931/mcp" } } }
+@@ -357,7 +358,7 @@ session_list_page_size = 50
+ # Bridge tuning (timeouts, caps, allow_stdio/allow_http, self-connection
+ # refusal) is shared with [acp.mcp] below.
+ enabled = true
+-servers_file = "~/.config/daimonos/mcp_servers.json"
++servers_file = "~/.config/zed/settings.json"
+ 
+ [acp.mcp]
+ # MCP-server bridge (ADR-003, #990). Zed forwards every configured context
+@@ -399,12 +400,10 @@ max_tools_per_server = 128
+ # Fallback for unpatched Zed: when Zed forwards an EMPTY MCP server list at
+ # session start (a cold-start race where its context-server store isn't
+ # populated yet, and it never re-forwards to a live session), read Zed's own
+-# `context_servers` settings directly and bridge those. Off by default because
+-# it reads an external app's config and spawns that config's stdio servers, so
+-# it must not fire for non-Zed ACP clients. Enable it only when running
+-# daimonos as Zed's ACP agent on an unpatched Zed. Only triggers on an empty
+-# forwarded list — servers Zed did forward are never overridden.
+-zed_config_fallback = false
++# `context_servers` settings directly and bridge those. This is considered
++# only when initialize identifies the ACP client as Zed; an empty list from any
++# other harness remains authoritative. Harness-forwarded servers always win.
++zed_config_fallback = true
+ # Path to Zed's settings.json for the fallback above. Empty/unset derives it
+ # from $XDG_CONFIG_HOME/$HOME (~/.config/zed/settings.json).
+ # zed_settings_path = "/home/you/.config/zed/settings.json"
+diff --git i/docs/zed-acp-setup.md w/docs/zed-acp-setup.md
+index 2cbfa8f..f221412 100644
+--- i/docs/zed-acp-setup.md
++++ w/docs/zed-acp-setup.md
+@@ -13,6 +13,35 @@ used together.
+   `daimonos acp` loads it the same way `daimonos agent`/`daimonos chat` do
+ - Zed editor installed, with agent-panel support for custom `agent_servers`
+ 
++## Shared MCP configuration
++
++Daimonos treats Zed as the primary MCP configuration by default. Non-ACP
++agents read `~/.config/zed/settings.json` directly, including its JSONC
++`context_servers`. ACP sessions resolve servers in this order:
++
++1. Servers forwarded by the current ACP harness.
++2. If—and only if—ACP initialize identifies the harness as Zed and it forwards
++   an empty list, Zed `context_servers`.
++3. For that same Zed recovery case, `[agent.mcp].servers_file` as the final
++   Daimonos fallback.
++
++An empty list from Cursor or any unknown/non-Zed ACP harness remains
++authoritative and produces no MCP servers.
++
++To select a Claude/Cursor-style shared file instead:
++
++```toml
++[agent.mcp]
++servers_file = "~/.config/mcp/servers.json"
++```
++
++The selected file may contain either `mcpServers` or `context_servers`. A
++harness that cannot select a path may symlink its standalone MCP file to the
++shared file. Do not symlink all of Zed's `settings.json` over a harness file
++that only accepts a standalone `mcpServers` document. While Zed's file is being
++edited, invalid JSONC causes Daimonos to skip configured MCP servers and emit a
++warning rather than failing the agent session.
++
+ ## Setup
+ 
+ Add daimonos under the `agent_servers` key in Zed's `settings.json`. The
+diff --git i/src/acp_cmd.rs w/src/acp_cmd.rs
+index 6737377..e058280 100644
+--- i/src/acp_cmd.rs
++++ w/src/acp_cmd.rs
+@@ -444,6 +444,9 @@ struct AcpState {
+     supports_images: bool,
+     /// Zed's `_meta.terminal_output` extension, negotiated at initialize.
+     supports_terminal_output: AtomicBool,
++    /// Whether initialize identified the current ACP client as Zed. File-based
++    /// recovery is never applied to other clients' intentionally empty lists.
++    client_is_zed: AtomicBool,
+     /// Maximum sessions returned by one session/list response.
+     session_list_page_size: usize,
+     /// Context/window compaction configuration cloned into each session.
+@@ -1566,42 +1569,34 @@ fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
+         .collect()
+ }
+ 
+-/// Resolve the MCP servers to bridge for a session. Normally these are the
+-/// list Zed forwards in `session/new`/`session/load`. But unpatched Zed has a
+-/// cold-start race where it forwards an EMPTY list (its context-server store
+-/// isn't populated when it issues a restored session) and never re-forwards to
+-/// a live session — leaving the session with no MCP tools. So when the
+-/// forwarded list is empty (and the fallback is enabled), read Zed's own
+-/// `context_servers` settings directly and bridge those instead (see
+-/// [`crate::zed_config`]). Only the empty case triggers the fallback; servers
+-/// Zed did forward are never overridden.
+-fn resolve_mcp_specs(forwarded: Vec<McpServer>, cfg: &Config) -> Vec<ServerSpec> {
++/// Resolve MCP servers in precedence order: the ACP harness first, then its
++/// Zed settings fallback, then Daimonos's configured shared servers file.
++async fn resolve_mcp_specs(
++    forwarded: Vec<McpServer>,
++    cfg: &Config,
++    client_is_zed: bool,
++) -> Vec<ServerSpec> {
+     let specs = to_server_specs(forwarded);
+-    if !specs.is_empty() || !cfg.acp.mcp.enabled || !cfg.acp.mcp.zed_config_fallback {
++    // An empty list from an unknown/non-Zed client may be intentional. Zed is
++    // the sole exception because its known cold-start race loses configured
++    // servers before session/new or session/load.
++    if !specs.is_empty() || !cfg.acp.mcp.enabled || !client_is_zed {
+         return specs;
+     }
+-    match crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()) {
+-        Ok(fallback) if !fallback.is_empty() => {
+-            tracing::warn!(
+-                target: "daimonos::acp",
+-                event = "mcp_forward_empty_fallback",
+-                recovered = fallback.len(),
+-                "Zed forwarded no MCP servers; recovered them from Zed settings \
+-                 (unpatched-Zed cold-start race)"
+-            );
+-            fallback
+-        }
+-        Ok(_) => specs,
+-        Err(e) => {
+-            tracing::warn!(
+-                target: "daimonos::acp",
+-                event = "mcp_fallback_failed",
+-                error = %e,
+-                "Zed forwarded no MCP servers and reading Zed settings failed"
+-            );
+-            specs
++    if cfg.acp.mcp.zed_config_fallback {
++        match crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()) {
++            Ok(fallback) if !fallback.is_empty() => {
++                tracing::warn!(target: "daimonos::acp", event = "mcp_forward_empty_fallback",
++                    recovered = fallback.len(),
++                    "ACP harness forwarded no MCP servers; recovered Zed settings");
++                return fallback;
++            }
++            Ok(_) => {}
++            Err(error) => tracing::warn!(target: "daimonos::acp", event = "mcp_fallback_failed",
++                %error, "ACP harness forwarded no MCP servers and Zed settings failed"),
+         }
+     }
++    crate::agent_mcp::load_configured_specs(cfg).await
+ }
+ 
+ fn should_refresh_mcp_bridge(
+@@ -2584,6 +2579,7 @@ fn build_agent_with_state(
+         }),
+         supports_images,
+         supports_terminal_output: AtomicBool::new(false),
++        client_is_zed: AtomicBool::new(false),
+         session_list_page_size: cfg.acp.session_list_page_size,
+         compaction,
+         analytics,
+@@ -2610,6 +2606,13 @@ fn build_agent_with_state(
+                         state
+                             .supports_terminal_output
+                             .store(client_supports_terminal_output(&req), Ordering::Release);
++                        let is_zed = req.client_info.as_ref().is_some_and(|info| {
++                            info.name.eq_ignore_ascii_case("zed")
++                                || info.title.as_deref().is_some_and(|title| {
++                                    title.to_ascii_lowercase().contains("zed")
++                                })
++                        });
++                        state.client_is_zed.store(is_zed, Ordering::Release);
+                         // load_session(true): Zed calls session/load to reopen
+                         // a thread on window refocus.
+                         let mut capabilities = AgentCapabilities::new()
+@@ -2876,11 +2879,15 @@ fn build_agent_with_state(
+                     let token_log = token_log.clone();
+                     async move {
+                         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+-                        // Zed forwards the user's configured MCP servers here
+-                        // (ADR-003); bridge them into this session. Falls back
+-                        // to Zed's settings when the forwarded list is empty
+-                        // (unpatched-Zed cold-start race).
+-                        let mcp_specs = resolve_mcp_specs(req.mcp_servers, &cfg);
++                        // The current harness's non-empty list is authoritative.
++                        // Only an identified Zed client gets file recovery for
++                        // its known empty-forward cold-start race.
++                        let mcp_specs = resolve_mcp_specs(
++                            req.mcp_servers,
++                            &cfg,
++                            state.client_is_zed.load(Ordering::Acquire),
++                        )
++                        .await;
+                         let mcp_server_count = mcp_specs.len();
+                         // Use the client-provided project root, not the CLI's
+                         // own cwd — Zed passes the actual project it wants this
+@@ -3000,9 +3007,14 @@ fn build_agent_with_state(
+                     let token_log = token_log.clone();
+                     async move {
+                         let session_id = req.session_id.clone();
+-                        // Same empty-forward fallback as session/new: a
+-                        // reloaded thread must also recover its MCP servers.
+-                        let mcp_specs = resolve_mcp_specs(req.mcp_servers, &cfg);
++                        // Apply the same harness-first, Zed-gated recovery as
++                        // session/new so restored Zed threads recover MCP tools.
++                        let mcp_specs = resolve_mcp_specs(
++                            req.mcp_servers,
++                            &cfg,
++                            state.client_is_zed.load(Ordering::Acquire),
++                        )
++                        .await;
+                         let session_workspace = if req.cwd.as_os_str().is_empty() {
+                             workspace_fallback
+                         } else {
+@@ -4026,8 +4038,8 @@ mod tests {
+         );
+     }
+ 
+-    #[test]
+-    fn resolve_mcp_specs_fallback_gating() {
++    #[tokio::test]
++    async fn resolve_mcp_specs_fallback_gating() {
+         let dir = tempfile::tempdir().unwrap();
+         let path = dir.path().join("settings.json");
+         std::fs::write(
+@@ -4038,23 +4050,44 @@ mod tests {
+         let mut cfg = Config::default();
+         cfg.acp.mcp.zed_settings_path = Some(path.to_string_lossy().into_owned());
+ 
+-        // Enabled + empty forward -> read Zed config fallback.
++        // Identified Zed + empty forward -> read Zed config fallback.
+         cfg.acp.mcp.zed_config_fallback = true;
+-        assert_eq!(resolve_mcp_specs(vec![], &cfg).len(), 1);
++        assert_eq!(resolve_mcp_specs(vec![], &cfg, true).await.len(), 1);
+ 
+-        // Disabled (the default) -> no fallback, even with an empty forward.
++        // An empty list from any other harness is authoritative.
++        assert!(resolve_mcp_specs(vec![], &cfg, false).await.is_empty());
++
++        // With both file fallbacks disabled, an empty forward stays empty.
+         cfg.acp.mcp.zed_config_fallback = false;
+-        assert!(resolve_mcp_specs(vec![], &cfg).is_empty());
++        cfg.agent.mcp.enabled = false;
++        assert!(resolve_mcp_specs(vec![], &cfg, true).await.is_empty());
+ 
+-        // A non-empty forward is never overridden by the fallback.
++        // Tier 3: identified Zed, no Zed settings, configured shared file.
++        cfg.acp.mcp.zed_settings_path =
++            Some(dir.path().join("missing.json").to_string_lossy().into());
++        let shared = dir.path().join("shared.json");
++        std::fs::write(
++            &shared,
++            r#"{ "mcpServers": { "shared": { "command": "x" } } }"#,
++        )
++        .unwrap();
++        cfg.agent.mcp.servers_file = shared.to_string_lossy().into();
++        cfg.agent.mcp.enabled = true;
++        assert!(matches!(
++            &resolve_mcp_specs(vec![], &cfg, true).await[0],
++            ServerSpec::Stdio { name, .. } if name == "shared"
++        ));
++
++        // A non-empty forward is never overridden by either fallback.
+         cfg.acp.mcp.zed_config_fallback = true;
++        cfg.agent.mcp.enabled = true;
+         let forwarded = vec![McpServer::Http(
+             agent_client_protocol::schema::v1::McpServerHttp::new(
+                 "fwd".to_string(),
+                 "http://127.0.0.1:10/".to_string(),
+             ),
+         )];
+-        let specs = resolve_mcp_specs(forwarded, &cfg);
++        let specs = resolve_mcp_specs(forwarded, &cfg, true).await;
+         assert_eq!(specs.len(), 1);
+         assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "fwd"));
+     }
+@@ -7720,6 +7753,7 @@ mod tests {
+             stop_reason,
+             error_message: None,
+             context_overflow: false,
++            evidence: Default::default(),
+         };
+         assert_eq!(
+             canonical_assistant_outcome(&turn(crate::providers::StopReason::EndTurn)),
+diff --git i/src/agent_mcp.rs w/src/agent_mcp.rs
+index 850e293..b60f121 100644
+--- i/src/agent_mcp.rs
++++ w/src/agent_mcp.rs
+@@ -24,19 +24,26 @@ use crate::config::Config;
+ use crate::mcp_bridge::{McpBridge, McpClientPool, ServerSpec};
+ use crate::providers::ToolSchema;
+ 
+-/// Parse a Claude-style config: `{"mcpServers": {name: {command, args?, env?}
+-/// | {url, headers?}}}`. Entries are sorted by name so bridge order (and thus
+-/// the `max_servers` cap) is deterministic — JSON object order is not
+-/// preserved. Unknown per-server keys are ignored for forward compatibility;
+-/// a `type` field, when present, must agree with the transport implied by
+-/// `command`/`url`.
++/// Parse either a Claude/Cursor-style `mcpServers` file or Zed's
++/// `settings.json` (`context_servers`). This lets `[agent.mcp].servers_file`
++/// point directly at the system's primary Zed configuration instead of
++/// maintaining a translated copy. Entries are sorted by name so bridge order
++/// (and thus the `max_servers` cap) is deterministic.
+ pub fn parse_servers_json(content: &str) -> Result<Vec<ServerSpec>, String> {
++    // Zed settings are JSONC. Reuse its reader's string-aware cleanup before
++    // parsing; ordinary JSON passes through unchanged.
++    let cleaned = crate::zed_config::clean_jsonc(content);
+     let root: Value =
+-        serde_json::from_str(content).map_err(|error| format!("invalid JSON: {error}"))?;
++        serde_json::from_str(&cleaned).map_err(|error| format!("invalid JSON/JSONC: {error}"))?;
++    if root.get("context_servers").is_some() {
++        return Ok(crate::zed_config::specs_from_settings(&root));
++    }
+     let servers = root
+         .get("mcpServers")
+         .and_then(Value::as_object)
+-        .ok_or_else(|| "missing top-level \"mcpServers\" object".to_string())?;
++        .ok_or_else(|| {
++            "missing top-level \"mcpServers\" or \"context_servers\" object".to_string()
++        })?;
+     let mut names: Vec<&String> = servers.keys().collect();
+     names.sort();
+     names
+@@ -156,6 +163,32 @@ impl AgentMcp {
+     }
+ }
+ 
++/// Load the system/user MCP configuration selected by `[agent.mcp]`.
++/// Both Claude/Cursor and Zed settings formats are accepted.
++pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
++    if !cfg.agent.mcp.enabled {
++        return Vec::new();
++    }
++    let path = crate::paths::expand_tilde(&cfg.agent.mcp.servers_file);
++    let content = match tokio::fs::read_to_string(&path).await {
++        Ok(content) => content,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
++        Err(error) => {
++            tracing::warn!(target: "daimonos::agent_mcp", path = %path.display(), %error,
++                "mcp servers file unreadable; continuing without configured MCP servers");
++            return Vec::new();
++        }
++    };
++    match parse_servers_json(&content) {
++        Ok(specs) => specs,
++        Err(error) => {
++            tracing::warn!(target: "daimonos::agent_mcp", path = %path.display(), %error,
++                "mcp servers file invalid; continuing without configured MCP servers");
++            Vec::new()
++        }
++    }
++}
++
+ /// Read `[agent.mcp] servers_file` and connect. `None` when disabled, the
+ /// file is absent or empty, or it fails to read/parse (logged) — the agent
+ /// then runs with native tools only.
+@@ -164,35 +197,7 @@ pub async fn connect(
+     native_tool_names: &HashSet<String>,
+     analytics: Option<Arc<AnalyticsStore>>,
+ ) -> Option<AgentMcp> {
+-    if !cfg.agent.mcp.enabled {
+-        return None;
+-    }
+-    let path = crate::paths::expand_tilde(&cfg.agent.mcp.servers_file);
+-    let content = match tokio::fs::read_to_string(&path).await {
+-        Ok(content) => content,
+-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+-        Err(error) => {
+-            tracing::warn!(
+-                target: "daimonos::agent_mcp",
+-                path = %path.display(),
+-                %error,
+-                "mcp servers file unreadable; continuing with native tools only"
+-            );
+-            return None;
+-        }
+-    };
+-    let specs = match parse_servers_json(&content) {
+-        Ok(specs) => specs,
+-        Err(error) => {
+-            tracing::warn!(
+-                target: "daimonos::agent_mcp",
+-                path = %path.display(),
+-                %error,
+-                "mcp servers file invalid; continuing with native tools only"
+-            );
+-            return None;
+-        }
+-    };
++    let specs = load_configured_specs(cfg).await;
+     if specs.is_empty() {
+         return None;
+     }
+@@ -257,6 +262,20 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn parses_zed_jsonc_context_servers() {
++        let jsonc = r#"{
++          // one primary config for Zed and Daimonos
++          "context_servers": {
++            "zed-http": { "url": "https://example.test/mcp", },
++            "off": { "enabled": false, "command": "nope" },
++          },
++        }"#;
++        let specs = parse_servers_json(jsonc).unwrap();
++        assert_eq!(specs.len(), 1);
++        assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "zed-http"));
++    }
++
+     #[test]
+     fn type_field_is_validated_but_optional() {
+         let ok = r#"{"mcpServers": {"a": {"type": "stdio", "command": "x"},
+@@ -276,7 +295,7 @@ mod tests {
+     fn rejects_malformed_documents_legibly() {
+         assert!(parse_servers_json("not json")
+             .unwrap_err()
+-            .contains("invalid JSON"));
++            .contains("invalid JSON/JSONC"));
+         assert!(parse_servers_json("{}").unwrap_err().contains("mcpServers"));
+         assert!(parse_servers_json(r#"{"mcpServers": {"a": {}}}"#)
+             .unwrap_err()
+diff --git i/src/config.rs w/src/config.rs
+index cdd9f90..ed0836f 100644
+--- i/src/config.rs
++++ w/src/config.rs
+@@ -68,7 +68,7 @@ impl Default for AgentMcpConfig {
+     fn default() -> Self {
+         Self {
+             enabled: true,
+-            servers_file: "~/.config/daimonos/mcp_servers.json".to_string(),
++            servers_file: "~/.config/zed/settings.json".to_string(),
+         }
+     }
+ }
+@@ -1043,10 +1043,10 @@ pub struct AcpMcpConfig {
+     /// settings directly and bridge those. Only triggers on an empty forwarded
+     /// list — never overrides servers Zed did forward.
+     ///
+-    /// **Opt-in (default false):** it reads an external app's config file and
+-    /// spawns that config's stdio servers, so it must not fire for non-Zed ACP
+-    /// clients or in tests. Enable it only when running daimonos as Zed's ACP
+-    /// agent on an unpatched Zed.
++    /// This is gated on ACP initialize identifying the client as Zed, so an
++    /// empty list from another harness remains authoritative. When enabled for
++    /// Zed, `[agent.mcp].servers_file` is the final fallback if this file has no
++    /// usable servers.
+     pub zed_config_fallback: bool,
+     /// Path to Zed's `settings.json` for `zed_config_fallback`. `None` derives
+     /// it from `$XDG_CONFIG_HOME`/`$HOME` (`~/.config/zed/settings.json`).
+@@ -1067,7 +1067,7 @@ impl Default for AcpMcpConfig {
+             max_servers: 32,
+             max_concurrent_connects: 8,
+             max_tools_per_server: 128,
+-            zed_config_fallback: false,
++            zed_config_fallback: true,
+             zed_settings_path: None,
+         }
+     }
+diff --git i/src/zed_config.rs w/src/zed_config.rs
+index 438210d..967903e 100644
+--- i/src/zed_config.rs
++++ w/src/zed_config.rs
+@@ -43,7 +43,7 @@ pub fn context_server_specs(override_path: Option<&str>) -> anyhow::Result<Vec<S
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+     };
+-    let json = strip_trailing_commas(&strip_jsonc(&raw));
++    let json = clean_jsonc(&raw);
+     let value: serde_json::Value = serde_json::from_str(&json)
+         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+     Ok(specs_from_settings(&value))
+@@ -61,7 +61,7 @@ fn settings_path(override_path: Option<&str>) -> Option<PathBuf> {
+ 
+ /// Map the `context_servers` object of a parsed Zed settings document to
+ /// [`ServerSpec`]s. Unknown/incomplete entries are skipped.
+-fn specs_from_settings(value: &serde_json::Value) -> Vec<ServerSpec> {
++pub(crate) fn specs_from_settings(value: &serde_json::Value) -> Vec<ServerSpec> {
+     let Some(servers) = value.get("context_servers").and_then(|v| v.as_object()) else {
+         return Vec::new();
+     };
+@@ -119,6 +119,12 @@ fn string_map(value: Option<&serde_json::Value>) -> HashMap<String, String> {
+         .unwrap_or_default()
+ }
+ 
++/// Normalize Zed JSONC into strict JSON for both direct fallback and shared
++/// `[agent.mcp].servers_file` consumption.
++pub(crate) fn clean_jsonc(input: &str) -> String {
++    strip_trailing_commas(&strip_jsonc(input))
++}
++
+ /// Remove `//` line comments and `/* */` block comments from a JSONC document,
+ /// preserving anything inside string literals (so `"http://…"` and comment-like
+ /// content in strings survive).

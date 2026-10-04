@@ -1510,6 +1510,65 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[test]
+    fn discovered_schema_preserves_optional_filters_on_provider_wire() {
+        let upstream = serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "customView": {"type": "string", "minLength": 1},
+                "filters": {"type": "object", "additionalProperties": false,
+                    "properties": {"cursor": {"anyOf": [{"type":"string"}, {"type":"null"}]}}}
+            }
+        });
+        let parsed: rust_mcp_sdk::schema::ToolInputSchema =
+            serde_json::from_value(upstream.clone()).unwrap();
+        let schema = crate::providers::ToolSchema {
+            name: "mcp__mock__list_initiatives".into(),
+            description: "mock schema fidelity".into(),
+            input_schema: serde_json::to_value(parsed).unwrap(),
+        };
+        let wire = crate::providers::openai::tools_to_wire(&[schema]);
+        let parameters = &wire[0]["parameters"];
+        assert!(parameters.get("required").is_none());
+        assert_eq!(parameters["properties"], upstream["properties"]);
+        assert_eq!(wire[0]["strict"], false);
+
+        // The incident's configured provider is OpenRouter, not native OpenAI.
+        // Confirm that adapter also leaves optional fields optional.
+        let router = crate::providers::openrouter::tools_to_wire(&[crate::providers::ToolSchema {
+            name: "mcp__mock__list_initiatives".into(),
+            description: "mock schema fidelity".into(),
+            input_schema: serde_json::to_value(
+                serde_json::from_value::<rust_mcp_sdk::schema::ToolInputSchema>(upstream.clone())
+                    .unwrap(),
+            )
+            .unwrap(),
+        }]);
+        let parameters = &router[0]["function"]["parameters"];
+        assert!(parameters.get("required").is_none());
+        assert_eq!(parameters["properties"], upstream["properties"]);
+        assert!(router[0]["function"].get("strict").is_none());
+    }
+
+    #[test]
+    #[ignore = "reproduced upstream SDK loss; schema repair requires separate review"]
+    fn discovered_schema_preserves_top_level_additional_properties() {
+        let upstream =
+            serde_json::json!({"type":"object", "additionalProperties":false, "properties":{}});
+        let parsed: rust_mcp_sdk::schema::ToolInputSchema =
+            serde_json::from_value(upstream.clone()).unwrap();
+        let schema = crate::providers::ToolSchema {
+            name: "mcp__mock__schema".into(),
+            description: "mock".into(),
+            input_schema: serde_json::to_value(parsed).unwrap(),
+        };
+        let wire = crate::providers::openai::tools_to_wire(&[schema]);
+        assert_eq!(
+            wire[0]["parameters"].get("additionalProperties"),
+            upstream.get("additionalProperties")
+        );
+    }
+
     // --- result_to_outcome ---
 
     #[test]

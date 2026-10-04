@@ -26,6 +26,7 @@ mod mcp;
 mod mcp_bridge;
 mod mcp_config_cmd;
 mod mcp_oauth;
+mod mcp_primary;
 mod observability;
 mod ops;
 mod paths;

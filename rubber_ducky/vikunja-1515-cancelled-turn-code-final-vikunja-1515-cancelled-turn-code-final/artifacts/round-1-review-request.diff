@@ -1,0 +1,63 @@
+Commit 639caca changes 17 files (+1566/-79): agent loop/session lifecycle, ACP/chat/session persistence, all three provider tests, prompt config/docs, ADR-016.
+
+Core staged API:
+```
+pub(crate) fn staged_prompt_message(&mut self, user_message: Message) -> Pin<Box<dyn Future<Output=AgentResult> + Send + '_>> {
+    self.begin_turn_journal(TurnJournalMode::Append, user_message.clone());
+    Box::pin(async move { self.run_prompt_attempt(user_message).await })
+}
+pub(crate) fn commit_staged(&mut self, result: AgentResult, completion_claimed: bool) -> TurnResult {
+    debug_assert!(completion_claimed);
+    self.inflight_turn = None;
+    self.commit(result)
+}
+pub(crate) fn finalize_cancelled_turn(&mut self, usage_already_applied: bool) -> Option<CancelledTurnKind> {
+    let journal = self.inflight_turn.take()?;
+    let state = journal.lock().unwrap_or_else(|p| p.into_inner());
+    let suffix = materialize_cancelled_suffix(state.suffix.clone(), configured_note.trim());
+    match state.mode { Append => self.messages.extend(suffix), ReplaceFrom(i) => { self.messages.truncate(i); self.messages.extend(suffix); } }
+    if !usage_already_applied { self.total_usage = accumulate_usage(take(&mut self.total_usage), state.usage.clone()); ... }
+    Some(kind)
+}
+```
+
+Single-winner core:
+```
+let staged_result = { let staged = agent_session.staged_prompt_message(user_message); tokio::select! { result = staged => Some(result), _ = active_turn.cancelled() => None } };
+let (turn, cancelled_kind) = match staged_result {
+  Some(result) if active_turn.mark_completed() => (Some(agent_session.commit_staged(result, true)), None),
+  Some(_) => (None, agent_session.finalize_cancelled_turn(true)),
+  None => (None, agent_session.finalize_cancelled_turn(false)),
+};
+// align IDs/outcomes, persist_current().await, then drop(active_turn)
+```
+
+Journal boundaries:
+- checkpoint full suffix after each complete provider response and continuation repair
+- record cumulative completed-provider usage
+- after each bounded tool result, checkpoint assistant call plus partial ordered result batch
+- policy-blocked results are checkpointed before `continue`
+- final batch checkpoint follows insertion into normal history
+
+Materialization:
+```
+for each assistant message's ToolCall ids:
+  consume an adjacent all-ToolResult user message if present;
+  emit results in call order, preserving exact existing blocks;
+  synthesize error ToolResult(note) only for missing ids;
+append one assistant cancellation note unless empty.
+```
+
+Acceptance tests added/updated:
+- cancellation before first future poll retains user
+- completed write then cancellation retains exact result
+- multi-call completed + unresolved pairing
+- blocked first call retains exact policy result when second call is cancelled
+- unfinalized stream text is not promoted
+- completed background-handle-shaped result survives
+- staged completion/cancel usage is not double-counted
+- normal/cancel journal resources are released
+- ACP cancel then follow-up sees recovered context; persisted reload contains it once
+- cancelled explicit retry preserves one user/client ID, Aborted outcome, uncertainty result, and persisted record
+- Anthropic signed thinking, OpenAI encrypted reasoning state, and OpenRouter multi-call wire shapes each pair every call exactly once
+- prompt default/override/dump/config docs coverage.

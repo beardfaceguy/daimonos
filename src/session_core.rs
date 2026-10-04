@@ -1357,7 +1357,9 @@ impl SessionCore {
         PersistenceCapture {
             generation,
             through_seq,
-            model: session.model().to_string(),
+            // A picker selection is effective on the next turn, so the
+            // selected model may differ from AgentSession's last-used model.
+            model: self.current_model(),
             thinking: thinking.as_str().to_string(),
             messages: session.history().to_vec(),
             cwd: self.cwd.clone(),
