@@ -1547,7 +1547,7 @@ mod tests {
         let parameters = &router[0]["function"]["parameters"];
         assert!(parameters.get("required").is_none());
         assert_eq!(parameters["properties"], upstream["properties"]);
-        assert!(router[0]["function"].get("strict").is_none());
+        assert_eq!(router[0]["function"]["strict"], false);
     }
 
     #[test]
@@ -1567,6 +1567,227 @@ mod tests {
             wire[0]["parameters"].get("additionalProperties"),
             upstream.get("additionalProperties")
         );
+    }
+
+    /// Exercise discovery, provider HTTP declarations and remote dispatch, not
+    /// just ToolInputSchema serialization. The mock server enforces the source
+    /// fixture's required/minLength rules without filling absent arguments.
+    #[tokio::test]
+    async fn optional_filters_round_trip_through_discovery_provider_and_dispatch() {
+        use crate::providers::{CompleteOpts, Context, LlmProvider};
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::json;
+
+        let upstream = json!({
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "customView": {"type": "string", "minLength": 1},
+                "includeArchived": {"type": "boolean", "default": false},
+                "limit": {"type": "number", "default": 50},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "assignee": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "filters": {"type": "object", "additionalProperties": false,
+                    "properties": {"cursor": {"type": ["string", "null"]}}}
+            }
+        });
+        let mut required = upstream.clone();
+        required["required"] = json!(["project"]);
+        let mut empty_required = upstream.clone();
+        empty_required["required"] = json!([]);
+        let schemas = json!({
+            "list_issues": upstream,
+            "required_project": required,
+            "empty_required": empty_required,
+            "save_comment": {
+                "type": "object", "required": ["body"],
+                "properties": {
+                    "body": {"type": "string"},
+                    "issueId": {"type": "string"},
+                    "parentId": {"type": "string"},
+                    "statusUpdateId": {"type": "string"},
+                    "statusUpdateType": {"type": "string", "enum": ["project", "initiative"]}
+                }
+            }
+        });
+        let received = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        async fn mcp(
+            State((schemas, received)): State<(Value, Arc<std::sync::Mutex<Vec<Value>>>)>,
+            Json(request): Json<Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let Some(id) = request.get("id") else {
+                return axum::http::StatusCode::ACCEPTED.into_response();
+            };
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => json!({
+                    "protocolVersion": LATEST_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "schema-fixture", "version": "1"}
+                }),
+                "tools/list" => json!({"tools": schemas.as_object().unwrap().iter()
+                    .map(|(name, schema)| json!({"name": name, "inputSchema": schema}))
+                    .collect::<Vec<_>>()}),
+                "tools/call" => {
+                    let params = &request["params"];
+                    let args = &params["arguments"];
+                    let schema = &schemas[params["name"].as_str().unwrap()];
+                    received.lock().unwrap().push(params.clone());
+                    let missing_required = schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .is_some_and(|keys| {
+                            keys.iter()
+                                .any(|key| args.get(key.as_str().unwrap()).is_none())
+                        });
+                    let too_short = args.get("customView").is_some_and(|value| {
+                        value.as_str().is_none_or(|text| {
+                            text.chars().count()
+                                < schema["properties"]["customView"]["minLength"]
+                                    .as_u64()
+                                    .unwrap() as usize
+                        })
+                    });
+                    json!({"content": [{"type": "text", "text": "fixture result"}],
+                        "isError": missing_required || too_short ||
+                            (params["name"] == "save_comment" && args.get("statusUpdateType").is_some()
+                                && args.get("statusUpdateId").and_then(Value::as_str).is_none_or(str::is_empty))})
+                }
+                method => panic!("unexpected fixture method: {method}"),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/mcp", post(mcp))
+            .with_state((schemas.clone(), received.clone()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bridge = McpBridge::build_with_pool(
+            vec![ServerSpec::Http {
+                name: "fixture".into(),
+                url,
+                headers: HashMap::new(),
+            }],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+            McpClientPool::new(),
+        )
+        .await;
+        assert_eq!(bridge.tools().len(), 4, "{:?}", bridge.diagnostics());
+        for tool in bridge.tools() {
+            let original = tool.name.strip_prefix("mcp__fixture__").unwrap();
+            assert_eq!(
+                tool.input_schema["properties"],
+                schemas[original]["properties"]
+            );
+            if original == "required_project" {
+                assert_eq!(tool.input_schema["required"], json!(["project"]));
+            } else if original == "save_comment" {
+                assert_eq!(tool.input_schema["required"], json!(["body"]));
+            } else {
+                assert!(tool.input_schema.get("required").is_none());
+            }
+        }
+        let intended = json!({"project": "P-INFRA-247", "includeArchived": true,
+            "limit": 250, "fields": ["id", "title", "project", "url"]});
+        let response = json!({"choices": [{"message": {"role": "assistant",
+            "tool_calls": [{"id": "call_fixture", "type": "function", "function": {
+                "name": "mcp__fixture__list_issues", "arguments": intended.to_string()
+            }}]}, "finish_reason": "tool_calls"}]});
+        let (base_url, captured) = crate::providers::test_support::mock_http_server(
+            "200 OK",
+            "application/json",
+            response.to_string(),
+        )
+        .await;
+        let provider =
+            crate::providers::openrouter::OpenRouterProvider::new("fixture-key".into(), base_url)
+                .unwrap();
+        let response = provider
+            .complete(
+                &Context {
+                    tools: bridge.tools().to_vec(),
+                    messages: vec![],
+                    system: None,
+                    stable_prefix_len: 0,
+                },
+                &CompleteOpts {
+                    model: "fixture/model".into(),
+                    ..CompleteOpts::default()
+                },
+            )
+            .await;
+        let request = captured.await.unwrap();
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        for declaration in body["tools"].as_array().unwrap() {
+            let function = &declaration["function"];
+            let tool = bridge
+                .tools()
+                .iter()
+                .find(|tool| tool.name == function["name"])
+                .unwrap();
+            assert_eq!(function["parameters"], tool.input_schema);
+            assert_eq!(function["strict"], false);
+        }
+        let crate::providers::ContentBlock::ToolCall { name, input, .. } = &response.content[0]
+        else {
+            panic!("expected structured provider tool call");
+        };
+        assert_eq!(input, &intended);
+        assert!(!bridge.call(name, input).await.unwrap().is_error);
+        for (tool, args, is_error) in [
+            ("list_issues", json!({"project": "P-INFRA-247"}), false),
+            (
+                "list_issues",
+                json!({"project": "P-INFRA-247", "assignee": null}),
+                false,
+            ),
+            ("list_issues", json!({"customView": ""}), true),
+            ("required_project", json!({}), true),
+            ("required_project", json!({"project": "P-INFRA-251"}), false),
+            ("empty_required", json!({}), false),
+            (
+                "save_comment",
+                json!({"issueId": "SAUL-623", "body": "Test comment"}),
+                false,
+            ),
+            (
+                "save_comment",
+                json!({"parentId": "fixture-thread", "body": "Test reply"}),
+                false,
+            ),
+            (
+                "save_comment",
+                json!({"statusUpdateId": "fixture-update", "statusUpdateType": "project", "body": "Test update comment"}),
+                false,
+            ),
+            (
+                "save_comment",
+                json!({"issueId": "SAUL-623", "body": "Test comment", "statusUpdateId": "", "statusUpdateType": "project"}),
+                true,
+            ),
+            (
+                "save_comment",
+                json!({"issueId": "SAUL-623", "body": "Test comment", "statusUpdateId": null, "statusUpdateType": "project"}),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                bridge
+                    .call(&format!("mcp__fixture__{tool}"), &args)
+                    .await
+                    .unwrap()
+                    .is_error,
+                is_error
+            );
+            assert_eq!(received.lock().unwrap().last().unwrap()["arguments"], args);
+        }
+        assert_eq!(received.lock().unwrap()[0]["arguments"], intended);
+        bridge.shutdown().await;
+        server.abort();
     }
 
     // --- result_to_outcome ---

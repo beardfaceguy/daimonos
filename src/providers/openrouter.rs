@@ -540,6 +540,11 @@ pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
                 "function": {
                     "name": t.name,
                     "description": t.description,
+                    // OpenRouter's OpenAI routes have produced different tool
+                    // calls for omission versus explicit false, synthesizing
+                    // every property only in the omitted case. Pin non-strict
+                    // mode so `required` remains authoritative (#1526).
+                    "strict": false,
                     "parameters": t.input_schema,
                 }
             })
@@ -1219,6 +1224,7 @@ mod tests {
         assert_eq!(wire[0]["type"], "function");
         assert_eq!(wire[0]["function"]["name"], "read_file");
         assert_eq!(wire[0]["function"]["description"], "Read a file");
+        assert_eq!(wire[0]["function"]["strict"], false);
         assert_eq!(wire[0]["function"]["parameters"]["type"], "object");
     }
 
