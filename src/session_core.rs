@@ -83,6 +83,7 @@ pub enum SessionPromptError {
     Busy,
     Stopped,
     DuplicateRequest(String),
+    Prompt(String),
     Model(String),
 }
 
@@ -94,6 +95,7 @@ impl std::fmt::Display for SessionPromptError {
             Self::DuplicateRequest(id) => {
                 write!(formatter, "duplicate client user message id '{id}'")
             }
+            Self::Prompt(error) => formatter.write_str(error),
             Self::Model(error) => formatter.write_str(error),
         }
     }
@@ -1779,7 +1781,7 @@ impl SessionCore {
             let expanded = agent_session
                 .expand_skill_invocation(text)
                 .await
-                .map_err(SessionPromptError::Model)?;
+                .map_err(SessionPromptError::Prompt)?;
             if expanded != text {
                 user_message = Message::user(expanded);
             }

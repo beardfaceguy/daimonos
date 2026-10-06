@@ -7,11 +7,22 @@
 
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 pub const DEFAULT_SKILL_DIR: &str = ".agents/skills";
 pub const SKILL_DIR_ENV: &str = "DAIMONOS_SKILL_DIR";
+
+static GLOBAL_ROOT_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+pub fn set_global_root_override(root: Option<PathBuf>) {
+    *GLOBAL_ROOT_OVERRIDE
+        .get_or_init(|| RwLock::new(None))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
@@ -84,8 +95,15 @@ pub fn global_root_from(raw: Option<&str>, home: Option<&Path>) -> Result<PathBu
 }
 
 pub fn global_root() -> Result<PathBuf, String> {
-    let raw = std::env::var(SKILL_DIR_ENV).ok();
-    global_root_from(raw.as_deref(), crate::paths::home_dir().as_deref())
+    if let Some(root) = GLOBAL_ROOT_OVERRIDE
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Ok(root);
+    }
+    global_root_from(None, crate::paths::home_dir().as_deref())
 }
 
 pub fn discover(workspace: &Path, config: &crate::config::AgentSkillsConfig) -> Discovery {
@@ -170,24 +188,7 @@ fn parse_metadata(
     directory: PathBuf,
     config: &crate::config::AgentSkillsConfig,
 ) -> Result<(Skill, Option<String>), String> {
-    let metadata = std::fs::symlink_metadata(file)
-        .map_err(|e| format!("skill {} metadata unreadable: {e}", file.display()))?;
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "skill {} must be a regular file, not a symlink or special file",
-            file.display()
-        ));
-    }
-    let len = metadata.len();
-    if len > config.max_file_bytes {
-        return Err(format!(
-            "skill {} is {len} bytes; maximum is {}",
-            file.display(),
-            config.max_file_bytes
-        ));
-    }
-    let content = std::fs::read_to_string(file)
-        .map_err(|e| format!("skill {} unreadable: {e}", file.display()))?;
+    let content = read_bounded_regular_file(file, config.max_file_bytes)?;
     let (frontmatter, _) =
         split_frontmatter(&content).map_err(|e| format!("skill {}: {e}", file.display()))?;
     let raw: serde_yaml::Value = serde_yaml::from_str(frontmatter).map_err(|e| {
@@ -220,11 +221,16 @@ fn parse_metadata(
             extensions.insert(key.to_string(), value);
         }
     }
-    let warning = (description.len() > config.description_warning_bytes).then(|| {
+    let normalized_description_bytes = description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .len();
+    let warning = (normalized_description_bytes > config.description_warning_bytes).then(|| {
         format!(
             "skill {} description is {} bytes; recommended maximum is {}",
             file.display(),
-            description.len(),
+            normalized_description_bytes,
             config.description_warning_bytes
         )
     });
@@ -242,6 +248,56 @@ fn parse_metadata(
         },
         warning,
     ))
+}
+
+fn read_bounded_regular_file(file: &Path, max_bytes: u64) -> Result<String, String> {
+    let path_metadata = std::fs::symlink_metadata(file)
+        .map_err(|error| format!("skill {} metadata unreadable: {error}", file.display()))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(format!(
+            "skill {} must be a regular file, not a symlink or special file",
+            file.display()
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file_handle = options
+        .open(file)
+        .map_err(|error| format!("skill {} unreadable: {error}", file.display()))?;
+    let metadata = file_handle
+        .metadata()
+        .map_err(|error| format!("skill {} metadata unreadable: {error}", file.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "skill {} must be a regular file, not a symlink or special file",
+            file.display()
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "skill {} is {} bytes; maximum is {max_bytes}",
+            file.display(),
+            metadata.len()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file_handle
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("skill {} unreadable: {error}", file.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "skill {} exceeds the {max_bytes}-byte maximum",
+            file.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| format!("skill {} is not valid UTF-8: {error}", file.display()))
 }
 
 fn split_frontmatter(content: &str) -> Result<(&str, &str), &'static str> {
@@ -331,7 +387,7 @@ pub fn catalog(
     let mut out = introduction.trim_end().to_string();
     out.push_str("\n\n");
     let mut omitted = 0usize;
-    for skill in eligible {
+    for (index, skill) in eligible.iter().enumerate() {
         let description = skill
             .metadata
             .description
@@ -340,7 +396,8 @@ pub fn catalog(
             .join(" ");
         let line = format!("- `{}`: {}\n", skill.metadata.name, description);
         if out.len() + line.len() > config.catalog_max_bytes {
-            omitted += 1;
+            omitted = eligible.len() - index;
+            break;
         } else {
             out.push_str(&line);
         }
@@ -384,7 +441,7 @@ pub fn expand_manual_invocation(
     {
         return Ok(text.to_string());
     }
-    let envelope = activation_envelope(workspace, name, config)?;
+    let envelope = activation_envelope(workspace, name, config, true)?;
     if remainder.trim().is_empty() {
         Ok(envelope)
     } else {
@@ -396,6 +453,7 @@ pub fn activation_envelope(
     workspace: &Path,
     name: &str,
     config: &crate::config::AgentSkillsConfig,
+    allow_manual_only: bool,
 ) -> Result<String, String> {
     validate_name(name)?;
     let discovery = discover(workspace, config);
@@ -416,28 +474,12 @@ pub fn activation_envelope(
                 format!("skill '{name}' not found; available skills: {names}")
             }
         })?;
-    let metadata = std::fs::symlink_metadata(&skill.file)
-        .map_err(|e| format!("skill {} metadata unreadable: {e}", skill.file.display()))?;
-    if !metadata.file_type().is_file() {
+    if skill.metadata.disable_model_invocation && !allow_manual_only {
         return Err(format!(
-            "skill {} must be a regular file, not a symlink or special file",
-            skill.file.display()
+            "skill '{name}' is available only through explicit user invocation"
         ));
     }
-    if metadata.len() > config.max_file_bytes {
-        return Err(format!(
-            "skill '{}' exceeds the {}-byte maximum",
-            skill.metadata.name, config.max_file_bytes
-        ));
-    }
-    let content = std::fs::read_to_string(&skill.file)
-        .map_err(|e| format!("skill {} unreadable: {e}", skill.file.display()))?;
-    if content.len() as u64 > config.max_file_bytes {
-        return Err(format!(
-            "skill '{}' exceeds the {}-byte maximum",
-            skill.metadata.name, config.max_file_bytes
-        ));
-    }
+    let content = read_bounded_regular_file(&skill.file, config.max_file_bytes)?;
     let (_, body) =
         split_frontmatter(&content).map_err(|e| format!("skill {}: {e}", skill.file.display()))?;
     Ok(format!(
@@ -567,6 +609,8 @@ mod tests {
             expand_manual_invocation(workspace, "/help", &config).unwrap(),
             "/help"
         );
+        assert!(activation_envelope(workspace, "manual", &config, false).is_err());
+        assert!(activation_envelope(workspace, "manual", &config, true).is_ok());
     }
 
     #[test]

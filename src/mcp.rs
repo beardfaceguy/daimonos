@@ -433,6 +433,7 @@ async fn dispatch_tool_inner(
                 &session.workspace,
                 name,
                 &session.cfg.agent.skills,
+                false,
             ) {
                 Ok(body) => ok_text(body),
                 Err(error) => err_text(error),

@@ -557,17 +557,18 @@ fn builtin_commands() -> Vec<AvailableCommand> {
     ]
 }
 
-fn available_commands(
+fn build_available_commands(
     workspace: &Path,
     skills: &crate::config::AgentSkillsConfig,
-) -> Vec<AvailableCommand> {
+) -> (Vec<AvailableCommand>, Vec<String>) {
     let mut commands = builtin_commands();
     let reserved: HashSet<String> = commands
         .iter()
         .map(|command| command.name.clone())
         .collect();
+    let discovery = crate::skills::discover(workspace, skills);
     commands.extend(
-        crate::skills::discover(workspace, skills)
+        discovery
             .skills
             .into_iter()
             .filter(|skill| !reserved.contains(skill.metadata.name.as_str()))
@@ -589,10 +590,38 @@ fn available_commands(
                     ]))
             }),
     );
-    commands
+    (commands, discovery.warnings)
 }
 
-fn send_available_commands(
+async fn available_commands(
+    workspace: &Path,
+    skills: &crate::config::AgentSkillsConfig,
+) -> Vec<AvailableCommand> {
+    let workspace = workspace.to_path_buf();
+    let skills = skills.clone();
+    match tokio::task::spawn_blocking(move || build_available_commands(&workspace, &skills)).await {
+        Ok((commands, warnings)) => {
+            for warning in warnings {
+                tracing::warn!(
+                    target: "daimonos::acp",
+                    event = "agent_skill_discovery_warning",
+                    warning = %warning,
+                );
+            }
+            commands
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "daimonos::acp",
+                event = "agent_skill_discovery_failed",
+                error = %error,
+            );
+            builtin_commands()
+        }
+    }
+}
+
+async fn send_available_commands(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
     workspace: &Path,
@@ -601,9 +630,9 @@ fn send_available_commands(
     send_notification(
         cx,
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
-            workspace, skills,
-        ))),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+            available_commands(workspace, skills).await,
+        )),
     );
 }
 
@@ -1985,7 +2014,7 @@ async fn run_prompt_turn(
             );
             return Ok(AcpStopReason::EndTurn);
         }
-        Err(SessionPromptError::Model(error)) => {
+        Err(SessionPromptError::Prompt(error) | SessionPromptError::Model(error)) => {
             send_notification(
                 cx,
                 session_id,
@@ -3081,7 +3110,8 @@ fn build_agent_with_state(
                             &session_id,
                             &handle.core.cwd,
                             &cfg.agent.skills,
-                        );
+                        )
+                        .await;
                         send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
                         tracing::info!(
                             target: "daimonos::acp",
@@ -3307,7 +3337,8 @@ fn build_agent_with_state(
                             &session_id,
                             &active_handle.core.cwd,
                             &cfg.agent.skills,
-                        );
+                        )
+                        .await;
                         // Notifications must follow a successfully queued load
                         // response: Zed registers the session while handling
                         // that response, then accepts its session updates.
@@ -5443,10 +5474,11 @@ mod tests {
         )
         .unwrap();
 
-        let commands = available_commands(
+        let (commands, warnings) = build_available_commands(
             workspace.path(),
             &crate::config::AgentSkillsConfig::default(),
         );
+        assert!(warnings.is_empty());
         let deploy = commands
             .iter()
             .find(|command| command.name == "deploy")
@@ -5483,10 +5515,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            available_commands(
+            build_available_commands(
                 workspace.path(),
                 &crate::config::AgentSkillsConfig::default(),
             )
+            .0
             .iter()
             .filter(|command| command.name == "help")
             .count(),

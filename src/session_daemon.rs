@@ -2889,6 +2889,9 @@ fn prompt_error(error: crate::session_core::SessionPromptError) -> (String, Stri
             "duplicate_request".to_string(),
             format!("request '{request_id}' has already completed"),
         ),
+        crate::session_core::SessionPromptError::Prompt(message) => {
+            ("invalid_prompt".to_string(), message)
+        }
         crate::session_core::SessionPromptError::Model(message) => {
             ("model_error".to_string(), message)
         }

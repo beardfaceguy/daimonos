@@ -117,6 +117,8 @@ pub struct AgentEnv {
     /// Additional providers routable in the same session (multi-provider
     /// support). Empty = single-provider, exactly the pre-existing behaviour.
     pub secondary_providers: Vec<SecondaryProvider>,
+    /// Optional validated global Agent Skills root.
+    pub skill_dir: Option<PathBuf>,
 }
 
 impl AgentEnv {
@@ -169,17 +171,9 @@ impl AgentEnv {
         })?;
         let mut vars = parse_dotenv(&content);
         merge_process_overrides(&mut vars, process_vars);
-        if let Some(skill_dir) = vars
-            .get(crate::skills::SKILL_DIR_ENV)
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-        {
-            // Agent Skills discovery is shared by all harness frontends. Publish
-            // the selected agent.env value so the discovery layer sees it; a
-            // non-empty process value already won during the merge above.
-            std::env::set_var(crate::skills::SKILL_DIR_ENV, skill_dir);
-        }
-        Self::from_vars(&vars, &path)
+        let agent = Self::from_vars(&vars, &path)?;
+        crate::skills::set_global_root_override(agent.skill_dir.clone());
+        Ok(agent)
     }
 
     fn from_vars(vars: &HashMap<String, String>, path: &Path) -> Result<AgentEnv, String> {
@@ -240,6 +234,12 @@ impl AgentEnv {
             "DAIMONOS_AGENT_PROMPT_CACHE",
             path,
         )?;
+        let skill_dir = present(crate::skills::SKILL_DIR_ENV)
+            .map(|raw| {
+                crate::skills::global_root_from(Some(&raw), crate::paths::home_dir().as_deref())
+                    .map_err(|error| format!("agent configuration for {}: {error}", path.display()))
+            })
+            .transpose()?;
 
         let secondary_providers = ["anthropic", "openai", "openrouter"]
             .iter()
@@ -271,6 +271,7 @@ impl AgentEnv {
             timestamp_turns,
             thinking,
             secondary_providers,
+            skill_dir,
         })
     }
 
@@ -681,6 +682,16 @@ mod tests {
         assert!(!e.prompt_cache);
         // No DAIMONOS_AGENT_MODELS → picker list is just the active model.
         assert_eq!(e.models, vec!["anthropic/claude-sonnet-4.6"]);
+        assert!(e.skill_dir.is_none());
+    }
+
+    #[test]
+    fn skill_directory_is_validated_without_mutating_process_environment() {
+        let env = load_str(&(base() + "DAIMONOS_SKILL_DIR=/tmp/agent-skills\n")).unwrap();
+        assert_eq!(env.skill_dir, Some(PathBuf::from("/tmp/agent-skills")));
+
+        let error = load_str(&(base() + "DAIMONOS_SKILL_DIR=relative/skills\n")).unwrap_err();
+        assert!(error.contains("DAIMONOS_SKILL_DIR must be an absolute path"));
     }
 
     #[test]
