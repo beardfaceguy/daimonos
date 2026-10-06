@@ -53,6 +53,7 @@ pub struct AgentModeConfig {
 pub struct AgentSkillsConfig {
     #[serde(skip)]
     pub global_dir: Option<std::path::PathBuf>,
+    pub max_skills: usize,
     pub max_file_bytes: u64,
     pub catalog_max_bytes: usize,
     pub description_warning_bytes: usize,
@@ -62,6 +63,7 @@ impl Default for AgentSkillsConfig {
     fn default() -> Self {
         Self {
             global_dir: None,
+            max_skills: 128,
             max_file_bytes: 100 * 1024,
             catalog_max_bytes: 16 * 1024,
             description_warning_bytes: 1024,
@@ -71,6 +73,9 @@ impl Default for AgentSkillsConfig {
 
 impl AgentSkillsConfig {
     fn validate(&self) -> Result<(), String> {
+        if self.max_skills == 0 {
+            return Err("agent.skills.max_skills must be greater than zero".to_string());
+        }
         if self.max_file_bytes == 0 {
             return Err("agent.skills.max_file_bytes must be greater than zero".to_string());
         }
@@ -2549,11 +2554,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.agent.skills.max_file_bytes, 2048);
+        assert_eq!(cfg.agent.skills.max_skills, 128);
         assert_eq!(cfg.agent.skills.catalog_max_bytes, 512);
         assert_eq!(cfg.agent.skills.description_warning_bytes, 128);
         assert!(cfg.validate().is_ok());
 
         for field in [
+            "max_skills",
             "max_file_bytes",
             "catalog_max_bytes",
             "description_warning_bytes",

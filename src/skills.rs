@@ -148,13 +148,20 @@ fn scan_root(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|entry| entry.path())
+        .filter(|directory| directory.join(SKILL_FILE).is_file())
         .collect::<Vec<_>>();
     dirs.sort();
+    if dirs.len() > config.max_skills {
+        out.warnings.push(format!(
+            "skill directory {} contains {} entries; only the first {} are considered",
+            root.display(),
+            dirs.len(),
+            config.max_skills
+        ));
+        dirs.truncate(config.max_skills);
+    }
     for directory in dirs {
         let file = directory.join(SKILL_FILE);
-        if !file.is_file() {
-            continue;
-        }
         match parse_metadata(&file, source, directory, config) {
             Ok((skill, warning)) => {
                 if let Some(warning) = warning {
@@ -418,6 +425,7 @@ pub fn expand_manual_invocation(
     workspace: &Path,
     text: &str,
     config: &crate::config::AgentSkillsConfig,
+    reserved_commands: &[&str],
 ) -> Result<String, String> {
     let Some(command) = text.strip_prefix('/') else {
         return Ok(text.to_string());
@@ -430,7 +438,7 @@ pub fn expand_manual_invocation(
     }
     // Reserved harness commands remain owned by their frontends. Unknown valid
     // skill names are left untouched so other slash-command integrations can run.
-    if matches!(name, "exit" | "quit" | "clear" | "help" | "usage") {
+    if reserved_commands.contains(&name) {
         return Ok(text.to_string());
     }
     validate_name(name)?;
@@ -608,15 +616,15 @@ mod tests {
         );
         let config = config();
         let expanded =
-            expand_manual_invocation(workspace, "/manual argument text", &config).unwrap();
+            expand_manual_invocation(workspace, "/manual argument text", &config, &[]).unwrap();
         assert!(expanded.contains("do the thing"));
         assert!(expanded.ends_with("argument text"));
         assert_eq!(
-            expand_manual_invocation(workspace, "/unknown value", &config).unwrap(),
+            expand_manual_invocation(workspace, "/unknown value", &config, &[]).unwrap(),
             "/unknown value"
         );
         assert_eq!(
-            expand_manual_invocation(workspace, "/help", &config).unwrap(),
+            expand_manual_invocation(workspace, "/help", &config, &["help"]).unwrap(),
             "/help"
         );
         assert!(activation_envelope(workspace, "manual", &config, false).is_err());

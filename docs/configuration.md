@@ -121,6 +121,7 @@ Resource limits are configured separately in `daimonos.toml`:
 
 ```toml
 [agent.skills]
+max_skills = 128
 max_file_bytes = 102400
 catalog_max_bytes = 16384
 description_warning_bytes = 1024
@@ -128,6 +129,7 @@ description_warning_bytes = 1024
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `max_skills` | `128` | Maximum valid skill directories considered in each global or workspace discovery root. |
 | `max_file_bytes` | `102400` | Maximum bytes read from one `SKILL.md` during discovery or activation. |
 | `catalog_max_bytes` | `16384` | Maximum metadata-only Agent Skills catalog appended to the system prompt. |
 | `description_warning_bytes` | `1024` | Description size above which discovery emits a warning. |

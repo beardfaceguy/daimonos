@@ -312,14 +312,25 @@ pub async fn run_chat(
                     if text.is_empty() {
                         continue;
                     }
-                    let text = match crate::skills::expand_manual_invocation(
-                        workspace,
-                        &text,
-                        &cfg.agent.skills,
-                    ) {
-                        Ok(text) => text,
-                        Err(error) => {
+                    let skill_workspace = workspace.to_path_buf();
+                    let skill_config = cfg.agent.skills.clone();
+                    let text = match tokio::task::spawn_blocking(move || {
+                        crate::skills::expand_manual_invocation(
+                            &skill_workspace,
+                            &text,
+                            &skill_config,
+                            &["exit", "quit", "clear", "help", "usage"],
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(text)) => text,
+                        Ok(Err(error)) => {
                             eprintln!("[error] Agent skill activation failed: {error}");
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("[error] Agent skill activation task failed: {error}");
                             continue;
                         }
                     };

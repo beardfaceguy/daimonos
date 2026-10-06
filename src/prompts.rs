@@ -288,17 +288,25 @@ pub async fn agent_system_for_workspace(
         let introduction = skill_catalog(cfg).await;
         match tokio::task::spawn_blocking(move || {
             let discovery = crate::skills::discover(&workspace, &skills);
+            let has_model_skills = discovery
+                .skills
+                .iter()
+                .any(|skill| !skill.metadata.disable_model_invocation);
             let catalog = crate::skills::catalog(&discovery, &skills, &introduction);
-            (discovery.warnings, catalog)
+            (discovery.warnings, has_model_skills, catalog)
         })
         .await
         {
-            Ok((warnings, catalog)) => {
+            Ok((warnings, has_model_skills, catalog)) => {
                 for warning in warnings {
                     eprintln!("daimonos: agent skill warning: {warning}");
                 }
                 if let Some(catalog) = catalog {
                     append_prompt_section(&mut prompt, &catalog);
+                } else if has_model_skills {
+                    eprintln!(
+                        "daimonos: Agent Skills catalog omitted because agent.skills.catalog_max_bytes is too small"
+                    );
                 }
             }
             Err(error) => eprintln!("daimonos: Agent Skills discovery failed: {error}"),

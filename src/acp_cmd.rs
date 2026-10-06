@@ -567,30 +567,37 @@ fn build_available_commands(
         .map(|command| command.name.clone())
         .collect();
     let discovery = crate::skills::discover(workspace, skills);
-    commands.extend(
-        discovery
-            .skills
-            .into_iter()
-            .filter(|skill| !reserved.contains(skill.metadata.name.as_str()))
-            .map(|skill| {
-                AvailableCommand::new(&skill.metadata.name, &skill.metadata.description)
-                    .input(AvailableCommandInput::Unstructured(
-                        UnstructuredCommandInput::new("<arguments>"),
-                    ))
-                    .meta(Meta::from_iter([
-                        (ACP_SKILL_META_KIND.into(), serde_json::json!(true)),
-                        (
-                            ACP_SKILL_META_SOURCE.into(),
-                            serde_json::json!(skill.source.label()),
-                        ),
-                        (
-                            ACP_SKILL_META_PATH.into(),
-                            serde_json::json!(skill.file.to_string_lossy()),
-                        ),
-                    ]))
-            }),
-    );
-    (commands, discovery.warnings)
+    let candidates = discovery
+        .skills
+        .into_iter()
+        .filter(|skill| !reserved.contains(skill.metadata.name.as_str()))
+        .collect::<Vec<_>>();
+    let omitted = candidates.len().saturating_sub(skills.max_skills);
+    commands.extend(candidates.into_iter().take(skills.max_skills).map(|skill| {
+        AvailableCommand::new(&skill.metadata.name, &skill.metadata.description)
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("<arguments>"),
+            ))
+            .meta(Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), serde_json::json!(true)),
+                (
+                    ACP_SKILL_META_SOURCE.into(),
+                    serde_json::json!(skill.source.label()),
+                ),
+                (
+                    ACP_SKILL_META_PATH.into(),
+                    serde_json::json!(skill.file.to_string_lossy()),
+                ),
+            ]))
+    }));
+    let mut warnings = discovery.warnings;
+    if omitted > 0 {
+        warnings.push(format!(
+            "{omitted} Agent Skill command(s) omitted because agent.skills.max_skills is {}",
+            skills.max_skills
+        ));
+    }
+    (commands, warnings)
 }
 
 async fn available_commands(
@@ -2011,7 +2018,17 @@ async fn run_prompt_turn(
             );
             return Ok(AcpStopReason::EndTurn);
         }
-        Err(SessionPromptError::Prompt(error) | SessionPromptError::Model(error)) => {
+        Err(SessionPromptError::Prompt(error)) => {
+            send_notification(
+                cx,
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                    TextContent::new(format!("Prompt preparation failed: {error}")),
+                ))),
+            );
+            return Ok(AcpStopReason::EndTurn);
+        }
+        Err(SessionPromptError::Model(error)) => {
             send_notification(
                 cx,
                 session_id,

@@ -1789,11 +1789,14 @@ impl SessionCore {
                 (index, text.clone())
             });
         if let Some((index, text)) = direct_text {
+            // Keep `canonical_user_text` as the client's slash command for the
+            // UI/event stream. Only the provider-bound message is expanded;
+            // this is the same separation used for other frontend projections.
             let workspace = self.cwd.clone();
             let skills = self.skills.clone();
             let invocation = text.clone();
             let expanded = tokio::task::spawn_blocking(move || {
-                crate::skills::expand_manual_invocation(&workspace, &invocation, &skills)
+                crate::skills::expand_manual_invocation(&workspace, &invocation, &skills, &[])
             })
             .await
             .map_err(|error| {

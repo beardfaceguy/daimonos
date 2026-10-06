@@ -345,6 +345,8 @@ scrollback_entries = 2_000
 session_list_page_size = 50
 
 [agent.skills]
+# Maximum valid skill directories considered in each discovery root.
+max_skills = 128
 # Maximum size of one SKILL.md read during discovery or activation.
 max_file_bytes = 102400
 # Maximum metadata-only skills catalog appended to the agent system prompt.
