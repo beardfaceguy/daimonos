@@ -621,18 +621,15 @@ async fn available_commands(
     }
 }
 
-async fn send_available_commands(
+fn send_available_commands(
     cx: &ConnectionTo<AcpClientRole>,
     session_id: &SessionId,
-    workspace: &Path,
-    skills: &crate::config::AgentSkillsConfig,
+    commands: Vec<AvailableCommand>,
 ) {
     send_notification(
         cx,
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-            available_commands(workspace, skills).await,
-        )),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands)),
     );
 }
 
@@ -3101,17 +3098,13 @@ fn build_agent_with_state(
                         // start on the default model.
                         let config_options =
                             model_config_options(&state.models, &state.default_model);
+                        let commands =
+                            available_commands(&handle.core.cwd, &cfg.agent.skills).await;
                         responder.respond(
                             NewSessionResponse::new(session_id.clone())
                                 .config_options(Some(config_options)),
                         )?;
-                        send_available_commands(
-                            &cx,
-                            &session_id,
-                            &handle.core.cwd,
-                            &cfg.agent.skills,
-                        )
-                        .await;
+                        send_available_commands(&cx, &session_id, commands);
                         send_session_mcp_diagnostics(&cx, &session_id, &handle).await;
                         tracing::info!(
                             target: "daimonos::acp",
@@ -3329,16 +3322,12 @@ fn build_agent_with_state(
                         // Echo the model picker (vikunja #960) with the session's
                         // current model, as session/new does.
                         let config_options = model_config_options(&state.models, &current_model);
+                        let commands =
+                            available_commands(&active_handle.core.cwd, &cfg.agent.skills).await;
                         responder.respond(
                             LoadSessionResponse::new().config_options(Some(config_options)),
                         )?;
-                        send_available_commands(
-                            &cx,
-                            &session_id,
-                            &active_handle.core.cwd,
-                            &cfg.agent.skills,
-                        )
-                        .await;
+                        send_available_commands(&cx, &session_id, commands);
                         // Notifications must follow a successfully queued load
                         // response: Zed registers the session while handling
                         // that response, then accepts its session updates.
