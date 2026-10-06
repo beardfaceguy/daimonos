@@ -119,7 +119,8 @@ mod tests {
                 continue;
             }
             // Path 2: special-cased directly in the agent loop.
-            if name == "execute_script" || name == crate::agent::UPDATE_PLAN_TOOL {
+            if name == "execute_script" || name == "skill" || name == crate::agent::UPDATE_PLAN_TOOL
+            {
                 continue;
             }
             // Path 3: plugin/meta tool shared with the MCP adapter. Arguments are

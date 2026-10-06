@@ -212,7 +212,9 @@ impl SessionFactory for AgentSessionFactory {
             tools.extend(mcp.tools());
         }
         let agent_config = AgentConfig {
-            system: Some(crate::prompts::agent_system(&self.config).await),
+            system: Some(
+                crate::prompts::agent_system_for_workspace(&self.config, Some(&workspace)).await,
+            ),
             cancelled_turn_message: Some(crate::prompts::cancelled_turn(&self.config).await),
             tools,
             opts: CompleteOpts {
@@ -258,6 +260,7 @@ impl SessionFactory for AgentSessionFactory {
             agent_session,
             model.clone(),
             workspace,
+            self.config.agent.skills.clone(),
             self.compaction.clone(),
             context_windows,
             approvals,

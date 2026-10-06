@@ -35,17 +35,20 @@ pub const SUMMARY_DEFAULT: &str = include_str!("../prompts/summary.md");
 pub const LOOP_STEER_DEFAULT: &str = include_str!("../prompts/loop_steer.md");
 /// Safety note retained when a turn is cancelled after work may have started.
 pub const CANCELLED_TURN_DEFAULT: &str = include_str!("../prompts/cancelled_turn.md");
+/// Agent Skills catalog introduction; discovered metadata is appended after it.
+pub const SKILL_CATALOG_DEFAULT: &str = include_str!("../prompts/skill_catalog.md");
 
 /// Canonical prompt keys, in a stable display order. This is the single list
 /// used by `default_by_name`, the `--print-prompt` flag, and the `--dump-prompts`
 /// scaffold, so adding a prompt means editing here and `default_by_name` only.
-pub const PROMPT_NAMES: [&str; 7] = [
+pub const PROMPT_NAMES: [&str; 8] = [
     "agent_system",
     "mcp_instructions",
     "kgl_hint",
     "summary",
     "loop_steer",
     "cancelled_turn",
+    "skill_catalog",
     "tool_descriptions",
 ];
 
@@ -60,6 +63,7 @@ pub fn default_by_name(name: &str) -> Option<&'static str> {
         "summary" => Some(SUMMARY_DEFAULT),
         "loop_steer" => Some(LOOP_STEER_DEFAULT),
         "cancelled_turn" => Some(CANCELLED_TURN_DEFAULT),
+        "skill_catalog" => Some(SKILL_CATALOG_DEFAULT),
         "tool_descriptions" => Some(crate::tool_descriptions::DEFAULT_TEXT),
         _ => None,
     }
@@ -257,18 +261,63 @@ async fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> Str
 /// optional user instructions loaded during startup. The additional file is
 /// appended verbatim with only a blank-line separator — no hidden instruction
 /// text is injected around it.
+#[allow(dead_code)]
 pub async fn agent_system(cfg: &Config) -> String {
+    agent_system_for_workspace(cfg, None).await
+}
+
+/// Build the agent system prompt with a compact metadata-only Agent Skills
+/// catalog for `workspace`. Skill bodies remain on disk until the `skill` tool
+/// is invoked.
+pub async fn agent_system_for_workspace(
+    cfg: &Config,
+    workspace: Option<&std::path::Path>,
+) -> String {
     let mut prompt = resolve(
         "agent_system",
         cfg.prompts.agent_system.as_deref(),
         AGENT_SYSTEM_DEFAULT,
     )
     .await;
-    let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() else {
-        return prompt;
-    };
-    if additional.is_empty() {
-        return prompt;
+    if let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() {
+        append_prompt_section(&mut prompt, additional);
+    }
+    if let Some(workspace) = workspace {
+        let workspace = workspace.to_path_buf();
+        let skills = cfg.agent.skills.clone();
+        let introduction = skill_catalog(cfg).await;
+        match tokio::task::spawn_blocking(move || {
+            let discovery = crate::skills::discover(&workspace, &skills);
+            let has_model_skills = discovery
+                .skills
+                .iter()
+                .any(|skill| !skill.metadata.disable_model_invocation);
+            let catalog = crate::skills::catalog(&discovery, &skills, &introduction);
+            (discovery.warnings, has_model_skills, catalog)
+        })
+        .await
+        {
+            Ok((warnings, has_model_skills, catalog)) => {
+                for warning in warnings {
+                    eprintln!("daimonos: agent skill warning: {warning}");
+                }
+                if let Some(catalog) = catalog {
+                    append_prompt_section(&mut prompt, &catalog);
+                } else if has_model_skills {
+                    eprintln!(
+                        "daimonos: Agent Skills catalog omitted because agent.skills.catalog_max_bytes is too small"
+                    );
+                }
+            }
+            Err(error) => eprintln!("daimonos: Agent Skills discovery failed: {error}"),
+        }
+    }
+    prompt
+}
+
+fn append_prompt_section(prompt: &mut String, section: &str) {
+    if section.is_empty() {
+        return;
     }
     if !prompt.ends_with('\n') {
         prompt.push('\n');
@@ -276,8 +325,7 @@ pub async fn agent_system(cfg: &Config) -> String {
     if !prompt.ends_with("\n\n") {
         prompt.push('\n');
     }
-    prompt.push_str(additional);
-    prompt
+    prompt.push_str(section);
 }
 
 /// Static MCP server instructions (before dynamic workspace context is appended).
@@ -306,6 +354,16 @@ pub async fn cancelled_turn(cfg: &Config) -> String {
         "cancelled_turn",
         cfg.prompts.cancelled_turn.as_deref(),
         CANCELLED_TURN_DEFAULT,
+    )
+    .await
+}
+
+/// Introduction prepended to the bounded metadata-only Agent Skills catalog.
+pub async fn skill_catalog(cfg: &Config) -> String {
+    resolve(
+        "skill_catalog",
+        cfg.prompts.skill_catalog.as_deref(),
+        SKILL_CATALOG_DEFAULT,
     )
     .await
 }
@@ -519,6 +577,7 @@ mod tests {
             SUMMARY_DEFAULT,
             LOOP_STEER_DEFAULT,
             CANCELLED_TURN_DEFAULT,
+            SKILL_CATALOG_DEFAULT,
         ] {
             assert!(!s.trim().is_empty());
         }
@@ -533,6 +592,7 @@ mod tests {
         assert_eq!(mcp_instructions(&cfg).await, MCP_INSTRUCTIONS_DEFAULT);
         assert_eq!(kgl_hint(&cfg).await, KGL_HINT_DEFAULT);
         assert_eq!(cancelled_turn(&cfg).await, CANCELLED_TURN_DEFAULT);
+        assert_eq!(skill_catalog(&cfg).await, SKILL_CATALOG_DEFAULT);
     }
 
     #[tokio::test]
@@ -560,6 +620,37 @@ mod tests {
         let mut cfg = Config::default();
         cfg.prompts.cancelled_turn = Some(path.to_string_lossy().to_string());
         assert_eq!(cancelled_turn(&cfg).await, "CUSTOM CANCELLATION NOTE");
+    }
+
+    #[tokio::test]
+    async fn skill_catalog_override_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skill-catalog.md");
+        std::fs::write(&path, "CUSTOM SKILL CATALOG").unwrap();
+        let mut cfg = Config::default();
+        cfg.prompts.skill_catalog = Some(path.to_string_lossy().to_string());
+        assert_eq!(skill_catalog(&cfg).await, "CUSTOM SKILL CATALOG");
+    }
+
+    #[tokio::test]
+    async fn workspace_skill_catalog_uses_override_without_loading_body() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = workspace.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review safely\n---\nPRIVATE SKILL BODY\n",
+        )
+        .unwrap();
+        let override_path = workspace.path().join("skill-catalog.md");
+        std::fs::write(&override_path, "CUSTOM SKILL INTRO").unwrap();
+        let mut cfg = Config::default();
+        cfg.prompts.skill_catalog = Some(override_path.to_string_lossy().to_string());
+
+        let prompt = agent_system_for_workspace(&cfg, Some(workspace.path())).await;
+        assert!(prompt.contains("CUSTOM SKILL INTRO"));
+        assert!(prompt.contains("`review`: Review safely"));
+        assert!(!prompt.contains("PRIVATE SKILL BODY"));
     }
 
     #[tokio::test]

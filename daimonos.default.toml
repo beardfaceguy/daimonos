@@ -344,6 +344,16 @@ scrollback_entries = 2_000
 # an opaque continuation cursor when more sessions remain.
 session_list_page_size = 50
 
+[agent.skills]
+# Maximum valid skill directories considered in each discovery root.
+max_skills = 128
+# Maximum size of one SKILL.md read during discovery or activation.
+max_file_bytes = 102400
+# Maximum metadata-only skills catalog appended to the agent system prompt.
+catalog_max_bytes = 16384
+# Emit a warning when one skill description exceeds this many bytes.
+description_warning_bytes = 1024
+
 [agent.mcp]
 # Outbound MCP servers for daimonos's own agent frontends — interactive TUI,
 # one-shot `agent`, `chat` REPL, and the session daemon (#1289). The ACP path
@@ -546,6 +556,7 @@ poll_interval_ms = 1500
 # summary          = "~/.config/daimonos/prompts/summary.md"
 # loop_steer       = "~/.config/daimonos/prompts/loop_steer.md"
 # cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
+# skill_catalog    = "~/.config/daimonos/prompts/skill_catalog.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 # Note: `summary` is also overridable via the agent-env DAIMONOS_AGENT_SUMMARY_PROMPT,
 # which takes precedence over the path above.

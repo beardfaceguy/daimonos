@@ -232,7 +232,7 @@ pub async fn run_chat(
     resume: Option<String>,
     compaction: Option<CompactionPolicy>,
 ) -> anyhow::Result<()> {
-    let system_prompt = crate::prompts::agent_system(&cfg).await;
+    let system_prompt = crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await;
     let mut config = build_agent_config_with_descriptions(
         workspace,
         model.clone(),
@@ -254,7 +254,7 @@ pub async fn run_chat(
     }
     let session_store_busy_timeout =
         std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
-    let tool_session = build_tool_session(workspace, cfg);
+    let tool_session = build_tool_session(workspace, Arc::clone(&cfg));
     let mut session = AgentSession::new(provider, tool_session, config);
 
     // Persist to disk so the conversation can be resumed later (vikunja #963).
@@ -312,6 +312,28 @@ pub async fn run_chat(
                     if text.is_empty() {
                         continue;
                     }
+                    let skill_workspace = workspace.to_path_buf();
+                    let skill_config = cfg.agent.skills.clone();
+                    let text = match tokio::task::spawn_blocking(move || {
+                        crate::skills::expand_manual_invocation(
+                            &skill_workspace,
+                            &text,
+                            &skill_config,
+                            &["exit", "quit", "clear", "help", "usage"],
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(text)) => text,
+                        Ok(Err(error)) => {
+                            eprintln!("[error] Agent skill activation failed: {error}");
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("[error] Agent skill activation task failed: {error}");
+                            continue;
+                        }
+                    };
                     let prompt_span = PromptSpan::new(PromptMetadata {
                         mode: "chat",
                         session_id: Some(&session_id),

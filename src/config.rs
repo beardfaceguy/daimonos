@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub index: IndexConfig,
@@ -44,6 +44,51 @@ pub struct Config {
 #[serde(default)]
 pub struct AgentModeConfig {
     pub mcp: AgentMcpConfig,
+    pub skills: AgentSkillsConfig,
+}
+
+/// `[agent.skills]` — bounded portable Agent Skills discovery and prompt catalog.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AgentSkillsConfig {
+    #[serde(skip)]
+    pub global_dir: Option<std::path::PathBuf>,
+    pub max_skills: usize,
+    pub max_file_bytes: u64,
+    pub catalog_max_bytes: usize,
+    pub description_warning_bytes: usize,
+}
+
+impl Default for AgentSkillsConfig {
+    fn default() -> Self {
+        Self {
+            global_dir: None,
+            max_skills: 128,
+            max_file_bytes: 100 * 1024,
+            catalog_max_bytes: 16 * 1024,
+            description_warning_bytes: 1024,
+        }
+    }
+}
+
+impl AgentSkillsConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_skills == 0 {
+            return Err("agent.skills.max_skills must be greater than zero".to_string());
+        }
+        if self.max_file_bytes == 0 {
+            return Err("agent.skills.max_file_bytes must be greater than zero".to_string());
+        }
+        if self.catalog_max_bytes < 256 {
+            return Err("agent.skills.catalog_max_bytes must be at least 256".to_string());
+        }
+        if self.description_warning_bytes == 0 {
+            return Err(
+                "agent.skills.description_warning_bytes must be greater than zero".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[agent.mcp]` — outbound MCP servers for non-ACP agent frontends
@@ -95,6 +140,8 @@ pub struct PromptsConfig {
     pub loop_steer: Option<String>,
     /// Cancelled-turn safety note retained in provider history.
     pub cancelled_turn: Option<String>,
+    /// Agent Skills catalog introduction appended before discovered metadata.
+    pub skill_catalog: Option<String>,
     /// Top-level full/terse tool-description catalog.
     pub tool_descriptions: Option<String>,
     /// Additional user instructions loaded at startup for agent/chat/ACP and
@@ -128,7 +175,7 @@ pub enum IndexMode {
 pub const INDEX_FALLBACK_MAX_FILES: usize = 50_000;
 pub const DEFAULT_INDEX_MAX_WALK_ENTRIES: usize = 100_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct IndexConfig {
     pub mode: IndexMode,
@@ -157,7 +204,7 @@ pub struct IndexConfig {
     pub project_markers: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct SearchConfig {
     pub default_grep_max: usize,
@@ -1227,7 +1274,7 @@ pub struct ObservabilityConfig {
     pub flush_timeout_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct AnalyticsConfig {
     pub enabled: bool,
@@ -1897,6 +1944,7 @@ impl IndexConfig {
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.index.validate()?;
+        self.agent.skills.validate()?;
         self.acp.validate()?;
         self.session.validate()?;
         self.tui.validate()?;
@@ -2496,6 +2544,34 @@ mod tests {
         let toml = "[mcp]\ndefault_verbosity = \"terse\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.mcp.default_verbosity, Verbosity::Terse);
+    }
+
+    #[test]
+    fn agent_skill_limits_parse_and_must_be_positive() {
+        let cfg: Config = toml::from_str(
+            "[agent.skills]\nmax_file_bytes = 2048\ncatalog_max_bytes = 512\n\
+             description_warning_bytes = 128\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agent.skills.max_file_bytes, 2048);
+        assert_eq!(cfg.agent.skills.max_skills, 128);
+        assert_eq!(cfg.agent.skills.catalog_max_bytes, 512);
+        assert_eq!(cfg.agent.skills.description_warning_bytes, 128);
+        assert!(cfg.validate().is_ok());
+
+        for field in [
+            "max_skills",
+            "max_file_bytes",
+            "catalog_max_bytes",
+            "description_warning_bytes",
+        ] {
+            let invalid: Config =
+                toml::from_str(&format!("[agent.skills]\n{field} = 0\n")).unwrap();
+            assert!(invalid
+                .validate()
+                .expect_err("zero Agent Skills limit must be rejected")
+                .contains(&format!("agent.skills.{field}")));
+        }
     }
 
     #[test]

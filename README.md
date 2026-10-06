@@ -348,6 +348,9 @@ and adapting the best ones.
 
 Agent-mode configuration lives in a dotenv-style `agent.env`
 (`~/.config/daimonos/agent.env`); see [Runtime modes](docs/runtime-modes.md).
+Portable Agent Skills are discovered from `~/.agents/skills` and
+`<workspace>/.agents/skills`; set `DAIMONOS_SKILL_DIR` in `agent.env` to
+override the global directory. See [Configuration](docs/configuration.md#agent-skills-daimonos_skill_dir).
 
 ## Architecture
 

@@ -77,6 +77,63 @@ DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
 DAIMONOS_AGENT_API_KEY=sk-...
 ```
 
+### Agent Skills (`DAIMONOS_SKILL_DIR`)
+
+Daimonos discovers portable Agent Skills from `~/.agents/skills` by default.
+Override that global root in `~/.config/daimonos/agent.env` (or the selected
+agent env file):
+
+```dotenv
+DAIMONOS_SKILL_DIR=/absolute/path/to/skills
+```
+
+The value must be absolute; `~/...` is expanded. An unset or blank value uses
+the default. Relative values are rejected with a warning and no global skills
+are loaded. Project skills are also discovered from
+`<workspace>/.agents/skills`; a project skill overrides a same-named global
+skill.
+
+Each skill is `<root>/<name>/SKILL.md`: Markdown with YAML frontmatter. Only
+`name` and `description` are required. Unknown frontmatter keys are tolerated
+for cross-harness portability; `disable-model-invocation: true` is an optional
+Zed-compatible extension that hides the skill from the model catalog while
+leaving manual `/name` activation available. Names use lowercase ASCII letters,
+digits, and hyphens, with a 64-byte limit. A `SKILL.md` may be at most 100 KiB.
+Supporting files should use paths relative to the skill directory.
+
+```markdown
+---
+name: code-review
+description: Review a change for correctness and security.
+---
+
+# Code review
+
+Review the requested change and report findings by severity.
+```
+
+At session startup Daimonos adds only eligible names and descriptions to the
+system prompt; bodies remain on disk until the model calls `skill` or the user
+enters `/code-review [arguments]`. This is separate from
+`agent-instructions.md`, which remains always-on.
+
+Resource limits are configured separately in `daimonos.toml`:
+
+```toml
+[agent.skills]
+max_skills = 128
+max_file_bytes = 102400
+catalog_max_bytes = 16384
+description_warning_bytes = 1024
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_skills` | `128` | Maximum valid skill directories considered in each global or workspace discovery root. |
+| `max_file_bytes` | `102400` | Maximum bytes read from one `SKILL.md` during discovery or activation. |
+| `catalog_max_bytes` | `16384` | Maximum metadata-only Agent Skills catalog appended to the system prompt. |
+| `description_warning_bytes` | `1024` | Description size above which discovery emits a warning. |
+
 For `gpt-5.6-sol`, daimonos reports the documented 1,050,000-token context
 window and 128,000-token maximum output capability. The model is text-only;
 ACP image prompts are rejected before provider dispatch. OpenAI tool loops
@@ -852,6 +909,7 @@ inside them. See `prompts/README.md` for the committed defaults and guidance.
 # summary          = "~/.config/daimonos/prompts/summary.md"
 # loop_steer       = "~/.config/daimonos/prompts/loop_steer.md"
 # cancelled_turn   = "~/.config/daimonos/prompts/cancelled_turn.md"
+# skill_catalog    = "~/.config/daimonos/prompts/skill_catalog.md"
 # tool_descriptions = "~/.config/daimonos/prompts/tool_descriptions.toml"
 ```
 
@@ -863,6 +921,7 @@ inside them. See `prompts/README.md` for the committed defaults and guidance.
 | `summary` | context compaction | System prompt for the summarizer that replaces evicted turns. |
 | `loop_steer` | `daimonos agent` / `chat` / ACP | Corrective steer rotated by the deterministic loop detector. |
 | `cancelled_turn` | `daimonos chat` / ACP | Safety note retained for cancelled turns and unresolved tool calls. |
+| `skill_catalog` | `daimonos agent` / `chat` / ACP | Introduction prepended to the bounded metadata-only Agent Skills catalog. |
 | `tool_descriptions` | MCP / `agent` / `chat` / ACP | Partial TOML overlay for full/terse tool descriptions and nested `[tool.parameters]` JSON Schema property descriptions. |
 
 **Getting the baseline defaults**: the defaults are embedded in the binary, so
@@ -870,13 +929,13 @@ you don't need the source to see or copy them:
 
 ```bash
 daimonos --print-prompt mcp_instructions      # print one default to stdout
-daimonos --dump-prompts                        # scaffold all seven resources into
+daimonos --dump-prompts                        # scaffold all eight resources into
                                                #   ~/.config/daimonos/prompts/
 daimonos --dump-prompts /path/to/dir           # ...into a custom directory
 daimonos --dump-prompts --force                # overwrite existing files
 ```
 
-`--dump-prompts` writes the six `<name>.md` prompts and
+`--dump-prompts` writes the seven `<name>.md` prompts and
 `tool_descriptions.toml` (skipping existing files unless `--force`), then prints
 a ready-to-paste `[prompts]` block. Start from these so an override begins at —
 and can be diffed against — the baseline.
