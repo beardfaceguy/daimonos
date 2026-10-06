@@ -3566,6 +3566,9 @@ fn build_agent_with_state(
                                 .unwrap_or_else(|p| p.into_inner())
                                 .clone();
                             if changed {
+                                // A picker change without a later prompt must
+                                // still survive process restart/session load.
+                                handle.core.persist_current().await;
                                 let _ = handle.core.events.emit(
                                     CoreSessionEvent::RuntimeOptionsChanged {
                                         options: canonical_model_options(&state.models, &current),
@@ -7296,6 +7299,95 @@ mod tests {
             Some(1_000_000),
             "usage must use the picked model's provider-reported window"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_model_selection_survives_restart_without_a_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let make_agent = || {
+            build_agent(
+                mock_factory(vec![]),
+                workspace.path(),
+                Arc::new(Config::default()),
+                "model-a".to_string(),
+                models.clone(),
+                Arc::new(crate::safety::SafetyPolicy::default()),
+                None,
+                Some(sessions.path().to_path_buf()),
+                None,
+                None,
+            )
+        };
+
+        let new_workspace = workspace.path().to_path_buf();
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(
+                make_agent(),
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(&new_workspace))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+                    let response = connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            MODEL_CONFIG_ID,
+                            agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id(
+                                "model-b",
+                            ),
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(
+                        select_state(model_option(&response.config_options))
+                            .current_value
+                            .to_string(),
+                        "model-b"
+                    );
+                    Ok(session_id)
+                },
+            )
+            .await
+            .unwrap();
+
+        // No prompt has run: the picker selection alone must be durable.
+        let store = SessionStore::new(sessions.path().to_path_buf());
+        assert_eq!(
+            store.load(&session_id.to_string()).unwrap().model,
+            "model-b"
+        );
+        let load_workspace = workspace.path().to_path_buf();
+        let restored = AcpClientRole
+            .builder()
+            .connect_with(
+                make_agent(),
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let response = connection
+                        .send_request(LoadSessionRequest::new(session_id, &load_workspace))
+                        .block_task()
+                        .await?;
+                    Ok(
+                        select_state(model_option(&response.config_options.unwrap()))
+                            .current_value
+                            .to_string(),
+                    )
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored, "model-b");
     }
 
     #[tokio::test]

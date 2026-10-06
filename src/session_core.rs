@@ -1362,7 +1362,7 @@ impl SessionCore {
         PersistenceCapture {
             generation,
             through_seq,
-            model: session.model().to_string(),
+            model: self.current_model(),
             thinking: thinking.as_str().to_string(),
             messages: session.history().to_vec(),
             cwd: self.cwd.clone(),
