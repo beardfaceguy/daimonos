@@ -987,6 +987,7 @@ pub struct SessionCore {
     pub(crate) current_model: StdMutex<String>,
     current_thinking: StdMutex<ThinkingLevel>,
     pub(crate) cwd: PathBuf,
+    skills: crate::config::AgentSkillsConfig,
     pub(crate) client_user_message_ids: tokio::sync::Mutex<Vec<String>>,
     pub(crate) assistant_outcomes: StdMutex<Vec<AssistantOutcome>>,
     pub(crate) compaction: SessionCompaction,
@@ -1117,6 +1118,7 @@ impl SessionCore {
         session: AgentSession,
         current_model: String,
         cwd: PathBuf,
+        skills: crate::config::AgentSkillsConfig,
         compaction: SessionCompaction,
         context_windows: HashMap<String, u64>,
         approvals: Arc<ApprovalBroker>,
@@ -1134,6 +1136,7 @@ impl SessionCore {
             current_model: StdMutex::new(current_model),
             current_thinking: StdMutex::new(current_thinking),
             cwd,
+            skills,
             client_user_message_ids: tokio::sync::Mutex::new(Vec::new()),
             assistant_outcomes: StdMutex::new(Vec::new()),
             compaction,
@@ -1771,21 +1774,37 @@ impl SessionCore {
         C: FnOnce(),
         M: Fn(&crate::agent::TurnResult) -> crate::session_protocol::AssistantOutcome,
     {
-        let mut agent_session = self.session.lock().await;
         let mut user_message = user_message;
-        let direct_text = match (&user_message.role, user_message.content.as_slice()) {
-            (Role::User, [ContentBlock::Text(text)]) => Some(text.as_str()),
-            _ => None,
-        };
-        if let Some(text) = direct_text {
-            let expanded = agent_session
-                .expand_skill_invocation(text)
-                .await
-                .map_err(SessionPromptError::Prompt)?;
+        let direct_text = (user_message.role == Role::User)
+            .then(|| {
+                user_message.content.iter().position(
+                    |block| matches!(block, ContentBlock::Text(text) if text.starts_with('/')),
+                )
+            })
+            .flatten()
+            .map(|index| {
+                let ContentBlock::Text(text) = &user_message.content[index] else {
+                    unreachable!("position selected a text block");
+                };
+                (index, text.clone())
+            });
+        if let Some((index, text)) = direct_text {
+            let workspace = self.cwd.clone();
+            let skills = self.skills.clone();
+            let invocation = text.clone();
+            let expanded = tokio::task::spawn_blocking(move || {
+                crate::skills::expand_manual_invocation(&workspace, &invocation, &skills)
+            })
+            .await
+            .map_err(|error| {
+                SessionPromptError::Prompt(format!("Agent skill activation failed: {error}"))
+            })?
+            .map_err(SessionPromptError::Prompt)?;
             if expanded != text {
-                user_message = Message::user(expanded);
+                user_message.content[index] = ContentBlock::Text(expanded);
             }
         }
+        let mut agent_session = self.session.lock().await;
         {
             let mut client_ids = self.client_user_message_ids.lock().await;
             align_client_user_message_ids(&mut client_ids, agent_session.user_turn_count());
@@ -3481,7 +3500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_execution_is_transport_independent() {
+    async fn prompt_execution_is_transport_independent_and_expands_skill_with_image() {
         struct StaticProvider;
 
         #[async_trait::async_trait]
@@ -3507,6 +3526,13 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review safely\n---\nReview instructions\n",
+        )
+        .unwrap();
         let config = std::sync::Arc::new(crate::config::Config::default());
         let tool_session = crate::session::Session::new(dir.path().to_path_buf(), config);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3540,6 +3566,7 @@ mod tests {
             ),
             "test-model".to_string(),
             dir.path().to_path_buf(),
+            crate::config::AgentSkillsConfig::default(),
             SessionCompaction::new(None, false),
             HashMap::new(),
             approvals,
@@ -3549,13 +3576,20 @@ mod tests {
         );
         let message = crate::providers::Message {
             role: crate::providers::Role::User,
-            content: vec![crate::providers::ContentBlock::Text("ping".to_string())],
+            content: vec![
+                crate::providers::ContentBlock::Text("/review focus".to_string()),
+                crate::providers::ContentBlock::Image {
+                    data: "image-data".to_string(),
+                    media_type: "image/png".to_string(),
+                    uri: None,
+                },
+            ],
         };
 
         let execution = core
             .prompt(
                 message,
-                "ping".to_string(),
+                "/review focus".to_string(),
                 Some("request-1".to_string()),
                 None,
                 || {},
@@ -3568,6 +3602,13 @@ mod tests {
             SessionPromptOutcome::Completed(_)
         ));
         let history = core.session.lock().await.history().to_vec();
+        assert!(matches!(
+            &history[0].content[..],
+            [
+                crate::providers::ContentBlock::Text(text),
+                crate::providers::ContentBlock::Image { .. }
+            ] if text.contains("Review instructions") && text.ends_with("focus")
+        ));
         assert!(history.iter().any(|message| {
             message.content.iter().any(
                 |block| matches!(block, crate::providers::ContentBlock::Text(text) if text == "pong"),
@@ -3579,7 +3620,7 @@ mod tests {
             SessionEvent::UserMessage {
                 text,
                 request_id: Some(request_id),
-            } if text == "ping" && request_id == "request-1"
+            } if text == "/review focus" && request_id == "request-1"
         )));
         assert!(seen.iter().any(|event| matches!(
             event,
@@ -4430,6 +4471,7 @@ mod tests {
             ),
             "model".to_string(),
             cwd.to_path_buf(),
+            crate::config::AgentSkillsConfig::default(),
             SessionCompaction::new(None, false),
             HashMap::new(),
             approvals,

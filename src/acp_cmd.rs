@@ -2378,6 +2378,7 @@ async fn build_session_handle(
         AgentSession::new(provider, tool_session, config),
         state.default_model.clone(),
         session_workspace,
+        cfg.agent.skills.clone(),
         state.compaction.clone(),
         context_windows,
         Arc::clone(&approvals),

@@ -171,9 +171,7 @@ impl AgentEnv {
         })?;
         let mut vars = parse_dotenv(&content);
         merge_process_overrides(&mut vars, process_vars);
-        let agent = Self::from_vars(&vars, &path)?;
-        crate::skills::set_global_root_override(agent.skill_dir.clone());
-        Ok(agent)
+        Self::from_vars(&vars, &path)
     }
 
     fn from_vars(vars: &HashMap<String, String>, path: &Path) -> Result<AgentEnv, String> {

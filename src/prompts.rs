@@ -283,14 +283,25 @@ pub async fn agent_system_for_workspace(
         append_prompt_section(&mut prompt, additional);
     }
     if let Some(workspace) = workspace {
-        let discovery = crate::skills::discover(workspace, &cfg.agent.skills);
-        for warning in &discovery.warnings {
-            eprintln!("daimonos: agent skill warning: {warning}");
-        }
-        if let Some(catalog) =
-            crate::skills::catalog(&discovery, &cfg.agent.skills, &skill_catalog(cfg).await)
+        let workspace = workspace.to_path_buf();
+        let skills = cfg.agent.skills.clone();
+        let introduction = skill_catalog(cfg).await;
+        match tokio::task::spawn_blocking(move || {
+            let discovery = crate::skills::discover(&workspace, &skills);
+            let catalog = crate::skills::catalog(&discovery, &skills, &introduction);
+            (discovery.warnings, catalog)
+        })
+        .await
         {
-            append_prompt_section(&mut prompt, &catalog);
+            Ok((warnings, catalog)) => {
+                for warning in warnings {
+                    eprintln!("daimonos: agent skill warning: {warning}");
+                }
+                if let Some(catalog) = catalog {
+                    append_prompt_section(&mut prompt, &catalog);
+                }
+            }
+            Err(error) => eprintln!("daimonos: Agent Skills discovery failed: {error}"),
         }
     }
     prompt

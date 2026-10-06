@@ -9,20 +9,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 pub const DEFAULT_SKILL_DIR: &str = ".agents/skills";
 pub const SKILL_DIR_ENV: &str = "DAIMONOS_SKILL_DIR";
-
-static GLOBAL_ROOT_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
-
-pub fn set_global_root_override(root: Option<PathBuf>) {
-    *GLOBAL_ROOT_OVERRIDE
-        .get_or_init(|| RwLock::new(None))
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
@@ -94,20 +84,15 @@ pub fn global_root_from(raw: Option<&str>, home: Option<&Path>) -> Result<PathBu
     }
 }
 
-pub fn global_root() -> Result<PathBuf, String> {
-    if let Some(root) = GLOBAL_ROOT_OVERRIDE
-        .get_or_init(|| RwLock::new(None))
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-    {
-        return Ok(root);
+pub fn global_root(config: &crate::config::AgentSkillsConfig) -> Result<PathBuf, String> {
+    match &config.global_dir {
+        Some(root) => Ok(root.clone()),
+        None => global_root_from(None, crate::paths::home_dir().as_deref()),
     }
-    global_root_from(None, crate::paths::home_dir().as_deref())
 }
 
 pub fn discover(workspace: &Path, config: &crate::config::AgentSkillsConfig) -> Discovery {
-    match global_root() {
+    match global_root(config) {
         Ok(root) => discover_in(workspace, &root, config),
         Err(error) => Discovery {
             warnings: vec![error],
@@ -384,32 +369,48 @@ pub fn catalog(
     if introduction.trim_end().len().saturating_add(2) > config.catalog_max_bytes {
         return None;
     }
-    let mut out = introduction.trim_end().to_string();
-    out.push_str("\n\n");
-    let mut omitted = 0usize;
-    for (index, skill) in eligible.iter().enumerate() {
-        let description = skill
-            .metadata
-            .description
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let line = format!("- `{}`: {}\n", skill.metadata.name, description);
-        if out.len() + line.len() > config.catalog_max_bytes {
-            omitted = eligible.len() - index;
+    let header = format!("{}\n\n", introduction.trim_end());
+    let lines = eligible
+        .iter()
+        .map(|skill| {
+            let description = skill
+                .metadata
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("- `{}`: {}\n", skill.metadata.name, description)
+        })
+        .collect::<Vec<_>>();
+    let mut included = Vec::new();
+    let mut used = header.len();
+    for line in &lines {
+        if used + line.len() > config.catalog_max_bytes {
             break;
-        } else {
-            out.push_str(&line);
         }
+        used += line.len();
+        included.push(line);
     }
+    let mut omitted = lines.len() - included.len();
+    let mut notice = String::new();
     if omitted > 0 {
-        let notice = format!(
-            "\n[{omitted} skill(s) omitted because the catalog reached its byte budget.]\n"
-        );
-        if out.len() + notice.len() <= config.catalog_max_bytes {
-            out.push_str(&notice);
+        loop {
+            notice = format!(
+                "\n[{omitted} skill(s) omitted because the catalog reached its byte budget.]\n"
+            );
+            if used + notice.len() <= config.catalog_max_bytes {
+                break;
+            }
+            let removed = included.pop()?;
+            used -= removed.len();
+            omitted += 1;
         }
     }
+    let mut out = header;
+    for line in included {
+        out.push_str(line);
+    }
+    out.push_str(&notice);
     Some(out)
 }
 
@@ -434,14 +435,14 @@ pub fn expand_manual_invocation(
     }
     validate_name(name)?;
     let discovery = discover(workspace, config);
-    if !discovery
+    let Some(skill) = discovery
         .skills
         .iter()
-        .any(|skill| skill.metadata.name == name)
-    {
+        .find(|skill| skill.metadata.name == name)
+    else {
         return Ok(text.to_string());
-    }
-    let envelope = activation_envelope(workspace, name, config, true)?;
+    };
+    let envelope = activation_envelope_from_skill(skill, config, true)?;
     if remainder.trim().is_empty() {
         Ok(envelope)
     } else {
@@ -474,9 +475,18 @@ pub fn activation_envelope(
                 format!("skill '{name}' not found; available skills: {names}")
             }
         })?;
+    activation_envelope_from_skill(skill, config, allow_manual_only)
+}
+
+fn activation_envelope_from_skill(
+    skill: &Skill,
+    config: &crate::config::AgentSkillsConfig,
+    allow_manual_only: bool,
+) -> Result<String, String> {
     if skill.metadata.disable_model_invocation && !allow_manual_only {
         return Err(format!(
-            "skill '{name}' is available only through explicit user invocation"
+            "skill '{}' is available only through explicit user invocation",
+            skill.metadata.name
         ));
     }
     let content = read_bounded_regular_file(&skill.file, config.max_file_bytes)?;
@@ -659,5 +669,26 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("regular file")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_skill_directories_are_not_traversed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join("global");
+        let outside = temp.path().join("outside");
+        write_skill(
+            &outside,
+            "linked",
+            "name: linked\ndescription: outside",
+            "body",
+        );
+        std::fs::create_dir_all(&global).unwrap();
+        symlink(outside.join("linked"), global.join("linked")).unwrap();
+
+        let found = discover_in(temp.path(), &global, &config());
+        assert!(found.skills.is_empty());
     }
 }

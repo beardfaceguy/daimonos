@@ -260,6 +260,7 @@ impl SessionFactory for AgentSessionFactory {
             agent_session,
             model.clone(),
             workspace,
+            self.config.agent.skills.clone(),
             self.compaction.clone(),
             context_windows,
             approvals,

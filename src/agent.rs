@@ -2352,11 +2352,6 @@ impl AgentSession {
         std::sync::Arc::clone(&self.tool_session)
     }
 
-    pub async fn expand_skill_invocation(&self, text: &str) -> Result<String, String> {
-        let session = self.tool_session.lock().await;
-        crate::skills::expand_manual_invocation(&session.workspace, text, &session.cfg.agent.skills)
-    }
-
     pub async fn poll_coordination_ui_notice(
         tool_session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
     ) -> Option<(String, i64)> {

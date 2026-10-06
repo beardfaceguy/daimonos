@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub index: IndexConfig,
@@ -51,6 +51,8 @@ pub struct AgentModeConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct AgentSkillsConfig {
+    #[serde(skip)]
+    pub global_dir: Option<std::path::PathBuf>,
     pub max_file_bytes: u64,
     pub catalog_max_bytes: usize,
     pub description_warning_bytes: usize,
@@ -59,6 +61,7 @@ pub struct AgentSkillsConfig {
 impl Default for AgentSkillsConfig {
     fn default() -> Self {
         Self {
+            global_dir: None,
             max_file_bytes: 100 * 1024,
             catalog_max_bytes: 16 * 1024,
             description_warning_bytes: 1024,
@@ -167,7 +170,7 @@ pub enum IndexMode {
 pub const INDEX_FALLBACK_MAX_FILES: usize = 50_000;
 pub const DEFAULT_INDEX_MAX_WALK_ENTRIES: usize = 100_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct IndexConfig {
     pub mode: IndexMode,
@@ -196,7 +199,7 @@ pub struct IndexConfig {
     pub project_markers: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct SearchConfig {
     pub default_grep_max: usize,
@@ -1266,7 +1269,7 @@ pub struct ObservabilityConfig {
     pub flush_timeout_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct AnalyticsConfig {
     pub enabled: bool,

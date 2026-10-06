@@ -415,6 +415,7 @@ pub async fn run_agent(
         task
     };
     let agent = load_agent_env(agent_env)?;
+    let cfg = with_skill_dir(cfg, &agent);
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let llm = build_provider(
@@ -481,6 +482,7 @@ pub async fn run_chat(
     }
 
     let agent = load_agent_env(agent_env)?;
+    let cfg = with_skill_dir(cfg, &agent);
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let model_explicit = model.is_some();
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -527,6 +529,7 @@ pub async fn run_acp(
         agent_env,
     } = args;
     let agent = load_agent_env(agent_env)?;
+    let cfg = with_skill_dir(cfg, &agent);
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let make_provider: acp_cmd::ProviderFactory = {
@@ -614,6 +617,7 @@ pub async fn run_session_daemon(
         remote_trust_proxy_headers,
     } = args;
     let agent = load_agent_env(agent_env)?;
+    let cfg = with_skill_dir(cfg, &agent);
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let make_provider: session_factory::ProviderFactory = {
@@ -1026,6 +1030,14 @@ fn remote_capability_name(capability: &crate::session_protocol::ClientCapability
 
 fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {
     agent_env::AgentEnv::load(path).map_err(|error| anyhow::anyhow!("agent config: {error}"))
+}
+
+fn with_skill_dir(
+    mut cfg: Arc<config::Config>,
+    agent: &agent_env::AgentEnv,
+) -> Arc<config::Config> {
+    Arc::make_mut(&mut cfg).agent.skills.global_dir = agent.skill_dir.clone();
+    cfg
 }
 
 fn require_agent_task(

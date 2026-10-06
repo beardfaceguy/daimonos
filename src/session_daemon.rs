@@ -3489,6 +3489,7 @@ mod tests {
             4,
         ));
         let stream_events = Arc::clone(&events);
+        let skills = config.agent.skills.clone();
         Arc::new(SessionCore::new(
             AgentSession::new(
                 provider,
@@ -3510,6 +3511,7 @@ mod tests {
             ),
             "test-model".to_string(),
             workspace,
+            skills,
             SessionCompaction::new(None, false),
             HashMap::new(),
             approvals,
