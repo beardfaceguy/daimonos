@@ -79,8 +79,8 @@ impl AgentSkillsConfig {
         if self.max_file_bytes == 0 {
             return Err("agent.skills.max_file_bytes must be greater than zero".to_string());
         }
-        if self.catalog_max_bytes == 0 {
-            return Err("agent.skills.catalog_max_bytes must be greater than zero".to_string());
+        if self.catalog_max_bytes < 256 {
+            return Err("agent.skills.catalog_max_bytes must be at least 256".to_string());
         }
         if self.description_warning_bytes == 0 {
             return Err(

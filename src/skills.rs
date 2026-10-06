@@ -441,7 +441,9 @@ pub fn expand_manual_invocation(
     if reserved_commands.contains(&name) {
         return Ok(text.to_string());
     }
-    validate_name(name)?;
+    if validate_name(name).is_err() {
+        return Ok(text.to_string());
+    }
     let discovery = discover(workspace, config);
     let Some(skill) = discovery
         .skills
@@ -626,6 +628,14 @@ mod tests {
         assert_eq!(
             expand_manual_invocation(workspace, "/help", &config, &["help"]).unwrap(),
             "/help"
+        );
+        assert_eq!(
+            expand_manual_invocation(workspace, "/usr/bin/tool", &config, &[]).unwrap(),
+            "/usr/bin/tool"
+        );
+        assert_eq!(
+            expand_manual_invocation(workspace, "/Deploy now", &config, &[]).unwrap(),
+            "/Deploy now"
         );
         assert!(activation_envelope(workspace, "manual", &config, false).is_err());
         assert!(activation_envelope(workspace, "manual", &config, true).is_ok());
