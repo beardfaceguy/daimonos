@@ -1177,6 +1177,22 @@ impl SessionCore {
             .clone()
     }
 
+    pub fn current_thinking(&self) -> ThinkingLevel {
+        self.current_thinking
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Select the thinking level for subsequent turns without waiting on the
+    /// session lock; `prepare_model` applies it when the next turn starts.
+    pub fn set_current_thinking(&self, thinking: ThinkingLevel) {
+        *self
+            .current_thinking
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thinking;
+    }
+
     pub async fn apply_runtime_option(
         &self,
         config_id: &str,
@@ -1292,6 +1308,7 @@ impl SessionCore {
         let policy = self.compaction.policy_for(model, context_window)?;
         session.set_model(model);
         session.set_compaction(policy);
+        session.set_thinking(self.current_thinking());
         Ok(context_window.or_else(|| {
             (!self.compaction.follows_model_window)
                 .then(|| {

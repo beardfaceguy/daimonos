@@ -432,6 +432,9 @@ struct AcpState {
         tokio::sync::Mutex<HashMap<SessionId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Builds a provider per new session (see [`ProviderFactory`]).
     make_provider: ProviderFactory,
+    /// Provider instance used only for capability queries (thinking levels),
+    /// so config requests never wait on a session lock held by a turn.
+    capabilities: Option<Arc<dyn LlmProvider>>,
     /// Candidate models for the picker (from `DAIMONOS_AGENT_MODELS`);
     /// always non-empty (includes the active model).
     models: Vec<String>,
@@ -494,6 +497,8 @@ fn request_session_cancel(handle: &SessionHandle) {
 
 /// The `SessionConfigId` for the model picker option.
 const MODEL_CONFIG_ID: &str = "model";
+/// The `SessionConfigId` for the reasoning-effort selector (vikunja #1523).
+const THINKING_CONFIG_ID: &str = "thinking";
 const SESSION_END_REASON_DELETED: &str = "deleted";
 const SESSION_END_REASON_ENGINE_SHUTDOWN: &str = "engine_shutdown";
 const REFUSAL_DIAGNOSTIC: &str = "Provider refused the request based on content policy.";
@@ -1500,6 +1505,110 @@ fn canonical_model_options(models: &[String], current: &str) -> Vec<CoreRuntimeO
             .map(|model| CoreRuntimeChoice::new(model, model))
             .collect(),
     )]
+}
+
+/// A session's thinking selector state: the levels the provider honors for
+/// the current model and the level the next turn will send.
+struct ThinkingSelection {
+    levels: Vec<crate::providers::ThinkingLevel>,
+    current: crate::providers::ThinkingLevel,
+}
+
+fn thinking_label(level: &crate::providers::ThinkingLevel) -> &'static str {
+    use crate::providers::ThinkingLevel::*;
+    match level {
+        Off => "Off",
+        Minimal => "Minimal",
+        Low => "Low",
+        Medium => "Medium",
+        High => "High",
+        XHigh => "Extra high",
+        Max => "Max",
+    }
+}
+
+/// The full ACP `config_options` list: the model picker, plus the thinking
+/// selector when the provider can honor distinct levels for the model.
+fn session_config_options(
+    models: &[String],
+    current_model: &str,
+    thinking: Option<&ThinkingSelection>,
+) -> Vec<SessionConfigOption> {
+    let mut options = model_config_options(models, current_model);
+    if let Some(thinking) = thinking {
+        let choices = thinking
+            .levels
+            .iter()
+            .map(|level| SessionConfigSelectOption::new(level.as_str(), thinking_label(level)))
+            .collect::<Vec<_>>();
+        options.push(
+            SessionConfigOption::select(
+                THINKING_CONFIG_ID,
+                "Thinking",
+                thinking.current.as_str(),
+                choices,
+            )
+            .category(Some(SessionConfigOptionCategory::ThoughtLevel)),
+        );
+    }
+    options
+}
+
+fn canonical_config_options(
+    models: &[String],
+    current_model: &str,
+    thinking: Option<&ThinkingSelection>,
+) -> Vec<CoreRuntimeOption> {
+    let mut options = canonical_model_options(models, current_model);
+    if let Some(thinking) = thinking {
+        options.push(CoreRuntimeOption::select(
+            THINKING_CONFIG_ID,
+            "Thinking",
+            CoreRuntimeValue::String(thinking.current.as_str().to_string()),
+            thinking
+                .levels
+                .iter()
+                .map(|level| CoreRuntimeChoice::new(level.as_str(), thinking_label(level)))
+                .collect(),
+        ));
+    }
+    options
+}
+
+/// The honored level closest to `target` in effort order; ties go lower so a
+/// snap never silently raises cost.
+fn nearest_thinking_level(
+    levels: &[crate::providers::ThinkingLevel],
+    target: &crate::providers::ThinkingLevel,
+) -> Option<crate::providers::ThinkingLevel> {
+    let rank = |level: &crate::providers::ThinkingLevel| {
+        crate::providers::ThinkingLevel::ALL
+            .iter()
+            .position(|candidate| candidate == level)
+            .unwrap_or(0)
+    };
+    let target = rank(target);
+    levels
+        .iter()
+        .min_by_key(|level| (rank(level).abs_diff(target), rank(level)))
+        .cloned()
+}
+
+/// Reconcile `core`'s thinking level with what the provider honors for its
+/// current model, snapping an unsupported level so the advertised value is
+/// always what the next turn sends. `None` = no truthful selector.
+async fn sync_thinking_selection(
+    state: &AcpState,
+    core: &SessionCore,
+) -> Option<ThinkingSelection> {
+    let model = core.current_model();
+    let levels = state.capabilities.as_ref()?.thinking_levels(&model).await?;
+    let mut current = core.current_thinking();
+    if !levels.contains(&current) {
+        current = nearest_thinking_level(&levels, &current)?;
+        core.set_current_thinking(current.clone());
+    }
+    Some(ThinkingSelection { levels, current })
 }
 
 /// Surface a compaction as a subtle thought chunk in Zed's thread view
@@ -2716,9 +2825,10 @@ fn build_agent_with_state(
     state_out: &mut Option<Arc<AcpState>>,
 ) -> impl ConnectTo<AcpClientRole> {
     let workspace = workspace.to_path_buf();
-    let supports_images = make_provider()
-        .map(|provider| provider.supports_images())
-        .unwrap_or(false);
+    let capabilities: Option<Arc<dyn LlmProvider>> = make_provider().ok().map(Arc::from);
+    let supports_images = capabilities
+        .as_ref()
+        .is_some_and(|provider| provider.supports_images());
     // Advertise MCP transports so Zed forwards the matching server kinds
     // (ADR-003, D8). stdio needs no capability flag; http is gated on it.
     let mcp_enabled = cfg.acp.mcp.enabled;
@@ -2729,6 +2839,7 @@ fn build_agent_with_state(
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         session_operations: tokio::sync::Mutex::new(HashMap::new()),
         make_provider,
+        capabilities,
         models,
         default_model: model,
         store: sessions_dir.map(|directory| {
@@ -3103,6 +3214,8 @@ fn build_agent_with_state(
                             .await
                             .insert(session_id.clone(), Arc::clone(&handle));
 
+                        let thinking = sync_thinking_selection(&state, &handle.core).await;
+
                         // Persist immediately with empty history so a thread the
                         // user opens but never prompts survives a process restart
                         // and can be resumed by session/load. Without this,
@@ -3114,8 +3227,11 @@ fn build_agent_with_state(
 
                         // Advertise the model picker (vikunja #960); new sessions
                         // start on the default model.
-                        let config_options =
-                            model_config_options(&state.models, &state.default_model);
+                        let config_options = session_config_options(
+                            &state.models,
+                            &state.default_model,
+                            thinking.as_ref(),
+                        );
                         let commands =
                             available_commands(&handle.core.cwd, &cfg.agent.skills).await;
                         responder.respond(
@@ -3322,6 +3438,13 @@ fn build_agent_with_state(
                                 .current_model
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner()) = model.clone();
+                            if let Some(thinking) = record
+                                .thinking
+                                .as_deref()
+                                .and_then(|raw| crate::providers::ThinkingLevel::from_input(raw).ok())
+                            {
+                                handle.core.set_current_thinking(thinking);
+                            }
                             state
                                 .sessions
                                 .lock()
@@ -3339,7 +3462,12 @@ fn build_agent_with_state(
                         };
                         // Echo the model picker (vikunja #960) with the session's
                         // current model, as session/new does.
-                        let config_options = model_config_options(&state.models, &current_model);
+                        let thinking = sync_thinking_selection(&state, &active_handle.core).await;
+                        let config_options = session_config_options(
+                            &state.models,
+                            &current_model,
+                            thinking.as_ref(),
+                        );
                         let commands =
                             available_commands(&active_handle.core.cwd, &cfg.agent.skills).await;
                         responder.respond(
@@ -3540,9 +3668,25 @@ fn build_agent_with_state(
                         // the session is unknown (shouldn't happen from a real
                         // client, but keep the echo sensible).
                         let mut current = state.default_model.clone();
+                        let mut thinking = None;
                         if let Some(handle) = handle {
                             let mut changed = false;
-                            if req.config_id.to_string() == MODEL_CONFIG_ID {
+                            let thinking_before = handle.core.current_thinking();
+                            if req.config_id.to_string() == THINKING_CONFIG_ID {
+                                // Only honor a level advertised for the current model.
+                                let picked = req.value.as_value_id().and_then(|value| {
+                                    crate::providers::ThinkingLevel::from_input(&value.to_string())
+                                        .ok()
+                                });
+                                if let (Some(picked), Some(selection)) = (
+                                    picked,
+                                    sync_thinking_selection(&state, &handle.core).await,
+                                ) {
+                                    if selection.levels.contains(&picked) {
+                                        handle.core.set_current_thinking(picked);
+                                    }
+                                }
+                            } else if req.config_id.to_string() == MODEL_CONFIG_ID {
                                 if let Some(value) = req.value.as_value_id() {
                                     let picked = value.to_string();
                                     // Only honor a value we actually advertised.
@@ -3565,18 +3709,26 @@ fn build_agent_with_state(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .clone();
+                            // A model change can narrow the honored levels.
+                            thinking = sync_thinking_selection(&state, &handle.core).await;
+                            changed |= handle.core.current_thinking() != thinking_before;
                             if changed {
                                 // A picker change without a later prompt must
                                 // still survive process restart/session load.
                                 handle.core.persist_current().await;
                                 let _ = handle.core.events.emit(
                                     CoreSessionEvent::RuntimeOptionsChanged {
-                                        options: canonical_model_options(&state.models, &current),
+                                        options: canonical_config_options(
+                                            &state.models,
+                                            &current,
+                                            thinking.as_ref(),
+                                        ),
                                     },
                                 );
                             }
                         }
-                        let options = model_config_options(&state.models, &current);
+                        let options =
+                            session_config_options(&state.models, &current, thinking.as_ref());
                         responder.respond(SetSessionConfigOptionResponse::new(options))
                     }
                 }
@@ -7116,6 +7268,267 @@ mod tests {
         );
     }
 
+    // --- thinking selector (vikunja #1523) ---
+
+    /// Honors a scripted level list per model and records the effort each
+    /// turn was sent with.
+    struct LevelsProvider {
+        levels: HashMap<String, Vec<crate::providers::ThinkingLevel>>,
+        seen: Arc<StdMutex<Vec<crate::providers::ThinkingLevel>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for LevelsProvider {
+        async fn complete(
+            &self,
+            _ctx: &crate::providers::Context,
+            opts: &CompleteOpts,
+        ) -> crate::providers::LlmResponse {
+            self.seen.lock().unwrap().push(opts.thinking.clone());
+            end_turn_resp("ok")
+        }
+
+        async fn thinking_levels(
+            &self,
+            model: &str,
+        ) -> Option<Vec<crate::providers::ThinkingLevel>> {
+            self.levels.get(model).cloned()
+        }
+    }
+
+    /// model-a honors off/low/high; model-b offers no selector.
+    fn levels_factory(
+        seen: &Arc<StdMutex<Vec<crate::providers::ThinkingLevel>>>,
+    ) -> ProviderFactory {
+        use crate::providers::ThinkingLevel::*;
+        let seen = Arc::clone(seen);
+        Arc::new(move || {
+            Ok(Box::new(LevelsProvider {
+                levels: HashMap::from([("model-a".to_string(), vec![Off, Low, High])]),
+                seen: Arc::clone(&seen),
+            }))
+        })
+    }
+
+    fn build_levels_agent(
+        seen: &Arc<StdMutex<Vec<crate::providers::ThinkingLevel>>>,
+        workspace: &Path,
+        sessions_dir: Option<PathBuf>,
+    ) -> impl ConnectTo<AcpClientRole> {
+        let mut state_out = None;
+        build_agent_with_state(
+            levels_factory(seen),
+            workspace,
+            Arc::new(Config::default()),
+            "model-a".to_string(),
+            vec!["model-a".to_string(), "model-b".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            sessions_dir,
+            SessionCompaction::new(None, false),
+            None,
+            false,
+            crate::providers::ThinkingLevel::Medium,
+            &mut state_out,
+        )
+    }
+
+    fn thinking_option(options: &[SessionConfigOption]) -> Option<&SessionConfigOption> {
+        options
+            .iter()
+            .find(|option| option.id.to_string() == THINKING_CONFIG_ID)
+    }
+
+    fn thinking_current(options: &[SessionConfigOption]) -> String {
+        let option = thinking_option(options).expect("thinking option advertised");
+        select_state(option).current_value.to_string()
+    }
+
+    fn set_option(
+        session_id: &SessionId,
+        config_id: &str,
+        value: &str,
+    ) -> SetSessionConfigOptionRequest {
+        SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            config_id.to_string(),
+            agent_client_protocol::schema::v1::SessionConfigOptionValue::value_id(
+                value.to_string(),
+            ),
+        )
+    }
+
+    #[test]
+    fn nearest_thinking_level_prefers_lower_effort_on_ties() {
+        use crate::providers::ThinkingLevel::*;
+        assert_eq!(
+            nearest_thinking_level(&[Off, Low, High], &Medium),
+            Some(Low)
+        );
+        assert_eq!(nearest_thinking_level(&[Low, High], &Off), Some(Low));
+        assert_eq!(nearest_thinking_level(&[Low, High], &Max), Some(High));
+        assert_eq!(nearest_thinking_level(&[], &Max), None);
+    }
+
+    #[tokio::test]
+    async fn acp_thinking_selector_offers_honored_levels_and_applies_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let agent = build_levels_agent(&seen, dir.path(), None);
+
+        let (created, rejected, picked, second_session, model_b) = AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let session_id = new_session.session_id;
+                let rejected = connection
+                    .send_request(set_option(&session_id, THINKING_CONFIG_ID, "max"))
+                    .block_task()
+                    .await?;
+                let picked = connection
+                    .send_request(set_option(&session_id, THINKING_CONFIG_ID, "high"))
+                    .block_task()
+                    .await?;
+                let second = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                let model_b = connection
+                    .send_request(set_option(&session_id, MODEL_CONFIG_ID, "model-b"))
+                    .block_task()
+                    .await?;
+                Ok((
+                    new_session.config_options.unwrap(),
+                    rejected.config_options,
+                    picked.config_options,
+                    second.config_options.unwrap(),
+                    model_b.config_options,
+                ))
+            })
+            .await
+            .unwrap();
+
+        let option = thinking_option(&created).expect("thinking option advertised");
+        assert_eq!(
+            option.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
+        let values: Vec<String> = match &select_state(option).options {
+            agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(opts) => {
+                opts.iter().map(|o| o.value.to_string()).collect()
+            }
+            _ => panic!("expected ungrouped options"),
+        };
+        assert_eq!(values, vec!["off", "low", "high"]);
+        assert_eq!(
+            thinking_current(&created),
+            "low",
+            "the unsupported env default (medium) snaps to the nearest lower level"
+        );
+        assert_eq!(
+            thinking_current(&rejected),
+            "low",
+            "unadvertised levels are ignored"
+        );
+        assert_eq!(thinking_current(&picked), "high");
+        assert_eq!(
+            thinking_current(&second_session),
+            "low",
+            "sessions are independent"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![crate::providers::ThinkingLevel::High],
+            "the next turn sends the picked level"
+        );
+        assert!(
+            thinking_option(&model_b).is_none(),
+            "a model without honored levels hides the selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_thinking_selection_survives_restart_without_a_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        let new_workspace = workspace.path().to_path_buf();
+        let session_id = AcpClientRole
+            .builder()
+            .connect_with(
+                build_levels_agent(&seen, workspace.path(), Some(sessions.path().to_path_buf())),
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(&new_workspace))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(set_option(
+                            &new_session.session_id,
+                            THINKING_CONFIG_ID,
+                            "high",
+                        ))
+                        .block_task()
+                        .await?;
+                    Ok(new_session.session_id)
+                },
+            )
+            .await
+            .unwrap();
+
+        let load_workspace = workspace.path().to_path_buf();
+        let restored = AcpClientRole
+            .builder()
+            .connect_with(
+                build_levels_agent(&seen, workspace.path(), Some(sessions.path().to_path_buf())),
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let response = connection
+                        .send_request(LoadSessionRequest::new(session_id.clone(), &load_workspace))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![AcpContentBlock::Text(TextContent::new("go"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    Ok(response.config_options.unwrap())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(thinking_current(&restored), "high");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![crate::providers::ThinkingLevel::High]
+        );
+    }
+
     /// Pull the single model `SessionConfigOption` out of a config_options list.
     fn model_option(options: &[SessionConfigOption]) -> &SessionConfigOption {
         options
@@ -7185,6 +7598,10 @@ mod tests {
             .unwrap()
             .expect("session/new should advertise config_options");
 
+        assert!(
+            thinking_option(&config_options).is_none(),
+            "no thinking selector when the provider reports no honored levels"
+        );
         let option = model_option(&config_options);
         assert_eq!(option.category, Some(SessionConfigOptionCategory::Model));
         let select = select_state(option);

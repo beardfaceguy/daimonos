@@ -570,6 +570,15 @@ pub trait LlmProvider: Send + Sync {
     async fn list_models(&self) -> Option<Vec<String>> {
         None
     }
+
+    /// The thinking levels this adapter sends distinctly for `model`, in
+    /// ascending-effort order. Feeds per-session reasoning selectors, which
+    /// must not offer a level the provider ignores or collapses into another.
+    /// `None` means no truthful selector can be offered (unknown model, or an
+    /// adapter that does not distinguish levels).
+    async fn thinking_levels(&self, _model: &str) -> Option<Vec<ThinkingLevel>> {
+        None
+    }
 }
 
 #[cfg(test)]

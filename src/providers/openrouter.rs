@@ -20,11 +20,16 @@ pub struct OpenRouterProvider {
     request_trace: super::request_trace::RequestTrace,
     /// Bounded HTTP/SSE deadlines (#1107).
     timeouts: super::ProviderTimeouts,
-    /// Per-model max output tokens from the last successful `/models` fetch.
+    /// Per-model capabilities from the last successful `/models` fetch.
     /// Replaced wholesale on each fetch, so it is bounded by the catalog size.
-    /// Filled only as a side effect of `list_models`/`context_window`; the
-    /// request path never fetches.
-    max_output: StdMutex<HashMap<String, u32>>,
+    /// The request path only reads it and never fetches.
+    catalog: StdMutex<HashMap<String, ModelCaps>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ModelCaps {
+    max_output: Option<u32>,
+    thinking_levels: Option<Vec<ThinkingLevel>>,
 }
 
 impl OpenRouterProvider {
@@ -40,23 +45,45 @@ impl OpenRouterProvider {
             prompt_cache: false,
             request_trace: super::request_trace::RequestTrace::from_env(),
             timeouts,
-            max_output: StdMutex::new(HashMap::new()),
+            catalog: StdMutex::new(HashMap::new()),
         })
     }
 
     fn remember_catalog(&self, body: &Value) {
-        let limits = max_output_from_models(body);
-        if !limits.is_empty() {
-            *self.max_output.lock().unwrap_or_else(|p| p.into_inner()) = limits;
+        let caps = caps_from_models(body);
+        if !caps.is_empty() {
+            *self.catalog.lock().unwrap_or_else(|p| p.into_inner()) = caps;
         }
     }
 
-    fn known_max_output(&self, model: &str) -> Option<u32> {
-        self.max_output
+    fn cached_caps(&self, model: &str) -> Option<ModelCaps> {
+        self.catalog
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(model)
-            .copied()
+            .cloned()
+    }
+
+    fn known_max_output(&self, model: &str) -> Option<u32> {
+        self.cached_caps(model)?.max_output
+    }
+
+    /// Fetch `GET /models`, refreshing the capability cache on success.
+    async fn fetch_catalog(&self) -> Option<Value> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        self.remember_catalog(&body);
+        Some(body)
     }
 
     fn request_body(&self, ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
@@ -114,19 +141,7 @@ impl LlmProvider for OpenRouterProvider {
         // OpenRouter serves hundreds of models across vendors; slugs sorted
         // newest-first by `created` so the failover chain degrades toward
         // older models. The picker is long, but discovery is the point.
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let body: Value = resp.json().await.ok()?;
-        self.remember_catalog(&body);
+        let body = self.fetch_catalog().await?;
         let mut entries: Vec<(i64, String)> = body["data"]
             .as_array()?
             .iter()
@@ -286,20 +301,20 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn context_window(&self, model: &str) -> Option<u64> {
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let body: Value = resp.json().await.ok()?;
-        self.remember_catalog(&body);
+        let body = self.fetch_catalog().await?;
         context_length_from_models(&body, model)
+    }
+
+    async fn thinking_levels(&self, model: &str) -> Option<Vec<ThinkingLevel>> {
+        if let Some(caps) = self.cached_caps(model) {
+            return caps.thinking_levels;
+        }
+        let body = self.fetch_catalog().await?;
+        let entry = body["data"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(model))?;
+        thinking_levels_from_model(entry)
     }
 }
 
@@ -775,21 +790,56 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
 /// vLLM exposes `max_model_len` on the same list endpoint, so fall back to
 /// that. `None` when the model id isn't listed, both fields are absent, or
 /// the value is zero.
-/// Per-model output ceilings (`top_provider.max_completion_tokens`) from an
-/// OpenRouter `GET /models` body. Models without a positive value are omitted.
-fn max_output_from_models(body: &Value) -> HashMap<String, u32> {
+/// Per-model capabilities from an OpenRouter `GET /models` body.
+fn caps_from_models(body: &Value) -> HashMap<String, ModelCaps> {
     body["data"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|model| {
             let id = model["id"].as_str()?;
-            let limit = model["top_provider"]["max_completion_tokens"]
+            let max_output = model["top_provider"]["max_completion_tokens"]
                 .as_u64()
-                .filter(|&n| n > 0)?;
-            Some((id.to_string(), u32::try_from(limit).unwrap_or(u32::MAX)))
+                .filter(|&n| n > 0)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+            let caps = ModelCaps {
+                max_output,
+                thinking_levels: thinking_levels_from_model(model),
+            };
+            Some((id.to_string(), caps))
         })
         .collect()
+}
+
+/// Levels a catalog entry honors, per OpenRouter's `reasoning` metadata:
+/// `supported_efforts` lists the accepted efforts (`null` = all, omitted = no
+/// effort selection), and `mandatory` models reject disabling reasoning.
+/// Off is sent as `enabled: false`, so it is offered whenever reasoning is
+/// optional even if `"none"` is not a listed effort.
+fn thinking_levels_from_model(model: &Value) -> Option<Vec<ThinkingLevel>> {
+    let reasoning = model.get("reasoning")?;
+    let efforts = reasoning.get("supported_efforts")?;
+    let mandatory = reasoning["mandatory"].as_bool().unwrap_or(false);
+    let accepted: Vec<ThinkingLevel> = match efforts {
+        Value::Null => ThinkingLevel::ALL.to_vec(),
+        Value::Array(names) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|name| match name {
+                "none" => Some(ThinkingLevel::Off),
+                name => ThinkingLevel::from_input(name).ok(),
+            })
+            .collect(),
+        _ => return None,
+    };
+    let levels: Vec<ThinkingLevel> = ThinkingLevel::ALL
+        .into_iter()
+        .filter(|level| match level {
+            ThinkingLevel::Off => !mandatory,
+            level => accepted.contains(level),
+        })
+        .collect();
+    (levels.iter().any(|level| *level != ThinkingLevel::Off)).then_some(levels)
 }
 
 pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u64> {
@@ -1860,10 +1910,64 @@ mod tests {
         );
         assert_eq!(after["max_tokens"], 128_000);
         assert_eq!(
-            max_output_from_models(&catalog).get("no/limit"),
+            caps_from_models(&catalog)
+                .get("no/limit")
+                .and_then(|caps| caps.max_output),
             None,
             "models without a ceiling keep the generic default"
         );
+    }
+
+    #[test]
+    fn catalog_reasoning_metadata_yields_only_honored_thinking_levels() {
+        use ThinkingLevel::*;
+        let entry = |reasoning: Value| json!({"id": "m", "reasoning": reasoning});
+        let cases = [
+            // anthropic/claude-opus-4.8: optional, no "none" effort.
+            (
+                entry(json!({"mandatory": false, "default_enabled": false,
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"]})),
+                Some(vec![Off, Low, Medium, High, XHigh, Max]),
+            ),
+            // anthropic/claude-opus-5.5: mandatory reasoning cannot be turned off.
+            (
+                entry(json!({"mandatory": true,
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"]})),
+                Some(vec![Low, Medium, High, XHigh, Max]),
+            ),
+            // openai/gpt-5.6-sol lists "none" explicitly.
+            (
+                entry(json!({"mandatory": false,
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"]})),
+                Some(vec![Off, Low, Medium, High, XHigh, Max]),
+            ),
+            // null = every gateway effort is accepted.
+            (
+                entry(json!({"mandatory": false, "supported_efforts": null})),
+                Some(ThinkingLevel::ALL.to_vec()),
+            ),
+            // Omitted efforts = the model exposes no effort selection.
+            (entry(json!({"mandatory": false})), None),
+            (json!({"id": "m"}), None),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(thinking_levels_from_model(&model), expected, "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_levels_come_from_the_cached_catalog() {
+        let catalog = json!({"data": [{"id": "anthropic/claude-opus-5.5", "created": 1,
+            "reasoning": {"mandatory": true, "supported_efforts": ["high", "low"]}}]});
+        let (base_url, _) =
+            mock_http_server("200 OK", "application/json", catalog.to_string()).await;
+        let provider = OpenRouterProvider::new("k".into(), base_url).unwrap();
+        assert!(provider.list_models().await.is_some());
+        assert_eq!(
+            provider.thinking_levels("anthropic/claude-opus-5.5").await,
+            Some(vec![ThinkingLevel::Low, ThinkingLevel::High])
+        );
+        assert_eq!(provider.thinking_levels("not/listed").await, None);
     }
 
     #[test]
