@@ -1,10 +1,16 @@
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::providers::{
     resolve_max_output, CompleteOpts, ContentBlock, Context, Cost, LlmProvider, LlmResponse,
-    Message, Role, StopReason, StreamEvent, ToolSchema, Usage,
+    Message, Role, StopReason, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
+
+/// `ContentBlock::ProviderState` owner tag for OpenRouter `reasoning_details`.
+const PROVIDER_STATE: &str = "openrouter";
 
 pub struct OpenRouterProvider {
     api_key: String,
@@ -14,6 +20,11 @@ pub struct OpenRouterProvider {
     request_trace: super::request_trace::RequestTrace,
     /// Bounded HTTP/SSE deadlines (#1107).
     timeouts: super::ProviderTimeouts,
+    /// Per-model max output tokens from the last successful `/models` fetch.
+    /// Replaced wholesale on each fetch, so it is bounded by the catalog size.
+    /// Filled only as a side effect of `list_models`/`context_window`; the
+    /// request path never fetches.
+    max_output: StdMutex<HashMap<String, u32>>,
 }
 
 impl OpenRouterProvider {
@@ -29,7 +40,55 @@ impl OpenRouterProvider {
             prompt_cache: false,
             request_trace: super::request_trace::RequestTrace::from_env(),
             timeouts,
+            max_output: StdMutex::new(HashMap::new()),
         })
+    }
+
+    fn remember_catalog(&self, body: &Value) {
+        let limits = max_output_from_models(body);
+        if !limits.is_empty() {
+            *self.max_output.lock().unwrap_or_else(|p| p.into_inner()) = limits;
+        }
+    }
+
+    fn known_max_output(&self, model: &str) -> Option<u32> {
+        self.max_output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(model)
+            .copied()
+    }
+
+    fn request_body(&self, ctx: &Context, opts: &CompleteOpts, stream: bool) -> Value {
+        let mut messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+        if self.prompt_cache && supports_explicit_prompt_cache(&opts.model) {
+            apply_prompt_cache(&mut messages);
+        }
+        let tools = tools_to_wire(&ctx.tools);
+
+        // No `stream_options`: OpenRouter deprecated `include_usage` (usage
+        // is now always included in the final SSE chunk automatically).
+        let mut body = json!({
+            "model": opts.model,
+            "messages": messages,
+            // Reasoning budgets are carved out of max_tokens, so the default
+            // must be the model's real output ceiling, not the generic floor.
+            "max_tokens": resolve_max_output(
+                opts.max_tokens,
+                self.known_max_output(&opts.model),
+                None,
+            ),
+            "reasoning": reasoning_param(&opts.thinking),
+            "stream": stream,
+        });
+
+        if let Some(t) = opts.temperature {
+            body["temperature"] = json!(t);
+        }
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+        body
     }
 
     pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
@@ -67,6 +126,7 @@ impl LlmProvider for OpenRouterProvider {
             return None;
         }
         let body: Value = resp.json().await.ok()?;
+        self.remember_catalog(&body);
         let mut entries: Vec<(i64, String)> = body["data"]
             .as_array()?
             .iter()
@@ -83,25 +143,7 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
-        let mut messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
-        if self.prompt_cache && supports_explicit_prompt_cache(&opts.model) {
-            apply_prompt_cache(&mut messages);
-        }
-        let tools = tools_to_wire(&ctx.tools);
-
-        let mut body = json!({
-            "model": opts.model,
-            "messages": messages,
-            "max_tokens": resolve_max_output(opts.max_tokens, None, None),
-            "stream": false,
-        });
-
-        if let Some(t) = opts.temperature {
-            body["temperature"] = json!(t);
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = self.request_body(ctx, opts, false);
         self.request_trace.capture(&body).await;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -160,27 +202,7 @@ impl LlmProvider for OpenRouterProvider {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
-        let mut messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
-        if self.prompt_cache && supports_explicit_prompt_cache(&opts.model) {
-            apply_prompt_cache(&mut messages);
-        }
-        let tools = tools_to_wire(&ctx.tools);
-
-        // No `stream_options`: OpenRouter deprecated `include_usage` (usage
-        // is now always included in the final SSE chunk automatically).
-        let mut body = json!({
-            "model": opts.model,
-            "messages": messages,
-            "max_tokens": resolve_max_output(opts.max_tokens, None, None),
-            "stream": true,
-        });
-
-        if let Some(t) = opts.temperature {
-            body["temperature"] = json!(t);
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = self.request_body(ctx, opts, true);
         self.request_trace.capture(&body).await;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -276,6 +298,7 @@ impl LlmProvider for OpenRouterProvider {
             return None;
         }
         let body: Value = resp.json().await.ok()?;
+        self.remember_catalog(&body);
         context_length_from_models(&body, model)
     }
 }
@@ -294,6 +317,8 @@ struct PartialToolCall {
 #[derive(Default)]
 struct StreamState {
     text: String,
+    thinking: String,
+    reasoning_details: Vec<Value>,
     tool_calls: Vec<PartialToolCall>,
     finish_reason: Option<String>,
     usage: Value,
@@ -317,6 +342,17 @@ impl StreamState {
         }
 
         let delta = &choice["delta"];
+        if let Some(piece) = delta["reasoning"].as_str() {
+            if !piece.is_empty() {
+                self.thinking.push_str(piece);
+                events.push(StreamEvent::ThinkingDelta(piece.to_string()));
+            }
+        }
+        if let Some(details) = delta["reasoning_details"].as_array() {
+            for fragment in details {
+                merge_reasoning_detail(&mut self.reasoning_details, fragment);
+            }
+        }
         if let Some(piece) = delta["content"].as_str() {
             if !piece.is_empty() {
                 self.text.push_str(piece);
@@ -347,7 +383,7 @@ impl StreamState {
     }
 
     fn finish(self) -> LlmResponse {
-        let mut content = Vec::new();
+        let mut content = reasoning_blocks(&self.thinking, self.reasoning_details);
         if !self.text.is_empty() {
             content.push(ContentBlock::Text(self.text));
         }
@@ -455,6 +491,7 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
             Role::Assistant => {
                 let mut text_parts: Vec<&str> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut reasoning_details: Vec<Value> = Vec::new();
 
                 for block in &msg.content {
                     match block {
@@ -470,7 +507,15 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                                 }
                             }));
                         }
-                        // Thinking/provider state are provider-specific; skip.
+                        ContentBlock::ProviderState { provider, data }
+                            if provider == PROVIDER_STATE =>
+                        {
+                            if let Some(details) = data.as_array() {
+                                reasoning_details.extend(details.iter().cloned());
+                            }
+                        }
+                        // Display-only thinking and other providers' state are
+                        // never replayed; `reasoning_details` carries continuity.
                         ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => {}
                         // Images are only valid in user prompts.
                         ContentBlock::Image { .. } => {}
@@ -488,6 +533,9 @@ pub(crate) fn messages_to_wire(system: Option<&str>, messages: &[Message]) -> Ve
                 let mut obj = json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {
                     obj["tool_calls"] = json!(tool_calls);
+                }
+                if !reasoning_details.is_empty() {
+                    obj["reasoning_details"] = json!(reasoning_details);
                 }
                 wire.push(obj);
             }
@@ -552,6 +600,66 @@ pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
         .collect()
 }
 
+/// OpenRouter's unified `reasoning` request object. Level names match
+/// OpenRouter's effort vocabulary one-to-one; OpenRouter normalizes them per
+/// upstream (Anthropic budgets, OpenAI effort, Gemini thinkingLevel).
+fn reasoning_param(level: &ThinkingLevel) -> Value {
+    match level {
+        ThinkingLevel::Off => json!({"enabled": false}),
+        level => json!({"effort": level.as_str()}),
+    }
+}
+
+/// Fold one streamed `reasoning_details` fragment into the accumulated list.
+/// Fragments sharing an `index` are one detail: string payloads concatenate
+/// and the remaining fields (signature, id, format, type) take the latest
+/// non-null value.
+fn merge_reasoning_detail(details: &mut Vec<Value>, fragment: &Value) {
+    let Some(fields) = fragment.as_object() else {
+        return;
+    };
+    let index = fragment.get("index").and_then(Value::as_u64);
+    let existing = index.and_then(|index| {
+        details
+            .iter_mut()
+            .find(|detail| detail.get("index").and_then(Value::as_u64) == Some(index))
+    });
+    let Some(Value::Object(target)) = existing else {
+        details.push(fragment.clone());
+        return;
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            (_, Value::Null) => {}
+            ("text" | "summary" | "data", Value::String(piece)) => match target.get_mut(key) {
+                Some(Value::String(accumulated)) => accumulated.push_str(piece),
+                _ => {
+                    target.insert(key.clone(), value.clone());
+                }
+            },
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Display text first, then the opaque replay state, matching the order the
+/// provider produced them.
+fn reasoning_blocks(thinking: &str, details: Vec<Value>) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if !thinking.is_empty() {
+        blocks.push(ContentBlock::Thinking(thinking.to_string()));
+    }
+    if !details.is_empty() {
+        blocks.push(ContentBlock::ProviderState {
+            provider: PROVIDER_STATE.to_string(),
+            data: Value::Array(details),
+        });
+    }
+    blocks
+}
+
 /// Parse an OpenRouter (OpenAI-format) response body into our neutral types.
 pub(crate) fn parse_response(body: &Value) -> LlmResponse {
     let choice = &body["choices"][0];
@@ -561,7 +669,13 @@ pub(crate) fn parse_response(body: &Value) -> LlmResponse {
     let usage = parse_usage(&body["usage"]);
     let message = &choice["message"];
 
-    let mut content: Vec<ContentBlock> = Vec::new();
+    let mut content = reasoning_blocks(
+        message["reasoning"].as_str().unwrap_or_default(),
+        message["reasoning_details"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    );
 
     if let Some(text) = message["content"].as_str() {
         if !text.is_empty() {
@@ -661,6 +775,23 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
 /// vLLM exposes `max_model_len` on the same list endpoint, so fall back to
 /// that. `None` when the model id isn't listed, both fields are absent, or
 /// the value is zero.
+/// Per-model output ceilings (`top_provider.max_completion_tokens`) from an
+/// OpenRouter `GET /models` body. Models without a positive value are omitted.
+fn max_output_from_models(body: &Value) -> HashMap<String, u32> {
+    body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["id"].as_str()?;
+            let limit = model["top_provider"]["max_completion_tokens"]
+                .as_u64()
+                .filter(|&n| n > 0)?;
+            Some((id.to_string(), u32::try_from(limit).unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
 pub(crate) fn context_length_from_models(body: &Value, model: &str) -> Option<u64> {
     let entry = body["data"]
         .as_array()?
@@ -1665,5 +1796,193 @@ mod tests {
         let resp = state.finish();
         assert_eq!(resp.usage.prompt_tokens(), 42);
         assert_eq!(resp.usage.output, 7);
+    }
+
+    // --- reasoning (vikunja #1527) ---
+
+    fn reasoning_ctx() -> Context {
+        Context {
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            stable_prefix_len: 0,
+        }
+    }
+
+    fn reasoning_opts(thinking: ThinkingLevel) -> CompleteOpts {
+        CompleteOpts {
+            model: "anthropic/claude-opus-4.8".into(),
+            thinking,
+            ..CompleteOpts::default()
+        }
+    }
+
+    #[test]
+    fn request_maps_every_thinking_level_to_openrouter_reasoning() {
+        let provider = OpenRouterProvider::new("k".into(), "http://unused".into()).unwrap();
+        let cases = [
+            (ThinkingLevel::Off, json!({"enabled": false})),
+            (ThinkingLevel::Minimal, json!({"effort": "minimal"})),
+            (ThinkingLevel::Low, json!({"effort": "low"})),
+            (ThinkingLevel::Medium, json!({"effort": "medium"})),
+            (ThinkingLevel::High, json!({"effort": "high"})),
+            (ThinkingLevel::XHigh, json!({"effort": "xhigh"})),
+            (ThinkingLevel::Max, json!({"effort": "max"})),
+        ];
+        for (level, expected) in cases {
+            let body = provider.request_body(&reasoning_ctx(), &reasoning_opts(level), true);
+            assert_eq!(body["reasoning"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_supplies_model_output_ceiling_for_requests() {
+        let catalog = json!({"data": [
+            {"id": "anthropic/claude-opus-4.8", "created": 2, "context_length": 1_000_000,
+             "top_provider": {"max_completion_tokens": 128_000}},
+            {"id": "no/limit", "created": 1, "top_provider": {}}
+        ]});
+        let (base_url, _) =
+            mock_http_server("200 OK", "application/json", catalog.to_string()).await;
+        let provider = OpenRouterProvider::new("k".into(), base_url).unwrap();
+        let before = provider.request_body(
+            &reasoning_ctx(),
+            &reasoning_opts(ThinkingLevel::High),
+            false,
+        );
+        assert_eq!(before["max_tokens"], crate::providers::DEFAULT_MAX_TOKENS);
+
+        assert!(provider.list_models().await.is_some());
+        let after = provider.request_body(
+            &reasoning_ctx(),
+            &reasoning_opts(ThinkingLevel::High),
+            false,
+        );
+        assert_eq!(after["max_tokens"], 128_000);
+        assert_eq!(
+            max_output_from_models(&catalog).get("no/limit"),
+            None,
+            "models without a ceiling keep the generic default"
+        );
+    }
+
+    #[test]
+    fn parse_response_keeps_reasoning_text_and_replay_state() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning": "thought",
+                    "reasoning_details": [{
+                        "type": "reasoning.text", "text": "thought",
+                        "signature": "sig", "format": "anthropic-claude-v1", "index": 0
+                    }],
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "calc", "arguments": "{}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let resp = parse_response(&body);
+        assert!(matches!(&resp.content[0], ContentBlock::Thinking(t) if t == "thought"));
+        match &resp.content[1] {
+            ContentBlock::ProviderState { provider, data } => {
+                assert_eq!(provider, PROVIDER_STATE);
+                assert_eq!(data[0]["signature"], "sig");
+            }
+            other => panic!("expected provider state, got {other:?}"),
+        }
+        assert!(matches!(&resp.content[2], ContentBlock::Text(t) if t == "answer"));
+        assert!(matches!(&resp.content[3], ContentBlock::ToolCall { id, .. } if id == "c1"));
+    }
+
+    #[test]
+    fn stream_merges_reasoning_fragments_and_emits_thinking_deltas() {
+        // Shape observed from OpenRouter + anthropic/claude-opus-4.8: text
+        // fragments share index 0 and the signature arrives alone, last.
+        let detail = |fields: Value| {
+            let mut detail =
+                json!({"type": "reasoning.text", "format": "anthropic-claude-v1", "index": 0});
+            detail
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            json!({"choices": [{"delta": {"reasoning_details": [detail]}}]})
+        };
+        let mut state = StreamState::default();
+        let mut events = Vec::new();
+        events.extend(state.on_chunk(&json!({"choices": [{"delta": {"reasoning": "Let "}}]})));
+        events.extend(state.on_chunk(&detail(json!({"text": "Let "}))));
+        events.extend(state.on_chunk(&json!({"choices": [{"delta": {"reasoning": "me"}}]})));
+        events.extend(state.on_chunk(&detail(json!({"text": "me", "signature": null}))));
+        events.extend(state.on_chunk(&detail(json!({"signature": "sig"}))));
+        events.extend(state.on_chunk(
+            &json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+        ));
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ThinkingDelta("Let ".into()),
+                StreamEvent::ThinkingDelta("me".into()),
+                StreamEvent::TextDelta("done".into()),
+            ]
+        );
+        let resp = state.finish();
+        assert!(matches!(&resp.content[0], ContentBlock::Thinking(t) if t == "Let me"));
+        match &resp.content[1] {
+            ContentBlock::ProviderState { data, .. } => assert_eq!(
+                data,
+                &json!([{"type": "reasoning.text", "format": "anthropic-claude-v1",
+                         "index": 0, "text": "Let me", "signature": "sig"}])
+            ),
+            other => panic!("expected provider state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_keeps_distinct_reasoning_detail_indices_separate() {
+        let mut details = Vec::new();
+        merge_reasoning_detail(
+            &mut details,
+            &json!({"type": "reasoning.summary", "summary": "a", "index": 0}),
+        );
+        merge_reasoning_detail(
+            &mut details,
+            &json!({"type": "reasoning.encrypted", "data": "x", "index": 1}),
+        );
+        merge_reasoning_detail(&mut details, &json!({"data": "y", "index": 1}));
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0]["summary"], "a");
+        assert_eq!(details[1]["data"], "xy");
+    }
+
+    #[test]
+    fn wire_replays_only_openrouter_reasoning_details() {
+        let details =
+            json!([{"type": "reasoning.text", "text": "t", "signature": "sig", "index": 0}]);
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking("t".into()),
+                ContentBlock::ProviderState {
+                    provider: PROVIDER_STATE.into(),
+                    data: details.clone(),
+                },
+                ContentBlock::ProviderState {
+                    provider: "openai".into(),
+                    data: json!({"type": "reasoning", "encrypted_content": "opaque"}),
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "calc".into(),
+                    input: json!({}),
+                },
+            ],
+        }];
+        let wire = messages_to_wire(None, &msgs);
+        assert_eq!(wire[0]["reasoning_details"], details);
+        assert!(!wire[0].to_string().contains("opaque"));
     }
 }
