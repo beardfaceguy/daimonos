@@ -147,6 +147,11 @@ impl LlmProvider for MultiProvider {
         adapter.context_window(slug).await
     }
 
+    async fn thinking_levels(&self, model: &str) -> Option<Vec<super::ThinkingLevel>> {
+        let (adapter, slug) = self.route(model).await;
+        adapter.thinking_levels(slug).await
+    }
+
     /// Merged catalog in adapter order (primary's models first), deduped
     /// first-wins — the same precedence the routing table uses. `None` only
     /// when every adapter's catalog is unavailable.
@@ -205,6 +210,14 @@ mod tests {
         async fn context_window(&self, model: &str) -> Option<u64> {
             // Encode which adapter answered so tests can assert delegation.
             Some(1000 + self.label.len() as u64 + model.len() as u64)
+        }
+
+        async fn thinking_levels(
+            &self,
+            model: &str,
+        ) -> Option<Vec<crate::providers::ThinkingLevel>> {
+            (self.label == "openai" && model == "gpt-5")
+                .then(|| vec![crate::providers::ThinkingLevel::Low])
         }
     }
 
@@ -339,6 +352,16 @@ mod tests {
             router.list_models().await,
             Some(vec!["claude-opus-5".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn thinking_levels_delegate_with_the_stripped_slug() {
+        let (router, _) = probes();
+        assert_eq!(
+            router.thinking_levels("openai:gpt-5").await,
+            Some(vec![crate::providers::ThinkingLevel::Low])
+        );
+        assert_eq!(router.thinking_levels("claude-opus-5").await, None);
     }
 
     #[tokio::test]

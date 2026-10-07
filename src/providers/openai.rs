@@ -222,6 +222,16 @@ impl LlmProvider for OpenAiProvider {
     async fn context_window(&self, model: &str) -> Option<u64> {
         known_context_window(model)
     }
+
+    async fn thinking_levels(&self, _model: &str) -> Option<Vec<ThinkingLevel>> {
+        // Max is sent as xhigh (see `reasoning_effort`), so it is not distinct.
+        Some(
+            ThinkingLevel::ALL
+                .into_iter()
+                .filter(|level| *level != ThinkingLevel::Max)
+                .collect(),
+        )
+    }
 }
 
 fn is_gpt_56_sol(model: &str) -> bool {
@@ -1190,6 +1200,22 @@ mod tests {
     #[test]
     fn max_thinking_maps_to_compatible_xhigh() {
         assert_eq!(reasoning_effort(&ThinkingLevel::Max), "xhigh");
+    }
+
+    #[tokio::test]
+    async fn thinking_levels_omit_max_because_it_collapses_into_xhigh() {
+        let provider = OpenAiProvider::new("k".into(), String::new()).unwrap();
+        let levels = provider.thinking_levels("gpt-5.6-sol").await.unwrap();
+        assert!(!levels.contains(&ThinkingLevel::Max));
+        let efforts: Vec<&str> = levels.iter().map(reasoning_effort).collect();
+        let mut distinct = efforts.clone();
+        distinct.dedup();
+        assert_eq!(
+            efforts, distinct,
+            "every offered level must be sent distinctly"
+        );
+        assert_eq!(levels.first(), Some(&ThinkingLevel::Off));
+        assert_eq!(levels.last(), Some(&ThinkingLevel::XHigh));
     }
 
     #[test]

@@ -168,6 +168,25 @@ Selecting a model in the dropdown applies to the next message you send.
 If `DAIMONOS_AGENT_MODELS` is unset, the dropdown just shows the single
 active model.
 
+## Thinking selector
+
+Next to the model dropdown, Zed shows a Thinking dropdown when the provider
+sends distinct reasoning levels for the selected model. It lists only those
+levels:
+
+- **OpenRouter** uses the model catalog's `reasoning.supported_efforts`.
+  `off` is listed unless the catalog marks reasoning as mandatory.
+- **Native OpenAI** lists `off` through `xhigh`. `max` is omitted because it
+  is sent as `xhigh`.
+- **Native Anthropic** shows no dropdown, because it sends the same adaptive
+  thinking for every level above `off`.
+
+The session starts at `DAIMONOS_AGENT_THINKING` (default `medium`). If the
+model does not offer that level, the dropdown snaps to the nearest offered
+level, and ties go to the lower one. A selection applies to the next
+message, is stored with the session, and is restored by `session/load`.
+Switching models re-checks the level against the new model's list.
+
 ## Context compaction (required config)
 
 Long conversations eventually exceed the model's context window. daimonos

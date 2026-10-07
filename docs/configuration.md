@@ -169,6 +169,16 @@ provider (pick `xhigh` unless you specifically want `max` to mean the
 maximum on a provider that exposes a distinct level). Provider defaults and
 the Anthropic adaptive thinking behavior are unchanged by this key.
 
+On OpenRouter the level is sent as the unified `reasoning` object:
+`reasoning.effort` with the same level name, or `reasoning.enabled=false`
+for `off`. OpenRouter turns the effort into each upstream's native control.
+For Anthropic models that is a reasoning budget carved out of `max_tokens`,
+so OpenRouter requests default `max_tokens` to the model's catalog output
+ceiling. Reasoning tokens are billed as output.
+
+In `daimonos acp` this key is only the starting level. Zed's Thinking
+dropdown changes it per session (see `docs/zed-acp-setup.md`).
+
 ### Provider prompt caching (`DAIMONOS_AGENT_PROMPT_CACHE`)
 
 Optional and default-off. Set `DAIMONOS_AGENT_PROMPT_CACHE=on` to enable an
