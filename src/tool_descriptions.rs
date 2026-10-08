@@ -11,7 +11,7 @@ pub const DEFAULT_TEXT: &str = include_str!("../prompts/tool_descriptions.toml")
 /// deletion fails parity tests. Future intentional additions/removals update
 /// this single value.
 #[cfg(test)]
-pub(crate) const DEFAULT_PARAMETER_DESCRIPTION_COUNT: usize = 139;
+pub(crate) const DEFAULT_PARAMETER_DESCRIPTION_COUNT: usize = 140;
 #[cfg(test)]
 pub(crate) const AGENT_ONLY_PARAMETER_DESCRIPTION_COUNT: usize = 2;
 #[cfg(test)]

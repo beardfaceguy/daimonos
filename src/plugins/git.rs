@@ -14,7 +14,7 @@ impl GitPlugin {
     pub fn new() -> Self {
         let mut commands = HashMap::new();
         for name in [
-            "status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout",
+            "status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout", "raw",
         ] {
             commands.insert(
                 name.to_string(),
@@ -70,13 +70,21 @@ impl ToolPlugin for GitPlugin {
             "push" => git_push(&runner, args).await?,
             "pull" => git_pull(&runner, args).await?,
             "checkout" => git_checkout(&runner, args).await?,
+            "raw" => git_raw(&runner, args).await?,
             _ => return Err(format!("unknown git command: {command}")),
         };
 
+        // Structured commands return Err on a non-zero exit, so only `raw`
+        // can reach here with a failing exit code.
+        let exit_code = output
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .filter(|_| command == "raw")
+            .unwrap_or(0) as i32;
         Ok(ToolResult {
             tool: "git".into(),
             command: command.into(),
-            exit_code: 0,
+            exit_code,
             output,
             stderr: String::new(),
         })
@@ -94,6 +102,10 @@ impl GitRun<'_> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let mut env = self.env.clone();
         env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        // No terminal to edit in: accept default merge/commit/rebase messages
+        // and todo lists instead of hanging on an editor.
+        env.insert("GIT_EDITOR".into(), "true".into());
+        env.insert("GIT_SEQUENCE_EDITOR".into(), "true".into());
         crate::managed_process::run("git", &args, self.cwd, &env, self.process_cfg, None)
             .await
             .map_err(|e| format!("git exec: {e}"))
@@ -112,6 +124,60 @@ impl GitRun<'_> {
         }
         Ok(output.stdout)
     }
+}
+
+// --- raw passthrough: any git subcommand, present or future ---
+
+/// The git argv for `raw` from the `args` string array. It must start with a
+/// subcommand: global options such as `-c` are refused so `raw` cannot
+/// reconfigure git (e.g. `core.sshCommand`) for the invocation.
+fn raw_argv(args: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+    let arr = args
+        .and_then(|a| a.get("args"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            "raw requires 'args' (array of strings), e.g. [\"merge\",\"--no-ff\",\"topic\"]"
+                .to_string()
+        })?;
+    let argv = arr
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("raw args[{i}] must be a string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match argv.first() {
+        None => Err("raw 'args' must not be empty".to_string()),
+        Some(first) if first.starts_with('-') => Err(format!(
+            "raw args[0] must be a git subcommand, not the global option '{first}'"
+        )),
+        Some(_) => Ok(argv),
+    }
+}
+
+/// Run an arbitrary git subcommand, surfacing exit code, stdout, and stderr
+/// rather than erroring on a non-zero exit (the caller chose the command).
+async fn git_raw(
+    runner: &GitRun<'_>,
+    args: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let argv = raw_argv(args)?;
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let output = runner.output(&argv).await?;
+    let max = runner.process_cfg.exec_output_max_chars;
+    let (stdout, stdout_truncated) = super::gh::cap_str(output.stdout.trim_end(), max);
+    let (stderr, stderr_truncated) = super::gh::cap_str(output.stderr.trim(), max);
+    Ok(json!({
+        "exit_code": output.status.code().unwrap_or(-1),
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": output.stdout_truncated
+            || output.stderr_truncated
+            || stdout_truncated
+            || stderr_truncated,
+    }))
 }
 
 async fn git_status(runner: &GitRun<'_>) -> Result<serde_json::Value, String> {
@@ -1163,6 +1229,127 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("output exceeded"));
+    }
+
+    // --- raw passthrough (vikunja #1538) ---
+
+    async fn committed_repo(dir: &Path) {
+        setup_git_repo(dir).await;
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn raw(dir: &Path, argv: serde_json::Value) -> Result<ToolResult, String> {
+        GitPlugin::new()
+            .run_command(
+                "raw",
+                dir,
+                &HashMap::new(),
+                None,
+                Some(&json!({"args": argv})),
+            )
+            .await
+    }
+
+    #[test]
+    fn raw_argv_rejects_missing_empty_non_string_or_global_options() {
+        assert!(raw_argv(None).is_err());
+        assert!(raw_argv(Some(&json!({}))).is_err());
+        assert!(raw_argv(Some(&json!({"args": []}))).is_err());
+        assert!(raw_argv(Some(&json!({"args": ["tag", 3]}))).is_err());
+        assert!(
+            raw_argv(Some(&json!({"args": ["-c", "core.pager=x", "log"]}))).is_err(),
+            "argv must start with a subcommand, not a global option"
+        );
+        assert_eq!(
+            raw_argv(Some(
+                &json!({"args": ["merge", "--no-ff", "-m", "msg", "topic"]})
+            ))
+            .unwrap(),
+            vec!["merge", "--no-ff", "-m", "msg", "topic"]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_runs_subcommands_without_a_structured_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let tagged = raw(dir.path(), json!(["tag", "v1"])).await.unwrap();
+        assert_eq!(tagged.command, "raw");
+        assert_eq!(tagged.exit_code, 0);
+        let listed = raw(dir.path(), json!(["tag", "--list"])).await.unwrap();
+        assert_eq!(listed.output["stdout"], "v1");
+
+        raw(dir.path(), json!(["switch", "-c", "topic"]))
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("g.txt"), "y").unwrap();
+        raw(dir.path(), json!(["add", "g.txt"])).await.unwrap();
+        raw(dir.path(), json!(["commit", "-m", "topic work"]))
+            .await
+            .unwrap();
+        raw(dir.path(), json!(["switch", "main"])).await.unwrap();
+        // No -m: the default merge message must be accepted, not left waiting
+        // on an editor.
+        let merged = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            raw(dir.path(), json!(["merge", "--no-ff", "topic"])),
+        )
+        .await
+        .expect("merge must not block on an editor")
+        .unwrap();
+        assert_eq!(merged.exit_code, 0, "{}", merged.output);
+        assert!(dir.path().join("g.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn raw_surfaces_nonzero_exit_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let result = raw(dir.path(), json!(["merge", "no-such-branch"]))
+            .await
+            .unwrap();
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.output["exit_code"], result.exit_code);
+        assert!(!result.output["stderr"].as_str().unwrap().is_empty());
+        assert_eq!(result.output["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn raw_caps_output_at_exec_output_max_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let cfg = crate::config::ProcessConfig {
+            exec_output_max_chars: 4,
+            ..crate::config::ProcessConfig::default()
+        };
+        let result = GitPlugin::new()
+            .run_command_with_config(
+                "raw",
+                dir.path(),
+                &HashMap::new(),
+                None,
+                Some(&json!({"args": ["log", "--format=%s%n%s%n%s"]})),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["truncated"], true);
+        let stdout = result.output["stdout"].as_str().unwrap();
+        assert!(stdout.starts_with("init"), "{stdout}");
+        assert!(stdout.contains("[truncated"), "{stdout}");
+    }
+
+    #[test]
+    fn descriptor_lists_raw() {
+        assert!(GitPlugin::new().descriptor().commands.contains_key("raw"));
     }
 
     #[tokio::test]

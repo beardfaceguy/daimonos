@@ -351,7 +351,7 @@ const MAX_GH_OUTPUT: usize = 100_000;
 
 /// Truncate `s` to at most `max` bytes on a char boundary. Returns the possibly
 /// truncated string and whether truncation happened; appends a marker when cut.
-fn cap_str(s: &str, max: usize) -> (String, bool) {
+pub(super) fn cap_str(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
     }
