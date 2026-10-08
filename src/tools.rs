@@ -701,7 +701,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "enum": ["status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout"]},
+                    "command": {"type": "string", "enum": ["status", "log", "diff", "branch", "add", "commit", "push", "pull", "checkout", "raw"]},
+                    "args": {"type": "array", "items": {"type": "string"}},
                     "message": {"type": "string"},
                     "all": {"type": "boolean"},
                     "limit": {"type": "integer"},

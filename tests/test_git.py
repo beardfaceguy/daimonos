@@ -254,3 +254,33 @@ def test_tools_list_hides_extended(daimonos):
     assert "diff_files" not in tool_names
     assert "tool_pipeline" not in tool_names
     assert "tool_repair" not in tool_names
+
+
+def test_git_raw_runs_any_subcommand(daimonos):
+    ws = daimonos.workspace
+    _init_repo(ws)
+    with open(os.path.join(ws, "file.txt"), "w") as f:
+        f.write("v1")
+    _git(ws, "add", ".")
+    _git(ws, "commit", "-m", "init")
+    with open(os.path.join(ws, "file.txt"), "w") as f:
+        f.write("dirty")
+
+    stashed = _parse(daimonos.call_tool("git", {"command": "raw", "args": ["stash", "push", "-m", "wip"]}))
+    assert stashed["exit_code"] == 0, stashed
+    assert open(os.path.join(ws, "file.txt")).read() == "v1"
+
+    listed = _parse(daimonos.call_tool("git", {"command": "raw", "args": ["stash", "list"]}))
+    assert "wip" in listed["stdout"]
+
+
+def test_git_raw_reports_failing_exit_and_rejects_global_options(daimonos):
+    ws = daimonos.workspace
+    _init_repo(ws)
+
+    failed = _parse(daimonos.call_tool("git", {"command": "raw", "args": ["merge", "nope"]}))
+    assert failed["exit_code"] != 0
+    assert failed["stderr"]
+
+    refused = daimonos.call_tool("git", {"command": "raw", "args": ["-c", "core.pager=cat", "log"]})
+    assert refused.get("isError") is True

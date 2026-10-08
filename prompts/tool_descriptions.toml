@@ -198,10 +198,11 @@ limit = "Max reservations to return (most-recent first)."
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 
 [git]
-full = """Git operations. Commands: status, log, diff, branch, add, commit, push, pull, checkout. All args besides 'command' are passed through."""
-terse = """Git: status, log, diff, branch, add, commit, push, pull, checkout."""
+full = """Git operations. Structured commands: status, log, diff, branch, add, commit, push, pull, checkout. Any other git subcommand (merge, rebase, stash, fetch, tag, reset, cherry-pick, show, ...): command=raw with args=[subcommand, ...]; returns exit_code/stdout/stderr."""
+terse = """Git: status, log, diff, branch, add, commit, push, pull, checkout; raw for any other subcommand (args=[subcommand, ...])."""
 
 [git.parameters]
+args = "raw: git argv after 'git', e.g. [\"merge\", \"--no-ff\", \"topic\"]"
 message = "commit: message"
 all = "commit: auto-stage (-a)"
 limit = "log: max commits (default 10)"
