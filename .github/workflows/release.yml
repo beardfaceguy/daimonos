@@ -40,7 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # Must match rust-toolchain.toml: cargo builds with the pinned toolchain,
+      # so targets installed on any other toolchain are invisible to it.
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         with:
           targets: ${{ matrix.target }}
 
