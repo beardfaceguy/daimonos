@@ -228,3 +228,127 @@ def test_idle_timeout_does_not_fire_during_active_use(daimonos_binary, tmp_path)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A zombie still answers kill(0); it holds no resources and is not running.
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ", 1)[1][0] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.parametrize("ending", ["client_exit", "SIGTERM", "SIGINT", "SIGHUP"])
+def test_client_disconnect_or_signal_retires_running_children(
+    daimonos_binary, tmp_path, ending
+):
+    """Closing a chat mid-command must not leave the command running (#1544).
+
+    Clients end MCP servers by exiting (both pipes close) or by signaling
+    them. Before the fix, a departed client left the server alive until the
+    command finished (the idle watchdog never fires while a call is in
+    flight), and a signal killed the server on the default handler, orphaning
+    the command's process group. The grandchild here proves the whole group
+    is retired, not just the direct child.
+    """
+    import signal
+
+    pid_file = tmp_path / "child.pid"
+    proc = _spawn(daimonos_binary, str(tmp_path), idle_secs=0)
+    grandchild = None
+    try:
+        _handshake(proc)
+        proc.stdin.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 300,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "command": "sh",
+                                "args": ["-c", f"sleep 300 & echo $! > {pid_file}; wait"],
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        proc.stdin.flush()
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() or not pid_file.read_text().strip():
+            assert time.monotonic() < deadline, "exec never started its child"
+            time.sleep(0.05)
+        grandchild = int(pid_file.read_text().strip())
+        assert _pid_alive(grandchild)
+
+        if ending == "client_exit":
+            proc.stdin.close()
+            proc.stdout.close()
+        else:
+            proc.send_signal(getattr(signal, ending))
+
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"daimonos --mcp still running 10s after {ending} with a call in flight")
+
+        deadline = time.monotonic() + 5
+        while _pid_alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(grandchild), (
+            f"the in-flight command's process group survived {ending}; "
+            "children must be retired when the client goes away"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if grandchild is not None and _pid_alive(grandchild):
+            os.kill(grandchild, 9)
+
+
+def test_closing_only_stdin_still_answers_the_in_flight_call(daimonos_binary, tmp_path):
+    """`echo request | daimonos --mcp` closes stdin but still reads the reply.
+
+    Only a departed reader is a disconnect (#1544); half-close must keep the
+    in-flight call running to completion and deliver its response.
+    """
+    proc = _spawn(daimonos_binary, str(tmp_path), idle_secs=0)
+    try:
+        _handshake(proc)
+        proc.stdin.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 400,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {"command": "sh", "args": ["-c", "sleep 1; echo finished"]},
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        proc.stdin.flush()
+        proc.stdin.close()
+        line = proc.stdout.readline()
+        assert line, "server exited without answering the in-flight call"
+        resp = json.loads(line)
+        assert resp.get("id") == 400 and "finished" in json.dumps(resp), resp
+        assert proc.wait(timeout=10) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

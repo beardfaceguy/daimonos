@@ -320,6 +320,10 @@ retention_days = 90
 # editor worker still holds the write-end). Set to 0 to disable.
 # Override at startup with the DAIMONOS_IDLE_TIMEOUT_SECS env var.
 idle_timeout_secs = 600
+# How often (ms) to check whether the client stopped reading stdout (it exited
+# or closed the pipe). Running commands are then retired rather than left to
+# finish for nobody. Closing only stdin is not a disconnect. 0 disables.
+client_gone_poll_ms = 250
 # When false (default), MCP mode avoids benign stderr lines during startup and
 # idle shutdown so Cursor does not surface them as `[error]` (Cursor treats all
 # MCP subprocess stderr as errors). Use `--verbose`, export DAIMONOS_LOG_STARTUP=1,

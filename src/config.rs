@@ -1295,6 +1295,11 @@ pub struct McpConfig {
     /// Set to 0 to disable. Overridable at startup via the
     /// `DAIMONOS_IDLE_TIMEOUT_SECS` environment variable (used by tests).
     pub idle_timeout_secs: u64,
+    /// How often the stdio server checks whether the client stopped reading
+    /// stdout (it exited or closed the pipe). When it has, running commands
+    /// are retired instead of finishing for nobody. Closing only stdin is not
+    /// a disconnect: the client may still be waiting for replies. 0 disables.
+    pub client_gone_poll_ms: u64,
     /// When `false` (default), `--mcp` mode avoids informational messages on
     /// stderr during startup and idle shutdown. Cursor (and some other MCP
     /// hosts) classify subprocess stderr as `[error]` in the UI even when the
@@ -1346,6 +1351,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 600,
+            client_gone_poll_ms: 250,
             startup_logs: false,
             full_tool_schemas: false,
             default_verbosity: Verbosity::Full,

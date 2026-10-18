@@ -1586,6 +1586,33 @@ fn spawn_idle_watchdog(
     });
 }
 
+/// Whether the reading side of `fd` is gone: a pipe reports POLLERR and a
+/// socket POLLHUP once the peer closes. A tty or file never reports either.
+fn reader_gone(fd: std::os::fd::RawFd) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout (never blocks).
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+}
+
+/// Resolves once nobody reads our stdout, i.e. the client exited or closed
+/// the pipe. Closing only stdin is not a disconnect, so stdin is not watched.
+async fn client_gone(poll: Duration) {
+    if poll.is_zero() {
+        return std::future::pending().await;
+    }
+    loop {
+        tokio::time::sleep(poll).await;
+        if reader_gone(libc::STDOUT_FILENO) {
+            return;
+        }
+    }
+}
+
 pub async fn run_mcp_server(
     workspace: PathBuf,
     cfg: Arc<Config>,
@@ -1652,12 +1679,47 @@ pub async fn run_mcp_server(
         );
     }
 
-    let result = server
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("mcp server: {e}"));
+    let (grace, drain_timeout, client_poll) = {
+        let session = session_handle.lock().await;
+        (
+            Duration::from_millis(session.cfg.process.termination_grace_ms),
+            Duration::from_secs(session.cfg.session.shutdown_grace_secs),
+            Duration::from_millis(session.cfg.mcp.client_gone_poll_ms),
+        )
+    };
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    // `start` returns on stdin EOF only after every in-flight call finishes,
+    // so a departed client must be detected separately (#1544).
+    let ended_by = tokio::select! {
+        result = server.start() => Ok(result.map_err(|e| anyhow::anyhow!("mcp server: {e}"))),
+        _ = client_gone(client_poll) => Err("client_gone"),
+        _ = tokio::signal::ctrl_c() => Err("SIGINT"),
+        _ = terminate.recv() => Err("SIGTERM"),
+        _ = hangup.recv() => Err("SIGHUP"),
+    };
+
+    // An in-flight call may still hold the session lock while its command
+    // runs, so retire child process groups first; the call then completes
+    // and the session can shut down its background jobs.
+    crate::managed_process::terminate_all(grace).await;
     session_handle.lock().await.shutdown_processes().await;
-    result
+    match ended_by {
+        Ok(result) => result,
+        Err(reason) => {
+            tracing::warn!(
+                event = "client_shutdown",
+                reason,
+                "MCP server shutting down"
+            );
+            if let Some(analytics) = analytics.as_ref() {
+                analytics.wait_until_quiet(drain_timeout).await;
+            }
+            // Returning would wait on the runtime's blocking stdin reader,
+            // which never finishes while the client holds the pipe open.
+            std::process::exit(0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,6 +1943,25 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_gone_detects_a_closed_pipe_reader_only() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills two descriptors we own and close below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_end, write_end) = (fds[0], fds[1]);
+        assert!(
+            !reader_gone(write_end),
+            "an open reader is not a disconnect"
+        );
+        // SAFETY: closing descriptors created above.
+        unsafe { libc::close(read_end) };
+        assert!(
+            reader_gone(write_end),
+            "a closed reader means the client is gone"
+        );
+        unsafe { libc::close(write_end) };
+    }
 
     /// `dispatch_tool_inner` calls `activate_tool` and records `used_tools` on
     /// entry, so `dispatch_local_tool` has to establish that a name belongs to

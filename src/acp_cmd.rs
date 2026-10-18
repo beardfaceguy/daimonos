@@ -3806,6 +3806,7 @@ pub async fn run_acp(
         anyhow::bail!("provider init: {e}");
     }
     tracing::info!(target: "daimonos::acp", event = "provider_validated");
+    let termination_grace = std::time::Duration::from_millis(cfg.process.termination_grace_ms);
     let mut state_out: Option<Arc<AcpState>> = None;
     let agent = build_agent_with_state(
         make_provider,
@@ -3866,14 +3867,21 @@ pub async fn run_acp(
     let connection = agent.connect_to(ByteStreams::new(stdout, stdin));
     tokio::pin!(connection);
     tokio::pin!(eof_wait);
-    let (result, input_error) = tokio::select! {
-        result = &mut connection => (Some(result), None),
-        input_error = &mut eof_wait => (None, input_error),
+    // A client that stops the engine by signal gets the same teardown as EOF;
+    // the default handlers would orphan running tool process groups (#1544).
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let (result, input_error, signal) = tokio::select! {
+        result = &mut connection => (Some(result), None, None),
+        input_error = &mut eof_wait => (None, input_error, None),
+        _ = tokio::signal::ctrl_c() => (None, None, Some("SIGINT")),
+        _ = terminate.recv() => (None, None, Some("SIGTERM")),
+        _ = hangup.recv() => (None, None, Some("SIGHUP")),
     };
     tracing::info!(
         target: "daimonos::acp",
         event = "acp_transport_stopped",
-        reason = if input_error.is_some() { "stdin_error" } else if result.is_some() { "connection_completed" } else { "stdin_eof" },
+        reason = if let Some(signal) = signal { signal } else if input_error.is_some() { "stdin_error" } else if result.is_some() { "connection_completed" } else { "stdin_eof" },
     );
     // stdin closed (or the connection errored): drain every live session's MCP
     // bridge so Zed-spawned stdio servers are reaped instead of leaking (D7/D8).
@@ -3882,6 +3890,7 @@ pub async fn run_acp(
         shutdown_all_bridges(&state).await;
         tracing::info!(target: "daimonos::acp", event = "session_shutdown_completed");
     }
+    crate::managed_process::terminate_all(termination_grace).await;
     if let Some(error) = input_error {
         anyhow::bail!("ACP stdin read failed: {error}");
     }

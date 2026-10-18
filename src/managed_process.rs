@@ -28,6 +28,56 @@ pub struct ManagedOutput {
     pub timed_out: bool,
 }
 
+/// Process groups of every live `ManagedChild`. Shutdown paths that cannot
+/// drop the owning futures (a signal handler, or an in-flight call holding
+/// the session lock) retire children through this. Entries leave when the
+/// group settles or its owner drops, so size tracks live children.
+#[cfg(unix)]
+static LIVE_GROUPS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn live_groups() -> std::sync::MutexGuard<'static, Vec<i32>> {
+    LIVE_GROUPS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(unix)]
+fn live_groups_snapshot() -> Vec<i32> {
+    live_groups().clone()
+}
+
+/// TERM, then after `grace` KILL, every live child process group. For process
+/// shutdown when the client is gone; owners observe the exit and settle.
+pub async fn terminate_all(grace: Duration) {
+    #[cfg(unix)]
+    terminate_groups(&live_groups_snapshot(), grace).await;
+    #[cfg(not(unix))]
+    let _ = grace;
+}
+
+#[cfg(unix)]
+async fn terminate_groups(groups: &[i32], grace: Duration) {
+    if groups.is_empty() {
+        return;
+    }
+    let signal = |sig: i32| {
+        for group in groups {
+            // SAFETY: negative pid addresses a group created by `spawn`.
+            unsafe { libc::kill(-group, sig) };
+        }
+    };
+    signal(term_signal());
+    let deadline = tokio::time::Instant::now() + grace;
+    while tokio::time::Instant::now() < deadline {
+        if !live_groups().iter().any(|group| groups.contains(group)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Leaders that exited on TERM may leave descendants behind; KILL is a
+    // no-op (ESRCH) for groups that are already empty.
+    signal(kill_signal());
+}
+
 /// A spawned child whose Unix process group remains owned until settlement.
 pub struct ManagedChild {
     child: Child,
@@ -44,6 +94,10 @@ impl ManagedChild {
         let child = command.spawn()?;
         #[cfg(unix)]
         let process_group = child.id().and_then(|pid| i32::try_from(pid).ok());
+        #[cfg(unix)]
+        if let Some(group) = process_group {
+            live_groups().push(group);
+        }
         Ok(Self {
             child,
             #[cfg(unix)]
@@ -127,8 +181,9 @@ impl ManagedChild {
     fn finish_group(&mut self) {
         #[cfg(unix)]
         {
-            if self.process_group.is_some() {
+            if let Some(group) = self.process_group {
                 let _ = self.signal_group(kill_signal());
+                live_groups().retain(|live| *live != group);
                 self.process_group = None;
             }
         }
@@ -139,7 +194,7 @@ impl Drop for ManagedChild {
     fn drop(&mut self) {
         // Async cleanup must happen through `terminate`/`wait`. This emergency
         // path prevents a cancelled future from abandoning its process group.
-        let _ = self.signal_group(kill_signal());
+        self.finish_group();
     }
 }
 
@@ -704,5 +759,83 @@ mod tests {
         let rc = unsafe { libc::kill(-group, 0) };
         assert_eq!(rc, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_group_registry_tracks_spawn_settle_and_drop() {
+        let mut command = Command::new("true");
+        command.stdin(Stdio::null());
+        let mut settled = ManagedChild::spawn(&mut command).unwrap();
+        let settled_group = settled.process_group.unwrap();
+        assert!(live_groups_snapshot().contains(&settled_group));
+        settled.wait().await.unwrap();
+        assert!(!live_groups_snapshot().contains(&settled_group));
+
+        let mut command = Command::new("sleep");
+        command.arg("30").stdin(Stdio::null());
+        let dropped = ManagedChild::spawn(&mut command).unwrap();
+        let dropped_group = dropped.process_group.unwrap();
+        assert!(live_groups_snapshot().contains(&dropped_group));
+        drop(dropped);
+        assert!(!live_groups_snapshot().contains(&dropped_group));
+    }
+
+    /// The shutdown path cannot drop the futures that own a child (a signal
+    /// arrives, or an in-flight call holds the session lock). Signalling the
+    /// group must still retire every descendant and let the owner settle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_groups_retires_children_owned_by_another_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "trap '' TERM; sleep 30 & echo $! > {}; wait",
+                    pid_file.display()
+                ),
+            ])
+            .stdin(Stdio::null());
+        let mut child = ManagedChild::spawn(&mut command).unwrap();
+        let group = child.process_group.unwrap();
+        let owner = tokio::spawn(async move { child.wait().await });
+        while std::fs::read_to_string(&pid_file).map_or(true, |s| s.trim().is_empty()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        // The leader ignores TERM, so this also proves the KILL escalation.
+        terminate_groups(&[group], Duration::from_millis(200)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("owner must settle once its group is retired")
+            .unwrap()
+            .unwrap();
+        assert!(!live_groups_snapshot().contains(&group));
+        // A killed grandchild is reparented and may stay a zombie until its new
+        // parent reaps it (slow under some CI init processes). A zombie is not
+        // running, so only a live, non-zombie process counts as a survivor.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, rest)| !rest.starts_with('Z'))
+                })
+                .unwrap_or(false)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while running() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!running(), "grandchild survived group termination");
     }
 }
