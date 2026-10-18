@@ -259,3 +259,35 @@ def test_exec_plugin_redirect_preserves_raw_for_unknown(daimonos):
     assert content["exit"] == 0
     assert content.get("via") is None
     assert content["out"] == "via-test"
+
+
+def test_exec_argv_git_is_verbatim_plugin_passthrough(daimonos):
+    """`exec("git", [...])` keeps git's exact text but counts as a redirect (#1540).
+
+    Scripts parse exec stdout, so the argv form must never be swapped for the
+    plugin's structured JSON; it runs verbatim under the git plugin's
+    non-interactive environment and is attributed to the plugin.
+    """
+    import subprocess
+    import time
+
+    ws = daimonos.workspace
+    for args in (
+        ["init", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "T"],
+        ["config", "commit.gpgsign", "false"],
+        ["commit", "--allow-empty", "-m", "first line"],
+    ):
+        subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True)
+
+    def redirects():
+        time.sleep(0.3)
+        info = json.loads(daimonos.call_tool("workspace_info", {})["content"][0]["text"])
+        return info["analytics"]["redirects"]
+
+    before = redirects()
+    result = daimonos.call_tool("exec", {"command": "git", "args": ["log", "-1", "--format=%s"]})
+    content = json.loads(result["content"][0]["text"])
+    assert content == {"exit": 0, "out": "first line"}
+    assert redirects() == before + 1

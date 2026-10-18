@@ -438,23 +438,104 @@ pub async fn exec_with_progress(
         None => session.cwd.clone(),
     };
 
-    let env = merge_env(&session.env, op.kv.as_ref());
+    let mut env = merge_env(&session.env, op.kv.as_ref());
 
-    // Layer 1: try redirecting through a native plugin for structured output.
-    // Pass the merged env so per-call kv reaches the plugin too.
-    // Native plugins return only their completed structured result. ACP terminal
-    // streaming needs subprocess pipes, so observed foreground calls stay raw.
-    if on_progress.is_none() && session.cfg.process.exec_plugin_redirect && args.is_empty() {
+    let mut passthrough = false;
+    if session.cfg.process.exec_plugin_redirect {
         if let Some(registry) = &session.tool_registry {
-            if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
-                return resp;
+            // Layer 1a: structured redirect. Its JSON replaces the command's
+            // text, so only plain string commands take it: argv-form calls
+            // (scripts that parse stdout) and shell lines never do, and ACP
+            // streaming keeps live terminal output. Pass the merged env so
+            // per-call kv reaches the plugin too.
+            if on_progress.is_none() && args.is_empty() && !has_shell_syntax(&cmd) {
+                if let Some(resp) = try_plugin_redirect(&cmd, &cwd, &env, registry).await {
+                    return resp;
+                }
+            }
+            // Layer 1b: verbatim passthrough (#1540). Everything else bound for
+            // a plugin's binary runs as plain exec (byte-identical output) under
+            // that plugin's non-interactive environment.
+            if let Some(extra) = passthrough_env(&cmd, &args, registry).await {
+                for (key, value) in extra {
+                    env.entry((*key).into()).or_insert_with(|| (*value).into());
+                }
+                passthrough = true;
             }
         }
     }
 
-    let mut command = build_command(&cmd, &args);
-    command.current_dir(&cwd);
-    crate::managed_process::apply_environment(&mut command, &session.cfg.process, &env);
+    let resp = capture_exec(session, &cmd, &args, &cwd, &env, on_progress).await;
+    if passthrough {
+        resp.redirect_via_plugin()
+    } else {
+        resp
+    }
+}
+
+/// Characters that make a command string a shell line rather than a single
+/// whitespace-separated argv.
+fn has_shell_syntax(cmd: &str) -> bool {
+    cmd.chars().any(|c| {
+        matches!(
+            c,
+            '\'' | '"'
+                | '\\'
+                | '|'
+                | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '*'
+                | '?'
+                | '['
+                | '~'
+                | '\n'
+        )
+    })
+}
+
+/// The non-interactive environment of the registered plugin that owns the
+/// binary this exec runs, or `None` when no plugin owns it (or the string is a
+/// shell line whose binaries cannot be known).
+async fn passthrough_env(
+    cmd: &str,
+    args: &[String],
+    registry: &Arc<ToolRegistry>,
+) -> Option<&'static [(&'static str, &'static str)]> {
+    let binary = if args.is_empty() {
+        if has_shell_syntax(cmd) {
+            return None;
+        }
+        cmd.split_whitespace().next()?
+    } else {
+        cmd
+    };
+    let (plugin, env) = match binary.rsplit('/').next()? {
+        "git" => ("git", crate::plugins::git::NONINTERACTIVE_ENV),
+        "gh" => ("gh", crate::plugins::gh::NONINTERACTIVE_ENV),
+        _ => return None,
+    };
+    registry.get(plugin).await.map(|_| env)
+}
+
+async fn capture_exec(
+    session: &Session,
+    cmd: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    on_progress: Option<&ExecProgressCallback<'_>>,
+) -> Response {
+    let mut command = build_command(cmd, args);
+    command.current_dir(cwd);
+    crate::managed_process::apply_environment(&mut command, &session.cfg.process, env);
     let progress = on_progress.map(|callback| {
         move |text: String| {
             callback(ExecProgress::Output(text));
@@ -505,7 +586,7 @@ pub async fn exec_with_progress(
         && !output.stdout_truncated
         && !output.stderr_truncated
     {
-        if let Some(filtered) = exec_filter::filter_exec_output(&cmd, &stdout, &stderr, exit) {
+        if let Some(filtered) = exec_filter::filter_exec_output(cmd, &stdout, &stderr, exit) {
             let raw_chars = stdout.len() + stderr.len();
             let mut resp = json!({
                 "exit": exit,
@@ -2014,6 +2095,155 @@ mod tests {
         );
         assert!(!r.meta.filter_applied);
         assert!(!r.meta.read_dedup);
+    }
+
+    // --- Verbatim plugin passthrough (vikunja #1540) ---
+
+    async fn committed_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+    }
+
+    fn exec_op(command: &str, args: &[&str]) -> Op {
+        Op {
+            c: 8,
+            s: Some(command.into()),
+            a: (!args.is_empty()).then(|| args.iter().map(|a| a.to_string()).collect()),
+            ..Op::default()
+        }
+    }
+
+    /// The same call with redirects disabled: the exact output a script saw
+    /// before this change.
+    async fn unredirected(dir: &std::path::Path, op: &Op) -> Response {
+        let mut cfg = Config::default();
+        cfg.process.exec_plugin_redirect = false;
+        exec(&Session::new(dir.to_path_buf(), Arc::new(cfg)), op).await
+    }
+
+    #[tokio::test]
+    async fn argv_git_exec_passes_through_verbatim_and_counts_as_redirect() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = session_with_registry(dir.path()).await;
+        for op in [
+            exec_op("git", &["status"]),
+            exec_op("git", &["log", "-1", "--format=%s"]),
+            exec_op("git", &["show", "--stat", "HEAD"]),
+        ] {
+            let redirected = exec(&s, &op).await;
+            assert!(redirected.meta.redirect_via_plugin, "{op:?}");
+            assert_eq!(
+                redirected.d,
+                unredirected(dir.path(), &op).await.d,
+                "scripts must see byte-identical exec output: {op:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unmapped_git_string_falls_back_to_verbatim_passthrough() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = session_with_registry(dir.path()).await;
+        let op = exec_op("git show --stat HEAD", &[]);
+        let redirected = exec(&s, &op).await;
+        assert!(redirected.meta.redirect_via_plugin);
+        assert_eq!(redirected.d, unredirected(dir.path(), &op).await.d);
+    }
+
+    #[tokio::test]
+    async fn passthrough_applies_noninteractive_git_env() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = session_with_registry(dir.path()).await;
+        // A message-less merge would otherwise launch an editor.
+        for args in [
+            &["switch", "-c", "topic"][..],
+            &["commit", "--allow-empty", "-m", "topic"][..],
+            &["switch", "main"][..],
+        ] {
+            assert_eq!(exec(&s, &exec_op("git", args)).await.d.unwrap()["exit"], 0);
+        }
+        let merged = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            exec(&s, &exec_op("git", &["merge", "--no-ff", "topic"])),
+        )
+        .await
+        .expect("a message-less merge must not wait for an editor");
+        assert_eq!(merged.d.unwrap()["exit"], 0);
+    }
+
+    #[tokio::test]
+    async fn shell_lines_and_other_binaries_are_not_redirected() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = session_with_registry(dir.path()).await;
+        for op in [
+            exec_op("git log --oneline | head -1", &[]),
+            exec_op("git commit -m \"two words\"", &[]),
+            exec_op("echo", &["git"]),
+        ] {
+            let r = exec(&s, &op).await;
+            assert!(!r.meta.redirect_via_plugin, "{op:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_requires_the_plugin_to_be_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = Session::new(dir.path().to_path_buf(), Arc::new(Config::default()));
+        let r = exec(&s, &exec_op("git", &["status"])).await;
+        assert!(!r.meta.redirect_via_plugin);
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_keeps_live_output_and_gets_passthrough() {
+        if !crate::plugins::git::is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        committed_repo(dir.path()).await;
+        let s = session_with_registry(dir.path()).await;
+        let seen = std::sync::Mutex::new(String::new());
+        let progress = |event: ExecProgress| {
+            if let ExecProgress::Output(text) = event {
+                seen.lock().unwrap().push_str(&text);
+            }
+        };
+        let r = exec_with_progress(
+            &s,
+            &exec_op("git", &["log", "-1", "--format=%s"]),
+            Some(&progress),
+        )
+        .await;
+        assert!(r.meta.redirect_via_plugin);
+        assert!(
+            seen.lock().unwrap().contains("init"),
+            "live output must still stream"
+        );
     }
 
     #[tokio::test]

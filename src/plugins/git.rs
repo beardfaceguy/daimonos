@@ -97,15 +97,22 @@ struct GitRun<'a> {
     process_cfg: &'a crate::config::ProcessConfig,
 }
 
+/// Environment that keeps git from blocking on a prompt or editor: there is
+/// no terminal, so accept default merge/commit/rebase messages and todo lists.
+/// Also applied to `exec git ...` passthrough (`exec_ops`).
+pub(crate) const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", "true"),
+    ("GIT_SEQUENCE_EDITOR", "true"),
+];
+
 impl GitRun<'_> {
     async fn output(&self, args: &[&str]) -> Result<crate::managed_process::ManagedOutput, String> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let mut env = self.env.clone();
-        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-        // No terminal to edit in: accept default merge/commit/rebase messages
-        // and todo lists instead of hanging on an editor.
-        env.insert("GIT_EDITOR".into(), "true".into());
-        env.insert("GIT_SEQUENCE_EDITOR".into(), "true".into());
+        for (key, value) in NONINTERACTIVE_ENV {
+            env.insert((*key).into(), (*value).into());
+        }
         crate::managed_process::run("git", &args, self.cwd, &env, self.process_cfg, None)
             .await
             .map_err(|e| format!("git exec: {e}"))

@@ -120,13 +120,19 @@ struct GhRun<'a> {
     process_cfg: &'a crate::config::ProcessConfig,
 }
 
+/// Environment that keeps gh from blocking on an interactive prompt. Also
+/// applied to `exec gh ...` passthrough (`exec_ops`).
+pub(crate) const NONINTERACTIVE_ENV: &[(&str, &str)] = &[("GH_PROMPT_DISABLED", "1")];
+
 impl GhRun<'_> {
     async fn output(
         &self,
         args: &[String],
     ) -> Result<crate::managed_process::ManagedOutput, String> {
         let mut env = self.env.clone();
-        env.insert("GH_PROMPT_DISABLED".into(), "1".into());
+        for (key, value) in NONINTERACTIVE_ENV {
+            env.insert((*key).into(), (*value).into());
+        }
         env.insert("NO_COLOR".into(), "1".into());
         crate::managed_process::run("gh", args, self.cwd, &env, self.process_cfg, None)
             .await
