@@ -385,6 +385,7 @@ Zed, etc.). Socket-mode daemon behavior is unchanged.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `idle_timeout_secs` | `600` | Exit cleanly after this many seconds with **no** MCP requests (`list_tools`, `call_tool`, …). Protects against orphaned processes when an editor leaks stdin. Set `0` to disable. Overridable with `DAIMONOS_IDLE_TIMEOUT_SECS`. |
+| `client_gone_poll_ms` | `250` | How often the stdio server checks whether the client stopped reading stdout, because it exited or closed the pipe. When that happens, and also on SIGTERM, SIGINT, or SIGHUP, running commands' process groups get SIGTERM, then SIGKILL after `[process] termination_grace_ms`, so they don't outlive the session. Closing only stdin is **not** a disconnect: in-flight calls still finish and reply. Set `0` to disable. |
 | `startup_logs` | `false` | When `false`, omit benign informational lines on stderr during MCP startup and idle shutdown (plugin registration, indexer stats, watchdog messages). Some MCP hosts (notably **Cursor**) classify **all** subprocess stderr as `[error]` in the UI. Use `--verbose`, `[mcp] startup_logs = true`, or `DAIMONOS_LOG_STARTUP=1` when debugging daimonos. |
 
 ```toml
