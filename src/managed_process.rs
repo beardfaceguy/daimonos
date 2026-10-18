@@ -820,8 +820,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!live_groups_snapshot().contains(&group));
-        // SAFETY: signal 0 probes existence without changing process state.
-        let alive = unsafe { libc::kill(grandchild, 0) } == 0;
-        assert!(!alive, "grandchild survived group termination");
+        // A killed grandchild is reparented and may stay a zombie until its new
+        // parent reaps it (slow under some CI init processes). A zombie is not
+        // running, so only a live, non-zombie process counts as a survivor.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, rest)| !rest.starts_with('Z'))
+                })
+                .unwrap_or(false)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while running() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!running(), "grandchild survived group termination");
     }
 }
