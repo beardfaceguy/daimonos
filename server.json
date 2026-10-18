@@ -3,7 +3,7 @@
   "name": "io.github.beardfaceguy/daimonos",
   "title": "Daimonos",
   "description": "Agent-optimized MCP server with structured JSON tools. 20-45% token savings.",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "repository": {
     "url": "https://github.com/beardfaceguy/daimonos",
     "source": "github"
