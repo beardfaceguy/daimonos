@@ -123,9 +123,14 @@ We will add a new built-in plugin tool named `git_read`. It is separate from
     `prompts/tool_descriptions.toml` under `[git_read]`. It tells the model
     when to use `git_read` and when to use `git`.
 
-12. **Submodules.** Resolved on 2026-10-24. See Decision item 12.
-3. **Alternates.** Resolved on 2026-10-24. See Decision item 13.
-4. **Old git.** Resolved on 2026-10-24. See Decision item 14.
+12. **Submodules.** `worktree_status` ignores submodules with
+    `--ignore-submodules=all`. The reviewer does not run git inside submodules.
+13. **Alternates.** Reject repositories with alternate object stores outside the
+    workspace. Check chained stores after symlink resolution.
+14. **Old git.** Register `git_read` only when git accepts `--no-lazy-fetch`.
+    Every request also passes that option. Never use a fallback that can fetch.
+
+## Open questions
 5. **Names.** The config section, the error kinds, and the file and type names
    are proposed.
 6. **Participants.** Consulted and Informed are empty. Add names if other

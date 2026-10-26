@@ -197,6 +197,27 @@ limit = "Max reservations to return (most-recent first)."
 [list_tool_signatures]
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 
+[git_read]
+full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only."""
+terse = "Read-only git at pinned commits. No writes or network."
+[git_read.parameters]
+command = "Operation to run. No raw commands or user flags."
+repo = "Repository root relative to the workspace. Default: workspace root."
+rev = "Commit, ref, tag, or log range. Default: HEAD."
+path = "Literal repository-relative path."
+paths = "Literal repository-relative paths."
+pattern = "Extended regular expression for grep. Must not start with a hyphen."
+a = "First revision for diff or ancestry."
+b = "Second revision for diff or ancestry."
+mode = "diff: stat or patch. Default: stat."
+offset = "Zero-based line or entry offset. Default: 0."
+limit = "Maximum returned items, bounded by configuration."
+recursive = "list_tree: include descendants. Default: false."
+follow = "log: follow renames for one path. Default: false."
+patch = "show_commit: include a bounded patch preview. Default: false."
+start_line = "blame: first line, one-based. Default: 1."
+end_line = "blame: final line, inclusive. Bounded by max_lines."
+
 [git]
 full = """Git operations. Structured commands: status, log, diff, branch, add, commit, push, pull, checkout. Any other git subcommand (merge, rebase, stash, fetch, tag, reset, cherry-pick, show, ...): command=raw with args=[subcommand, ...]; returns exit_code/stdout/stderr."""
 terse = """Git: status, log, diff, branch, add, commit, push, pull, checkout; raw for any other subcommand (args=[subcommand, ...])."""

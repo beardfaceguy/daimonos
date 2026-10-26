@@ -7,11 +7,69 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Read-only git bounds. Context: docs/adr/017-git-read-tool.md.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct GitReadConfig {
+    pub max_output_bytes: usize,
+    pub max_file_bytes: usize,
+    pub max_lines: usize,
+    pub max_entries: usize,
+    pub max_results: usize,
+    pub max_commits: usize,
+    pub max_patch_bytes: usize,
+    pub max_input_bytes: usize,
+    pub max_alternate_dirs: usize,
+}
+
+impl Default for GitReadConfig {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 1024 * 1024,
+            max_file_bytes: 512 * 1024,
+            max_lines: 1000,
+            max_entries: 1000,
+            max_results: 200,
+            max_commits: 100,
+            max_patch_bytes: 64 * 1024,
+            max_input_bytes: 16 * 1024,
+            max_alternate_dirs: 32,
+        }
+    }
+}
+
+impl GitReadConfig {
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("max_output_bytes", self.max_output_bytes),
+            ("max_file_bytes", self.max_file_bytes),
+            ("max_lines", self.max_lines),
+            ("max_entries", self.max_entries),
+            ("max_results", self.max_results),
+            ("max_commits", self.max_commits),
+            ("max_patch_bytes", self.max_patch_bytes),
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_alternate_dirs", self.max_alternate_dirs),
+        ] {
+            if value == 0 {
+                return Err(format!("git_read.{name} must be greater than zero"));
+            }
+        }
+        if self.max_file_bytes > self.max_output_bytes
+            || self.max_patch_bytes > self.max_output_bytes
+        {
+            return Err("git_read file and patch caps must not exceed max_output_bytes".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
+    pub git_read: GitReadConfig,
     pub process: ProcessConfig,
     pub tool_output: ToolOutputConfig,
     pub loop_detector: LoopDetectorConfig,
@@ -1950,6 +2008,7 @@ impl IndexConfig {
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.index.validate()?;
+        self.git_read.validate()?;
         self.agent.skills.validate()?;
         self.acp.validate()?;
         self.session.validate()?;
@@ -2178,6 +2237,10 @@ pub(crate) fn dirs_next() -> Option<std::path::PathBuf> {
 /// Register tools from config into the tool registry.
 pub async fn register_tools(cfg: &Config, registry: &ToolRegistry, quiet_stderr: bool) {
     for (id, tool_cfg) in &cfg.tools {
+        // ADR-017 reserves this non-destructive identity, even on unsupported git.
+        if id == "git_read" {
+            continue;
+        }
         if id == "x07" {
             let plugin = Arc::new(X07Plugin::new(&tool_cfg.bin));
             if !quiet_stderr {
