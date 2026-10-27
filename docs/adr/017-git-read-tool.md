@@ -126,6 +126,7 @@ We will add a new built-in plugin tool named `git_read`. It is separate from
 
 12. **Submodules.** `worktree_status` ignores submodules with
     `--ignore-submodules=all`. The reviewer does not run git inside submodules.
+    History reads support bare repositories. `worktree_status` rejects them.
 13. **Alternates.** Reject repositories with alternate object stores outside the
     workspace. Check chained stores after symlink resolution.
 14. **Old git.** Register `git_read` only when git accepts `--no-lazy-fetch`.

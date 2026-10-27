@@ -198,7 +198,7 @@ limit = "Max reservations to return (most-recent first)."
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 
 [git_read]
-full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only."""
+full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Use workspace-relative repo and path values. Revisions, paths, repo names, and patterns must not start with a hyphen. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only."""
 terse = "Read-only git at pinned commits. No writes or network."
 [git_read.parameters]
 command = "Operation to run. No raw commands or user flags."

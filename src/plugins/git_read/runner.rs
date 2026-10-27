@@ -43,6 +43,7 @@ pub(super) struct ReadRepo {
     pub path: PathBuf,
     pub shallow: bool,
     pub partial: bool,
+    pub bare: bool,
     env: HashMap<String, String>,
     process: ProcessConfig,
 }
@@ -177,7 +178,11 @@ impl ReadRepo {
             env.insert(key.into(), value.into());
         }
         env.insert("GIT_DIR".into(), gitdir.to_string_lossy().into_owned());
-        env.insert("GIT_WORK_TREE".into(), path.to_string_lossy().into_owned());
+        // A bare repository has no worktree. Never reinterpret its object database as one.
+        let bare = gitdir == path;
+        if !bare {
+            env.insert("GIT_WORK_TREE".into(), path.to_string_lossy().into_owned());
+        }
         let mut process = process.clone();
         // Inherit no Git controls, even if process.inherit_env_prefixes includes GIT_.
         process
@@ -191,6 +196,7 @@ impl ReadRepo {
             path,
             shallow: false,
             partial: false,
+            bare,
             env,
             process,
         };

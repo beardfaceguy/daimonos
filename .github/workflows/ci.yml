@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CLI test prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes npm shellcheck
       - run: cargo test
 
   mcp-integration:
@@ -58,6 +60,8 @@ jobs:
           python-version: "3.12"
       - run: pip install -r tests/requirements.txt
       - run: cargo build
+      - name: Install CLI test prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes npm shellcheck
       - run: pytest tests/ -v
 
   android:

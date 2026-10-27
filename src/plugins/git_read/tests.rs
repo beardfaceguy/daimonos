@@ -499,3 +499,152 @@ async fn missing_tree_is_not_reported_as_an_absent_path() {
         );
     }
 }
+
+#[tokio::test]
+async fn bare_repository_rejects_worktree_status_without_mutation() {
+    let f = Fixture::new();
+    git(f.workspace.path(), &["clone", "--bare", "source", "bare"]);
+    let bare = f.workspace.path().join("bare");
+    let before = snapshot(&bare);
+    let response = f
+        .call(json!({"command":"worktree_status","repo":"bare"}))
+        .await;
+    assert_ne!(response.exit_code, 0, "{}", response.output);
+    assert_eq!(response.output["error"]["kind"], "bare_repository");
+    assert_eq!(snapshot(&bare), before);
+}
+
+#[tokio::test]
+async fn bare_repository_supports_all_history_reads_without_mutation() {
+    let f = Fixture::new();
+    git(f.workspace.path(), &["clone", "--bare", "source", "bare"]);
+    let bare = f.workspace.path().join("bare");
+    for mut args in f.cases() {
+        if args["command"] == "worktree_status" {
+            continue;
+        }
+        args["repo"] = json!("bare");
+        let before = snapshot(&bare);
+        let response = f.call(args.clone()).await;
+        assert_eq!(response.exit_code, 0, "{args}: {}", response.output);
+        assert_eq!(snapshot(&bare), before, "mutation in {args}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_nested_ranges_are_rejected_before_resolution() {
+    let f = Fixture::new();
+    for command in ["log", "diff"] {
+        for rev in [
+            "HEAD..HEAD..HEAD",
+            "HEAD...HEAD",
+            "..HEAD",
+            "HEAD..",
+            "HEAD..-p",
+        ] {
+            let before = snapshot(&f.repo);
+            let result = f
+                .call(json!({"command":command,"repo":"source","rev":rev}))
+                .await;
+            assert_eq!(
+                result.output["error"]["kind"], "rejected_argument",
+                "{command} {rev}: {}",
+                result.output
+            );
+            assert_eq!(snapshot(&f.repo), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn upstream_resolution_is_local_and_search_syntax_has_a_structured_result() {
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &f.first],
+    );
+    git(&f.repo, &["config", "branch.main.remote", "origin"]);
+    git(
+        &f.repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(&f.repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    git(
+        &f.repo,
+        &[
+            "config",
+            "remote.origin.url",
+            &format!("http://{}/forbidden", listener.local_addr().unwrap()),
+        ],
+    );
+    let before = snapshot(&f.repo);
+    let upstream = f
+        .call(json!({"command":"resolve","repo":"source","rev":"@{u}"}))
+        .await;
+    assert_eq!(upstream.exit_code, 0, "{}", upstream.output);
+    assert_eq!(upstream.output["commits"], json!([f.first]));
+    let unsupported = f
+        .call(json!({"command":"resolve","repo":"source","rev":":/Initial"}))
+        .await;
+    assert_eq!(unsupported.output["error"]["kind"], "unknown_revision");
+    assert_eq!(snapshot(&f.repo), before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn grep_distinguishes_no_matches_from_an_invalid_expression() {
+    let f = Fixture::new();
+    let absent = f
+        .call(json!({"command":"grep","repo":"source","pattern":"no matching text"}))
+        .await;
+    assert_eq!(absent.exit_code, 0, "{}", absent.output);
+    assert_eq!(absent.output["matches"], json!([]));
+    let invalid = f
+        .call(json!({"command":"grep","repo":"source","pattern":"["}))
+        .await;
+    assert_ne!(invalid.exit_code, 0);
+    assert_eq!(invalid.output["error"]["kind"], "git_error");
+}
+
+#[tokio::test]
+async fn registered_plugin_uses_the_smaller_git_and_shared_response_caps() {
+    let f = Fixture::new();
+    // Raw capture fits both git caps. JSON escaping makes the successful response larger.
+    fs::write(f.repo.join("quoted.txt"), "\"".repeat(4096)).unwrap();
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-m", "Escaped response fixture"]);
+    for (git_cap, shared_cap) in [(16384, 1024), (5000, 16384)] {
+        let mut cfg = crate::config::Config::default();
+        cfg.git_read.max_output_bytes = git_cap;
+        cfg.git_read.max_file_bytes = git_cap;
+        cfg.git_read.max_patch_bytes = git_cap;
+        cfg.tool_output.max_bytes = shared_cap;
+        let registry = crate::tool_runner::ToolRegistry::with_process_config(cfg.process.clone());
+        crate::plugins::register_builtin_plugins(&cfg, &registry, true).await;
+        let before = snapshot(&f.repo);
+        let response = registry
+            .run(
+                "git_read",
+                "show_file",
+                f.workspace.path(),
+                &HashMap::new(),
+                None,
+                Some(&json!({"repo":"source","path":"quoted.txt"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.exit_code, 1, "{}", response.output);
+        assert_eq!(response.output["error"]["kind"], "output_limit");
+        assert!(response.output.to_string().len() <= git_cap.min(shared_cap));
+        assert_eq!(snapshot(&f.repo), before);
+    }
+}

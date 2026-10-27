@@ -348,12 +348,16 @@ impl GitReadPlugin {
                 if out.status.code() != Some(1) || !out.stderr.is_empty() {
                     repo.check(&out)?;
                 }
-                if out.stdout_truncated {
+                if out.stdout_truncated || out.stderr_truncated {
                     return Err(Failure::new(
                         "output_limit",
                         "grep output exceeds git_read.max_output_bytes",
                     )
                     .truncated());
+                }
+                // A warning can mean an incomplete search. Do not report it as a clean result.
+                if !out.stderr.trim().is_empty() {
+                    return Err(Failure::new("git_error", out.stderr.trim()));
                 }
                 let mut matches = Vec::new();
                 let mut remaining = out.stdout.as_str();
@@ -565,6 +569,12 @@ impl GitReadPlugin {
                 )
             }
             "worktree_status" => {
+                if repo.bare {
+                    return Err(Failure::new(
+                        "bare_repository",
+                        "worktree_status requires a working tree",
+                    ));
+                }
                 let commit = repo.commit("HEAD").await?;
                 let listing = repo
                     .text(&[
@@ -725,7 +735,7 @@ fn page(entries: Vec<Value>, commit: &str, offset: usize, limit: usize, field: &
 
 async fn pinned_range(repo: &ReadRepo, revision: &str) -> Result<(String, Vec<String>), Failure> {
     if let Some((a, b)) = revision.split_once("..") {
-        if a.is_empty() || b.is_empty() || b.starts_with('.') {
+        if a.is_empty() || b.is_empty() || b.starts_with('.') || b.contains("..") {
             return Err(Failure::new(
                 "rejected_argument",
                 "range requires two revisions: a..b",

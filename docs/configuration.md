@@ -1079,6 +1079,9 @@ The tool name `git_read` is reserved. A generic CLI configuration cannot replace
 current directory. Git directories and alternate stores must also stay inside
 the workspace after symlink resolution. `worktree_status` ignores submodules.
 The tool requires git with `--no-lazy-fetch` support. Older git does not register it.
+History reads support bare repositories. `worktree_status` rejects them with `bare_repository`.
+Grep rejects stderr diagnostics instead of reporting a potentially incomplete search as successful.
+Malformed nested ranges return `rejected_argument`.
 
 Every successful result includes `repo` and `commits`. Annotated tags retain
 their object SHA and report their peeled commit SHA separately. Tags that name

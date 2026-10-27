@@ -204,3 +204,91 @@ def test_git_read_does_not_spill_large_results_to_disk(daimonos_factory, tmp_pat
     failure=json.loads(response["content"][0]["text"])
     assert failure["error"]["kind"] == "output_limit"
     assert not spill.exists()
+
+
+def test_git_read_bare_repository_has_history_but_no_worktree_status(daimonos):
+    _, commit=repository(daimonos.workspace)
+    git(Path(daimonos.workspace),"clone","--bare","source","bare")
+    status=daimonos.call_tool("git_read",{"command":"worktree_status","repo":"bare"})
+    assert status.get("isError"),status
+    assert json.loads(status["content"][0]["text"])["error"]["kind"]=="bare_repository"
+    resolved=daimonos.call_tool("git_read",{"command":"resolve","repo":"bare","rev":"HEAD"})
+    assert not resolved.get("isError"),resolved
+    assert json.loads(resolved["content"][0]["text"])["commits"]==[commit]
+
+
+def test_git_read_rejects_nested_revision_ranges(daimonos):
+    repository(daimonos.workspace)
+    for command in ("log","diff"):
+        response=daimonos.call_tool("git_read",{"command":command,"repo":"source","rev":"HEAD..HEAD..HEAD"})
+        assert response.get("isError"),response
+        assert json.loads(response["content"][0]["text"])["error"]["kind"]=="rejected_argument"
+
+
+def test_git_read_grep_frames_matches_without_final_newlines(daimonos):
+    repo,_=repository(daimonos.workspace)
+    (repo/"a.txt").write_text("needle without newline")
+    (repo/"b.txt").write_text("needle with newline\n")
+    (repo/"c.txt").write_text("one\nneedle two\nneedle three\n")
+    (repo/"binary.bin").write_bytes(b"\x00needle\x00")
+    git(repo,"add",".")
+    git(repo,"commit","-m","Grep framing fixture")
+    response=daimonos.call_tool("git_read",{"command":"grep","repo":"source","pattern":"needle"})
+    assert not response.get("isError"),response
+    assert json.loads(response["content"][0]["text"])["matches"]==[
+        {"path":"a.txt","line_number":1,"line":"needle without newline"},
+        {"path":"b.txt","line_number":1,"line":"needle with newline"},
+        {"path":"c.txt","line_number":2,"line":"needle two"},
+        {"path":"c.txt","line_number":3,"line":"needle three"},
+    ]
+
+
+def test_git_read_blame_continuation_keeps_the_original_start_line(daimonos):
+    repository(daimonos.workspace)
+    params={"command":"blame","repo":"source","path":"file.txt","start_line":1,"end_line":2,"limit":1}
+    first=daimonos.call_tool("git_read",params)
+    assert not first.get("isError"),first
+    first_page=json.loads(first["content"][0]["text"])
+    second=daimonos.call_tool("git_read",{**params,"offset":first_page["next_offset"]})
+    assert not second.get("isError"),second
+    second_page=json.loads(second["content"][0]["text"])
+    assert [first_page["lines"][0]["line_number"],second_page["lines"][0]["line_number"]]==[1,2]
+    assert second_page["truncated"] is False
+
+
+def test_git_read_grep_reports_successful_stderr(daimonos_factory,tmp_path):
+    import os
+    import shutil
+    import sys
+
+    repo,_=repository(tmp_path)
+    real_git=shutil.which("git")
+    assert real_git
+    wrapper_dir=tmp_path/"wrapper"
+    wrapper_dir.mkdir()
+    wrapper=wrapper_dir/"git"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport subprocess,sys\n"
+        f"code=subprocess.run([{real_git!r},*sys.argv[1:]]).returncode\n"
+        "if 'grep' in sys.argv[1:]: print('warning: incomplete search',file=sys.stderr)\n"
+        "sys.exit(code)\n"
+    )
+    wrapper.chmod(0o755)
+    client=daimonos_factory(tmp_path,env={"PATH":str(wrapper_dir)+os.pathsep+os.environ["PATH"]})
+    response=client.call_tool("git_read",{"command":"grep","repo":"source","pattern":"first"})
+    assert response.get("isError"),response
+    failure=json.loads(response["content"][0]["text"])
+    assert failure["error"]["kind"]=="git_error"
+    assert "incomplete search" in failure["error"]["message"]
+
+
+def test_git_read_short_inheritance_prefixes_do_not_leak_git_controls(daimonos_factory,tmp_path):
+    repository(tmp_path)
+    for index,prefix in enumerate(("G","")):
+        trace=tmp_path/f"git-trace-{index}"
+        (tmp_path/"daimonos.toml").write_text(f'[process]\ninherit_env_prefixes=["{prefix}"]\n')
+        client=daimonos_factory(tmp_path,env={"GIT_TRACE":str(trace)})
+        trace.unlink(missing_ok=True)
+        response=client.call_tool("git_read",{"command":"resolve","repo":"source"})
+        assert not response.get("isError"),response
+        assert not trace.exists(),f"git controls leaked through prefix {prefix!r}"
