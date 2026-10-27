@@ -1211,6 +1211,19 @@ mod tests {
     }
 
     #[test]
+    fn git_read_allowlist_does_not_grant_git_or_request_approval() {
+        use crate::safety::{is_destructive_tool, Gate};
+        let content = base() + "DAIMONOS_AGENT_ALLOWED_COMMANDS=read_file,search,git_read\n";
+        let mut environment = load_str(&content).unwrap();
+        environment.approval_mode = "interactive".into();
+        let policy = environment.to_safety_policy(None);
+        assert_eq!(policy.gate("git_read"), Gate::Allow);
+        assert!(matches!(policy.gate("git"), Gate::Block(_)));
+        assert!(!is_destructive_tool("git_read"));
+        assert!(is_destructive_tool("git"));
+    }
+
+    #[test]
     fn parses_comma_separated_command_lists() {
         let s = base()
             + "DAIMONOS_AGENT_ALLOWED_COMMANDS=read_file, search ,ls\n\

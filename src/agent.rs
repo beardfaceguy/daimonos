@@ -6859,6 +6859,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_read_runs_in_agent_mode_while_git_is_blocked() {
+        use crate::safety::{ApprovalMode, Gate, SafetyPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut session = session_in(dir.path());
+        let registry = Arc::new(crate::tool_runner::ToolRegistry::with_process_config(
+            session.cfg.process.clone(),
+        ));
+        crate::plugins::register_builtin_plugins(&session.cfg, &registry, true).await;
+        session.tool_registry = Some(registry);
+        let policy = SafetyPolicy {
+            approval_mode: ApprovalMode::Interactive,
+            allowed_commands: vec!["read_file".into(), "search".into(), "git_read".into()],
+            ..Default::default()
+        };
+        let provider = MockProvider::new(vec![
+            tool_call_resp("read", "git_read", json!({"command":"resolve"})),
+            tool_call_resp("write-capable", "git", json!({"command":"status"})),
+            end_turn_resp(),
+        ]);
+        let config = AgentConfig {
+            before_tool_call: Some(Box::new(move |info| {
+                let result = match policy.gate(&info.name) {
+                    Gate::Allow => BeforeHookResult::Allow,
+                    Gate::Block(reason) => BeforeHookResult::Block(reason),
+                    Gate::NeedsApproval => panic!("git_read unexpectedly requested approval"),
+                };
+                Box::pin(std::future::ready(result))
+            })),
+            ..Default::default()
+        };
+        let result = run(
+            &provider,
+            shared(session),
+            vec![Message::user("read history")],
+            &config,
+        )
+        .await;
+        let mut observed = 0;
+        for block in result.messages.iter().flat_map(|message| &message.content) {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            {
+                if tool_use_id == "read" {
+                    assert!(!is_error, "{content}");
+                    let response: Value = serde_json::from_str(content).unwrap();
+                    assert_eq!(response["commits"][0].as_str().unwrap().len(), 40);
+                    observed += 1;
+                } else if tool_use_id == "write-capable" {
+                    assert!(*is_error, "{content}");
+                    observed += 1;
+                }
+            }
+        }
+        assert_eq!(observed, 2);
+    }
+
+    // Report-only reproduction for #1573. This pins the current unsafe behavior.
+    #[tokio::test]
+    async fn policy_audit_script_inner_writes_bypass_allowlist_and_denylist() {
+        use crate::safety::{Gate, SafetyPolicy};
+        for restrict_allowlist in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SafetyPolicy {
+                allowed_commands: if restrict_allowlist {
+                    vec!["execute_script".into()]
+                } else {
+                    vec![]
+                },
+                denied_commands: if restrict_allowlist {
+                    vec![]
+                } else {
+                    vec!["write_file".into()]
+                },
+                ..Default::default()
+            };
+            assert!(matches!(policy.gate("write_file"), Gate::Block(_)));
+            assert_eq!(policy.gate("execute_script"), Gate::Allow);
+            let provider = MockProvider::new(vec![
+                tool_call_resp(
+                    "direct",
+                    "write_file",
+                    json!({"path":"blocked.txt","content":"blocked"}),
+                ),
+                tool_call_resp(
+                    "delegated",
+                    "execute_script",
+                    json!({"code":"result = write_file(\"delegated.txt\", \"written\")"}),
+                ),
+                end_turn_resp(),
+            ]);
+            let config = AgentConfig {
+                before_tool_call: Some(Box::new(move |info| {
+                    let decision = match policy.gate(&info.name) {
+                        Gate::Block(reason) => BeforeHookResult::Block(reason),
+                        _ => BeforeHookResult::Allow,
+                    };
+                    Box::pin(std::future::ready(decision))
+                })),
+                ..Default::default()
+            };
+            run(
+                &provider,
+                shared(session_in(dir.path())),
+                vec![Message::user("audit")],
+                &config,
+            )
+            .await;
+            assert!(!dir.path().join("blocked.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("delegated.txt")).unwrap(),
+                "written"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn before_hook_block_returns_error_result() {
         let dir = tempfile::tempdir().unwrap();
         let s = session_in(dir.path());

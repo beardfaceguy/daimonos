@@ -694,6 +694,36 @@ async fn dispatch_tool_inner(
             )
         }
 
+        "git_read" => {
+            let command = get_str(args, "command").unwrap_or_default();
+            let Some(registry) = &session.tool_registry else {
+                return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
+            };
+            match registry
+                .run(
+                    "git_read",
+                    &command,
+                    &session.workspace,
+                    &session.env,
+                    None,
+                    Some(args),
+                )
+                .await
+            {
+                Ok(result) => {
+                    let text = result.output.to_string();
+                    if result.exit_code == 0 {
+                        ok_text(text)
+                    } else {
+                        err_text(text)
+                    }
+                }
+                Err(message) => err_text(
+                    serde_json::json!({"error":{"kind":"unavailable","message":message}})
+                        .to_string(),
+                ),
+            }
+        }
         "git" => {
             let command = match get_str(args, "command") {
                 Some(c) => c,

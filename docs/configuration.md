@@ -1048,3 +1048,65 @@ securely before it is rotated out.
 This captures Daimonos's outgoing schema, not OpenRouter's downstream transformed
 request. It cannot recover older requests, prove downstream behavior, or correlate
 raw model responses; the UUID is local, not a provider request ID.
+
+## Read-only git (`git_read`)
+
+The `[git_read]` section bounds local, pinned git reads. `GitReadConfig` in
+`src/config.rs` defines the defaults. `daimonos.default.toml` lists every key.
+ADR-017 records the safety boundary.
+
+| Key | Controls |
+|-----|----------|
+| `max_output_bytes` | Captured bytes per stream and serialized response bytes |
+| `max_file_bytes` | Blob size before content reads |
+| `max_lines` | Lines in `show_file` and `blame` |
+| `max_entries` | Tree entries, refs, status entries, and changed files |
+| `max_results` | Grep matches |
+| `max_commits` | Log entries |
+| `max_patch_bytes` | UTF-8 bytes in a patch preview |
+| `max_input_bytes` | Request size and repository metadata size |
+| `max_alternate_dirs` | Reachable alternate object stores |
+
+Each value must be positive. File and patch caps must not exceed the output cap.
+The output cap must fit the minimal structured error response.
+The effective response cap is the smaller of `git_read.max_output_bytes` and `tool_output.max_bytes`.
+Oversized responses fail before the shared output handler can spill them to disk.
+Caller limits can reduce a cap, but cannot increase it.
+`max_alternate_dirs` counts the primary store and its reachable alternate stores.
+The tool name `git_read` is reserved. A generic CLI configuration cannot replace it.
+
+`repo` names a repository root relative to the workspace, not the session's
+current directory. Git directories and alternate stores must also stay inside
+the workspace after symlink resolution. `worktree_status` ignores submodules.
+The tool requires git with `--no-lazy-fetch` support. Older git does not register it.
+History reads support bare repositories. `worktree_status` rejects them with `bare_repository`.
+Grep rejects stderr diagnostics instead of reporting a potentially incomplete search as successful.
+Malformed nested ranges return `rejected_argument`.
+
+Every successful result includes `repo` and `commits`. Annotated tags retain
+their object SHA and report their peeled commit SHA separately. Tags that name
+non-commit objects report a null commit SHA. `log` accepts one revision or an
+explicit `a..b` range. `diff` requires `a` and `b`, or `rev=a..b`.
+`show_commit` compares a merge commit with its first parent.
+
+`offset` starts at zero. `next_offset` continues a truncated page with the same
+arguments. Blame uses one-based `start_line` and `end_line`. Its continuation
+keeps those arguments and changes only `offset`. Patch previews do not support
+continuation. A truncated preview is not a complete patch.
+
+Failures return `error.kind` and `error.message`. Required kinds are
+`unknown_revision`, `path_not_found`, `object_missing`, `binary_file`,
+`repo_outside_workspace`, and `rejected_argument`. Binary errors include metadata,
+not content. Additional kinds describe invalid repositories, I/O failures,
+unavailable tools, and git errors. Oversized captures or responses return
+`output_limit` with `truncated: true`. They never return partially parsed records.
+
+Agent mode can grant `git_read` without granting `git`:
+
+```dotenv
+DAIMONOS_AGENT_ALLOWED_COMMANDS=read_file,search,workspace_info,git_read
+```
+
+MCP mode does not enforce this agent allowlist. MCP clients must expose only the
+required read tools. Do not expose `exec`, `batch`, or `execute_script` to a
+strictly read-only reviewer. Their internal calls do not apply the agent policy.

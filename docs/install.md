@@ -26,6 +26,9 @@ Optional (auto-detected at startup):
 | `gh` | Native GitHub CLI tool (pr_list, pr_create, api, etc.) |
 | `docker` | Native Docker tool (ps, logs, images, compose, etc.) |
 
+For development checks, follow [the test prerequisites](../tests/README.md).
+The full suites also require npm and ShellCheck.
+
 ## Option A: Download Pre-Built Binary
 
 Pre-built binaries are available from

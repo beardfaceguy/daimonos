@@ -5,6 +5,7 @@ pub mod docker;
 pub mod generic_cli;
 pub mod gh;
 pub mod git;
+pub mod git_read;
 pub mod npm;
 pub mod pytest;
 pub mod shellcheck;
@@ -17,7 +18,11 @@ use crate::tool_runner::{ToolPlugin, ToolRegistry};
 
 /// One built-in CLI plugin's registration entry: its id, an availability probe
 /// (is the underlying CLI on PATH?), and a constructor for the plugin object.
-type BuiltinPlugin = (&'static str, fn() -> bool, fn() -> Arc<dyn ToolPlugin>);
+type BuiltinPlugin = (
+    &'static str,
+    fn() -> bool,
+    fn(&Config) -> Arc<dyn ToolPlugin>,
+);
 
 /// The canonical set of built-in CLI tool plugins, as (id, is_available,
 /// constructor) triples. This is the SINGLE source of truth for which
@@ -33,24 +38,39 @@ type BuiltinPlugin = (&'static str, fn() -> bool, fn() -> Arc<dyn ToolPlugin>);
 /// `plugins::*` CLI plugin module appears in this table.
 fn builtin_cli_plugins() -> Vec<BuiltinPlugin> {
     vec![
-        ("git", git::is_available, || Arc::new(git::GitPlugin::new())),
-        ("docker", docker::is_available, || {
+        (
+            "git",
+            git::is_available,
+            |_| Arc::new(git::GitPlugin::new()),
+        ),
+        ("git_read", git_read::is_available, |cfg| {
+            // ADR-017: reject large responses before the shared boundary can spill them.
+            Arc::new(
+                git_read::GitReadPlugin::new(cfg.git_read.clone())
+                    .with_response_cap(cfg.tool_output.max_bytes),
+            )
+        }),
+        ("docker", docker::is_available, |_| {
             Arc::new(docker::DockerPlugin::new())
         }),
-        ("cargo", cargo::is_available, || {
+        ("cargo", cargo::is_available, |_| {
             Arc::new(cargo::CargoPlugin::new())
         }),
-        ("gh", gh::is_available, || Arc::new(gh::GhPlugin::new())),
-        ("pytest", pytest::is_available, || {
+        ("gh", gh::is_available, |_| Arc::new(gh::GhPlugin::new())),
+        ("pytest", pytest::is_available, |_| {
             Arc::new(pytest::PytestPlugin::new())
         }),
-        ("curl", curl::is_available, || {
+        ("curl", curl::is_available, |_| {
             Arc::new(curl::CurlPlugin::new())
         }),
-        ("shellcheck", shellcheck::is_available, || {
+        ("shellcheck", shellcheck::is_available, |_| {
             Arc::new(shellcheck::ShellcheckPlugin::new())
         }),
-        ("npm", npm::is_available, || Arc::new(npm::NpmPlugin::new())),
+        (
+            "npm",
+            npm::is_available,
+            |_| Arc::new(npm::NpmPlugin::new()),
+        ),
     ]
 }
 
@@ -66,7 +86,7 @@ pub async fn register_builtin_plugins(cfg: &Config, registry: &ToolRegistry, qui
 
     for (id, available, make) in builtin_cli_plugins() {
         if available() {
-            registry.register(make()).await;
+            registry.register(make(cfg)).await;
             if !quiet_stderr {
                 eprintln!("auto-registered {id} tool plugin");
             }

@@ -244,6 +244,7 @@ These appear automatically when the corresponding CLI tool is found on PATH:
 | Plugin | Commands | Detected by |
 |--------|----------|-------------|
 | `git` | status, log, diff, branch, add, commit, push, pull, checkout | `.git` directory |
+| `git_read` | resolve, show_file, list_tree, grep, log, show_commit, diff, blame, refs, ancestry, worktree_status | git with `--no-lazy-fetch` support |
 | `cargo` | test, build, check, clippy, fmt, add | `Cargo.toml` |
 | `gh` | pr_view, pr_list, pr_create, pr_diff, pr_checks, api | `gh` on PATH |
 | `docker` | ps, logs, exec, images, inspect, stop, compose_up/down/ps | `docker` on PATH |

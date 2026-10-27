@@ -696,6 +696,13 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         // ===================== Tier 1: Terse schema =====================
         ToolDef {
+            name: "git_read",
+            tier: ToolTier::Terse,
+            schema: crate::plugins::git_read::schema(),
+            to_request: None,
+            context_check: None,
+        },
+        ToolDef {
             name: "git",
             tier: ToolTier::Terse,
             schema: json!({

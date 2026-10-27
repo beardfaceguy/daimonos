@@ -604,3 +604,24 @@ poll_interval_ms = 1500
 #   DAIMONOS_AGENT_PROMPT_CACHE=off             # optional; Anthropic models, default off
 #   DAIMONOS_AGENT_ALLOWED_COMMANDS=            # optional, comma-separated
 #   DAIMONOS_AGENT_DENIED_COMMANDS=exec         # optional, comma-separated
+
+# Pinned, local git reads. See ADR-017 and GitReadConfig in src/config.rs.
+[git_read]
+# Maximum captured bytes per stream and maximum serialized response bytes.
+max_output_bytes = 1048576
+# Reject larger blobs before reading their content.
+max_file_bytes = 524288
+# Maximum lines for show_file and blame.
+max_lines = 1000
+# Maximum entries for list_tree, refs, worktree_status, and changed-file lists.
+max_entries = 1000
+# Maximum grep matches per response.
+max_results = 200
+# Maximum log entries per response.
+max_commits = 100
+# Maximum UTF-8 bytes in a patch preview. Truncated previews are not complete patches.
+max_patch_bytes = 65536
+# Maximum request bytes and repository metadata bytes.
+max_input_bytes = 16384
+# Maximum reachable alternate object stores during confinement checks.
+max_alternate_dirs = 32
