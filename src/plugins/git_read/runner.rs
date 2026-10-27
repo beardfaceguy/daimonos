@@ -60,6 +60,12 @@ async fn confined(path: &Path, workspace: &Path) -> Result<PathBuf, Failure> {
 
 async fn bounded_file(path: &Path, limit: usize) -> Result<String, Failure> {
     use tokio::io::AsyncReadExt;
+    if !tokio::fs::metadata(path).await?.is_file() {
+        return Err(Failure::new(
+            "invalid_repository",
+            "repository metadata must be a regular file",
+        ));
+    }
     let file = tokio::fs::File::open(path).await?;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1) as u64)
@@ -94,7 +100,8 @@ impl ReadRepo {
         let gitdir = if dotgit.is_dir() {
             confined(&dotgit, &workspace).await?
         } else if dotgit.is_file() {
-            let content = bounded_file(&dotgit, limits.max_input_bytes).await?;
+            let pointer = confined(&dotgit, &workspace).await?;
+            let content = bounded_file(&pointer, limits.max_input_bytes).await?;
             let target = content
                 .trim()
                 .strip_prefix("gitdir: ")
@@ -109,7 +116,8 @@ impl ReadRepo {
             ));
         };
         let common = if gitdir.join("commondir").exists() {
-            let content = bounded_file(&gitdir.join("commondir"), limits.max_input_bytes).await?;
+            let pointer = confined(&gitdir.join("commondir"), &workspace).await?;
+            let content = bounded_file(&pointer, limits.max_input_bytes).await?;
             confined(&gitdir.join(content.trim()), &workspace).await?
         } else {
             gitdir.clone()
@@ -200,7 +208,25 @@ impl ReadRepo {
                 "^(extensions\\.partialclone|remote\\..*\\.promisor)$",
             ])
             .await?;
-        repo.partial = partial.status.success() && !partial.stdout.trim().is_empty();
+        if partial.status.code() != Some(1) {
+            repo.check(&partial)?;
+        }
+        if partial.stdout_truncated || partial.stderr_truncated {
+            return Err(
+                Failure::new("output_limit", "partial-clone metadata exceeds byte cap").truncated(),
+            );
+        }
+        repo.partial = partial.stdout.lines().any(|line| {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            if key == "extensions.partialclone" {
+                !value.is_empty()
+            } else {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "" | "true" | "yes" | "on" | "1"
+                )
+            }
+        });
         Ok(repo)
     }
 
@@ -248,6 +274,7 @@ impl ReadRepo {
         if output.status.success() {
             return Ok(());
         }
+        let diagnostic = output.stderr.to_ascii_lowercase();
         let kind = if [
             "missing",
             "bad object",
@@ -255,9 +282,10 @@ impl ReadRepo {
             "could not read",
             "not a valid object",
             "could not get object info",
+            "not a tree object",
         ]
         .iter()
-        .any(|message| output.stderr.contains(message))
+        .any(|message| diagnostic.contains(message))
         {
             "object_missing"
         } else {
@@ -266,22 +294,33 @@ impl ReadRepo {
         Err(Failure::new(kind, output.stderr.trim()))
     }
     pub async fn file_object(&self, commit: &str, path: &str) -> Result<String, Failure> {
-        let name = format!("{commit}:{path}");
-        let out = self
-            .output(&["rev-parse", "--verify", "--end-of-options", &name])
-            .await?;
-        if !out.status.success() {
+        self.path_object(commit, path, "blob").await
+    }
+    pub async fn path_object(
+        &self,
+        commit: &str,
+        path: &str,
+        expected: &str,
+    ) -> Result<String, Failure> {
+        let path = path.trim_end_matches('/');
+        let listing = self.text(&["ls-tree", "-z", commit, "--", path]).await?;
+        let header = listing
+            .split_once('\t')
+            .map(|(header, _)| header)
+            .ok_or_else(|| Failure::new("path_not_found", "path is absent at revision"))?;
+        let fields: Vec<_> = header.split_whitespace().collect();
+        if fields.len() != 3 {
+            return Err(Failure::new("git_error", "invalid tree entry"));
+        }
+        if fields[1] != expected {
             return Err(Failure::new(
                 "path_not_found",
-                format!("path is absent at revision: {path}"),
+                "path has the wrong object type",
             ));
         }
-        let object = out.stdout.trim().to_string();
-        let kind = self.text(&["cat-file", "-t", &object]).await?;
-        if kind.trim() != "blob" {
-            return Err(Failure::new("path_not_found", "path is not a file"));
-        }
-        Ok(object)
+        // ls-tree can name a promised object that is not present locally.
+        self.text(&["cat-file", "-t", fields[2]]).await?;
+        Ok(fields[2].into())
     }
     pub async fn object(&self, revision: &str) -> Result<String, Failure> {
         if revision.starts_with('-') || revision.contains('\0') {

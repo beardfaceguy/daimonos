@@ -428,3 +428,74 @@ async fn custom_cli_config_cannot_replace_the_read_only_tool() {
     assert_eq!(output.exit_code, 0, "{}", output.output);
     assert_eq!(output.output["commits"][0], f.last);
 }
+
+#[tokio::test]
+async fn serialized_errors_respect_the_response_byte_cap() {
+    let f = Fixture::new();
+    let limits = GitReadConfig {
+        max_output_bytes: 256,
+        max_file_bytes: 128,
+        max_patch_bytes: 128,
+        ..Default::default()
+    };
+    let result = f
+        .with_limits(
+            json!({"command":"resolve","repo":"source","rev":"x".repeat(4000)}),
+            limits,
+        )
+        .await;
+    assert_ne!(result.exit_code, 0);
+    assert!(
+        result.output.to_string().len() <= 256,
+        "{} bytes",
+        result.output.to_string().len()
+    );
+    assert_eq!(result.output["error"]["kind"], "output_limit");
+    assert_eq!(result.output["truncated"], true);
+}
+
+#[tokio::test]
+async fn a_false_promisor_setting_does_not_report_a_partial_clone() {
+    let f = Fixture::new();
+    git(&f.repo, &["config", "remote.origin.promisor", "false"]);
+    let result = f.call(json!({"command":"resolve","repo":"source"})).await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["partial"], false);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gitdir_pointer_file_cannot_escape_the_workspace() {
+    let f = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let store = f.workspace.path().join("git-storage");
+    fs::rename(f.repo.join(".git"), &store).unwrap();
+    let pointer = outside.path().join("pointer");
+    fs::write(&pointer, format!("gitdir: {}\n", store.display())).unwrap();
+    std::os::unix::fs::symlink(&pointer, f.repo.join(".git")).unwrap();
+    let result = f.call(json!({"command":"resolve","repo":"source"})).await;
+    assert_eq!(result.output["error"]["kind"], "repo_outside_workspace");
+}
+
+#[tokio::test]
+async fn missing_tree_is_not_reported_as_an_absent_path() {
+    let f = Fixture::new();
+    let tree = git(&f.repo, &["rev-parse", "HEAD:nested"]);
+    fs::remove_file(
+        f.repo
+            .join(format!(".git/objects/{}/{}", &tree[..2], &tree[2..])),
+    )
+    .unwrap();
+    git(&f.repo, &["config", "remote.origin.promisor", "true"]);
+    for args in [
+        json!({"command":"list_tree","repo":"source","path":"nested"}),
+        json!({"command":"show_file","repo":"source","path":"nested/child.txt"}),
+    ] {
+        let result = f.call(args).await;
+        assert_eq!(
+            result.output["error"]["kind"], "object_missing",
+            "{}",
+            result.output
+        );
+    }
+}

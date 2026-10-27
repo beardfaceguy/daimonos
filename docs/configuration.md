@@ -1068,7 +1068,12 @@ ADR-017 records the safety boundary.
 | `max_alternate_dirs` | Reachable alternate object stores |
 
 Each value must be positive. File and patch caps must not exceed the output cap.
+The output cap must fit the minimal structured error response.
+The effective response cap is the smaller of `git_read.max_output_bytes` and `tool_output.max_bytes`.
+Oversized responses fail before the shared output handler can spill them to disk.
 Caller limits can reduce a cap, but cannot increase it.
+`max_alternate_dirs` counts the primary store and its reachable alternate stores.
+The tool name `git_read` is reserved. A generic CLI configuration cannot replace it.
 
 `repo` names a repository root relative to the workspace, not the session's
 current directory. Git directories and alternate stores must also stay inside

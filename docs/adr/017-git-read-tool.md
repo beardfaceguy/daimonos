@@ -76,9 +76,9 @@ can grant this access without also granting git writes?
 We will add a new built-in plugin tool named `git_read`. It is separate from
 `git`.
 
-1. **Tool boundary.** `git_read` is a new `ToolPlugin` (proposed file:
-   `src/plugins/git_read.rs`). It registers in `plugins::builtin_cli_plugins`
-   with `git::is_available` as its probe. So MCP, agent, and ACP mode all list
+1. **Tool boundary.** `git_read` is a `ToolPlugin` in
+   `src/plugins/git_read.rs`. It registers in `plugins::builtin_cli_plugins`
+   with `git_read::is_available` as its capability probe. So MCP, agent, and ACP mode all list
    it.
 2. **Operations.** `git_read` has only the 11 read ops in the spec: `resolve`,
    `show_file`, `list_tree`, `grep`, `log`, `show_commit`, `diff`, `blame`,
@@ -111,9 +111,10 @@ We will add a new built-in plugin tool named `git_read`. It is separate from
    partial clone gives an "object missing" error. Git does not fetch the object.
 9. **Output.** Each successful response is structured JSON. It contains the
    full commit SHA or SHAs that the op read and the repository path. All caps
-   come from a new config section in `Config` and `daimonos.default.toml`
-   (proposed name: `[git_read]`). A truncated result says `"truncated": true`
+   come from `GitReadConfig` and `[git_read]` in `daimonos.default.toml`. A truncated result says `"truncated": true`
    and gives a continuation offset where one makes sense.
+   Responses also respect `tool_output.max_bytes`. Reject oversized responses
+   before the shared output handler can persist them.
 10. **Errors.** Each failure has its own error kind: unknown revision, path not
     found at revision, object missing, binary file, repository outside the
     workspace, and rejected argument. Proposed names: `unknown_revision`,
@@ -131,7 +132,80 @@ We will add a new built-in plugin tool named `git_read`. It is separate from
     Every request also passes that option. Never use a fallback that can fetch.
 
 ## Open questions
-5. **Names.** The config section, the error kinds, and the file and type names
-   are proposed.
-6. **Participants.** Consulted and Informed are empty. Add names if other
-   people take part.
+The implementation resolves the proposed names. No product question remains open.
+Consulted and Informed remain empty because no other participants were recorded.
+
+
+## Alternatives
+
+- **Gate the existing git tool by operation.** This requires a new permission contract across all callers.
+  It also changes the existing git tool, which the spec excludes.
+- **Add a read-only mode to git.** A configuration mistake could restore writes under an already allowed tool name.
+  Interactive approval would still classify the whole tool as destructive.
+- **Permit selected git commands through exec.** Caller-controlled flags remain an injection risk.
+  For example, `git diff --output` can write a file.
+- **Use gix or git2.** A library avoids subprocess configuration hazards.
+  It adds a crate dependency and different behavior for grep, shallow clones, and partial clones.
+  This change does not add that dependency.
+- **Rely only on client filters or read-only mounts.** These remain useful additional controls.
+  A mount does not prevent network access or repository-controlled programs.
+  Client filters do not replace a safe implementation of the granted tool.
+
+## Consequences
+
+The existing permission model can grant git reads without granting git writes.
+Reviewer citations use full commit SHAs rather than moving refs.
+
+The tool adds a schema and a second set of git argument templates.
+Maintainers must review git behavior changes that affect configuration or object fetching.
+Older git installations do not register the tool.
+Some operations need multiple subprocesses to resolve and read pinned objects.
+Configured output caps can reject large reads instead of returning incomplete structured records.
+
+This decision does not add an MCP allowlist or repair delegated policy enforcement.
+The report in `docs/security-reports/2026-10-27-delegated-tool-policy.md` records those separate findings.
+
+## Confirmation
+
+The implementation uses these executable checks:
+
+```bash
+cargo test plugins::git_read::tests
+cargo test git_read_runs_in_agent_mode_while_git_is_blocked
+cargo test git_read_allowlist_does_not_grant_git_or_request_approval
+python3 -m pytest tests/test_git_read.py -v
+cargo test
+python3 -m pytest tests/ -v
+cargo clippy --all-targets -- -D warnings
+```
+
+The focused suite checks all operations against full repository mutation snapshots.
+It also checks malicious configuration, option injection, local object failures, and workspace confinement.
+The agent test verifies that reads run while the write-capable git tool remains blocked.
+The policy audit reproductions document unsafe behavior. They do not assert that the policy is secure.
+
+## Anchors
+
+_Anchors:_
+
+- `src/plugins/git_read.rs::GitReadPlugin`
+- `src/plugins/git_read.rs::is_available`
+- `src/plugins/git_read/runner.rs::ReadRepo`
+- `src/plugins/git_read/tests.rs::every_operation_preserves_git_and_worktree_even_when_stat_stale`
+- `src/plugins/git_read/tests.rs::every_operation_ignores_malicious_config`
+- `src/config.rs::GitReadConfig`
+- `src/plugins/mod.rs::builtin_cli_plugins`
+- `src/plugins/git.rs::GitPlugin`
+- `src/safety.rs::DESTRUCTIVE_TOOLS`
+- `src/safety.rs::SafetyPolicy::gate`
+- `src/agent.rs::git_read_runs_in_agent_mode_while_git_is_blocked`
+- `src/managed_process.rs::run`
+
+## Revisit when
+
+- Another tool family needs a separate read-only identity.
+- A git release adds a configuration path that can execute code during these operations.
+- A library backend meets the operation requirements and a new dependency is acceptable.
+- Daimonos adopts an MCP policy or inner-call policy enforcement.
+
+Implementation notes updated: 2026-10-27. The accepted boundary remains unchanged.

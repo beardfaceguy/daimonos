@@ -30,9 +30,14 @@ const OPERATIONS: &[&str] = &[
 pub struct GitReadPlugin {
     descriptor: ToolDescriptor,
     limits: GitReadConfig,
+    response_cap: usize,
 }
 
 impl GitReadPlugin {
+    pub fn with_response_cap(mut self, cap: usize) -> Self {
+        self.response_cap = self.response_cap.min(cap);
+        self
+    }
     pub fn new(limits: GitReadConfig) -> Self {
         let commands = OPERATIONS
             .iter()
@@ -48,6 +53,7 @@ impl GitReadPlugin {
             })
             .collect();
         Self {
+            response_cap: limits.max_output_bytes,
             limits,
             descriptor: ToolDescriptor {
                 id: "git_read".into(),
@@ -135,19 +141,17 @@ impl ToolPlugin for GitReadPlugin {
             output["repo"] = json!(repo.path);
             output["shallow"] = json!(repo.shallow);
             output["partial"] = json!(repo.partial);
-            if output.to_string().len() > self.limits.max_output_bytes {
-                return Err(
-                    Failure::new("output_limit", "JSON exceeds git_read.max_output_bytes")
-                        .truncated(),
-                );
-            }
             Ok(output)
         }
         .await;
-        let (output, exit_code) = match result {
+        let (mut output, mut exit_code) = match result {
             Ok(output) => (output, 0),
             Err(failure) => (failure.json(), 1),
         };
+        if output.to_string().len() > self.response_cap {
+            output = output_limit_response();
+            exit_code = 1;
+        }
         Ok(ToolResult {
             tool: "git_read".into(),
             command: command.into(),
@@ -156,6 +160,11 @@ impl ToolPlugin for GitReadPlugin {
             stderr: String::new(),
         })
     }
+}
+
+/// Config validation ensures that even the smallest response cap fits this error.
+pub(crate) fn output_limit_response() -> Value {
+    json!({"error":{"kind":"output_limit","message":"response exceeds byte cap"},"truncated":true})
 }
 
 impl Arguments {
@@ -234,7 +243,7 @@ impl GitReadPlugin {
             "resolve" => {
                 let original = repo.object(args.rev()).await?;
                 let kind = repo.text(&["cat-file", "-t", &original]).await?;
-                let commit = repo.commit(args.rev()).await?;
+                let commit = repo.commit(&original).await?;
                 Ok(json!({"commits":[commit], "object_sha":original, "object_type":kind.trim()}))
             }
             "show_file" => {
@@ -284,18 +293,7 @@ impl GitReadPlugin {
                 let tree = if let Some(path) =
                     args.path.as_deref().filter(|p| !p.is_empty() && *p != ".")
                 {
-                    let tree = format!("{commit}:{path}");
-                    let out = repo.output(&["cat-file", "-t", &tree]).await?;
-                    if !out.status.success() {
-                        return Err(Failure::new(
-                            "path_not_found",
-                            "tree path is absent at revision",
-                        ));
-                    }
-                    if out.stdout.trim() != "tree" {
-                        return Err(Failure::new("path_not_found", "path is not a tree"));
-                    }
-                    tree
+                    repo.path_object(&commit, path, "tree").await?
                 } else {
                     commit.clone()
                 };

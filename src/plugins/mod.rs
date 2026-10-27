@@ -44,7 +44,11 @@ fn builtin_cli_plugins() -> Vec<BuiltinPlugin> {
             |_| Arc::new(git::GitPlugin::new()),
         ),
         ("git_read", git_read::is_available, |cfg| {
-            Arc::new(git_read::GitReadPlugin::new(cfg.git_read.clone()))
+            // ADR-017: reject large responses before the shared boundary can spill them.
+            Arc::new(
+                git_read::GitReadPlugin::new(cfg.git_read.clone())
+                    .with_response_cap(cfg.tool_output.max_bytes),
+            )
         }),
         ("docker", docker::is_available, |_| {
             Arc::new(docker::DockerPlugin::new())

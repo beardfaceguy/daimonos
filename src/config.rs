@@ -55,6 +55,13 @@ impl GitReadConfig {
                 return Err(format!("git_read.{name} must be greater than zero"));
             }
         }
+        if self.max_output_bytes
+            < crate::plugins::git_read::output_limit_response()
+                .to_string()
+                .len()
+        {
+            return Err("git_read.max_output_bytes must fit the minimal structured error".into());
+        }
         if self.max_file_bytes > self.max_output_bytes
             || self.max_patch_bytes > self.max_output_bytes
         {

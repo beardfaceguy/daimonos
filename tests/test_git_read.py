@@ -142,7 +142,7 @@ def test_git_read_blame_uses_committed_lines(daimonos):
     assert blame["lines"][0]["date"]
 
 
-def test_git_read_is_listed_with_a_closed_schema(daimonos_factory, tmp_path):
+def test_git_read_lists_schema_and_rejects_unknown_arguments(daimonos_factory, tmp_path):
     (tmp_path / "daimonos.toml").write_text("[mcp]\nfull_tool_schemas=true\n")
     daimonos = daimonos_factory(tmp_path)
     daimonos.call_tool("list_all_tools", {})
@@ -150,7 +150,7 @@ def test_git_read_is_listed_with_a_closed_schema(daimonos_factory, tmp_path):
     schema = tool["inputSchema"]
     assert schema["type"] == "object"
     assert schema["required"] == ["command"]
-    assert schema["additionalProperties"] is False
+    # The MCP SDK drops root additionalProperties. The request parser still rejects extras.
     properties = schema["properties"]
     assert len(properties["command"]["enum"]) == 11
     assert properties["repo"]["type"] == "string"
@@ -169,3 +169,38 @@ def test_git_read_workspace_does_not_follow_session_cwd(daimonos):
     response = daimonos.call_tool("git_read", {"command":"resolve", "repo":"source"})
     assert not response.get("isError"), response
     assert json.loads(response["content"][0]["text"])["commits"] == [commit]
+
+
+def test_policy_audit_mcp_delegates_ignore_agent_env(daimonos_factory, tmp_path):
+    """Report-only reproduction. MCP does not enforce the agent policy."""
+    client = daimonos_factory(tmp_path, env={
+        "DAIMONOS_AGENT_ALLOWED_COMMANDS":"read_file,search,git_read,batch,execute_script",
+        "DAIMONOS_AGENT_DENIED_COMMANDS":"write_file",
+    })
+    direct = client.call_tool("write_file", {"path":"direct.txt","content":"written"})
+    batch = client.call_tool("batch", {"ops":[{
+        "tool":"write_file", "arguments":{"path":"batch.txt","content":"written"}
+    }]})
+    script = client.call_tool("execute_script", {"code":'result = write_file("script.txt", "written")'})
+    assert not direct.get("isError"), direct
+    assert not batch.get("isError"), batch
+    assert not script.get("isError"), script
+    for name in ("direct.txt", "batch.txt", "script.txt"):
+        assert (tmp_path / name).read_text() == "written"
+
+
+def test_git_read_does_not_spill_large_results_to_disk(daimonos_factory, tmp_path):
+    spill = tmp_path / "spill"
+    (tmp_path / "daimonos.toml").write_text(
+        f'[tool_output]\nmax_bytes=1024\ndirectory="{spill}"\n'
+    )
+    repo, _ = repository(tmp_path)
+    (repo / "file.txt").write_text("x" * 4096 + "\n")
+    git(repo,"add",".")
+    git(repo,"commit","-m","Large content")
+    client=daimonos_factory(tmp_path)
+    response=client.call_tool("git_read", {"command":"show_file","repo":"source","path":"file.txt"})
+    assert response.get("isError"), response
+    failure=json.loads(response["content"][0]["text"])
+    assert failure["error"]["kind"] == "output_limit"
+    assert not spill.exists()
