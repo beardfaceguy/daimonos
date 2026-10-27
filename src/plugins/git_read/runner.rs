@@ -44,6 +44,8 @@ pub(super) struct ReadRepo {
     pub shallow: bool,
     pub partial: bool,
     pub bare: bool,
+    strict_pinning: bool,
+    filter_overrides: Vec<String>,
     env: HashMap<String, String>,
     process: ProcessConfig,
 }
@@ -197,9 +199,54 @@ impl ReadRepo {
             shallow: false,
             partial: false,
             bare,
+            strict_pinning: limits.strict_pinning,
+            filter_overrides: Vec::new(),
             env,
             process,
         };
+        // status can run clean/process filters while comparing dirty files. Disable every
+        // configured driver before any operation that can inspect worktree content.
+        let filters = repo
+            .output(&[
+                "config",
+                "--null",
+                "--name-only",
+                "--get-regexp",
+                "^filter\\..*\\.(clean|smudge|process|required)$",
+            ])
+            .await?;
+        if filters.status.code() != Some(1) {
+            repo.check(&filters)?;
+        }
+        if filters.stdout_truncated
+            || filters.stderr_truncated
+            || filters.stdout.len() > limits.max_input_bytes
+        {
+            return Err(Failure::new(
+                "output_limit",
+                "filter configuration exceeds metadata budget",
+            ));
+        }
+        if !filters.stderr.trim().is_empty() {
+            return Err(Failure::new(
+                "invalid_repository",
+                "cannot safely inspect filter configuration",
+            ));
+        }
+        for key in filters.stdout.split_terminator('\0') {
+            if key.contains('=') || key.chars().any(char::is_control) {
+                return Err(Failure::new(
+                    "invalid_repository",
+                    "unsupported filter configuration key",
+                ));
+            }
+            let value = if key.ends_with(".required") {
+                "false"
+            } else {
+                ""
+            };
+            repo.filter_overrides.push(format!("{key}={value}"));
+        }
         repo.shallow = repo
             .text(&["rev-parse", "--is-shallow-repository"])
             .await?
@@ -259,6 +306,9 @@ impl ReadRepo {
         .iter()
         .map(|s| (*s).into())
         .collect();
+        for setting in &self.filter_overrides {
+            argv.extend(["-c".to_string(), setting.clone()]);
+        }
         argv.extend(arguments.iter().map(|s| (*s).into()));
         managed_process::run("git", &argv, &self.path, &self.env, &self.process, None)
             .await
@@ -338,7 +388,15 @@ impl ReadRepo {
         self.resolve(revision, "object").await
     }
     pub async fn commit(&self, revision: &str) -> Result<String, Failure> {
-        self.resolve(revision, "commit").await
+        let commit = self.resolve(revision, "commit").await?;
+        if self.strict_pinning && commit != revision.to_ascii_lowercase() {
+            return Err(Failure::new(
+                "rejected_argument",
+                "strict pinning requires a commit object, not a peeled tag",
+            ));
+        }
+
+        Ok(commit)
     }
     async fn resolve(&self, revision: &str, kind: &str) -> Result<String, Failure> {
         if revision.starts_with('-') || revision.contains('\0') {

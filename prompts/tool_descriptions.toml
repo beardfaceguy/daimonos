@@ -198,12 +198,12 @@ limit = "Max reservations to return (most-recent first)."
 full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
 
 [git_read]
-full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Use workspace-relative repo and path values. Revisions, paths, repo names, and patterns must not start with a hyphen. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only."""
+full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Use workspace-relative repo and path values. Revisions, paths, repo names, and patterns must not start with a hyphen. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only. When strict pinning is enabled, supply full SHA-1 commit hashes. Names, ranges, and unpinned operations are refused."""
 terse = "Read-only git at pinned commits. No writes or network."
 [git_read.parameters]
 command = "Operation to run. No raw commands or user flags."
 repo = "Repository root relative to the workspace. Default: workspace root."
-rev = "Commit, ref, tag, or log range. Default: HEAD."
+rev = "Commit, ref, tag, or log range. Default: HEAD. Strict pinning requires an explicit full commit hash."
 path = "Literal repository-relative path."
 paths = "Literal repository-relative paths."
 pattern = "Extended regular expression for grep. Must not start with a hyphen."
@@ -215,6 +215,7 @@ limit = "Maximum returned items, bounded by configuration."
 recursive = "list_tree: include descendants. Default: false."
 follow = "log: follow renames for one path. Default: false."
 patch = "show_commit: include a bounded patch preview. Default: false."
+include_body = "log and show_commit: include the commit body. Default: false."
 start_line = "blame: first line, one-based. Default: 1."
 end_line = "blame: final line, inclusive. Bounded by max_lines."
 

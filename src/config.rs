@@ -11,6 +11,7 @@ use std::sync::Arc;
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct GitReadConfig {
+    pub strict_pinning: bool,
     pub max_output_bytes: usize,
     pub max_file_bytes: usize,
     pub max_lines: usize,
@@ -25,6 +26,7 @@ pub struct GitReadConfig {
 impl Default for GitReadConfig {
     fn default() -> Self {
         Self {
+            strict_pinning: false,
             max_output_bytes: 1024 * 1024,
             max_file_bytes: 512 * 1024,
             max_lines: 1000,

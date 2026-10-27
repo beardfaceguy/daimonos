@@ -607,6 +607,8 @@ poll_interval_ms = 1500
 
 # Pinned, local git reads. See ADR-017 and GitReadConfig in src/config.rs.
 [git_read]
+# Require explicit full SHA-1 commit identifiers. Reject names, ranges, and unpinned operations.
+strict_pinning = false
 # Maximum captured bytes per stream and maximum serialized response bytes.
 max_output_bytes = 1048576
 # Reject larger blobs before reading their content.

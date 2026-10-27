@@ -1051,6 +1051,20 @@ raw model responses; the UUID is local, not a provider request ID.
 
 ## Read-only git (`git_read`)
 
+`git_read.strict_pinning` is false by default. Enable it to require explicit
+40-character SHA-1 commit identifiers. `diff` and `ancestry` then require `a` and
+`b`. Other permitted operations require `rev`. Names, ranges, implicit HEAD,
+short hashes, and annotated-tag object identifiers are rejected. `refs` and
+`worktree_status` are refused under this policy. Default revision resolution remains unchanged.
+
+`log` and `show_commit` accept `include_body=true`. Only that opt-in adds the
+`body` field to commit metadata. The existing response cap still applies.
+
+The runner disables configured clean, smudge, and process filters in both modes.
+Unsupported filter keys or oversized configuration fail closed before reads.
+Strict pinning is not required for process hardening. It adds immutable input selection.
+
+
 The `[git_read]` section bounds local, pinned git reads. `GitReadConfig` in
 `src/config.rs` defines the defaults. `daimonos.default.toml` lists every key.
 ADR-017 records the safety boundary.

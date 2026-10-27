@@ -127,9 +127,9 @@ async fn every_operation_preserves_git_and_worktree_even_when_stat_stale() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
         .unwrap();
-    for args in f.cases() {
+    for (args, limits) in f.policy_cases() {
         let before = snapshot(&f.repo);
-        let response = f.call(args.clone()).await;
+        let response = f.with_limits(args.clone(), limits).await;
         assert_eq!(response.exit_code, 0, "{args}: {}", response.output);
         assert_eq!(snapshot(&f.repo), before, "mutation in {args}");
         assert!(response.output["repo"].as_str().is_some());
@@ -166,9 +166,40 @@ async fn every_operation_ignores_malicious_config() {
         &f.repo,
         &["config", "diff.trap.textconv", script.to_str().unwrap()],
     );
-    fs::write(f.repo.join(".gitattributes"), "*.txt diff=trap\n").unwrap();
-    for args in f.cases() {
-        let response = f.call(args.clone()).await;
+    git(
+        &f.repo,
+        &["config", "filter.trap.clean", script.to_str().unwrap()],
+    );
+    git(
+        &f.repo,
+        &["config", "filter.trap.smudge", script.to_str().unwrap()],
+    );
+    git(
+        &f.repo,
+        &["config", "filter.trap.process", script.to_str().unwrap()],
+    );
+    git(&f.repo, &["config", "filter.trap.required", "true"]);
+    git(
+        &f.repo,
+        &["config", "alias.show", &format!("!{}", script.display())],
+    );
+    let hooks = f.workspace.path().join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    for hook in ["post-index-change", "post-checkout", "pre-auto-gc"] {
+        fs::copy(&script, hooks.join(hook)).unwrap();
+    }
+    git(
+        &f.repo,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    fs::write(
+        f.repo.join(".gitattributes"),
+        "*.txt diff=trap filter=trap\n",
+    )
+    .unwrap();
+    fs::write(f.repo.join("renamed.txt"), "dirty working-tree content\n").unwrap();
+    for (args, limits) in f.policy_cases() {
+        let response = f.with_limits(args.clone(), limits).await;
         assert_eq!(response.exit_code, 0, "{args}: {}", response.output);
         assert!(!sentinel.exists(), "repo code ran in {args}");
     }
@@ -646,5 +677,170 @@ async fn registered_plugin_uses_the_smaller_git_and_shared_response_caps() {
         assert_eq!(response.output["error"]["kind"], "output_limit");
         assert!(response.output.to_string().len() <= git_cap.min(shared_cap));
         assert_eq!(snapshot(&f.repo), before);
+    }
+}
+
+#[tokio::test]
+async fn strict_pinning_refuses_a_branch_while_the_default_keeps_it() {
+    let f = Fixture::new();
+    let args = json!({"command":"resolve","repo":"source","rev":"main"});
+    assert_eq!(f.call(args.clone()).await.exit_code, 0);
+    let strict = GitReadConfig {
+        strict_pinning: true,
+        ..Default::default()
+    };
+    let response = f.with_limits(args, strict).await;
+    assert_eq!(
+        response.output["error"]["kind"], "rejected_argument",
+        "{}",
+        response.output
+    );
+}
+
+#[tokio::test]
+async fn strict_pinning_requires_commit_objects_not_annotated_tag_objects() {
+    let f = Fixture::new();
+    git(
+        &f.repo,
+        &[
+            "tag",
+            "-a",
+            "policy-tag",
+            "-m",
+            "Tag object for strict policy",
+        ],
+    );
+    let tag = git(&f.repo, &["rev-parse", "refs/tags/policy-tag"]);
+    assert_eq!(
+        f.call(json!({"command":"resolve","repo":"source","rev":tag}))
+            .await
+            .exit_code,
+        0
+    );
+    let strict = GitReadConfig {
+        strict_pinning: true,
+        ..Default::default()
+    };
+    let response = f
+        .with_limits(
+            json!({"command":"resolve","repo":"source","rev":tag}),
+            strict,
+        )
+        .await;
+    assert_eq!(
+        response.output["error"]["kind"], "rejected_argument",
+        "{}",
+        response.output
+    );
+}
+
+impl Fixture {
+    fn policy_cases(&self) -> Vec<(Value, GitReadConfig)> {
+        let mut cases: Vec<_> = self
+            .cases()
+            .into_iter()
+            .map(|args| (args, GitReadConfig::default()))
+            .collect();
+        for mut args in self.cases() {
+            let command = args["command"].as_str().unwrap();
+            if matches!(command, "refs" | "worktree_status") {
+                continue;
+            }
+            if !matches!(command, "diff" | "ancestry")
+                && args
+                    .get("rev")
+                    .and_then(Value::as_str)
+                    .is_none_or(|rev| rev.len() != 40)
+            {
+                args["rev"] = json!(self.last);
+            }
+            cases.push((
+                args,
+                GitReadConfig {
+                    strict_pinning: true,
+                    ..Default::default()
+                },
+            ));
+        }
+        cases
+    }
+}
+
+#[tokio::test]
+async fn strict_pinning_rejects_all_unpinned_revision_forms_and_operations() {
+    let f = Fixture::new();
+    let strict = GitReadConfig {
+        strict_pinning: true,
+        ..Default::default()
+    };
+    for command in OPERATIONS {
+        if matches!(*command, "refs" | "worktree_status") {
+            let result = f
+                .with_limits(
+                    json!({"command":command,"repo":"source","rev":f.last}),
+                    strict.clone(),
+                )
+                .await;
+            assert_eq!(result.output["error"]["kind"], "rejected_argument");
+            continue;
+        }
+        for revision in [
+            None,
+            Some("HEAD"),
+            Some("HEAD~1"),
+            Some("main"),
+            Some("review"),
+            Some("abcd123"),
+            Some("HEAD..main"),
+        ] {
+            let mut args = json!({"command":command,"repo":"source","path":"renamed.txt"});
+            if matches!(*command, "diff" | "ancestry") {
+                args["b"] = json!(f.last);
+                if let Some(revision) = revision {
+                    args["a"] = json!(revision);
+                }
+            } else if let Some(revision) = revision {
+                args["rev"] = json!(revision);
+            }
+            let result = f.with_limits(args.clone(), strict.clone()).await;
+            assert_eq!(
+                result.output["error"]["kind"], "rejected_argument",
+                "{args}: {}",
+                result.output
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn commit_bodies_are_additive_and_do_not_change_default_log_fields() {
+    let f = Fixture::new();
+    git(
+        &f.repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Body fixture",
+            "-m",
+            "First body line.\nSecond body line.",
+        ],
+    );
+    let ordinary = f
+        .call(json!({"command":"log","repo":"source","limit":1}))
+        .await;
+    assert!(ordinary.output["entries"][0].get("body").is_none());
+    for command in ["log", "show_commit"] {
+        let result = f
+            .call(json!({"command":command,"repo":"source","limit":1,"include_body":true}))
+            .await;
+        assert_eq!(result.exit_code, 0, "{}", result.output);
+        let commit = if command == "log" {
+            &result.output["entries"][0]
+        } else {
+            &result.output["commit"]
+        };
+        assert_eq!(commit["body"], "First body line.\nSecond body line.\n");
+        assert_eq!(commit["subject"], "Body fixture");
     }
 }

@@ -292,3 +292,90 @@ def test_git_read_short_inheritance_prefixes_do_not_leak_git_controls(daimonos_f
         response=client.call_tool("git_read",{"command":"resolve","repo":"source"})
         assert not response.get("isError"),response
         assert not trace.exists(),f"git controls leaked through prefix {prefix!r}"
+
+
+def test_git_read_strict_policy_keeps_default_resolution_and_adds_bodies(daimonos_factory,tmp_path):
+    repo,first=repository(tmp_path)
+    git(repo,"commit","--allow-empty","-m","Body fixture","-m","Stored body.")
+    commit=git(repo,"rev-parse","HEAD")
+    ordinary=daimonos_factory(tmp_path)
+    assert not ordinary.call_tool("git_read",{"command":"resolve","repo":"source","rev":"HEAD"}).get("isError")
+    (tmp_path/"daimonos.toml").write_text("[git_read]\nstrict_pinning=true\n")
+    strict=daimonos_factory(tmp_path)
+    for revision in (None,"HEAD","main",commit[:10],"HEAD~1",f"{first}..{commit}"):
+        args={"command":"resolve","repo":"source"}
+        if revision is not None:
+            args["rev"]=revision
+        response=strict.call_tool("git_read",args)
+        assert response.get("isError"),response
+        assert json.loads(response["content"][0]["text"])["error"]["kind"]=="rejected_argument"
+    resolved=strict.call_tool("git_read",{"command":"resolve","repo":"source","rev":commit})
+    assert not resolved.get("isError"),resolved
+    assert json.loads(resolved["content"][0]["text"])["commits"]==[commit]
+    history=strict.call_tool("git_read",{"command":"log","repo":"source","rev":commit,"include_body":True,"limit":1})
+    assert not history.get("isError"),history
+    assert json.loads(history["content"][0]["text"])["entries"][0]["body"]=="Stored body.\n"
+    assert not ordinary.call_tool("git_read",{"command":"resolve","repo":"source","rev":"HEAD"}).get("isError")
+
+
+def test_git_read_strict_operations_on_a_real_read_only_bind_mount(daimonos_binary,tmp_path):
+    import errno
+    import os
+    import shutil
+    import sys
+    import pytest
+
+    if sys.platform!="linux" or not shutil.which("unshare"):
+        pytest.skip("requires Linux user and mount namespaces")
+    supported=subprocess.run(["unshare","-Urnm","true"],capture_output=True,text=True)
+    if supported.returncode:
+        pytest.skip("user or mount namespaces are unavailable")
+    workspace=tmp_path/"evidence"
+    workspace.mkdir()
+    _,commit=repository(workspace)
+    (workspace/"daimonos.toml").write_text("[git_read]\nstrict_pinning=true\n[logging]\nenabled=false\n[analytics]\nenabled=false\n")
+    source_tests=str(Path(__file__).resolve().parent)
+    program=r'''
+import errno,hashlib,json,os,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from conftest import DaimonosClient
+binary,workspace,commit=sys.argv[2:]
+workspace=Path(workspace)
+def snapshot():
+    return [(str(p.relative_to(workspace)),p.lstat().st_size,p.lstat().st_mtime_ns,hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None) for p in sorted(workspace.rglob("*"))]
+subprocess.run(["mount","--bind",str(workspace),str(workspace)],check=True)
+subprocess.run(["mount","-o","remount,bind,ro",str(workspace)],check=True)
+try:
+    (workspace/"must-not-write").write_text("forbidden")
+    raise AssertionError("the mount is not read-only")
+except OSError as error:
+    assert error.errno==errno.EROFS,error
+before=snapshot()
+process=subprocess.Popen([binary,"--mcp","-w",str(workspace)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+try:
+    client=DaimonosClient(process,str(workspace))
+    client.send_raw({"jsonrpc":"2.0","id":client._next_id(),"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"readonly-probe","version":"1"}}})
+    client.send_raw({"jsonrpc":"2.0","method":"notifications/initialized"})
+    calls=[{"command":"resolve"},{"command":"show_file","path":"file.txt"},{"command":"list_tree"},{"command":"grep","pattern":"first"},{"command":"log","include_body":True},{"command":"show_commit","include_body":True},{"command":"diff","a":commit,"b":commit},{"command":"blame","path":"file.txt"},{"command":"ancestry","a":commit,"b":commit}]
+    for args in calls:
+        if args["command"] not in ("diff","ancestry"):
+            args["rev"]=commit
+        response=client.call_tool("git_read",{"repo":"source",**args})
+        assert not response.get("isError"),(args,response)
+        assert commit in json.loads(response["content"][0]["text"])["commits"]
+    for command in ("refs","worktree_status"):
+        response=client.call_tool("git_read",{"repo":"source","command":command})
+        assert response.get("isError"),response
+        assert json.loads(response["content"][0]["text"])["error"]["kind"]=="rejected_argument"
+finally:
+    process.terminate()
+    process.wait(timeout=5)
+assert snapshot()==before,"the evidence changed"
+print(json.dumps({"read_only_mount":True,"pinned_operations":9,"refused_operations":2,"unchanged":True}))
+'''
+    env=os.environ.copy()
+    env["DAIMONOS_KGL_AUTOINDEX"]="0"
+    result=subprocess.run(["unshare","-Urnm",sys.executable,"-c",program,source_tests,str(daimonos_binary),str(workspace),commit],env=env,capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert json.loads(result.stdout)=={"read_only_mount":True,"pinned_operations":9,"refused_operations":2,"unchanged":True}

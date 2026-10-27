@@ -99,6 +99,7 @@ struct Arguments {
     recursive: bool,
     follow: bool,
     patch: bool,
+    include_body: bool,
     start_line: Option<usize>,
     end_line: Option<usize>,
 }
@@ -130,6 +131,9 @@ impl ToolPlugin for GitReadPlugin {
             let args: Arguments = serde_json::from_value(input)
                 .map_err(|e| Failure::new("rejected_argument", e.to_string()))?;
             args.validate(command)?;
+            if self.limits.strict_pinning {
+                args.validate_pinning(command)?;
+            }
             let repo = ReadRepo::open(
                 workspace,
                 args.repo.as_deref().unwrap_or("."),
@@ -208,6 +212,39 @@ impl Arguments {
         }
         if self.limit == Some(0) {
             return Err(Failure::new("rejected_argument", "limit must be positive"));
+        }
+        Ok(())
+    }
+    fn validate_pinning(&self, command: &str) -> Result<(), Failure> {
+        // ADR-018: strict inputs are commit identifiers, not names resolved after the call starts.
+        if matches!(command, "refs" | "worktree_status") {
+            return Err(Failure::new(
+                "rejected_argument",
+                "strict pinning refuses unpinned operations",
+            ));
+        }
+        let full_commit =
+            |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        for value in [&self.rev, &self.a, &self.b].into_iter().flatten() {
+            if !full_commit(value) {
+                return Err(Failure::new(
+                    "rejected_argument",
+                    "strict pinning requires full 40-character commit hashes",
+                ));
+            }
+        }
+        if matches!(command, "diff" | "ancestry") {
+            if self.a.is_none() || self.b.is_none() || self.rev.is_some() {
+                return Err(Failure::new(
+                    "rejected_argument",
+                    "strict pinning requires explicit a and b hashes, without rev",
+                ));
+            }
+        } else if self.rev.is_none() {
+            return Err(Failure::new(
+                "rejected_argument",
+                "strict pinning requires an explicit rev hash",
+            ));
         }
         Ok(())
     }
@@ -448,6 +485,7 @@ impl GitReadPlugin {
                     &commit,
                     &Arguments {
                         limit: Some(1),
+                        include_body: args.include_body,
                         ..Default::default()
                     },
                     1,
@@ -721,6 +759,7 @@ pub fn schema() -> Value {
         "a":{"type":"string"}, "b":{"type":"string"}, "mode":{"type":"string","enum":["stat","patch"]},
         "offset":{"type":"integer","minimum":0}, "limit":{"type":"integer","minimum":1},
         "recursive":{"type":"boolean"}, "follow":{"type":"boolean"}, "patch":{"type":"boolean"},
+        "include_body":{"type":"boolean"},
         "start_line":{"type":"integer","minimum":1}, "end_line":{"type":"integer","minimum":1}
     }})
 }
@@ -758,6 +797,11 @@ async fn history(
 ) -> Result<Vec<Value>, Failure> {
     let limit = format!("--max-count={}", args.limit(max_commits).saturating_add(1));
     let skip = format!("--skip={}", args.offset);
+    let format = if args.include_body {
+        "--format=%H%x00%an%x00%aI%x00%cI%x00%s%x00%b"
+    } else {
+        "--format=%H%x00%an%x00%aI%x00%cI%x00%s"
+    };
     let mut argv = vec![
         "log",
         "--no-ext-diff",
@@ -765,7 +809,7 @@ async fn history(
         "--no-show-signature",
         "--no-use-mailmap",
         "--encoding=UTF-8",
-        "--format=%H%x00%an%x00%aI%x00%cI%x00%s",
+        format,
         "-z",
         &limit,
         &skip,
@@ -785,11 +829,16 @@ async fn history(
     let out = repo.text(&argv).await?;
     let fields: Vec<_> = out.split_terminator('\0').collect();
     let mut entries = Vec::new();
-    for record in fields.chunks(5) {
-        if record.len() != 5 {
+    let width = if args.include_body { 6 } else { 5 };
+    for record in fields.chunks(width) {
+        if record.len() != width {
             return Err(Failure::new("git_error", "invalid log record"));
         }
-        entries.push(json!({"sha":record[0],"author":record[1],"author_date":record[2],"committer_date":record[3],"subject":record[4]}));
+        let mut entry = json!({"sha":record[0],"author":record[1],"author_date":record[2],"committer_date":record[3],"subject":record[4]});
+        if args.include_body {
+            entry["body"] = json!(record[5]);
+        }
+        entries.push(entry);
     }
     Ok(entries)
 }

@@ -4,7 +4,7 @@ Date: 2026-10-26
 
 | Context | Glossary | Decisions |
 |---------|----------|-----------|
-| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md) |
+| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md) |
 
 This map covers the git-read context. Other contexts are not mapped here yet.
 
