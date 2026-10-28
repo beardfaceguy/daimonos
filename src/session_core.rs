@@ -1,3 +1,4 @@
+//! Context: docs/contexts/session-durability/CONTEXT.md and docs/adr/020-durable-turn-checkpoints.md.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -996,11 +997,11 @@ pub struct SessionCore {
     pub(crate) tool_lifecycle: Arc<CanonicalToolLifecycle>,
     runtime_options: StdMutex<Vec<RuntimeOption>>,
     current_context_usage: StdMutex<Option<ContextUsage>>,
-    persistence_generation: AtomicU64,
+    persistence_generation: Arc<AtomicU64>,
     persistence_gate: tokio::sync::Mutex<()>,
     persistence_requested: AtomicU64,
     persistence_completed: AtomicU64,
-    durability_status: AtomicU8,
+    durability_status: Arc<AtomicU8>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -1145,13 +1146,13 @@ impl SessionCore {
             tool_lifecycle,
             runtime_options: StdMutex::new(Vec::new()),
             current_context_usage: StdMutex::new(None),
-            persistence_generation: AtomicU64::new(0),
+            persistence_generation: Arc::new(AtomicU64::new(0)),
             persistence_gate: tokio::sync::Mutex::new(()),
             persistence_requested: AtomicU64::new(0),
             persistence_completed: AtomicU64::new(0),
-            durability_status: AtomicU8::new(durability_status_code(
+            durability_status: Arc::new(AtomicU8::new(durability_status_code(
                 crate::session_protocol::DurabilityStatus::Saved,
-            )),
+            ))),
             persistence,
         }
     }
@@ -1351,6 +1352,94 @@ impl SessionCore {
         let _ = self
             .events
             .emit(SessionEvent::ContextUsageChanged { usage });
+    }
+
+    /// ADR-020: persist a restart-safe projection without committing the live turn.
+    pub(crate) async fn configure_turn_checkpoint(
+        &self,
+        session: &mut AgentSession,
+        client_id: Option<&str>,
+        retry: bool,
+    ) {
+        let Some(persistence) = self.persistence.clone() else {
+            session.set_turn_checkpoint(None);
+            return;
+        };
+        let mut ids = self.client_user_message_ids.lock().await.clone();
+        align_client_user_message_ids(&mut ids, session.user_turn_count());
+        let mut outcomes = self
+            .assistant_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if retry {
+            outcomes.pop();
+        } else {
+            ids.push(client_id.unwrap_or_default().to_string());
+        }
+        outcomes.push(AssistantOutcome::Aborted);
+        let model = self.current_model();
+        let thinking = session.thinking().as_str().to_string();
+        let cwd = self.cwd.clone();
+        let generations = Arc::clone(&self.persistence_generation);
+        let status = Arc::clone(&self.durability_status);
+        let events = Arc::clone(&self.events);
+        session.set_turn_checkpoint(Some(Arc::new(move |messages| {
+            let persistence = persistence.clone();
+            let generations = Arc::clone(&generations);
+            let status = Arc::clone(&status);
+            let events = Arc::clone(&events);
+            let model = model.clone();
+            let thinking = thinking.clone();
+            let cwd = cwd.clone();
+            let ids = ids.clone();
+            let outcomes = outcomes.clone();
+            Box::pin(async move {
+                persistence.mark_dirty();
+                let turns = messages.iter().filter(|message| crate::agent::is_user_turn_message(message)).count();
+                let mut ids = ids;
+                align_client_user_message_ids(&mut ids, turns);
+                let mut outcomes = outcomes;
+                if outcomes.len() > turns {
+                    outcomes.drain(..outcomes.len() - turns);
+                }
+                let policy = persistence.retry_policy;
+                let mut delay = policy.initial_backoff;
+                for attempt in 1..=policy.attempts {
+                    let capture = PersistenceCapture {
+                        generation: generations.fetch_add(1, Ordering::AcqRel) + 1,
+                        // A recovery projection does not claim coverage of transient UI deltas.
+                        through_seq: 0, model: model.clone(), thinking: thinking.clone(),
+                        messages: messages.clone(), cwd: cwd.clone(),
+                        client_user_message_ids: ids.clone(), assistant_outcomes: outcomes.clone(),
+                    };
+                    match Self::save_capture_blocking(persistence.clone(), capture).await {
+                        Ok(PersistenceSaveOutcome::Saved | PersistenceSaveOutcome::SkippedDeleted) => {
+                            events.transition_durability(&status, crate::session_protocol::DurabilityStatus::Unsaved);
+                            return;
+                        }
+                        Ok(PersistenceSaveOutcome::Superseded) => {
+                            events.transition_durability(&status, crate::session_protocol::DurabilityStatus::Superseded);
+                            return;
+                        }
+                        Ok(PersistenceSaveOutcome::SkippedStale { stored_generation }) => {
+                            generations.fetch_max(stored_generation, Ordering::AcqRel);
+                            if attempt == policy.attempts { return; }
+                        }
+                        Err(error) => {
+                            let retryable = is_retryable_persistence_error(&error);
+                            persistence.mark_degraded(retryable);
+                            events.transition_durability(&status, crate::session_protocol::DurabilityStatus::Degraded);
+                            tracing::warn!(target: "daimonos::session_core", event="turn_checkpoint_save_failed",
+                                attempt, retryable, error=%error);
+                            if !retryable || attempt == policy.attempts { return; }
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(policy.max_backoff);
+                }
+            })
+        })));
     }
 
     /// Phase one samples the router, then captures a payload under the
@@ -1847,6 +1936,13 @@ impl SessionCore {
         if self.persistence.is_some() {
             self.publish_durability_status(crate::session_protocol::DurabilityStatus::Unsaved);
         }
+        self.configure_turn_checkpoint(
+            &mut agent_session,
+            client_user_message_id.as_deref(),
+            false,
+        )
+        .await;
+        agent_session.checkpoint_accepted_user(&user_message).await;
         let _ = self.events.emit(SessionEvent::UserMessage {
             text: canonical_user_text,
             request_id: event_request_id,
@@ -1864,6 +1960,7 @@ impl SessionCore {
                 _ = active_turn.cancelled() => None,
             }
         };
+        agent_session.set_turn_checkpoint(None);
         let (turn, cancelled_kind) = match staged_result {
             Some(result) if active_turn.mark_completed() => {
                 (Some(agent_session.commit_staged(result, true)), None)
@@ -2093,6 +2190,7 @@ impl TurnSignal {
 #[derive(Default)]
 pub struct TurnController {
     active: StdMutex<Option<std::sync::Arc<TurnSignal>>>,
+    idle: tokio::sync::Notify,
 }
 
 pub struct ActiveTurn<'a> {
@@ -2157,6 +2255,19 @@ impl TurnController {
         true
     }
 
+    /// Wait until the permit owner finishes its terminal persistence write.
+    pub async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if !self.is_active() {
+                return;
+            }
+            idle.await;
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
             .lock()
@@ -2196,6 +2307,7 @@ impl Drop for ActiveTurn<'_> {
             .is_some_and(|signal| std::sync::Arc::ptr_eq(signal, &self.signal))
         {
             *active = None;
+            self.controller.idle.notify_waiters();
         }
     }
 }
@@ -4499,6 +4611,97 @@ mod tests {
             events,
             lifecycle,
         ))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_reports_degraded_and_a_later_boundary_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let persistence = SessionPersistence::new(
+            "session-1",
+            store.clone(),
+            PersistenceRetryPolicy::single_attempt(),
+        );
+        persistence.fail_saves([std::io::ErrorKind::PermissionDenied]);
+        let core = persistence_test_core(directory.path(), persistence);
+        let mut session = core.session.lock().await;
+        core.configure_turn_checkpoint(&mut session, Some("pending-id"), false)
+            .await;
+        session
+            .checkpoint_accepted_user(&Message::user("pending"))
+            .await;
+        assert_eq!(
+            core.durability_status(),
+            crate::session_protocol::DurabilityStatus::Degraded
+        );
+        assert_eq!(
+            core.persistence_health(),
+            PersistenceHealth::Degraded { retryable: false }
+        );
+        assert!(
+            session.history().is_empty(),
+            "a recovery save must not commit the live turn"
+        );
+        session
+            .checkpoint_accepted_user(&Message::user("pending"))
+            .await;
+        // ADR-015 keeps degradation visible until a full terminal save succeeds.
+        // A recovery-only checkpoint must not claim that all UI state is saved.
+        assert_eq!(
+            core.durability_status(),
+            crate::session_protocol::DurabilityStatus::Degraded
+        );
+        let record = store.load_result("session-1").unwrap();
+        assert_eq!(record.client_user_message_ids, vec!["pending-id"]);
+        assert_eq!(record.assistant_outcomes, vec![AssistantOutcome::Aborted]);
+        assert!(
+            session.history().is_empty(),
+            "successful recovery saves remain separate from live canonical history"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_checkpoint_aligns_metadata_after_compaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        let core = persistence_test_core(
+            directory.path(),
+            SessionPersistence::new(
+                "session-1",
+                store.clone(),
+                PersistenceRetryPolicy::single_attempt(),
+            ),
+        );
+        let mut session = core.session.lock().await;
+        session.set_history(vec![
+            Message::user("old"),
+            Message::assistant("old answer"),
+            Message::user("recent"),
+            Message::assistant("recent answer"),
+        ]);
+        *core.client_user_message_ids.lock().await = vec!["old-id".into(), "recent-id".into()];
+        *core.assistant_outcomes.lock().unwrap() =
+            vec![AssistantOutcome::Refused, AssistantOutcome::Completed];
+        core.configure_turn_checkpoint(&mut session, Some("pending-id"), false)
+            .await;
+        // The provider loop can compact the base after the hook captures turn metadata.
+        session.set_history(vec![
+            Message::user("[Summary of earlier conversation: old]"),
+            Message::user("recent"),
+            Message::assistant("recent answer"),
+        ]);
+        session
+            .checkpoint_accepted_user(&Message::user("pending"))
+            .await;
+        let record = store.load_result("session-1").unwrap();
+        assert_eq!(
+            record.client_user_message_ids,
+            vec!["recent-id", "pending-id"]
+        );
+        assert_eq!(
+            record.assistant_outcomes,
+            vec![AssistantOutcome::Completed, AssistantOutcome::Aborted]
+        );
     }
 
     #[tokio::test]

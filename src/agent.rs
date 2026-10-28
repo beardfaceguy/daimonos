@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+//! Context: docs/contexts/session-durability/CONTEXT.md and docs/adr/020-durable-turn-checkpoints.md.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -50,6 +51,13 @@ pub type BeforeHook = Box<
 >;
 pub type AfterHook = Box<dyn Fn(&ToolCallInfo, &str, bool) -> AfterHookResult + Send + Sync>;
 pub type ToolProgressHook = Box<dyn Fn(&ToolCallInfo, crate::ops::ExecProgress) + Send + Sync>;
+
+/// Awaited at authoritative boundaries, never from streamed-token callbacks.
+pub(crate) type TurnCheckpointHook = std::sync::Arc<
+    dyn Fn(Vec<Message>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 
@@ -898,7 +906,7 @@ async fn run_inner(
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
     if let Some(journal) = &journal {
-        journal.checkpoint(&messages);
+        journal.checkpoint(&messages).await;
     }
 
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
@@ -989,7 +997,7 @@ async fn run_inner(
             }
         }
         if let Some(journal) = &journal {
-            journal.checkpoint(&messages);
+            journal.checkpoint(&messages).await;
         }
 
         // Safe boundary: no provider stream or tool call is active here. This
@@ -1162,7 +1170,7 @@ async fn run_inner(
                 content: resp.content.clone(),
             });
             if let Some(journal) = &journal {
-                journal.checkpoint(&messages);
+                journal.checkpoint(&messages).await;
             }
         }
 
@@ -1202,7 +1210,7 @@ async fn run_inner(
                     messages.push(Message::user(AUTO_CONTINUE_NUDGE));
                 }
                 if let Some(journal) = &journal {
-                    journal.checkpoint(&messages);
+                    journal.checkpoint(&messages).await;
                 }
                 continue;
             }
@@ -1300,7 +1308,7 @@ async fn run_inner(
                     messages.push(Message::user(ERROR_RESUME_NUDGE));
                 }
                 if let Some(journal) = &journal {
-                    journal.checkpoint(&messages);
+                    journal.checkpoint(&messages).await;
                 }
                 continue;
             }
@@ -1374,7 +1382,9 @@ async fn run_inner(
                                     is_error: true,
                                 });
                                 if let Some(journal) = &journal {
-                                    journal.checkpoint_tool_results(&messages, &tool_results);
+                                    journal
+                                        .checkpoint_tool_results(&messages, &tool_results)
+                                        .await;
                                 }
                                 continue;
                             }
@@ -1843,7 +1853,9 @@ async fn run_inner(
                         is_error,
                     });
                     if let Some(journal) = &journal {
-                        journal.checkpoint_tool_results(&messages, &tool_results);
+                        journal
+                            .checkpoint_tool_results(&messages, &tool_results)
+                            .await;
                         journal.record_usage(&total_usage, &resp.usage);
                     }
                 }
@@ -1854,7 +1866,7 @@ async fn run_inner(
                         content: tool_results,
                     });
                     if let Some(journal) = &journal {
-                        journal.checkpoint(&messages);
+                        journal.checkpoint(&messages).await;
                     }
                 }
 
@@ -1981,29 +1993,38 @@ struct TurnJournalState {
 struct TurnJournalWriter {
     state: std::sync::Arc<std::sync::Mutex<TurnJournalState>>,
     base_len: usize,
+    durable: Option<TurnCheckpointHook>,
+    cancellation_note: String,
 }
 
 impl TurnJournalWriter {
-    fn checkpoint(&self, messages: &[Message]) {
-        let suffix = messages.get(self.base_len..).unwrap_or_default().to_vec();
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .suffix = suffix;
+    async fn checkpoint(&self, messages: &[Message]) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.suffix = messages.get(self.base_len..).unwrap_or_default().to_vec();
+        }
+        // ADR-020: one awaited save per authoritative boundary. No streamed-token jobs.
+        if let Some(durable) = &self.durable {
+            durable(materialize_cancelled_suffix(
+                messages.to_vec(),
+                &self.cancellation_note,
+            ))
+            .await;
+        }
     }
 
-    fn checkpoint_tool_results(&self, messages: &[Message], tool_results: &[ContentBlock]) {
-        let mut suffix = messages.get(self.base_len..).unwrap_or_default().to_vec();
+    async fn checkpoint_tool_results(&self, messages: &[Message], tool_results: &[ContentBlock]) {
+        let mut checkpoint = messages.to_vec();
         if !tool_results.is_empty() {
-            suffix.push(Message {
+            checkpoint.push(Message {
                 role: Role::User,
                 content: tool_results.to_vec(),
             });
         }
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .suffix = suffix;
+        self.checkpoint(&checkpoint).await;
     }
 
     fn record_usage(&self, usage: &Usage, last_call_usage: &Usage) {
@@ -2055,6 +2076,7 @@ pub struct AgentSession {
     last_prompt_tokens: u64,
     /// Cancellation-surviving provider-neutral suffix for the active turn.
     inflight_turn: Option<std::sync::Arc<std::sync::Mutex<TurnJournalState>>>,
+    turn_checkpoint: Option<TurnCheckpointHook>,
 }
 
 impl AgentSession {
@@ -2075,6 +2097,7 @@ impl AgentSession {
             total_usage: Usage::default(),
             last_prompt_tokens: 0,
             inflight_turn: None,
+            turn_checkpoint: None,
         }
     }
 
@@ -2226,6 +2249,24 @@ impl AgentSession {
         }))
     }
 
+    pub(crate) fn set_turn_checkpoint(&mut self, hook: Option<TurnCheckpointHook>) {
+        self.turn_checkpoint = hook;
+    }
+
+    pub(crate) async fn checkpoint_accepted_user(&self, user_message: &Message) {
+        if let Some(checkpoint) = &self.turn_checkpoint {
+            let mut messages = self.messages.clone();
+            messages.push(user_message.clone());
+            let note = self
+                .config
+                .cancelled_turn_message
+                .as_deref()
+                .unwrap_or(crate::prompts::CANCELLED_TURN_DEFAULT)
+                .trim();
+            checkpoint(materialize_cancelled_suffix(messages, note)).await;
+        }
+    }
+
     fn begin_turn_journal(&mut self, mode: TurnJournalMode, user_message: Message) {
         if self.inflight_turn.is_some() {
             tracing::warn!(
@@ -2277,6 +2318,14 @@ impl AgentSession {
         self.inflight_turn.as_ref().map(|state| TurnJournalWriter {
             state: std::sync::Arc::clone(state),
             base_len,
+            durable: self.turn_checkpoint.clone(),
+            cancellation_note: self
+                .config
+                .cancelled_turn_message
+                .as_deref()
+                .unwrap_or(crate::prompts::CANCELLED_TURN_DEFAULT)
+                .trim()
+                .to_string(),
         })
     }
 
@@ -2897,7 +2946,7 @@ fn close_orphan_tool_calls(messages: Vec<Message>) -> Vec<Message> {
     repaired
 }
 
-fn is_user_turn_message(message: &Message) -> bool {
+pub(crate) fn is_user_turn_message(message: &Message) -> bool {
     if message.role != Role::User {
         return false;
     }
