@@ -1,0 +1,1599 @@
+diff --git c/CONTEXT-MAP.md w/CONTEXT-MAP.md
+index e2585b1..c0431e8 100644
+--- c/CONTEXT-MAP.md
++++ w/CONTEXT-MAP.md
+@@ -1,10 +1,10 @@
+ # Context map
+ 
+-Date: 2026-10-26
++Date: 2026-10-28
+ 
+ | Context | Glossary | Decisions |
+ |---------|----------|-----------|
+-| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md) |
++| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md), [Proposed ADR-019](docs/adr/019-ignore-repository-filters.md) |
+ 
+ This map covers the git-read context. Other contexts are not mapped here yet.
+ 
+diff --git c/daimonos.default.toml w/daimonos.default.toml
+index 7de95d9..7c9a5ee 100644
+--- c/daimonos.default.toml
++++ w/daimonos.default.toml
+@@ -607,6 +607,12 @@ poll_interval_ms = 1500
+ 
+ # Pinned, local git reads. See ADR-017 and GitReadConfig in src/config.rs.
+ [git_read]
++# Require explicit full SHA-1 commit identifiers. Reject names, ranges, and unpinned operations.
++strict_pinning = false
++# Default: system temporary directory. An override must already exist outside the workspace.
++# status_directory = "/private/state"
++# Bound the complete private index/configuration snapshot used by worktree_status.
++max_status_metadata_bytes = 67108864
+ # Maximum captured bytes per stream and maximum serialized response bytes.
+ max_output_bytes = 1048576
+ # Reject larger blobs before reading their content.
+diff --git c/docs/adr/018-strict-git-pinning.md w/docs/adr/018-strict-git-pinning.md
+new file mode 100644
+index 0000000..4550b43
+--- /dev/null
++++ w/docs/adr/018-strict-git-pinning.md
+@@ -0,0 +1,75 @@
++# ADR-018: Strict git pinning is an opt-in policy
++
++- **Status:** Proposed
++- **Date:** 2026-10-27
++- **Deciders:** Pending architectural review. The human approved the product requirements.
++- **Consulted:** dbunk PM, through the round-1 written answers
++- **Informed:** None recorded
++- **Spec:** `daimonos-feature-requests-for-dbunk.md`, FR-06, and `daimonos-pm-answers-round-1.md`
++- **Tracking:** Vikunja #1576, parent #1575
++- **Supersedes:** None
++- **Superseded by:** None
++
++## Context
++
++ADR-017 permits local revision resolution and returns full commit identifiers.
++The dbunk reviewer instead needs caller-pinned input identifiers before any git read.
++The PM accepted an additive policy and rejected a global revision-contract change.
++How can dbunk require pinned inputs without breaking existing callers?
++
++## Decision drivers
++
++- Existing calls, defaults, and result shapes remain unchanged except for the approved filter security fix in ADR-019.
++- Every strict read must identify its input commits explicitly.
++- Output pinning cannot replace input validation.
++- The existing process hardening must remain active under both policies.
++
++## Decision
++
++We will add `git_read.strict_pinning`, default false.
++When true, operations require explicit full 40-character hexadecimal commit identifiers.
++`diff` and `ancestry` require both `a` and `b` in that form.
++Other pinned operations require `rev`. Implicit HEAD, ranges, relative revisions, and short hashes are rejected.
++`refs` and `worktree_status` are refused because they cannot supply a pinned view.
++`resolve` remains useful only for verifying an explicit full commit identifier.
++The existing runner still resolves and checks the object type locally.
++This policy does not weaken confinement, no-mutation, or no-network controls.
++
++We will add `include_body`, default false, for `log` and `show_commit`.
++The field `body` appears in commit metadata only when the caller requests it.
++Existing names and result fields remain unchanged by default.
++
++## Alternatives
++
++- Globally reject revision names. This breaks ADR-017 and existing callers.
++- Accept names and only pin outputs. A moving ref can change before the request starts.
++- Create a second git tool. This duplicates the operation surface and process hardening.
++
++## Consequences
++
++The caller must explicitly select strict pinning. It is not a complete reviewer sandbox.
++Forty-character hashes restrict the strict profile to SHA-1 repositories.
++The default policy still supports other locally resolvable git object formats.
++Commit bodies can increase output size, so existing response caps still apply.
++
++## Confirmation
++
++- Test every strict operation through the public plugin interface.
++- Reject missing hashes, names, tags, short hashes, ranges, and unpinned operations.
++- Prove names still work with the default policy.
++- Compare repository snapshots before and after strict calls and hostile-config tests.
++- Exercise strict reads on a real read-only mount. Record unavailable platform facilities explicitly.
++- Verify `include_body` through Rust and MCP without changing default metadata fields.
++- Run `cargo test` and `python3 -m pytest tests/ -v`.
++
++## Anchors
++
++_Anchors:_ src/plugins/git_read.rs::GitReadPlugin, src/plugins/git_read.rs::Arguments, src/plugins/git_read.rs::history, src/plugins/git_read/runner.rs::ReadRepo, src/config.rs::GitReadConfig
++
++## Revisit when
++
++The caller needs strict SHA-256 repositories or a versioned pinned-only tool contract.
++
++## Open questions
++
++No product acceptance blocker remains for this slice. Architectural review is pending.
+diff --git c/docs/adr/019-ignore-repository-filters.md w/docs/adr/019-ignore-repository-filters.md
+new file mode 100644
+index 0000000..feb774d
+--- /dev/null
++++ w/docs/adr/019-ignore-repository-filters.md
+@@ -0,0 +1,79 @@
++# ADR-019: Ignore repository-configured filters during git reads
++
++- **Status:** Proposed
++- **Date:** 2026-10-28
++- **Deciders:** The human approved option 2 of Q-FR-06-2.1 on 2026-10-27. This record awaits architectural review.
++- **Consulted:** dbunk PM, through the written requirements.
++- **Informed:** None recorded.
++- **Spec:** FR-06, PM round 1, and `docs/reviews/2026-10-27-dbunk-follow-up.md`.
++- **Tracking:** Vikunja #1576, under #1575.
++- **Supersedes:** None. This clarifies the security guarantee in ADR-017.
++- **Superseded by:** None.
++
++## Context
++
++Git status can execute a configured clean or process filter while checking dirty files.
++The expanded hostile-configuration test reproduced that execution through git_read.
++Disabling filters also changes status results for legitimate filtered repositories.
++The human explicitly approved that compatibility exception instead of retaining the execution risk.
++Should filter suppression apply in both policies, despite the changed status semantics?
++
++## Decision drivers
++
++- A read-only tool must not execute repository-configured programs.
++- Strict pinning alone does not protect existing callers of worktree_status.
++- The compatibility change must remain explicit and tested.
++
++## Decision
++
++We will suppress configured clean, smudge, and process filters in both pinning policies.
++The runner retains bounded per-process overrides as defense for committed-object reads.
++Working-tree status does not depend on that scan. It uses a private, frozen Git metadata directory outside the workspace.
++The directory contains a pinned HEAD, copied index metadata, and only data-only configuration needed for built-in status behavior.
++It contains no filter definitions or include directives. Mutable repository configuration cannot add a driver to that process.
++The process reads the original worktree and object store without changing them.
++Split-index and local attribute/exclude metadata are copied into the private view.
++The private view is removed after success, failure, or cancellation. No repository configuration file changes.
++The worktree result excludes external filter transformations. Built-in Git conversions can still apply.
++The user-facing documentation will warn that a filtered file can appear modified where ordinary Git reports clean.
++
++## Alternatives
++
++- Retain filter execution in default mode. Rejected by the human because the read-only tool would remain an execution surface.
++- Suppress filters only under strict pinning. This protects the dbunk policy but not ordinary worktree-status callers.
++- Execute only familiar filters. Rejected because repository configuration selects executable commands, not trustworthy implementations.
++
++## Consequences
++
++The fix changes default status semantics for repositories such as Git LFS repositories.
++This is the narrow compatibility exception approved as option 2, not permission for unrelated default changes.
++The existing git tool remains unchanged.
++The metadata budgets reject excessive configuration or index snapshots instead of applying incomplete protection.
++`git_read.max_status_metadata_bytes` bounds the private view. `git_read.status_directory` selects an existing directory outside the workspace.
++Without an override, the view uses the system temporary directory. FR-08 must route this internal state under an explicit state root.
++
++## Confirmation
++
++- Run `cargo test default_status_reports_raw_bytes_without_running_normalizing_filters`.
++- In that fixture, ordinary Git reports clean after a real filter transformation.
++- Verify that git_read instead reports the tracked file as modified and leaves the full repository snapshot unchanged.
++- Run `cargo test every_operation_ignores_malicious_config` under both policies.
++- Run `python3 -m pytest tests/test_git_read.py::test_git_read_filter_added_after_inspection_cannot_execute -v`.
++- Prove that a filter added through an include immediately before status cannot execute.
++- Test mixed-case keys, malformed configuration, split indexes, local excludes, built-in normalization, linked worktrees, reftable, and SHA-256 defaults.
++- Verify metadata caps and private-directory cleanup after failure.
++- Run `cargo test plugins::git_read::tests` and `python3 -m pytest tests/test_git_read.py -v`.
++- Run the full Rust and Python suites before completing this slice.
++
++## Anchors
++
++_Anchors:_ src/plugins/git_read/status.rs::StatusView, src/plugins/git_read/runner.rs::ReadRepo, src/plugins/git_read/tests.rs::default_status_reports_raw_bytes_without_running_normalizing_filters, src/plugins/git_read/tests.rs::every_operation_ignores_malicious_config
++
++## Revisit when
++
++Git provides a way to inspect filter-normalized status without executing repository-controlled programs.
++Also revisit this decision if the caller needs explicitly trusted filter execution in a different tool.
++
++## Open questions
++
++The human resolved the product choice. Architectural review of this record remains pending.
+diff --git c/docs/configuration.md w/docs/configuration.md
+index 8072776..74e08c0 100644
+--- c/docs/configuration.md
++++ w/docs/configuration.md
+@@ -1051,6 +1051,31 @@ raw model responses; the UUID is local, not a provider request ID.
+ 
+ ## Read-only git (`git_read`)
+ 
++`git_read.strict_pinning` is false by default. Enable it to require explicit
++40-character SHA-1 commit identifiers. `diff` and `ancestry` then require `a` and
++`b`. Other permitted operations require `rev`. Names, ranges, implicit HEAD,
++short hashes, and annotated-tag object identifiers are rejected. `refs` and
++`worktree_status` are refused under this policy. Default revision resolution remains unchanged.
++
++`log` and `show_commit` accept `include_body=true`. Only that opt-in adds the
++`body` field to commit metadata. The existing response cap still applies.
++Bodies preserve Git's body text, including any trailing newline. Do not trim them before comparisons.
++
++The runner disables configured clean, smudge, and process filters in both modes.
++This is an approved security-fix exception to the unchanged-default rule.
++`worktree_status` does not apply those external transformations. It can report a
++modified file where ordinary Git reports a clean filtered file, including Git LFS cases.
++Do not interpret this result as filter-aware status. Built-in Git conversions can still apply.
++[ADR-019](adr/019-ignore-repository-filters.md) records the reason and the human approval.
++Status runs against private, frozen metadata with no filter definitions or include directives.
++Later changes to repository configuration cannot add executable filters to that process.
++`git_read.status_directory` can select an existing metadata directory outside the workspace.
++The default is the system temporary directory. The private directory is removed after the call.
++`git_read.max_status_metadata_bytes` defaults to 64 MiB and bounds the copied metadata.
++Unsupported filter keys or oversized configuration fail closed before reads.
++Strict pinning is not required for process hardening. It adds immutable input selection.
++
++
+ The `[git_read]` section bounds local, pinned git reads. `GitReadConfig` in
+ `src/config.rs` defines the defaults. `daimonos.default.toml` lists every key.
+ ADR-017 records the safety boundary.
+diff --git c/docs/contexts/git-read/CONTEXT.md w/docs/contexts/git-read/CONTEXT.md
+index b0080cd..11ef21c 100644
+--- c/docs/contexts/git-read/CONTEXT.md
++++ w/docs/contexts/git-read/CONTEXT.md
+@@ -1,14 +1,16 @@
+ # Pinned git reads
+ 
+-Date: 2026-10-27
++Date: 2026-10-28
+ 
+ - **Workspace:** The fixed root that contains repositories. The session cwd does not change this boundary.
+ - **Pinned commit:** A full commit SHA returned with a read result. It makes a citation independent of moving refs.
++- **Strict pinning:** The optional policy that also requires explicit SHA-1 commit identifiers as inputs. It rejects mutable names and tag objects.
+ - **Promisor:** A partial-clone remote that holds objects absent locally. `git_read` never asks it for objects.
+ - **Alternate store:** Another git object directory. Chained stores must stay inside the workspace.
+ - **Patch preview:** Bounded patch text. A truncated preview is not a complete patch.
+ - **Pointer file:** Git metadata that selects a git directory or common directory. It must stay inside the workspace.
+ - **Bare repository:** A git database without a working tree. History reads are valid, but worktree status is not.
++- **Filter-free status:** Status without repository-configured external filter transformations. A filtered file can appear modified even when ordinary Git reports clean.
+ 
+ [ADR-017](../../adr/017-git-read-tool.md) records why the tool is separate from `git`.
+ [Configuration](../../configuration.md#read-only-git-git_read) names its limits.
+diff --git c/docs/reviews/2026-10-28-fr06-validation.md w/docs/reviews/2026-10-28-fr06-validation.md
+new file mode 100644
+index 0000000..40d3463
+--- /dev/null
++++ w/docs/reviews/2026-10-28-fr06-validation.md
+@@ -0,0 +1,47 @@
++# FR-06 local validation
++
++Date: 2026-10-28
++Task: Vikunja #1576, under #1575.
++Branch: `feat/1575-dbunk-reviewer`.
++Status: Local validation passed. Rubber Ducky round 2 is pending.
++
++## Scope
++
++This evidence covers strict git pinning, additive bodies, and the approved filter security exception.
++It does not establish completion of FR-02, FR-03, FR-07, or FR-08 integration.
++No new crate, live credentialed endpoint test, publication, or merge occurred.
++
++## Actual checks
++
++- `cargo fmt --all -- --check`: passed.
++- `cargo clippy --all-targets -- -D warnings`: passed.
++- `cargo test`: 2011 passed, 0 failed, 10 ignored.
++- `python3 -m pytest tests/ -v`: 385 passed, 0 failed, 1 skipped.
++- The full-suite commands used `target/test-tools/bin` and `.venv/bin` as PATH prefixes.
++- Logs: `target/dbunk-fr06-rust-review1.log` and `target/dbunk-fr06-pytest-review1.log`.
++- Those logs and temporary test tools are local artifacts, not committed dependencies.
++
++## Read-only mount evidence
++
++The Linux namespace test ran and passed on this host. It checked EROFS on a real bind mount.
++It exercised all nine pinned operations and both refused operations, with unchanged evidence snapshots.
++The test skips on non-Linux hosts or when user/mount namespaces are unavailable.
++No macOS mount test ran here. A skip does not count as a successful read-only-mount check.
++
++## Review regressions
++
++- A process-boundary fixture introduced a filter through an include after the original inspection.
++  The old implementation executed it. The frozen-metadata implementation does not.
++- Mixed-case filter keys are canonicalized by Git and suppressed under both policies.
++- Both sides of diff and ancestry reject full annotated-tag object IDs under strict pinning.
++- Malformed configuration returns a structured failure without mutating the repository.
++- The private metadata budget fails closed, and the temporary directory is removed after failure.
++- Split indexes, local excludes, built-in text normalization, linked worktrees, reftable, and SHA-256 defaults pass.
++- Uppercase SHA-1 inputs return canonical lowercase commit identifiers.
++
++## Internal state
++
++Status uses private metadata outside the workspace. It contains no filter definitions or include directives.
++`git_read.status_directory` selects an existing directory. Its default is the system temporary directory.
++`git_read.max_status_metadata_bytes` defaults to 64 MiB.
++FR-08 must route this internal state under the explicit state root. That integration remains pending.
+diff --git c/prompts/tool_descriptions.toml w/prompts/tool_descriptions.toml
+index 6e44a35..da684f5 100644
+--- c/prompts/tool_descriptions.toml
++++ w/prompts/tool_descriptions.toml
+@@ -198,12 +198,12 @@ limit = "Max reservations to return (most-recent first)."
+ full = """Python-style function signatures for all tool bindings available in execute_script. Already included in server instructions."""
+ 
+ [git_read]
+-full = """Read local git history at pinned commits without writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Use workspace-relative repo and path values. Revisions, paths, repo names, and patterns must not start with a hyphen. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only."""
+-terse = "Read-only git at pinned commits. No writes or network."
++full = """Read local git history at pinned commits without repository writes or network access. Use git_read for reviewer reads. Use git for writes. Returns JSON with the repo and full commit SHAs. Use workspace-relative repo and path values. Revisions, paths, repo names, and patterns must not start with a hyphen. Requires git with --no-lazy-fetch support. Caps come from [git_read] config. Oversized metadata returns output_limit. Binary files return metadata only. When strict pinning is enabled, supply full SHA-1 commit hashes. Names, ranges, and unpinned operations are refused."""
++terse = "Read-only git at pinned commits. No repository writes or network."
+ [git_read.parameters]
+ command = "Operation to run. No raw commands or user flags."
+ repo = "Repository root relative to the workspace. Default: workspace root."
+-rev = "Commit, ref, tag, or log range. Default: HEAD."
++rev = "Commit, ref, tag, or log range. Default: HEAD. Strict pinning requires an explicit full commit hash."
+ path = "Literal repository-relative path."
+ paths = "Literal repository-relative paths."
+ pattern = "Extended regular expression for grep. Must not start with a hyphen."
+@@ -215,6 +215,7 @@ limit = "Maximum returned items, bounded by configuration."
+ recursive = "list_tree: include descendants. Default: false."
+ follow = "log: follow renames for one path. Default: false."
+ patch = "show_commit: include a bounded patch preview. Default: false."
++include_body = "log and show_commit: include the commit body. Default: false."
+ start_line = "blame: first line, one-based. Default: 1."
+ end_line = "blame: final line, inclusive. Bounded by max_lines."
+ 
+diff --git c/src/config.rs w/src/config.rs
+index d0c0720..3db0bee 100644
+--- c/src/config.rs
++++ w/src/config.rs
+@@ -11,6 +11,9 @@ use std::sync::Arc;
+ #[derive(Debug, Deserialize, Clone)]
+ #[serde(default)]
+ pub struct GitReadConfig {
++    pub strict_pinning: bool,
++    pub status_directory: Option<String>,
++    pub max_status_metadata_bytes: usize,
+     pub max_output_bytes: usize,
+     pub max_file_bytes: usize,
+     pub max_lines: usize,
+@@ -25,6 +28,9 @@ pub struct GitReadConfig {
+ impl Default for GitReadConfig {
+     fn default() -> Self {
+         Self {
++            strict_pinning: false,
++            status_directory: None,
++            max_status_metadata_bytes: 64 * 1024 * 1024,
+             max_output_bytes: 1024 * 1024,
+             max_file_bytes: 512 * 1024,
+             max_lines: 1000,
+@@ -50,6 +56,7 @@ impl GitReadConfig {
+             ("max_patch_bytes", self.max_patch_bytes),
+             ("max_input_bytes", self.max_input_bytes),
+             ("max_alternate_dirs", self.max_alternate_dirs),
++            ("max_status_metadata_bytes", self.max_status_metadata_bytes),
+         ] {
+             if value == 0 {
+                 return Err(format!("git_read.{name} must be greater than zero"));
+diff --git c/src/plugins/git_read.rs w/src/plugins/git_read.rs
+index 3bf1341..c7a182b 100644
+--- c/src/plugins/git_read.rs
++++ w/src/plugins/git_read.rs
+@@ -1,8 +1,9 @@
+-//! Pinned git reads with no writes, network, or repository-controlled programs.
++//! Pinned git reads with no repository writes, network, or repository-controlled programs.
+ //! Context: docs/adr/017-git-read-tool.md. The caller supplies the workspace,
+ //! not the mutable session cwd. All errors stay structured across frontends.
+ 
+ mod runner;
++mod status;
+ #[cfg(test)]
+ mod tests;
+ use crate::config::{GitReadConfig, ProcessConfig};
+@@ -13,6 +14,10 @@ use serde_json::{json, Value};
+ use std::collections::HashMap;
+ use std::path::Path;
+ 
++fn is_full_sha1(value: &str) -> bool {
++    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
++}
++
+ const OPERATIONS: &[&str] = &[
+     "resolve",
+     "show_file",
+@@ -99,6 +104,7 @@ struct Arguments {
+     recursive: bool,
+     follow: bool,
+     patch: bool,
++    include_body: bool,
+     start_line: Option<usize>,
+     end_line: Option<usize>,
+ }
+@@ -130,6 +136,9 @@ impl ToolPlugin for GitReadPlugin {
+             let args: Arguments = serde_json::from_value(input)
+                 .map_err(|e| Failure::new("rejected_argument", e.to_string()))?;
+             args.validate(command)?;
++            if self.limits.strict_pinning {
++                args.validate_pinning(command)?;
++            }
+             let repo = ReadRepo::open(
+                 workspace,
+                 args.repo.as_deref().unwrap_or("."),
+@@ -211,6 +220,38 @@ impl Arguments {
+         }
+         Ok(())
+     }
++    fn validate_pinning(&self, command: &str) -> Result<(), Failure> {
++        // ADR-018: strict inputs are commit identifiers, not names resolved after the call starts.
++        if matches!(command, "refs" | "worktree_status") {
++            return Err(Failure::new(
++                "rejected_argument",
++                "strict pinning refuses unpinned operations",
++            ));
++        }
++
++        for value in [&self.rev, &self.a, &self.b].into_iter().flatten() {
++            if !is_full_sha1(value) {
++                return Err(Failure::new(
++                    "rejected_argument",
++                    "strict pinning requires full 40-character SHA-1 commit hashes; SHA-256 is unsupported",
++                ));
++            }
++        }
++        if matches!(command, "diff" | "ancestry") {
++            if self.a.is_none() || self.b.is_none() || self.rev.is_some() {
++                return Err(Failure::new(
++                    "rejected_argument",
++                    "strict pinning requires explicit a and b hashes, without rev",
++                ));
++            }
++        } else if self.rev.is_none() {
++            return Err(Failure::new(
++                "rejected_argument",
++                "strict pinning requires an explicit rev hash",
++            ));
++        }
++        Ok(())
++    }
+     fn paths(&self) -> Vec<String> {
+         let mut paths = self.paths.clone().unwrap_or_default();
+         if let Some(path) = &self.path {
+@@ -448,6 +489,7 @@ impl GitReadPlugin {
+                     &commit,
+                     &Arguments {
+                         limit: Some(1),
++                        include_body: args.include_body,
+                         ..Default::default()
+                     },
+                     1,
+@@ -577,14 +619,17 @@ impl GitReadPlugin {
+                 }
+                 let commit = repo.commit("HEAD").await?;
+                 let listing = repo
+-                    .text(&[
+-                        "status",
+-                        "--porcelain=v1",
+-                        "-z",
+-                        "--no-renames",
+-                        "--untracked-files=all",
+-                        "--ignore-submodules=all",
+-                    ])
++                    .worktree_status(
++                        &commit,
++                        &[
++                            "status",
++                            "--porcelain=v1",
++                            "-z",
++                            "--no-renames",
++                            "--untracked-files=all",
++                            "--ignore-submodules=all",
++                        ],
++                    )
+                     .await?;
+                 let mut entries = Vec::new();
+                 for record in listing.split_terminator('\0') {
+@@ -721,6 +766,7 @@ pub fn schema() -> Value {
+         "a":{"type":"string"}, "b":{"type":"string"}, "mode":{"type":"string","enum":["stat","patch"]},
+         "offset":{"type":"integer","minimum":0}, "limit":{"type":"integer","minimum":1},
+         "recursive":{"type":"boolean"}, "follow":{"type":"boolean"}, "patch":{"type":"boolean"},
++        "include_body":{"type":"boolean"},
+         "start_line":{"type":"integer","minimum":1}, "end_line":{"type":"integer","minimum":1}
+     }})
+ }
+@@ -758,6 +804,11 @@ async fn history(
+ ) -> Result<Vec<Value>, Failure> {
+     let limit = format!("--max-count={}", args.limit(max_commits).saturating_add(1));
+     let skip = format!("--skip={}", args.offset);
++    let format = if args.include_body {
++        "--format=%H%x00%an%x00%aI%x00%cI%x00%s%x00%b"
++    } else {
++        "--format=%H%x00%an%x00%aI%x00%cI%x00%s"
++    };
+     let mut argv = vec![
+         "log",
+         "--no-ext-diff",
+@@ -765,7 +816,7 @@ async fn history(
+         "--no-show-signature",
+         "--no-use-mailmap",
+         "--encoding=UTF-8",
+-        "--format=%H%x00%an%x00%aI%x00%cI%x00%s",
++        format,
+         "-z",
+         &limit,
+         &skip,
+@@ -785,11 +836,16 @@ async fn history(
+     let out = repo.text(&argv).await?;
+     let fields: Vec<_> = out.split_terminator('\0').collect();
+     let mut entries = Vec::new();
+-    for record in fields.chunks(5) {
+-        if record.len() != 5 {
++    let width = if args.include_body { 6 } else { 5 };
++    for record in fields.chunks(width) {
++        if record.len() != width {
+             return Err(Failure::new("git_error", "invalid log record"));
+         }
+-        entries.push(json!({"sha":record[0],"author":record[1],"author_date":record[2],"committer_date":record[3],"subject":record[4]}));
++        let mut entry = json!({"sha":record[0],"author":record[1],"author_date":record[2],"committer_date":record[3],"subject":record[4]});
++        if args.include_body {
++            entry["body"] = json!(record[5]);
++        }
++        entries.push(entry);
+     }
+     Ok(entries)
+ }
+diff --git c/src/plugins/git_read/runner.rs w/src/plugins/git_read/runner.rs
+index 91bfcb2..fe0e95c 100644
+--- c/src/plugins/git_read/runner.rs
++++ w/src/plugins/git_read/runner.rs
+@@ -44,6 +44,11 @@ pub(super) struct ReadRepo {
+     pub shallow: bool,
+     pub partial: bool,
+     pub bare: bool,
++    workspace: PathBuf,
++    gitdir: PathBuf,
++    common: PathBuf,
++    limits: GitReadConfig,
++    filter_overrides: Vec<String>,
+     env: HashMap<String, String>,
+     process: ProcessConfig,
+ }
+@@ -197,9 +202,57 @@ impl ReadRepo {
+             shallow: false,
+             partial: false,
+             bare,
++            workspace,
++            gitdir,
++            common,
++            limits: limits.clone(),
++            filter_overrides: Vec::new(),
+             env,
+             process,
+         };
++        // ADR-019: status can run clean/process filters. Disable every
++        // configured driver before any operation that can inspect worktree content.
++        let filters = repo
++            .output(&[
++                "config",
++                "--null",
++                "--name-only",
++                "--get-regexp",
++                "^filter\\..*\\.(clean|smudge|process|required)$",
++            ])
++            .await?;
++        if filters.status.code() != Some(1) {
++            repo.check(&filters)?;
++        }
++        if filters.stdout_truncated
++            || filters.stderr_truncated
++            || filters.stdout.len() > limits.max_input_bytes
++        {
++            return Err(Failure::new(
++                "output_limit",
++                "filter configuration exceeds metadata budget",
++            ));
++        }
++        if !filters.stderr.trim().is_empty() {
++            return Err(Failure::new(
++                "invalid_repository",
++                "cannot safely inspect filter configuration",
++            ));
++        }
++        for key in filters.stdout.split_terminator('\0') {
++            if key.contains('=') || key.chars().any(char::is_control) {
++                return Err(Failure::new(
++                    "invalid_repository",
++                    "unsupported filter configuration key",
++                ));
++            }
++            let value = if key.ends_with(".required") {
++                "false"
++            } else {
++                ""
++            };
++            repo.filter_overrides.push(format!("{key}={value}"));
++        }
+         repo.shallow = repo
+             .text(&["rev-parse", "--is-shallow-repository"])
+             .await?
+@@ -237,6 +290,13 @@ impl ReadRepo {
+     }
+ 
+     pub async fn output(&self, arguments: &[&str]) -> Result<ManagedOutput, Failure> {
++        self.output_with_env(arguments, &self.env).await
++    }
++    async fn output_with_env(
++        &self,
++        arguments: &[&str],
++        env: &HashMap<String, String>,
++    ) -> Result<ManagedOutput, Failure> {
+         let mut argv: Vec<String> = [
+             "--no-pager",
+             "--no-lazy-fetch",
+@@ -259,13 +319,23 @@ impl ReadRepo {
+         .iter()
+         .map(|s| (*s).into())
+         .collect();
++        for setting in &self.filter_overrides {
++            argv.extend(["-c".to_string(), setting.clone()]);
++        }
+         argv.extend(arguments.iter().map(|s| (*s).into()));
+-        managed_process::run("git", &argv, &self.path, &self.env, &self.process, None)
++        managed_process::run("git", &argv, &self.path, env, &self.process, None)
+             .await
+             .map_err(Into::into)
+     }
+     pub async fn text(&self, arguments: &[&str]) -> Result<String, Failure> {
+-        let output = self.output(arguments).await?;
++        self.text_with_env(arguments, &self.env).await
++    }
++    async fn text_with_env(
++        &self,
++        arguments: &[&str],
++        env: &HashMap<String, String>,
++    ) -> Result<String, Failure> {
++        let output = self.output_with_env(arguments, env).await?;
+         self.check(&output)?;
+         if output.stdout_truncated || output.stderr_truncated {
+             return Err(Failure::new(
+@@ -276,6 +346,59 @@ impl ReadRepo {
+         }
+         Ok(output.stdout)
+     }
++    pub async fn worktree_status(
++        &self,
++        commit: &str,
++        arguments: &[&str],
++    ) -> Result<String, Failure> {
++        let config = self
++            .output(&[
++                "config",
++                "--null",
++                "--get-regexp",
++                super::status::STATUS_CONFIG_PATTERN,
++            ])
++            .await?;
++        if config.status.code() != Some(1) {
++            self.check(&config)?;
++        }
++        if config.stdout_truncated || config.stderr_truncated {
++            return Err(Failure::new(
++                "output_limit",
++                "status configuration exceeds capture limit",
++            ));
++        }
++        if !config.stderr.trim().is_empty() {
++            return Err(Failure::new(
++                "invalid_repository",
++                "cannot freeze status configuration",
++            ));
++        }
++        let view = super::status::StatusView::create(
++            &self.workspace,
++            &self.gitdir,
++            &self.common,
++            commit,
++            &config.stdout,
++            &self.limits,
++        )
++        .await?;
++        let mut env = self.env.clone();
++        env.insert("GIT_DIR".into(), view.path.to_string_lossy().into_owned());
++        env.insert(
++            "GIT_COMMON_DIR".into(),
++            view.path.to_string_lossy().into_owned(),
++        );
++        env.insert(
++            "GIT_INDEX_FILE".into(),
++            view.path.join("index").to_string_lossy().into_owned(),
++        );
++        env.insert(
++            "GIT_OBJECT_DIRECTORY".into(),
++            self.common.join("objects").to_string_lossy().into_owned(),
++        );
++        self.text_with_env(arguments, &env).await
++    }
+     pub fn check(&self, output: &ManagedOutput) -> Result<(), Failure> {
+         if output.status.success() {
+             return Ok(());
+@@ -338,7 +461,21 @@ impl ReadRepo {
+         self.resolve(revision, "object").await
+     }
+     pub async fn commit(&self, revision: &str) -> Result<String, Failure> {
+-        self.resolve(revision, "commit").await
++        if self.limits.strict_pinning && !super::is_full_sha1(revision) {
++            return Err(Failure::new(
++                "rejected_argument",
++                "strict pinning requires a full SHA-1 commit hash",
++            ));
++        }
++        let commit = self.resolve(revision, "commit").await?;
++        if self.limits.strict_pinning && commit != revision.to_ascii_lowercase() {
++            return Err(Failure::new(
++                "rejected_argument",
++                "strict pinning requires an unpeeled SHA-1 commit object",
++            ));
++        }
++
++        Ok(commit)
+     }
+     async fn resolve(&self, revision: &str, kind: &str) -> Result<String, Failure> {
+         if revision.starts_with('-') || revision.contains('\0') {
+diff --git c/src/plugins/git_read/status.rs w/src/plugins/git_read/status.rs
+new file mode 100644
+index 0000000..b54ccd4
+--- /dev/null
++++ w/src/plugins/git_read/status.rs
+@@ -0,0 +1,214 @@
++//! Frozen metadata prevents repository-config races from executing status filters.
++//! Context: docs/contexts/git-read/CONTEXT.md and ADR-019.
++
++use super::runner::Failure;
++use crate::config::GitReadConfig;
++use std::path::{Path, PathBuf};
++use tokio::io::AsyncReadExt;
++
++// These data-only settings preserve built-in status normalization. Executable settings,
++// includes, and filter sections never enter the private repository.
++pub(super) const STATUS_CONFIG_PATTERN: &str = r"^(core\.(filemode|ignorecase|symlinks|precomposeunicode|trustctime|checkstat|ignorestat|autocrlf|eol|safecrlf|attributesfile|excludesfile|checkroundtripencoding|sparsecheckout|sparsecheckoutcone|protectntfs|protecthfs)|index\.(sparse|version))$";
++
++pub(super) struct StatusView {
++    pub path: PathBuf,
++    remaining: u64,
++}
++
++impl Drop for StatusView {
++    fn drop(&mut self) {
++        if let Err(error) = std::fs::remove_dir_all(&self.path) {
++            tracing::warn!(target:"daimonos::git_read",event="status_metadata_cleanup_failed",%error);
++        }
++    }
++}
++
++impl StatusView {
++    pub async fn create(
++        workspace: &Path,
++        gitdir: &Path,
++        common: &Path,
++        commit: &str,
++        config: &str,
++        limits: &GitReadConfig,
++    ) -> Result<Self, Failure> {
++        let directory = limits
++            .status_directory
++            .as_deref()
++            .map(crate::paths::expand_tilde)
++            .unwrap_or_else(std::env::temp_dir);
++        let directory = if directory.is_absolute() {
++            directory
++        } else {
++            workspace.join(directory)
++        };
++        let directory = tokio::fs::canonicalize(&directory).await.map_err(|error| {
++            Failure::new(
++                "io_error",
++                format!("git_read.status_directory {}: {error}", directory.display()),
++            )
++        })?;
++        if directory.starts_with(workspace) {
++            return Err(Failure::new(
++                "rejected_argument",
++                format!(
++                    "git_read.status_directory must be outside the workspace: {}",
++                    directory.display()
++                ),
++            ));
++        }
++        let path = directory.join(format!("daimonos-git-status-{}", uuid::Uuid::new_v4()));
++        // Acquire directory ownership without an await between creation and the drop guard.
++        let mut builder = std::fs::DirBuilder::new();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::DirBuilderExt;
++            builder.mode(0o700);
++        }
++        builder.create(&path).map_err(|error| {
++            Failure::new(
++                "io_error",
++                format!("git_read.status_directory {}: {error}", directory.display()),
++            )
++        })?;
++        let mut view = Self {
++            path,
++            remaining: limits.max_status_metadata_bytes as u64,
++        };
++        tokio::fs::create_dir(view.path.join("refs")).await?;
++        tokio::fs::create_dir(view.path.join("info")).await?;
++        let format = match commit.len() {
++            40 => "[core]\nrepositoryformatversion=0\nbare=false\n",
++            64 => {
++                "[core]\nrepositoryformatversion=1\nbare=false\n[extensions]\nobjectformat=sha256\n"
++            }
++            _ => {
++                return Err(Failure::new(
++                    "git_error",
++                    "unsupported commit identifier format",
++                ))
++            }
++        };
++        let mut settings = format.to_string();
++        for record in config.split_terminator('\0') {
++            let (key, value) = record.split_once('\n').unwrap_or((record, "true"));
++            let (section, name) = key
++                .split_once('.')
++                .ok_or_else(|| Failure::new("git_error", "invalid status configuration"))?;
++            let allowed = match section {
++                "core" => matches!(
++                    name,
++                    "filemode"
++                        | "ignorecase"
++                        | "symlinks"
++                        | "precomposeunicode"
++                        | "trustctime"
++                        | "checkstat"
++                        | "ignorestat"
++                        | "autocrlf"
++                        | "eol"
++                        | "safecrlf"
++                        | "attributesfile"
++                        | "excludesfile"
++                        | "checkroundtripencoding"
++                        | "sparsecheckout"
++                        | "sparsecheckoutcone"
++                        | "protectntfs"
++                        | "protecthfs"
++                ),
++                "index" => matches!(name, "sparse" | "version"),
++                _ => false,
++            };
++            if !allowed {
++                return Err(Failure::new(
++                    "git_error",
++                    "unexpected status configuration key",
++                ));
++            }
++            let value = value
++                .replace('\\', "\\\\")
++                .replace('"', "\\\"")
++                .replace('\n', "\\n")
++                .replace('\t', "\\t");
++            settings.push_str(&format!("[{section}]\n{name}=\"{value}\"\n"));
++        }
++        view.write("config", settings.as_bytes()).await?;
++        view.write("HEAD", format!("{commit}\n").as_bytes()).await?;
++        view.copy(&gitdir.join("index"), "index", workspace).await?;
++        for name in ["attributes", "exclude"] {
++            view.copy(
++                &common.join("info").join(name),
++                &format!("info/{name}"),
++                workspace,
++            )
++            .await?;
++        }
++        view.copy(
++            &gitdir.join("info/sparse-checkout"),
++            "info/sparse-checkout",
++            workspace,
++        )
++        .await?;
++        let mut entries = tokio::fs::read_dir(gitdir).await?;
++        while let Some(entry) = entries.next_entry().await? {
++            let name = entry.file_name();
++            view.charge(name.len() as u64)?;
++            if name.to_string_lossy().starts_with("sharedindex.") {
++                let name = name
++                    .to_str()
++                    .ok_or_else(|| Failure::new("git_error", "invalid shared-index name"))?;
++                view.copy(&entry.path(), name, workspace).await?;
++            }
++        }
++        Ok(view)
++    }
++
++    fn charge(&mut self, bytes: u64) -> Result<(), Failure> {
++        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
++            Failure::new(
++                "output_limit",
++                "status metadata exceeds git_read.max_status_metadata_bytes",
++            )
++        })?;
++        Ok(())
++    }
++    async fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), Failure> {
++        self.charge(bytes.len() as u64)?;
++        let mut options = tokio::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        options.mode(0o600);
++        let mut file = options.open(self.path.join(name)).await?;
++        tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
++        Ok(())
++    }
++    async fn copy(&mut self, source: &Path, name: &str, workspace: &Path) -> Result<(), Failure> {
++        match tokio::fs::symlink_metadata(source).await {
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++            Err(error) => return Err(error.into()),
++            Ok(_) => {}
++        }
++        let source = tokio::fs::canonicalize(source).await?;
++        if !source.starts_with(workspace) {
++            return Err(Failure::new(
++                "repo_outside_workspace",
++                "status metadata points outside workspace",
++            ));
++        }
++        let file = tokio::fs::File::open(&source).await?;
++        if !file.metadata().await?.is_file() {
++            return Err(Failure::new(
++                "invalid_repository",
++                "status metadata is not a regular file",
++            ));
++        }
++        let mut input = file.take(self.remaining.saturating_add(1));
++        let mut options = tokio::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        options.mode(0o600);
++        let mut output = options.open(self.path.join(name)).await?;
++        let bytes = tokio::io::copy(&mut input, &mut output).await?;
++        self.charge(bytes)
++    }
++}
+diff --git c/src/plugins/git_read/tests.rs w/src/plugins/git_read/tests.rs
+index 547eba9..5c54039 100644
+--- c/src/plugins/git_read/tests.rs
++++ w/src/plugins/git_read/tests.rs
+@@ -127,9 +127,9 @@ async fn every_operation_preserves_git_and_worktree_even_when_stat_stale() {
+         .unwrap()
+         .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
+         .unwrap();
+-    for args in f.cases() {
++    for (args, limits) in f.policy_cases() {
+         let before = snapshot(&f.repo);
+-        let response = f.call(args.clone()).await;
++        let response = f.with_limits(args.clone(), limits).await;
+         assert_eq!(response.exit_code, 0, "{args}: {}", response.output);
+         assert_eq!(snapshot(&f.repo), before, "mutation in {args}");
+         assert!(response.output["repo"].as_str().is_some());
+@@ -166,9 +166,40 @@ async fn every_operation_ignores_malicious_config() {
+         &f.repo,
+         &["config", "diff.trap.textconv", script.to_str().unwrap()],
+     );
+-    fs::write(f.repo.join(".gitattributes"), "*.txt diff=trap\n").unwrap();
+-    for args in f.cases() {
+-        let response = f.call(args.clone()).await;
++    git(
++        &f.repo,
++        &["config", "filter.trap.clean", script.to_str().unwrap()],
++    );
++    git(
++        &f.repo,
++        &["config", "filter.trap.smudge", script.to_str().unwrap()],
++    );
++    git(
++        &f.repo,
++        &["config", "filter.trap.process", script.to_str().unwrap()],
++    );
++    git(&f.repo, &["config", "filter.trap.required", "true"]);
++    git(
++        &f.repo,
++        &["config", "alias.show", &format!("!{}", script.display())],
++    );
++    let hooks = f.workspace.path().join("hooks");
++    fs::create_dir(&hooks).unwrap();
++    for hook in ["post-index-change", "post-checkout", "pre-auto-gc"] {
++        fs::copy(&script, hooks.join(hook)).unwrap();
++    }
++    git(
++        &f.repo,
++        &["config", "core.hooksPath", hooks.to_str().unwrap()],
++    );
++    fs::write(
++        f.repo.join(".gitattributes"),
++        "*.txt diff=trap filter=trap\n",
++    )
++    .unwrap();
++    fs::write(f.repo.join("renamed.txt"), "dirty working-tree content\n").unwrap();
++    for (args, limits) in f.policy_cases() {
++        let response = f.with_limits(args.clone(), limits).await;
+         assert_eq!(response.exit_code, 0, "{args}: {}", response.output);
+         assert!(!sentinel.exists(), "repo code ran in {args}");
+     }
+@@ -648,3 +679,431 @@ async fn registered_plugin_uses_the_smaller_git_and_shared_response_caps() {
+         assert_eq!(snapshot(&f.repo), before);
+     }
+ }
++
++#[tokio::test]
++async fn strict_pinning_refuses_a_branch_while_the_default_keeps_it() {
++    let f = Fixture::new();
++    let args = json!({"command":"resolve","repo":"source","rev":"main"});
++    assert_eq!(f.call(args.clone()).await.exit_code, 0);
++    let strict = GitReadConfig {
++        strict_pinning: true,
++        ..Default::default()
++    };
++    let response = f.with_limits(args, strict).await;
++    assert_eq!(
++        response.output["error"]["kind"], "rejected_argument",
++        "{}",
++        response.output
++    );
++}
++
++#[tokio::test]
++async fn strict_pinning_requires_commit_objects_not_annotated_tag_objects() {
++    let f = Fixture::new();
++    git(
++        &f.repo,
++        &[
++            "tag",
++            "-a",
++            "policy-tag",
++            "-m",
++            "Tag object for strict policy",
++        ],
++    );
++    let tag = git(&f.repo, &["rev-parse", "refs/tags/policy-tag"]);
++    assert_eq!(
++        f.call(json!({"command":"resolve","repo":"source","rev":tag}))
++            .await
++            .exit_code,
++        0
++    );
++    let strict = GitReadConfig {
++        strict_pinning: true,
++        ..Default::default()
++    };
++    let response = f
++        .with_limits(
++            json!({"command":"resolve","repo":"source","rev":tag}),
++            strict,
++        )
++        .await;
++    assert_eq!(
++        response.output["error"]["kind"], "rejected_argument",
++        "{}",
++        response.output
++    );
++}
++
++impl Fixture {
++    fn policy_cases(&self) -> Vec<(Value, GitReadConfig)> {
++        let mut cases: Vec<_> = self
++            .cases()
++            .into_iter()
++            .map(|args| (args, GitReadConfig::default()))
++            .collect();
++        for mut args in self.cases() {
++            let command = args["command"].as_str().unwrap();
++            if matches!(command, "refs" | "worktree_status") {
++                continue;
++            }
++            if !matches!(command, "diff" | "ancestry")
++                && args
++                    .get("rev")
++                    .and_then(Value::as_str)
++                    .is_none_or(|rev| rev.len() != 40)
++            {
++                args["rev"] = json!(self.last);
++            }
++            cases.push((
++                args,
++                GitReadConfig {
++                    strict_pinning: true,
++                    ..Default::default()
++                },
++            ));
++        }
++        cases
++    }
++}
++
++#[tokio::test]
++async fn strict_pinning_rejects_all_unpinned_revision_forms_and_operations() {
++    let f = Fixture::new();
++    let strict = GitReadConfig {
++        strict_pinning: true,
++        ..Default::default()
++    };
++    for command in OPERATIONS {
++        if matches!(*command, "refs" | "worktree_status") {
++            let result = f
++                .with_limits(
++                    json!({"command":command,"repo":"source","rev":f.last}),
++                    strict.clone(),
++                )
++                .await;
++            assert_eq!(result.output["error"]["kind"], "rejected_argument");
++            continue;
++        }
++        for revision in [
++            None,
++            Some("HEAD"),
++            Some("HEAD~1"),
++            Some("main"),
++            Some("review"),
++            Some("abcd123"),
++            Some("HEAD..main"),
++        ] {
++            let mut args = json!({"command":command,"repo":"source","path":"renamed.txt"});
++            if matches!(*command, "diff" | "ancestry") {
++                args["b"] = json!(f.last);
++                if let Some(revision) = revision {
++                    args["a"] = json!(revision);
++                }
++            } else if let Some(revision) = revision {
++                args["rev"] = json!(revision);
++            }
++            let result = f.with_limits(args.clone(), strict.clone()).await;
++            assert_eq!(
++                result.output["error"]["kind"], "rejected_argument",
++                "{args}: {}",
++                result.output
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn commit_bodies_are_additive_and_do_not_change_default_log_fields() {
++    let f = Fixture::new();
++    git(
++        &f.repo,
++        &[
++            "commit",
++            "--allow-empty",
++            "-m",
++            "Body fixture",
++            "-m",
++            "First body line.\nSecond body line.",
++        ],
++    );
++    let ordinary = f
++        .call(json!({"command":"log","repo":"source","limit":1}))
++        .await;
++    assert!(ordinary.output["entries"][0].get("body").is_none());
++    for command in ["log", "show_commit"] {
++        let result = f
++            .call(json!({"command":command,"repo":"source","limit":1,"include_body":true}))
++            .await;
++        assert_eq!(result.exit_code, 0, "{}", result.output);
++        let commit = if command == "log" {
++            &result.output["entries"][0]
++        } else {
++            &result.output["commit"]
++        };
++        assert_eq!(commit["body"], "First body line.\nSecond body line.\n");
++        assert_eq!(commit["subject"], "Body fixture");
++    }
++}
++
++#[tokio::test]
++async fn default_status_reports_raw_bytes_without_running_normalizing_filters() {
++    let f = Fixture::new();
++    let filtered = f.repo.join("filtered.txt");
++    fs::write(&filtered, "worktree content\n").unwrap();
++    fs::write(
++        f.repo.join(".gitattributes"),
++        "filtered.txt filter=normalize\n",
++    )
++    .unwrap();
++    git(
++        &f.repo,
++        &[
++            "config",
++            "filter.normalize.clean",
++            "sed s/worktree/canonical/g",
++        ],
++    );
++    git(&f.repo, &["config", "filter.normalize.required", "true"]);
++    git(&f.repo, &["add", "filtered.txt", ".gitattributes"]);
++    git(&f.repo, &["commit", "-m", "Normalizing filter fixture"]);
++    assert_eq!(
++        git(&f.repo, &["show", "HEAD:filtered.txt"]),
++        "canonical content"
++    );
++    assert_eq!(fs::read_to_string(&filtered).unwrap(), "worktree content\n");
++    // Force a content check without allowing ordinary Git to refresh the index.
++    fs::File::open(&filtered)
++        .unwrap()
++        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
++        .unwrap();
++    let before = snapshot(&f.repo);
++    assert_eq!(
++        git(
++            &f.repo,
++            &["--no-optional-locks", "status", "--porcelain=v1"]
++        ),
++        ""
++    );
++    assert_eq!(snapshot(&f.repo), before);
++    let result = f
++        .call(json!({"command":"worktree_status","repo":"source"}))
++        .await;
++    assert_eq!(result.exit_code, 0, "{}", result.output);
++    assert_eq!(result.output["clean"], false);
++    assert!(result.output["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .any(|entry| entry["path"] == "filtered.txt" && entry["status"] == " M"));
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn mixed_case_filter_configuration_is_suppressed_under_both_policies() {
++    use std::io::Write;
++    let f = Fixture::new();
++    let marker = f.workspace.path().join("mixed-filter-executed");
++    let command = format!("printf executed > '{}'", marker.display());
++    let mut config = fs::OpenOptions::new()
++        .append(true)
++        .open(f.repo.join(".git/config"))
++        .unwrap();
++    writeln!(
++        config,
++        "[FILTER \"MiXeD\"]\nClEaN = {command}\nPrOcEsS = {command}\nReQuIrEd = true"
++    )
++    .unwrap();
++    drop(config);
++    fs::write(f.repo.join(".gitattributes"), "*.txt filter=MiXeD\n").unwrap();
++    let content = fs::read(f.repo.join("renamed.txt")).unwrap();
++    fs::write(f.repo.join("renamed.txt"), vec![b'X'; content.len()]).unwrap();
++    let keys = git(
++        &f.repo,
++        &["config", "--name-only", "--get-regexp", "^filter\\."],
++    );
++    assert!(keys.contains("filter.MiXeD.clean"), "{keys}");
++    assert!(keys.contains("filter.MiXeD.process"), "{keys}");
++    let before = snapshot(&f.repo);
++    for (args, limits) in f.policy_cases() {
++        let result = f.with_limits(args.clone(), limits).await;
++        assert_eq!(result.exit_code, 0, "{args}: {}", result.output);
++        assert!(!marker.exists(), "a mixed-case filter executed");
++    }
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn strict_pair_operations_reject_annotated_tags_on_both_sides() {
++    let f = Fixture::new();
++    git(&f.repo, &["tag", "-a", "pair-tag", "-m", "Pair input tag"]);
++    let tag = git(&f.repo, &["rev-parse", "refs/tags/pair-tag"]);
++    let strict = GitReadConfig {
++        strict_pinning: true,
++        ..Default::default()
++    };
++    let before = snapshot(&f.repo);
++    for command in ["diff", "ancestry"] {
++        for (a, b) in [(&tag, &f.last), (&f.first, &tag)] {
++            let args = json!({"command":command,"repo":"source","a":a,"b":b});
++            let ordinary = f.call(args.clone()).await;
++            assert_eq!(ordinary.exit_code, 0, "{}", ordinary.output);
++            let pinned = f.with_limits(args.clone(), strict.clone()).await;
++            assert_eq!(
++                pinned.output["error"]["kind"], "rejected_argument",
++                "{args}: {}",
++                pinned.output
++            );
++        }
++    }
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn malformed_filter_configuration_fails_structurally_without_mutation() {
++    use std::io::Write;
++    let f = Fixture::new();
++    let mut config = fs::OpenOptions::new()
++        .append(true)
++        .open(f.repo.join(".git/config"))
++        .unwrap();
++    writeln!(config, "[unterminated").unwrap();
++    drop(config);
++    let before = snapshot(&f.repo);
++    for args in [
++        json!({"command":"worktree_status","repo":"source"}),
++        json!({"command":"show_file","repo":"source","rev":f.first,"path":"old.txt"}),
++    ] {
++        let result = f.call(args).await;
++        assert_ne!(result.exit_code, 0);
++        assert_eq!(
++            result.output["error"]["kind"], "git_error",
++            "{}",
++            result.output
++        );
++        assert!(result.output["error"]["message"]
++            .as_str()
++            .unwrap()
++            .contains("config"));
++    }
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn private_status_metadata_is_bounded_and_removed_after_failure() {
++    let f = Fixture::new();
++    let state = tempfile::tempdir().unwrap();
++    let limits = GitReadConfig {
++        status_directory: Some(state.path().to_string_lossy().into_owned()),
++        max_status_metadata_bytes: 1,
++        ..Default::default()
++    };
++    let before = snapshot(&f.repo);
++    let result = f
++        .with_limits(json!({"command":"worktree_status","repo":"source"}), limits)
++        .await;
++    assert_eq!(
++        result.output["error"]["kind"], "output_limit",
++        "{}",
++        result.output
++    );
++    assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
++    assert_eq!(snapshot(&f.repo), before);
++    let unsafe_directory = GitReadConfig {
++        status_directory: Some(f.repo.to_string_lossy().into_owned()),
++        ..Default::default()
++    };
++    let refused = f
++        .with_limits(
++            json!({"command":"worktree_status","repo":"source"}),
++            unsafe_directory,
++        )
++        .await;
++    assert_eq!(refused.output["error"]["kind"], "rejected_argument");
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn frozen_status_preserves_builtin_normalization_split_index_and_local_excludes() {
++    let f = Fixture::new();
++    git(&f.repo, &["config", "core.autocrlf", "true"]);
++    fs::write(f.repo.join(".git/info/attributes"), "eol.txt text\n").unwrap();
++    fs::write(f.repo.join("eol.txt"), "first\r\nsecond\r\n").unwrap();
++    git(&f.repo, &["add", "eol.txt"]);
++    git(&f.repo, &["commit", "-m", "Built-in normalization fixture"]);
++    fs::File::open(f.repo.join("eol.txt"))
++        .unwrap()
++        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
++        .unwrap();
++    fs::write(f.repo.join(".git/info/exclude"), "ignored.local\n").unwrap();
++    fs::write(f.repo.join("ignored.local"), "ignored\n").unwrap();
++    git(&f.repo, &["update-index", "--split-index"]);
++    assert_eq!(
++        git(
++            &f.repo,
++            &["--no-optional-locks", "status", "--porcelain=v1"]
++        ),
++        ""
++    );
++    let before = snapshot(&f.repo);
++    let result = f
++        .call(json!({"command":"worktree_status","repo":"source"}))
++        .await;
++    assert_eq!(result.exit_code, 0, "{}", result.output);
++    assert_eq!(result.output["clean"], true, "{}", result.output);
++    assert_eq!(snapshot(&f.repo), before);
++}
++
++#[tokio::test]
++async fn frozen_status_handles_linked_worktrees_reftable_and_sha256() {
++    let f = Fixture::new();
++    git(
++        &f.repo,
++        &["worktree", "add", "--detach", "../linked", &f.last],
++    );
++    git(f.workspace.path(), &["clone", "source", "reftable"]);
++    git(
++        &f.workspace.path().join("reftable"),
++        &["refs", "migrate", "--ref-format=reftable"],
++    );
++    git(
++        f.workspace.path(),
++        &["init", "--object-format=sha256", "sha256"],
++    );
++    let sha256 = f.workspace.path().join("sha256");
++    git(&sha256, &["config", "user.name", "Format Fixture"]);
++    git(&sha256, &["config", "user.email", "format@example.test"]);
++    git(&sha256, &["config", "commit.gpgsign", "false"]);
++    fs::write(sha256.join("file.txt"), "format fixture\n").unwrap();
++    git(&sha256, &["add", "."]);
++    git(&sha256, &["commit", "-m", "Format fixture"]);
++    let before = snapshot(f.workspace.path());
++    for repo in ["linked", "reftable", "sha256"] {
++        let result = f
++            .call(json!({"command":"worktree_status","repo":repo}))
++            .await;
++        assert_eq!(result.exit_code, 0, "{repo}: {}", result.output);
++        assert_eq!(result.output["clean"], true, "{repo}: {}", result.output);
++        assert_eq!(
++            result.output["commits"][0].as_str().unwrap().len(),
++            if repo == "sha256" { 64 } else { 40 }
++        );
++    }
++    assert_eq!(snapshot(f.workspace.path()), before);
++}
++
++#[tokio::test]
++async fn strict_uppercase_hash_inputs_return_canonical_lowercase_commits() {
++    let f = Fixture::new();
++    let strict = GitReadConfig {
++        strict_pinning: true,
++        ..Default::default()
++    };
++    let result = f
++        .with_limits(
++            json!({"command":"resolve","repo":"source","rev":f.last.to_ascii_uppercase()}),
++            strict,
++        )
++        .await;
++    assert_eq!(result.exit_code, 0, "{}", result.output);
++    assert_eq!(result.output["commits"], json!([f.last]));
++}
+diff --git c/src/tool_descriptions.rs w/src/tool_descriptions.rs
+index 088518c..1e62cbb 100644
+--- c/src/tool_descriptions.rs
++++ w/src/tool_descriptions.rs
+@@ -11,7 +11,7 @@ pub const DEFAULT_TEXT: &str = include_str!("../prompts/tool_descriptions.toml")
+ /// deletion fails parity tests. Future intentional additions/removals update
+ /// this single value.
+ #[cfg(test)]
+-pub(crate) const DEFAULT_PARAMETER_DESCRIPTION_COUNT: usize = 156;
++pub(crate) const DEFAULT_PARAMETER_DESCRIPTION_COUNT: usize = 157;
+ #[cfg(test)]
+ pub(crate) const AGENT_ONLY_PARAMETER_DESCRIPTION_COUNT: usize = 2;
+ #[cfg(test)]
+diff --git c/tests/test_git_read.py w/tests/test_git_read.py
+index 88b11ea..743107f 100644
+--- c/tests/test_git_read.py
++++ w/tests/test_git_read.py
+@@ -292,3 +292,135 @@ def test_git_read_short_inheritance_prefixes_do_not_leak_git_controls(daimonos_f
+         response=client.call_tool("git_read",{"command":"resolve","repo":"source"})
+         assert not response.get("isError"),response
+         assert not trace.exists(),f"git controls leaked through prefix {prefix!r}"
++
++
++def test_git_read_strict_policy_keeps_default_resolution_and_adds_bodies(daimonos_factory,tmp_path):
++    repo,first=repository(tmp_path)
++    git(repo,"commit","--allow-empty","-m","Body fixture","-m","Stored body.")
++    commit=git(repo,"rev-parse","HEAD")
++    ordinary=daimonos_factory(tmp_path)
++    assert not ordinary.call_tool("git_read",{"command":"resolve","repo":"source","rev":"HEAD"}).get("isError")
++    (tmp_path/"daimonos.toml").write_text("[git_read]\nstrict_pinning=true\n")
++    strict=daimonos_factory(tmp_path)
++    for revision in (None,"HEAD","main",commit[:10],"HEAD~1",f"{first}..{commit}"):
++        args={"command":"resolve","repo":"source"}
++        if revision is not None:
++            args["rev"]=revision
++        response=strict.call_tool("git_read",args)
++        assert response.get("isError"),response
++        assert json.loads(response["content"][0]["text"])["error"]["kind"]=="rejected_argument"
++    resolved=strict.call_tool("git_read",{"command":"resolve","repo":"source","rev":commit})
++    assert not resolved.get("isError"),resolved
++    assert json.loads(resolved["content"][0]["text"])["commits"]==[commit]
++    history=strict.call_tool("git_read",{"command":"log","repo":"source","rev":commit,"include_body":True,"limit":1})
++    assert not history.get("isError"),history
++    assert json.loads(history["content"][0]["text"])["entries"][0]["body"]=="Stored body.\n"
++    assert not ordinary.call_tool("git_read",{"command":"resolve","repo":"source","rev":"HEAD"}).get("isError")
++
++
++def test_git_read_strict_operations_on_a_real_read_only_bind_mount(daimonos_binary,tmp_path):
++    import errno
++    import os
++    import shutil
++    import sys
++    import pytest
++
++    if sys.platform!="linux" or not shutil.which("unshare"):
++        pytest.skip("requires Linux user and mount namespaces")
++    supported=subprocess.run(["unshare","-Urnm","true"],capture_output=True,text=True)
++    if supported.returncode:
++        pytest.skip("user or mount namespaces are unavailable")
++    workspace=tmp_path/"evidence"
++    workspace.mkdir()
++    _,commit=repository(workspace)
++    (workspace/"daimonos.toml").write_text("[git_read]\nstrict_pinning=true\n[logging]\nenabled=false\n[analytics]\nenabled=false\n")
++    source_tests=str(Path(__file__).resolve().parent)
++    program=r'''
++import errno,hashlib,json,os,subprocess,sys
++from pathlib import Path
++sys.path.insert(0,sys.argv[1])
++from conftest import DaimonosClient
++binary,workspace,commit=sys.argv[2:]
++workspace=Path(workspace)
++def snapshot():
++    return [(str(p.relative_to(workspace)),p.lstat().st_size,p.lstat().st_mtime_ns,hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None) for p in sorted(workspace.rglob("*"))]
++subprocess.run(["mount","--bind",str(workspace),str(workspace)],check=True)
++subprocess.run(["mount","-o","remount,bind,ro",str(workspace)],check=True)
++try:
++    (workspace/"must-not-write").write_text("forbidden")
++    raise AssertionError("the mount is not read-only")
++except OSError as error:
++    assert error.errno==errno.EROFS,error
++before=snapshot()
++process=subprocess.Popen([binary,"--mcp","-w",str(workspace)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
++try:
++    client=DaimonosClient(process,str(workspace))
++    client.send_raw({"jsonrpc":"2.0","id":client._next_id(),"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"readonly-probe","version":"1"}}})
++    client.send_raw({"jsonrpc":"2.0","method":"notifications/initialized"})
++    calls=[{"command":"resolve"},{"command":"show_file","path":"file.txt"},{"command":"list_tree"},{"command":"grep","pattern":"first"},{"command":"log","include_body":True},{"command":"show_commit","include_body":True},{"command":"diff","a":commit,"b":commit},{"command":"blame","path":"file.txt"},{"command":"ancestry","a":commit,"b":commit}]
++    for args in calls:
++        if args["command"] not in ("diff","ancestry"):
++            args["rev"]=commit
++        response=client.call_tool("git_read",{"repo":"source",**args})
++        assert not response.get("isError"),(args,response)
++        assert commit in json.loads(response["content"][0]["text"])["commits"]
++    for command in ("refs","worktree_status"):
++        response=client.call_tool("git_read",{"repo":"source","command":command})
++        assert response.get("isError"),response
++        assert json.loads(response["content"][0]["text"])["error"]["kind"]=="rejected_argument"
++finally:
++    process.terminate()
++    process.wait(timeout=5)
++assert snapshot()==before,"the evidence changed"
++print(json.dumps({"read_only_mount":True,"pinned_operations":9,"refused_operations":2,"unchanged":True}))
++'''
++    env=os.environ.copy()
++    env["DAIMONOS_KGL_AUTOINDEX"]="0"
++    result=subprocess.run(["unshare","-Urnm",sys.executable,"-c",program,source_tests,str(daimonos_binary),str(workspace),commit],env=env,capture_output=True,text=True,timeout=60)
++    assert result.returncode==0,result.stdout+result.stderr
++    assert json.loads(result.stdout)=={"read_only_mount":True,"pinned_operations":9,"refused_operations":2,"unchanged":True}
++
++
++def test_git_read_filter_added_after_inspection_cannot_execute(daimonos_factory,tmp_path):
++    import os
++    import shutil
++    import sys
++
++    repo,_=repository(tmp_path)
++    included=tmp_path/"late-filter.cfg"
++    included.write_text("")
++    marker=tmp_path/"late-filter-executed"
++    malicious=tmp_path/"late-filter.sh"
++    malicious.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
++    malicious.chmod(0o755)
++    git(repo,"config","include.path",str(included))
++    (repo/".gitattributes").write_text("file.txt filter=late\n")
++    git(repo,"add",".gitattributes")
++    git(repo,"commit","-m","Late filter attribute")
++    original=(repo/"file.txt").read_bytes()
++    (repo/"file.txt").write_bytes(b"X"*len(original))
++    real_git=shutil.which("git")
++    assert real_git
++    wrapper_dir=tmp_path/"git-wrapper"
++    wrapper_dir.mkdir()
++    wrapper=wrapper_dir/"git"
++    payload=f'[filter "late"]\nprocess = {malicious}\nrequired = true\n'
++    trigger=tmp_path/"status-boundary-reached"
++    wrapper.write_text(
++        f"#!{sys.executable}\nimport pathlib,subprocess,sys\n"
++        f"if 'status' in sys.argv[1:]:\n    pathlib.Path({str(included)!r}).write_text({payload!r})\n    pathlib.Path({str(trigger)!r}).write_text('triggered')\n"
++        f"sys.exit(subprocess.run([{real_git!r},*sys.argv[1:]]).returncode)\n"
++    )
++    wrapper.chmod(0o755)
++    client=daimonos_factory(tmp_path,env={"PATH":str(wrapper_dir)+os.pathsep+os.environ["PATH"]})
++    trigger.unlink(missing_ok=True)
++    included.write_text(payload)
++    baseline=subprocess.run([real_git,"--no-optional-locks","status","--porcelain=v1"],cwd=repo,capture_output=True,text=True)
++    assert marker.exists(),baseline.stdout+baseline.stderr
++    marker.unlink()
++    included.write_text("")
++    response=client.call_tool("git_read",{"command":"worktree_status","repo":"source"})
++    assert trigger.exists(),"the process-boundary race did not run"
++    assert included.read_text()==payload
++    assert not marker.exists(),"a filter introduced after the inspection executed"
++    assert not response.get("isError"),response

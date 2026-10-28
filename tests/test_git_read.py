@@ -379,3 +379,88 @@ print(json.dumps({"read_only_mount":True,"pinned_operations":9,"refused_operatio
     result=subprocess.run(["unshare","-Urnm",sys.executable,"-c",program,source_tests,str(daimonos_binary),str(workspace),commit],env=env,capture_output=True,text=True,timeout=60)
     assert result.returncode==0,result.stdout+result.stderr
     assert json.loads(result.stdout)=={"read_only_mount":True,"pinned_operations":9,"refused_operations":2,"unchanged":True}
+
+
+def test_git_read_filter_added_after_inspection_cannot_execute(daimonos_factory,tmp_path):
+    import os
+    import shutil
+    import sys
+
+    repo,_=repository(tmp_path)
+    included=tmp_path/"late-filter.cfg"
+    included.write_text("")
+    marker=tmp_path/"late-filter-executed"
+    malicious=tmp_path/"late-filter.sh"
+    malicious.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
+    malicious.chmod(0o755)
+    git(repo,"config","include.path",str(included))
+    (repo/".gitattributes").write_text("file.txt filter=late\n")
+    git(repo,"add",".gitattributes")
+    git(repo,"commit","-m","Late filter attribute")
+    original=(repo/"file.txt").read_bytes()
+    (repo/"file.txt").write_bytes(b"X"*len(original))
+    real_git=shutil.which("git")
+    assert real_git
+    wrapper_dir=tmp_path/"git-wrapper"
+    wrapper_dir.mkdir()
+    wrapper=wrapper_dir/"git"
+    payload=f'[filter "late"]\nprocess = {malicious}\nrequired = true\n'
+    trigger=tmp_path/"status-boundary-reached"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport pathlib,subprocess,sys\n"
+        f"if 'status' in sys.argv[1:]:\n    pathlib.Path({str(included)!r}).write_text({payload!r})\n    pathlib.Path({str(trigger)!r}).write_text('triggered')\n"
+        f"sys.exit(subprocess.run([{real_git!r},*sys.argv[1:]]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    client=daimonos_factory(tmp_path,env={"PATH":str(wrapper_dir)+os.pathsep+os.environ["PATH"]})
+    trigger.unlink(missing_ok=True)
+    included.write_text(payload)
+    baseline=subprocess.run([real_git,"--no-optional-locks","status","--porcelain=v1"],cwd=repo,capture_output=True,text=True)
+    assert marker.exists(),baseline.stdout+baseline.stderr
+    marker.unlink()
+    included.write_text("")
+    response=client.call_tool("git_read",{"command":"worktree_status","repo":"source"})
+    assert trigger.exists(),"the process-boundary race did not run"
+    assert included.read_text()==payload
+    assert not marker.exists(),"a filter introduced after the inspection executed"
+    assert not response.get("isError"),response
+
+
+def test_frozen_status_cannot_inherit_global_or_system_filters(daimonos_factory,tmp_path):
+    import os
+    import shutil
+
+    workspace=tmp_path/"evidence"
+    workspace.mkdir()
+    repo,_=repository(workspace)
+    original=(repo/"file.txt").read_bytes()
+    (repo/"system.txt").write_bytes(original)
+    (repo/".gitattributes").write_text("file.txt filter=fromglobal required\nsystem.txt filter=fromsystem required\n")
+    git(repo,"add",".")
+    git(repo,"commit","-m","Inherited filter attributes")
+    for name in ("file.txt","system.txt"):
+        (repo/name).write_bytes(b"X"*len(original))
+    global_config=tmp_path/"global.gitconfig"
+    system_config=tmp_path/"system.gitconfig"
+    markers=[]
+    for driver,config in (("fromglobal",global_config),("fromsystem",system_config)):
+        marker=tmp_path/f"{driver}-executed"
+        script=tmp_path/f"{driver}.sh"
+        script.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
+        script.chmod(0o755)
+        config.write_text(f'[FILTER "{driver}"]\nPrOcEsS = {script}\nReQuIrEd = true\n')
+        markers.append(marker)
+    inherited={"GIT_CONFIG_GLOBAL":str(global_config),"GIT_CONFIG_SYSTEM":str(system_config),"GIT_CONFIG_NOSYSTEM":"0"}
+    real_git=shutil.which("git")
+    assert real_git
+    for name,marker in zip(("file.txt","system.txt"),markers):
+        baseline=subprocess.run([real_git,"--no-optional-locks","status","--porcelain=v1","--",name],cwd=repo,env={**os.environ,**inherited},capture_output=True,text=True)
+        assert marker.exists(),baseline.stdout+baseline.stderr
+        marker.unlink()
+    client=daimonos_factory(workspace,env=inherited)
+    for marker in markers:
+        marker.unlink(missing_ok=True)
+    response=client.call_tool("git_read",{"command":"worktree_status","repo":"source"})
+    assert not response.get("isError"),response
+    assert not any(marker.exists() for marker in markers)
+    assert json.loads(response["content"][0]["text"])["clean"] is False

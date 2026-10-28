@@ -44,7 +44,10 @@ pub(super) struct ReadRepo {
     pub shallow: bool,
     pub partial: bool,
     pub bare: bool,
-    strict_pinning: bool,
+    workspace: PathBuf,
+    gitdir: PathBuf,
+    common: PathBuf,
+    limits: GitReadConfig,
     filter_overrides: Vec<String>,
     env: HashMap<String, String>,
     process: ProcessConfig,
@@ -199,12 +202,15 @@ impl ReadRepo {
             shallow: false,
             partial: false,
             bare,
-            strict_pinning: limits.strict_pinning,
+            workspace,
+            gitdir,
+            common,
+            limits: limits.clone(),
             filter_overrides: Vec::new(),
             env,
             process,
         };
-        // status can run clean/process filters while comparing dirty files. Disable every
+        // ADR-019: status can run clean/process filters. Disable every
         // configured driver before any operation that can inspect worktree content.
         let filters = repo
             .output(&[
@@ -284,6 +290,13 @@ impl ReadRepo {
     }
 
     pub async fn output(&self, arguments: &[&str]) -> Result<ManagedOutput, Failure> {
+        self.output_with_env(arguments, &self.env).await
+    }
+    async fn output_with_env(
+        &self,
+        arguments: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<ManagedOutput, Failure> {
         let mut argv: Vec<String> = [
             "--no-pager",
             "--no-lazy-fetch",
@@ -310,12 +323,19 @@ impl ReadRepo {
             argv.extend(["-c".to_string(), setting.clone()]);
         }
         argv.extend(arguments.iter().map(|s| (*s).into()));
-        managed_process::run("git", &argv, &self.path, &self.env, &self.process, None)
+        managed_process::run("git", &argv, &self.path, env, &self.process, None)
             .await
             .map_err(Into::into)
     }
     pub async fn text(&self, arguments: &[&str]) -> Result<String, Failure> {
-        let output = self.output(arguments).await?;
+        self.text_with_env(arguments, &self.env).await
+    }
+    async fn text_with_env(
+        &self,
+        arguments: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<String, Failure> {
+        let output = self.output_with_env(arguments, env).await?;
         self.check(&output)?;
         if output.stdout_truncated || output.stderr_truncated {
             return Err(Failure::new(
@@ -325,6 +345,59 @@ impl ReadRepo {
             .truncated());
         }
         Ok(output.stdout)
+    }
+    pub async fn worktree_status(
+        &self,
+        commit: &str,
+        arguments: &[&str],
+    ) -> Result<String, Failure> {
+        let config = self
+            .output(&[
+                "config",
+                "--null",
+                "--get-regexp",
+                super::status::STATUS_CONFIG_PATTERN,
+            ])
+            .await?;
+        if config.status.code() != Some(1) {
+            self.check(&config)?;
+        }
+        if config.stdout_truncated || config.stderr_truncated {
+            return Err(Failure::new(
+                "output_limit",
+                "status configuration exceeds capture limit",
+            ));
+        }
+        if !config.stderr.trim().is_empty() {
+            return Err(Failure::new(
+                "invalid_repository",
+                "cannot freeze status configuration",
+            ));
+        }
+        let view = super::status::StatusView::create(
+            &self.workspace,
+            &self.gitdir,
+            &self.common,
+            commit,
+            &config.stdout,
+            &self.limits,
+        )
+        .await?;
+        let mut env = self.env.clone();
+        env.insert("GIT_DIR".into(), view.path.to_string_lossy().into_owned());
+        env.insert(
+            "GIT_COMMON_DIR".into(),
+            view.path.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "GIT_INDEX_FILE".into(),
+            view.path.join("index").to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "GIT_OBJECT_DIRECTORY".into(),
+            self.common.join("objects").to_string_lossy().into_owned(),
+        );
+        self.text_with_env(arguments, &env).await
     }
     pub fn check(&self, output: &ManagedOutput) -> Result<(), Failure> {
         if output.status.success() {
@@ -388,11 +461,17 @@ impl ReadRepo {
         self.resolve(revision, "object").await
     }
     pub async fn commit(&self, revision: &str) -> Result<String, Failure> {
-        let commit = self.resolve(revision, "commit").await?;
-        if self.strict_pinning && commit != revision.to_ascii_lowercase() {
+        if self.limits.strict_pinning && !super::is_full_sha1(revision) {
             return Err(Failure::new(
                 "rejected_argument",
-                "strict pinning requires a commit object, not a peeled tag",
+                "strict pinning requires a full SHA-1 commit hash",
+            ));
+        }
+        let commit = self.resolve(revision, "commit").await?;
+        if self.limits.strict_pinning && commit != revision.to_ascii_lowercase() {
+            return Err(Failure::new(
+                "rejected_argument",
+                "strict pinning requires an unpeeled SHA-1 commit object",
             ));
         }
 

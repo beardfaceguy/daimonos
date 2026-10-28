@@ -1059,8 +1059,19 @@ short hashes, and annotated-tag object identifiers are rejected. `refs` and
 
 `log` and `show_commit` accept `include_body=true`. Only that opt-in adds the
 `body` field to commit metadata. The existing response cap still applies.
+Bodies preserve Git's body text, including any trailing newline. Do not trim them before comparisons.
 
 The runner disables configured clean, smudge, and process filters in both modes.
+This is an approved security-fix exception to the unchanged-default rule.
+`worktree_status` does not apply those external transformations. It can report a
+modified file where ordinary Git reports a clean filtered file, including Git LFS cases.
+Do not interpret this result as filter-aware status. Built-in Git conversions can still apply.
+[ADR-019](adr/019-ignore-repository-filters.md) records the reason and the human approval.
+Status runs against private, frozen metadata with no filter definitions or include directives.
+Later changes to repository configuration cannot add executable filters to that process.
+`git_read.status_directory` can select an existing metadata directory outside the workspace.
+The default is the system temporary directory. The private directory is removed after the call.
+`git_read.max_status_metadata_bytes` defaults to 64 MiB and bounds the copied metadata.
 Unsupported filter keys or oversized configuration fail closed before reads.
 Strict pinning is not required for process hardening. It adds immutable input selection.
 

@@ -84,8 +84,8 @@ ed25519-dalek = "3.0.0"
 unicode-width = "=0.2.0"
 unicode-segmentation = "1.13.3"
 
-# Only for fcntl(F_GETFL/F_SETFL) on the ACP stdin descriptor, to clear an
-# O_NONBLOCK flag a child process left behind on the shared file description.
+# ACP stdin flag repair and nonblocking, no-follow reads of git status metadata.
+# Both uses require Unix descriptor flags without a new dependency.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

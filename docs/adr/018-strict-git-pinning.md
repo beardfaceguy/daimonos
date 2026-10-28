@@ -19,7 +19,7 @@ How can dbunk require pinned inputs without breaking existing callers?
 
 ## Decision drivers
 
-- Existing calls, defaults, and result shapes must remain unchanged.
+- Existing calls, defaults, and result shapes remain unchanged except for the approved filter security fix in ADR-019.
 - Every strict read must identify its input commits explicitly.
 - Output pinning cannot replace input validation.
 - The existing process hardening must remain active under both policies.

@@ -844,3 +844,475 @@ async fn commit_bodies_are_additive_and_do_not_change_default_log_fields() {
         assert_eq!(commit["subject"], "Body fixture");
     }
 }
+
+#[tokio::test]
+async fn default_status_reports_raw_bytes_without_running_normalizing_filters() {
+    let f = Fixture::new();
+    let filtered = f.repo.join("filtered.txt");
+    fs::write(&filtered, "worktree content\n").unwrap();
+    fs::write(
+        f.repo.join(".gitattributes"),
+        "filtered.txt filter=normalize\n",
+    )
+    .unwrap();
+    git(
+        &f.repo,
+        &[
+            "config",
+            "filter.normalize.clean",
+            "sed s/worktree/canonical/g",
+        ],
+    );
+    git(&f.repo, &["config", "filter.normalize.required", "true"]);
+    git(&f.repo, &["add", "filtered.txt", ".gitattributes"]);
+    git(&f.repo, &["commit", "-m", "Normalizing filter fixture"]);
+    assert_eq!(
+        git(&f.repo, &["show", "HEAD:filtered.txt"]),
+        "canonical content"
+    );
+    assert_eq!(fs::read_to_string(&filtered).unwrap(), "worktree content\n");
+    // Force a content check without allowing ordinary Git to refresh the index.
+    fs::File::open(&filtered)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
+        .unwrap();
+    let before = snapshot(&f.repo);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["--no-optional-locks", "status", "--porcelain=v1"]
+        ),
+        ""
+    );
+    assert_eq!(snapshot(&f.repo), before);
+    let result = f
+        .call(json!({"command":"worktree_status","repo":"source"}))
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["clean"], false);
+    assert!(result.output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "filtered.txt" && entry["status"] == " M"));
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn mixed_case_filter_configuration_is_suppressed_under_both_policies() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let marker = f.workspace.path().join("mixed-filter-executed");
+    let command = format!("printf executed > '{}'", marker.display());
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(f.repo.join(".git/config"))
+        .unwrap();
+    writeln!(
+        config,
+        "[FILTER \"MiXeD\"]\nClEaN = {command}\nPrOcEsS = {command}\nReQuIrEd = true"
+    )
+    .unwrap();
+    drop(config);
+    fs::write(f.repo.join(".gitattributes"), "*.txt filter=MiXeD\n").unwrap();
+    let content = fs::read(f.repo.join("renamed.txt")).unwrap();
+    fs::write(f.repo.join("renamed.txt"), vec![b'X'; content.len()]).unwrap();
+    let keys = git(
+        &f.repo,
+        &["config", "--name-only", "--get-regexp", "^filter\\."],
+    );
+    assert!(keys.contains("filter.MiXeD.clean"), "{keys}");
+    assert!(keys.contains("filter.MiXeD.process"), "{keys}");
+    let before = snapshot(&f.repo);
+    for (args, limits) in f.policy_cases() {
+        let result = f.with_limits(args.clone(), limits).await;
+        assert_eq!(result.exit_code, 0, "{args}: {}", result.output);
+        assert!(!marker.exists(), "a mixed-case filter executed");
+    }
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn strict_pair_operations_reject_annotated_tags_on_both_sides() {
+    let f = Fixture::new();
+    git(&f.repo, &["tag", "-a", "pair-tag", "-m", "Pair input tag"]);
+    let tag = git(&f.repo, &["rev-parse", "refs/tags/pair-tag"]);
+    let strict = GitReadConfig {
+        strict_pinning: true,
+        ..Default::default()
+    };
+    let before = snapshot(&f.repo);
+    for command in ["diff", "ancestry"] {
+        for (a, b) in [(&tag, &f.last), (&f.first, &tag)] {
+            let args = json!({"command":command,"repo":"source","a":a,"b":b});
+            let ordinary = f.call(args.clone()).await;
+            assert_eq!(ordinary.exit_code, 0, "{}", ordinary.output);
+            let pinned = f.with_limits(args.clone(), strict.clone()).await;
+            assert_eq!(
+                pinned.output["error"]["kind"], "rejected_argument",
+                "{args}: {}",
+                pinned.output
+            );
+        }
+    }
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn malformed_filter_configuration_fails_structurally_without_mutation() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(f.repo.join(".git/config"))
+        .unwrap();
+    writeln!(config, "[unterminated").unwrap();
+    drop(config);
+    let before = snapshot(&f.repo);
+    for args in [
+        json!({"command":"worktree_status","repo":"source"}),
+        json!({"command":"show_file","repo":"source","rev":f.first,"path":"old.txt"}),
+    ] {
+        let result = f.call(args).await;
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(
+            result.output["error"]["kind"], "git_error",
+            "{}",
+            result.output
+        );
+        assert!(result.output["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("config"));
+    }
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn private_status_metadata_is_bounded_and_removed_after_failure() {
+    let f = Fixture::new();
+    let state = tempfile::tempdir().unwrap();
+    let limits = GitReadConfig {
+        status_directory: Some(state.path().to_string_lossy().into_owned()),
+        max_status_metadata_bytes: 1,
+        ..Default::default()
+    };
+    let before = snapshot(&f.repo);
+    let result = f
+        .with_limits(json!({"command":"worktree_status","repo":"source"}), limits)
+        .await;
+    assert_eq!(
+        result.output["error"]["kind"], "output_limit",
+        "{}",
+        result.output
+    );
+    assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+    assert_eq!(snapshot(&f.repo), before);
+    let unsafe_directory = GitReadConfig {
+        status_directory: Some(f.repo.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let refused = f
+        .with_limits(
+            json!({"command":"worktree_status","repo":"source"}),
+            unsafe_directory,
+        )
+        .await;
+    assert_eq!(refused.output["error"]["kind"], "rejected_argument");
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn frozen_status_preserves_builtin_normalization_split_index_and_local_excludes() {
+    let f = Fixture::new();
+    git(&f.repo, &["config", "core.autocrlf", "true"]);
+    fs::write(f.repo.join(".git/info/attributes"), "eol.txt text\n").unwrap();
+    fs::write(f.repo.join("eol.txt"), "first\r\nsecond\r\n").unwrap();
+    git(&f.repo, &["add", "eol.txt"]);
+    git(&f.repo, &["commit", "-m", "Built-in normalization fixture"]);
+    fs::File::open(f.repo.join("eol.txt"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(5)))
+        .unwrap();
+    fs::write(f.repo.join(".git/info/exclude"), "ignored.local\n").unwrap();
+    fs::write(f.repo.join("ignored.local"), "ignored\n").unwrap();
+    git(&f.repo, &["update-index", "--split-index"]);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["--no-optional-locks", "status", "--porcelain=v1"]
+        ),
+        ""
+    );
+    let before = snapshot(&f.repo);
+    let result = f
+        .call(json!({"command":"worktree_status","repo":"source"}))
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["clean"], true, "{}", result.output);
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn frozen_status_handles_linked_worktrees_reftable_and_sha256() {
+    let f = Fixture::new();
+    git(
+        &f.repo,
+        &["worktree", "add", "--detach", "../linked", &f.last],
+    );
+    git(f.workspace.path(), &["clone", "source", "reftable"]);
+    git(
+        &f.workspace.path().join("reftable"),
+        &["refs", "migrate", "--ref-format=reftable"],
+    );
+    git(
+        f.workspace.path(),
+        &["init", "--object-format=sha256", "sha256"],
+    );
+    let sha256 = f.workspace.path().join("sha256");
+    git(&sha256, &["config", "user.name", "Format Fixture"]);
+    git(&sha256, &["config", "user.email", "format@example.test"]);
+    git(&sha256, &["config", "commit.gpgsign", "false"]);
+    fs::write(sha256.join("file.txt"), "format fixture\n").unwrap();
+    git(&sha256, &["add", "."]);
+    git(&sha256, &["commit", "-m", "Format fixture"]);
+    let before = snapshot(f.workspace.path());
+    for repo in ["linked", "reftable", "sha256"] {
+        let result = f
+            .call(json!({"command":"worktree_status","repo":repo}))
+            .await;
+        assert_eq!(result.exit_code, 0, "{repo}: {}", result.output);
+        assert_eq!(result.output["clean"], true, "{repo}: {}", result.output);
+        assert_eq!(
+            result.output["commits"][0].as_str().unwrap().len(),
+            if repo == "sha256" { 64 } else { 40 }
+        );
+    }
+    assert_eq!(snapshot(f.workspace.path()), before);
+}
+
+#[tokio::test]
+async fn strict_uppercase_hash_inputs_return_canonical_lowercase_commits() {
+    let f = Fixture::new();
+    let strict = GitReadConfig {
+        strict_pinning: true,
+        ..Default::default()
+    };
+    let result = f
+        .with_limits(
+            json!({"command":"resolve","repo":"source","rev":f.last.to_ascii_uppercase()}),
+            strict,
+        )
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["commits"], json!([f.last]));
+}
+
+#[tokio::test]
+async fn frozen_status_preserves_racy_index_content_checks() {
+    let f = Fixture::new();
+    let file = f.repo.join("renamed.txt");
+    let index = f.repo.join(".git/index");
+    let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    git(&f.repo, &["config", "core.trustctime", "false"]);
+    fs::File::open(&file)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+    git(
+        &f.repo,
+        &["update-index", "--really-refresh", "--", "renamed.txt"],
+    );
+    let previous = fs::read(&file).unwrap();
+    fs::write(&file, vec![b'X'; previous.len()]).unwrap();
+    fs::File::open(&file)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+    fs::File::open(&index)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+    assert_eq!(
+        git(
+            &f.repo,
+            &["--no-optional-locks", "status", "--porcelain=v1"]
+        ),
+        "M renamed.txt"
+    );
+    let before = snapshot(&f.repo);
+    let result = f
+        .call(json!({"command":"worktree_status","repo":"source"}))
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["clean"], false, "{}", result.output);
+    assert!(result.output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "renamed.txt"));
+    assert_eq!(snapshot(&f.repo), before);
+}
+
+#[tokio::test]
+async fn frozen_status_handles_a_linked_split_index_with_an_upstream() {
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &f.first],
+    );
+    git(
+        &f.repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(
+        &f.repo,
+        &[
+            "config",
+            "remote.origin.url",
+            &format!("http://{}/forbidden", listener.local_addr().unwrap()),
+        ],
+    );
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-split",
+            "../linked-split",
+            &f.last,
+        ],
+    );
+    let linked = f.workspace.path().join("linked-split");
+    git(&linked, &["branch", "--set-upstream-to=origin/main"]);
+    git(&linked, &["update-index", "--split-index"]);
+    assert_eq!(git(&linked, &["rev-parse", "@{upstream}"]), f.first);
+    let gitdir = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]))
+        .canonicalize()
+        .unwrap();
+    let shared = linked
+        .join(git(&linked, &["rev-parse", "--shared-index-path"]))
+        .canonicalize()
+        .unwrap();
+    assert_eq!(shared.parent(), Some(gitdir.as_path()));
+    fs::write(linked.join("note.txt"), "untracked note\n").unwrap();
+    assert_eq!(
+        git(
+            &linked,
+            &["--no-optional-locks", "status", "--porcelain=v1"]
+        ),
+        "?? note.txt"
+    );
+    let before = snapshot(f.workspace.path());
+    let result = f
+        .call(json!({"command":"worktree_status","repo":"linked-split"}))
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(
+        result.output["entries"],
+        json!([{"status":"??","path":"note.txt"}])
+    );
+    assert_eq!(snapshot(f.workspace.path()), before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn frozen_status_respects_alternate_object_store_confinement() {
+    let f = Fixture::new();
+    git(
+        f.workspace.path(),
+        &["clone", "--shared", "source", "shared"],
+    );
+    let before = snapshot(f.workspace.path());
+    let allowed = f
+        .call(json!({"command":"worktree_status","repo":"shared"}))
+        .await;
+    assert_eq!(allowed.exit_code, 0, "{}", allowed.output);
+    assert_eq!(allowed.output["clean"], true);
+    assert_eq!(snapshot(f.workspace.path()), before);
+    let outside = tempfile::tempdir().unwrap();
+    let external = outside.path().join("objects");
+    fs::create_dir(&external).unwrap();
+    fs::write(
+        f.workspace
+            .path()
+            .join("shared/.git/objects/info/alternates"),
+        format!("{}\n", external.display()),
+    )
+    .unwrap();
+    let changed = snapshot(f.workspace.path());
+    let refused = f
+        .call(json!({"command":"worktree_status","repo":"shared"}))
+        .await;
+    assert_eq!(refused.output["error"]["kind"], "repo_outside_workspace");
+    assert_eq!(snapshot(f.workspace.path()), changed);
+}
+
+#[tokio::test]
+async fn frozen_status_preserves_quoted_path_configuration_values() {
+    let f = Fixture::new();
+    let exclude = f
+        .workspace
+        .path()
+        .join("exclude-\"-backslash\\-line\n-tab\t-return\r");
+    fs::write(&exclude, "ignored.local\n").unwrap();
+    git(
+        &f.repo,
+        &["config", "core.excludesFile", exclude.to_str().unwrap()],
+    );
+    fs::write(f.repo.join("ignored.local"), "ignored\n").unwrap();
+    assert_eq!(
+        git(
+            &f.repo,
+            &["--no-optional-locks", "status", "--porcelain=v1"]
+        ),
+        ""
+    );
+    let before = snapshot(f.workspace.path());
+    let result = f
+        .call(json!({"command":"worktree_status","repo":"source"}))
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.output);
+    assert_eq!(result.output["clean"], true, "{}", result.output);
+    assert_eq!(snapshot(f.workspace.path()), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn frozen_status_refuses_fifo_metadata_without_waiting_for_a_writer() {
+    let f = Fixture::new();
+    let state = tempfile::tempdir().unwrap();
+    let index = f.repo.join(".git/index");
+    fs::remove_file(&index).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&index)
+        .status()
+        .unwrap()
+        .success());
+    let limits = GitReadConfig {
+        status_directory: Some(state.path().to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.with_limits(json!({"command":"worktree_status","repo":"source"}), limits),
+    )
+    .await
+    .expect("FIFO metadata must not block");
+    assert_eq!(
+        result.output["error"]["kind"], "invalid_repository",
+        "{}",
+        result.output
+    );
+    assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+}

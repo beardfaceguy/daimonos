@@ -12,6 +12,8 @@ use std::sync::Arc;
 #[serde(default)]
 pub struct GitReadConfig {
     pub strict_pinning: bool,
+    pub status_directory: Option<String>,
+    pub max_status_metadata_bytes: usize,
     pub max_output_bytes: usize,
     pub max_file_bytes: usize,
     pub max_lines: usize,
@@ -27,6 +29,8 @@ impl Default for GitReadConfig {
     fn default() -> Self {
         Self {
             strict_pinning: false,
+            status_directory: None,
+            max_status_metadata_bytes: 64 * 1024 * 1024,
             max_output_bytes: 1024 * 1024,
             max_file_bytes: 512 * 1024,
             max_lines: 1000,
@@ -52,6 +56,7 @@ impl GitReadConfig {
             ("max_patch_bytes", self.max_patch_bytes),
             ("max_input_bytes", self.max_input_bytes),
             ("max_alternate_dirs", self.max_alternate_dirs),
+            ("max_status_metadata_bytes", self.max_status_metadata_bytes),
         ] {
             if value == 0 {
                 return Err(format!("git_read.{name} must be greater than zero"));

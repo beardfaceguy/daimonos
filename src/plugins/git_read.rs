@@ -1,8 +1,9 @@
-//! Pinned git reads with no writes, network, or repository-controlled programs.
+//! Pinned git reads with no repository writes, network, or repository-controlled programs.
 //! Context: docs/adr/017-git-read-tool.md. The caller supplies the workspace,
 //! not the mutable session cwd. All errors stay structured across frontends.
 
 mod runner;
+mod status;
 #[cfg(test)]
 mod tests;
 use crate::config::{GitReadConfig, ProcessConfig};
@@ -12,6 +13,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+
+fn is_full_sha1(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 const OPERATIONS: &[&str] = &[
     "resolve",
@@ -223,13 +228,12 @@ impl Arguments {
                 "strict pinning refuses unpinned operations",
             ));
         }
-        let full_commit =
-            |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+
         for value in [&self.rev, &self.a, &self.b].into_iter().flatten() {
-            if !full_commit(value) {
+            if !is_full_sha1(value) {
                 return Err(Failure::new(
                     "rejected_argument",
-                    "strict pinning requires full 40-character commit hashes",
+                    "strict pinning requires full 40-character SHA-1 commit hashes; SHA-256 is unsupported",
                 ));
             }
         }
@@ -615,14 +619,17 @@ impl GitReadPlugin {
                 }
                 let commit = repo.commit("HEAD").await?;
                 let listing = repo
-                    .text(&[
-                        "status",
-                        "--porcelain=v1",
-                        "-z",
-                        "--no-renames",
-                        "--untracked-files=all",
-                        "--ignore-submodules=all",
-                    ])
+                    .worktree_status(
+                        &commit,
+                        &[
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                            "--no-renames",
+                            "--untracked-files=all",
+                            "--ignore-submodules=all",
+                        ],
+                    )
                     .await?;
                 let mut entries = Vec::new();
                 for record in listing.split_terminator('\0') {

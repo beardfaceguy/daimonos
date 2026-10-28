@@ -1,10 +1,10 @@
 # Context map
 
-Date: 2026-10-26
+Date: 2026-10-28
 
 | Context | Glossary | Decisions |
 |---------|----------|-----------|
-| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md) |
+| Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md), [Proposed ADR-019](docs/adr/019-ignore-repository-filters.md) |
 
 This map covers the git-read context. Other contexts are not mapped here yet.
 
