@@ -405,6 +405,22 @@ pub fn stream_error_response<E: std::fmt::Display>(
     }
 }
 
+/// Build the provider error for a stream that closed before its terminal event
+/// (Anthropic `message_delta.stop_reason`, OpenAI `response.completed`, an
+/// OpenRouter `finish_reason`).
+///
+/// Like a [`stream_error_response`] transport fault this is only reachable after
+/// a 2xx header response, so the request itself was accepted: the server (or a
+/// proxy in between) simply stopped talking mid-generation. Re-issuing the
+/// request usually succeeds, so it is **retryable** — classifying it fatal is
+/// what made the turn dead-stop until the user typed a nudge. Partial output is
+/// deliberately dropped: the in-generation retry regenerates the whole turn, and
+/// a half-received tool call or unsigned thinking block must never reach
+/// history.
+pub fn truncated_stream_response(prefix: &str) -> LlmResponse {
+    LlmResponse::retryable_error(format!("{prefix}: response stream ended before completion"))
+}
+
 pub struct Context {
     pub messages: Vec<Message>,
     pub system: Option<String>,
@@ -726,6 +742,25 @@ mod tests {
         let msg = err.error_message.unwrap_or_default();
         assert!(msg.contains("first event"), "names the phase that stalled");
         assert!(!err.context_overflow);
+    }
+
+    /// A stream that closes before its terminal event is a provider dropping
+    /// out mid-generation, not a bad request: it must be retryable so the
+    /// agent loop recovers on its own instead of waiting for a user nudge. The
+    /// message must land in the "response stream" diagnostic class.
+    #[test]
+    fn a_truncated_stream_is_a_retryable_provider_error() {
+        let resp = truncated_stream_response("openrouter stream");
+        assert!(resp.retryable, "a truncated stream is transient");
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(
+            resp.content.is_empty(),
+            "partial output never reaches history"
+        );
+        assert!(!resp.context_overflow);
+        let msg = resp.error_message.unwrap_or_default();
+        assert!(msg.starts_with("openrouter stream:"), "{msg}");
+        assert!(msg.contains("response stream ended"), "{msg}");
     }
 
     #[tokio::test]

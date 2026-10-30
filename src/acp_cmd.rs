@@ -61,15 +61,13 @@ use crate::providers::{
 use crate::session::Session;
 use crate::session_core::{
     align_client_user_message_ids, canonical_assistant_outcome,
-    canonical_assistant_outcome_with_logging, tool_call_title, ApprovalBroker,
-    CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
+    canonical_assistant_outcome_with_logging, safe_provider_error_message, tool_call_title,
+    ApprovalBroker, CanonicalToolLifecycle, PersistenceRetryPolicy, SessionCompaction, SessionCore,
     SessionEventHandler, SessionEventRouter, SessionPersistence, SessionPromptError,
     SessionPromptOutcome, TurnError,
 };
 #[cfg(test)]
-use crate::session_core::{
-    log_raw_provider_error, safe_provider_error_message, sanitize_provider_error, RAW_ERROR_LOG_CAP,
-};
+use crate::session_core::{log_raw_provider_error, sanitize_provider_error, RAW_ERROR_LOG_CAP};
 use crate::session_protocol::{
     ApprovalDecision as CoreApprovalDecision, ApprovalRequest as CoreApprovalRequest,
     AssistantOutcome as CoreAssistantOutcome, ClientCapability, RuntimeChoice as CoreRuntimeChoice,
@@ -1626,6 +1624,31 @@ fn build_compaction_hook(events: Arc<SessionEventRouter>) -> crate::agent::Compa
     })
 }
 
+/// Text of the thought chunk shown when the loop recovers from a provider
+/// failure on its own. Only the bounded diagnostic class reaches the client —
+/// never the raw provider text, which can echo request content or keys.
+fn provider_notice_text(notice: &crate::agent::ProviderNotice<'_>) -> String {
+    format!(
+        "\n[{} Recovering automatically: {}.]\n",
+        safe_provider_error_message(false, notice.error()),
+        notice.action()
+    )
+}
+
+/// Surface provider recovery (retry, failover, turn resume) as a thought chunk.
+/// Without it a mid-stream drop looked like the agent restarting its answer —
+/// or, before the drop was classified transient, like the turn just ending
+/// until the user typed a nudge. Routed through the canonical event stream
+/// like [`build_compaction_hook`], so it orders correctly with the streamed
+/// deltas around it.
+fn build_provider_notice_hook(events: Arc<SessionEventRouter>) -> crate::agent::ProviderNoticeHook {
+    Box::new(move |notice: &crate::agent::ProviderNotice<'_>| {
+        let _ = events.emit(CoreSessionEvent::ThoughtDelta {
+            text: provider_notice_text(notice),
+        });
+    })
+}
+
 /// Build the [`AgentConfig`] for one ACP session — mirrors
 /// `chat_cmd::build_agent_config`, but every hook reports through
 /// `session/update`/`session/request_permission` instead of the terminal.
@@ -1667,10 +1690,10 @@ fn build_agent_config(
         auto_continue_budget: None,
         // Leave unset: `run()` resolves DAIMONOS_AGENT_ERROR_RESUME, then the
         // on-by-default budget. The resume itself is what an ACP client needs
-        // most (a blip no longer fails the turn); a client-visible notice via
-        // session updates is a follow-up.
+        // most (a blip no longer fails the turn); the notice hook tells the
+        // user it happened.
         error_resume_budget: None,
-        on_provider_notice: None,
+        on_provider_notice: Some(build_provider_notice_hook(Arc::clone(&events))),
         // #1240: bounded retry of transient provider failures, then failover
         // along the configured chain. An ACP client (Zed) surfaces a provider
         // blip as a failed turn the user must redo, so absorbing it is exactly
@@ -5519,6 +5542,121 @@ mod tests {
         assert!(!text.contains("Authorization"));
     }
 
+    /// The reported Zed symptom: the provider drops out mid-turn, a
+    /// "Provider ..." diagnostic appears and the agent stops until the user
+    /// nudges it. A transient failure must instead be recovered inside the
+    /// same prompt turn, with a thought chunk telling the user so — carrying
+    /// only the bounded diagnostic class, never the raw provider text.
+    #[tokio::test]
+    async fn acp_recovers_from_a_transient_provider_dropout_within_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent(
+            mock_factory(vec![
+                crate::providers::LlmResponse::retryable_error(
+                    "stream error: response stream ended before completion; Bearer secret-token",
+                ),
+                end_turn_resp("finished the task"),
+            ]),
+            dir.path(),
+            Arc::new(Config::default()),
+            "test-model".to_string(),
+            vec!["test-model".to_string()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let updates: Arc<StdMutex<Vec<SessionUpdate>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_for_handler = Arc::clone(&updates);
+
+        let stop_reason = AcpClientRole
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let updates = Arc::clone(&updates_for_handler);
+                    async move {
+                        updates.lock().unwrap().push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(NewSessionRequest::new(dir.path()))
+                    .block_task()
+                    .await?;
+                let response = connection
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![AcpContentBlock::Text(TextContent::new("go"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stop_reason, AcpStopReason::EndTurn);
+        let updates = updates.lock().unwrap();
+        let chunk_text = |update: &SessionUpdate, thought: bool| match update {
+            SessionUpdate::AgentThoughtChunk(chunk) if thought => match &chunk.content {
+                AcpContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            },
+            SessionUpdate::AgentMessageChunk(chunk) if !thought => match &chunk.content {
+                AcpContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let thoughts = updates
+            .iter()
+            .filter_map(|update| chunk_text(update, true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = updates
+            .iter()
+            .filter_map(|update| chunk_text(update, false))
+            .collect::<String>();
+        assert!(
+            thoughts.contains(
+                "[Provider response stream failed. Recovering automatically: retrying (1/2).]"
+            ),
+            "{thoughts}"
+        );
+        assert!(messages.contains("finished the task"), "{messages}");
+        assert!(!thoughts.contains("secret-token"));
+        assert!(!messages.contains("secret-token"));
+    }
+
+    #[test]
+    fn provider_notice_text_is_classified_not_raw() {
+        let text = provider_notice_text(&crate::agent::ProviderNotice::Resume {
+            attempt: 2,
+            budget: 2,
+            error: Some("API error (overloaded_error): Overloaded sk-live-secret"),
+        });
+        assert_eq!(
+            text,
+            "\n[Provider is overloaded or temporarily unavailable. Recovering automatically: resuming (2/2).]\n"
+        );
+        let failover = provider_notice_text(&crate::agent::ProviderNotice::Failover {
+            to: "backup-model",
+            error: None,
+        });
+        assert_eq!(
+            failover,
+            "\n[Provider request failed. Recovering automatically: failing over to backup-model.]\n"
+        );
+    }
+
     #[tokio::test]
     async fn acp_commands_execute_without_llm_and_clear_persisted_history() {
         let workspace = tempfile::tempdir().unwrap();
@@ -8964,6 +9102,30 @@ mod tests {
             safe_provider_error_message(false, Some("stream_error")),
             "Provider response stream failed."
         );
+        // Mid-stream provider dropouts (each adapter's in-band/truncation text).
+        for overloaded in [
+            "API error (overloaded_error): Overloaded",
+            "API 529: overloaded",
+            "openai 503: upstream is busy",
+            "openrouter stream error: provider_unavailable",
+        ] {
+            assert_eq!(
+                safe_provider_error_message(false, Some(overloaded)),
+                "Provider is overloaded or temporarily unavailable.",
+                "{overloaded}"
+            );
+        }
+        for truncated in [
+            "stream error: response stream ended before completion",
+            "openai stream: response stream ended before completion",
+            "openrouter stream error 502: Provider disconnected unexpectedly",
+        ] {
+            assert_eq!(
+                safe_provider_error_message(false, Some(truncated)),
+                "Provider response stream failed.",
+                "{truncated}"
+            );
+        }
     }
 
     // --- raw provider-error debug logging (#1062) ---

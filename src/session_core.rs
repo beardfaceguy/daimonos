@@ -173,6 +173,12 @@ pub(crate) fn safe_provider_error_message(
         "Provider authorization failed (HTTP 403)."
     } else if error_has_http_status(&error, "429") || normalized.contains("rate limit") {
         "Provider rate limit exceeded (HTTP 429)."
+    } else if error_has_http_status(&error, "529")
+        || error_has_http_status(&error, "503")
+        || normalized.contains("overloaded")
+        || normalized.contains("unavailable")
+    {
+        "Provider is overloaded or temporarily unavailable."
     } else if normalized.contains("timeout")
         || normalized.contains("timed out")
         || normalized.contains("time out")

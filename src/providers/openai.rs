@@ -639,6 +639,38 @@ pub(crate) fn is_context_overflow_error(message: &str) -> bool {
         || value.contains("input is too long")
 }
 
+/// Whether a Responses-API error code marks a transient server-side failure.
+///
+/// Mid-stream failures arrive after a 2xx — as an `error` event or a
+/// `response.failed` terminal — so status classification never sees them.
+/// `server_error` and `rate_limit_exceeded` are the documented transient
+/// codes; a numeric code is read as an HTTP status. Everything else
+/// (`invalid_prompt`, `invalid_image`, ...) is the request's fault and stays
+/// fatal.
+fn is_transient_error_code(code: &Value) -> bool {
+    match code {
+        Value::String(code) => matches!(code.as_str(), "server_error" | "rate_limit_exceeded"),
+        Value::Number(code) => code
+            .as_u64()
+            .and_then(|code| u16::try_from(code).ok())
+            .is_some_and(super::is_retryable_status),
+        _ => false,
+    }
+}
+
+/// The error code of a stream `error`/`response.error` event or a failed
+/// terminal response, wherever the payload put it.
+fn stream_error_code(event: &Value) -> &Value {
+    [
+        &event["code"],
+        &event["error"]["code"],
+        &event["response"]["error"]["code"],
+    ]
+    .into_iter()
+    .find(|value| !value.is_null())
+    .unwrap_or(&Value::Null)
+}
+
 fn stream_error_message(event: &Value) -> String {
     for value in [
         &event["message"],
@@ -725,6 +757,19 @@ impl StreamState {
                         .push(ContentBlock::Thinking(std::mem::take(&mut self.thinking)));
                 }
                 parsed.content = std::mem::take(&mut self.content);
+                // A `response.failed` with a transient code is the server
+                // giving up mid-generation, not a bad request; let core's
+                // retry/resume path recover it.
+                if parsed.stop_reason == StopReason::Error
+                    && !parsed.context_overflow
+                    && is_transient_error_code(stream_error_code(event))
+                {
+                    parsed = LlmResponse::retryable_error(
+                        parsed
+                            .error_message
+                            .unwrap_or_else(|| "server_error".into()),
+                    );
+                }
                 self.terminal = Some(parsed);
                 self.finished = true;
             }
@@ -733,6 +778,8 @@ impl StreamState {
                 let full = format!("openai stream error: {}", bounded(&message, 500));
                 self.terminal = Some(if is_context_overflow_error(&message) {
                     LlmResponse::context_overflow_error(full)
+                } else if is_transient_error_code(stream_error_code(event)) {
+                    LlmResponse::retryable_error(full)
                 } else {
                     LlmResponse::error(full)
                 });
@@ -747,7 +794,7 @@ impl StreamState {
         if let Some(response) = self.terminal.take() {
             return response;
         }
-        LlmResponse::error("openai stream ended before terminal response")
+        crate::providers::truncated_stream_response("openai stream")
     }
 }
 
@@ -1438,6 +1485,78 @@ mod tests {
         let response = state.finish();
         assert_eq!(response.stop_reason, StopReason::Error);
         assert!(response.context_overflow);
+    }
+
+    /// Mid-stream server failures arrive after a 2xx, so only the event's code
+    /// can classify them. Transient codes must be retryable so the agent loop
+    /// recovers; request-level codes stay fatal.
+    #[test]
+    fn stream_error_event_classifies_transient_codes() {
+        let finish_with = |event: Value| {
+            let mut state = StreamState::new("gpt-5.6-sol".into());
+            state.on_event(&json!({"type":"response.output_text.delta","delta":"partial"}));
+            state.on_event(&event);
+            state.finish()
+        };
+        for event in [
+            json!({"type":"error","code":"server_error","message":"The server had an error"}),
+            json!({"type":"error","code":"rate_limit_exceeded","message":"slow down"}),
+            json!({"type":"response.error","error":{"code":429}}),
+            json!({"type":"response.error","error":{"code":503,"message":"upstream"}}),
+        ] {
+            let response = finish_with(event.clone());
+            assert_eq!(response.stop_reason, StopReason::Error);
+            assert!(response.retryable, "{event} must be retryable");
+            assert!(response.content.is_empty());
+        }
+        for event in [
+            json!({"type":"error","code":"invalid_prompt","message":"bad"}),
+            json!({"type":"response.error","error":{"code":400,"message":"bad"}}),
+            json!({"type":"error","message":"no code at all"}),
+        ] {
+            assert!(
+                !finish_with(event.clone()).retryable,
+                "{event} must stay fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn response_failed_with_server_error_is_retryable() {
+        let failed = |code: &str| {
+            let mut state = StreamState::new("gpt-5.6-sol".into());
+            state.on_event(&json!({
+                "type":"response.failed",
+                "response":{"status":"failed","output":[],
+                            "error":{"code":code,"message":"generation failed"},"usage":{}}
+            }));
+            state.finish()
+        };
+        let transient = failed("server_error");
+        assert_eq!(transient.stop_reason, StopReason::Error);
+        assert!(transient.retryable);
+        assert_eq!(
+            transient.error_message.as_deref(),
+            Some("generation failed")
+        );
+        let fatal = failed("invalid_prompt");
+        assert_eq!(fatal.stop_reason, StopReason::Error);
+        assert!(!fatal.retryable);
+    }
+
+    /// A stream that closes before any terminal event is the server dropping
+    /// out, not a request error.
+    #[test]
+    fn stream_without_terminal_event_is_retryable() {
+        let mut state = StreamState::new("gpt-5.6-sol".into());
+        state.on_event(&json!({"type":"response.output_text.delta","delta":"half"}));
+        let response = state.finish();
+        assert_eq!(response.stop_reason, StopReason::Error);
+        assert!(response.retryable);
+        assert!(response
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("openai stream:")));
     }
 
     #[test]

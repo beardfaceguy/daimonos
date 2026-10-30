@@ -337,6 +337,69 @@ struct StreamState {
     tool_calls: Vec<PartialToolCall>,
     finish_reason: Option<String>,
     usage: Value,
+    /// Top-level `error` object of a mid-stream failure chunk. OpenRouter keeps
+    /// the HTTP status at 200 once streaming starts, so this is the only place
+    /// such a failure is reported.
+    error: Option<Value>,
+}
+
+/// OpenRouter `error_type` values (from `error.metadata.error_type`) that mark
+/// a transient upstream failure. Any other typed value is a request, auth,
+/// billing or policy problem and stays fatal; `unmapped` carries no
+/// classification and falls back to the numeric code.
+fn is_transient_error_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "rate_limit_exceeded"
+            | "provider_overloaded"
+            | "provider_unavailable"
+            | "server"
+            | "timeout"
+    )
+}
+
+/// Build the response for a stream that OpenRouter terminated with
+/// `finish_reason: "error"` and/or a top-level `error` object.
+///
+/// The request was accepted (2xx) and the upstream provider failed while
+/// generating — typically a disconnect, overload or timeout, which OpenRouter
+/// cannot fail over once output has started. Treating it as a clean finish
+/// with an unknown stop reason made it fatal, so the turn dead-stopped with
+/// "Provider request failed." until the user nudged it. Classify it here so
+/// core's retry/resume path can recover (ADR-001).
+fn mid_stream_error_response(error: Option<&Value>) -> LlmResponse {
+    let null = Value::Null;
+    let error = error.unwrap_or(&null);
+    let message: String = error["message"]
+        .as_str()
+        .unwrap_or("upstream provider failed mid-stream")
+        .chars()
+        .take(500)
+        .collect();
+    let error_type = error["metadata"]["error_type"]
+        .as_str()
+        .or_else(|| error["error_type"].as_str());
+    let code = error["code"].as_u64();
+    let full = match code {
+        Some(code) => format!("openrouter stream error {code}: {message}"),
+        None => format!("openrouter stream error: {message}"),
+    };
+    if error_type == Some("context_length_exceeded") || is_context_overflow_error(&message) {
+        return LlmResponse::context_overflow_error(full);
+    }
+    let retryable = match error_type {
+        Some(kind) if is_transient_error_type(kind) => true,
+        Some(kind) if kind != "unmapped" => false,
+        // No usable type: trust the HTTP-style code when there is one; with
+        // neither, a failure after a 2xx is far more likely a dropped upstream
+        // than a bad request (those are rejected before streaming starts).
+        _ => code.is_none_or(|code| u16::try_from(code).is_ok_and(super::is_retryable_status)),
+    };
+    if retryable {
+        LlmResponse::retryable_error(full)
+    } else {
+        LlmResponse::error(full)
+    }
 }
 
 impl StreamState {
@@ -348,6 +411,11 @@ impl StreamState {
         if let Some(u) = chunk.get("usage") {
             if !u.is_null() {
                 self.usage = u.clone();
+            }
+        }
+        if let Some(error) = chunk.get("error") {
+            if !error.is_null() {
+                self.error = Some(error.clone());
             }
         }
 
@@ -398,6 +466,12 @@ impl StreamState {
     }
 
     fn finish(self) -> LlmResponse {
+        if self.error.is_some() || self.finish_reason.as_deref() == Some("error") {
+            return mid_stream_error_response(self.error.as_ref());
+        }
+        if self.finish_reason.is_none() {
+            return super::truncated_stream_response("openrouter stream");
+        }
         let mut content = reasoning_blocks(&self.thinking, self.reasoning_details);
         if !self.text.is_empty() {
             content.push(ContentBlock::Text(self.text));
@@ -729,7 +803,9 @@ pub(crate) fn map_finish_reason(reason: Option<&str>) -> StopReason {
     match reason {
         Some("stop") | Some("end_turn") => StopReason::EndTurn,
         Some("tool_calls") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::MaxTokens,
+        // `length` is the value OpenRouter normalizes every output-cap stop to;
+        // `max_tokens` is kept for OpenAI-dialect servers that pass it through.
+        Some("length") | Some("max_tokens") => StopReason::MaxTokens,
         Some("content_filter") | Some("refusal") => StopReason::Refusal,
         _ => StopReason::Error,
     }
@@ -1715,6 +1791,7 @@ mod tests {
         assert_eq!(map_finish_reason(Some("end_turn")), StopReason::EndTurn);
         assert_eq!(map_finish_reason(Some("tool_calls")), StopReason::ToolUse);
         assert_eq!(map_finish_reason(Some("max_tokens")), StopReason::MaxTokens);
+        assert_eq!(map_finish_reason(Some("length")), StopReason::MaxTokens);
         assert_eq!(
             map_finish_reason(Some("content_filter")),
             StopReason::Refusal
@@ -1846,6 +1923,135 @@ mod tests {
         let resp = state.finish();
         assert_eq!(resp.usage.prompt_tokens(), 42);
         assert_eq!(resp.usage.output, 7);
+    }
+
+    /// The documented mid-stream failure shape: partial output, then a chunk
+    /// with a top-level `error` and `finish_reason: "error"`, all under a 200.
+    /// A transient upstream failure must be retryable so the agent loop
+    /// recovers on its own instead of ending the turn.
+    #[test]
+    fn stream_mid_stream_provider_error_is_retryable() {
+        let mut state = StreamState::default();
+        state.on_chunk(
+            &json!({"choices": [{"delta": {"content": "Working on"}, "finish_reason": null}]}),
+        );
+        state.on_chunk(&json!({
+            "error": {
+                "code": 502,
+                "message": "Provider disconnected unexpectedly",
+                "metadata": {"error_type": "provider_unavailable"}
+            },
+            "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]
+        }));
+        let resp = state.finish();
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable, "a dropped upstream is transient");
+        assert!(
+            resp.content.is_empty(),
+            "partial output never reaches history"
+        );
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("openrouter stream error 502: Provider disconnected unexpectedly")
+        );
+    }
+
+    #[test]
+    fn stream_mid_stream_error_classification() {
+        let finish_with = |error: Value| {
+            let mut state = StreamState::default();
+            state.on_chunk(&json!({
+                "error": error,
+                "choices": [{"delta": {}, "finish_reason": "error"}]
+            }));
+            state.finish()
+        };
+        for kind in [
+            "rate_limit_exceeded",
+            "provider_overloaded",
+            "provider_unavailable",
+            "server",
+            "timeout",
+        ] {
+            let resp =
+                finish_with(json!({"code": 400, "message": "m", "metadata": {"error_type": kind}}));
+            assert!(resp.retryable, "{kind} must be retryable");
+        }
+        for kind in [
+            "invalid_request",
+            "authentication",
+            "payment_required",
+            "content_policy_violation",
+        ] {
+            let resp =
+                finish_with(json!({"code": 503, "message": "m", "metadata": {"error_type": kind}}));
+            assert!(!resp.retryable, "{kind} must stay fatal");
+        }
+        // No usable type: fall back to the HTTP-style code.
+        assert!(finish_with(json!({"code": 529, "message": "busy"})).retryable);
+        assert!(
+            finish_with(
+                json!({"code": 503, "message": "m", "metadata": {"error_type": "unmapped"}})
+            )
+            .retryable
+        );
+        assert!(!finish_with(json!({"code": 401, "message": "bad key"})).retryable);
+        // Context overflow keeps its own compaction path.
+        let overflow = finish_with(json!({
+            "code": 400,
+            "message": "too long",
+            "metadata": {"error_type": "context_length_exceeded"}
+        }));
+        assert!(overflow.context_overflow);
+        assert!(!overflow.retryable);
+    }
+
+    /// `finish_reason: "error"` with no error object, and an error object on a
+    /// chunk whose finish reason never arrives, both still fail the attempt.
+    #[test]
+    fn stream_error_without_details_is_retryable() {
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "error"}]}));
+        let resp = state.finish();
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable);
+
+        let mut state = StreamState::default();
+        state.on_chunk(&json!({"error": {"message": "upstream reset"}, "choices": []}));
+        let resp = state.finish();
+        assert!(resp.retryable);
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("openrouter stream error: upstream reset")
+        );
+    }
+
+    /// A stream that ends (EOF or `[DONE]`) without any finish reason is the
+    /// upstream dropping out, not a completed turn.
+    #[test]
+    fn stream_ended_without_finish_reason_is_retryable() {
+        let mut state = StreamState::default();
+        state
+            .on_chunk(&json!({"choices": [{"delta": {"content": "half"}, "finish_reason": null}]}));
+        let resp = state.finish();
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable);
+        assert!(resp.content.is_empty());
+    }
+
+    /// OpenRouter normalizes every output-cap stop to `length`; it must map to
+    /// `MaxTokens` (auto-continue / the client's max-tokens notice), not to a
+    /// fatal error.
+    #[test]
+    fn stream_length_finish_is_max_tokens() {
+        let mut state = StreamState::default();
+        state.on_chunk(
+            &json!({"choices": [{"delta": {"content": "cut"}, "finish_reason": "length"}]}),
+        );
+        let resp = state.finish();
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+        assert!(!resp.retryable);
+        assert!(matches!(&resp.content[0], ContentBlock::Text(t) if t == "cut"));
     }
 
     // --- reasoning (vikunja #1527) ---

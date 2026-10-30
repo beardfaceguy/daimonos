@@ -7,6 +7,32 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent turns no longer stop when the provider drops out mid-stream.**
+  Several mid-stream provider failures were classified fatal, so the turn
+  ended with a "Provider request failed." style notice (in Zed, a thought
+  line) until the user typed a nudge. Each is now classified transient, so
+  the existing in-generation retry and turn-level resume recover it inside the
+  same turn:
+  - a stream that closes before its terminal event (all three providers);
+  - Anthropic in-band `overloaded_error`, `api_error`, `rate_limit_error` and
+    `timeout_error` events;
+  - OpenRouter mid-stream error chunks (`finish_reason: "error"`), classified
+    by `error_type`;
+  - OpenAI `error` / `response.failed` events with `server_error` or
+    `rate_limit_exceeded`.
+- **OpenRouter `finish_reason: "length"` maps to max tokens.** It was treated
+  as an unknown stop reason, so any output-cap truncation through OpenRouter
+  ended the turn as a provider error.
+
+### Changed
+
+- The ACP engine now shows provider recovery (retry, failover, turn resume) as
+  a thought chunk in Zed, carrying only the bounded diagnostic class. Overload
+  and `503` errors have their own diagnostic: "Provider is overloaded or
+  temporarily unavailable."
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

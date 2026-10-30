@@ -485,6 +485,43 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
 
 // --- Streaming (vikunja #957) ---
 
+/// Anthropic `error.type` values that mark a transient server-side failure: the
+/// in-band equivalents of HTTP 429, 500, 504 and 529. Every other type
+/// (`invalid_request_error`, `authentication_error`, `permission_error`,
+/// `not_found_error`, `request_too_large`, `billing_error`) means the request
+/// itself is wrong and stays fatal.
+fn is_transient_error_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+    )
+}
+
+/// Build the response for an in-band SSE `error` event.
+///
+/// The event arrives after a 2xx header response, so status-code
+/// classification never saw it. Anthropic's typical mid-stream failure is
+/// `overloaded_error`; classifying it fatal ended the turn with "Provider
+/// request failed." until the user typed a nudge, so the transient types are
+/// retryable here and core's retry/resume path absorbs them (ADR-001).
+fn in_band_error_response(data: &Value) -> LlmResponse {
+    let msg = data["error"]["message"]
+        .as_str()
+        .unwrap_or("unknown stream error");
+    let kind = data["error"]["type"].as_str();
+    let full = match kind {
+        Some(kind) => format!("API error ({kind}): {msg}"),
+        None => format!("API error: {msg}"),
+    };
+    if is_context_overflow_error(msg) {
+        return LlmResponse::context_overflow_error(full);
+    }
+    if kind.is_some_and(is_transient_error_type) {
+        return LlmResponse::retryable_error(full);
+    }
+    LlmResponse::error(full)
+}
+
 /// One in-progress content block, tracked by SSE `index` from
 /// `content_block_start` through `content_block_delta`/`_stop`.
 enum PartialBlock {
@@ -588,6 +625,11 @@ impl StreamState {
     }
 
     fn finish(self, model: &str) -> LlmResponse {
+        // Every complete message carries a `message_delta` stop reason before
+        // `message_stop`; without one the connection closed mid-generation.
+        if self.stop_reason.is_none() {
+            return super::truncated_stream_response("stream error");
+        }
         let mut content = Vec::new();
         for block in self.blocks {
             match block {
@@ -844,14 +886,7 @@ impl LlmProvider for AnthropicProvider {
                 Err(_) => continue,
             };
             if data["type"] == "error" {
-                let msg = data["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown stream error");
-                let full = format!("API error: {msg}");
-                if is_context_overflow_error(msg) {
-                    return LlmResponse::context_overflow_error(full);
-                }
-                return LlmResponse::error(full);
+                return in_band_error_response(&data);
             }
             for ev in state.on_data(&data) {
                 on_event(ev);
@@ -2194,5 +2229,145 @@ mod tests {
             resp.content.is_empty(),
             "an empty text block should not appear in content"
         );
+    }
+
+    /// A stream that closes after partial output but before `message_delta`
+    /// is the provider dropping out mid-turn. It must be retryable so the
+    /// agent loop recovers instead of ending the turn, and the half-received
+    /// tool call must not survive into history.
+    #[test]
+    fn stream_closed_before_stop_reason_is_retryable() {
+        let mut state = StreamState::default();
+        state.on_data(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+        state.on_data(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Let me check"}}));
+        state.on_data(&json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "exec"}}));
+        state.on_data(&json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"c\":\"car"}}));
+        let resp = state.finish("claude-opus-5");
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable, "a truncated stream is transient");
+        assert!(resp.content.is_empty(), "{:?}", resp.content);
+        assert!(resp
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("response stream ended")));
+    }
+
+    /// Anthropic's mid-stream failures arrive as an in-band SSE `error` event
+    /// after a 2xx, so status classification never sees them. The transient
+    /// types must be retryable; request-level types must stay fatal.
+    #[test]
+    fn in_band_transient_errors_are_retryable() {
+        for kind in [
+            "overloaded_error",
+            "api_error",
+            "rate_limit_error",
+            "timeout_error",
+        ] {
+            let resp = in_band_error_response(
+                &json!({"type": "error", "error": {"type": kind, "message": "Overloaded"}}),
+            );
+            assert_eq!(resp.stop_reason, StopReason::Error);
+            assert!(resp.retryable, "{kind} must be retryable");
+            assert!(!resp.context_overflow);
+            assert_eq!(
+                resp.error_message.as_deref(),
+                Some(format!("API error ({kind}): Overloaded").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn in_band_request_errors_stay_fatal() {
+        for kind in [
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "request_too_large",
+            "billing_error",
+        ] {
+            let resp = in_band_error_response(
+                &json!({"type": "error", "error": {"type": kind, "message": "nope"}}),
+            );
+            assert!(!resp.retryable, "{kind} must stay fatal");
+        }
+        let untyped = in_band_error_response(&json!({"type": "error", "error": {}}));
+        assert!(!untyped.retryable, "an unclassifiable error stays fatal");
+        assert_eq!(
+            untyped.error_message.as_deref(),
+            Some("API error: unknown stream error")
+        );
+    }
+
+    #[test]
+    fn in_band_overflow_is_classified_before_transience() {
+        let resp = in_band_error_response(&json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > 200000 maximum"}
+        }));
+        assert!(resp.context_overflow);
+        assert!(!resp.retryable, "overflow has its own compaction path");
+    }
+
+    /// End to end through the real SSE reader: partial text streams, then the
+    /// server sends `overloaded_error`. The deltas reach the caller and the
+    /// response is retryable, so core's retry/resume path takes over.
+    #[tokio::test]
+    async fn a_mid_stream_overloaded_event_is_retryable_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+                );
+                stream.write_all(resp.as_bytes()).await.ok();
+                stream.shutdown().await.ok();
+            }
+        });
+
+        let provider =
+            AnthropicProvider::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        let ctx = Context {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let mut seen = Vec::new();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.stream(&ctx, &CompleteOpts::default(), &mut |ev| seen.push(ev)),
+        )
+        .await
+        .expect("must not hang");
+
+        assert_eq!(seen, vec![StreamEvent::TextDelta("partial".into())]);
+        assert_eq!(resp.stop_reason, StopReason::Error);
+        assert!(resp.retryable, "overloaded mid-stream is transient");
+        assert!(resp
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("overloaded_error")));
     }
 }

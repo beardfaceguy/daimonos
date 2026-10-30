@@ -114,10 +114,71 @@ pub fn parse_plan_entries(input: &Value) -> Result<Vec<PlanEntry>, String> {
 /// Receives each complete normalized plan replacement.
 pub type PlanHook = Box<dyn Fn(&[PlanEntry]) + Send + Sync>;
 
-/// Receives human-readable notices about provider-level recovery actions
-/// (transient-error resume, model failover) so frontends can surface them
-/// without parsing logs. Un-defers the frontend notice noted in #1240.
-pub type ProviderNoticeHook = Box<dyn Fn(&str) + Send + Sync>;
+/// A provider-level recovery action the agent loop took on its own after a
+/// transient failure. `error` is the adapter's raw, provider-authored message:
+/// fine for logs and a local terminal, but frontends that relay to a remote
+/// client should classify it (see `session_core::safe_provider_error_message`)
+/// rather than echo it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderNotice<'a> {
+    /// Same-model retry inside one generation (#1240).
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        error: Option<&'a str>,
+    },
+    /// Same-model retries spent; continuing the turn on the next model in the
+    /// failover chain (#1240).
+    Failover { to: &'a str, error: Option<&'a str> },
+    /// Retries and failover spent; pausing, then resuming the same turn
+    /// (turn-level error resume).
+    Resume {
+        attempt: u32,
+        budget: u32,
+        error: Option<&'a str>,
+    },
+}
+
+impl ProviderNotice<'_> {
+    pub fn error(&self) -> Option<&str> {
+        match *self {
+            ProviderNotice::Retry { error, .. }
+            | ProviderNotice::Failover { error, .. }
+            | ProviderNotice::Resume { error, .. } => error,
+        }
+    }
+
+    /// What the loop is doing about the failure, without the provider text.
+    pub fn action(&self) -> String {
+        match self {
+            ProviderNotice::Retry {
+                attempt,
+                max_attempts,
+                ..
+            } => format!("retrying ({attempt}/{max_attempts})"),
+            ProviderNotice::Failover { to, .. } => format!("failing over to {to}"),
+            ProviderNotice::Resume {
+                attempt, budget, ..
+            } => format!("resuming ({attempt}/{budget})"),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderNotice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transient provider error \u{2014} {}: {}",
+            self.action(),
+            self.error().unwrap_or("unknown")
+        )
+    }
+}
+
+/// Receives provider-level recovery actions (in-generation retry, model
+/// failover, transient-error resume) so frontends can surface them without
+/// parsing logs. Un-defers the frontend notice noted in #1240.
+pub type ProviderNoticeHook = Box<dyn Fn(&ProviderNotice<'_>) + Send + Sync>;
 
 /// Provider-neutral outcome of a tool served outside the opcode facade (e.g. a
 /// remote MCP server bridged into an ACP session — ADR-003).
@@ -1103,6 +1164,15 @@ async fn run_inner(
                 error = attempt.error_message.as_deref().unwrap_or("unknown"),
                 "transient provider error; retrying after backoff"
             );
+            // A mid-stream failure may already have streamed partial output;
+            // tell the frontend why the retry is about to stream it again.
+            if let Some(notice) = &config.on_provider_notice {
+                notice(&ProviderNotice::Retry {
+                    attempt: retries,
+                    max_attempts: config.provider_retry.max_attempts,
+                    error: attempt.error_message.as_deref(),
+                });
+            }
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
@@ -1234,10 +1304,10 @@ async fn run_inner(
                 // deferred) tells attached frontends the turn continued on a
                 // substitute model.
                 if let Some(notice) = &config.on_provider_notice {
-                    notice(&format!(
-                        "transient provider error \u{2014} failing over to {to}: {}",
-                        resp.error_message.as_deref().unwrap_or("unknown")
-                    ));
+                    notice(&ProviderNotice::Failover {
+                        to: &to,
+                        error: resp.error_message.as_deref(),
+                    });
                 }
                 failover_model = Some(to);
                 continue;
@@ -1271,10 +1341,11 @@ async fn run_inner(
                     "transient provider error; resuming the turn after backoff"
                 );
                 if let Some(notice) = &config.on_provider_notice {
-                    notice(&format!(
-                        "transient provider error \u{2014} resuming ({error_resumes_used}/{error_resume_budget}): {}",
-                        resp.error_message.as_deref().unwrap_or("unknown")
-                    ));
+                    notice(&ProviderNotice::Resume {
+                        attempt: error_resumes_used,
+                        budget: error_resume_budget,
+                        error: resp.error_message.as_deref(),
+                    });
                 }
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -3286,6 +3357,154 @@ mod tests {
         assert_eq!(notices.len(), 2);
         assert!(notices[0].contains("resuming (1/2)"), "{notices:?}");
         assert!(notices[1].contains("resuming (2/2)"), "{notices:?}");
+    }
+
+    /// In-generation retries are reported too: after a mid-stream failure the
+    /// retry re-streams output the frontend already showed, so it must be able
+    /// to say why. The notice carries the raw provider error separately from
+    /// the action so relaying frontends can classify it instead of echoing it.
+    #[tokio::test]
+    async fn in_generation_retry_emits_a_structured_notice() {
+        let provider = FlakyProvider {
+            failures: Mutex::new(1),
+            calls: Mutex::new(0),
+        };
+        // (action, raw error, Display) per notice.
+        type Seen = Vec<(String, Option<String>, String)>;
+        let notices: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notices);
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            error_resume_budget: Some(0),
+            on_provider_notice: Some(Box::new(move |n| {
+                sink.lock().unwrap().push((
+                    n.action(),
+                    n.error().map(str::to_string),
+                    n.to_string(),
+                ));
+            })),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("hi")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(*provider.calls.lock().unwrap(), 2, "1 failure + success");
+        let notices = notices.lock().unwrap();
+        assert_eq!(
+            *notices,
+            vec![(
+                "retrying (1/2)".to_string(),
+                Some("API 529: overloaded".to_string()),
+                "transient provider error \u{2014} retrying (1/2): API 529: overloaded".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn provider_notice_display_keeps_the_log_format() {
+        let failover = ProviderNotice::Failover {
+            to: "model-b",
+            error: None,
+        };
+        assert_eq!(
+            failover.to_string(),
+            "transient provider error \u{2014} failing over to model-b: unknown"
+        );
+        let resume = ProviderNotice::Resume {
+            attempt: 1,
+            budget: 2,
+            error: Some("stream error: response stream ended before completion"),
+        };
+        assert_eq!(resume.action(), "resuming (1/2)");
+        assert_eq!(
+            resume.error(),
+            Some("stream error: response stream ended before completion")
+        );
+    }
+
+    /// End to end through the loop: an adapter that drops out mid-stream (the
+    /// shape every adapter now reports as a retryable truncation) is absorbed
+    /// by the turn-level resume when in-generation retries are off, so the
+    /// turn completes without the user typing a nudge.
+    #[tokio::test]
+    async fn truncated_stream_resumes_without_a_user_nudge() {
+        struct DropsOutOnce {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl LlmProvider for DropsOutOnce {
+            async fn complete(&self, _ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+                panic!("expects stream()");
+            }
+            async fn stream(
+                &self,
+                _ctx: &Context,
+                _opts: &CompleteOpts,
+                on_event: &mut (dyn FnMut(StreamEvent) + Send),
+            ) -> LlmResponse {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    on_event(StreamEvent::TextDelta("Working".into()));
+                    return crate::providers::truncated_stream_response("stream error");
+                }
+                on_event(StreamEvent::TextDelta("Done".into()));
+                end_turn_resp_with_text("Done")
+            }
+        }
+        let provider = DropsOutOnce {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let config = AgentConfig {
+            provider_retry: ProviderRetryConfig {
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: vec![],
+            },
+            error_resume_budget: Some(1),
+            on_stream_event: Some(Box::new(|_| {})),
+            ..AgentConfig::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            &provider,
+            shared(session_in(dir.path())),
+            vec![Message::user("do the thing")],
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert!(result.error_message.is_none());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            result
+                .messages
+                .last()
+                .is_some_and(|m| m.role == Role::Assistant
+                    && matches!(m.content.as_slice(), [ContentBlock::Text(t)] if t == "Done")),
+            "{:?}",
+            result.messages
+        );
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.is_empty()),
+            "the dropped attempt must not leave an empty husk: {:?}",
+            result.messages
+        );
     }
 
     /// The budget is a hard bound: once spent, the transient error surfaces
