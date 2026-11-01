@@ -16,7 +16,7 @@ use crate::kgl::model::{
 };
 use crate::kgl::substrate::Substrate;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -70,10 +70,25 @@ impl KglStore {
     /// makes a contended connection wait briefly instead of erroring
     /// `SQLITE_BUSY`.
     pub fn open_with(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        Self::open_with_policy(path, busy_timeout_ms, false)
+    }
+
+    fn open_with_policy(path: &Path, busy_timeout_ms: u64, reject_symlinks: bool) -> Result<Self> {
+        if reject_symlinks {
+            crate::state_root::verify_unshared_sqlite_files(path)
+                .context("validate kgl sqlite store")?;
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path).context("open kgl sqlite store")?;
+        // ADR-021: a selected state root must not follow an escaping database link.
+        let flags = OpenFlags::default()
+            | if reject_symlinks {
+                OpenFlags::SQLITE_OPEN_NOFOLLOW
+            } else {
+                OpenFlags::empty()
+            };
+        let conn = Connection::open_with_flags(path, flags).context("open kgl sqlite store")?;
         // WAL is a no-op for some VFS/back-ends; best-effort, never fatal.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
@@ -103,9 +118,27 @@ impl KglStore {
     }
 
     /// Open the workspace store honoring an operator-supplied `[kgl]` config.
-    /// Single source of truth for the store path.
+    /// Single source of truth for the workspace-relative store path.
     pub fn open_workspace_with(workspace: &Path, cfg: &KglConfig) -> Result<Self> {
-        Self::open_with(&workspace.join(".kgl").join("kgl.db"), cfg.busy_timeout_ms)
+        let directory = cfg
+            .state_directory
+            .clone()
+            .unwrap_or_else(|| workspace.join(".kgl"));
+        Self::open_workspace_at(&directory, cfg)
+    }
+
+    /// Open the workspace store at an explicit, relocated directory (ADR-021:
+    /// caller-owned `--state-dir`). The DB lives at `store_dir/kgl.db` rather
+    /// than the legacy `<workspace>/.kgl/kgl.db`; parent dirs are created by
+    /// `open_with`. `open_workspace_with` remains the workspace-relative wrapper
+    /// used when no state authority is in effect.
+    pub fn open_workspace_at(store_dir: &Path, cfg: &KglConfig) -> Result<Self> {
+        let path = store_dir.join("kgl.db");
+        if cfg.state_directory.is_some() {
+            Self::open_with_policy(&path, cfg.busy_timeout_ms, true)
+        } else {
+            Self::open_with(&path, cfg.busy_timeout_ms)
+        }
     }
 
     fn init(&self) -> Result<()> {

@@ -97,9 +97,12 @@ class RootsAwareClient:
         return resp.get("result", {})
 
 
-def _spawn(binary, launch_ws, roots):
+def _spawn(binary, launch_ws, roots, state_dir=None):
+    args = [binary, "--mcp", "-w", str(launch_ws)]
+    if state_dir is not None:
+        args += ["--state-dir", str(state_dir)]
     proc = subprocess.Popen(
-        [binary, "--mcp", "-w", str(launch_ws)],
+        args,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -173,6 +176,52 @@ def test_invalid_root_falls_back_to_launch_workspace(daimonos_binary, tmp_path):
         assert ws == os.path.realpath(launch_ws), (
             f"expected fallback to {launch_ws}, got {ws}"
         )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_client_root_uses_its_own_private_snapshot_namespace(daimonos_binary, tmp_path):
+    launch_ws = tmp_path / "first"
+    other_ws = tmp_path / "second"
+    launch_ws.mkdir()
+    other_ws.mkdir()
+    (launch_ws / "file.txt").write_text("first")
+    (other_ws / "file.txt").write_text("second")
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    proc, client = _spawn(daimonos_binary, launch_ws, [], state)
+    try:
+        created = json.loads(_tool_text(client.call_tool("snapshot", {"action": "create", "tag": "first"})))
+        assert created["tag"] == "first"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+    proc, client = _spawn(daimonos_binary, launch_ws, [{"uri": other_ws.resolve().as_uri()}], state)
+    try:
+        deadline = time.time() + 5
+        while _workspace_from_info(client) != os.path.realpath(other_ws):
+            assert time.time() < deadline, "client root was not applied"
+            time.sleep(0.1)
+        snapshots = json.loads(_tool_text(client.call_tool("snapshot", {"action": "list"})))
+        assert snapshots["snapshots"] == [], "snapshots from the launch workspace leaked into the new workspace"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_client_root_overlapping_private_state_is_rejected(daimonos_binary, tmp_path):
+    """A later MCP root must not put private state inside the evidence tree."""
+    launch_ws = tmp_path / "launch"
+    launch_ws.mkdir()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    overlapping_root = {"uri": tmp_path.resolve().as_uri(), "name": "overlap"}
+    proc, client = _spawn(daimonos_binary, launch_ws, [overlapping_root], state)
+    try:
+        time.sleep(1.0)  # Allow the asynchronous roots/list response to apply.
+        assert _workspace_from_info(client) == os.path.realpath(launch_ws)
     finally:
         proc.terminate()
         proc.wait(timeout=5)

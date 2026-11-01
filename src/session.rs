@@ -86,7 +86,8 @@ impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
         let cwd = workspace.clone();
         let env = Self::build_initial_env(&cfg);
-        let snapshot_store = SnapshotStore::new(workspace.clone());
+        let snapshot_store =
+            SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref());
         let verbosity = cfg.mcp.default_verbosity;
         Self {
             workspace,

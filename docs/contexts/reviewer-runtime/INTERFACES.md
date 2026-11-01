@@ -250,8 +250,9 @@ Do not present generic `anyhow` text as the machine-readable contract.
 | 24 | `model_request_limit` | Inclusive request counter prevents the next attempt |
 | 25 | `controlled_endpoint_error` | Controlled transport failure outside a probe or final-output failure context |
 
-Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `unknown_tool`, `tool_name_collision`,
+Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
+`state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.
 A probe endpoint failure uses exit 21. A later controlled endpoint failure in final-output mode uses exit 20 with `endpoint_error`.
 Audit failure takes precedence over reporting successful completion. Preserve the original failure code as bounded secondary metadata when available.

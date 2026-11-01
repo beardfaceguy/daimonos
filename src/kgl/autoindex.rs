@@ -99,10 +99,26 @@ pub fn run_startup(
     now: &str,
     cfg: &KglConfig,
 ) -> Result<Option<(&'static str, usize, usize)>> {
+    run_startup_in(workspace, cfg.state_directory.as_deref(), now, cfg)
+}
+
+/// As [`run_startup`], but opening the KGL store at an explicit relocated
+/// directory (ADR-021: caller-owned `--state-dir`). `store_dir = None` preserves
+/// the legacy workspace-relative `<workspace>/.kgl/kgl.db` location. Detection
+/// still reads the workspace source tree; only the store destination moves.
+pub fn run_startup_in(
+    workspace: &Path,
+    store_dir: Option<&Path>,
+    now: &str,
+    cfg: &KglConfig,
+) -> Result<Option<(&'static str, usize, usize)>> {
     let Some((name, sub)) = detect(workspace, cfg) else {
         return Ok(None);
     };
-    let mut store = KglStore::open_workspace_with(workspace, cfg)?;
+    let mut store = match store_dir {
+        Some(dir) => KglStore::open_workspace_at(dir, cfg)?,
+        None => KglStore::open_workspace_with(workspace, cfg)?,
+    };
     let (nodes, edges) = store.populate(sub.as_ref(), workspace, now)?;
     Ok(Some((name, nodes, edges)))
 }
@@ -113,6 +129,20 @@ pub fn run_startup(
 /// `kgl_query` opens the store fresh per call, background rebuilds are picked up
 /// automatically with no handler/session changes.
 pub fn spawn_watcher(workspace: PathBuf, quiet: bool, cfg: KglConfig) {
+    let directory = cfg.state_directory.clone();
+    spawn_watcher_in(workspace, directory, quiet, cfg)
+}
+
+/// As [`spawn_watcher`], but rebuilding into an explicit relocated store
+/// directory (ADR-021). `store_dir = None` keeps the legacy workspace-relative
+/// store. When the store is relocated outside the workspace, its writes land
+/// outside the watched tree, so they cannot self-trigger a rebuild.
+pub fn spawn_watcher_in(
+    workspace: PathBuf,
+    store_dir: Option<PathBuf>,
+    quiet: bool,
+    cfg: KglConfig,
+) {
     let spawned = std::thread::Builder::new()
         .name("kgl-watch".to_string())
         .spawn(move || {
@@ -130,7 +160,7 @@ pub fn spawn_watcher(workspace: PathBuf, quiet: bool, cfg: KglConfig) {
                     let now = chrono::Utc::now().to_rfc3339();
                     // Surface rebuild failures (e.g. SQLITE_BUSY, parse errors)
                     // instead of silently leaving the graph stale.
-                    if let Err(e) = run_startup(&workspace, &now, &cfg) {
+                    if let Err(e) = run_startup_in(&workspace, store_dir.as_deref(), &now, &cfg) {
                         if !quiet {
                             eprintln!("kgl: background re-index failed: {e}");
                         }
@@ -278,6 +308,35 @@ mod tests {
         assert!(nodes >= 2); // module + foo
 
         let store = KglStore::open_workspace(tmp.path()).unwrap();
+        assert!(store
+            .find("foo", usize::MAX)
+            .unwrap()
+            .iter()
+            .any(|r| r.node.name.as_deref() == Some("foo")));
+    }
+
+    #[test]
+    fn run_startup_in_relocates_the_store_outside_the_workspace() {
+        let cfg = KglConfig::default();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::File::create(ws.path().join("m.x07.json"))
+            .unwrap()
+            .write_all(
+                br#"{"module_id":"m","schema_version":"1.0","kind":"library","imports":[],
+                    "decls":[{"kind":"defn","name":"foo","params":[],"result":"Unit","body":[]}]}"#,
+            )
+            .unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (sub, nodes, _edges) = run_startup_in(ws.path(), Some(store_root.path()), "t0", &cfg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sub, "x07");
+        assert!(nodes >= 2);
+        // The DB lives under the relocated root, never under the workspace.
+        assert!(store_root.path().join("kgl.db").exists());
+        assert!(!ws.path().join(".kgl").join("kgl.db").exists());
+
+        let store = KglStore::open_workspace_at(store_root.path(), &cfg).unwrap();
         assert!(store
             .find("foo", usize::MAX)
             .unwrap()

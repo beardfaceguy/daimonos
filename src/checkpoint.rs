@@ -77,7 +77,21 @@ impl CheckpointStore {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
         let git_dir = workspace.join(SHADOW_DIR);
-        Self { workspace, git_dir }
+        Self::with_git_dir(workspace, git_dir)
+    }
+
+    /// Build a store whose shadow repository lives at an explicit `git_dir`
+    /// instead of the legacy `<workspace>/.daimonos/checkpoints.git` (ADR-021:
+    /// caller-owned `--state-dir`). The work tree is still `workspace`, and the
+    /// repo is driven purely via `--git-dir`/`--work-tree`, so all shadow-git
+    /// isolation holds with the store relocated outside the evidence tree.
+    /// `new` remains the workspace-relative wrapper used without a state
+    /// authority.
+    pub fn with_git_dir(workspace: impl Into<PathBuf>, git_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            git_dir: git_dir.into(),
+        }
     }
 
     /// Run one git command against the shadow repo. Never inherits the ambient
@@ -330,6 +344,33 @@ mod tests {
         assert_eq!(all[0].id, cp.id);
         // The store lives inside the workspace it checkpoints.
         assert!(dir.path().join(SHADOW_DIR).join("HEAD").exists());
+    }
+
+    /// A selected git directory keeps checkpoint state outside the workspace.
+    #[tokio::test]
+    async fn with_git_dir_stores_the_shadow_repo_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        tokio::fs::write(ws.path().join("a.rs"), "fn a() {}\n")
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let git_dir = state.path().join("checkpoints.git");
+        let store = CheckpointStore::with_git_dir(ws.path(), &git_dir);
+        let cp = store.create("first").await.unwrap().expect("checkpoint");
+        assert!(!cp.id.is_empty());
+        // Shadow repo lives under the relocated state dir, not in the workspace.
+        assert!(git_dir.join("HEAD").exists());
+        assert!(!ws.path().join(SHADOW_DIR).join("HEAD").exists());
+        // Restore semantics still work against the relocated repo.
+        tokio::fs::write(ws.path().join("a.rs"), "fn a() { changed }\n")
+            .await
+            .unwrap();
+        let outcome = store.restore_files(&cp.id).await.unwrap();
+        assert_eq!(outcome.id, cp.id);
+        let restored = tokio::fs::read_to_string(ws.path().join("a.rs"))
+            .await
+            .unwrap();
+        assert_eq!(restored, "fn a() {}\n");
     }
 
     /// An unchanged turn must not produce a checkpoint — otherwise a long

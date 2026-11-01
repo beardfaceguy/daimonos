@@ -1139,16 +1139,71 @@ fn pick_workspace_root(roots: &[Root]) -> Option<PathBuf> {
         .find(|p| p.is_dir())
 }
 
+// ADR-021 moves the KGL store outside the workspace in selected-state mode.
+fn passes_session_context_check(session: &Session, name: &str) -> bool {
+    if matches!(name, "kgl_query" | "kgl_assert") {
+        if let Some(directory) = session.cfg.kgl.state_directory.as_deref() {
+            return directory.exists();
+        }
+    }
+    tools::passes_context_check(name, &session.workspace)
+}
+
 /// Re-root a live session onto `new_root`: repoint the workspace, working
 /// directory, snapshot store, and trigram index, and drop the read cache
-/// (its keys are canonical paths under the old root). The KGL store path is
-/// derived from `session.workspace` at call time, so it follows automatically.
+/// (its keys are canonical paths under the old root). Default KGL paths follow
+/// `session.workspace`; selected-state paths are re-derived below.
 /// A fresh `WorkspaceIndex` is spawned because `WorkspaceIndex::root` is
 /// immutable by design — the index owns its root for the life of the build.
-fn apply_reroot(session: &mut Session, new_root: PathBuf) {
+///
+/// Under ADR-021, reject roots that overlap private state and derive fresh
+/// workspace-scoped paths before changing the live session.
+fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
+    let relocated = if let Some(authority) = &session.cfg.state_authority {
+        if authority.root().starts_with(&new_root) || new_root.starts_with(authority.root()) {
+            tracing::warn!(workspace = %new_root.display(), state = %authority.root().display(),
+                "rejecting MCP root that overlaps the selected state directory");
+            return false;
+        }
+        let id = crate::state_root::WorkspaceId::from_workspace(&new_root);
+        let resolve = |key| authority.resolve(key, Some(&id));
+        let snapshots = match resolve(crate::state_root::StateKey::Snapshots) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(?error, "rejecting MCP root with unusable snapshot state");
+                return false;
+            }
+        };
+        let kgl = match resolve(crate::state_root::StateKey::Kgl) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(?error, "rejecting MCP root with unusable KGL state");
+                return false;
+            }
+        };
+        for (name, path) in [
+            ("snapshot_directory", &snapshots),
+            ("kgl.state_directory", &kgl),
+        ] {
+            if let Err(error) = authority.verify_writable_directory(name, path) {
+                tracing::warn!(?error, "rejecting MCP root with unusable workspace state");
+                return false;
+            }
+        }
+        Some((snapshots, kgl))
+    } else {
+        None
+    };
+    if let Some((snapshots, kgl)) = relocated {
+        let mut config = (*session.cfg).clone();
+        config.snapshot_directory = Some(snapshots);
+        config.kgl.state_directory = Some(kgl);
+        session.cfg = Arc::new(config);
+    }
     session.workspace = new_root.clone();
     session.cwd = new_root.clone();
-    session.snapshot_store = SnapshotStore::new(new_root.clone());
+    session.snapshot_store =
+        SnapshotStore::for_workspace(new_root.clone(), session.cfg.snapshot_directory.as_ref());
     session.read_cache.clear();
     let should_warm = crate::index::should_warm_index(&new_root, &session.cfg.index, true);
     let idx = Arc::new(WorkspaceIndex::new(new_root, &session.cfg.index, false));
@@ -1156,6 +1211,7 @@ fn apply_reroot(session: &mut Session, new_root: PathBuf) {
         idx.spawn_reindex();
     }
     session.index = Some(idx);
+    true
 }
 
 #[async_trait]
@@ -1191,13 +1247,12 @@ impl ServerHandler for DaimonosHandler {
         if new_root == current {
             return;
         }
-        if self.startup_logs {
+        if apply_reroot(&mut session, new_root.clone()) && self.startup_logs {
             eprintln!(
                 "daimonos: re-rooting workspace {:?} -> client root {:?}",
                 current, new_root
             );
         }
-        apply_reroot(&mut session, new_root);
     }
 
     async fn handle_list_tools_request(
@@ -1209,14 +1264,12 @@ impl ServerHandler for DaimonosHandler {
         let session = self.session.lock().await;
         let descriptions = &session.cfg.prompts.resolved_tool_descriptions;
         let all = tools::tool_definitions(descriptions);
-        let workspace = &session.workspace;
-
         let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
         let verbosity = session.verbosity;
         let visible: Vec<Tool> = all
             .into_iter()
             .filter(|t| session.exposed_tools.contains(&t.name))
-            .filter(|t| tools::passes_context_check(&t.name, workspace))
+            .filter(|t| passes_session_context_check(&session, &t.name))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
                 tools::render_list_tool(t, descriptions, verbosity, full_tool_schemas, already_used)
@@ -1767,12 +1820,11 @@ fn socket_jsonrpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
 fn socket_list_tools_json(session: &Session) -> Vec<Value> {
     let descriptions = &session.cfg.prompts.resolved_tool_descriptions;
     let all = tools::tool_definitions(descriptions);
-    let workspace = &session.workspace;
     let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
     let verbosity = session.verbosity;
     all.into_iter()
         .filter(|t| session.exposed_tools.contains(&t.name))
-        .filter(|t| tools::passes_context_check(&t.name, workspace))
+        .filter(|t| passes_session_context_check(session, &t.name))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
             let t = tools::render_list_tool(
@@ -1825,8 +1877,7 @@ fn apply_socket_roots_response(session: &mut Session, response: &Value) -> bool 
     if new_root == current {
         return false;
     }
-    apply_reroot(session, new_root);
-    true
+    apply_reroot(session, new_root)
 }
 
 /// Serve one MCP session over an already-connected `UnixStream`.

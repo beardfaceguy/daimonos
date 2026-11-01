@@ -75,7 +75,12 @@ pub fn coord(session: &mut Session, op: &Op) -> Response {
     // agent continues (constraint 2).
     let base = cfg.resolved_db_dir();
     let db_path = workspace_db_path(&base, &session.workspace);
-    let store = match CoordinationStore::open_with(&db_path, cfg.effective_busy_timeout_ms()) {
+    let opened = if session.cfg.state_authority.is_some() {
+        CoordinationStore::open_with_no_follow(&db_path, cfg.effective_busy_timeout_ms())
+    } else {
+        CoordinationStore::open_with(&db_path, cfg.effective_busy_timeout_ms())
+    };
+    let store = match opened {
         Ok(s) => s,
         Err(e) => {
             return finish(

@@ -53,6 +53,7 @@ mod session_store;
 mod session_timeline;
 mod skills;
 mod snapshot;
+mod state_root;
 mod tool_descriptions;
 mod tool_facade;
 mod tool_output;
@@ -132,10 +133,48 @@ fn debug_tokens_log_path() -> Option<PathBuf> {
     Some(dir.join("token-debug.log"))
 }
 
+/// Internal listeners remain under caller-owned state when it is selected.
+fn state_socket_path(
+    authority: &state_root::StateAuthority,
+    requested: &std::path::Path,
+) -> Result<PathBuf, state_root::RunFailure> {
+    let directory = authority.resolve(state_root::StateKey::Sockets, None)?;
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        directory.join(requested)
+    };
+    if candidate.file_name().is_none() {
+        return Err(state_root::RunFailure::state_unusable(format!(
+            "--socket {} has no file name",
+            requested.display()
+        )));
+    }
+    authority.explicit_destination("--socket", &candidate)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let runtime_mode = cli.runtime_mode();
+    let mut runtime_mode = cli.runtime_mode();
+
+    // ADR-021: until WP02 relocates frontend state, never accept a partial guarantee.
+    if cli.state_dir.is_some()
+        && !matches!(
+            runtime_mode,
+            RuntimeMode::McpStdio | RuntimeMode::McpSocket(_) | RuntimeMode::Daemon
+        )
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error":{
+                "code":"run_configuration_invalid",
+                "reason":"state_mode_unsupported",
+                "message":"--state-dir is not supported for this runtime mode yet"
+            }})
+        );
+        std::process::exit(2);
+    }
 
     if runtime_mode.is_mcp_stdio() {
         install_parent_death_signal();
@@ -143,18 +182,80 @@ async fn main() -> anyhow::Result<()> {
 
     session::enhance_process_path();
 
-    let token_log = if cli.debug_tokens {
+    let workspace = match std::fs::canonicalize(&cli.workspace) {
+        Ok(path) => path,
+        Err(error) if cli.state_dir.is_some() => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid", "reason": "state_unusable",
+                    "message": format!("workspace {} cannot be resolved: {error}", cli.workspace.display())
+                }})
+            );
+            std::process::exit(2);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state_authority = match cli.state_dir.as_deref() {
+        Some(path) => match state_root::StateAuthority::explicit(path, &workspace) {
+            Ok(authority) => Some(authority),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+                );
+                std::process::exit(error.exit_code);
+            }
+        },
+        None => None,
+    };
+    let mut native_socket = cli
+        .socket
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/tmp/daimonos.sock"));
+    if let Some(authority) = &state_authority {
+        let requested = cli
+            .socket
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("daemon.sock"));
+        native_socket = match state_socket_path(authority, requested) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+                );
+                std::process::exit(error.exit_code);
+            }
+        };
+        if let RuntimeMode::McpSocket(requested) = &runtime_mode {
+            runtime_mode = match state_socket_path(authority, requested) {
+                Ok(path) => RuntimeMode::McpSocket(path),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+                    );
+                    std::process::exit(error.exit_code);
+                }
+            };
+        }
+    }
+    // Keep legacy behavior, but delay selected-mode writes until all config is validated.
+    let mut token_log = if cli.debug_tokens && state_authority.is_none() {
         debug_tokens_log_path()
     } else {
         None
     };
 
-    let workspace = std::fs::canonicalize(&cli.workspace)?;
-
     // --print-config-path: report discovery order and which file wins, then
     // exit — before any config load / index / plugin setup.
     if cli.print_config_path {
-        let candidates = config::search_candidates(cli.config.as_deref(), &workspace);
+        let candidates = if state_authority.is_some() {
+            config::search_candidates_with_user_config(cli.config.as_deref(), &workspace, false)
+        } else {
+            config::search_candidates(cli.config.as_deref(), &workspace)
+        };
         println!("config: search order (first existing file wins):");
         let mut used: Option<&std::path::Path> = None;
         for (i, c) in candidates.iter().enumerate() {
@@ -226,17 +327,96 @@ async fn main() -> anyhow::Result<()> {
     // dispatch, so every runtime mode and every later `std::env::var` read sees
     // the same values from one place. The real environment wins; loader-hijack
     // variables are refused. See `env_file`.
-    env_file::load_default(&workspace, runtime_mode.is_mcp_stdio() && !cli.verbose);
+    if state_authority.is_some() {
+        env_file::load_default_with_user_config(
+            &workspace,
+            runtime_mode.is_mcp_stdio() && !cli.verbose,
+            false,
+        );
+    } else {
+        env_file::load_default(&workspace, runtime_mode.is_mcp_stdio() && !cli.verbose);
+    }
 
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = runtime_mode.is_mcp_stdio() && !startup_logs_early;
-    let mut cfg = config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr);
+    let mut cfg = if state_authority.is_some() {
+        config::load_with_user_config(cli.config.as_deref(), &workspace, quiet_cfg_stderr, false)
+    } else {
+        config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr)
+    };
+    if let Some(authority) = state_authority {
+        if let Err(error) = cfg.apply_state_authority(authority, &workspace) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+            );
+            std::process::exit(error.exit_code);
+        }
+    }
     if let Err(e) = cfg.validate() {
         eprintln!(
             "config: validation error: {}",
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    // Validate enabled writer destinations after config validation and before any writer starts.
+    if let Some(authority) = &cfg.state_authority {
+        let mut directories: Vec<(&str, PathBuf)> = Vec::new();
+        if cfg.logging.enabled {
+            directories.push(("logging.directory", cfg.logging.resolved_directory()));
+        }
+        if cfg.analytics.enabled {
+            let database = cfg.analytics.resolved_db_path();
+            if let Some(parent) = database.parent() {
+                directories.push(("analytics.db_path", parent.to_path_buf()));
+            }
+        }
+        if cfg.coordination.enabled {
+            directories.push(("coordination.db_dir", cfg.coordination.resolved_db_dir()));
+        }
+        directories.push((
+            "tool_output.directory",
+            cfg.tool_output.resolved_directory(),
+        ));
+        if let Some(path) = &cfg.process.artifact_directory {
+            directories.push(("process.artifact_directory", paths::expand_tilde(path)));
+        }
+        if let Some(path) = &cfg.git_read.status_directory {
+            directories.push(("git_read.status_directory", paths::expand_tilde(path)));
+        }
+        if let Some(path) = &cfg.snapshot_directory {
+            directories.push(("snapshot_directory", path.clone()));
+        }
+        if let Some(path) = &cfg.kgl.state_directory {
+            directories.push(("kgl.state_directory", path.clone()));
+        }
+        let socket = match &runtime_mode {
+            RuntimeMode::McpSocket(path) => Some(path.as_path()),
+            RuntimeMode::Daemon => Some(native_socket.as_path()),
+            _ => None,
+        };
+        if let Some(parent) = socket.and_then(std::path::Path::parent) {
+            directories.push(("--socket", parent.to_path_buf()));
+        }
+        for (option, directory) in directories {
+            if let Err(error) = authority.verify_writable_directory(option, &directory) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code":"run_configuration_invalid", "reason":error.code, "message":error.message
+                    }})
+                );
+                std::process::exit(error.exit_code);
+            }
+        }
+    }
+    if cli.debug_tokens {
+        if let Some(authority) = &cfg.state_authority {
+            let directory = authority.resolve(state_root::StateKey::Logs, None)?;
+            std::fs::create_dir_all(&directory)?;
+            token_log = Some(directory.join("token-debug.log"));
+        }
     }
     cfg.prompts.resolved_tool_descriptions =
         tool_descriptions::ToolDescriptions::load(cfg.prompts.tool_descriptions.as_deref()).await;
@@ -269,9 +449,23 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut observability_runtime =
         observability::ObservabilityRuntime::initialize(&observability_config);
-    let _logging_guard = match logging::init(&cfg.logging, observability_runtime.tracer()) {
+    let _logging_guard = match logging::init(
+        &cfg.logging,
+        observability_runtime.tracer(),
+        cfg.state_authority.is_some(),
+    ) {
         Ok(guard) => guard,
         Err(error) => {
+            if cfg.state_authority.is_some() && cfg.logging.enabled {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid", "reason": "state_unusable",
+                        "message": format!("logging.directory {}: {error}", cfg.logging.resolved_directory().display())
+                    }})
+                );
+                std::process::exit(2);
+            }
             eprintln!("logging: initialization failed: {error}");
             None
         }
@@ -349,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
-                cli.socket,
+                native_socket,
                 cli.debug,
                 cli.session_id,
                 workspace,
@@ -377,6 +571,22 @@ async fn run_tool_service(
     cfg: Arc<config::Config>,
     startup_logs_early: bool,
 ) -> anyhow::Result<()> {
+    if cfg.state_authority.is_some() {
+        let selected_socket = match &runtime_mode {
+            RuntimeMode::McpSocket(path) => Some(path.as_path()),
+            RuntimeMode::Daemon => Some(socket.as_path()),
+            _ => None,
+        };
+        if let Some(path) = selected_socket {
+            let directory = path.parent().ok_or_else(|| {
+                state_root::RunFailure::state_unusable(format!(
+                    "--socket {} has no parent",
+                    path.display()
+                ))
+            })?;
+            std::fs::create_dir_all(directory)?;
+        }
+    }
     let startup_logs = startup_logs_early || cfg.mcp.startup_logs;
     // When MCP runs without startup diagnostics, avoid benign stderr lines —
     // Cursor surfaces subprocess stderr as `[error]` even for informational text.
@@ -459,6 +669,16 @@ async fn run_tool_service(
                 Some(Arc::new(store))
             }
             Err(e) => {
+                if cfg.state_authority.is_some() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"error": {
+                            "code": "run_configuration_invalid", "reason": "state_unusable",
+                            "message": format!("analytics.db_path {}: {e}", db_path.display())
+                        }})
+                    );
+                    std::process::exit(2);
+                }
                 eprintln!("analytics: disabled (init failed: {e})");
                 None
             }
