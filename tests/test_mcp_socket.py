@@ -143,6 +143,43 @@ def mcp_socket_server(daimonos_binary, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_selected_state_lists_kgl_tools_over_socket(daimonos_binary, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    sock_path = state / "sockets" / "mcp.sock"
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp-socket", str(sock_path), "--state-dir", str(state), "-w", str(workspace)],
+        stderr=subprocess.PIPE,
+    )
+    client = None
+    try:
+        for _ in range(100):
+            if sock_path.exists():
+                break
+            if proc.poll() is not None:
+                pytest.fail(f"socket server exited: {proc.stderr.read().decode(errors='replace')}")
+            time.sleep(0.05)
+        else:
+            pytest.fail("socket file never appeared")
+        client = McpSocketClient(str(sock_path))
+        client.handshake()
+        result = client.call_tool("kgl_query", {"query": "open_questions"})
+        assert not result.get("isError"), result
+        assert {"kgl_query", "kgl_assert"} <= {tool["name"] for tool in client.list_tools()}
+        assert not (workspace / ".kgl").exists()
+    finally:
+        if client:
+            client.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def test_mcp_socket_second_server_does_not_replace_live_socket(
     daimonos_binary, mcp_socket_server
 ):

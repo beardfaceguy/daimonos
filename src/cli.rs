@@ -248,13 +248,17 @@ impl RuntimeMode {
 #[derive(Debug, Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 pub struct Cli {
-    /// Unix socket path used by `daemon` and the legacy default mode.
-    #[arg(short, long, default_value = "/tmp/daimonos.sock")]
-    pub socket: PathBuf,
+    /// Unix socket path used by `daemon` and the legacy default mode (default: /tmp/daimonos.sock).
+    #[arg(short, long)]
+    pub socket: Option<PathBuf>,
 
     /// Workspace root directory.
     #[arg(short, long, default_value = ".")]
     pub workspace: PathBuf,
+
+    /// Private directory for internal state. Context: ADR-021.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub state_dir: Option<PathBuf>,
 
     /// Human-readable debug output (daemon mode only).
     #[arg(long, default_value_t = false)]
@@ -344,6 +348,12 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_explicit_state_directory_before_and_after_subcommand() {
+        assert!(Cli::try_parse_from(["daimonos", "--state-dir", "/private/state", "mcp"]).is_ok());
+        assert!(Cli::try_parse_from(["daimonos", "mcp", "--state-dir", "/private/state"]).is_ok());
+    }
 
     fn mode(args: &[&str]) -> RuntimeMode {
         Cli::try_parse_from(args).unwrap().runtime_mode()

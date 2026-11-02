@@ -95,6 +95,21 @@ def test_snapshot_delete(daimonos):
     assert len(data["snapshots"]) == 0
 
 
+def test_legacy_snapshot_accepts_non_uuid_directory(daimonos, tmp_path):
+    (tmp_path / "file.txt").write_text("original")
+    snapshot = _parse(daimonos.call_tool("snapshot", {"action": "create"}))
+    snapshots = tmp_path / ".daimonos" / "snapshots"
+    (snapshots / snapshot["id"]).rename(snapshots / "legacy-name")
+    (tmp_path / "file.txt").write_text("changed")
+
+    restored = daimonos.call_tool("snapshot", {"action": "restore", "id": "legacy-name"})
+    assert not restored.get("isError"), restored
+    assert (tmp_path / "file.txt").read_text() == "original"
+    deleted = daimonos.call_tool("snapshot", {"action": "delete", "id": "legacy-name"})
+    assert not deleted.get("isError"), deleted
+    assert not (snapshots / "legacy-name").exists()
+
+
 def test_snapshot_delete_nonexistent(daimonos):
     result = daimonos.call_tool("snapshot", {"action": "delete", "id": "nope"})
     assert result.get("isError") is True

@@ -112,9 +112,16 @@ pub fn plan(content: &str, is_present: impl Fn(&str) -> bool) -> Plan {
 /// informational summary (MCP stdio without `--verbose`); denylist refusals are
 /// always reported because they signal a potentially hostile file.
 pub fn load_default(workspace: &Path, quiet: bool) {
+    load_default_with_user_config(workspace, quiet, true);
+}
+
+/// State-owned runs never consult HOME/XDG fallback input. ADR-021.
+pub(crate) fn load_default_with_user_config(workspace: &Path, quiet: bool, include_user: bool) {
     let mut candidates = vec![workspace.join("agent.env")];
-    if let Some(dir) = crate::paths::config_dir() {
-        candidates.push(dir.join("daimonos").join("agent.env"));
+    if include_user {
+        if let Some(dir) = crate::paths::config_dir() {
+            candidates.push(dir.join("daimonos").join("agent.env"));
+        }
     }
     for path in candidates {
         if !path.is_file() {

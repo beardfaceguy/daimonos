@@ -81,6 +81,11 @@ impl GitReadConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
+    /// Caller-owned state authority. Never deserialized from workspace config.
+    #[serde(skip)]
+    pub(crate) state_authority: Option<Arc<crate::state_root::StateAuthority>>,
+    #[serde(skip)]
+    pub(crate) snapshot_directory: Option<std::path::PathBuf>,
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub git_read: GitReadConfig,
@@ -1437,6 +1442,9 @@ impl Default for McpConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct KglConfig {
+    /// Runtime-only state destination selected by the caller. ADR-021.
+    #[serde(skip)]
+    pub(crate) state_directory: Option<std::path::PathBuf>,
     /// SQLite busy-timeout in milliseconds applied to every KGL store
     /// connection. The autoindex watcher writes on its own connection while
     /// `kgl_query` / `kgl_assert` use separate ones; a non-zero busy timeout
@@ -1473,6 +1481,7 @@ impl Default for KglConfig {
             find_max: 200,
             blast_radius_max: 500,
             skip_dirs: default_kgl_skip_dirs(),
+            state_directory: None,
         }
     }
 }
@@ -2020,6 +2029,116 @@ impl IndexConfig {
 }
 
 impl Config {
+    /// Apply explicit state ownership before any service constructor. ADR-021.
+    pub(crate) fn apply_state_authority(
+        &mut self,
+        authority: crate::state_root::StateAuthority,
+        workspace: &Path,
+    ) -> Result<(), crate::state_root::RunFailure> {
+        use crate::state_root::{StateKey, WorkspaceId};
+        let id = WorkspaceId::from_workspace(workspace);
+        // Validate the complete reserved layout without creating unused caches.
+        for key in [
+            StateKey::Index,
+            StateKey::Snapshots,
+            StateKey::Pipeline,
+            StateKey::Kgl,
+            StateKey::Checkpoints,
+            StateKey::Evidence,
+            StateKey::Sessions,
+            StateKey::Catalog,
+            StateKey::Coordination,
+            StateKey::Analytics,
+            StateKey::Logs,
+            StateKey::ToolOutput,
+            StateKey::Oauth,
+            StateKey::Scratch,
+            StateKey::Sockets,
+        ] {
+            if !authority
+                .resolve(key, Some(&id))?
+                .starts_with(authority.root())
+            {
+                return Err(crate::state_root::RunFailure::configuration_invalid(
+                    "state_unusable",
+                    "internal state layout escapes the selected root",
+                ));
+            }
+        }
+        let path = |key| authority.resolve(key, Some(&id));
+        let destination = |name: &str, configured: &Option<String>, default: std::path::PathBuf| {
+            let value = configured
+                .as_deref()
+                .map(std::path::Path::new)
+                .unwrap_or(default.as_path());
+            authority
+                .explicit_destination(name, value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        self.logging.directory = Some(destination(
+            "logging.directory",
+            &self.logging.directory,
+            path(StateKey::Logs)?,
+        )?);
+        let verify_unshared = |name: &str, path: &std::path::Path| {
+            crate::state_root::verify_unshared_sqlite_files(path).map_err(|error| {
+                crate::state_root::RunFailure::state_unusable(format!(
+                    "{name} {}: {error}",
+                    path.display()
+                ))
+            })
+        };
+        self.analytics.db_path = Some(destination(
+            "analytics.db_path",
+            &self.analytics.db_path,
+            path(StateKey::Analytics)?.join("analytics.db"),
+        )?);
+        let analytics_db = self.analytics.resolved_db_path();
+        verify_unshared("analytics.db_path", &analytics_db)?;
+        self.coordination.db_dir = Some(destination(
+            "coordination.db_dir",
+            &self.coordination.db_dir,
+            path(StateKey::Coordination)?,
+        )?);
+        let coordination_db =
+            crate::coordination::workspace_db_path(&self.coordination.resolved_db_dir(), workspace);
+        authority.explicit_destination("coordination database", &coordination_db)?;
+        verify_unshared("coordination database", &coordination_db)?;
+        self.tool_output.directory = Some(destination(
+            "tool_output.directory",
+            &self.tool_output.directory,
+            path(StateKey::ToolOutput)?,
+        )?);
+        self.process.artifact_directory = Some(destination(
+            "process.artifact_directory",
+            &self.process.artifact_directory,
+            path(StateKey::Scratch)?.join("process-output"),
+        )?);
+        self.git_read.status_directory = Some(destination(
+            "git_read.status_directory",
+            &self.git_read.status_directory,
+            path(StateKey::Scratch)?.join("git-status"),
+        )?);
+        self.session.socket_path = Some(destination(
+            "session.socket_path",
+            &self.session.socket_path,
+            path(StateKey::Sockets)?.join("session.sock"),
+        )?);
+        self.session.session_catalog_path = Some(destination(
+            "session.session_catalog_path",
+            &self.session.session_catalog_path,
+            path(StateKey::Catalog)?.join("catalog.sqlite"),
+        )?);
+        self.snapshot_directory = Some(path(StateKey::Snapshots)?);
+        let kgl_directory = path(StateKey::Kgl)?;
+        let kgl_db = kgl_directory.join("kgl.db");
+        authority.explicit_destination("kgl database", &kgl_db)?;
+        verify_unshared("kgl database", &kgl_db)?;
+        self.kgl.state_directory = Some(kgl_directory);
+        self.state_authority = Some(Arc::new(authority));
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.index.validate()?;
         self.git_read.validate()?;
@@ -2196,7 +2315,16 @@ fn default_project_markers() -> Vec<String> {
 /// successful config discovery (`loaded from …`, `using built-in defaults`).
 /// Parse/read failures are always printed — those are real errors.
 pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: bool) -> Config {
-    for candidate in search_candidates(explicit, workspace) {
+    load_with_user_config(explicit, workspace, quiet_diagnostic_stderr, true)
+}
+
+pub(crate) fn load_with_user_config(
+    explicit: Option<&Path>,
+    workspace: &Path,
+    quiet_diagnostic_stderr: bool,
+    include_user: bool,
+) -> Config {
+    for candidate in search_candidates_with_user_config(explicit, workspace, include_user) {
         let candidate = &candidate;
         if candidate.is_file() {
             match std::fs::read_to_string(candidate) {
@@ -2230,10 +2358,21 @@ pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: 
 /// be formed (no `$HOME`/`$XDG_CONFIG_HOME`) are omitted. This is the single
 /// source of truth shared by `load` and the `--print-config-path` CLI flag.
 pub fn search_candidates(explicit: Option<&Path>, workspace: &Path) -> Vec<std::path::PathBuf> {
+    search_candidates_with_user_config(explicit, workspace, true)
+}
+
+pub(crate) fn search_candidates_with_user_config(
+    explicit: Option<&Path>,
+    workspace: &Path,
+    include_user: bool,
+) -> Vec<std::path::PathBuf> {
     [
         explicit.map(|p| p.to_path_buf()),
         Some(workspace.join("daimonos.toml")),
-        dirs_next().map(|d| d.join("daimonos").join("config.toml")),
+        include_user
+            .then(dirs_next)
+            .flatten()
+            .map(|d| d.join("daimonos").join("config.toml")),
     ]
     .into_iter()
     .flatten()
@@ -3186,5 +3325,90 @@ rate_limit_max_sleep_ms = 5000
         std::env::remove_var(&cfg.discord.bot_token_env_var);
         assert!(!redacted.contains("discord-super-secret"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    /// A private (0700) directory under the system temp dir, owned by the test
+    /// user. Mirrors `state_root`'s own fixtures so `StateAuthority::explicit`
+    /// accepts it as a caller-private root.
+    fn private_tmp(label: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "daimonos-cfg-state-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// ADR-021 (WP01): applying an explicit state authority must point every
+    /// internal writer destination below the selected root. A single field that
+    /// still resolved under HOME/XDG/cwd/temp would be a silent escape, so this
+    /// asserts the whole relocated writer set at once — the integration contract
+    /// above the per-writer unit tests.
+    #[test]
+    fn apply_state_authority_relocates_every_writer_under_root() {
+        let root = private_tmp("root");
+        let workspace = private_tmp("ws");
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let authority = crate::state_root::StateAuthority::explicit(&root, &workspace).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.apply_state_authority(authority, &workspace).unwrap();
+
+        // Every relocated writer destination must live under the selected root.
+        let string_dests = [
+            ("logging.directory", cfg.logging.directory.clone()),
+            ("analytics.db_path", cfg.analytics.db_path.clone()),
+            ("coordination.db_dir", cfg.coordination.db_dir.clone()),
+            ("tool_output.directory", cfg.tool_output.directory.clone()),
+            (
+                "process.artifact_directory",
+                cfg.process.artifact_directory.clone(),
+            ),
+            (
+                "git_read.status_directory",
+                cfg.git_read.status_directory.clone(),
+            ),
+            ("session.socket_path", cfg.session.socket_path.clone()),
+            (
+                "session.session_catalog_path",
+                cfg.session.session_catalog_path.clone(),
+            ),
+        ];
+        for (name, value) in string_dests {
+            let value = value.unwrap_or_else(|| panic!("{name} was not relocated"));
+            assert!(
+                std::path::Path::new(&value).starts_with(&canonical_root),
+                "{name} = {value} escaped the state root {}",
+                canonical_root.display()
+            );
+        }
+
+        let path_dests = [
+            ("snapshot_directory", cfg.snapshot_directory.clone()),
+            ("kgl.state_directory", cfg.kgl.state_directory.clone()),
+        ];
+        for (name, value) in path_dests {
+            let value = value.unwrap_or_else(|| panic!("{name} was not relocated"));
+            assert!(
+                value.starts_with(&canonical_root),
+                "{name} = {} escaped the state root {}",
+                value.display(),
+                canonical_root.display()
+            );
+        }
+
+        // The authority itself is retained so downstream constructors can resolve
+        // further keys (e.g. the Oauth and Sockets destinations) from one source.
+        assert!(cfg.state_authority.is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&workspace).ok();
     }
 }

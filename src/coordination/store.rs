@@ -8,7 +8,7 @@
 //! slices add methods, not migrations.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 use std::time::Duration;
 
@@ -156,10 +156,30 @@ impl CoordinationStore {
     /// without blocking; the busy timeout makes a contended writer wait briefly
     /// instead of erroring `SQLITE_BUSY` (ADR-009 D1/D7).
     pub fn open_with(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        Self::open_with_policy(path, busy_timeout_ms, false)
+    }
+
+    pub fn open_with_no_follow(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        Self::open_with_policy(path, busy_timeout_ms, true)
+    }
+
+    fn open_with_policy(path: &Path, busy_timeout_ms: u64, reject_symlinks: bool) -> Result<Self> {
+        if reject_symlinks {
+            crate::state_root::verify_unshared_sqlite_files(path)
+                .context("validate coordination sqlite store")?;
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path).context("open coordination sqlite store")?;
+        // ADR-021: a selected state root must not follow an escaping database link.
+        let flags = OpenFlags::default()
+            | if reject_symlinks {
+                OpenFlags::SQLITE_OPEN_NOFOLLOW
+            } else {
+                OpenFlags::empty()
+            };
+        let conn =
+            Connection::open_with_flags(path, flags).context("open coordination sqlite store")?;
         // WAL + NORMAL synchronous: matches analytics.rs. Best-effort — a VFS
         // that rejects WAL must not be fatal.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");

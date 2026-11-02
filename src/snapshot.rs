@@ -18,11 +18,61 @@ pub struct SnapshotMeta {
 
 pub struct SnapshotStore {
     workspace: PathBuf,
+    snapshots_root: PathBuf,
+    selected_state: bool,
 }
 
 impl SnapshotStore {
+    /// Legacy placement: snapshots live inside the workspace tree at
+    /// `.daimonos/snapshots`. Preserved for callers without a state authority.
     pub fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        let snapshots_root = workspace.join(SNAPSHOTS_DIR);
+        Self {
+            workspace,
+            snapshots_root,
+            selected_state: false,
+        }
+    }
+
+    /// Store snapshots at an explicit caller-owned root outside the workspace
+    /// (ADR-021, state key `snapshots`). The workspace tree is still the
+    /// snapshot/restore source; only the stored copies move under state.
+    pub fn with_snapshots_root(workspace: PathBuf, snapshots_root: PathBuf) -> Self {
+        Self {
+            workspace,
+            snapshots_root,
+            selected_state: true,
+        }
+    }
+
+    /// Build a store for `workspace`, honoring an optional relocated snapshots
+    /// root (ADR-021 state key `snapshots`). When `snapshots_root` is `Some`
+    /// (a state authority is in effect) stored copies live there, outside the
+    /// workspace; otherwise they stay at the legacy `<workspace>/.daimonos/
+    /// snapshots`. The single construction rule shared by `Session::new` and
+    /// MCP re-root so a re-rooted session cannot silently fall back to
+    /// workspace-relative placement.
+    pub fn for_workspace(workspace: PathBuf, snapshots_root: Option<&PathBuf>) -> Self {
+        match snapshots_root {
+            Some(root) => Self::with_snapshots_root(workspace, root.clone()),
+            None => Self::new(workspace),
+        }
+    }
+
+    /// The directory under which snapshot copies are stored. Under a state
+    /// authority this is outside the workspace; otherwise it is the legacy
+    /// `<workspace>/.daimonos/snapshots`.
+    #[cfg(test)]
+    pub(crate) fn snapshots_root(&self) -> &Path {
+        &self.snapshots_root
+    }
+
+    // Reject path-like IDs when the caller selects state (ADR-021).
+    fn validate_id(&self, id: &str) -> Result<(), String> {
+        if self.selected_state && !Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id) {
+            return Err("invalid snapshot id".to_string());
+        }
+        Ok(())
     }
 
     /// Create a snapshot of the workspace.
@@ -35,7 +85,8 @@ impl SnapshotStore {
     /// filesystem (network mount, BTRFS under load, etc.). See vikunja #252.
     pub async fn create(&self, tag: Option<String>) -> Result<SnapshotMeta, String> {
         let workspace = self.workspace.clone();
-        tokio::task::spawn_blocking(move || create_impl(&workspace, tag))
+        let root = self.snapshots_root.clone();
+        tokio::task::spawn_blocking(move || create_impl(&workspace, &root, tag))
             .await
             .map_err(|e| format!("spawn: {e}"))?
     }
@@ -43,9 +94,12 @@ impl SnapshotStore {
     /// Restore a snapshot, replacing workspace files with the snapshot's contents.
     /// Removes files not in the snapshot that were in the workspace (tracked files only).
     pub async fn restore(&self, id: &str) -> Result<SnapshotMeta, String> {
+        self.validate_id(id)?;
         let workspace = self.workspace.clone();
+        let root = self.snapshots_root.clone();
+        let selected_state = self.selected_state;
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || restore_impl(&workspace, &id))
+        tokio::task::spawn_blocking(move || restore_impl(&workspace, &root, &id, selected_state))
             .await
             .map_err(|e| format!("spawn: {e}"))?
     }
@@ -56,8 +110,9 @@ impl SnapshotStore {
     /// for every snapshot, which previously blocked the runtime when
     /// called from `snap_ops::snap_list`.
     pub async fn list(&self) -> Result<Vec<SnapshotMeta>, String> {
-        let workspace = self.workspace.clone();
-        tokio::task::spawn_blocking(move || list_impl(&workspace))
+        let root = self.snapshots_root.clone();
+        let selected_state = self.selected_state;
+        tokio::task::spawn_blocking(move || list_impl(&root, selected_state))
             .await
             .map_err(|e| format!("spawn: {e}"))?
     }
@@ -68,31 +123,28 @@ impl SnapshotStore {
     /// large source tree, and we used to call it on the tokio runtime
     /// thread from `snap_ops::snap_delete`.
     pub async fn delete(&self, id: &str) -> Result<(), String> {
-        let workspace = self.workspace.clone();
+        self.validate_id(id)?;
+        let root = self.snapshots_root.clone();
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || delete_impl(&workspace, &id))
+        tokio::task::spawn_blocking(move || delete_impl(&root, &id))
             .await
             .map_err(|e| format!("spawn: {e}"))?
     }
 }
 
-fn snapshots_dir(workspace: &Path) -> PathBuf {
-    workspace.join(SNAPSHOTS_DIR)
+fn snap_dir(root: &Path, id: &str) -> PathBuf {
+    root.join(id)
 }
 
-fn snap_dir(workspace: &Path, id: &str) -> PathBuf {
-    snapshots_dir(workspace).join(id)
-}
-
-fn read_manifest_at(workspace: &Path, id: &str) -> Result<SnapshotMeta, String> {
-    let path = snap_dir(workspace, id).join(MANIFEST_FILE);
+fn read_manifest_at(root: &Path, id: &str) -> Result<SnapshotMeta, String> {
+    let path = snap_dir(root, id).join(MANIFEST_FILE);
     let content = std::fs::read_to_string(&path).map_err(|e| format!("read manifest: {e}"))?;
     serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
 }
 
-fn create_impl(workspace: &Path, tag: Option<String>) -> Result<SnapshotMeta, String> {
+fn create_impl(workspace: &Path, root: &Path, tag: Option<String>) -> Result<SnapshotMeta, String> {
     let id = Uuid::new_v4().to_string();
-    let snap_dir_path = snap_dir(workspace, &id);
+    let snap_dir_path = snap_dir(root, &id);
     let files_dir = snap_dir_path.join("files");
 
     std::fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -113,20 +165,30 @@ fn create_impl(workspace: &Path, tag: Option<String>) -> Result<SnapshotMeta, St
     Ok(meta)
 }
 
-fn restore_impl(workspace: &Path, id: &str) -> Result<SnapshotMeta, String> {
-    let snap_dir_path = snap_dir(workspace, id);
+fn restore_impl(
+    workspace: &Path,
+    root: &Path,
+    id: &str,
+    selected_state: bool,
+) -> Result<SnapshotMeta, String> {
+    let snap_dir_path = snap_dir(root, id);
     if !snap_dir_path.exists() {
         return Err(format!("snapshot not found: {id}"));
     }
 
-    let meta = read_manifest_at(workspace, id)?;
     let files_dir = snap_dir_path.join("files");
-    restore_workspace(workspace, &files_dir)?;
+    if selected_state {
+        reject_snapshot_symlink(&snap_dir_path)?;
+        reject_snapshot_symlink(&snap_dir_path.join(MANIFEST_FILE))?;
+        reject_snapshot_symlink(&files_dir)?;
+    }
+    let meta = read_manifest_at(root, id)?;
+    restore_workspace(workspace, &files_dir, selected_state)?;
     Ok(meta)
 }
 
-fn list_impl(workspace: &Path) -> Result<Vec<SnapshotMeta>, String> {
-    let dir = snapshots_dir(workspace);
+fn list_impl(root: &Path, selected_state: bool) -> Result<Vec<SnapshotMeta>, String> {
+    let dir = root.to_path_buf();
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -137,7 +199,14 @@ fn list_impl(workspace: &Path) -> Result<Vec<SnapshotMeta>, String> {
     for entry in entries.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let id = entry.file_name().to_string_lossy().to_string();
-            if let Ok(meta) = read_manifest_at(workspace, &id) {
+            let manifest = entry.path().join(MANIFEST_FILE);
+            if selected_state
+                && std::fs::symlink_metadata(&manifest)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err("snapshot manifest is a symlink".to_string());
+            }
+            if let Ok(meta) = read_manifest_at(root, &id) {
                 snaps.push(meta);
             }
         }
@@ -147,8 +216,8 @@ fn list_impl(workspace: &Path) -> Result<Vec<SnapshotMeta>, String> {
     Ok(snaps)
 }
 
-fn delete_impl(workspace: &Path, id: &str) -> Result<(), String> {
-    let snap_dir_path = snap_dir(workspace, id);
+fn delete_impl(root: &Path, id: &str) -> Result<(), String> {
+    let snap_dir_path = snap_dir(root, id);
     if !snap_dir_path.exists() {
         return Err(format!("snapshot not found: {id}"));
     }
@@ -199,8 +268,12 @@ fn copy_workspace(workspace: &Path, dest: &Path) -> Result<(usize, u64), String>
     Ok((file_count, total_bytes))
 }
 
-fn restore_workspace(workspace: &Path, snap_files: &Path) -> Result<(), String> {
-    let snap_set = collect_relative_paths(snap_files)?;
+fn restore_workspace(
+    workspace: &Path,
+    snap_files: &Path,
+    selected_state: bool,
+) -> Result<(), String> {
+    let snap_set = collect_relative_paths(snap_files, selected_state)?;
     let workspace_set = collect_workspace_paths(workspace)?;
 
     // Remove workspace files not in the snapshot
@@ -225,7 +298,19 @@ fn restore_workspace(workspace: &Path, snap_files: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn collect_relative_paths(root: &Path) -> Result<HashMap<String, PathBuf>, String> {
+fn reject_snapshot_symlink(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| format!("snapshot metadata: {e}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("snapshot path is a symlink: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn collect_relative_paths(
+    root: &Path,
+    selected_state: bool,
+) -> Result<HashMap<String, PathBuf>, String> {
     let mut map = HashMap::new();
     let walker = WalkBuilder::new(root)
         .git_ignore(false)
@@ -235,6 +320,9 @@ fn collect_relative_paths(root: &Path) -> Result<HashMap<String, PathBuf>, Strin
     for result in walker {
         let entry = result.map_err(|e| format!("walk: {e}"))?;
         let path = entry.path();
+        if selected_state && entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            return Err(format!("snapshot path is a symlink: {}", path.display()));
+        }
         if path.is_file() {
             let rel = path.strip_prefix(root).map_err(|e| format!("strip: {e}"))?;
             map.insert(rel.to_string_lossy().to_string(), path.to_path_buf());
@@ -329,6 +417,50 @@ mod tests {
         assert!(snap_dir.join("manifest.json").exists());
         assert!(snap_dir.join("files/main.rs").exists());
         assert!(snap_dir.join("files/src/lib.rs").exists());
+    }
+
+    #[test]
+    fn for_workspace_honors_relocated_root() {
+        let ws = PathBuf::from("/tmp/evidence-ws");
+        let relocated_root = PathBuf::from("/var/state/snapshots");
+
+        // With a state authority (snapshot_directory = Some), stored copies live
+        // under the caller-owned root, never inside the workspace.
+        let relocated = SnapshotStore::for_workspace(ws.clone(), Some(&relocated_root));
+        assert_eq!(relocated.snapshots_root(), relocated_root.as_path());
+        assert!(!relocated.snapshots_root().starts_with(&ws));
+
+        // Without an authority (None) the legacy workspace-relative placement is
+        // preserved exactly.
+        let legacy = SnapshotStore::for_workspace(ws.clone(), None);
+        assert_eq!(legacy.snapshots_root(), ws.join(SNAPSHOTS_DIR));
+    }
+
+    #[tokio::test]
+    async fn relocated_root_keeps_snapshots_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_workspace(dir.path());
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("snapshots");
+
+        let store = SnapshotStore::with_snapshots_root(dir.path().to_path_buf(), root.clone());
+        let meta = store.create(Some("v1".into())).await.unwrap();
+
+        // Stored copy lives under the relocated root, not the workspace.
+        assert!(root.join(&meta.id).join("manifest.json").exists());
+        assert!(root.join(&meta.id).join("files/main.rs").exists());
+        assert!(!dir.path().join(".daimonos/snapshots").exists());
+
+        // The relocated store still lists, restores, and deletes correctly.
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        std::fs::write(dir.path().join("main.rs"), "fn main() { panic!() }").unwrap();
+        store.restore(&meta.id).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "fn main() {}"
+        );
+        store.delete(&meta.id).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 0);
     }
 
     #[tokio::test]

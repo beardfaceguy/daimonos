@@ -39,6 +39,23 @@ marker and the file that wins (or `built-in defaults` if none exist), then
 exits without starting the server. In non-MCP modes daimonos also logs
 `config: loaded from …` to stderr at startup (add `--verbose` in `--mcp` mode).
 
+## Caller-owned state (`--state-dir`)
+
+Use `--state-dir PATH` to keep Daimonos-owned MCP or native tool-server state
+outside the workspace and HOME. The caller must create a private, writable
+state directory that does not overlap the workspace after symlink resolution.
+See `StateAuthority` in `src/state_root.rs` and ADR-021 for the boundary.
+
+Daimonos rejects an internal configuration destination outside that root.
+It also rejects MCP client roots that overlap the selected state directory.
+When selected, automatic HOME config discovery is disabled. Explicit and
+workspace config files remain available.
+
+This option does **not** make the workspace read-only or confine tool reads.
+Agent, chat, ACP, and session frontends reject the option with exit 2 and reason
+`state_mode_unsupported` until WP02 supports their state. Without the option,
+existing state locations remain unchanged.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,

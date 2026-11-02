@@ -105,6 +105,7 @@ struct SecureRollingAppender {
     file_prefix: String,
     rotation: LogRotation,
     max_files: usize,
+    reject_symlinks: bool,
     bucket: u64,
     file: File,
 }
@@ -115,17 +116,19 @@ impl SecureRollingAppender {
         file_prefix: String,
         rotation: LogRotation,
         max_files: usize,
+        reject_symlinks: bool,
     ) -> std::io::Result<Self> {
         secure_log_directory(&directory)?;
         let bucket = rotation.bucket();
         let current_path = log_path(&directory, &file_prefix, rotation, bucket);
-        let file = open_secure_log(&current_path)?;
+        let file = open_secure_log(&current_path, reject_symlinks)?;
         prune_log_files(&directory, &file_prefix, max_files, &current_path)?;
         Ok(Self {
             directory,
             file_prefix,
             rotation,
             max_files,
+            reject_symlinks,
             bucket,
             file,
         })
@@ -137,7 +140,7 @@ impl SecureRollingAppender {
             return Ok(());
         }
         let current_path = log_path(&self.directory, &self.file_prefix, self.rotation, bucket);
-        self.file = open_secure_log(&current_path)?;
+        self.file = open_secure_log(&current_path, self.reject_symlinks)?;
         self.bucket = bucket;
         prune_log_files(
             &self.directory,
@@ -179,6 +182,7 @@ impl Drop for LoggingGuard {
 pub fn init(
     config: &LoggingConfig,
     telemetry_tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
+    reject_symlinks: bool,
 ) -> anyhow::Result<Option<LoggingGuard>> {
     if !config.enabled && telemetry_tracer.is_none() {
         return Ok(None);
@@ -197,6 +201,7 @@ pub fn init(
             config.file_prefix.clone(),
             rotation,
             config.max_files,
+            reject_symlinks,
         )?;
         let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
         let layer = fmt::layer()
@@ -262,18 +267,30 @@ fn secure_log_directory(directory: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)
 }
 
-fn open_secure_log(path: &Path) -> std::io::Result<File> {
+fn open_secure_log(path: &Path, reject_symlinks: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        // ADR-021: a selected state root must not follow an escaping log file.
+        if reject_symlinks {
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
     }
+    #[cfg(not(unix))]
+    let _ = reject_symlinks;
     let file = options.open(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if reject_symlinks && file.metadata()?.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "state log file must not have multiple hard links",
+            ));
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
@@ -555,6 +572,7 @@ mod tests {
             "daimonos".to_string(),
             LogRotation::Never,
             2,
+            false,
         )
         .unwrap();
         appender.write_all(b"test event\n").unwrap();
