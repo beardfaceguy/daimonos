@@ -257,7 +257,41 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+// SQLite can return BUSY immediately when two new connections both request WAL.
+// Bound the startup wait and retain rusqlite's normal timeout after initialization.
+fn configure_analytics_connection(conn: &Connection) -> Result<(), String> {
+    conn.busy_timeout(std::time::Duration::from_millis(100))
+        .map_err(|error| format!("pragma timeout: {error}"))?;
+    let mut retries = 20;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;") {
+            Ok(()) => break,
+            Err(error) => {
+                let busy = matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                );
+                if !busy || retries == 0 {
+                    return Err(format!("pragma: {error}"));
+                }
+                retries -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("pragma timeout: {error}"))
+}
+
 impl AnalyticsStore {
+    /// Initialize without blocking the async runtime during SQLite contention.
+    pub async fn open_async(db_path: &Path, retention_days: u64) -> Result<Self, String> {
+        let path = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::new(&path, retention_days))
+            .await
+            .map_err(|error| format!("analytics initialization task: {error}"))?
+    }
+
     pub fn new(db_path: &Path, retention_days: u64) -> Result<Self, String> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create analytics dir: {e}"))?;
@@ -265,8 +299,7 @@ impl AnalyticsStore {
 
         let conn = Connection::open(db_path).map_err(|e| format!("open analytics db: {e}"))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| format!("pragma: {e}"))?;
+        configure_analytics_connection(&conn)?;
 
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| format!("schema migration: {e}"))?;
@@ -730,6 +763,32 @@ mod tests {
         let (saved, pct) = compute_savings(800, 400);
         assert_eq!(saved, 100);
         assert!((pct - 50.0).abs() < 0.01, "expected ~50%, got {pct}");
+    }
+
+    #[test]
+    fn concurrent_initialization_of_one_database_succeeds() {
+        for _ in 0..30 {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("analytics.db");
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        AnalyticsStore::new(&path, 90).map(|_| ())
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for worker in workers {
+                worker
+                    .join()
+                    .unwrap()
+                    .expect("concurrent analytics initialization");
+            }
+        }
     }
 
     fn test_store() -> (TempDir, AnalyticsStore) {

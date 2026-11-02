@@ -60,6 +60,9 @@ user instructions, global skills, or Zed MCP settings. Explicit inputs remain
 available. Use `--agent-env` or `DAIMONOS_AGENT_ENV` to select the agent file.
 Pass an explicit output directory with `--dump-prompts`.
 The session-store layout is defined by `StateAuthority::verify_session_store`.
+To avoid HOME writes during startup, selected-state CLI registration checks
+executable presence on `PATH` without running version probes. An executable can
+still fail when a caller invokes it.
 
 ## Agent Environment File
 

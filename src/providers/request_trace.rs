@@ -47,9 +47,23 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        write_with_limit(dir.path(), &json!({"tools":[]}), 128).unwrap();
+        // The nonblocking lock can be contended during parallel tests.
+        // Production tracing fails fast on contention, so retry only in this test.
+        let write = || {
+            for _ in 0..100 {
+                match write_with_limit(dir.path(), &json!({"tools":[]}), 128) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("trace write failed: {error}"),
+                }
+            }
+            panic!("trace lock remained contended");
+        };
+        write();
         for _ in 0..12 {
-            write_with_limit(dir.path(), &json!({"tools":[]}), 128).unwrap();
+            write();
         }
         assert!(dir.path().join("requests.jsonl.1").exists());
         assert!(

@@ -442,7 +442,7 @@ pub async fn run_agent(
     )?;
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
-        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+        match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
             Ok(store) => Some(Arc::new(store)),
             Err(error) if cfg.state_authority.is_some() => {
                 return Err(anyhow::anyhow!(
@@ -606,7 +606,7 @@ pub async fn run_acp(
     };
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
-        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+        match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
             Ok(store) => Some(Arc::new(store)),
             Err(error) => {
                 if cfg.state_authority.is_some() {
@@ -687,10 +687,12 @@ pub async fn run_session_daemon(
         .map_err(|error| anyhow::anyhow!("agent config: {error}"))?;
     let compaction = prompts::apply_summary_override(compaction, &cfg).await;
     let analytics_store = if cfg.analytics.enabled {
-        match analytics::AnalyticsStore::new(
+        match analytics::AnalyticsStore::open_async(
             &cfg.analytics.resolved_db_path(),
             cfg.analytics.retention_days,
-        ) {
+        )
+        .await
+        {
             Ok(store) => Some(Arc::new(store)),
             Err(error) => {
                 if cfg.state_authority.is_some() {

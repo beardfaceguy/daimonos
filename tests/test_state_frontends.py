@@ -28,6 +28,8 @@ def test_session_daemon_uses_selected_state_root(daimonos_binary, tmp_path):
     env = {key: value for key, value in os.environ.items() if not key.startswith("DAIMONOS_")}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                XDG_DATA_HOME=str(home / "data"), TMPDIR=str(tmp_path))
+    env.pop("RUSTUP_HOME", None)
+    env.pop("CARGO_HOME", None)
     with tempfile.TemporaryDirectory(prefix="ds-") as state_name:
         state = Path(state_name)
         workspace_id = hashlib.sha256(os.fsencode(workspace.resolve())).hexdigest()[:16]

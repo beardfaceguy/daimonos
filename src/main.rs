@@ -798,7 +798,7 @@ async fn run_tool_service(
     // Initialize analytics store for session tracking
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
-        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+        match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
             Ok(store) => {
                 if !mcp_quiet_stderr {
                     eprintln!("analytics: enabled ({})", db_path.display());

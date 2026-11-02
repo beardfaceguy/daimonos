@@ -74,6 +74,26 @@ fn builtin_cli_plugins() -> Vec<BuiltinPlugin> {
     ]
 }
 
+/// Locate a selected-state CLI without starting a process that can write under HOME.
+fn executable_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path else { return false };
+    std::env::split_paths(path).any(|directory| {
+        let Ok(metadata) = std::fs::metadata(directory.join(program)) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        true
+    })
+}
+
 /// Build the complete tool registry every front-door should use: the
 /// config-driven plugins (via [`crate::config::register_tools`]) plus the
 /// built-in CLI plugins ([`builtin_cli_plugins`]) that pass their availability
@@ -85,7 +105,14 @@ pub async fn register_builtin_plugins(cfg: &Config, registry: &ToolRegistry, qui
     crate::config::register_tools(cfg, registry, quiet_stderr).await;
 
     for (id, available, make) in builtin_cli_plugins() {
-        if available() {
+        // ADR-021: automatic probes must not write into the caller's HOME.
+        let present = if cfg.state_authority.is_some() {
+            let program = if id == "git_read" { "git" } else { id };
+            executable_on_path(program, std::env::var_os("PATH").as_deref())
+        } else {
+            available()
+        };
+        if present {
             registry.register(make(cfg)).await;
             if !quiet_stderr {
                 eprintln!("auto-registered {id} tool plugin");
@@ -124,6 +151,22 @@ mod tests {
     use crate::config::Config;
     use crate::tool_runner::ToolRegistry;
     use std::collections::BTreeSet;
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_state_detection_checks_path_without_executing() {
+        use super::executable_on_path;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("tool");
+        std::fs::write(&candidate, "not an executable format").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!executable_on_path("tool", Some(&path)));
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(executable_on_path("tool", Some(&path)));
+        assert!(!executable_on_path("missing", Some(&path)));
+    }
 
     #[tokio::test]
     async fn every_builtin_cli_module_is_in_the_canonical_registry() {
