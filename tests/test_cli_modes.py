@@ -352,6 +352,19 @@ def test_interactive_bootstrap_failure_is_actionable(daimonos_binary, tmp_path):
 
 
 def test_session_daemon_recovers_socket_after_sigkill(daimonos_binary, tmp_path):
+    def wait_for_listener(process, path):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            assert process.poll() is None
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                try:
+                    client.connect(str(path))
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(0.01)
+                else:
+                    return
+        raise AssertionError(f"session daemon did not listen on {path}")
+
     agent_env = tmp_path / "agent.env"
     agent_env.write_text(
         "\n".join(
@@ -387,6 +400,7 @@ def test_session_daemon_recovers_socket_after_sigkill(daimonos_binary, tmp_path)
             assert first.poll() is None
             time.sleep(0.01)
         first_pid = json.loads(instance_path.read_text())["pid"]
+        wait_for_listener(first, socket_path)
         first.kill()
         first.wait(timeout=5)
         assert socket_path.exists()
@@ -400,9 +414,7 @@ def test_session_daemon_recovers_socket_after_sigkill(daimonos_binary, tmp_path)
                 second_pid = json.loads(instance_path.read_text())["pid"]
             time.sleep(0.01)
         assert second_pid == second.pid
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.connect(str(socket_path))
-        client.close()
+        wait_for_listener(second, socket_path)
     finally:
         if first.poll() is None:
             first.kill()
