@@ -246,6 +246,7 @@ pub async fn run_agent(
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
     explicit_config_path: Option<PathBuf>,
+    explicit_agent_instructions: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let AgentArgs {
         task,
@@ -265,11 +266,21 @@ pub async fn run_agent(
     // text consumes this, to explain why a task argument became mandatory.
     let interactive_fell_back = interactive && !print && !dry_run && !tty;
     let mode = tui::resolve_agent_mode(interactive, print, dry_run, tty);
-    let thought_log = resolve_thought_log_path(
-        debug_thoughts,
-        debug_thoughts_path,
-        crate::paths::home_dir(),
-    )?;
+    let thought_log = if let Some(authority) = &cfg.state_authority {
+        if debug_thoughts {
+            let path = debug_thoughts_path
+                .unwrap_or_else(|| cfg.logging.resolved_directory().join("thought-debug.log"));
+            Some(authority.explicit_destination("--debug-thoughts-path", &path)?)
+        } else {
+            None
+        }
+    } else {
+        resolve_thought_log_path(
+            debug_thoughts,
+            debug_thoughts_path,
+            crate::paths::home_dir(),
+        )?
+    };
 
     struct DryRunProvider;
     #[async_trait]
@@ -315,6 +326,12 @@ pub async fn run_agent(
             &crate::session_bootstrap::BootstrapOptions {
                 workspace,
                 config_path: explicit_config_path.as_deref(),
+                state_dir: cfg
+                    .state_authority
+                    .as_ref()
+                    .map(|authority| authority.root()),
+                agent_instructions: explicit_agent_instructions.as_deref(),
+                debug_tokens: token_log.is_some(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),
@@ -414,8 +431,8 @@ pub async fn run_agent(
     } else {
         task
     };
-    let agent = load_agent_env(agent_env)?;
-    let cfg = with_skill_dir(cfg, &agent);
+    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let llm = build_provider(
@@ -425,9 +442,15 @@ pub async fn run_agent(
     )?;
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
-        analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days)
-            .ok()
-            .map(Arc::new)
+        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) if cfg.state_authority.is_some() => {
+                return Err(anyhow::anyhow!(
+                    "selected state analytics is unusable: {error}"
+                ));
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -438,11 +461,12 @@ pub async fn run_agent(
     } else {
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
+    let safety = safety_policy(&agent, &cfg, approve_fn)?;
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
         dry_run: false,
-        safety: Some(agent.to_safety_policy(approve_fn)),
+        safety: Some(safety),
         analytics: analytics_store,
         token_log,
         thought_log,
@@ -466,13 +490,18 @@ pub async fn run_chat(
         resume,
         list,
     } = args;
-    let sessions_dir = paths::home_dir().map(|home| home.join(".daimonos").join("chat-sessions"));
+    let sessions_dir = if let Some(authority) = &cfg.state_authority {
+        Some(authority.verify_session_store(crate::state_root::SessionStoreKind::Chat)?)
+    } else {
+        paths::home_dir().map(|home| home.join(".daimonos").join("chat-sessions"))
+    };
     if list {
         let busy_timeout =
             std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms);
         let sessions = sessions_dir
             .map(|directory| {
                 session_store::SessionStore::new(directory)
+                    .with_private_state(cfg.state_authority.is_some())
                     .with_busy_timeout(busy_timeout)
                     .list()
             })
@@ -481,8 +510,8 @@ pub async fn run_chat(
         return Ok(());
     }
 
-    let agent = load_agent_env(agent_env)?;
-    let cfg = with_skill_dir(cfg, &agent);
+    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let model_explicit = model.is_some();
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -501,7 +530,7 @@ pub async fn run_chat(
     } else {
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
-    let safety = agent.to_safety_policy(approve_fn);
+    let safety = safety_policy(&agent, &cfg, approve_fn)?;
     chat_cmd::run_chat(
         llm,
         workspace,
@@ -528,8 +557,8 @@ pub async fn run_acp(
         provider,
         agent_env,
     } = args;
-    let agent = load_agent_env(agent_env)?;
-    let cfg = with_skill_dir(cfg, &agent);
+    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let make_provider: acp_cmd::ProviderFactory = {
@@ -569,13 +598,22 @@ pub async fn run_acp(
         !models_discovery_disabled(),
     )
     .await;
-    let safety = agent.to_safety_policy(None);
-    let sessions_dir = paths::agent_sessions_dir();
+    let safety = safety_policy(&agent, &cfg, None)?;
+    let sessions_dir = if let Some(authority) = &cfg.state_authority {
+        Some(authority.verify_session_store(crate::state_root::SessionStoreKind::Acp)?)
+    } else {
+        paths::agent_sessions_dir()
+    };
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
             Ok(store) => Some(Arc::new(store)),
             Err(error) => {
+                if cfg.state_authority.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "selected state analytics is unusable: {error}"
+                    ));
+                }
                 eprintln!("analytics: disabled (init failed: {error})");
                 None
             }
@@ -616,8 +654,8 @@ pub async fn run_session_daemon(
         remote_allow_always,
         remote_trust_proxy_headers,
     } = args;
-    let agent = load_agent_env(agent_env)?;
-    let cfg = with_skill_dir(cfg, &agent);
+    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let make_provider: session_factory::ProviderFactory = {
@@ -655,6 +693,11 @@ pub async fn run_session_daemon(
         ) {
             Ok(store) => Some(Arc::new(store)),
             Err(error) => {
+                if cfg.state_authority.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "selected state analytics is unusable: {error}"
+                    ));
+                }
                 tracing::warn!(
                     target: "daimonos::analytics",
                     event = "session_daemon_analytics_init_failed",
@@ -666,11 +709,18 @@ pub async fn run_session_daemon(
     } else {
         None
     };
-    let sessions_dir = paths::daemon_sessions_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for session persistence"))?;
-    let session_store = session_store::SessionStore::new(sessions_dir.clone()).with_busy_timeout(
-        std::time::Duration::from_millis(cfg.session.session_store_busy_timeout_ms),
-    );
+    let sessions_dir = if let Some(authority) = &cfg.state_authority {
+        authority.verify_session_store(crate::state_root::SessionStoreKind::Daemon)?
+    } else {
+        paths::daemon_sessions_dir().ok_or_else(|| {
+            anyhow::anyhow!("cannot resolve home directory for session persistence")
+        })?
+    };
+    let session_store = session_store::SessionStore::new(sessions_dir.clone())
+        .with_private_state(cfg.state_authority.is_some())
+        .with_busy_timeout(std::time::Duration::from_millis(
+            cfg.session.session_store_busy_timeout_ms,
+        ));
     let workspace_identity =
         session_factory::canonical_session_workspace(workspace, cfg.session.max_label_bytes);
     let catalog = match crate::session_catalog::SessionCatalog::open(
@@ -679,6 +729,11 @@ pub async fn run_session_daemon(
     ) {
         Ok(crate::session_catalog::CatalogOpen::Ready(catalog)) => Some(catalog),
         Ok(crate::session_catalog::CatalogOpen::NewerSchema { found }) => {
+            if cfg.state_authority.is_some() {
+                return Err(anyhow::anyhow!(
+                    "selected state session catalog has unsupported schema {found}"
+                ));
+            }
             tracing::warn!(
                 target: "daimonos::session_catalog",
                 event = "newer_catalog_schema",
@@ -688,6 +743,11 @@ pub async fn run_session_daemon(
             None
         }
         Err(error) => {
+            if cfg.state_authority.is_some() {
+                return Err(anyhow::anyhow!(
+                    "selected state session catalog is unusable: {error}"
+                ));
+            }
             tracing::warn!(
                 target: "daimonos::session_catalog",
                 event = "catalog_open_failed",
@@ -731,7 +791,7 @@ pub async fn run_session_daemon(
         effective_model,
         models,
         agent.thinking.clone(),
-        agent.to_safety_policy(None),
+        safety_policy(&agent, &cfg, None)?,
         token_log,
         session_store,
         crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
@@ -1028,16 +1088,44 @@ fn remote_capability_name(capability: &crate::session_protocol::ClientCapability
     }
 }
 
-fn load_agent_env(path: Option<PathBuf>) -> anyhow::Result<agent_env::AgentEnv> {
-    agent_env::AgentEnv::load(path).map_err(|error| anyhow::anyhow!("agent config: {error}"))
+fn load_agent_env(
+    path: Option<PathBuf>,
+    selected_state: bool,
+) -> anyhow::Result<agent_env::AgentEnv> {
+    let loaded = if selected_state {
+        agent_env::AgentEnv::load_explicit(path)
+    } else {
+        agent_env::AgentEnv::load(path)
+    };
+    loaded.map_err(|error| anyhow::anyhow!("agent config: {error}"))
 }
 
 fn with_skill_dir(
     mut cfg: Arc<config::Config>,
     agent: &agent_env::AgentEnv,
-) -> Arc<config::Config> {
-    Arc::make_mut(&mut cfg).agent.skills.global_dir = agent.skill_dir.clone();
-    cfg
+) -> anyhow::Result<Arc<config::Config>> {
+    let directory = if let Some(directory) = &agent.skill_dir {
+        Some(directory.clone())
+    } else if let Some(authority) = &cfg.state_authority {
+        let sessions = authority.resolve(crate::state_root::StateKey::Sessions, None)?;
+        Some(authority.explicit_destination("default skills", &sessions.join("skills"))?)
+    } else {
+        None
+    };
+    Arc::make_mut(&mut cfg).agent.skills.global_dir = directory;
+    Ok(cfg)
+}
+
+fn safety_policy(
+    agent: &agent_env::AgentEnv,
+    cfg: &config::Config,
+    approve_fn: Option<safety::ApproveFn>,
+) -> anyhow::Result<safety::SafetyPolicy> {
+    Ok(if let Some(authority) = &cfg.state_authority {
+        agent.to_safety_policy_with_approvals(approve_fn, Some(authority.verify_approvals()?))
+    } else {
+        agent.to_safety_policy(approve_fn)
+    })
 }
 
 fn require_agent_task(

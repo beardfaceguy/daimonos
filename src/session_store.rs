@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{ContentBlock, Message, Role};
@@ -16,7 +16,7 @@ use crate::session_protocol::AssistantOutcome;
 /// change can be detected and old files ignored rather than mis-parsed.
 pub const SESSION_PERSIST_VERSION: u32 = 1;
 const SESSION_STORE_SCHEMA_VERSION: i64 = 1;
-const SESSION_DATABASE_NAME: &str = "sessions.sqlite3";
+pub(crate) const SESSION_DATABASE_NAME: &str = "sessions.sqlite3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStoreErrorKind {
@@ -170,6 +170,7 @@ pub struct SessionSummaryScan {
 pub struct SessionStore {
     dir: PathBuf,
     busy_timeout: Duration,
+    private_state: bool,
 }
 
 impl SessionStore {
@@ -177,7 +178,14 @@ impl SessionStore {
         SessionStore {
             dir,
             busy_timeout: Duration::ZERO,
+            private_state: false,
         }
+    }
+
+    /// Apply selected-state file protections (ADR-021).
+    pub fn with_private_state(mut self, private_state: bool) -> Self {
+        self.private_state = private_state;
+        self
     }
 
     pub fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
@@ -205,7 +213,18 @@ impl SessionStore {
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
             .map_err(SessionStoreError::Io)?;
         let path = self.dir.join(SESSION_DATABASE_NAME);
-        let mut connection = Connection::open(&path).map_err(SessionStoreError::Database)?;
+        if self.private_state {
+            crate::state_root::verify_unshared_sqlite_files(&path)
+                .map_err(SessionStoreError::Io)?;
+        }
+        let flags = OpenFlags::default()
+            | if self.private_state {
+                OpenFlags::SQLITE_OPEN_NOFOLLOW
+            } else {
+                OpenFlags::empty()
+            };
+        let mut connection =
+            Connection::open_with_flags(&path, flags).map_err(SessionStoreError::Database)?;
         connection
             .busy_timeout(self.busy_timeout)
             .map_err(SessionStoreError::Database)?;
@@ -1029,6 +1048,19 @@ mod tests {
             Message::user("first question\nsecond line"),
             Message::assistant("the answer"),
         ]
+    }
+
+    #[test]
+    fn private_store_rejects_a_hardlinked_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let evidence = directory.path().join("evidence.db");
+        let store_dir = directory.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        std::fs::write(&evidence, b"unchanged").unwrap();
+        std::fs::hard_link(&evidence, store_dir.join(SESSION_DATABASE_NAME)).unwrap();
+        let store = SessionStore::new(store_dir).with_private_state(true);
+        assert!(store.claim_writer("test", None).is_err());
+        assert_eq!(std::fs::read(evidence).unwrap(), b"unchanged");
     }
 
     #[test]

@@ -205,6 +205,14 @@ impl StateKey {
     }
 }
 
+/// The session store used by a supported frontend.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SessionStoreKind {
+    Daemon,
+    Acp,
+    Chat,
+}
+
 /// Immutable, run-scoped authority over internal state placement. Constructed
 /// once from an explicit caller `--state-dir`; cloned freely and threaded
 /// through constructors. Carries no mutable or process-global state.
@@ -458,6 +466,38 @@ impl StateAuthority {
                 }
             }
         }
+    }
+
+    /// Validate one frontend's session store before its writers start (ADR-021).
+    pub(crate) fn verify_session_store(
+        &self,
+        kind: SessionStoreKind,
+    ) -> Result<PathBuf, RunFailure> {
+        let name = match kind {
+            SessionStoreKind::Daemon => "daemon",
+            SessionStoreKind::Acp => "acp",
+            SessionStoreKind::Chat => "chat",
+        };
+        let directory = self.resolve_trusted(&["sessions", name])?;
+        self.verify_writable_directory("session store", &directory)?;
+        let database = directory.join(crate::session_store::SESSION_DATABASE_NAME);
+        self.explicit_destination("session database", &database)?;
+        verify_unshared_sqlite_files(&database).map_err(|error| {
+            RunFailure::state_unusable(format!("session database {}: {error}", database.display()))
+        })?;
+        Ok(directory)
+    }
+
+    /// Validate the selected-state approval file before frontend startup (ADR-021).
+    pub(crate) fn verify_approvals(&self) -> Result<PathBuf, RunFailure> {
+        let directory = self.resolve_trusted(&["sessions", "approvals"])?;
+        self.verify_writable_directory("approvals", &directory)?;
+        let file = directory.join("agent-approvals");
+        self.explicit_destination("approvals", &file)?;
+        verify_unshared_file(&file).map_err(|error| {
+            RunFailure::state_unusable(format!("approvals {}: {error}", file.display()))
+        })?;
+        Ok(file)
     }
 
     /// The validated root path (a canonical value, not an open descriptor).

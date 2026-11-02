@@ -1037,7 +1037,11 @@ async fn connect(
             Some(Arc::new(
                 tokio::time::timeout_at(
                     deadline,
-                    crate::mcp_oauth::start_proxy(url, &policy.profile),
+                    crate::mcp_oauth::start_proxy(
+                        url,
+                        &policy.profile,
+                        cfg.oauth_state_root.as_deref(),
+                    ),
                 )
                 .await
                 .map_err(|_| "OAuth proxy startup timed out")??,

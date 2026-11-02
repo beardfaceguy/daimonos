@@ -776,8 +776,8 @@ def test_state_dir_rejects_invalid_workspace_with_structured_error(daimonos_bina
     assert not list(state.iterdir())
 
 
-def test_state_dir_rejects_unimplemented_acp_before_writing(daimonos_binary, tmp_path):
-    """WP01 must not advertise ACP state isolation before WP02 implements it."""
+def test_state_dir_rejects_unimplemented_mcp_config_before_writing(daimonos_binary, tmp_path):
+    """Unsupported modes must not silently ignore the selected state root."""
     workspace = tmp_path / "evidence"
     workspace.mkdir()
     state = tmp_path / "state"
@@ -787,22 +787,16 @@ def test_state_dir_rejects_unimplemented_acp_before_writing(daimonos_binary, tmp
     env = {key: value for key, value in os.environ.items() if not key.startswith("DAIMONOS_")}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
                XDG_DATA_HOME=str(home / ".local" / "share"), TMPDIR=str(tmp_path))
-    agent_env = tmp_path / "synthetic-agent.env"
-    agent_env.write_text("\n".join([
-        "DAIMONOS_AGENT_PROVIDER=openrouter", "DAIMONOS_AGENT_MODEL=test/model",
-        "DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:1", "DAIMONOS_AGENT_API_KEY=test",
-        "DAIMONOS_AGENT_APPROVAL_MODE=auto", "DAIMONOS_AGENT_COMPACTION=off", "",
-    ]))
     completed = subprocess.run(
         [daimonos_binary, "--state-dir", str(state), "-w", str(workspace),
-         "acp", "--agent-env", str(agent_env)],
+         "mcp-config", "sync", "--dry-run"],
         input=b"", capture_output=True, timeout=15, env=env,
     )
     assert completed.returncode == 2, completed.stderr.decode(errors="replace")
     error = json.loads(completed.stderr.decode().splitlines()[-1])["error"]
     assert error["code"] == "run_configuration_invalid"
     assert error["reason"] == "state_mode_unsupported"
-    assert not list(home.rglob("*")), "unsupported ACP mode wrote under HOME"
+    assert not list(home.rglob("*")), "unsupported MCP config mode wrote under HOME"
 
 
 def test_state_dir_rejects_explicit_log_destination_outside_root(daimonos_binary, tmp_path):

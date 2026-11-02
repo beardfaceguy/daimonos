@@ -1777,7 +1777,7 @@ async fn resolve_mcp_specs(
     {
         return specs;
     }
-    {
+    if cfg.state_authority.is_none() || cfg.acp.mcp.zed_settings_path.is_some() {
         match crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()) {
             Ok(fallback) if !fallback.is_empty() => {
                 tracing::warn!(target: "daimonos::acp", event = "mcp_forward_empty_fallback",
@@ -2848,7 +2848,9 @@ fn build_agent_with_state(
         models,
         default_model: model,
         store: sessions_dir.map(|directory| {
-            SessionStore::new(directory).with_busy_timeout(session_store_busy_timeout)
+            SessionStore::new(directory)
+                .with_private_state(cfg.state_authority.is_some())
+                .with_busy_timeout(session_store_busy_timeout)
         }),
         supports_images,
         supports_terminal_output: AtomicBool::new(false),
@@ -4408,7 +4410,7 @@ mod tests {
             r#"{ "mcpServers": { "shared": { "command": "x" } } }"#,
         )
         .unwrap();
-        cfg.agent.mcp.servers_file = shared.to_string_lossy().into();
+        cfg.agent.mcp.servers_file = Some(shared.to_string_lossy().into());
         cfg.agent.mcp.enabled = true;
         cfg.acp.mcp.zed_config_fallback = true;
         assert!(matches!(
