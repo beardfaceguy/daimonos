@@ -2219,11 +2219,16 @@ async fn run_retry_turn(
         .prepare_model(&mut agent_session, &model)
         .await?;
 
+    handle
+        .core
+        .configure_turn_checkpoint(&mut agent_session, None, true)
+        .await;
     let staged = agent_session.staged_retry_last_turn()?;
     let staged_result = tokio::select! {
         result = staged => Some(result),
         _ = active_turn.cancelled() => None,
     };
+    agent_session.set_turn_checkpoint(None);
     let (outcome, cancelled_kind) = match staged_result {
         Some(result) if active_turn.mark_completed() => {
             (Some(Ok(agent_session.commit_staged(result, true))), None)
@@ -3940,9 +3945,12 @@ where
     let completed = Arc::new(AtomicUsize::new(0));
     let shutdowns = handles.into_iter().map(|handle| {
         let completed = Arc::clone(&completed);
+        let drain = Arc::clone(&handle);
         let shutdown = shutdown(handle);
         async move {
-            shutdown.await;
+            // The permit stays active through final persistence (ADR-016).
+            // Drain and bridge shutdown share the existing bounded deadline.
+            futures_util::future::join(drain.core.turn.wait_idle(), shutdown).await;
             completed.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -5248,9 +5256,17 @@ mod tests {
             .expect("subscribe");
 
         // A turn is in flight at the moment the transport dies.
-        let _turn = handle.core.begin_turn().expect("begin turn");
-
+        let owner = Arc::clone(&handle);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let turn = owner.core.begin_turn().expect("begin turn");
+            ready.send(()).unwrap();
+            turn.cancelled().await;
+            drop(turn);
+        });
+        started.await.unwrap();
         let summary = shutdown_all_bridges(&state).await;
+        worker.await.unwrap();
 
         let seen = statuses.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert!(
@@ -5260,6 +5276,33 @@ mod tests {
         assert_eq!(summary.sessions, 1);
         assert_eq!(summary.completed, 1);
         assert!(!summary.timed_out);
+    }
+
+    #[tokio::test]
+    async fn transport_teardown_waits_for_cancelled_turn_finalization() {
+        let (state, handle, _workspace) = state_with_live_session().await;
+        let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::clone(&finalized);
+        let owner = Arc::clone(&handle);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let turn = owner.core.begin_turn().unwrap();
+            ready.send(()).unwrap();
+            turn.cancelled().await;
+            // A real prompt retains this permit through its final persistence write.
+            tokio::task::yield_now().await;
+            finished.store(true, Ordering::SeqCst);
+            drop(turn);
+        });
+        started.await.unwrap();
+        let summary = shutdown_all_bridges(&state).await;
+        assert!(
+            finalized.load(Ordering::SeqCst),
+            "teardown returned before turn finalization"
+        );
+        assert!(!handle.core.turn_is_active());
+        assert!(!summary.timed_out);
+        worker.await.unwrap();
     }
 
     /// vikunja #1293: all session bridges must begin shutdown concurrently,
@@ -6058,6 +6101,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(stop_reason, AcpStopReason::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_is_durable_before_the_provider_starts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&started);
+        let factory: ProviderFactory = Arc::new(move || {
+            Ok(Box::new(CancelThenCaptureProvider {
+                calls: AtomicUsize::new(0),
+                first_started: Arc::clone(&signal),
+                follow_up_context: Arc::new(StdMutex::new(Vec::new())),
+            }))
+        });
+        let agent = build_agent(
+            factory,
+            workspace.path(),
+            Arc::new(Config::default()),
+            "test-model".into(),
+            vec!["test-model".into()],
+            Arc::new(crate::safety::SafetyPolicy::default()),
+            None,
+            Some(sessions.path().to_path_buf()),
+            None,
+            None,
+        );
+        let store = SessionStore::new(sessions.path().to_path_buf());
+        AcpClientRole
+            .builder()
+            .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let id = connection
+                    .send_request(NewSessionRequest::new(workspace.path()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![AcpContentBlock::Text(TextContent::new(
+                            "durable accepted prompt",
+                        ))],
+                    ))
+                    .block_task();
+                started.notified().await;
+                let record = store.load_result(&id.to_string()).unwrap();
+                assert!(record.messages.iter().flat_map(|m| &m.content).any(|block|
+                matches!(block, CoreBlock::Text(text) if text == "durable accepted prompt")),
+                "the provider started before the accepted prompt reached storage");
+                connection.send_notification(CancelNotification::new(id))?;
+                assert_eq!(prompt.await?.stop_reason, AcpStopReason::Cancelled);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -1135,3 +1135,18 @@ DAIMONOS_AGENT_ALLOWED_COMMANDS=read_file,search,workspace_info,git_read
 MCP mode does not enforce this agent allowlist. MCP clients must expose only the
 required read tools. Do not expose `exec`, `batch`, or `execute_script` to a
 strictly read-only reviewer. Their internal calls do not apply the agent policy.
+
+## Active-turn crash recovery
+
+When chat persistence is enabled, SessionCore writes recovery projections at authoritative turn boundaries.
+`DAIMONOS_CHAT_PERSIST` controls whether ACP sessions have persistence.
+Checkpoint saves reuse the configured persistence retries and writer-generation guards.
+They do not store individual streamed tokens or commit the live turn early.
+The session file format remains unchanged.
+
+ACP shutdown drains cancelled turns and MCP bridges within `[acp.mcp].teardown_timeout_secs`.
+A timeout does not remove the latest completed recovery checkpoint.
+Storage failures remain visible as degraded durability until a full save succeeds.
+
+[ADR-020](adr/020-durable-turn-checkpoints.md) explains the design and rollback behavior.
+[The glossary](contexts/session-durability/CONTEXT.md) defines checkpoint and canonical history.
