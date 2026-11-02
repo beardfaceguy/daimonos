@@ -124,11 +124,17 @@ pub fn decode(
 }
 
 pub fn run(args: SessionArgs, config: &crate::config::Config) -> anyhow::Result<()> {
-    let directory = crate::paths::daemon_sessions_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve session database directory"))?;
-    let store = crate::session_store::SessionStore::new(directory).with_busy_timeout(
-        std::time::Duration::from_millis(config.session.session_store_busy_timeout_ms),
-    );
+    let directory = if let Some(authority) = &config.state_authority {
+        authority.verify_session_store(crate::state_root::SessionStoreKind::Daemon)?
+    } else {
+        crate::paths::daemon_sessions_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve session database directory"))?
+    };
+    let store = crate::session_store::SessionStore::new(directory)
+        .with_private_state(config.state_authority.is_some())
+        .with_busy_timeout(std::time::Duration::from_millis(
+            config.session.session_store_busy_timeout_ms,
+        ));
     match args.command {
         SessionCommand::Import { file } => {
             let format = SessionFormat::from_path(&file)?;

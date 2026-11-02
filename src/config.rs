@@ -183,14 +183,14 @@ pub struct AgentMcpConfig {
     pub enabled: bool,
     /// Path to the Claude-style `mcpServers` JSON file. A missing file is
     /// not an error — agent mode simply runs with native tools only.
-    pub servers_file: String,
+    pub servers_file: Option<String>,
 }
 
 impl Default for AgentMcpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            servers_file: "~/.config/zed/settings.json".to_string(),
+            servers_file: None,
         }
     }
 }
@@ -1229,6 +1229,9 @@ pub struct AcpMcpConfig {
     pub zed_settings_path: Option<String>,
     /// Explicit endpoint/profile OAuth policy for outbound HTTP MCP.
     pub oauth_servers: HashMap<String, McpOAuthServer>,
+    /// Caller-selected OAuth credential directory (ADR-021).
+    #[serde(skip)]
+    pub oauth_state_root: Option<std::path::PathBuf>,
 }
 
 impl Default for AcpMcpConfig {
@@ -1248,6 +1251,7 @@ impl Default for AcpMcpConfig {
             zed_config_fallback: true,
             zed_settings_path: None,
             oauth_servers: HashMap::new(),
+            oauth_state_root: None,
         }
     }
 }
@@ -2122,13 +2126,18 @@ impl Config {
         self.session.socket_path = Some(destination(
             "session.socket_path",
             &self.session.socket_path,
-            path(StateKey::Sockets)?.join("session.sock"),
+            path(StateKey::Sockets)?.join(format!("session-{}.sock", &id.as_str()[..16])),
         )?);
         self.session.session_catalog_path = Some(destination(
             "session.session_catalog_path",
             &self.session.session_catalog_path,
             path(StateKey::Catalog)?.join("catalog.sqlite"),
         )?);
+        let catalog_db = self
+            .session
+            .resolved_session_catalog_path(&path(StateKey::Sessions)?);
+        verify_unshared("session.session_catalog_path", &catalog_db)?;
+        self.acp.mcp.oauth_state_root = Some(path(StateKey::Oauth)?);
         self.snapshot_directory = Some(path(StateKey::Snapshots)?);
         let kgl_directory = path(StateKey::Kgl)?;
         let kgl_db = kgl_directory.join("kgl.db");

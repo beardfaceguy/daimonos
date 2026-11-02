@@ -109,10 +109,21 @@ pub async fn load_agent_instructions(
     cli_path: Option<&std::path::Path>,
     workspace: &std::path::Path,
 ) -> std::io::Result<Option<String>> {
+    load_agent_instructions_with_user_config(cli_path, workspace, true).await
+}
+
+/// Load workspace and explicitly selected instructions without implicit HOME (ADR-021).
+pub async fn load_agent_instructions_with_user_config(
+    cli_path: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+    allow_user_config: bool,
+) -> std::io::Result<Option<String>> {
     if let Some(path) = cli_path {
         return read_agent_instructions(path, false).await;
     }
-    let global = default_agent_instructions_path();
+    let global = allow_user_config
+        .then(default_agent_instructions_path)
+        .flatten();
     let workspace_file = workspace_agent_instructions_path(workspace);
     load_layered_instructions(global.as_deref(), &workspace_file).await
 }

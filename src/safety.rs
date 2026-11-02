@@ -77,6 +77,8 @@ pub struct SafetyPolicy {
     /// Where to persist `Always` approvals (append-only, one tool name per
     /// line). `None` disables persistence (e.g. in tests / headless).
     pub approvals_path: Option<PathBuf>,
+    /// Apply selected-state file protections to persisted approvals.
+    pub secure_approvals: bool,
 }
 
 impl Default for SafetyPolicy {
@@ -88,6 +90,7 @@ impl Default for SafetyPolicy {
             approve_fn: None,
             auto_approve: Arc::new(Mutex::new(HashSet::new())),
             approvals_path: None,
+            secure_approvals: false,
         }
     }
 }
@@ -160,7 +163,11 @@ impl SafetyPolicy {
             return;
         }
         if let Some(path) = &self.approvals_path {
-            persist_approval(path, name);
+            if self.secure_approvals {
+                persist_state_approval(path, name);
+            } else {
+                persist_approval(path, name);
+            }
         }
     }
 
@@ -249,6 +256,41 @@ fn persist_approval(path: &Path, name: &str) {
     {
         let _ = writeln!(f, "{name}");
     }
+}
+
+/// Persist an approval without following links out of selected state (ADR-021).
+fn persist_state_approval(path: &Path, name: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
+    {
+        return;
+    }
+    let mut existing = String::new();
+    if file.read_to_string(&mut existing).is_err()
+        || existing.lines().any(|line| line.trim() == name)
+    {
+        return;
+    }
+    let _ = writeln!(file, "{name}");
 }
 
 #[cfg(test)]
@@ -398,6 +440,22 @@ mod tests {
         assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
         policy.remember_always("exec");
         assert_eq!(policy.gate("exec"), Gate::Allow);
+    }
+
+    #[test]
+    fn state_approvals_reject_hardlinked_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let evidence = directory.path().join("evidence");
+        let approvals = directory.path().join("approvals");
+        std::fs::write(&evidence, "unchanged\n").unwrap();
+        std::fs::hard_link(&evidence, &approvals).unwrap();
+        let policy = SafetyPolicy {
+            approvals_path: Some(approvals),
+            secure_approvals: true,
+            ..Default::default()
+        };
+        policy.remember_always("write_file");
+        assert_eq!(std::fs::read_to_string(evidence).unwrap(), "unchanged\n");
     }
 
     #[test]

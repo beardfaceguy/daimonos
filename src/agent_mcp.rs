@@ -172,7 +172,12 @@ pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
     if !cfg.agent.mcp.enabled {
         return Vec::new();
     }
-    let path = crate::paths::expand_tilde(&cfg.agent.mcp.servers_file);
+    let source = match cfg.agent.mcp.servers_file.as_deref() {
+        Some(source) => source,
+        None if cfg.state_authority.is_some() => return Vec::new(),
+        None => "~/.config/zed/settings.json",
+    };
+    let path = crate::paths::expand_tilde(source);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -309,12 +314,13 @@ mod tests {
     async fn connect_is_none_when_file_missing_or_disabled() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.agent.mcp.servers_file = dir.path().join("absent.json").to_string_lossy().to_string();
+        cfg.agent.mcp.servers_file =
+            Some(dir.path().join("absent.json").to_string_lossy().to_string());
         assert!(connect(&cfg, &HashSet::new(), None).await.is_none());
         // Disabled: even an existing file is never read.
         let present = dir.path().join("present.json");
         std::fs::write(&present, "not even json").unwrap();
-        cfg.agent.mcp.servers_file = present.to_string_lossy().to_string();
+        cfg.agent.mcp.servers_file = Some(present.to_string_lossy().to_string());
         cfg.agent.mcp.enabled = false;
         assert!(connect(&cfg, &HashSet::new(), None).await.is_none());
     }

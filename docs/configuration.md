@@ -41,8 +41,8 @@ exits without starting the server. In non-MCP modes daimonos also logs
 
 ## Caller-owned state (`--state-dir`)
 
-Use `--state-dir PATH` to keep Daimonos-owned MCP or native tool-server state
-outside the workspace and HOME. The caller must create a private, writable
+Use `--state-dir PATH` to keep Daimonos-owned frontend state outside the
+workspace and HOME. The caller must create a private, writable
 state directory that does not overlap the workspace after symlink resolution.
 See `StateAuthority` in `src/state_root.rs` and ADR-021 for the boundary.
 
@@ -52,9 +52,17 @@ When selected, automatic HOME config discovery is disabled. Explicit and
 workspace config files remain available.
 
 This option does **not** make the workspace read-only or confine tool reads.
-Agent, chat, ACP, and session frontends reject the option with exit 2 and reason
-`state_mode_unsupported` until WP02 supports their state. Without the option,
-existing state locations remain unchanged.
+Without the option, existing state locations remain unchanged.
+`mcp-config` rejects the option with reason `state_mode_unsupported`.
+
+With selected state, agent frontends do not discover HOME agent environments,
+user instructions, global skills, or Zed MCP settings. Explicit inputs remain
+available. Use `--agent-env` or `DAIMONOS_AGENT_ENV` to select the agent file.
+Pass an explicit output directory with `--dump-prompts`.
+The session-store layout is defined by `StateAuthority::verify_session_store`.
+To avoid HOME writes during startup, selected-state CLI registration checks
+executable presence on `PATH` without running version probes. An executable can
+still fail when a caller invokes it.
 
 ## Agent Environment File
 
@@ -64,7 +72,7 @@ is required; its location is selected in this order:
 
 1. `--agent-env <path>`
 2. `$DAIMONOS_AGENT_ENV`
-3. `~/.config/daimonos/agent.env`
+3. `~/.config/daimonos/agent.env` when `--state-dir` is not selected.
 
 After reading the selected file, non-empty process variables named
 `DAIMONOS_AGENT_*` override values from the file. Empty or whitespace-only

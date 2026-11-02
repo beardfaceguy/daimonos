@@ -153,6 +153,16 @@ fn state_socket_path(
     authority.explicit_destination("--socket", &candidate)
 }
 
+fn exit_for_state_failure(error: state_root::RunFailure) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({"error": {
+            "code": "run_configuration_invalid", "reason": error.code, "message": error.message
+        }})
+    );
+    std::process::exit(error.exit_code);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -162,7 +172,16 @@ async fn main() -> anyhow::Result<()> {
     if cli.state_dir.is_some()
         && !matches!(
             runtime_mode,
-            RuntimeMode::McpStdio | RuntimeMode::McpSocket(_) | RuntimeMode::Daemon
+            RuntimeMode::McpStdio
+                | RuntimeMode::McpSocket(_)
+                | RuntimeMode::Daemon
+                | RuntimeMode::Session
+                | RuntimeMode::SessionDaemon
+                | RuntimeMode::Acp
+                | RuntimeMode::Chat
+                | RuntimeMode::Agent
+                | RuntimeMode::McpAuth
+                | RuntimeMode::Stats
         )
     {
         eprintln!(
@@ -240,6 +259,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
         }
+    }
+    if state_authority.is_some()
+        && cli
+            .dump_prompts
+            .as_ref()
+            .is_some_and(|directory| directory.trim().is_empty())
+    {
+        exit_for_state_failure(state_root::RunFailure::state_unusable(
+            "--dump-prompts requires an explicit output directory with --state-dir",
+        ));
     }
     // Keep legacy behavior, but delay selected-mode writes until all config is validated.
     let mut token_log = if cli.debug_tokens && state_authority.is_none() {
@@ -362,7 +391,106 @@ async fn main() -> anyhow::Result<()> {
     }
     // Validate enabled writer destinations after config validation and before any writer starts.
     if let Some(authority) = &cfg.state_authority {
+        if cli.debug_tokens {
+            let token_path = cfg.logging.resolved_directory().join("token-debug.log");
+            let checked = authority
+                .explicit_destination("--debug-tokens", &token_path)
+                .and_then(|_| {
+                    state_root::verify_unshared_file(&token_path).map_err(|error| {
+                        state_root::RunFailure::state_unusable(format!(
+                            "--debug-tokens {}: {error}",
+                            token_path.display()
+                        ))
+                    })
+                });
+            checked.unwrap_or_else(|error| exit_for_state_failure(error));
+        }
+        if matches!(
+            runtime_mode,
+            RuntimeMode::Agent | RuntimeMode::Chat | RuntimeMode::Acp | RuntimeMode::SessionDaemon
+        ) {
+            if let Some(trace) =
+                std::env::var_os("DAIMONOS_OPENROUTER_TRACE_DIR").filter(|value| !value.is_empty())
+            {
+                let directory = PathBuf::from(trace);
+                let checked = authority
+                    .explicit_destination("DAIMONOS_OPENROUTER_TRACE_DIR", &directory)
+                    .and_then(|path| {
+                        authority.verify_writable_directory("DAIMONOS_OPENROUTER_TRACE_DIR", &path)
+                    });
+                checked.unwrap_or_else(|error| exit_for_state_failure(error));
+            }
+        }
+        if let Some(Command::Agent(args)) = &cli.command {
+            if args.debug_thoughts {
+                let path = args
+                    .debug_thoughts_path
+                    .clone()
+                    .unwrap_or_else(|| cfg.logging.resolved_directory().join("thought-debug.log"));
+                let checked = authority
+                    .explicit_destination("--debug-thoughts-path", &path)
+                    .and_then(|_| {
+                        state_root::verify_unshared_file(&path).map_err(|error| {
+                            state_root::RunFailure::state_unusable(format!(
+                                "--debug-thoughts-path {}: {error}",
+                                path.display()
+                            ))
+                        })
+                    });
+                checked.unwrap_or_else(|error| exit_for_state_failure(error));
+            }
+        }
+        if matches!(
+            runtime_mode,
+            RuntimeMode::SessionDaemon | RuntimeMode::Agent
+        ) {
+            let socket = match &cli.command {
+                Some(Command::SessionDaemon(args)) => args.socket.clone(),
+                _ => None,
+            }
+            .unwrap_or_else(|| cfg.session.resolved_socket_path(&workspace));
+            let checked = authority
+                .explicit_destination("session-daemon --socket", &socket)
+                .and_then(|_| {
+                    let mut lock_name = socket.as_os_str().to_os_string();
+                    lock_name.push(".lock");
+                    let lock = PathBuf::from(lock_name);
+                    state_root::verify_unshared_file(&lock).map_err(|error| {
+                        state_root::RunFailure::state_unusable(format!(
+                            "session socket lock {}: {error}",
+                            lock.display()
+                        ))
+                    })
+                });
+            checked.unwrap_or_else(|error| exit_for_state_failure(error));
+        }
+        let session_kind = match runtime_mode {
+            RuntimeMode::Session | RuntimeMode::SessionDaemon | RuntimeMode::Agent => {
+                Some(state_root::SessionStoreKind::Daemon)
+            }
+            RuntimeMode::Acp => Some(state_root::SessionStoreKind::Acp),
+            RuntimeMode::Chat => Some(state_root::SessionStoreKind::Chat),
+            _ => None,
+        };
+        if let Some(kind) = session_kind {
+            authority
+                .verify_session_store(kind)
+                .unwrap_or_else(|error| exit_for_state_failure(error));
+        }
+        if matches!(
+            runtime_mode,
+            RuntimeMode::SessionDaemon | RuntimeMode::Acp | RuntimeMode::Chat | RuntimeMode::Agent
+        ) {
+            authority
+                .verify_approvals()
+                .unwrap_or_else(|error| exit_for_state_failure(error));
+        }
         let mut directories: Vec<(&str, PathBuf)> = Vec::new();
+        if !cfg.acp.mcp.oauth_servers.is_empty() {
+            if let Some(directory) = &cfg.acp.mcp.oauth_state_root {
+                directories.push(("oauth", directory.clone()));
+            }
+        }
         if cfg.logging.enabled {
             directories.push(("logging.directory", cfg.logging.resolved_directory()));
         }
@@ -413,7 +541,8 @@ async fn main() -> anyhow::Result<()> {
     }
     if cli.debug_tokens {
         if let Some(authority) = &cfg.state_authority {
-            let directory = authority.resolve(state_root::StateKey::Logs, None)?;
+            let directory = cfg.logging.resolved_directory();
+            authority.explicit_destination("--debug-tokens", &directory)?;
             std::fs::create_dir_all(&directory)?;
             token_log = Some(directory.join("token-debug.log"));
         }
@@ -431,16 +560,22 @@ async fn main() -> anyhow::Result<()> {
         | None => false,
     };
     if uses_agent_prompt {
-        cfg.prompts.additional_agent_instructions =
-            match prompts::load_agent_instructions(cli.agent_instructions.as_deref(), &workspace)
-                .await
-            {
-                Ok(instructions) => instructions,
-                Err(e) => {
-                    eprintln!("agent instructions: {e}");
-                    std::process::exit(2);
-                }
-            };
+        cfg.prompts.additional_agent_instructions = match if cfg.state_authority.is_some() {
+            prompts::load_agent_instructions_with_user_config(
+                cli.agent_instructions.as_deref(),
+                &workspace,
+                false,
+            )
+            .await
+        } else {
+            prompts::load_agent_instructions(cli.agent_instructions.as_deref(), &workspace).await
+        } {
+            Ok(instructions) => instructions,
+            Err(e) => {
+                eprintln!("agent instructions: {e}");
+                std::process::exit(2);
+            }
+        };
     }
     let mut observability_config = cfg.observability.clone();
     let observability_ignored = observability_config.enabled && !uses_agent_prompt;
@@ -511,6 +646,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let cfg = Arc::new(cfg);
     let explicit_config_path = cli.config.clone();
+    let explicit_agent_instructions = cli.agent_instructions.clone();
     // Agent frontends skip workspace service setup; tool-serving modes share
     // the lower dispatcher. All paths rendezvous below for ordered telemetry
     // teardown before the logging guard is dropped.
@@ -522,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&cfg),
                 token_log,
                 explicit_config_path,
+                explicit_agent_instructions,
             )
             .await
         }
@@ -661,7 +798,7 @@ async fn run_tool_service(
     // Initialize analytics store for session tracking
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
-        match analytics::AnalyticsStore::new(&db_path, cfg.analytics.retention_days) {
+        match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
             Ok(store) => {
                 if !mcp_quiet_stderr {
                     eprintln!("analytics: enabled ({})", db_path.display());

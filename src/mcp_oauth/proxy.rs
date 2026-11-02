@@ -1,5 +1,5 @@
 //! In-process loopback proxy: the SDK never sees a bearer token.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,8 +17,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use super::{
-    canonical_endpoint, default_store_dir, read_credential, remove_credential, write_credential,
-    Credential,
+    canonical_endpoint, default_store_dir, read_credential, remove_credential,
+    validate_selected_credential, write_credential, Credential,
 };
 
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
@@ -296,8 +296,19 @@ fn shared_refresh_lock(endpoint: &str, profile: &str) -> Arc<Mutex<()>> {
 
 /// Each bridge gets its own random capability and listener. The capability is
 /// never exposed in ACP or tool schemas; dropping the bridge closes the proxy.
-pub async fn start_proxy(endpoint: &str, profile: &str) -> Result<OAuthProxy, String> {
-    start_proxy_with_root(endpoint, profile, default_store_dir()?).await
+pub async fn start_proxy(
+    endpoint: &str,
+    profile: &str,
+    state_root: Option<&Path>,
+) -> Result<OAuthProxy, String> {
+    let root = match state_root {
+        Some(root) => {
+            validate_selected_credential(root, endpoint, profile)?;
+            root.to_path_buf()
+        }
+        None => default_store_dir()?,
+    };
+    start_proxy_with_root(endpoint, profile, root).await
 }
 
 async fn start_proxy_with_root(
@@ -430,7 +441,7 @@ mod integration_tests {
             },
         )
         .unwrap();
-        let proxy = start_proxy_with_root(&endpoint, "p", store).await.unwrap();
+        let proxy = start_proxy(&endpoint, "p", Some(&store)).await.unwrap();
         let http = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()

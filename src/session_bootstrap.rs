@@ -22,6 +22,9 @@ const INSTANCE_METADATA_MAX_BYTES: u64 = 16 * 1024;
 pub struct BootstrapOptions<'a> {
     pub workspace: &'a Path,
     pub config_path: Option<&'a Path>,
+    pub state_dir: Option<&'a Path>,
+    pub agent_instructions: Option<&'a Path>,
+    pub debug_tokens: bool,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -168,6 +171,17 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--config"));
         args.push(path.as_os_str().to_owned());
     }
+    if let Some(path) = options.state_dir {
+        args.push(OsString::from("--state-dir"));
+        args.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = options.agent_instructions {
+        args.push(OsString::from("--agent-instructions"));
+        args.push(path.as_os_str().to_owned());
+    }
+    if options.debug_tokens {
+        args.push(OsString::from("--debug-tokens"));
+    }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
     args.push(options.socket_path.as_os_str().to_owned());
@@ -199,6 +213,21 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         }
         digest.update([0_u8]);
     }
+    if let Some(path) = options.state_dir {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        digest.update(b"selected-state\0");
+        digest.update(canonical.as_os_str().as_bytes());
+        digest.update([0_u8]);
+    }
+    if let Some(path) = options.agent_instructions {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        digest.update(b"agent-instructions\0");
+        digest.update(canonical.as_os_str().as_bytes());
+        digest.update([0_u8]);
+    }
+    if options.debug_tokens {
+        digest.update(b"debug-tokens\0");
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
@@ -207,7 +236,13 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
 }
 
 fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIdentity> {
-    if options.config_path.is_none() && options.provider.is_none() && options.agent_env.is_none() {
+    if options.config_path.is_none()
+        && options.provider.is_none()
+        && options.agent_env.is_none()
+        && options.state_dir.is_none()
+        && options.agent_instructions.is_none()
+        && !options.debug_tokens
+    {
         return Ok(LaunchIdentity::NotRequested);
     }
     let Some(value) = instance_metadata(options.socket_path)? else {
@@ -284,6 +319,9 @@ mod tests {
         BootstrapOptions {
             workspace,
             config_path: Some(config),
+            state_dir: None,
+            agent_instructions: None,
+            debug_tokens: false,
             socket_path: socket,
             provider: Some("openrouter"),
             model: Some("test/model"),
@@ -322,6 +360,32 @@ mod tests {
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn daemon_arguments_and_identity_include_selected_state() {
+        let mut first = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        first.state_dir = Some(Path::new("/state/one"));
+        let args = daemon_args(&first);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--state-dir", "/state/one"]));
+        let mut second = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        second.state_dir = Some(Path::new("/state/two"));
+        assert_ne!(
+            bootstrap_fingerprint(&first),
+            bootstrap_fingerprint(&second)
         );
     }
 

@@ -95,6 +95,13 @@ pub fn credential_path(root: &Path, url: &str, profile: &str) -> Result<PathBuf,
     Ok(root.join(format!("{}.json", hex::encode(digest))))
 }
 
+/// Reject linked credentials in the caller-selected store (ADR-021).
+fn validate_selected_credential(root: &Path, url: &str, profile: &str) -> Result<(), String> {
+    let path = credential_path(root, url, profile)?;
+    crate::state_root::verify_unshared_file(&path)
+        .map_err(|_| "selected state OAuth credential must not be a link".to_string())
+}
+
 pub fn default_store_dir() -> Result<PathBuf, String> {
     let home = crate::paths::home_dir().ok_or("HOME required for OAuth credential storage")?;
     let parent = home.join(".blue_rose");
@@ -235,7 +242,14 @@ pub async fn run_command(
     let policy = cfg.oauth_servers.get(server_name).ok_or_else(|| {
         anyhow::anyhow!("no OAuth policy configured for MCP server '{server_name}'")
     })?;
-    let root = default_store_dir().map_err(anyhow::Error::msg)?;
+    let root = match &cfg.oauth_state_root {
+        Some(root) => root.clone(),
+        None => default_store_dir().map_err(anyhow::Error::msg)?,
+    };
+    if cfg.oauth_state_root.is_some() {
+        validate_selected_credential(&root, &policy.url, &policy.profile)
+            .map_err(anyhow::Error::msg)?;
+    }
     match command {
         crate::cli::McpAuthCommand::Login { .. } => {
             login(&root, server_name, policy)

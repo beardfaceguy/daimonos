@@ -261,7 +261,9 @@ pub async fn run_chat(
     // `None` disables persistence (tests). A resumed session keeps its id;
     // a fresh one mints a uuid.
     let store = sessions_dir.map(|directory| {
-        SessionStore::new(directory).with_busy_timeout(session_store_busy_timeout)
+        SessionStore::new(directory)
+            .with_private_state(cfg.state_authority.is_some())
+            .with_busy_timeout(session_store_busy_timeout)
     });
     let session_id = resume
         .clone()

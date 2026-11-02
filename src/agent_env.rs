@@ -150,6 +150,14 @@ impl AgentEnv {
         Self::load_with_process_vars(flag, &process_vars)
     }
 
+    /// Load only an explicitly selected agent env file under ADR-021.
+    pub fn load_explicit(flag: Option<PathBuf>) -> Result<AgentEnv, String> {
+        if flag.is_none() && std::env::var_os("DAIMONOS_AGENT_ENV").is_none() {
+            return Err("set --agent-env or DAIMONOS_AGENT_ENV when using --state-dir".to_string());
+        }
+        Self::load(flag)
+    }
+
     /// Injectable load seam used by tests to verify real file + process
     /// precedence without mutating the process-global environment.
     fn load_with_process_vars(
@@ -344,12 +352,29 @@ impl AgentEnv {
         &self,
         approve_fn: Option<crate::safety::ApproveFn>,
     ) -> crate::safety::SafetyPolicy {
+        self.build_safety_policy(approve_fn, Self::approvals_path(), false)
+    }
+
+    /// Build the policy with the caller-selected approvals file (ADR-021).
+    pub(crate) fn to_safety_policy_with_approvals(
+        &self,
+        approve_fn: Option<crate::safety::ApproveFn>,
+        approvals_path: Option<PathBuf>,
+    ) -> crate::safety::SafetyPolicy {
+        self.build_safety_policy(approve_fn, approvals_path, true)
+    }
+
+    fn build_safety_policy(
+        &self,
+        approve_fn: Option<crate::safety::ApproveFn>,
+        approvals_path: Option<PathBuf>,
+        secure_approvals: bool,
+    ) -> crate::safety::SafetyPolicy {
         let approval_mode = match self.approval_mode.as_str() {
             "auto" => crate::safety::ApprovalMode::Auto,
             "paranoid" => crate::safety::ApprovalMode::Paranoid,
             _ => crate::safety::ApprovalMode::Interactive,
         };
-        let approvals_path = Self::approvals_path();
         let seed = approvals_path
             .as_ref()
             .map(|p| crate::safety::load_approvals(p))
@@ -361,6 +386,7 @@ impl AgentEnv {
             approve_fn,
             auto_approve: std::sync::Arc::new(std::sync::Mutex::new(seed)),
             approvals_path,
+            secure_approvals,
         }
     }
 }
@@ -1208,6 +1234,24 @@ mod tests {
             Some("anthropic/claude-haiku-4.5")
         );
         assert_eq!(p.summary_prompt.as_deref(), Some("Summarize tersely."));
+    }
+
+    #[test]
+    fn selected_approval_path_controls_seed_and_persistence() {
+        use crate::safety::Gate;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("approvals");
+        std::fs::write(&path, "write_file\n").unwrap();
+        let mut environment = load_str(&base()).unwrap();
+        environment.approval_mode = "interactive".into();
+        environment.allowed_commands.clear();
+        let policy = environment.to_safety_policy_with_approvals(None, Some(path.clone()));
+        assert_eq!(policy.gate("write_file"), Gate::Allow);
+        policy.remember_always("exec");
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .any(|line| line == "exec"));
     }
 
     #[test]
