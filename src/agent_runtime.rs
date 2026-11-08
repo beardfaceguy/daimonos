@@ -321,7 +321,24 @@ pub async fn run_agent(
     }
 
     if mode == tui::AgentMode::Interactive {
+        let bootstrap_agent_env = if cfg.filesystem_authority.is_some() {
+            Some(agent_env.as_deref().or(cfg.caller_agent_env.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!("agent config: set --agent-env or DAIMONOS_AGENT_ENV with --confine-paths")
+            })?)
+        } else {
+            agent_env.as_deref()
+        };
         let socket_path = cfg.session.resolved_socket_path(workspace);
+        let confine_reference = cfg
+            .filesystem_authority
+            .as_ref()
+            .map(|authority| authority.bootstrap_reference());
+        let confine_identity = cfg
+            .filesystem_authority
+            .as_ref()
+            .map(|authority| authority.bootstrap_identity())
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
         let bootstrap = crate::session_bootstrap::connect_or_spawn(
             &crate::session_bootstrap::BootstrapOptions {
                 workspace,
@@ -331,11 +348,13 @@ pub async fn run_agent(
                     .as_ref()
                     .map(|authority| authority.root()),
                 agent_instructions: explicit_agent_instructions.as_deref(),
+                confine_reference: confine_reference.as_deref(),
+                confine_identity: confine_identity.as_deref(),
                 debug_tokens: token_log.is_some(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),
-                agent_env: agent_env.as_deref(),
+                agent_env: bootstrap_agent_env,
                 max_frame_bytes: cfg.session.max_frame_bytes,
                 timeout: std::time::Duration::from_secs(cfg.session.bootstrap_timeout_secs),
                 retry_interval: std::time::Duration::from_millis(
@@ -349,7 +368,7 @@ pub async fn run_agent(
             | crate::session_bootstrap::LaunchIdentity::Matched => {}
             crate::session_bootstrap::LaunchIdentity::Mismatched => {
                 anyhow::bail!(
-                    "explicit config/provider/agent-env selection differs from the running \
+                    "explicit config/provider/agent-env/state/confinement selection differs from the running \
                      session daemon; restart the daemon with the requested selection"
                 );
             }
@@ -357,7 +376,7 @@ pub async fn run_agent(
                 anyhow::bail!(
                     "the running session daemon does not publish a comparable launch identity; \
                      restart it with this daimonos version before applying explicit \
-                     config/provider/agent-env selection"
+                     config/provider/agent-env/state/confinement selection"
                 );
             }
         }
@@ -431,7 +450,7 @@ pub async fn run_agent(
     } else {
         task
     };
-    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -510,7 +529,7 @@ pub async fn run_chat(
         return Ok(());
     }
 
-    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let model_explicit = model.is_some();
@@ -557,7 +576,7 @@ pub async fn run_acp(
         provider,
         agent_env,
     } = args;
-    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -654,7 +673,7 @@ pub async fn run_session_daemon(
         remote_allow_always,
         remote_trust_proxy_headers,
     } = args;
-    let agent = load_agent_env(agent_env, cfg.state_authority.is_some())?;
+    let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
@@ -1092,9 +1111,18 @@ fn remote_capability_name(capability: &crate::session_protocol::ClientCapability
 
 fn load_agent_env(
     path: Option<PathBuf>,
-    selected_state: bool,
+    cfg: &config::Config,
 ) -> anyhow::Result<agent_env::AgentEnv> {
-    let loaded = if selected_state {
+    let loaded = if cfg.filesystem_authority.is_some() {
+        let selected = path
+            .or_else(|| cfg.caller_agent_env.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent config: set --agent-env or DAIMONOS_AGENT_ENV with --confine-paths"
+                )
+            })?;
+        agent_env::AgentEnv::load(Some(selected))
+    } else if cfg.state_authority.is_some() {
         agent_env::AgentEnv::load_explicit(path)
     } else {
         agent_env::AgentEnv::load(path)
@@ -1107,6 +1135,19 @@ fn with_skill_dir(
     agent: &agent_env::AgentEnv,
 ) -> anyhow::Result<Arc<config::Config>> {
     let directory = if let Some(directory) = &agent.skill_dir {
+        if let Some(authority) = &cfg.filesystem_authority {
+            let requested = if directory.is_absolute() {
+                directory.clone()
+            } else {
+                std::env::current_dir()?.join(directory)
+            };
+            let entry = authority.open_read(&requested).map_err(|error| {
+                anyhow::anyhow!("{}: DAIMONOS_SKILL_DIR: {}", error.code, error.message)
+            })?;
+            if !entry.metadata()?.is_dir() {
+                anyhow::bail!("DAIMONOS_SKILL_DIR is not a directory");
+            }
+        }
         Some(directory.clone())
     } else if let Some(authority) = &cfg.state_authority {
         let sessions = authority.resolve(crate::state_root::StateKey::Sessions, None)?;

@@ -53,7 +53,8 @@ pub async fn build_tool_services(
         &cfg.index,
         !quiet_stderr,
     ));
-    let background_work = index::should_warm_index(workspace, &cfg.index, eager_index);
+    let background_work = cfg.filesystem_authority.is_none()
+        && index::should_warm_index(workspace, &cfg.index, eager_index);
     if background_work {
         index.spawn_reindex();
     }

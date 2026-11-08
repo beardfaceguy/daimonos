@@ -78,6 +78,29 @@ impl GitReadConfig {
     }
 }
 
+/// Limits for the confined filesystem authority (ADR-022).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ToolLimitsConfig {
+    pub max_symlinks: u32,
+    pub max_symlink_target_bytes: usize,
+}
+
+impl Default for ToolLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_symlinks: 40,
+            max_symlink_target_bytes: 65536,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReviewerConfig {
+    pub tool_limits: ToolLimitsConfig,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
@@ -112,8 +135,29 @@ pub struct Config {
     pub kgl: KglConfig,
     pub coordination: CoordinationConfig,
     pub prompts: PromptsConfig,
+    pub reviewer: ReviewerConfig,
+    /// Whether the caller explicitly selected the configuration file.
+    #[serde(skip)]
+    pub explicit_control_paths: bool,
+    /// Agent-env path inherited from the caller before workspace env loading.
+    #[serde(skip)]
+    pub caller_agent_env: Option<std::path::PathBuf>,
+    /// Pinned at startup and shared across sessions (ADR-022).
+    #[serde(skip)]
+    pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
+}
+
+impl Config {
+    pub fn fs_limits(&self) -> crate::path_policy::FsLimits {
+        crate::path_policy::FsLimits {
+            max_walk_depth: Some(self.index.max_depth),
+            max_walk_entries: self.index.max_walk_entries,
+            max_symlinks: self.reviewer.tool_limits.max_symlinks,
+            max_symlink_target_bytes: self.reviewer.tool_limits.max_symlink_target_bytes,
+        }
+    }
 }
 
 /// `[agent]` — settings for daimonos's own agent frontends.
@@ -130,6 +174,9 @@ pub struct AgentModeConfig {
 pub struct AgentSkillsConfig {
     #[serde(skip)]
     pub global_dir: Option<std::path::PathBuf>,
+    /// Fixed filesystem authority for skill discovery (ADR-022).
+    #[serde(skip)]
+    pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
     pub max_skills: usize,
     pub max_file_bytes: u64,
     pub catalog_max_bytes: usize,
@@ -140,6 +187,7 @@ impl Default for AgentSkillsConfig {
     fn default() -> Self {
         Self {
             global_dir: None,
+            filesystem_authority: None,
             max_skills: 128,
             max_file_bytes: 100 * 1024,
             catalog_max_bytes: 16 * 1024,
@@ -1232,6 +1280,9 @@ pub struct AcpMcpConfig {
     /// Caller-selected OAuth credential directory (ADR-021).
     #[serde(skip)]
     pub oauth_state_root: Option<std::path::PathBuf>,
+    /// Refuse local stdio MCP servers under the filesystem policy (ADR-022).
+    #[serde(skip)]
+    pub confined: bool,
 }
 
 impl Default for AcpMcpConfig {
@@ -1252,6 +1303,7 @@ impl Default for AcpMcpConfig {
             zed_settings_path: None,
             oauth_servers: HashMap::new(),
             oauth_state_root: None,
+            confined: false,
         }
     }
 }
@@ -2359,6 +2411,59 @@ pub(crate) fn load_with_user_config(
         eprintln!("config: using built-in defaults");
     }
     Config::default()
+}
+
+/// Load explicit caller configuration or an authorized workspace config (ADR-022).
+pub(crate) fn load_confined(
+    explicit: Option<&Path>,
+    workspace: &Path,
+    quiet_diagnostic_stderr: bool,
+    authority: &crate::path_policy::FilesystemAuthority,
+) -> Result<Config, String> {
+    use std::io::Read;
+    let parse = |path: &Path, content: &str| match toml::from_str::<Config>(content) {
+        Ok(cfg) => {
+            if !quiet_diagnostic_stderr {
+                eprintln!("config: loaded from {:?}", path);
+            }
+            Some(cfg)
+        }
+        Err(error) => {
+            eprintln!("config: parse error in {:?}: {}", path, error);
+            None
+        }
+    };
+    if let Some(path) = explicit {
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            format!(
+                "cannot read explicit config {}: {}",
+                path.display(),
+                error.kind()
+            )
+        })?;
+        let mut cfg = toml::from_str::<Config>(&content).map_err(|error| {
+            format!(
+                "invalid explicit config {}: {}",
+                path.display(),
+                error.message()
+            )
+        })?;
+        cfg.explicit_control_paths = true;
+        return Ok(cfg);
+    }
+    let workspace_path = workspace.join("daimonos.toml");
+    if let Ok(authorized) = authority.open_read(&workspace_path) {
+        let mut content = String::new();
+        if authorized.into_file().read_to_string(&mut content).is_ok() {
+            if let Some(cfg) = parse(&workspace_path, &content) {
+                return Ok(cfg);
+            }
+        }
+    }
+    if !quiet_diagnostic_stderr {
+        eprintln!("config: using built-in defaults");
+    }
+    Ok(Config::default())
 }
 
 /// Ordered config-file search candidates, matching `load`'s discovery order:

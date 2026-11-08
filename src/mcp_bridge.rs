@@ -593,6 +593,23 @@ impl McpBridge {
         if !cfg.enabled {
             return bridge;
         }
+        let specs = if cfg.confined {
+            specs
+                .into_iter()
+                .filter_map(|spec| match spec {
+                    ServerSpec::Stdio { name, .. } => {
+                        bridge.had_connection_failures = true;
+                        bridge
+                            .diagnostics
+                            .push(format!("local MCP server {name} refused by confinement"));
+                        None
+                    }
+                    remote => Some(remote),
+                })
+                .collect()
+        } else {
+            specs
+        };
 
         let concurrency = cfg.max_concurrent_connects.min(cfg.max_servers).max(1);
         let current_executable = if self_connect.rejects() {

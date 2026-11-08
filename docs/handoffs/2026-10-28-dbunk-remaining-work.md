@@ -287,7 +287,7 @@ Each package includes an opt-out regression. Existing default behavior remains u
 
 ### WP03 — C: confined paths and safe tool eligibility
 
-- Outcome: root-confined reads and walks reject escapes before accessing content. Relative paths use the fixed root after `set_cwd`.
+- Outcome: root-confined reads and walks reject escapes before accessing content. Relative paths use the current working directory after `set_cwd`. The confinement root remains fixed (ADR-022, amended 2026-11-03).
 - Own: `src/path_policy.rs` (new), `tests/test_path_confinement.py` (new). I wires `Session::resolve_path`, native operations, index walks, dispatch, and git consumers.
 - Reuse existing git confinement checks as evidence, not as proof that other tools are confined. Review unsafe raw execution and composite eligibility explicitly.
 - Failure/default: name the refused argument. Skip/report escaping walk entries. Allow in-root links unless independent no-follow is enabled. Refuse unconfineable allowlisted local tools at startup.

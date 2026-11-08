@@ -101,6 +101,10 @@ fn executable_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
 /// set is assembled; MCP, agent, and ACP all call it, so they can never drift
 /// out of sync on which tools exist.
 pub async fn register_builtin_plugins(cfg: &Config, registry: &ToolRegistry, quiet_stderr: bool) {
+    // ADR-022: opaque local plugins cannot be confined or probed safely.
+    if cfg.filesystem_authority.is_some() {
+        return;
+    }
     // Config-driven / generic-CLI plugins first (x07, user-declared tools).
     crate::config::register_tools(cfg, registry, quiet_stderr).await;
 

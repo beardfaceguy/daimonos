@@ -1651,8 +1651,9 @@ fn build_agent_config(
     // `[active_model]` when `DAIMONOS_AGENT_MODELS` is unset — so failover is
     // naturally opt-in: a single-entry chain has no successor to advance to.
     failover_models: Vec<String>,
+    confined: bool,
 ) -> AgentConfig {
-    let tools = agent_tools(workspace, descriptions, &bridge);
+    let tools = agent_tools(workspace, descriptions, &bridge, confined);
     let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
     AgentConfig {
         system: Some(system_prompt),
@@ -1723,15 +1724,17 @@ fn agent_tools(
     workspace: &Path,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     bridge: &McpBridge,
+    confined: bool,
 ) -> Vec<ToolSchema> {
-    let mut tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
-        .into_iter()
-        .map(|s| ToolSchema {
-            name: s.name,
-            description: s.description,
-            input_schema: s.input_schema,
-        })
-        .collect();
+    let mut tools: Vec<ToolSchema> =
+        tool_facade::active_schemas_for_policy(workspace, descriptions, confined)
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s.name,
+                description: s.description,
+                input_schema: s.input_schema,
+            })
+            .collect();
     tools.extend(bridge.tools().iter().cloned());
     tools
 }
@@ -1761,6 +1764,14 @@ fn to_server_specs(servers: Vec<McpServer>) -> Vec<ServerSpec> {
 
 /// Resolve MCP servers in precedence order: the ACP harness first, then its
 /// Zed settings fallback, then Daimonos's configured shared servers file.
+fn unconfineable_stdio<'a>(specs: &'a [ServerSpec], cfg: &Config) -> Option<&'a str> {
+    cfg.filesystem_authority.as_ref()?;
+    specs.iter().find_map(|spec| match spec {
+        ServerSpec::Stdio { name, .. } => Some(name.as_str()),
+        ServerSpec::Http { .. } => None,
+    })
+}
+
 async fn resolve_mcp_specs(
     forwarded: Vec<McpServer>,
     cfg: &Config,
@@ -1777,8 +1788,27 @@ async fn resolve_mcp_specs(
     {
         return specs;
     }
-    if cfg.state_authority.is_none() || cfg.acp.mcp.zed_settings_path.is_some() {
-        match crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()) {
+    if (cfg.state_authority.is_none() && cfg.filesystem_authority.is_none())
+        || cfg.acp.mcp.zed_settings_path.is_some()
+    {
+        let specs = match (
+            &cfg.filesystem_authority,
+            cfg.acp.mcp.zed_settings_path.as_deref(),
+        ) {
+            (Some(authority), Some(path)) if !cfg.explicit_control_paths => {
+                crate::zed_config::context_server_specs_confined(path, authority)
+            }
+            _ => crate::zed_config::context_server_specs(cfg.acp.mcp.zed_settings_path.as_deref()),
+        };
+        match specs {
+            Ok(fallback)
+                if !fallback.is_empty()
+                    && cfg.filesystem_authority.is_some()
+                    && !cfg.explicit_control_paths =>
+            {
+                tracing::warn!(target: "daimonos::acp", "workspace MCP servers require an explicitly selected config under confinement");
+                return Vec::new();
+            }
             Ok(fallback) if !fallback.is_empty() => {
                 tracing::warn!(target: "daimonos::acp", event = "mcp_forward_empty_fallback",
                     recovered = fallback.len(),
@@ -2421,10 +2451,14 @@ async fn build_session_handle(
     // names are gathered first so they always win a name collision (ADR-003).
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
-        tool_facade::active_schemas(&session_workspace, descriptions)
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        tool_facade::active_schemas_for_policy(
+            &session_workspace,
+            descriptions,
+            cfg.filesystem_authority.is_some(),
+        )
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
     let bridge = Arc::new(
         McpBridge::build_with_pool(
             mcp_specs.clone(),
@@ -2472,6 +2506,7 @@ async fn build_session_handle(
         Arc::clone(&bridge),
         Arc::clone(&bridge_slot),
         state.models.clone(),
+        cfg.filesystem_authority.is_some(),
     );
     let acp_session_key = session_id.to_string();
     let tool_session = build_acp_tool_session(
@@ -2610,10 +2645,14 @@ async fn refresh_live_mcp_bridge(
     let mut agent_session = handle.core.session.lock().await;
     let descriptions = &cfg.prompts.resolved_tool_descriptions;
     let native_tool_names: std::collections::HashSet<String> =
-        tool_facade::active_schemas(&handle.core.cwd, descriptions)
-            .into_iter()
-            .map(|schema| schema.name)
-            .collect();
+        tool_facade::active_schemas_for_policy(
+            &handle.core.cwd,
+            descriptions,
+            cfg.filesystem_authority.is_some(),
+        )
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect();
     let new_bridge = Arc::new(
         McpBridge::build_with_pool(
             mcp_specs.clone(),
@@ -2625,7 +2664,12 @@ async fn refresh_live_mcp_bridge(
         )
         .await,
     );
-    agent_session.set_tools(agent_tools(&handle.core.cwd, descriptions, &new_bridge));
+    agent_session.set_tools(agent_tools(
+        &handle.core.cwd,
+        descriptions,
+        &new_bridge,
+        cfg.filesystem_authority.is_some(),
+    ));
     let old_bridge = {
         let mut bridge = handle.bridge.write().await;
         std::mem::replace(&mut *bridge, new_bridge)
@@ -3161,6 +3205,14 @@ fn build_agent_with_state(
                             state.client_is_zed.load(Ordering::Acquire),
                         )
                         .await;
+                        if let Some(name) = unconfineable_stdio(&mcp_specs, &cfg) {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(format!(
+                                    "{}: local MCP server {name} cannot be confined",
+                                    crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED
+                                )),
+                            );
+                        }
                         let mcp_server_count = mcp_specs.len();
                         // Use the client-provided project root, not the CLI's
                         // own cwd — Zed passes the actual project it wants this
@@ -3295,6 +3347,14 @@ fn build_agent_with_state(
                             state.client_is_zed.load(Ordering::Acquire),
                         )
                         .await;
+                        if let Some(name) = unconfineable_stdio(&mcp_specs, &cfg) {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(format!(
+                                    "{}: local MCP server {name} cannot be confined",
+                                    crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED
+                                )),
+                            );
+                        }
                         let session_workspace = if req.cwd.as_os_str().is_empty() {
                             workspace_fallback
                         } else {
@@ -4432,6 +4492,29 @@ mod tests {
         assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "fwd"));
     }
     use std::time::Duration;
+
+    #[test]
+    fn confined_forwarding_allows_http_and_rejects_stdio() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(directory.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let remote = ServerSpec::Http {
+            name: "remote".into(),
+            url: "https://example.com/mcp".into(),
+            headers: HashMap::new(),
+        };
+        assert!(unconfineable_stdio(&[remote], &cfg).is_none());
+        let local = ServerSpec::Stdio {
+            name: "local".into(),
+            command: "tool".into(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        assert_eq!(unconfineable_stdio(&[local], &cfg), Some("local"));
+    }
 
     // --- MockProvider (mirrors agent.rs/agent_cmd.rs test doubles) ---
 

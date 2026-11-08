@@ -140,7 +140,20 @@ pub fn run(args: SessionArgs, config: &crate::config::Config) -> anyhow::Result<
             let format = SessionFormat::from_path(&file)?;
             use std::io::Read;
             let mut bytes = Vec::new();
-            std::fs::File::open(&file)?
+            let input = if let Some(authority) = &config.filesystem_authority {
+                let requested = if file.is_absolute() {
+                    file.clone()
+                } else {
+                    std::env::current_dir()?.join(&file)
+                };
+                authority
+                    .open_read(&requested)
+                    .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?
+                    .into_file()
+            } else {
+                std::fs::File::open(&file)?
+            };
+            input
                 .take(config.session.session_archive_max_bytes as u64 + 1)
                 .read_to_end(&mut bytes)?;
             anyhow::ensure!(

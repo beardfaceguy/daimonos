@@ -24,6 +24,8 @@ pub struct BootstrapOptions<'a> {
     pub config_path: Option<&'a Path>,
     pub state_dir: Option<&'a Path>,
     pub agent_instructions: Option<&'a Path>,
+    pub confine_reference: Option<&'a Path>,
+    pub confine_identity: Option<&'a str>,
     pub debug_tokens: bool,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
@@ -182,6 +184,11 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if options.debug_tokens {
         args.push(OsString::from("--debug-tokens"));
     }
+    if let Some(reference) = options.confine_reference {
+        args.push(OsString::from("--confine-paths"));
+        args.push(OsString::from("--confine-root"));
+        args.push(reference.as_os_str().to_owned());
+    }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
     args.push(options.socket_path.as_os_str().to_owned());
@@ -228,6 +235,11 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.debug_tokens {
         digest.update(b"debug-tokens\0");
     }
+    if let Some(identity) = options.confine_identity {
+        digest.update(b"confined-root\0");
+        digest.update(identity.as_bytes());
+        digest.update([0_u8]);
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
@@ -242,6 +254,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.state_dir.is_none()
         && options.agent_instructions.is_none()
         && !options.debug_tokens
+        && options.confine_identity.is_none()
     {
         return Ok(LaunchIdentity::NotRequested);
     }
@@ -321,6 +334,8 @@ mod tests {
             config_path: Some(config),
             state_dir: None,
             agent_instructions: None,
+            confine_reference: None,
+            confine_identity: None,
             debug_tokens: false,
             socket_path: socket,
             provider: Some("openrouter"),

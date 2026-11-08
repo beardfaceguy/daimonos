@@ -37,6 +37,12 @@ skip_extensions = [
   "ttf", "otf", "woff", "woff2", "eot",
 ]
 
+[reviewer.tool_limits]
+# Maximum symlinks followed while resolving one confined path.
+max_symlinks = 40
+# Maximum bytes in one symlink target.
+max_symlink_target_bytes = 65536
+
 [search]
 # Default max results for grep when not specified by caller
 default_grep_max = 100

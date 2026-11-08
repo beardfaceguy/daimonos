@@ -64,6 +64,40 @@ To avoid HOME writes during startup, selected-state CLI registration checks
 executable presence on `PATH` without running version probes. An executable can
 still fail when a caller invokes it.
 
+## Confined filesystem access
+
+`--confine-paths` fixes local filesystem reads to the workspace.
+`--confine-root PATH` selects a different root and also enables confinement.
+The root remains fixed when
+the logical working directory changes or an interactive agent starts a daemon.
+The Linux implementation requires `openat2` and procfs. It fails closed when
+those facilities are unavailable. Other platforms do not yet have an adapter.
+
+Confinement governs filesystem access only. The raw native protocol opcode
+`env_get` (17) stays available and can return a variable from the Daimonos
+process environment. No MCP or agent tool exposes this opcode. Only the native
+protocol client, which already supplies the process environment, can send it.
+See ADR-022 and `FilesystemAuthority` in `src/path_policy.rs`.
+
+Confined `read_file`, `ls`, `search`, `diff_files`, and skill reads use the
+fixed authority. Native `stat` and `glob` use it too. Automatic walks skip
+unsafe entries and report aggregate counts. The index walk limits and
+`reviewer.tool_limits` in `daimonos.default.toml` bound traversal.
+
+Tools without a confined adapter are not advertised and cannot run. Explicit
+local CLI tools and local stdio MCP servers are refused. `--dump-prompts` and
+`session export --output` are refused because their writes are not mediated.
+Explicitly forwarded HTTP MCP
+servers remain a separate trust boundary. This is not a sandbox for
+external services or a read-only workspace; WP04 covers the read-only gate.
+
+Workspace-discovered control files are read through the authority. Explicit
+caller-selected control files remain separate inputs. OAuth credentials, request
+tracing, and `--debug-thoughts` require `--state-dir` in confined mode. Global
+ignore files outside the root are not read. Confined glob patterns with a parent
+component after a wildcard are refused. Procfs symlink stat does not expose
+target text.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,
@@ -72,7 +106,7 @@ is required; its location is selected in this order:
 
 1. `--agent-env <path>`
 2. `$DAIMONOS_AGENT_ENV`
-3. `~/.config/daimonos/agent.env` when `--state-dir` is not selected.
+3. `~/.config/daimonos/agent.env` when neither `--state-dir` nor confinement (`--confine-paths` or `--confine-root`) is selected.
 
 After reading the selected file, non-empty process variables named
 `DAIMONOS_AGENT_*` override values from the file. Empty or whitespace-only

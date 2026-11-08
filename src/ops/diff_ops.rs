@@ -13,22 +13,16 @@ pub async fn diff(session: &Session, op: &Op) -> Response {
         None => return Response::err(3, "diff requires path in 'p'"),
     };
 
-    let content_a = match tokio::fs::read_to_string(&path_a).await {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Response::err(1, &format!("not found: {}", path_a.display()));
-        }
-        Err(e) => return Response::err(4, &format!("read: {e}")),
+    let content_a = match read_for_diff(session, &path_a, op.p.as_deref().unwrap_or("")).await {
+        Ok(content) => content,
+        Err(response) => return response,
     };
 
     let content_b = if let Some(q) = &op.q {
         let path_b = session.resolve_path(q);
-        match tokio::fs::read_to_string(&path_b).await {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Response::err(1, &format!("not found: {}", path_b.display()));
-            }
-            Err(e) => return Response::err(4, &format!("read: {e}")),
+        match read_for_diff(session, &path_b, op.q.as_deref().unwrap_or("")).await {
+            Ok(content) => content,
+            Err(response) => return response,
         }
     } else if let Some(s) = &op.s {
         s.clone()
@@ -81,6 +75,37 @@ pub async fn diff(session: &Session, op: &Op) -> Response {
         "hunks": hunks,
         "count": hunks.len(),
     }))
+}
+
+/// Read one diff input through the selected authority when present (ADR-022).
+async fn read_for_diff(
+    session: &Session,
+    path: &std::path::Path,
+    argument: &str,
+) -> Result<String, Response> {
+    if let Some(authority) = &session.authority {
+        let entry = authority
+            .open_read(path)
+            .map_err(|error| error.with_argument(argument).into_response("diff_files"))?;
+        return tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut content = String::new();
+            entry
+                .into_file()
+                .read_to_string(&mut content)
+                .map(|_| content)
+        })
+        .await
+        .map_err(|error| Response::err(4, &format!("read: {error}")))?
+        .map_err(|error| Response::err(4, &format!("read: {error}")));
+    }
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(Response::err(1, &format!("not found: {}", path.display())))
+        }
+        Err(error) => Err(Response::err(4, &format!("read: {error}"))),
+    }
 }
 
 #[cfg(test)]

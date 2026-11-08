@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-28
+- **Amended:** 2026-11-03, with explicit maintainer approval. PM confirmed 2026-11-07.
 - **Deciders:** Repository maintainer, by explicit user approval on 2026-10-29 UTC.
 - **Consulted:** None recorded.
 - **Informed:** None recorded.
@@ -28,10 +29,11 @@ Which authority can enforce these properties without claiming that opaque comman
 ## Decision
 
 We will pass a shared run-scoped filesystem authority to every Daimonos-owned filesystem consumer.
-It owns fixed-root resolution, access permission, walk behavior, and eligibility declarations.
+It owns path resolution, fixed-root authorization, access permission, walk behavior, and eligibility declarations.
 Confinement, no-workspace-writes, and no-follow remain independent opt-in constraints.
 
-Resolve relative arguments against the fixed root, including after set_cwd.
+Resolve relative arguments against the current session working directory, including after `set_cwd`.
+Keep the confinement root fixed. Authorize the resolved object against that root for each operation.
 Reject escaping explicit paths before exposing metadata or content. Walks skip and report escaping entries.
 Confinement alone permits links whose resolved target stays inside the root.
 No-follow reports a link and its target text without opening or walking the target.
@@ -49,6 +51,7 @@ Legacy behavior remains unchanged when these options are absent.
 
 ## Alternatives
 
+- **Resolve all relative paths from the fixed root:** makes paths independent of `set_cwd`, but breaks expected agent workflows.
 - **Validate the startup directory only:** misses later arguments, walks, and cwd changes.
 - **Trust path annotations alone:** metadata does not enforce access.
 - **Treat in-root symlinks as universally forbidden:** merges two independent requested options.
@@ -58,6 +61,7 @@ Legacy behavior remains unchanged when these options are absent.
 
 Native operations, indexes, and git access need auditable adapters.
 Some local tools become unavailable only when confinement requires it.
+Relative paths depend on the session working directory. Reproducing a sequence requires its working-directory changes.
 Platform support needs explicit verification. Do not promise enforceability on an unsupported resolver.
 This is not OS isolation for caller workers or a substitute for their sandbox.
 
@@ -65,6 +69,8 @@ This is not OS isolation for caller workers or a substitute for their sandbox.
 
 Run future path-confinement, read-only-workspace, and no-follow suites, plus existing symlink and git tests.
 Test direct and intermediate links, cwd changes, path arrays, walks, replacement races, and rejected tools.
+After `set_cwd` selects an in-root directory, verify that relative paths use that directory.
+Verify that `set_cwd` and later operations refuse escapes and unsafe working-directory replacement.
 Use actual read-only mounts and snapshots through startup/calls/shutdown.
 Run concurrent private git status views and verify independent cleanup.
 Worker tools remain available by name only when the caller explicitly permits them.
@@ -72,6 +78,15 @@ Worker tools remain available by name only when the caller explicitly permits th
 ## Anchors
 
 _Anchors:_ src/session.rs::Session::resolve_path, src/ops/mod.rs::dispatch_with_progress, src/tool_facade.rs::invoke_with_progress, src/plugins/git_read/runner.rs::ReadRepo, src/plugins/git_read/status.rs::StatusView::create
+
+## Amendment — relative path base (2026-11-03)
+
+The repository maintainer explicitly approved mutable working-directory resolution on 2026-11-03 UTC.
+The dbunk PM confirmed this amended FR-03 rule on 2026-11-07 UTC.
+This amendment replaces only the prior rule: "Resolve relative arguments against the fixed root, including after set_cwd."
+The fixed root remains the security boundary. A working-directory change does not change that boundary.
+The authority must refuse an operation if it cannot safely resolve the working directory or the requested object within the root.
+Confinement, no-workspace-writes, and no-follow remain independent options.
 
 ## Revisit when
 

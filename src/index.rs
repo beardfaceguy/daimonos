@@ -545,52 +545,8 @@ impl WorkspaceIndex {
         scope: Option<&str>,
         file_glob: Option<&glob::Pattern>,
     ) -> Vec<SearchResult> {
-        let query_trigrams = query_to_trigrams(query.as_bytes());
         let guard = self.inner.read().await;
-        if query_trigrams.is_empty() {
-            let mut results: Vec<SearchResult> = guard
-                .files
-                .iter()
-                .filter(|file| file.contains(query) && path_matches_filters(file, scope, file_glob))
-                .map(|file| SearchResult {
-                    file: file.clone(),
-                    score: 1,
-                })
-                .collect();
-            results.sort_by(|left, right| left.file.cmp(&right.file));
-            results.truncate(max);
-            return results;
-        }
-
-        let mut scores: HashMap<u32, u32> = HashMap::new();
-        for tri in &query_trigrams {
-            if let Some(file_ids) = guard.trigrams.get(tri) {
-                for &fid in file_ids {
-                    *scores.entry(fid).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let threshold = (query_trigrams.len() as u32).saturating_sub(1).max(1);
-
-        let mut results: Vec<SearchResult> = scores
-            .into_iter()
-            .filter(|(_, score)| *score >= threshold)
-            .map(|(fid, score)| SearchResult {
-                file: guard.files.get(fid as usize).cloned().unwrap_or_default(),
-                score,
-            })
-            .filter(|result| path_matches_filters(&result.file, scope, file_glob))
-            .collect();
-
-        results.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.file.cmp(&right.file))
-        });
-        results.truncate(max);
-        results
+        search_state(&guard, query, max, scope, file_glob)
     }
 
     pub async fn stats(&self) -> IndexStats {
@@ -604,6 +560,93 @@ impl WorkspaceIndex {
             capped: guard.capped,
         }
     }
+}
+
+fn search_state(
+    state: &IndexState,
+    query: &str,
+    max: usize,
+    scope: Option<&str>,
+    file_glob: Option<&glob::Pattern>,
+) -> Vec<SearchResult> {
+    let query_trigrams = query_to_trigrams(query.as_bytes());
+    if query_trigrams.is_empty() {
+        let mut results: Vec<SearchResult> = state
+            .files
+            .iter()
+            .filter(|file| file.contains(query) && path_matches_filters(file, scope, file_glob))
+            .map(|file| SearchResult {
+                file: file.clone(),
+                score: 1,
+            })
+            .collect();
+        results.sort_by(|left, right| left.file.cmp(&right.file));
+        results.truncate(max);
+        return results;
+    }
+
+    let mut scores: HashMap<u32, u32> = HashMap::new();
+    for tri in &query_trigrams {
+        if let Some(file_ids) = state.trigrams.get(tri) {
+            for &fid in file_ids {
+                *scores.entry(fid).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let threshold = (query_trigrams.len() as u32).saturating_sub(1).max(1);
+
+    let mut results: Vec<SearchResult> = scores
+        .into_iter()
+        .filter(|(_, score)| *score >= threshold)
+        .map(|(fid, score)| SearchResult {
+            file: state.files.get(fid as usize).cloned().unwrap_or_default(),
+            score,
+        })
+        .filter(|result| path_matches_filters(&result.file, scope, file_glob))
+        .collect();
+
+    results.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.file.cmp(&right.file))
+    });
+    results.truncate(max);
+    results
+}
+
+/// Rank paths that were already authorized by the confined walker.
+pub(crate) fn search_authorized_paths(
+    mut paths: Vec<String>,
+    cfg: &IndexConfig,
+    query: &str,
+    max: usize,
+    file_glob: Option<&glob::Pattern>,
+) -> (Vec<SearchResult>, IndexStats) {
+    paths.sort();
+    let capped = paths.len() > cfg.effective_max_files();
+    paths.truncate(cfg.effective_max_files());
+    let mut state = IndexState::new();
+    for path in paths {
+        let id = state.files.len() as u32;
+        extract_trigrams(path.as_bytes(), id, &mut state.trigrams);
+        state.files.push(path);
+    }
+    let results = search_state(&state, query, max, None, file_glob);
+    let stats = IndexStats {
+        files: state.files.len(),
+        trigrams: state.trigrams.len(),
+        age_ms: Some(0),
+        mode: cfg.mode,
+        coverage: if capped {
+            IndexCoverage::Partial
+        } else {
+            IndexCoverage::Complete
+        },
+        capped,
+    };
+    (results, stats)
 }
 
 fn relative_index_path(

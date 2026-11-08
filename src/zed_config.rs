@@ -43,7 +43,34 @@ pub fn context_server_specs(override_path: Option<&str>) -> anyhow::Result<Vec<S
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
-    let json = clean_jsonc(&raw);
+    parse_context_server_specs(&path, &raw)
+}
+
+/// Read an implicitly configured settings file through the fixed root.
+pub(crate) fn context_server_specs_confined(
+    path: &str,
+    authority: &crate::path_policy::FilesystemAuthority,
+) -> anyhow::Result<Vec<ServerSpec>> {
+    use std::io::Read;
+    let path = PathBuf::from(path);
+    let requested = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let authorized = authority
+        .open_read(&requested)
+        .map_err(|error| anyhow::anyhow!("{}", error.code))?;
+    let mut raw = String::new();
+    authorized.into_file().read_to_string(&mut raw)?;
+    parse_context_server_specs(&requested, &raw)
+}
+
+pub(crate) fn parse_context_server_specs(
+    path: &std::path::Path,
+    raw: &str,
+) -> anyhow::Result<Vec<ServerSpec>> {
+    let json = clean_jsonc(raw);
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     Ok(specs_from_settings(&value))

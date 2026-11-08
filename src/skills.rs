@@ -92,6 +92,9 @@ pub fn global_root(config: &crate::config::AgentSkillsConfig) -> Result<PathBuf,
 }
 
 pub fn discover(workspace: &Path, config: &crate::config::AgentSkillsConfig) -> Discovery {
+    if config.filesystem_authority.is_some() && config.global_dir.is_none() {
+        return discover_from(workspace, None, config);
+    }
     match global_root(config) {
         Ok(root) => discover_in(workspace, &root, config),
         Err(error) => Discovery {
@@ -106,9 +109,19 @@ pub fn discover_in(
     global_root: &Path,
     config: &crate::config::AgentSkillsConfig,
 ) -> Discovery {
+    discover_from(workspace, Some(global_root), config)
+}
+
+fn discover_from(
+    workspace: &Path,
+    global_root: Option<&Path>,
+    config: &crate::config::AgentSkillsConfig,
+) -> Discovery {
     let workspace_root = workspace.join(DEFAULT_SKILL_DIR);
     let mut out = Discovery::default();
-    scan_root(global_root, SkillSource::Global, config, &mut out);
+    if let Some(global_root) = global_root {
+        scan_root(global_root, SkillSource::Global, config, &mut out);
+    }
     scan_root(&workspace_root, SkillSource::Workspace, config, &mut out);
     out.all_sources.sort_by(|a, b| {
         a.metadata
@@ -133,6 +146,10 @@ fn scan_root(
     config: &crate::config::AgentSkillsConfig,
     out: &mut Discovery,
 ) {
+    if let Some(authority) = &config.filesystem_authority {
+        scan_root_confined(root, source, config, authority, out);
+        return;
+    }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -174,13 +191,65 @@ fn scan_root(
     }
 }
 
+fn scan_root_confined(
+    root: &Path,
+    source: SkillSource,
+    config: &crate::config::AgentSkillsConfig,
+    authority: &crate::path_policy::FilesystemAuthority,
+    out: &mut Discovery,
+) {
+    let walk = match authority.walk(
+        root,
+        crate::path_policy::WalkOptions {
+            max_depth: Some(0),
+            ..Default::default()
+        },
+    ) {
+        Ok(walk) => walk,
+        Err(_) => return,
+    };
+    let mut directories: Vec<_> = walk
+        .entries
+        .into_iter()
+        .filter(|entry| entry.metadata.is_dir())
+        .map(|entry| authority.root().join(entry.relative_path))
+        .collect();
+    directories.retain(|directory| authority.open_read(&directory.join(SKILL_FILE)).is_ok());
+    directories.sort();
+    if directories.len() > config.max_skills {
+        out.warnings.push(format!(
+            "skill directory {} contains {} entries; only the first {} are considered",
+            root.display(),
+            directories.len(),
+            config.max_skills
+        ));
+        directories.truncate(config.max_skills);
+    }
+    for directory in directories {
+        let file = directory.join(SKILL_FILE);
+        match parse_metadata(&file, source, directory, config) {
+            Ok((skill, warning)) => {
+                if let Some(warning) = warning {
+                    out.warnings.push(warning);
+                }
+                out.all_sources.push(skill);
+            }
+            Err(error) => out.warnings.push(error),
+        }
+    }
+}
+
 fn parse_metadata(
     file: &Path,
     source: SkillSource,
     directory: PathBuf,
     config: &crate::config::AgentSkillsConfig,
 ) -> Result<(Skill, Option<String>), String> {
-    let content = read_bounded_regular_file(file, config.max_file_bytes)?;
+    let content = read_bounded_regular_file(
+        file,
+        config.max_file_bytes,
+        config.filesystem_authority.as_deref(),
+    )?;
     let (frontmatter, _) =
         split_frontmatter(&content).map_err(|e| format!("skill {}: {e}", file.display()))?;
     let raw: serde_yaml::Value = serde_yaml::from_str(frontmatter).map_err(|e| {
@@ -242,7 +311,25 @@ fn parse_metadata(
     ))
 }
 
-fn read_bounded_regular_file(file: &Path, max_bytes: u64) -> Result<String, String> {
+fn read_bounded_regular_file(
+    file: &Path,
+    max_bytes: u64,
+    authority: Option<&crate::path_policy::FilesystemAuthority>,
+) -> Result<String, String> {
+    if let Some(authority) = authority {
+        if authority
+            .symlink_info(file)
+            .map_err(|error| error.message)?
+            .is_some()
+        {
+            return Err(format!(
+                "skill {} must be a regular file, not a symlink",
+                file.display()
+            ));
+        }
+        let authorized = authority.open_read(file).map_err(|error| error.message)?;
+        return read_bounded_handle(file, max_bytes, authorized.into_file());
+    }
     let path_metadata = std::fs::symlink_metadata(file)
         .map_err(|error| format!("skill {} metadata unreadable: {error}", file.display()))?;
     if !path_metadata.file_type().is_file() {
@@ -261,6 +348,14 @@ fn read_bounded_regular_file(file: &Path, max_bytes: u64) -> Result<String, Stri
     let file_handle = options
         .open(file)
         .map_err(|error| format!("skill {} unreadable: {error}", file.display()))?;
+    read_bounded_handle(file, max_bytes, file_handle)
+}
+
+fn read_bounded_handle(
+    file: &Path,
+    max_bytes: u64,
+    file_handle: std::fs::File,
+) -> Result<String, String> {
     let metadata = file_handle
         .metadata()
         .map_err(|error| format!("skill {} metadata unreadable: {error}", file.display()))?;
@@ -499,7 +594,11 @@ fn activation_envelope_from_skill(
             skill.metadata.name
         ));
     }
-    let content = read_bounded_regular_file(&skill.file, config.max_file_bytes)?;
+    let content = read_bounded_regular_file(
+        &skill.file,
+        config.max_file_bytes,
+        config.filesystem_authority.as_deref(),
+    )?;
     let (_, body) =
         split_frontmatter(&content).map_err(|e| format!("skill {}: {e}", skill.file.display()))?;
     Ok(format!(

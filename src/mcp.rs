@@ -207,6 +207,8 @@ fn response_to_result(resp: Response) -> std::result::Result<CallToolResult, Cal
             None => "{}".to_string(),
         };
         ok_text(text)
+    } else if let Some(data) = resp.d {
+        err_text(serde_json::to_string(&data).unwrap_or_default())
     } else {
         let msg = resp.m.unwrap_or_else(|| "unknown error".into());
         let code = resp.e.unwrap_or(0);
@@ -423,6 +425,15 @@ async fn dispatch_tool_inner(
         return response_to_result(resp);
     }
 
+    // ADR-022: non-opcode tools need an explicit safe classification.
+    if session.authority.is_some() && !crate::path_policy::tool_allowed(name) {
+        return response_to_result(
+            crate::path_policy::ToolFailure::unsupported(format!(
+                "tool {name} has no confined adapter"
+            ))
+            .into_response(name),
+        );
+    }
     // Special tools that need session access or custom handling
     match name {
         "skill" => {
@@ -455,6 +466,17 @@ async fn dispatch_tool_inner(
                 },
             };
 
+            if session.authority.is_some() {
+                if let Some(name) = names
+                    .iter()
+                    .find(|name| !crate::path_policy::tool_allowed(name))
+                {
+                    return err_text(format!(
+                        "{}: tool {name} has no confined adapter",
+                        crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED
+                    ));
+                }
+            }
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let results: Vec<Value> = all
                 .into_iter()
@@ -480,7 +502,7 @@ async fn dispatch_tool_inner(
         }
 
         "list_tool_signatures" => {
-            let sigs = script::tool_signatures();
+            let sigs = script::tool_signatures_for_policy(session.authority.is_some());
             ok_text(sigs)
         }
 
@@ -489,6 +511,9 @@ async fn dispatch_tool_inner(
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let summary: Vec<Value> = all
                 .iter()
+                .filter(|tool| {
+                    session.authority.is_none() || crate::path_policy::tool_allowed(&tool.name)
+                })
                 .map(|t| json!({"name": t.name, "description": t.description}))
                 .collect();
             ok_text(serde_json::to_string(&summary).unwrap_or_default())
@@ -670,6 +695,32 @@ async fn dispatch_tool_inner(
 
             let previous = session.cwd.display().to_string();
             let new_cwd = session.resolve_path(&path);
+            if let Some(authority) = &session.authority {
+                let authorized = match authority.open_read(&new_cwd) {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        return response_to_result(
+                            error.with_argument(&path).into_response("set_cwd"),
+                        )
+                    }
+                };
+                let cwd = match authority.directory_path(&new_cwd, &authorized) {
+                    Ok(cwd) => cwd,
+                    Err(error) => {
+                        return response_to_result(
+                            error.with_argument(&path).into_response("set_cwd"),
+                        )
+                    }
+                };
+                session.cwd = cwd.clone();
+                return ok_text(
+                    serde_json::to_string(&json!({
+                        "cwd": cwd.display().to_string(),
+                        "previous": previous,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
 
             // Canonicalize first, then stat the canonical path. Reversing
             // these (is_dir → canonicalize) opens a TOCTOU window where
@@ -1139,8 +1190,25 @@ fn pick_workspace_root(roots: &[Root]) -> Option<PathBuf> {
         .find(|p| p.is_dir())
 }
 
+/// Pick a client root only after the fixed authority opens it (ADR-022).
+fn pick_confined_root(
+    roots: &[Root],
+    authority: &crate::path_policy::FilesystemAuthority,
+) -> Option<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| root_uri_to_path(&root.uri))
+        .find_map(|path| {
+            let authorized = authority.open_read(&path).ok()?;
+            authority.directory_path(&path, &authorized).ok()
+        })
+}
+
 // ADR-021 moves the KGL store outside the workspace in selected-state mode.
 fn passes_session_context_check(session: &Session, name: &str) -> bool {
+    if session.authority.is_some() && !crate::path_policy::tool_allowed(name) {
+        return false;
+    }
     if matches!(name, "kgl_query" | "kgl_assert") {
         if let Some(directory) = session.cfg.kgl.state_directory.as_deref() {
             return directory.exists();
@@ -1159,6 +1227,16 @@ fn passes_session_context_check(session: &Session, name: &str) -> bool {
 /// Under ADR-021, reject roots that overlap private state and derive fresh
 /// workspace-scoped paths before changing the live session.
 fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
+    if let Some(authority) = &session.authority {
+        let allowed = authority
+            .open_read(&new_root)
+            .ok()
+            .and_then(|entry| entry.metadata().ok())
+            .is_some_and(|metadata| metadata.is_dir());
+        if !allowed {
+            return false;
+        }
+    }
     let relocated = if let Some(authority) = &session.cfg.state_authority {
         if authority.root().starts_with(&new_root) || new_root.starts_with(authority.root()) {
             tracing::warn!(workspace = %new_root.display(), state = %authority.root().display(),
@@ -1205,7 +1283,8 @@ fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
     session.snapshot_store =
         SnapshotStore::for_workspace(new_root.clone(), session.cfg.snapshot_directory.as_ref());
     session.read_cache.clear();
-    let should_warm = crate::index::should_warm_index(&new_root, &session.cfg.index, true);
+    let should_warm = session.authority.is_none()
+        && crate::index::should_warm_index(&new_root, &session.cfg.index, true);
     let idx = Arc::new(WorkspaceIndex::new(new_root, &session.cfg.index, false));
     if should_warm {
         idx.spawn_reindex();
@@ -1235,15 +1314,20 @@ impl ServerHandler for DaimonosHandler {
                 return;
             }
         };
-        let new_root = match pick_workspace_root(&roots) {
-            Some(p) => p,
-            None => return,
-        };
         let mut session = self.session.lock().await;
-        let current = session
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| session.workspace.clone());
+        let new_root = match &session.authority {
+            Some(authority) => pick_confined_root(&roots, authority),
+            None => pick_workspace_root(&roots),
+        };
+        let Some(new_root) = new_root else { return };
+        let current = if session.authority.is_some() {
+            session.workspace.clone()
+        } else {
+            session
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| session.workspace.clone())
+        };
         if new_root == current {
             return;
         }
@@ -1510,13 +1594,90 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
             .await
             .trim_end()
             .to_string(),
-        format!("Workspace: {}", workspace.display()),
+        format!(
+            "Workspace: {}",
+            cfg.filesystem_authority
+                .as_ref()
+                .map(|authority| authority.root())
+                .unwrap_or(workspace)
+                .display()
+        ),
     ];
 
     parts.push(format!(
         "Starlark tool functions for execute_script:\n{}",
-        script::tool_signatures()
+        if cfg.filesystem_authority.is_some() {
+            script::tool_signatures_for_policy(true)
+        } else {
+            script::tool_signatures()
+        }
     ));
+
+    if let Some(authority) = &cfg.filesystem_authority {
+        let authority = Arc::clone(authority);
+        let discovered = tokio::task::spawn_blocking(move || {
+            let markers = [
+                ("Cargo.toml", "Rust (Cargo)"),
+                ("package.json", "Node.js"),
+                ("pyproject.toml", "Python"),
+                ("go.mod", "Go"),
+                ("Gemfile", "Ruby"),
+                ("pom.xml", "Java (Maven)"),
+                ("build.gradle", "Java/Kotlin (Gradle)"),
+                ("CMakeLists.txt", "C/C++ (CMake)"),
+                ("Makefile", "Make"),
+            ];
+            let mut hints = Vec::new();
+            let detected: Vec<_> = markers
+                .into_iter()
+                .filter_map(|(file, language)| {
+                    authority
+                        .open_read(&authority.root().join(file))
+                        .ok()
+                        .map(|_| language)
+                })
+                .collect();
+            if !detected.is_empty() {
+                hints.push(format!("Project type: {}", detected.join(", ")));
+            }
+            if authority.open_read(&authority.root().join(".git")).is_ok() {
+                hints.push("VCS: git".to_string());
+            }
+            if let Ok(walk) = authority.walk(
+                authority.root(),
+                crate::path_policy::WalkOptions {
+                    max_depth: Some(0),
+                    include_hidden: false,
+                    skip_dirs: &["target", "node_modules"],
+                    ..Default::default()
+                },
+            ) {
+                let mut dirs: Vec<_> = walk
+                    .entries
+                    .into_iter()
+                    .filter(|entry| {
+                        entry.kind == crate::path_policy::EntryKind::Dir && entry.metadata.is_dir()
+                    })
+                    .filter_map(|entry| {
+                        entry
+                            .relative_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                    })
+                    .collect();
+                dirs.sort();
+                dirs.truncate(15);
+                if !dirs.is_empty() {
+                    hints.push(format!("Top-level dirs: {}", dirs.join(", ")));
+                }
+            }
+            hints
+        })
+        .await
+        .unwrap_or_default();
+        parts.extend(discovered);
+        return parts.join("\n");
+    }
 
     if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg).await {
         parts.push(hint.trim_end().to_string());

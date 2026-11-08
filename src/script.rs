@@ -1534,6 +1534,11 @@ fn tool_functions(builder: &mut GlobalsBuilder) {
 
 /// Generate Python-style function signatures for all available tool bindings.
 pub fn tool_signatures() -> String {
+    tool_signatures_for_policy(false)
+}
+
+/// Render only signatures admitted by the current filesystem policy.
+pub fn tool_signatures_for_policy(confined: bool) -> String {
     let sigs = [
         "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
@@ -1566,10 +1571,31 @@ pub fn tool_signatures() -> String {
     let mut via_generic: Vec<&str> = tools::all_tools()
         .into_iter()
         .filter(|t| t.to_request.is_some())
+        .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
         .map(|t| t.name)
         .collect();
     via_generic.sort_unstable();
-    let mut out = sigs.join("\n");
+    let shown: Vec<&str> = sigs
+        .into_iter()
+        .filter(|signature| {
+            if !confined {
+                return true;
+            }
+            let name = signature
+                .strip_prefix("def ")
+                .and_then(|text| text.split('(').next())
+                .unwrap_or("");
+            name == "print" || name == "tool" || crate::path_policy::tool_allowed(name)
+        })
+        .map(|signature| {
+            if confined && signature.starts_with("def tool(") {
+                "def tool(tool_name: str, /, **kwargs) -> dict: ...  # classified native tools only"
+            } else {
+                signature
+            }
+        })
+        .collect();
+    let mut out = shown.join("\n");
     if !via_generic.is_empty() {
         out.push_str("\n# Callable as tool(\"<name>\", ...): ");
         out.push_str(&via_generic.join(", "));
