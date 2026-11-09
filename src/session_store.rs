@@ -17,12 +17,15 @@ use crate::session_protocol::AssistantOutcome;
 pub const SESSION_PERSIST_VERSION: u32 = 1;
 const SESSION_STORE_SCHEMA_VERSION: i64 = 1;
 pub(crate) const SESSION_DATABASE_NAME: &str = "sessions.sqlite3";
+/// Per-session owner locks held by the live writing process (ADR-033).
+const OWNER_LOCK_DIRECTORY: &str = "locks";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStoreErrorKind {
     UnsafeId,
     AlreadyExists,
     WriterChanged,
+    OwnedElsewhere,
     NotFound,
     FutureVersion,
     UnsupportedVersion,
@@ -36,10 +39,23 @@ pub enum SessionStoreErrorKind {
 pub enum SessionStoreError {
     UnsafeId,
     AlreadyExists,
-    WriterChanged { expected: u64, found: Option<u64> },
+    WriterChanged {
+        expected: u64,
+        found: Option<u64>,
+    },
+    /// Another live process owns the session (ADR-033). `pid` is best effort.
+    OwnedElsewhere {
+        pid: Option<u32>,
+    },
     NotFound,
-    FutureVersion { found: u32, supported: u32 },
-    UnsupportedVersion { found: u32, supported: u32 },
+    FutureVersion {
+        found: u32,
+        supported: u32,
+    },
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
     Corrupt(serde_json::Error),
     Database(rusqlite::Error),
     Io(std::io::Error),
@@ -51,6 +67,7 @@ impl SessionStoreError {
             Self::UnsafeId => SessionStoreErrorKind::UnsafeId,
             Self::AlreadyExists => SessionStoreErrorKind::AlreadyExists,
             Self::WriterChanged { .. } => SessionStoreErrorKind::WriterChanged,
+            Self::OwnedElsewhere { .. } => SessionStoreErrorKind::OwnedElsewhere,
             Self::NotFound => SessionStoreErrorKind::NotFound,
             Self::FutureVersion { .. } => SessionStoreErrorKind::FutureVersion,
             Self::UnsupportedVersion { .. } => SessionStoreErrorKind::UnsupportedVersion,
@@ -73,6 +90,12 @@ impl std::fmt::Display for SessionStoreError {
                 formatter,
                 "session changed while claiming writer epoch: expected generation {expected}, found {found:?}"
             ),
+            Self::OwnedElsewhere { pid: Some(pid) } => write!(
+                formatter,
+                "session is open in another daimonos process (pid {pid})"
+            ),
+            Self::OwnedElsewhere { pid: None } => formatter
+                .write_str("session is open in another daimonos process (pid unknown)"),
             Self::NotFound => formatter.write_str("persisted session was not found"),
             Self::FutureVersion { found, supported } => write!(
                 formatter,
@@ -98,6 +121,7 @@ impl std::error::Error for SessionStoreError {
             Self::UnsafeId
             | Self::AlreadyExists
             | Self::WriterChanged { .. }
+            | Self::OwnedElsewhere { .. }
             | Self::NotFound
             | Self::FutureVersion { .. }
             | Self::UnsupportedVersion { .. } => None,
@@ -145,10 +169,31 @@ pub struct PersistedWrite {
     pub updated_at_unix_ns: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SessionWriter {
     session_id: String,
     epoch: String,
+    /// Held while this process owns the session. The OS releases it when the
+    /// last clone drops or the process exits, including on crash (ADR-033).
+    /// Never read: it is held only so that dropping it releases the lock.
+    _owner_lock: std::sync::Arc<std::fs::File>,
+}
+
+impl PartialEq for SessionWriter {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.epoch == other.epoch
+    }
+}
+
+impl Eq for SessionWriter {}
+
+impl SessionWriter {
+    /// Simulate the owning process exiting while a delayed write is pending.
+    #[cfg(test)]
+    pub(crate) fn release_owner_lock_for_test(&self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self._owner_lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +355,9 @@ impl SessionStore {
             return Err(SessionStoreError::UnsafeId);
         }
         let mut connection = self.connection()?;
+        // Take ownership before rotating the epoch, so a live writer in another
+        // process is never superseded (ADR-033).
+        let owner_lock = self.acquire_owner_lock(session_id)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(SessionStoreError::Database)?;
@@ -353,7 +401,46 @@ impl SessionStore {
         Ok(SessionWriter {
             session_id: session_id.to_string(),
             epoch,
+            _owner_lock: std::sync::Arc::new(owner_lock),
         })
+    }
+
+    /// Lock `locks/<id>.lock` for this process, or report the live owner.
+    fn acquire_owner_lock(&self, session_id: &str) -> Result<std::fs::File, SessionStoreError> {
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = self.dir.join(OWNER_LOCK_DIRECTORY);
+        std::fs::create_dir_all(&directory).map_err(SessionStoreError::Io)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(SessionStoreError::Io)?;
+        // std opens with O_CLOEXEC, so tool child processes never inherit it.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.join(format!("{session_id}.lock")))
+            .map_err(SessionStoreError::Io)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(SessionStoreError::Io(error));
+            }
+            let mut text = String::new();
+            let pid = file
+                .read_to_string(&mut text)
+                .ok()
+                .and_then(|_| text.trim().parse().ok());
+            return Err(SessionStoreError::OwnedElsewhere { pid });
+        }
+        file.set_len(0).map_err(SessionStoreError::Io)?;
+        file.rewind().map_err(SessionStoreError::Io)?;
+        write!(file, "{}", std::process::id()).map_err(SessionStoreError::Io)?;
+        file.flush().map_err(SessionStoreError::Io)?;
+        Ok(file)
     }
 
     /// Persist a single-writer chat session. Generation is assigned inside the
@@ -1125,6 +1212,37 @@ mod tests {
     }
 
     #[test]
+    fn live_writer_refuses_second_claim_and_reports_owner_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = SessionStore::new(directory.path().to_path_buf());
+        let other = SessionStore::new(directory.path().to_path_buf());
+        let writer = owner.claim_writer("owned", None).unwrap();
+
+        let refused = other.claim_writer("owned", None).unwrap_err();
+
+        assert_eq!(refused.kind(), SessionStoreErrorKind::OwnedElsewhere);
+        assert!(matches!(
+            refused,
+            SessionStoreError::OwnedElsewhere { pid: Some(pid) } if pid == std::process::id()
+        ));
+        drop(writer);
+        // A concurrently forked child holds a copy of the lock descriptor until
+        // its exec closes it (O_CLOEXEC), so release can take a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match other.claim_writer("owned", None) {
+                Ok(_) => break,
+                Err(SessionStoreError::OwnedElsewhere { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("reclaim after owner exit failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
     fn reopened_writer_epoch_rejects_old_save_and_delete() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1146,6 +1264,9 @@ mod tests {
                 .unwrap(),
             SessionWriteOutcome::Saved(_)
         ));
+        // The prior runtime exited (lock released, ADR-033); its stale writer
+        // remains for a delayed save.
+        old_writer.release_owner_lock_for_test();
         let reopened = store.load_result("epoch").unwrap();
         let new_writer = store
             .claim_writer("epoch", Some(reopened.generation))
@@ -1198,6 +1319,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().to_path_buf());
         let abandoned = store.claim_writer("unpersisted", None).unwrap();
+        // The failed creator exited (lock released, ADR-033).
+        abandoned.release_owner_lock_for_test();
         let replacement = store.claim_writer("unpersisted", None).unwrap();
 
         assert!(matches!(

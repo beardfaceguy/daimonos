@@ -1445,6 +1445,13 @@ fn build_acp_event_handler(
                 send_refusal_diagnostic(&cx, &session_id);
                 None
             }
+            CoreSessionEvent::DurabilityStatusChanged { status } => {
+                durability_notice(status).map(|text| {
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(AcpContentBlock::Text(
+                        TextContent::new(text),
+                    )))
+                })
+            }
             // Rich ACP tool/diff/terminal projections remain adapter-specific;
             // the canonical events still feed daemon snapshots/replay.
             _ => None,
@@ -1453,6 +1460,26 @@ fn build_acp_event_handler(
             send_notification(&cx, &session_id, update);
         }
     })
+}
+
+/// A lost save must never be silent (ADR-033). Zed renders thought chunks
+/// collapsed, so these notices are visible agent text.
+fn durability_notice(status: crate::session_protocol::DurabilityStatus) -> Option<String> {
+    use crate::session_protocol::DurabilityStatus;
+    match status {
+        DurabilityStatus::Superseded => Some(
+            "\n\n[daimonos warning: stopped saving this thread because another daimonos \
+             process took ownership of it. Later turns here will be lost. Reopen the \
+             thread before continuing.]\n\n"
+                .to_string(),
+        ),
+        DurabilityStatus::Degraded => Some(
+            "\n\n[daimonos warning: could not save this thread. Recent turns may be lost \
+             if this process exits. Check the daimonos log.]\n\n"
+                .to_string(),
+        ),
+        DurabilityStatus::Saved | DurabilityStatus::Saving | DurabilityStatus::Unsaved => None,
+    }
 }
 
 fn emit_usage_update(
@@ -8880,6 +8907,22 @@ mod tests {
         assert!(!should_refresh_mcp_bridge(&current, &current, false));
         assert!(should_refresh_mcp_bridge(&current, &[spec("two")], false));
         assert!(should_refresh_mcp_bridge(&current, &current, true));
+    }
+
+    #[test]
+    fn durability_notice_warns_only_when_saving_has_stopped_or_failed() {
+        use crate::session_protocol::DurabilityStatus;
+        let superseded = durability_notice(DurabilityStatus::Superseded).unwrap();
+        assert!(superseded.contains("stopped saving this thread"));
+        let degraded = durability_notice(DurabilityStatus::Degraded).unwrap();
+        assert!(degraded.contains("could not save this thread"));
+        for status in [
+            DurabilityStatus::Saved,
+            DurabilityStatus::Saving,
+            DurabilityStatus::Unsaved,
+        ] {
+            assert_eq!(durability_notice(status), None);
+        }
     }
 
     #[test]

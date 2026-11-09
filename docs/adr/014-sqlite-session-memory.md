@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-08-29
 - **Tracking:** Vikunja #1410; future tamper evidence #1411
+- **Amended by:** [ADR-033](033-live-session-owner-lock.md) (a live owner keeps the session)
 - **Anchors:** `src/session_store.rs::SessionStore::write_record`,
   `src/session_interchange.rs::SessionCodec`
 
