@@ -174,11 +174,42 @@ pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
     }
     let source = match cfg.agent.mcp.servers_file.as_deref() {
         Some(source) => source,
-        None if cfg.state_authority.is_some() => return Vec::new(),
+        None if cfg.state_authority.is_some() || cfg.filesystem_authority.is_some() => {
+            return Vec::new()
+        }
         None => "~/.config/zed/settings.json",
     };
     let path = crate::paths::expand_tilde(source);
-    let content = match tokio::fs::read_to_string(&path).await {
+    let loaded = if let Some(authority) = &cfg.filesystem_authority {
+        if !cfg.explicit_control_paths {
+            let requested = if path.is_absolute() {
+                path.clone()
+            } else {
+                match std::env::current_dir() {
+                    Ok(directory) => directory.join(&path),
+                    Err(_) => return Vec::new(),
+                }
+            };
+            match authority.open_read(&requested) {
+                Ok(authorized) => tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let mut content = String::new();
+                    authorized
+                        .into_file()
+                        .read_to_string(&mut content)
+                        .map(|_| content)
+                })
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error))),
+                Err(_) => return Vec::new(),
+            }
+        } else {
+            tokio::fs::read_to_string(&path).await
+        }
+    } else {
+        tokio::fs::read_to_string(&path).await
+    };
+    let content = match loaded {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(error) => {
@@ -188,6 +219,12 @@ pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
         }
     };
     match parse_servers_json(&content) {
+        Ok(specs) if cfg.filesystem_authority.is_some() && !cfg.explicit_control_paths => {
+            if !specs.is_empty() {
+                tracing::warn!(target: "daimonos::agent_mcp", "workspace MCP servers require an explicitly selected config under confinement");
+            }
+            Vec::new()
+        }
         Ok(specs) => specs,
         Err(error) => {
             tracing::warn!(target: "daimonos::agent_mcp", path = %path.display(), %error,
@@ -195,6 +232,18 @@ pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
             Vec::new()
         }
     }
+}
+
+/// Name an explicitly configured local server that cannot be confined.
+pub async fn unconfineable_stdio(cfg: &Config) -> Option<String> {
+    cfg.filesystem_authority.as_ref()?;
+    load_configured_specs(cfg)
+        .await
+        .into_iter()
+        .find_map(|spec| match spec {
+            ServerSpec::Stdio { name, .. } => Some(name),
+            ServerSpec::Http { .. } => None,
+        })
 }
 
 /// Read `[agent.mcp] servers_file` and connect. `None` when disabled, the
@@ -207,6 +256,14 @@ pub async fn connect(
 ) -> Option<AgentMcp> {
     let specs = load_configured_specs(cfg).await;
     if specs.is_empty() {
+        return None;
+    }
+    if cfg.filesystem_authority.is_some()
+        && specs
+            .iter()
+            .any(|spec| matches!(spec, ServerSpec::Stdio { .. }))
+    {
+        tracing::warn!(target: "daimonos::agent_mcp", "local MCP server refused by confinement");
         return None;
     }
     let external_session_id = crate::analytics::read_agent_session_id_env();
@@ -232,6 +289,26 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confined_implicit_config_does_not_select_remote_servers() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("servers.json");
+        std::fs::write(
+            &settings,
+            r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.agent.mcp.servers_file = Some(settings.to_string_lossy().into_owned());
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(directory.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        assert!(load_configured_specs(&cfg).await.is_empty());
+        cfg.explicit_control_paths = true;
+        assert_eq!(load_configured_specs(&cfg).await.len(), 1);
+    }
 
     #[test]
     fn parses_stdio_and_http_entries_sorted_by_name() {

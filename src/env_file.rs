@@ -136,27 +136,48 @@ pub(crate) fn load_default_with_user_config(workspace: &Path, quiet: bool, inclu
                 continue;
             }
         };
-        let outcome = plan(&content, |key| std::env::var_os(key).is_some());
-        for (key, value) in &outcome.set {
-            // Safe on edition 2021 and startup-only — no task has begun reading
-            // the environment yet; mirrors `session::enhance_process_path()`.
-            std::env::set_var(key, value);
-        }
-        if !quiet && !outcome.set.is_empty() {
-            eprintln!(
-                "daimonos: loaded {} variable(s) from {}",
-                outcome.set.len(),
-                path.display()
-            );
-        }
-        for key in &outcome.refused {
-            eprintln!(
-                "daimonos: refused unsafe variable {:?} from {} \
+        apply_content(&content, &path, quiet);
+    }
+}
+
+/// Load only an authorized workspace env file under confinement (ADR-022).
+pub(crate) fn load_confined(
+    workspace: &Path,
+    authority: &crate::path_policy::FilesystemAuthority,
+    quiet: bool,
+) {
+    use std::io::Read;
+    let path = workspace.join("agent.env");
+    let Ok(authorized) = authority.open_read(&path) else {
+        return;
+    };
+    let mut content = String::new();
+    if authorized.into_file().read_to_string(&mut content).is_ok() {
+        apply_content(&content, &path, quiet);
+    }
+}
+
+fn apply_content(content: &str, path: &Path, quiet: bool) {
+    let outcome = plan(content, |key| std::env::var_os(key).is_some());
+    for (key, value) in &outcome.set {
+        // Safe on edition 2021 and startup-only — no task has begun reading
+        // the environment yet; mirrors `session::enhance_process_path()`.
+        std::env::set_var(key, value);
+    }
+    if !quiet && !outcome.set.is_empty() {
+        eprintln!(
+            "daimonos: loaded {} variable(s) from {}",
+            outcome.set.len(),
+            path.display()
+        );
+    }
+    for key in &outcome.refused {
+        eprintln!(
+            "daimonos: refused unsafe variable {:?} from {} \
                  (loader/interpreter hijack vector; set it in the real environment if intended)",
-                key,
-                path.display()
-            );
-        }
+            key,
+            path.display()
+        );
     }
 }
 

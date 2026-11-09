@@ -128,6 +128,32 @@ pub async fn load_agent_instructions_with_user_config(
     load_layered_instructions(global.as_deref(), &workspace_file).await
 }
 
+/// Load implicit workspace instructions through the fixed root (ADR-022).
+pub async fn load_agent_instructions_confined(
+    cli_path: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+    authority: &crate::path_policy::FilesystemAuthority,
+) -> std::io::Result<Option<String>> {
+    if let Some(path) = cli_path {
+        return read_agent_instructions(path, false).await;
+    }
+    let path = workspace_agent_instructions_path(workspace);
+    let Ok(authorized) = authority.open_read(&path) else {
+        return Ok(None);
+    };
+    let content = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut content = String::new();
+        authorized
+            .into_file()
+            .read_to_string(&mut content)
+            .map(|_| content)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok((!content.trim().is_empty()).then_some(content))
+}
+
 /// Layer an optional global rule-set with an optional project-local one. Present,
 /// non-blank sections are concatenated global-first (workspace last so it can
 /// countermand). Both are missing-ok. Factored out with explicit paths so the
@@ -251,19 +277,44 @@ pub fn prompts_toml_block(dir: &std::path::Path) -> String {
 /// Resolve one prompt: read the override file when the key is set and non-empty,
 /// otherwise use the embedded default. A set-but-unreadable path warns and falls
 /// back so a typo never silently swaps in the wrong prompt without a trace.
-async fn resolve(name: &str, override_path: Option<&str>, embedded: &str) -> String {
+async fn read_prompt_override(cfg: &Config, path: &str) -> std::io::Result<String> {
+    let path = crate::paths::expand_tilde(path);
+    if let Some(authority) = &cfg.filesystem_authority {
+        if !cfg.explicit_control_paths {
+            let requested = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let authorized = authority.open_read(&requested).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.code)
+            })?;
+            return tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut content = String::new();
+                authorized
+                    .into_file()
+                    .read_to_string(&mut content)
+                    .map(|_| content)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+        }
+    }
+    tokio::fs::read_to_string(path).await
+}
+
+async fn resolve(name: &str, override_path: Option<&str>, embedded: &str, cfg: &Config) -> String {
     match override_path {
-        Some(p) if !p.trim().is_empty() => {
-            match tokio::fs::read_to_string(crate::paths::expand_tilde(p)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
+        Some(p) if !p.trim().is_empty() => match read_prompt_override(cfg, p).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
                     "daimonos: prompt override '{name}' ({p}) unreadable: {e}; using embedded default"
                 );
-                    embedded.to_string()
-                }
+                embedded.to_string()
             }
-        }
+        },
         _ => embedded.to_string(),
     }
 }
@@ -288,6 +339,7 @@ pub async fn agent_system_for_workspace(
         "agent_system",
         cfg.prompts.agent_system.as_deref(),
         AGENT_SYSTEM_DEFAULT,
+        cfg,
     )
     .await;
     if let Some(additional) = cfg.prompts.additional_agent_instructions.as_deref() {
@@ -345,6 +397,7 @@ pub async fn mcp_instructions(cfg: &Config) -> String {
         "mcp_instructions",
         cfg.prompts.mcp_instructions.as_deref(),
         MCP_INSTRUCTIONS_DEFAULT,
+        cfg,
     )
     .await
 }
@@ -355,6 +408,7 @@ pub async fn loop_steer(cfg: &Config) -> String {
         "loop_steer",
         cfg.prompts.loop_steer.as_deref(),
         LOOP_STEER_DEFAULT,
+        cfg,
     )
     .await
 }
@@ -365,6 +419,7 @@ pub async fn cancelled_turn(cfg: &Config) -> String {
         "cancelled_turn",
         cfg.prompts.cancelled_turn.as_deref(),
         CANCELLED_TURN_DEFAULT,
+        cfg,
     )
     .await
 }
@@ -375,6 +430,7 @@ pub async fn skill_catalog(cfg: &Config) -> String {
         "skill_catalog",
         cfg.prompts.skill_catalog.as_deref(),
         SKILL_CATALOG_DEFAULT,
+        cfg,
     )
     .await
 }
@@ -385,6 +441,7 @@ pub async fn kgl_hint(cfg: &Config) -> String {
         "kgl_hint",
         cfg.prompts.kgl_hint.as_deref(),
         KGL_HINT_DEFAULT,
+        cfg,
     )
     .await
 }
@@ -408,7 +465,7 @@ pub async fn apply_summary_override(
     };
     let mut policy = compaction?;
     if policy.summary_prompt.is_none() {
-        match tokio::fs::read_to_string(crate::paths::expand_tilde(path)).await {
+        match read_prompt_override(cfg, path).await {
             Ok(s) => policy.summary_prompt = Some(s),
             Err(e) => eprintln!(
                 "daimonos: prompt override 'summary' ({path}) unreadable: {e}; using default"

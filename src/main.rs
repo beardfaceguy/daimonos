@@ -11,6 +11,7 @@ mod cli;
 mod client_transport;
 mod compaction;
 mod config;
+mod confined_ignore;
 mod context_metrics;
 mod coordination;
 mod env_file;
@@ -28,6 +29,7 @@ mod mcp_config_cmd;
 mod mcp_oauth;
 mod observability;
 mod ops;
+mod path_policy;
 mod paths;
 mod pipeline_cache;
 mod plugins;
@@ -228,6 +230,35 @@ async fn main() -> anyhow::Result<()> {
         },
         None => None,
     };
+    let caller_agent_env = std::env::var_os("DAIMONOS_AGENT_ENV").map(PathBuf::from);
+    // Pin the confinement root before implicit startup file discovery (ADR-022).
+    let mut filesystem_authority = if cli.confinement_requested() {
+        let root = cli.confine_root.as_deref().unwrap_or(&workspace);
+        match path_policy::FilesystemAuthority::confined(root, path_policy::FsLimits::default()) {
+            Ok(authority) => Some(authority),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": error.code, "message": error.message
+                    }})
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    if filesystem_authority.is_some() && matches!(runtime_mode, RuntimeMode::McpConfig) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED,
+                "message": "mcp-config local access cannot be confined"
+            }})
+        );
+        std::process::exit(2);
+    }
     let mut native_socket = cli
         .socket
         .clone()
@@ -260,6 +291,16 @@ async fn main() -> anyhow::Result<()> {
             };
         }
     }
+    if filesystem_authority.is_some() && cli.dump_prompts.is_some() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED,
+                "message": "--dump-prompts cannot be confined"
+            }})
+        );
+        std::process::exit(2);
+    }
     if state_authority.is_some()
         && cli
             .dump_prompts
@@ -280,7 +321,7 @@ async fn main() -> anyhow::Result<()> {
     // --print-config-path: report discovery order and which file wins, then
     // exit — before any config load / index / plugin setup.
     if cli.print_config_path {
-        let candidates = if state_authority.is_some() {
+        let candidates = if state_authority.is_some() || filesystem_authority.is_some() {
             config::search_candidates_with_user_config(cli.config.as_deref(), &workspace, false)
         } else {
             config::search_candidates(cli.config.as_deref(), &workspace)
@@ -288,7 +329,15 @@ async fn main() -> anyhow::Result<()> {
         println!("config: search order (first existing file wins):");
         let mut used: Option<&std::path::Path> = None;
         for (i, c) in candidates.iter().enumerate() {
-            let found = c.is_file();
+            let found = if let Some(authority) = &filesystem_authority {
+                if cli.config.as_deref() == Some(c.as_path()) {
+                    c.is_file()
+                } else {
+                    authority.open_read(c).is_ok()
+                }
+            } else {
+                c.is_file()
+            };
             if found && used.is_none() {
                 used = Some(c);
             }
@@ -356,7 +405,13 @@ async fn main() -> anyhow::Result<()> {
     // dispatch, so every runtime mode and every later `std::env::var` read sees
     // the same values from one place. The real environment wins; loader-hijack
     // variables are refused. See `env_file`.
-    if state_authority.is_some() {
+    if let Some(authority) = &filesystem_authority {
+        env_file::load_confined(
+            &workspace,
+            authority,
+            runtime_mode.is_mcp_stdio() && !cli.verbose,
+        );
+    } else if state_authority.is_some() {
         env_file::load_default_with_user_config(
             &workspace,
             runtime_mode.is_mcp_stdio() && !cli.verbose,
@@ -368,7 +423,25 @@ async fn main() -> anyhow::Result<()> {
 
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = runtime_mode.is_mcp_stdio() && !startup_logs_early;
-    let mut cfg = if state_authority.is_some() {
+    let mut cfg = if let Some(authority) = &filesystem_authority {
+        match config::load_confined(
+            cli.config.as_deref(),
+            &workspace,
+            quiet_cfg_stderr,
+            authority,
+        ) {
+            Ok(cfg) => cfg,
+            Err(message) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED, "message": message
+                    }})
+                );
+                std::process::exit(2);
+            }
+        }
+    } else if state_authority.is_some() {
         config::load_with_user_config(cli.config.as_deref(), &workspace, quiet_cfg_stderr, false)
     } else {
         config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr)
@@ -388,6 +461,121 @@ async fn main() -> anyhow::Result<()> {
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    if cli.confinement_requested() {
+        if let Some(name) = cfg.tools.keys().min() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "filesystem_policy_unsupported",
+                    "message": format!("configured local tool {name} cannot be confined")
+                }})
+            );
+            std::process::exit(2);
+        }
+        if kgl::autoindex::enabled() || kgl::observe::enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "filesystem_policy_unsupported",
+                    "message": "KGL autoindex and observation are not supported with --confine-paths"
+                }})
+            );
+            std::process::exit(2);
+        }
+        if let Some(mut authority) = filesystem_authority.take() {
+            authority.set_limits(cfg.fs_limits());
+            cfg.caller_agent_env = caller_agent_env;
+            let authority = Arc::new(authority);
+            cfg.agent.skills.filesystem_authority = Some(Arc::clone(&authority));
+            cfg.acp.mcp.confined = true;
+            cfg.filesystem_authority = Some(authority);
+        }
+    }
+    if cfg.filesystem_authority.is_some()
+        && cfg.state_authority.is_none()
+        && matches!(&cli.command, Some(Command::Agent(args)) if args.debug_thoughts)
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": "filesystem_policy_unsupported",
+                "message": "--debug-thoughts requires --state-dir with --confine-paths"
+            }})
+        );
+        std::process::exit(2);
+    }
+    if cfg.filesystem_authority.is_some()
+        && cfg.state_authority.is_none()
+        && !cfg.acp.mcp.oauth_servers.is_empty()
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": "filesystem_policy_unsupported",
+                "message": "OAuth credentials require --state-dir with --confine-paths"
+            }})
+        );
+        std::process::exit(2);
+    }
+    if cfg.filesystem_authority.is_some()
+        && cfg.state_authority.is_none()
+        && std::env::var_os("DAIMONOS_OPENROUTER_TRACE_DIR").is_some_and(|value| !value.is_empty())
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": "filesystem_policy_unsupported",
+                "message": "DAIMONOS_OPENROUTER_TRACE_DIR requires --state-dir with --confine-paths"
+            }})
+        );
+        std::process::exit(2);
+    }
+    if matches!(
+        runtime_mode,
+        RuntimeMode::Agent | RuntimeMode::Chat | RuntimeMode::Acp | RuntimeMode::SessionDaemon
+    ) {
+        if let Some(name) = agent_mcp::unconfineable_stdio(&cfg).await {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "filesystem_policy_unsupported",
+                    "message": format!("configured local MCP server {name} cannot be confined")
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+    if let (Some(authority), Some(Command::Session(args))) =
+        (&cfg.filesystem_authority, &cli.command)
+    {
+        match &args.command {
+            cli::SessionCommand::Import { file } => {
+                let requested = if file.is_absolute() {
+                    file.clone()
+                } else {
+                    std::env::current_dir()?.join(file)
+                };
+                if let Err(error) = authority.open_read(&requested) {
+                    let error = error.with_argument(&file.to_string_lossy());
+                    eprintln!("{}", serde_json::json!({"error": error}));
+                    std::process::exit(2);
+                }
+            }
+            cli::SessionCommand::Export {
+                output: Some(_), ..
+            } => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED,
+                        "message": "session export --output cannot be confined"
+                    }})
+                );
+                std::process::exit(2);
+            }
+            cli::SessionCommand::Export { output: None, .. } => {}
+        }
     }
     // Validate enabled writer destinations after config validation and before any writer starts.
     if let Some(authority) = &cfg.state_authority {
@@ -560,7 +748,16 @@ async fn main() -> anyhow::Result<()> {
         | None => false,
     };
     if uses_agent_prompt {
-        cfg.prompts.additional_agent_instructions = match if cfg.state_authority.is_some() {
+        cfg.prompts.additional_agent_instructions = match if let Some(authority) =
+            &cfg.filesystem_authority
+        {
+            prompts::load_agent_instructions_confined(
+                cli.agent_instructions.as_deref(),
+                &workspace,
+                authority,
+            )
+            .await
+        } else if cfg.state_authority.is_some() {
             prompts::load_agent_instructions_with_user_config(
                 cli.agent_instructions.as_deref(),
                 &workspace,
@@ -750,7 +947,7 @@ async fn run_tool_service(
     // one-shot startup build so a fresh agent session gets a current graph
     // without a manual `kgl_query index`. Runs on a blocking task; never blocks
     // or breaks startup. Off unless DAIMONOS_KGL_AUTOINDEX is set.
-    if kgl::autoindex::enabled() && !overbroad {
+    if kgl::autoindex::enabled() && !overbroad && cfg.filesystem_authority.is_none() {
         let kgl_ws = workspace.clone();
         let quiet = mcp_quiet_stderr;
         let startup_cfg = cfg.kgl.clone();

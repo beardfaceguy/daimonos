@@ -1,9 +1,11 @@
 # Reviewer runtime
 
-Date: 2026-10-29
+Date: 2026-11-03
 
 - **Run authority:** Immutable caller-selected limits on configuration, storage, access, and execution for one run.
 - **State root:** Caller-owned location for internal artifacts. It is not permission to relocate explicit tool writes.
+- **Confinement root:** Fixed run-scoped boundary for authorized filesystem access. `set_cwd` does not change it.
+- **Working directory:** Mutable session base for relative paths. With confinement enabled, the filesystem authority enforces the confinement root for every operation.
 - **Effective catalog:** The definitions actually selected after registration, workspace checks, policy, tier, and schema mode.
 - **Terminal call:** A designated final-answer call intercepted on the model side rather than executed as a tool.
 - **Corrective retry:** A new model request after a failed ending. Ordinary evidence turns do not consume it.

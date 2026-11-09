@@ -48,6 +48,30 @@ async fn dispatch_op(
     op: Op,
     on_exec_progress: Option<&ExecProgressCallback<'_>>,
 ) -> Response {
+    if session.authority.is_some()
+        && !matches!(
+            op.c,
+            protocol::op::READ
+                | protocol::op::LS
+                | protocol::op::GREP
+                | protocol::op::FIND
+                | protocol::op::STAT
+                | protocol::op::GLOB
+                | protocol::op::DIFF
+                | protocol::op::SESSION
+                | protocol::op::SCHEMA
+                // ENV_GET can return process variables. This is a documented
+                // native-protocol note, not a filesystem path (docs/configuration.md).
+                | protocol::op::ENV_GET
+                | protocol::op::ENV_SET
+        )
+    {
+        return crate::path_policy::ToolFailure::unsupported(format!(
+            "operation {} has no confined adapter",
+            op.c
+        ))
+        .into_response(&format!("opcode {}", op.c));
+    }
     match op.c {
         protocol::op::READ => file_ops::read(session, &op).await,
         protocol::op::WRITE => file_ops::write(session, &op).await,
@@ -92,6 +116,9 @@ async fn dispatch_op(
 }
 
 async fn find(session: &Session, op: &Op) -> Response {
+    if session.authority.is_some() {
+        return find_confined(session, op).await;
+    }
     let query = match &op.p {
         Some(q) => q.clone(),
         None => return Response::err(3, "find requires query in 'p'"),
@@ -121,6 +148,111 @@ async fn find(session: &Session, op: &Op) -> Response {
         "results": results,
         "index": stats,
     }))
+}
+
+/// Rank only names returned by the confined walker (ADR-022).
+async fn find_confined(session: &Session, op: &Op) -> Response {
+    use crate::path_policy::WalkOptions;
+    let Some(query) = &op.p else {
+        return Response::err(3, "find requires query in 'p'");
+    };
+    let glob = match op.g.as_deref().map(glob::Pattern::new) {
+        Some(Ok(pattern)) => Some(pattern),
+        Some(Err(error)) => return Response::err(3, &format!("invalid glob: {error}")),
+        None => None,
+    };
+    let authority = session
+        .authority
+        .as_ref()
+        .expect("confined find requires authority")
+        .clone();
+    let root =
+        op.q.as_deref()
+            .map(|path| session.resolve_path(path))
+            .unwrap_or_else(|| {
+                if session.workspace.starts_with(authority.root()) {
+                    session.workspace.clone()
+                } else {
+                    authority.root().to_path_buf()
+                }
+            });
+    let workspace = session.workspace.clone();
+    let cfg = session.cfg.index.clone();
+    let query = query.clone();
+    let max =
+        op.n.unwrap_or(session.cfg.search.default_find_max as i64)
+            .max(1) as usize;
+    let result = tokio::task::spawn_blocking(move || {
+        let start = authority.open_read(&root)?;
+        let only_file = start
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file())
+            .then(|| start.relative_path().to_path_buf());
+        let scan_root = if only_file.is_some() {
+            root.parent().unwrap_or(&root).to_path_buf()
+        } else {
+            root.clone()
+        };
+        let walk = authority.walk(
+            &scan_root,
+            WalkOptions {
+                include_hidden: false,
+                ..WalkOptions::default()
+            },
+        )?;
+        let ignores =
+            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &scan_root, &walk);
+        let skip_extensions = cfg.skip_set();
+        let skipped = walk.skipped.len();
+        let paths = walk
+            .entries
+            .into_iter()
+            .filter_map(|entry| {
+                if !entry.metadata.is_file()
+                    || only_file
+                        .as_ref()
+                        .is_some_and(|path| path != &entry.relative_path)
+                    || ignores.is_ignored(&entry.relative_path, false)
+                {
+                    return None;
+                }
+                let ext = entry
+                    .relative_path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if skip_extensions.contains(&ext) {
+                    return None;
+                }
+                let display = authority.root().join(&entry.relative_path);
+                Some(
+                    display
+                        .strip_prefix(&workspace)
+                        .unwrap_or(&display)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            })
+            .collect();
+        let (results, stats) =
+            crate::index::search_authorized_paths(paths, &cfg, &query, max, glob.as_ref());
+        Ok::<_, crate::path_policy::ToolFailure>((results, stats, skipped))
+    })
+    .await;
+    match result {
+        Ok(Ok((results, stats, skipped))) => {
+            let mut value = serde_json::json!({"results": results, "index": stats});
+            if skipped > 0 {
+                value["skipped"] = serde_json::json!(skipped)
+            }
+            Response::ok(value)
+        }
+        Ok(Err(error)) => error
+            .with_argument(op.q.as_deref().unwrap_or("."))
+            .into_response("search"),
+        Err(error) => Response::err(4, &format!("find task: {error}")),
+    }
 }
 
 fn env_set(session: &mut Session, op: &Op) -> Response {

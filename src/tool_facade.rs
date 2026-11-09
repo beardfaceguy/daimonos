@@ -25,15 +25,25 @@ pub fn active_schemas(
     workspace: &Path,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
 ) -> Vec<NeutralToolSchema> {
+    active_schemas_for_policy(workspace, descriptions, false)
+}
+
+/// Build the agent catalog from tools admitted by the run's filesystem policy.
+pub fn active_schemas_for_policy(
+    workspace: &Path,
+    descriptions: &crate::tool_descriptions::ToolDescriptions,
+    confined: bool,
+) -> Vec<NeutralToolSchema> {
     tools::all_tools()
         .into_iter()
         .filter(|t| t.tier.exposed_to_agent())
+        .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
         .filter(|t| tools::passes_context_check(t.name, workspace))
         .map(|t| {
             let mut description = descriptions.full_or_name(t.name).to_string();
             if t.name == crate::agent::EXECUTE_SCRIPT_TOOL {
                 description.push_str("\n\nExact Starlark tool signatures:\n");
-                description.push_str(&crate::script::tool_signatures());
+                description.push_str(&crate::script::tool_signatures_for_policy(confined));
             }
             NeutralToolSchema {
                 name: t.name.to_string(),
@@ -60,10 +70,20 @@ pub async fn invoke_with_progress(
     on_exec_progress: Option<&crate::ops::ExecProgressCallback<'_>>,
 ) -> Option<Response> {
     let req = tools::build_request(name, args)?;
-    let response = match req {
+    let mut response = match req {
         Ok(r) => ops::dispatch_with_progress(session, r, on_exec_progress).await,
         Err(e) => Response::err(3, &e),
     };
+    if !response.ok {
+        if let Some(data) = response.d.as_mut().and_then(Value::as_object_mut) {
+            if data
+                .get("code")
+                .is_some_and(|code| code == crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED)
+            {
+                data.insert("tool".into(), Value::String(name.to_string()));
+            }
+        }
+    }
     Some(response)
 }
 

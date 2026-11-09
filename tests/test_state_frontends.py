@@ -735,7 +735,8 @@ def test_agent_print_routes_debug_files_to_selected_state(daimonos_binary, tmp_p
         assert list(workspace.iterdir()) == []
 
 
-def test_interactive_agent_bootstraps_daemon_with_selected_state(daimonos_binary, tmp_path):
+@pytest.mark.parametrize("confined", [False, True])
+def test_interactive_agent_bootstraps_daemon_with_selected_state(daimonos_binary, tmp_path, confined):
     import pty
     import select
     import signal
@@ -766,10 +767,13 @@ def test_interactive_agent_bootstraps_daemon_with_selected_state(daimonos_binary
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                    XDG_DATA_HOME=str(home / "data"), TMPDIR=str(tmp_path))
         master_fd, slave_fd = pty.openpty()
+        command = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state)]
+        if confined:
+            command += ["--confine-paths"]
+        command += ["--agent-instructions", str(instructions), "--debug-tokens",
+                    "agent", "--interactive", "--agent-env", str(agent_env)]
         process = subprocess.Popen(
-            [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state),
-             "--agent-instructions", str(instructions), "--debug-tokens",
-             "agent", "--interactive", "--agent-env", str(agent_env)],
+            command,
             stdin=slave_fd, stdout=slave_fd, stderr=subprocess.PIPE, text=True, env=env,
         )
         os.close(slave_fd)
@@ -787,6 +791,14 @@ def test_interactive_agent_bootstraps_daemon_with_selected_state(daimonos_binary
             assert b"--agent-instructions" in cmdline
             assert os.fsencode(instructions) in cmdline
             assert b"--debug-tokens" in cmdline
+            if confined:
+                assert b"--confine-paths" in cmdline
+                assert b"--confine-root" in cmdline
+                reference = Path(os.fsdecode(cmdline[cmdline.index(b"--confine-root") + 1]))
+                assert reference.parent == Path("/proc") / str(process.pid) / "fd"
+                pinned = reference.stat()
+                selected = workspace.stat()
+                assert (pinned.st_dev, pinned.st_ino) == (selected.st_dev, selected.st_ino)
             output = b""
             deadline = time.monotonic() + 15
             while b"\x1b[6n" not in output and time.monotonic() < deadline:
@@ -818,7 +830,8 @@ def test_interactive_agent_bootstraps_daemon_with_selected_state(daimonos_binary
     assert list(workspace.iterdir()) == []
 
 
-def test_mcp_auth_status_uses_selected_credentials(daimonos_binary, tmp_path):
+@pytest.mark.parametrize("confined", [False, True])
+def test_mcp_auth_status_uses_selected_credentials(daimonos_binary, tmp_path, confined):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "home"
@@ -843,13 +856,14 @@ def test_mcp_auth_status_uses_selected_credentials(daimonos_binary, tmp_path):
                                    capture_output=True, text=True, timeout=10, env=env)
     assert legacy_status.returncode == 0, legacy_status.stderr
     assert "authenticated" in legacy_status.stdout
-    selected_status = subprocess.run(prefix + ["--state-dir", str(state), "mcp", "auth", "status", "demo"],
+    selected_prefix = prefix + ["--state-dir", str(state)] + (["--confine-paths"] if confined else [])
+    selected_status = subprocess.run(selected_prefix + ["mcp", "auth", "status", "demo"],
                                      capture_output=True, text=True, timeout=10, env=env)
     assert selected_status.returncode == 0, selected_status.stderr
     assert "auth_required" in selected_status.stdout
     (state / "oauth").mkdir(mode=0o700)
     os.link(credential, state / "oauth" / (key + ".json"))
-    hardlinked_status = subprocess.run(prefix + ["--state-dir", str(state), "mcp", "auth", "status", "demo"],
+    hardlinked_status = subprocess.run(selected_prefix + ["mcp", "auth", "status", "demo"],
                                        capture_output=True, text=True, timeout=10, env=env)
     assert hardlinked_status.returncode != 0, hardlinked_status.stdout
     assert "authenticated" not in hardlinked_status.stdout
@@ -1044,7 +1058,8 @@ def test_chat_persists_selected_state_session(daimonos_binary, tmp_path):
 
 
 @pytest.mark.parametrize("explicit_instructions", [False, True])
-def test_agent_state_ignores_implicit_home_instructions(daimonos_binary, tmp_path, explicit_instructions):
+@pytest.mark.parametrize("confined", [False, True])
+def test_agent_state_ignores_implicit_home_instructions(daimonos_binary, tmp_path, explicit_instructions, confined):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1080,7 +1095,13 @@ def test_agent_state_ignores_implicit_home_instructions(daimonos_binary, tmp_pat
     try:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        (workspace / "agent-instructions.md").write_text("WORKSPACE_INSTRUCTION_MARKER")
+        project_instructions = workspace / "agent-instructions.md"
+        if confined:
+            outside = tmp_path / "outside-instructions.md"
+            outside.write_text("OUTSIDE_INSTRUCTION_MARKER")
+            project_instructions.symlink_to(outside)
+        else:
+            project_instructions.write_text("WORKSPACE_INSTRUCTION_MARKER")
         home = tmp_path / "home"
         config_home = home / ".config" / "daimonos"
         config_home.mkdir(parents=True)
@@ -1103,6 +1124,8 @@ def test_agent_state_ignores_implicit_home_instructions(daimonos_binary, tmp_pat
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
                    XDG_DATA_HOME=str(home / "data"), TMPDIR=str(tmp_path))
         command = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state)]
+        if confined:
+            command += ["--confine-paths"]
         if explicit_instructions:
             command += ["--agent-instructions", str(host_instructions)]
         completed = subprocess.run(
@@ -1111,8 +1134,14 @@ def test_agent_state_ignores_implicit_home_instructions(daimonos_binary, tmp_pat
         )
         assert completed.returncode == 0, completed.stderr
         sent = json.dumps(captured)
+        if confined:
+            names = {tool["function"]["name"] for tool in captured[-1]["tools"]}
+            assert "read_file" in names
+            assert "write_file" not in names
+            assert "exec" not in names
         assert ("HOME_INSTRUCTION_MARKER" in sent) is explicit_instructions
-        assert ("WORKSPACE_INSTRUCTION_MARKER" in sent) is not explicit_instructions
+        assert ("WORKSPACE_INSTRUCTION_MARKER" in sent) is (not explicit_instructions and not confined)
+        assert "OUTSIDE_INSTRUCTION_MARKER" not in sent
     finally:
         server.shutdown()
         server.server_close()

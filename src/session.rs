@@ -78,17 +78,25 @@ pub struct Session {
     /// of process-global env reads (which would otherwise race with env-mutating
     /// tests). Switchable mid-session via the `set_verbosity` tool.
     pub verbosity: crate::verbosity::Verbosity,
+    /// Pinned filesystem authority shared by this run (ADR-022).
+    pub authority: Option<Arc<crate::path_policy::FilesystemAuthority>>,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
 
 impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
-        let cwd = workspace.clone();
+        let cwd = match &cfg.filesystem_authority {
+            Some(authority) if !workspace.starts_with(authority.root()) => {
+                authority.root().to_path_buf()
+            }
+            _ => workspace.clone(),
+        };
         let env = Self::build_initial_env(&cfg);
         let snapshot_store =
             SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref());
         let verbosity = cfg.mcp.default_verbosity;
+        let authority = cfg.filesystem_authority.clone();
         Self {
             workspace,
             cwd,
@@ -111,6 +119,7 @@ impl Session {
             coordination_ui_watermark: 0,
             last_response_meta: ResponseMeta::default(),
             verbosity,
+            authority,
         }
     }
 

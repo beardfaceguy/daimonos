@@ -6,6 +6,9 @@ use std::path::Path;
 pub const SKIP_INDEX_OBSERVATION: &str = "skip_index_observation";
 
 pub async fn read(session: &mut Session, op: &Op) -> Response {
+    if session.authority.is_some() {
+        return read_confined(session, op).await;
+    }
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
         None => return Response::err(3, "read requires path in 'p'"),
@@ -40,15 +43,16 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         session.update_read_cache(path, &content);
     }
 
-    // Preserve the file's trailing newline. `str::lines()` discards
-    // trailing newlines and `lines.join("\n")` doesn't restore them, so
-    // a naive collect+join silently makes read→modify→write lossy.
-    // Full reads return content verbatim; sliced reads re-emit the
-    // trailing newline only when the slice actually reaches EOF.
+    slice_read_response(&content, total_lines, offset, limit)
+}
+
+/// Format read results identically for legacy and confined reads.
+fn slice_read_response(content: &str, total_lines: usize, offset: usize, limit: i64) -> Response {
+    let is_full_read = offset == 0 && limit <= 0;
     let ends_with_newline = content.ends_with('\n');
 
     let (body, returned_count) = if is_full_read {
-        (content.clone(), total_lines)
+        (content.to_string(), total_lines)
     } else {
         let lines: Vec<&str> = if limit > 0 {
             content.lines().skip(offset).take(limit as usize).collect()
@@ -73,6 +77,49 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         resp["returned"] = json!(returned_count);
     }
     Response::ok(resp)
+}
+
+/// Read from a pinned authorized descriptor (ADR-022).
+async fn read_confined(session: &mut Session, op: &Op) -> Response {
+    let raw = match &op.p {
+        Some(path) => path,
+        None => return Response::err(3, "read requires path in 'p'"),
+    };
+    let authority = session
+        .authority
+        .as_ref()
+        .expect("confined read requires authority");
+    let requested = session.resolve_path(raw);
+    let authorized = match authority.open_read(&requested) {
+        Ok(file) => file,
+        Err(error) => return error.with_argument(raw).into_response("read_file"),
+    };
+    let cache_key = authorized.relative_path().to_path_buf();
+    let content = match tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = authorized.into_file();
+        let mut content = String::new();
+        file.read_to_string(&mut content).map(|_| content)
+    })
+    .await
+    {
+        Ok(Ok(content)) => content,
+        Ok(Err(error)) => return Response::err(4, &format!("io: {error}")),
+        Err(error) => return Response::err(4, &format!("io: {error}")),
+    };
+    let total_lines = content.lines().count();
+    let offset = op.n.unwrap_or(0).max(0) as usize;
+    let limit = op.n2.unwrap_or(0);
+    let is_full_read = offset == 0 && limit <= 0;
+    if is_full_read {
+        if session.check_read_cache(&cache_key, &content).is_some() {
+            return Response::ok(json!({"unchanged": true, "lines": total_lines}))
+                .read_dedup()
+                .with_unfiltered_chars(content.len());
+        }
+        session.update_read_cache(cache_key, &content);
+    }
+    slice_read_response(&content, total_lines, offset, limit)
 }
 
 pub async fn write(session: &mut Session, op: &Op) -> Response {
@@ -358,6 +405,9 @@ struct LsOpts<'a> {
 }
 
 pub async fn ls(session: &Session, op: &Op) -> Response {
+    if session.authority.is_some() {
+        return ls_confined(session, op).await;
+    }
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
         None => session.cwd.clone(),
@@ -397,6 +447,95 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
     }
 
     Response::ok(json!({"entries": entries}))
+}
+
+/// List through independently authorized entries (ADR-022).
+async fn ls_confined(session: &Session, op: &Op) -> Response {
+    use crate::path_policy::{EntryKind, WalkOptions};
+    let authority = session
+        .authority
+        .as_ref()
+        .expect("confined ls requires authority")
+        .clone();
+    let path =
+        op.p.as_deref()
+            .map(|path| session.resolve_path(path))
+            .unwrap_or_else(|| session.cwd.clone());
+    let depth = op.n.unwrap_or(1).clamp(1, 5) as usize;
+    let show_all = op.g.as_deref() == Some("all");
+    let show_stat = op.g.as_deref() == Some("stat");
+    let glob =
+        op.q.as_deref()
+            .and_then(|pattern| glob::Pattern::new(pattern).ok());
+    let filter = op.n2;
+    let result = tokio::task::spawn_blocking(move || {
+        let start = authority.open_read(&path)?;
+        let base = start.relative_path().to_path_buf();
+        let walk = authority.walk(
+            &path,
+            WalkOptions {
+                max_depth: Some(depth - 1),
+                follow_symlinks: true,
+                include_hidden: show_all,
+                skip_dirs: SKIP_DIRS,
+            },
+        )?;
+        Ok::<_, crate::path_policy::ToolFailure>((base, walk))
+    })
+    .await;
+    let (base, walk) = match result {
+        Ok(Ok(walk)) => walk,
+        Ok(Err(error)) => {
+            return error
+                .with_argument(op.p.as_deref().unwrap_or("."))
+                .into_response("ls")
+        }
+        Err(error) => return Response::err(4, &format!("ls: {error}")),
+    };
+    let (skipped, skipped_links) = walk.skipped_summary();
+    let mut entries = Vec::new();
+    for entry in walk.entries {
+        let Ok(relative) = entry.relative_path.strip_prefix(&base) else {
+            continue;
+        };
+        let Some(name) = relative.file_name().map(|name| name.to_string_lossy()) else {
+            continue;
+        };
+        let is_dir = entry.metadata.is_dir();
+        if matches!(filter, Some(1)) && is_dir || matches!(filter, Some(2)) && !is_dir {
+            continue;
+        }
+        if glob.as_ref().is_some_and(|pattern| !pattern.matches(&name)) {
+            continue;
+        }
+        let mut value =
+            json!({"n": relative.to_string_lossy(), "d": is_dir, "s": entry.metadata.len()});
+        if entry.kind == EntryKind::Symlink && entry.link_target.is_some() {
+            value["l"] = json!(true);
+        }
+        if show_stat {
+            use std::os::unix::fs::PermissionsExt;
+            value["m"] = json!(format!(
+                "{:o}",
+                entry.metadata.permissions().mode() & 0o7777
+            ));
+            if let Ok(mtime) = entry.metadata.modified() {
+                if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    value["t"] = json!(duration.as_secs());
+                }
+            }
+        }
+        entries.push(value);
+    }
+    entries.sort_by(|a, b| a["n"].as_str().cmp(&b["n"].as_str()));
+    let mut response = json!({"entries": entries});
+    if skipped > 0 {
+        response["skipped"] = json!(skipped);
+    }
+    if skipped_links > 0 {
+        response["skipped_links"] = json!(skipped_links);
+    }
+    Response::ok(response)
 }
 
 async fn ls_recurse(
@@ -489,6 +628,34 @@ async fn ls_recurse(
 }
 
 pub async fn stat(session: &Session, op: &Op) -> Response {
+    if let Some(authority) = &session.authority {
+        let Some(path) = &op.p else {
+            return Response::err(3, "stat requires path in 'p'");
+        };
+        let requested = session.resolve_path(path);
+        match authority.symlink_info(&requested) {
+            Ok(Some((metadata, target, broken))) => {
+                return Response::ok(json!({
+                    "size": metadata.len(), "type": "link", "target": target,
+                    "broken": broken, "readonly": metadata.permissions().readonly(),
+                }))
+            }
+            Ok(None) => {}
+            Err(error) => return error.with_argument(path).into_response("stat"),
+        }
+        let entry = match authority.open_read(&requested) {
+            Ok(entry) => entry,
+            Err(error) => return error.with_argument(path).into_response("stat"),
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return Response::err(4, &format!("stat: {error}")),
+        };
+        let file_type = if metadata.is_dir() { "dir" } else { "file" };
+        return Response::ok(json!({
+            "size": metadata.len(), "type": file_type, "readonly": metadata.permissions().readonly(),
+        }));
+    }
     let path = match &op.p {
         Some(p) => session.resolve_path(p),
         None => return Response::err(3, "stat requires path in 'p'"),
@@ -532,6 +699,9 @@ pub async fn stat(session: &Session, op: &Op) -> Response {
 }
 
 pub async fn glob(session: &Session, op: &Op) -> Response {
+    if session.authority.is_some() {
+        return glob_confined(session, op).await;
+    }
     let pattern = match &op.p {
         Some(p) => p.clone(),
         None => return Response::err(3, "glob requires pattern in 'p'"),
@@ -567,7 +737,153 @@ pub async fn glob(session: &Session, op: &Op) -> Response {
     Response::ok(json!({"files": files}))
 }
 
+/// Match glob patterns over authorized entries (ADR-022).
+async fn glob_confined(session: &Session, op: &Op) -> Response {
+    use crate::path_policy::WalkOptions;
+    use std::path::{Component, PathBuf};
+    let Some(pattern) = &op.p else {
+        return Response::err(3, "glob requires pattern in 'p'");
+    };
+    let authority = session
+        .authority
+        .as_ref()
+        .expect("confined glob requires authority")
+        .clone();
+    let scope =
+        op.q.as_deref()
+            .map(|path| session.resolve_path(path))
+            .unwrap_or_else(|| session.cwd.clone());
+    let workspace = session.workspace.clone();
+    let pattern = pattern.clone();
+    let scope_argument = op.q.clone().unwrap_or_else(|| ".".to_string());
+    let explicit_scope = op.q.is_some();
+    let result = tokio::task::spawn_blocking(move || {
+        let supplied = Path::new(&pattern);
+        if explicit_scope {
+            authority
+                .open_read(&scope)
+                .map_err(|error| error.with_argument(&scope_argument))?;
+        }
+        let (scope, relative) = if supplied.is_absolute() {
+            (
+                authority.root().to_path_buf(),
+                authority
+                    .relative_argument(supplied)
+                    .map_err(|error| error.with_argument(&pattern))?,
+            )
+        } else {
+            if !explicit_scope {
+                authority
+                    .open_read(&scope)
+                    .map_err(|error| error.with_argument(&scope_argument))?;
+            }
+            (scope, supplied.to_path_buf())
+        };
+        let mut prefix = PathBuf::new();
+        let mut suffix = PathBuf::new();
+        let mut wildcard = false;
+        for component in relative.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if text.contains(['*', '?', '[']) {
+                wildcard = true
+            }
+            if wildcard {
+                if component == Component::ParentDir {
+                    return Err(crate::path_policy::ToolFailure::unsupported(
+                        "glob parent components after wildcards are not supported with confinement",
+                    ));
+                }
+                suffix.push(component.as_os_str());
+            } else {
+                prefix.push(component.as_os_str());
+            }
+        }
+        if !wildcard {
+            let name = prefix
+                .file_name()
+                .ok_or_else(|| {
+                    crate::path_policy::ToolFailure::unsupported("glob requires a file pattern")
+                })?
+                .to_os_string();
+            prefix.pop();
+            suffix.push(name);
+        }
+        let start = scope.join(prefix);
+        let directory = match authority.open_read(&start) {
+            Ok(directory) => directory,
+            Err(error) if error.code == crate::path_policy::CODE_PATH_NOT_FOUND => {
+                return Ok((Vec::new(), 0));
+            }
+            Err(error) => return Err(error.with_argument(&pattern)),
+        };
+        let directory = authority
+            .directory_path(&start, &directory)
+            .map_err(|error| error.with_argument(&pattern))?;
+        let directory_relative = authority.relative_argument(&directory)?;
+        let matcher = glob::Pattern::new(&suffix.to_string_lossy()).map_err(|error| {
+            crate::path_policy::ToolFailure::unsupported(format!("invalid glob: {error}"))
+        })?;
+        let depth = if suffix
+            .components()
+            .any(|component| component.as_os_str() == "**")
+        {
+            None
+        } else {
+            Some(suffix.components().count().saturating_sub(1))
+        };
+        let walk = authority
+            .walk(
+                &directory,
+                WalkOptions {
+                    max_depth: depth,
+                    ..WalkOptions::default()
+                },
+            )
+            .map_err(|error| error.with_argument(&pattern))?;
+        let options = glob::MatchOptions {
+            require_literal_separator: true,
+            ..glob::MatchOptions::new()
+        };
+        let skipped = walk.skipped.len();
+        let mut files = Vec::new();
+        for entry in walk.entries {
+            if !entry.metadata.is_file() {
+                continue;
+            }
+            let Ok(relative) = entry.relative_path.strip_prefix(&directory_relative) else {
+                continue;
+            };
+            if matcher.matches_path_with(relative, options) {
+                let path = start.join(relative);
+                files.push(
+                    path.strip_prefix(&workspace)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        files.sort();
+        Ok::<_, crate::path_policy::ToolFailure>((files, skipped))
+    })
+    .await;
+    match result {
+        Ok(Ok((files, skipped))) => {
+            let mut value = json!({"files": files});
+            if skipped > 0 {
+                value["skipped"] = json!(skipped)
+            }
+            Response::ok(value)
+        }
+        Ok(Err(error)) => error.into_response("glob"),
+        Err(error) => Response::err(4, &format!("glob task: {error}")),
+    }
+}
+
 pub async fn grep(session: &Session, op: &Op) -> Response {
+    if session.authority.is_some() {
+        return grep_confined(session, op).await;
+    }
     let pattern = match &op.p {
         Some(p) => p.clone(),
         None => return Response::err(3, "grep requires pattern in 'p'"),
@@ -605,6 +921,126 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
         }
         Ok(Err(e)) => Response::err(4, &format!("grep: {e}")),
         Err(e) => Response::err(4, &format!("grep task: {e}")),
+    }
+}
+
+/// Search only through authorized file handles (ADR-022).
+async fn grep_confined(session: &Session, op: &Op) -> Response {
+    use crate::path_policy::WalkOptions;
+    use grep_regex::RegexMatcher;
+    use grep_searcher::{sinks::UTF8, Searcher};
+    let Some(pattern) = &op.p else {
+        return Response::err(3, "grep requires pattern in 'p'");
+    };
+    let matcher = match RegexMatcher::new(pattern) {
+        Ok(matcher) => matcher,
+        Err(error) => return Response::err(3, &format!("regex: {error}")),
+    };
+    let authority = session
+        .authority
+        .as_ref()
+        .expect("confined grep requires authority")
+        .clone();
+    let root =
+        op.q.as_deref()
+            .map(|path| session.resolve_path(path))
+            .unwrap_or_else(|| session.cwd.clone());
+    let workspace = session.workspace.clone();
+    let max =
+        op.n.unwrap_or(session.cfg.search.default_grep_max as i64)
+            .max(1) as usize;
+    let file_glob = op.g.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut searcher = Searcher::new();
+        let mut scan = |file: std::fs::File,
+                        relative: String,
+                        matches: &mut Vec<serde_json::Value>| {
+            searcher
+                .search_reader(
+                    &matcher,
+                    file,
+                    UTF8(|line_num, line| {
+                        if matches.len() < max {
+                            matches
+                                .push(json!({"f": relative, "l": line_num, "t": line.trim_end()}));
+                        }
+                        Ok(matches.len() < max)
+                    }),
+                )
+                .is_ok()
+        };
+        let mut matches = Vec::new();
+        let start = authority.open_read(&root)?;
+        if start.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            let display = authority.root().join(start.relative_path());
+            if file_glob
+                .as_deref()
+                .is_none_or(|pattern| glob_match_simple(pattern, &display.to_string_lossy()))
+            {
+                let relative = display
+                    .strip_prefix(&workspace)
+                    .unwrap_or(&display)
+                    .to_string_lossy()
+                    .to_string();
+                let skipped = usize::from(!scan(start.into_file(), relative, &mut matches));
+                return Ok::<_, crate::path_policy::ToolFailure>((matches, skipped));
+            }
+            return Ok((matches, 0));
+        }
+        let walk = authority.walk(
+            &root,
+            WalkOptions {
+                include_hidden: false,
+                ..WalkOptions::default()
+            },
+        )?;
+        let ignores = crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk);
+        let mut skipped = walk.skipped.len();
+        for entry in walk.entries {
+            if matches.len() >= max {
+                break;
+            }
+            if !entry.metadata.is_file() || ignores.is_ignored(&entry.relative_path, false) {
+                continue;
+            }
+            let display = authority.root().join(&entry.relative_path);
+            if file_glob
+                .as_deref()
+                .is_some_and(|pattern| !glob_match_simple(pattern, &display.to_string_lossy()))
+            {
+                continue;
+            }
+            let authorized = match authority.open_read(&entry.relative_path) {
+                Ok(authorized) => authorized,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let relative = display
+                .strip_prefix(&workspace)
+                .unwrap_or(&display)
+                .to_string_lossy()
+                .to_string();
+            if !scan(authorized.into_file(), relative, &mut matches) {
+                skipped += 1
+            }
+        }
+        Ok::<_, crate::path_policy::ToolFailure>((matches, skipped))
+    })
+    .await;
+    match result {
+        Ok(Ok((matches, skipped))) => {
+            let mut value = json!({"matches": matches});
+            if skipped > 0 {
+                value["skipped"] = json!(skipped)
+            }
+            Response::ok(value)
+        }
+        Ok(Err(error)) => error
+            .with_argument(op.q.as_deref().unwrap_or("."))
+            .into_response("search"),
+        Err(error) => Response::err(4, &format!("grep task: {error}")),
     }
 }
 
@@ -695,6 +1131,303 @@ mod tests {
             p: Some(path.to_string()),
             ..Op::default()
         }
+    }
+
+    #[tokio::test]
+    async fn confined_stat_refuses_outside_symlink() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "OUTSIDE_SENTINEL").unwrap();
+        symlink(
+            outside.path().join("secret"),
+            workspace.path().join("escape"),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("escape".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        let message = response.m.unwrap_or_default();
+        assert!(message.contains("symlink_refused"), "{message}");
+        assert!(!message.contains("OUTSIDE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn confined_stat_reports_in_root_symlink() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside"), "visible").unwrap();
+        symlink("inside", workspace.path().join("link")).unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("link".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        let data = response.d.unwrap();
+        assert_eq!(data["type"], "link");
+        assert_eq!(data["target"], "inside");
+        assert_eq!(data["broken"], false);
+    }
+
+    #[tokio::test]
+    async fn confined_stat_reports_broken_in_root_symlink() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        symlink("missing", workspace.path().join("link")).unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("link".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        let data = response.d.unwrap();
+        assert_eq!(data["type"], "link");
+        assert_eq!(data["target"], "missing");
+        assert_eq!(data["broken"], true);
+    }
+
+    #[tokio::test]
+    async fn confined_glob_skips_outside_links() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside.txt"), "visible").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE_SENTINEL").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            workspace.path().join("escape.txt"),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("*.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        let data = response.d.unwrap();
+        assert_eq!(data["files"], json!(["inside.txt"]));
+        assert!(!data.to_string().contains("OUTSIDE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn confined_glob_refuses_explicit_outside_directory() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE_SENTINEL").unwrap();
+        symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("escape/*.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        let message = response.m.unwrap_or_default();
+        assert!(message.contains("symlink_refused"), "{message}");
+        assert!(!message.contains("OUTSIDE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn confined_glob_preserves_in_root_symlink_prefix() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("real")).unwrap();
+        std::fs::write(workspace.path().join("real/file.txt"), "visible").unwrap();
+        symlink("real", workspace.path().join("alias")).unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("alias/*.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        assert_eq!(response.d.unwrap()["files"], json!(["alias/file.txt"]));
+    }
+
+    #[tokio::test]
+    async fn confined_stat_enforces_symlink_budget() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside"), "visible").unwrap();
+        symlink("inside", workspace.path().join("link")).unwrap();
+        let mut cfg = Config::default();
+        cfg.reviewer.tool_limits.max_symlinks = 0;
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("link".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        assert!(response.m.unwrap_or_default().contains("limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn confined_stat_counts_full_symlink_chain() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside"), "visible").unwrap();
+        symlink("inside", workspace.path().join("second")).unwrap();
+        symlink("second", workspace.path().join("first")).unwrap();
+        let mut cfg = Config::default();
+        cfg.reviewer.tool_limits.max_symlinks = 1;
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("first".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        assert!(response.m.unwrap_or_default().contains("limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn confined_glob_reports_original_scope_argument() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("*.txt".into()),
+                q: Some("../outside".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.d.unwrap()["argument"], "../outside");
+    }
+
+    #[tokio::test]
+    async fn confined_glob_returns_empty_for_missing_in_root_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.filesystem_authority = Some(Arc::new(
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap(),
+        ));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("missing/*.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        assert_eq!(response.d.unwrap()["files"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn legacy_glob_accepts_parent_after_wildcard() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+        std::fs::write(workspace.path().join("inside.txt"), "visible").unwrap();
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(Config::default()));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::GLOB,
+                p: Some("*/../*.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.m);
+        let files = response.d.unwrap()["files"].as_array().unwrap().clone();
+        assert!(
+            files.iter().any(|file| file
+                .as_str()
+                .is_some_and(|path| path.ends_with("inside.txt"))),
+            "{files:?}"
+        );
     }
 
     #[tokio::test]

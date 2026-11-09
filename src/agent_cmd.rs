@@ -124,7 +124,11 @@ pub async fn run_agent(
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
-    let schemas = tool_facade::active_schemas(workspace, &cfg.prompts.resolved_tool_descriptions);
+    let schemas = tool_facade::active_schemas_for_policy(
+        workspace,
+        &cfg.prompts.resolved_tool_descriptions,
+        cfg.filesystem_authority.is_some(),
+    );
 
     if args.dry_run {
         writeln!(out, "[dry-run] task: {}", args.task)?;

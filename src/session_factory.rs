@@ -189,9 +189,10 @@ impl SessionFactory for AgentSessionFactory {
         let before_lifecycle = Arc::clone(&tool_lifecycle);
         let after_lifecycle = Arc::clone(&tool_lifecycle);
         let stream_events = Arc::clone(&events);
-        let mut tools: Vec<ToolSchema> = crate::tool_facade::active_schemas(
+        let mut tools: Vec<ToolSchema> = crate::tool_facade::active_schemas_for_policy(
             &workspace,
             &self.config.prompts.resolved_tool_descriptions,
+            self.config.filesystem_authority.is_some(),
         )
         .into_iter()
         .map(|schema| ToolSchema {

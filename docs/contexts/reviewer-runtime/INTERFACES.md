@@ -38,7 +38,7 @@ The final field names must appear in help, configuration docs, audit schemas, te
 | Package / FR | Proposed caller interface | Validation and startup behavior |
 |--------------|---------------------------|---------------------------------|
 | WP01/WP02, FR-08 | Global `--state-dir PATH` | Existing writable private directory outside evidence. Missing, unusable, or overlapping roots fail before writers. No HOME/XDG/temp fallback. |
-| WP03, FR-03 | `--confine-paths`; optional `--confine-root PATH` | The first selects the workspace root. An explicit root also enables confinement. Canonical root is fixed for the run. |
+| WP03, FR-03 | `--confine-paths`; optional `--confine-root PATH` | The first selects the workspace root. An explicit root also enables confinement. Canonical root is fixed for the run. Relative arguments use the session working directory (ADR-022 amendment, PM-confirmed 2026-11-07). |
 | WP04, FR-07 | `--workspace-read-only` | Deny all evidence mutations and unsupported opaque operations. Internal writes use state. No implicit relocation of a requested evidence edit. |
 | WP05, FR-01 | Agent `--final-output PATH` | JSON contains `schema` or `schema_path`, `tool_name`, `tool_description`, `corrective_retries`, and `max_model_requests`. Schema fields are mutually exclusive. Tool-name collisions fail startup. |
 | WP06, FR-02 | `--tool-allowlist PATH` | Explicit JSON array of exact exported tool names. Omitted means legacy behavior. `[]` allows none. Unknown names fail before the probe. |

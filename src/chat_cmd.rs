@@ -78,6 +78,7 @@ pub fn build_agent_config(
         compaction,
         system_prompt,
         &crate::tool_descriptions::ToolDescriptions::default(),
+        false,
     )
 }
 
@@ -90,15 +91,17 @@ fn build_agent_config_with_descriptions(
     compaction: Option<CompactionPolicy>,
     system_prompt: String,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
+    confined: bool,
 ) -> AgentConfig {
-    let tools: Vec<ToolSchema> = tool_facade::active_schemas(workspace, descriptions)
-        .into_iter()
-        .map(|s| ToolSchema {
-            name: s.name,
-            description: s.description,
-            input_schema: s.input_schema,
-        })
-        .collect();
+    let tools: Vec<ToolSchema> =
+        tool_facade::active_schemas_for_policy(workspace, descriptions, confined)
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s.name,
+                description: s.description,
+                input_schema: s.input_schema,
+            })
+            .collect();
     AgentConfig {
         system: Some(system_prompt),
         tools,
@@ -241,6 +244,7 @@ pub async fn run_chat(
         compaction,
         system_prompt,
         &cfg.prompts.resolved_tool_descriptions,
+        cfg.filesystem_authority.is_some(),
     );
     config.cancelled_turn_message = Some(crate::prompts::cancelled_turn(&cfg).await);
     // Outbound MCP servers (#1289): the chat REPL reads the Claude-style

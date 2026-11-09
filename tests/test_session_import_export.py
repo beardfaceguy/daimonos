@@ -57,7 +57,8 @@ def test_session_json_import_export_round_trip(daimonos_binary, tmp_path):
     assert document["messages"] == archive()["messages"]
 
 
-def test_session_import_export_uses_selected_state_root(daimonos_binary, tmp_path):
+@pytest.mark.parametrize("confined", [False, True])
+def test_session_import_export_uses_selected_state_root(daimonos_binary, tmp_path, confined):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     state = tmp_path / "state"
@@ -69,7 +70,10 @@ def test_session_import_export_uses_selected_state_root(daimonos_binary, tmp_pat
     env = {key: value for key, value in os.environ.items() if not key.startswith("DAIMONOS_")}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                XDG_DATA_HOME=str(home / "data"), TMPDIR=str(tmp_path))
-    prefix = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state), "session"]
+    prefix = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state)]
+    if confined:
+        prefix += ["--confine-paths"]
+    prefix += ["session"]
 
     imported = subprocess.run(prefix + ["import", str(source)], capture_output=True, text=True,
                               timeout=10, env=env)

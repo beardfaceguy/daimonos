@@ -312,11 +312,25 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub debug_tokens: bool,
 
+    /// Confine local filesystem access to a fixed root (ADR-022).
+    #[arg(long, global = true, default_value_t = false)]
+    pub confine_paths: bool,
+
+    /// Set the confinement root. Defaults to the workspace. An explicit root
+    /// also enables confinement (reviewer-runtime INTERFACES.md, FR-03).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub confine_root: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 impl Cli {
+    /// True when either confinement flag is present (ADR-022).
+    pub fn confinement_requested(&self) -> bool {
+        self.confine_paths || self.confine_root.is_some()
+    }
+
     /// Resolve old flags and normalized subcommands to one runtime identity.
     /// Explicit subcommands retain the historical precedence over legacy flags.
     pub fn runtime_mode(&self) -> RuntimeMode {
@@ -348,6 +362,18 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confinement_flags_are_global_and_root_implies_confinement() {
+        assert!(Cli::try_parse_from(["daimonos", "--confine-paths", "acp"]).is_ok());
+        assert!(Cli::try_parse_from(["daimonos", "acp", "--confine-paths"]).is_ok());
+        let cli = Cli::try_parse_from(["daimonos", "--confine-root", "/tmp", "acp"]).unwrap();
+        assert!(!cli.confine_paths);
+        assert!(cli.confinement_requested());
+        assert!(!Cli::try_parse_from(["daimonos", "acp"])
+            .unwrap()
+            .confinement_requested());
+    }
 
     #[test]
     fn accepts_explicit_state_directory_before_and_after_subcommand() {
