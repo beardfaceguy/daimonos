@@ -384,6 +384,8 @@ pub struct FilesystemAuthority {
     pre_final_open: Option<PreFinalOpenObserver>,
     #[cfg(all(test, target_os = "linux"))]
     post_walk_open: Option<PreFinalOpenObserver>,
+    #[cfg(all(test, target_os = "linux"))]
+    post_symlink_pin: Option<PreFinalOpenObserver>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -395,6 +397,11 @@ impl FilesystemAuthority {
 
     pub(crate) fn set_post_walk_open_observer(&mut self, f: impl Fn() + Send + Sync + 'static) {
         self.post_walk_open = Some(PreFinalOpenObserver(Box::new(f)));
+    }
+
+    /// Fire after `symlink_info` reads the pinned link and before its probes.
+    pub(crate) fn set_post_symlink_pin_observer(&mut self, f: impl Fn() + Send + Sync + 'static) {
+        self.post_symlink_pin = Some(PreFinalOpenObserver(Box::new(f)));
     }
 }
 
@@ -479,6 +486,14 @@ mod sys {
 
     pub(super) fn cname(name: &OsStr) -> Option<CString> {
         CString::new(name.as_bytes()).ok()
+    }
+
+    /// Report whether two descriptors name the same inode. Errors count as no.
+    pub(super) fn same_inode(a: RawFd, b: RawFd) -> bool {
+        match (fstat(a), fstat(b)) {
+            (Ok(a), Ok(b)) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
+            _ => false,
+        }
     }
 
     pub(super) fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
@@ -638,6 +653,8 @@ impl FilesystemAuthority {
             pre_final_open: None,
             #[cfg(test)]
             post_walk_open: None,
+            #[cfg(test)]
+            post_symlink_pin: None,
         })
     }
 
@@ -729,6 +746,12 @@ impl FilesystemAuthority {
     }
 
     /// Describe an authorized symlink without reopening an ambient path.
+    ///
+    /// Pins the link's parent directory through the resolver and opens the
+    /// link beneath that handle. A relative target is judged from the pinned
+    /// parent's physical in-root path, not the caller's lexical parent. After
+    /// the probes, the parent and link identities are checked again, so a swap
+    /// during the probes is refused instead of misreported (ADR-022).
     pub fn symlink_info(
         &self,
         path: &Path,
@@ -736,33 +759,33 @@ impl FilesystemAuthority {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStringExt;
         let relative = relativize(&self.root, path)?;
-        let name = sys::cstring(&relative)?;
-        let node = match sys::openat2(
-            self.root_fd.as_raw_fd(),
-            &name,
-            libc::O_PATH | libc::O_NOFOLLOW,
-            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS,
-        ) {
-            Ok(node) => {
-                let checked = self.resolve_manual(path, &relative, libc::O_PATH, false, true)?;
-                let expected =
-                    sys::fstat(node.as_raw_fd()).map_err(|error| map_open_err(path, error))?;
-                let actual =
-                    sys::fstat(checked.as_raw_fd()).map_err(|error| map_open_err(path, error))?;
-                if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
-                    return Err(ToolFailure::refusal(
-                        "path_read_failed",
-                        "path changed during authorization",
-                        Some(path),
-                    ));
-                }
-                node
-            }
-            Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-                self.resolve_manual(path, &relative, libc::O_PATH, true, true)?
-            }
-            Err(error) => return Err(map_open_err(path, error)),
+        // The root, `.`, and a final `..` never name a symlink. Callers
+        // authorize those paths with `open_read`.
+        let Some(name) = relative.file_name() else {
+            return Ok(None);
         };
+        let parent_rel = match relative.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let changed = || {
+            ToolFailure::refusal(
+                "path_read_failed",
+                "path changed during authorization",
+                Some(path),
+            )
+        };
+        let parent = self.resolve(path, parent_rel, libc::O_PATH | libc::O_DIRECTORY)?;
+        let name_c = sys::cstring(Path::new(name))?;
+        let open_link = || {
+            sys::openat2(
+                parent.as_raw_fd(),
+                &name_c,
+                libc::O_PATH | libc::O_NOFOLLOW,
+                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS,
+            )
+        };
+        let node = open_link().map_err(|error| map_open_err(path, error))?;
         let stat = sys::fstat(node.as_raw_fd()).map_err(|error| map_open_err(path, error))?;
         if (stat.st_mode as u32) & (libc::S_IFMT) != libc::S_IFLNK {
             return Ok(None);
@@ -774,13 +797,18 @@ impl FilesystemAuthority {
         let target = sys::readlink_fd(node.as_raw_fd(), self.limits.max_symlink_target_bytes)
             .map_err(|error| map_link_error(path, self.limits.max_symlink_target_bytes, error))?;
         let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+        #[cfg(test)]
+        if let Some(observer) = &self.post_symlink_pin {
+            (observer.0)();
+        }
+        let parent_dir = self.physical_relative(&parent).ok_or_else(changed)?;
         let target_path = if target.is_absolute() {
             target.clone()
         } else {
-            relative.parent().unwrap_or(Path::new("")).join(&target)
+            parent_dir.join(&target)
         };
         // Check the full caller path for the total link budget, and check the
-        // pinned link target separately so a concurrent swap cannot expose it.
+        // target from the pinned parent so a concurrent swap cannot expose it.
         let mut broken = false;
         for requested in [path, target_path.as_path()] {
             match self.open_read(requested) {
@@ -792,6 +820,17 @@ impl FilesystemAuthority {
                 Err(error) => return Err(error),
             }
         }
+        // The probes walk paths. Refuse if the pinned parent or link moved.
+        let parent_again = self
+            .resolve(path, parent_rel, libc::O_PATH | libc::O_DIRECTORY)
+            .map_err(|_| changed())?;
+        let link_again = open_link().map_err(|_| changed())?;
+        if !sys::same_inode(parent.as_raw_fd(), parent_again.as_raw_fd())
+            || !sys::same_inode(node.as_raw_fd(), link_again.as_raw_fd())
+            || self.physical_relative(&parent).as_ref() != Some(&parent_dir)
+        {
+            return Err(changed());
+        }
         let metadata = std::fs::File::from(node)
             .metadata()
             .map_err(|error| map_open_err(path, error))?;
@@ -800,6 +839,15 @@ impl FilesystemAuthority {
             target.to_string_lossy().into_owned(),
             broken,
         )))
+    }
+
+    /// Return the current in-root path of a pinned directory, or `None` when
+    /// it is no longer beneath the root.
+    fn physical_relative(&self, directory: &std::os::fd::OwnedFd) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        let current =
+            std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd())).ok()?;
+        current.strip_prefix(&self.root).ok().map(Path::to_path_buf)
     }
 
     /// Resolve atomically with the kernel's magic-link guard, then enforce the
@@ -1755,6 +1803,67 @@ mod tests {
         symlink(&real_path, dir.path().join("nlink")).unwrap();
         let auth = authority(dir.path());
         assert_eq!(read_to_string(&auth, "nlink").unwrap(), "raw-bytes-ok");
+    }
+
+    // symlink_info: the target and `broken` flag come from the pinned link's
+    // parent. A parent swapped after the pin is refused (rubber-ducky B1, PR #259).
+    fn symlink_info_fixture() -> (tempfile::TempDir, FilesystemAuthority) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/target.txt"), "inside").unwrap();
+        symlink("target.txt", dir.path().join("a/link")).unwrap();
+        let auth = authority(dir.path());
+        (dir, auth)
+    }
+
+    #[test]
+    fn symlink_info_judges_relative_targets_from_the_physical_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("t.txt"), "top").unwrap();
+        symlink("sub", dir.path().join("alias")).unwrap();
+        symlink("../t.txt", dir.path().join("sub/up")).unwrap();
+        symlink("nope", dir.path().join("sub/dead")).unwrap();
+        symlink("../../outside", dir.path().join("sub/esc")).unwrap();
+        let auth = authority(dir.path());
+
+        let (_, target, broken) = auth.symlink_info(Path::new("alias/up")).unwrap().unwrap();
+        assert_eq!((target.as_str(), broken), ("../t.txt", false));
+        let (_, _, broken) = auth.symlink_info(Path::new("alias/dead")).unwrap().unwrap();
+        assert!(broken);
+        let error = auth.symlink_info(Path::new("alias/esc")).unwrap_err();
+        assert_eq!(error.code, CODE_SYMLINK_REFUSED);
+        assert!(auth.symlink_info(Path::new("t.txt")).unwrap().is_none());
+        assert!(auth.symlink_info(Path::new(".")).unwrap().is_none());
+        assert!(auth.symlink_info(Path::new("alias")).unwrap().is_some());
+    }
+
+    #[test]
+    fn symlink_info_refuses_parent_swapped_inside_root_after_pin() {
+        let (dir, mut auth) = symlink_info_fixture();
+        let root = dir.path().to_path_buf();
+        auth.set_post_symlink_pin_observer(move || {
+            std::fs::rename(root.join("a"), root.join("b")).unwrap();
+            std::fs::create_dir(root.join("a")).unwrap();
+        });
+        let error = auth.symlink_info(Path::new("a/link")).unwrap_err();
+        assert_eq!(error.code, "path_read_failed");
+        assert!(error.message.contains("changed"), "{}", error.message);
+    }
+
+    #[test]
+    fn symlink_info_refuses_parent_moved_outside_root_after_pin() {
+        let (dir, mut auth) = symlink_info_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let moved = outside.path().join("moved_a");
+        auth.set_post_symlink_pin_observer(move || {
+            std::fs::rename(root.join("a"), &moved).unwrap();
+            std::fs::create_dir(root.join("a")).unwrap();
+        });
+        let error = auth.symlink_info(Path::new("a/link")).unwrap_err();
+        assert_eq!(error.code, "path_read_failed");
+        assert!(error.message.contains("changed"), "{}", error.message);
     }
 
     // Regression 4: a FIFO (special file) is refused up front, not reopened
