@@ -92,7 +92,11 @@ servers remain a separate trust boundary. This is not a sandbox for
 external services or a read-only workspace; WP04 covers the read-only gate.
 
 Workspace-discovered control files are read through the authority. Explicit
-caller-selected control files remain separate inputs. OAuth credentials, request
+caller-selected control files remain separate inputs. An explicit `--config`
+file is trusted caller input: the control paths it names, such as prompt
+overrides, `[agent.mcp] servers_file`, and Zed settings, are also read without
+the authority. A workspace `daimonos.toml` does not grant this trust. Do not
+pass `--config` a file that the evidence can modify. OAuth credentials, request
 tracing, and `--debug-thoughts` require `--state-dir` in confined mode. Global
 ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose

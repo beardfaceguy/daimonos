@@ -1297,26 +1297,17 @@ def test_confined_fifo_read_is_refused_without_blocking(confined):
     assert "unsupported_file_type" in json.dumps(result)
 
 
-def test_confined_native_socket_refuses_mutating_opcodes(daimonos_binary, tmp_path):
+def _native_requests(daimonos_binary, workspace, requests):
+    """Send native-protocol requests to a confined `--socket` server."""
     import socket
     import subprocess
     import tempfile
     import time
     from pathlib import Path
 
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    requests = {
-        "write": {"c": 1, "p": "new.txt", "s": "x"},
-        "append": {"c": 27, "p": "new.txt", "s": "x"},
-        "exec": {"c": 8, "s": "touch pwned"},
-        "bg": {"c": 9, "s": "touch pwned_bg"},
-        "git": {"c": 15, "s": "status"},
-        "snap": {"c": 12},
-        "tool_run": {"c": 20, "p": "anything"},
-    }
     responses = {}
-    with tempfile.TemporaryDirectory(prefix="dn-") as short:
+    # A short directory keeps the socket path under the Unix length limit.
+    with tempfile.TemporaryDirectory(prefix="dn-", dir="/tmp") as short:
         state = Path(short) / "s"
         state.mkdir(mode=0o700)
         socket_path = state / "native.sock"
@@ -1342,7 +1333,52 @@ def test_confined_native_socket_refuses_mutating_opcodes(daimonos_binary, tmp_pa
             if process.poll() is None:
                 process.terminate()
             process.communicate(timeout=5)
+    return responses
+
+
+def test_confined_native_socket_refuses_mutating_opcodes(daimonos_binary, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    requests = {
+        "write": {"c": 1, "p": "new.txt", "s": "x"},
+        "append": {"c": 27, "p": "new.txt", "s": "x"},
+        "exec": {"c": 8, "s": "touch pwned"},
+        "bg": {"c": 9, "s": "touch pwned_bg"},
+        "git": {"c": 15, "s": "status"},
+        "snap": {"c": 12},
+        "tool_run": {"c": 20, "p": "anything"},
+    }
+    responses = _native_requests(daimonos_binary, workspace, requests)
     for name, response in responses.items():
         assert response["ok"] is False, (name, response)
         assert response["d"]["code"] == "filesystem_policy_unsupported", (name, response)
     assert list(workspace.iterdir()) == []
+
+
+def test_confined_glob_parent_prefix_resolves_physically_and_refuses_escape(
+    daimonos_binary, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    (workspace / "sub" / "deep").mkdir(parents=True)
+    (workspace / "sub" / "side.txt").write_text("side")
+    (workspace / "top.txt").write_text("top")
+    (workspace / "alias").symlink_to("sub/deep", target_is_directory=True)
+    (tmp_path / "outside.txt").write_text("OUTSIDE_SENTINEL")
+    requests = {
+        "wildcard_through_link": {"c": 5, "p": "alias/../*.txt"},
+        "literal_through_link": {"c": 5, "p": "alias/../side.txt"},
+        "wildcard_escape": {"c": 5, "p": "../*.txt"},
+        "wildcard_escape_through_link": {"c": 5, "p": "alias/../../../*.txt"},
+        "literal_escape_through_link": {"c": 5, "p": "alias/../../../outside.txt"},
+    }
+    responses = _native_requests(daimonos_binary, workspace, requests)
+    # `alias/..` is the physical parent of sub/deep (sub), not the workspace
+    # root: only sub/side.txt matches, never top.txt. Matches keep the caller's
+    # prefix form, which later reads resolve through the same authority.
+    for name in ["wildcard_through_link", "literal_through_link"]:
+        assert responses[name]["ok"] is True, (name, responses[name])
+        assert responses[name]["d"]["files"] == ["alias/../side.txt"], (name, responses[name])
+    for name in ["wildcard_escape", "wildcard_escape_through_link", "literal_escape_through_link"]:
+        assert responses[name]["ok"] is False, (name, responses[name])
+        assert responses[name]["d"]["code"] == "path_outside_root", (name, responses[name])
+    assert "OUTSIDE_SENTINEL" not in json.dumps(responses)
