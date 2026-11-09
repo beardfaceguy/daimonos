@@ -841,6 +841,12 @@ impl SessionPersistence {
             .extend(failures);
     }
 
+    /// Simulate this runtime exiting while a delayed save is pending.
+    #[cfg(test)]
+    pub(crate) fn release_owner_lock_for_test(&self) {
+        self.writer.release_owner_lock_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_next_save(
         &self,
@@ -1551,6 +1557,7 @@ impl SessionCore {
                     tracing::warn!(
                         target: "daimonos::session_core",
                         event = "session_writer_superseded",
+                        session_id = %persistence.session_id,
                         "session persistence stopped because a newer runtime claimed ownership"
                     );
                     self.publish_durability_status(
@@ -1567,6 +1574,7 @@ impl SessionCore {
                         tracing::warn!(
                             target: "daimonos::session_core",
                             event = "session_payload_save_exhausted",
+                            session_id = %persistence.session_id,
                             attempts,
                             retryable,
                             error = %error,
@@ -5199,6 +5207,8 @@ mod tests {
         .await
         .unwrap();
 
+        // The prior runtime exited (lock released, ADR-033) with a save pending.
+        old_persistence.release_owner_lock_for_test();
         let new_persistence = SessionPersistence::new(
             "session-1",
             store.clone(),

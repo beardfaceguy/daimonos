@@ -366,7 +366,11 @@ impl From<SessionStoreErrorKind> for SessionOpenError {
                 debug_assert!(false, "session open cannot produce duplicate-import errors");
                 Self::Internal
             }
-            SessionStoreErrorKind::WriterChanged => Self::Io,
+            // The v3 attach protocol has no owner field. The claim WARN names the
+            // owner pid (ADR-033).
+            SessionStoreErrorKind::WriterChanged | SessionStoreErrorKind::OwnedElsewhere => {
+                Self::Io
+            }
             SessionStoreErrorKind::NotFound => Self::NotFound,
             SessionStoreErrorKind::FutureVersion => Self::FutureVersion,
             SessionStoreErrorKind::UnsupportedVersion => Self::UnsupportedVersion,
