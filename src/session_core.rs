@@ -2360,7 +2360,10 @@ struct ApprovalState {
 pub struct ApprovalBroker {
     state: StdMutex<ApprovalState>,
     allow_always: bool,
+    /// Deadline that runs only while no eligible client is attached (daemon).
     timeout: Option<std::time::Duration>,
+    /// Hard deadline from the request, whatever the client state (#1616).
+    response_timeout: Option<std::time::Duration>,
     approve_once_clients: AtomicUsize,
     approve_always_clients: AtomicUsize,
     eligibility_changed: tokio::sync::Notify,
@@ -2372,6 +2375,7 @@ impl ApprovalBroker {
             state: StdMutex::new(ApprovalState::default()),
             allow_always,
             timeout: None,
+            response_timeout: None,
             approve_once_clients: AtomicUsize::new(0),
             approve_always_clients: AtomicUsize::new(0),
             eligibility_changed: tokio::sync::Notify::new(),
@@ -2383,10 +2387,18 @@ impl ApprovalBroker {
             state: StdMutex::new(ApprovalState::default()),
             allow_always,
             timeout: Some(timeout),
+            response_timeout: None,
             approve_once_clients: AtomicUsize::new(0),
             approve_always_clients: AtomicUsize::new(0),
             eligibility_changed: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Deny any approval that gets no answer within `limit`, even while a
+    /// client is attached (#1616).
+    pub fn with_response_timeout(mut self, limit: std::time::Duration) -> Self {
+        self.response_timeout = Some(limit);
+        self
     }
 
     pub fn set_eligible_client_counts(&self, approve_once: usize, approve_always: usize) {
@@ -2599,6 +2611,17 @@ pub async fn request_approval(
         .register(request)
         .map_err(ApprovalRequestError::Broker)?;
     let approval_id = registered.request.id.clone();
+    let tool = registered.request.tool.clone();
+    let requested_at = std::time::Instant::now();
+    // #1616: without this line an unanswered prompt is invisible in the log.
+    tracing::info!(
+        target: "daimonos::session_core",
+        event = "approval_requested",
+        approval_id = %approval_id,
+        tool = %tool,
+        tool_call_id = %registered.request.tool_call_id,
+        response_timeout_secs = broker.response_timeout.map(|limit| limit.as_secs()),
+    );
 
     if let Err(error) = events.emit(SessionEvent::TurnStatusChanged {
         status: TurnStatus::WaitingForApproval,
@@ -2620,82 +2643,113 @@ pub async fn request_approval(
         });
         ApprovalRequestError::BrokerClosed
     };
-    let resolution = if let Some(timeout) = broker.timeout {
-        let mut ineligible_deadline: Option<(tokio::time::Instant, u64)> = None;
-        loop {
-            // Tokio oneshot::Receiver::try_recv consumes only a ready value;
-            // Empty leaves it valid for the cancel-safe &mut Receiver branch
-            // below. Biased selects prefer resolution over simultaneous
-            // eligibility churn.
-            match receiver.try_recv() {
-                Ok(resolution) => break resolution,
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    return Err(broker_closed());
+    let wait = async {
+        Ok::<_, ApprovalRequestError>(if let Some(timeout) = broker.timeout {
+            let mut ineligible_deadline: Option<(tokio::time::Instant, u64)> = None;
+            loop {
+                // Tokio oneshot::Receiver::try_recv consumes only a ready value;
+                // Empty leaves it valid for the cancel-safe &mut Receiver branch
+                // below. Biased selects prefer resolution over simultaneous
+                // eligibility churn.
+                match receiver.try_recv() {
+                    Ok(resolution) => break resolution,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        return Err(broker_closed());
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-            }
-            let mut eligibility_changed = Box::pin(broker.eligibility_changed.notified());
-            // notify_waiters does not retain a permit for a future that has
-            // not registered yet. Enable before reading eligibility so every
-            // transition after this point wakes this exact loop iteration.
-            eligibility_changed.as_mut().enable();
-            if broker.has_eligible_client(&approval_id) {
-                if let Some((_, deadline_unix_ms)) = ineligible_deadline {
-                    if broker.update_deadline(&approval_id, deadline_unix_ms, true) {
+                let mut eligibility_changed = Box::pin(broker.eligibility_changed.notified());
+                // notify_waiters does not retain a permit for a future that has
+                // not registered yet. Enable before reading eligibility so every
+                // transition after this point wakes this exact loop iteration.
+                eligibility_changed.as_mut().enable();
+                if broker.has_eligible_client(&approval_id) {
+                    if let Some((_, deadline_unix_ms)) = ineligible_deadline {
+                        if broker.update_deadline(&approval_id, deadline_unix_ms, true) {
+                            let _ = events.emit(SessionEvent::ApprovalDeadlineChanged {
+                                approval_id: approval_id.clone(),
+                                ineligible_deadline_unix_ms: deadline_unix_ms,
+                                paused: true,
+                            });
+                        }
+                    }
+                    tokio::select! {
+                        biased;
+                        resolution = &mut receiver => {
+                            break resolution.map_err(|_| broker_closed())?;
+                        }
+                        _ = &mut eligibility_changed => continue,
+                    }
+                } else {
+                    let (deadline, deadline_unix_ms) =
+                        *ineligible_deadline.get_or_insert_with(|| {
+                            (
+                                tokio::time::Instant::now() + timeout,
+                                system_deadline_unix_ms(timeout),
+                            )
+                        });
+                    if broker.update_deadline(&approval_id, deadline_unix_ms, false) {
                         let _ = events.emit(SessionEvent::ApprovalDeadlineChanged {
                             approval_id: approval_id.clone(),
                             ineligible_deadline_unix_ms: deadline_unix_ms,
-                            paused: true,
+                            paused: false,
                         });
                     }
-                }
-                tokio::select! {
-                    biased;
-                    resolution = &mut receiver => {
-                        break resolution.map_err(|_| broker_closed())?;
-                    }
-                    _ = &mut eligibility_changed => continue,
-                }
-            } else {
-                let (deadline, deadline_unix_ms) = *ineligible_deadline.get_or_insert_with(|| {
-                    (
-                        tokio::time::Instant::now() + timeout,
-                        system_deadline_unix_ms(timeout),
-                    )
-                });
-                if broker.update_deadline(&approval_id, deadline_unix_ms, false) {
-                    let _ = events.emit(SessionEvent::ApprovalDeadlineChanged {
-                        approval_id: approval_id.clone(),
-                        ineligible_deadline_unix_ms: deadline_unix_ms,
-                        paused: false,
-                    });
-                }
-                tokio::select! {
-                    biased;
-                    resolution = &mut receiver => {
-                        break resolution.map_err(|_| broker_closed())?;
-                    }
-                    _ = &mut eligibility_changed => continue,
-                    _ = tokio::time::sleep_until(deadline) => {
-                        match broker.resolve(
-                            &approval_id,
-                            "approval_timeout",
-                            &[ClientCapability::ApproveOnce],
-                            ApprovalDecision::Deny,
-                        ) {
-                            Ok(resolution) => break resolution,
-                            Err(ApprovalError::NotPending) => continue,
-                            Err(error) => {
-                                return Err(ApprovalRequestError::Broker(error));
+                    tokio::select! {
+                        biased;
+                        resolution = &mut receiver => {
+                            break resolution.map_err(|_| broker_closed())?;
+                        }
+                        _ = &mut eligibility_changed => continue,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            match broker.resolve(
+                                &approval_id,
+                                "approval_timeout",
+                                &[ClientCapability::ApproveOnce],
+                                ApprovalDecision::Deny,
+                            ) {
+                                Ok(resolution) => break resolution,
+                                Err(ApprovalError::NotPending) => continue,
+                                Err(error) => {
+                                    return Err(ApprovalRequestError::Broker(error));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-    } else {
-        receiver.await.map_err(|_| broker_closed())?
+        } else {
+            (&mut receiver).await.map_err(|_| broker_closed())?
+        })
     };
+    // #1616: the response timeout bounds the whole wait, even while a client
+    // is attached. An ACP client that never shows or answers the prompt must
+    // not park the turn forever.
+    let resolution = match broker.response_timeout {
+        None => wait.await?,
+        Some(limit) => match tokio::time::timeout(limit, wait).await {
+            Ok(result) => result?,
+            Err(_) => match broker.resolve(
+                &approval_id,
+                "approval_response_timeout",
+                &[ClientCapability::ApproveOnce],
+                ApprovalDecision::Deny,
+            ) {
+                Ok(resolution) => resolution,
+                // A client answer raced the deadline; keep that answer.
+                Err(_) => receiver.try_recv().map_err(|_| broker_closed())?,
+            },
+        },
+    };
+    tracing::info!(
+        target: "daimonos::session_core",
+        event = "approval_resolved",
+        approval_id = %approval_id,
+        tool = %tool,
+        decision = ?resolution.decision,
+        resolved_by = %resolution.resolved_by,
+        wait_ms = requested_at.elapsed().as_millis() as u64,
+    );
     if let Some(unemitted) = broker.take_unemitted(&approval_id) {
         let _ = events.emit(SessionEvent::ApprovalResolved {
             approval_id: unemitted.approval_id,
@@ -2737,7 +2791,11 @@ pub struct CanonicalToolLifecycle {
     active: StdMutex<HashSet<String>>,
     max_active_tools: usize,
     max_output_bytes: Option<usize>,
+    bridge_slot: Option<BridgeSlot>,
 }
+
+/// A session's swappable MCP bridge (replaced on a live MCP refresh).
+pub type BridgeSlot = Arc<tokio::sync::RwLock<Arc<crate::mcp_bridge::McpBridge>>>;
 
 impl CanonicalToolLifecycle {
     #[cfg(test)]
@@ -2754,6 +2812,7 @@ impl CanonicalToolLifecycle {
             active: StdMutex::new(HashSet::new()),
             max_active_tools: max_active_tools.max(1),
             max_output_bytes: None,
+            bridge_slot: None,
         }
     }
 
@@ -2771,6 +2830,7 @@ impl CanonicalToolLifecycle {
             active: StdMutex::new(HashSet::new()),
             max_active_tools: max_active_tools.max(1),
             max_output_bytes: Some(max_output_bytes.max(16)),
+            bridge_slot: None,
         }
     }
 
@@ -2784,8 +2844,27 @@ impl CanonicalToolLifecycle {
         self.authorize_reserved(info).await
     }
 
-    pub(crate) fn approval_required(&self, tool: &str) -> bool {
-        matches!(self.safety.gate(tool), crate::safety::Gate::NeedsApproval)
+    pub(crate) async fn approval_required(&self, tool: &str) -> bool {
+        matches!(self.gate(tool).await, crate::safety::Gate::NeedsApproval)
+    }
+
+    /// Resolve the session's live MCP bridge for remote-tool permission keys.
+    pub fn with_bridge_slot(mut self, slot: BridgeSlot) -> Self {
+        self.bridge_slot = Some(slot);
+        self
+    }
+
+    /// Safety gate with the remote tool's `server/tool` permission key taken
+    /// from the current bridge (#1616, ADR-034). Without a bridge, remote
+    /// tools keep an unknown identity and permission lists ask.
+    async fn gate(&self, tool: &str) -> crate::safety::Gate {
+        match &self.bridge_slot {
+            Some(slot) if tool.starts_with(crate::safety::REMOTE_TOOL_PREFIX) => {
+                let bridge = Arc::clone(&*slot.read().await);
+                self.safety.gate_keyed(tool, bridge.permission_key(tool))
+            }
+            _ => self.safety.gate(tool),
+        }
     }
 
     /// Atomically admit one tool call before any frontend announces it.
@@ -2824,7 +2903,7 @@ impl CanonicalToolLifecycle {
         info: &crate::agent::ToolCallInfo,
     ) -> crate::agent::BeforeHookResult {
         let title = tool_call_title(info);
-        let decision = match self.safety.gate(&info.name) {
+        let decision = match self.gate(&info.name).await {
             crate::safety::Gate::Block(reason) => crate::agent::BeforeHookResult::Block(reason),
             crate::safety::Gate::Allow => crate::agent::BeforeHookResult::Allow,
             crate::safety::Gate::NeedsApproval => {
@@ -2934,6 +3013,9 @@ impl CanonicalToolLifecycle {
 fn approval_denial_reason(tool: &str, resolution: &ApprovalResolution) -> String {
     match resolution.resolved_by.as_str() {
         "acp_cancelled" => format!("permission request cancelled for '{tool}'"),
+        "approval_response_timeout" => {
+            format!("permission request for '{tool}' timed out: the client did not answer")
+        }
         "acp_unrecognized" => format!("unrecognized permission outcome for '{tool}'"),
         "acp_request_failed" | "acp_unavailable" | "acp_spawn_failed" => {
             format!("permission request failed for '{tool}'")
@@ -3160,6 +3242,20 @@ mod tests {
             ),
             "permission request cancelled for 'exec'"
         );
+        // #1616: a timeout is not an operator refusal; the model must be told
+        // that nobody answered, so it does not report "the user declined".
+        assert_eq!(
+            approval_denial_reason(
+                "exec",
+                &ApprovalResolution {
+                    approval_id: "approval-3".to_string(),
+                    tool: "exec".to_string(),
+                    decision: ApprovalDecision::Deny,
+                    resolved_by: "approval_response_timeout".to_string(),
+                },
+            ),
+            "permission request for 'exec' timed out: the client did not answer"
+        );
     }
 
     #[tokio::test]
@@ -3235,6 +3331,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// #1616: an ACP client (Zed) is attached but never answers the
+    /// permission request. The response timeout must deny even though a
+    /// client is eligible, so the turn cannot wait forever.
+    #[tokio::test]
+    async fn response_timeout_denies_even_with_eligible_client() {
+        let broker =
+            ApprovalBroker::new(true).with_response_timeout(std::time::Duration::from_millis(20));
+        broker.set_eligible_client_counts(1, 1);
+        let events = SessionEventRouter::default();
+
+        let resolution = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            request_approval(&broker, &events, request()),
+        )
+        .await
+        .expect("response timeout must end the wait")
+        .expect("timeout resolves safely");
+
+        assert_eq!(resolution.decision, ApprovalDecision::Deny);
+        assert_eq!(resolution.resolved_by, "approval_response_timeout");
+        assert!(broker.pending().is_empty());
     }
 
     #[tokio::test]

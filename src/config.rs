@@ -1100,6 +1100,9 @@ impl SessionRuntimeConfig {
 pub struct AcpConfig {
     /// Maximum saved sessions returned by one ACP session/list response.
     pub session_list_page_size: usize,
+    /// Seconds a session/request_permission may go unanswered before the tool
+    /// call is denied (#1616). Applies while the client is connected.
+    pub approval_timeout_secs: u64,
     /// MCP-server bridge: consume the MCP servers Zed forwards on
     /// session/new/load and expose their tools to the model (ADR-003, #990).
     pub mcp: AcpMcpConfig,
@@ -1155,6 +1158,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             session_list_page_size: 50,
+            approval_timeout_secs: 120,
             mcp: AcpMcpConfig::default(),
         }
     }
@@ -1164,6 +1168,9 @@ impl AcpConfig {
     fn validate(&self) -> Result<(), String> {
         if self.session_list_page_size == 0 {
             return Err("acp.session_list_page_size must be greater than zero".to_string());
+        }
+        if self.approval_timeout_secs == 0 {
+            return Err("acp.approval_timeout_secs must be greater than zero".to_string());
         }
         self.mcp.validate()?;
         Ok(())
@@ -3164,6 +3171,17 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("scrollback_entries"));
+    }
+
+    #[test]
+    fn acp_approval_timeout_defaults_to_120_and_rejects_zero() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.acp.approval_timeout_secs, 120);
+        cfg.acp.approval_timeout_secs = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("acp.approval_timeout_secs"));
     }
 
     #[test]
