@@ -11,7 +11,9 @@
 //! model's own work is a mutation no name list would flag. The fingerprint is a
 //! git tree object built in a per-turn shadow repository, so it is
 //! content-addressed, includes ignored workspace content, never touches the
-//! user's index, and is removed at the end of the turn.
+//! user's index, and is removed at the end of the turn. A turn holds a flock on
+//! its repo's `<instance>.lock`; when a killed turn skips that removal, the next
+//! turn in the same workspace sweeps every repo whose lock is free (#1617).
 //!
 //! When the fingerprint is unavailable the status is [`EvidenceStatus::Unknown`]
 //! rather than "no mutations" — reporting unobserved absence as evidence is the
@@ -138,6 +140,93 @@ pub fn workspace_git_dir(base: &Path, workspace: &Path) -> PathBuf {
 pub struct Worktree {
     workspace: PathBuf,
     git_dir: PathBuf,
+    /// Exclusive flock on `<instance>.lock`, held for the turn's lifetime.
+    /// The kernel releases it when the process dies, which is how a later
+    /// sweep tells an orphaned repo from a live one (#1617).
+    owner: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+/// Owner-lock path that pairs with a shadow repo: `<instance>.git` →
+/// `<instance>.lock`.
+fn lock_path(git_dir: &Path) -> PathBuf {
+    git_dir.with_extension("lock")
+}
+
+/// Open and exclusively lock `path`. Retries when a concurrent sweep unlinked
+/// the file between open and lock: a lock on an unlinked inode protects
+/// nothing, because the next sweep would create and lock a fresh file.
+fn acquire_owner_lock(path: &Path) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    for _ in 0..8 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        file.try_lock_exclusive()
+            .map_err(|e| format!("lock {}: {e}", path.display()))?;
+        if still_linked(&file, path) {
+            return Ok(file);
+        }
+    }
+    Err(format!("lock {} kept being removed", path.display()))
+}
+
+#[cfg(unix)]
+fn still_linked(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(current)) => held.ino() == current.ino() && held.dev() == current.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn still_linked(_file: &std::fs::File, path: &Path) -> bool {
+    path.exists()
+}
+
+/// Remove every shadow repo in `store` whose owner lock is free, plus lock
+/// files whose repo is gone (#1617). Each repo belongs to one turn and `Drop`
+/// removes it, so a free lock means its turn's process died. Best effort:
+/// any entry that cannot be locked or removed is left for a later sweep.
+pub(crate) fn sweep_orphans(store: &Path) {
+    use fs2::FileExt;
+    let Ok(entries) = std::fs::read_dir(store) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (repo, lock) = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("git") => (path.clone(), lock_path(&path)),
+            Some("lock") => (path.with_extension("git"), path.clone()),
+            _ => continue,
+        };
+        if path == lock && repo.exists() {
+            continue; // handled through its repo entry
+        }
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+        else {
+            continue;
+        };
+        if file.try_lock_exclusive().is_err() {
+            continue; // a live turn owns it
+        }
+        let removed = !repo.exists() || std::fs::remove_dir_all(&repo).is_ok();
+        if removed {
+            let _ = std::fs::remove_file(&lock);
+            tracing::info!(
+                target: "daimonos::evidence",
+                event = "evidence_orphan_removed",
+                repo = %repo.display(),
+            );
+        }
+    }
 }
 
 impl Worktree {
@@ -147,7 +236,11 @@ impl Worktree {
         let workspace = workspace.into();
         let git_dir =
             workspace_git_dir(state_base, &workspace).join(format!("{}.git", uuid::Uuid::new_v4()));
-        Self { workspace, git_dir }
+        Self {
+            workspace,
+            git_dir,
+            owner: std::sync::Mutex::new(None),
+        }
     }
 
     /// Content hash of the current worktree, or `None` when it cannot be
@@ -183,6 +276,13 @@ impl Worktree {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            // #1617: own the repo before it exists, so a concurrent sweep can
+            // never remove it; then reclaim repos that killed turns left behind.
+            let lock = acquire_owner_lock(&lock_path(&self.git_dir))?;
+            *self.owner.lock().unwrap_or_else(|p| p.into_inner()) = Some(lock);
+            let store = parent.to_path_buf();
+            // Deleting multi-GB orphans must not delay this turn.
+            tokio::task::spawn_blocking(move || sweep_orphans(&store));
         }
         let out = tokio::process::Command::new("git")
             .args(["init", "--bare", "--quiet"])
@@ -244,6 +344,16 @@ impl Drop for Worktree {
         // Per-turn object stores are bounded by turn lifetime. Best effort:
         // shutdown must never fail merely because cleanup could not complete.
         let _ = std::fs::remove_dir_all(&self.git_dir);
+        // Unlink the lock while still holding it, then release it (#1617).
+        if let Some(lock) = self
+            .owner
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = std::fs::remove_file(lock_path(&self.git_dir));
+            drop(lock);
+        }
         if let Some(workspace_dir) = self.git_dir.parent() {
             let _ = std::fs::remove_dir(workspace_dir);
         }
@@ -422,8 +532,40 @@ mod tests {
             path = tree.git_dir.clone();
             assert!(tree.fingerprint().await.is_some());
             assert!(path.exists());
+            assert!(
+                lock_path(&path).exists(),
+                "a live turn holds its owner lock"
+            );
         }
         assert!(!path.exists());
+        assert!(
+            !lock_path(&path).exists(),
+            "drop must not leave a lock file"
+        );
+    }
+
+    /// #1617: a killed turn never runs `Drop`, so its multi-GB shadow repo
+    /// leaked. A sweep removes every repo whose owner lock is free and keeps
+    /// repos that a live turn still holds.
+    #[tokio::test]
+    async fn sweep_removes_orphaned_repos_and_keeps_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let live = Worktree::new(dir.path().to_path_buf(), state.path());
+        assert!(live.fingerprint().await.is_some());
+        let store = live.git_dir.parent().unwrap().to_path_buf();
+        // A repo left by a killed process: no lock holder, maybe no lock file.
+        let orphan = store.join("dead.git");
+        std::fs::create_dir_all(orphan.join("objects")).unwrap();
+        let stale_lock = store.join("gone.lock");
+        std::fs::write(&stale_lock, "").unwrap();
+
+        sweep_orphans(&store);
+
+        assert!(!orphan.exists(), "orphaned repo must be removed");
+        assert!(!stale_lock.exists(), "lock without a repo must be removed");
+        assert!(live.git_dir.exists(), "a live turn's repo must be kept");
     }
 
     #[tokio::test]
