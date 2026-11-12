@@ -79,6 +79,8 @@ pub struct SafetyPolicy {
     pub approvals_path: Option<PathBuf>,
     /// Apply selected-state file protections to persisted approvals.
     pub secure_approvals: bool,
+    /// Optional allow/deny list that replaces `approval_mode`'s ask decision.
+    pub permission: PermissionPolicy,
 }
 
 impl Default for SafetyPolicy {
@@ -91,7 +93,41 @@ impl Default for SafetyPolicy {
             auto_approve: Arc::new(Mutex::new(HashSet::new())),
             approvals_path: None,
             secure_approvals: false,
+            permission: PermissionPolicy::default(),
         }
+    }
+}
+
+/// Which tools need approval when a permission list is configured
+/// (`DAIMONOS_AGENT_PERMISSION_MODE`, vikunja #1616, ADR-034).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    /// No list: `approval_mode` decides.
+    #[default]
+    Null,
+    /// Listed tools run without asking; every other tool asks.
+    AllowList,
+    /// Listed tools ask; every other tool runs without asking.
+    DenyList,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionPolicy {
+    pub mode: PermissionMode,
+    /// Native tool names (`read_file`) or remote `server/tool` keys
+    /// (`notion/notion-get-self`). A trailing `*` matches any suffix
+    /// (`notion/*`, or `*` for everything); other patterns match exactly.
+    pub patterns: Vec<String>,
+}
+
+impl PermissionPolicy {
+    pub fn matches(&self, key: &str) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => key.starts_with(prefix),
+                None => pattern == key,
+            })
     }
 }
 
@@ -115,6 +151,17 @@ impl SafetyPolicy {
     /// callers that get `NeedsApproval` are responsible for asking (however
     /// they ask) and applying the operator's decision themselves.
     pub fn gate(&self, name: &str) -> Gate {
+        // A native tool's permission key is its own name. A remote tool's
+        // exposed name is not a stable identity (#990), so without a key from
+        // the bridge it can match no list entry (see `gate_keyed`).
+        let key = (!name.starts_with(REMOTE_TOOL_PREFIX)).then_some(name);
+        self.gate_keyed(name, key)
+    }
+
+    /// [`Self::gate`] with an explicit permission-list key. For a remote tool
+    /// the caller passes `"server/tool"` from the MCP bridge; `None` means the
+    /// identity is unknown, and permission lists then always ask (#1616).
+    pub fn gate_keyed(&self, name: &str, permission_key: Option<&str>) -> Gate {
         if self.denied_commands.iter().any(|d| d == name) {
             return Gate::Block(format!(
                 "blocked by policy: '{name}' is in the denied-commands list"
@@ -125,10 +172,17 @@ impl SafetyPolicy {
                 "blocked by policy: '{name}' is not in the allowed-commands list"
             ));
         }
-        let needs_approval = match self.approval_mode {
-            ApprovalMode::Auto => false,
-            ApprovalMode::Interactive => is_destructive_tool(name),
-            ApprovalMode::Paranoid => true,
+        // ADR-034: a set permission mode replaces approval_mode's ask decision.
+        let listed = || permission_key.is_some_and(|key| self.permission.matches(key));
+        let needs_approval = match self.permission.mode {
+            PermissionMode::Null => match self.approval_mode {
+                ApprovalMode::Auto => false,
+                ApprovalMode::Interactive => is_destructive_tool(name),
+                ApprovalMode::Paranoid => true,
+            },
+            PermissionMode::AllowList => !listed(),
+            // Unknown identity fails closed: ask rather than run unasked.
+            PermissionMode::DenyList => permission_key.is_none() || listed(),
         };
         if !needs_approval {
             return Gate::Allow;
@@ -382,6 +436,80 @@ mod tests {
             ..SafetyPolicy::default()
         };
         assert_eq!(policy.gate("mcp__github__create_pr"), Gate::Allow);
+    }
+
+    // --- permission mode lists (vikunja #1616) ---
+
+    fn with_permissions(mode: PermissionMode, patterns: &[&str]) -> SafetyPolicy {
+        SafetyPolicy {
+            // The list replaces approval_mode's ask decision, so pick the mode
+            // that would otherwise ask for everything.
+            approval_mode: ApprovalMode::Paranoid,
+            permission: PermissionPolicy {
+                mode,
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            },
+            ..SafetyPolicy::default()
+        }
+    }
+
+    #[test]
+    fn allow_list_runs_listed_tools_and_asks_for_the_rest() {
+        let policy = with_permissions(PermissionMode::AllowList, &["read_file", "exec"]);
+        assert_eq!(policy.gate("read_file"), Gate::Allow);
+        assert_eq!(policy.gate("exec"), Gate::Allow);
+        assert_eq!(policy.gate("write_file"), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn deny_list_asks_for_listed_tools_and_runs_the_rest() {
+        let policy = with_permissions(PermissionMode::DenyList, &["exec"]);
+        assert_eq!(policy.gate("exec"), Gate::NeedsApproval);
+        assert_eq!(policy.gate("write_file"), Gate::Allow);
+    }
+
+    #[test]
+    fn remote_tools_match_server_slash_tool_keys_with_trailing_wildcard() {
+        let allow = with_permissions(
+            PermissionMode::AllowList,
+            &["notion/notion-get-self", "linear/*"],
+        );
+        let exposed = "mcp__notion__notion-get-self";
+        assert_eq!(
+            allow.gate_keyed(exposed, Some("notion/notion-get-self")),
+            Gate::Allow
+        );
+        assert_eq!(
+            allow.gate_keyed("mcp__linear__save_issue", Some("linear/save_issue")),
+            Gate::Allow
+        );
+        assert_eq!(
+            allow.gate_keyed(
+                "mcp__notion__notion-update-page",
+                Some("notion/notion-update-page")
+            ),
+            Gate::NeedsApproval
+        );
+        // The exposed name alone never matches a list entry.
+        let by_exposed_name = with_permissions(PermissionMode::AllowList, &[exposed]);
+        assert_eq!(by_exposed_name.gate(exposed), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn remote_tool_with_unknown_identity_always_asks() {
+        // deny_list must fail closed: "notion/*" cannot be checked without
+        // the bridge's server identity, so the call asks instead of running.
+        let deny = with_permissions(PermissionMode::DenyList, &["notion/*"]);
+        assert_eq!(deny.gate("mcp__github__create_pr"), Gate::NeedsApproval);
+        let allow = with_permissions(PermissionMode::AllowList, &["*"]);
+        assert_eq!(allow.gate("mcp__github__create_pr"), Gate::NeedsApproval);
+    }
+
+    #[test]
+    fn denied_commands_still_block_before_permission_lists() {
+        let mut policy = with_permissions(PermissionMode::AllowList, &["exec"]);
+        policy.denied_commands = vec!["exec".to_string()];
+        assert!(matches!(policy.gate("exec"), Gate::Block(_)));
     }
 
     // --- gate / remember_always (vikunja #954: shared with ACP) ---

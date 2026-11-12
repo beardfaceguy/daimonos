@@ -140,6 +140,40 @@ DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
 DAIMONOS_AGENT_API_KEY=sk-...
 ```
 
+### Tool approval lists (`DAIMONOS_AGENT_PERMISSION_MODE`)
+
+`DAIMONOS_AGENT_PERMISSION_MODE` is optional. It decides which tool calls ask
+for approval (ADR-034):
+
+| Value | Behavior |
+|-------|----------|
+| `null` (default, or unset) | `DAIMONOS_AGENT_APPROVAL_MODE` decides. |
+| `allow_list` | Tools in `DAIMONOS_AGENT_PERMISSION_LIST` run without asking. Every other tool asks. |
+| `deny_list` | Tools in `DAIMONOS_AGENT_PERMISSION_LIST` ask. Every other tool runs without asking. |
+
+When the mode is `allow_list` or `deny_list`, the list replaces the ask decision
+of `DAIMONOS_AGENT_APPROVAL_MODE`. `DAIMONOS_AGENT_DENIED_COMMANDS` and
+`DAIMONOS_AGENT_ALLOWED_COMMANDS` still block tools first. An "Always Allow"
+answer still skips later prompts for that tool.
+
+`DAIMONOS_AGENT_PERMISSION_LIST` is a comma list:
+
+- A native tool uses its name, for example `read_file` or `exec`.
+- A remote MCP tool uses `server/tool`: the MCP server name from the client
+  (for example the Zed `context_servers` key) and the server's own tool name,
+  for example `notion/notion-get-self`. The exposed `mcp__...` name never
+  matches.
+- A trailing `*` matches any suffix, for example `notion/*`, or `*` for all
+  tools. Other patterns must match exactly.
+
+A remote tool whose server identity is unknown always asks. This applies in
+modes without an ACP MCP bridge.
+
+```dotenv
+DAIMONOS_AGENT_PERMISSION_MODE=allow_list
+DAIMONOS_AGENT_PERMISSION_LIST=read_file,search,notion/notion-get-self,linear/*
+```
+
 ### Agent Skills (`DAIMONOS_SKILL_DIR`)
 
 Daimonos discovers portable Agent Skills from `~/.agents/skills` by default.
@@ -648,10 +682,12 @@ These settings apply to native ACP integrations such as Zed.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `session_list_page_size` | `50` | Maximum saved sessions returned by one `session/list` response. When more remain, the response includes an opaque continuation cursor. Must be greater than zero. |
+| `approval_timeout_secs` | `120` | Maximum seconds a `session/request_permission` may go unanswered. Daimonos then denies the tool call and tells the model that the client did not answer. The limit applies while the client is connected. Must be greater than zero. |
 
 ```toml
 [acp]
 session_list_page_size = 50
+approval_timeout_secs = 120
 ```
 
 #### `[acp.mcp.oauth_servers.<name>]` — outbound OAuth policy

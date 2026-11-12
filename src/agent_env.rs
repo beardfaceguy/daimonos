@@ -95,6 +95,10 @@ pub struct AgentEnv {
     pub prompt_cache: bool,
     pub allowed_commands: Vec<String>,
     pub denied_commands: Vec<String>,
+    /// Optional `DAIMONOS_AGENT_PERMISSION_MODE` (null | allow_list |
+    /// deny_list) and its `DAIMONOS_AGENT_PERMISSION_LIST` (vikunja #1616).
+    pub permission_mode: crate::safety::PermissionMode,
+    pub permission_list: Vec<String>,
     /// Candidate models for the ACP model picker (vikunja #960), from the
     /// optional `DAIMONOS_AGENT_MODELS` comma-list. `model` (the active one)
     /// is always present — prepended if the list omits it, and the list is
@@ -222,6 +226,19 @@ impl AgentEnv {
             ));
         }
 
+        let permission_mode = match present("DAIMONOS_AGENT_PERMISSION_MODE").as_deref() {
+            None | Some("null") => crate::safety::PermissionMode::Null,
+            Some("allow_list") => crate::safety::PermissionMode::AllowList,
+            Some("deny_list") => crate::safety::PermissionMode::DenyList,
+            Some(other) => {
+                return Err(format!(
+                    "agent configuration for {}: DAIMONOS_AGENT_PERMISSION_MODE '{}' invalid (valid: null, allow_list, deny_list)",
+                    path.display(),
+                    other
+                ));
+            }
+        };
+
         let model = present("DAIMONOS_AGENT_MODEL").unwrap();
         let models = candidate_models(&model, parse_list(vars.get("DAIMONOS_AGENT_MODELS")));
         let compaction = parse_compaction(vars, path)?;
@@ -272,6 +289,8 @@ impl AgentEnv {
             prompt_cache,
             allowed_commands: parse_list(vars.get("DAIMONOS_AGENT_ALLOWED_COMMANDS")),
             denied_commands: parse_list(vars.get("DAIMONOS_AGENT_DENIED_COMMANDS")),
+            permission_mode,
+            permission_list: parse_list(vars.get("DAIMONOS_AGENT_PERMISSION_LIST")),
             models,
             compaction,
             timestamp_turns,
@@ -387,6 +406,10 @@ impl AgentEnv {
             auto_approve: std::sync::Arc::new(std::sync::Mutex::new(seed)),
             approvals_path,
             secure_approvals,
+            permission: crate::safety::PermissionPolicy {
+                mode: self.permission_mode,
+                patterns: self.permission_list.clone(),
+            },
         }
     }
 }
@@ -797,6 +820,40 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.contains("APPROVAL_MODE") && error.contains("invalid"));
+    }
+
+    #[test]
+    fn permission_mode_and_list_reach_the_safety_policy() {
+        use crate::safety::PermissionMode;
+        let env = load_str_with_overrides(
+            &base(),
+            &[
+                ("DAIMONOS_AGENT_PERMISSION_MODE", "deny_list"),
+                ("DAIMONOS_AGENT_PERMISSION_LIST", "exec, notion/*"),
+            ],
+        )
+        .unwrap();
+        let policy = env.to_safety_policy(None);
+        assert_eq!(policy.permission.mode, PermissionMode::DenyList);
+        assert_eq!(policy.permission.patterns, vec!["exec", "notion/*"]);
+
+        let unset = load_str_with_overrides(&base(), &[]).unwrap();
+        assert_eq!(
+            unset.to_safety_policy(None).permission.mode,
+            PermissionMode::Null
+        );
+        let explicit_null =
+            load_str_with_overrides(&base(), &[("DAIMONOS_AGENT_PERMISSION_MODE", "null")])
+                .unwrap();
+        assert_eq!(
+            explicit_null.to_safety_policy(None).permission.mode,
+            PermissionMode::Null
+        );
+
+        let error =
+            load_str_with_overrides(&base(), &[("DAIMONOS_AGENT_PERMISSION_MODE", "allowlist")])
+                .unwrap_err();
+        assert!(error.contains("PERMISSION_MODE") && error.contains("invalid"));
     }
 
     #[test]

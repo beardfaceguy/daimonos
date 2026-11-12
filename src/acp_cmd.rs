@@ -1141,7 +1141,7 @@ fn build_before_tool_call_hook(
                 return BeforeHookResult::Block(reason);
             }
             let cx = current_cx(&connection);
-            let retain_raw_input = tool_lifecycle.approval_required(&info.name);
+            let retain_raw_input = tool_lifecycle.approval_required(&info.name).await;
 
             let title = if terminal_output {
                 tool_call_title(info)
@@ -2501,20 +2501,28 @@ async fn build_session_handle(
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     // ACP local clients may retain the existing AllowAlways behavior. Remote
     // clients are capability-gated independently when they are attached.
-    let approvals = Arc::new(ApprovalBroker::new(true));
+    // #1616: an unanswered session/request_permission is denied after
+    // acp.approval_timeout_secs, so a prompt the client never shows cannot
+    // park the turn forever.
+    let approvals = Arc::new(ApprovalBroker::new(true).with_response_timeout(
+        std::time::Duration::from_secs(cfg.acp.approval_timeout_secs),
+    ));
     let events = Arc::new(SessionEventRouter::new(Some(build_acp_event_handler(
         Arc::clone(&connection),
         session_id.clone(),
         Arc::clone(&approvals),
         Arc::clone(&active_tool_calls),
     ))));
-    let tool_lifecycle = Arc::new(CanonicalToolLifecycle::new_with_output_limit(
-        Arc::clone(&events),
-        Arc::clone(&approvals),
-        safety,
-        cfg.session.max_active_tool_calls,
-        cfg.session.max_tool_event_output_bytes,
-    ));
+    let tool_lifecycle = Arc::new(
+        CanonicalToolLifecycle::new_with_output_limit(
+            Arc::clone(&events),
+            Arc::clone(&approvals),
+            safety,
+            cfg.session.max_active_tool_calls,
+            cfg.session.max_tool_event_output_bytes,
+        )
+        .with_bridge_slot(Arc::clone(&bridge_slot)),
+    );
     let config = build_agent_config(
         &session_workspace,
         state.default_model.clone(),

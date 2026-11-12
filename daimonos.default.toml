@@ -353,6 +353,9 @@ scrollback_entries = 2_000
 # Maximum saved sessions returned by one session/list response. Clients receive
 # an opaque continuation cursor when more sessions remain.
 session_list_page_size = 50
+# Seconds a session/request_permission may go unanswered before the tool call
+# is denied (vikunja #1616). Applies while the client is connected.
+approval_timeout_secs = 120
 
 [agent.skills]
 # Maximum valid skill directories considered in each discovery root.

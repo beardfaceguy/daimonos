@@ -484,6 +484,8 @@ pub struct McpBridge {
     analytics: Option<Arc<AnalyticsStore>>,
     external_session_id: Option<String>,
     call_timeout: Duration,
+    /// Exposed tool name → `server/tool` for permission lists (#1616).
+    permission_keys: HashMap<String, String>,
 }
 
 impl McpBridge {
@@ -503,7 +505,14 @@ impl McpBridge {
             analytics: None,
             external_session_id: None,
             call_timeout: Duration::from_secs(0),
+            permission_keys: HashMap::new(),
         }
+    }
+
+    /// Stable permission-list identity (`server/tool`) of an exposed remote
+    /// tool name, fixed when the bridge is built (#1616, ADR-034).
+    pub fn permission_key(&self, exposed: &str) -> Option<&str> {
+        self.permission_keys.get(exposed).map(String::as_str)
     }
 
     /// Connect to forwarded servers with bounded concurrency (fail-open: a
@@ -589,6 +598,7 @@ impl McpBridge {
             analytics,
             external_session_id,
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
+            permission_keys: HashMap::new(),
         };
         if !cfg.enabled {
             return bridge;
@@ -718,6 +728,9 @@ impl McpBridge {
                             description,
                             input_schema,
                         });
+                        bridge
+                            .permission_keys
+                            .insert(exposed.clone(), format!("{server_name}/{}", tool.name));
                         bridge.runtime.get_mut().routes.insert(
                             exposed,
                             Route {
@@ -878,7 +891,9 @@ impl McpBridge {
         let server = crate::observability::remote_server_alias(name).unwrap_or("unknown");
         let span = crate::observability::RemoteToolSpan::new(name, server);
         let started = Instant::now();
-        tracing::debug!(
+        // INFO (#1616): pairs with remote_tool_completed so a stalled call is
+        // visible at the default log level.
+        tracing::info!(
             target: "daimonos::mcp_bridge",
             event = "remote_tool_started",
             tool = %name,
@@ -2446,6 +2461,44 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|message| message.contains("broken")));
+        bridge.shutdown().await;
+    }
+
+    /// #1616: permission lists name remote tools as `server/tool` (the
+    /// forwarded server name plus the server's own tool name), never by the
+    /// sanitized, de-duplicated exposed name.
+    #[tokio::test]
+    async fn permission_key_maps_exposed_name_to_server_slash_tool() {
+        let Some(bin) = daimonos_binary() else {
+            eprintln!("skipping: daimonos binary not found next to test exe");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let server = ServerSpec::Stdio {
+            name: "notion".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--mcp".to_string(),
+                "-w".to_string(),
+                workspace.path().to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+        };
+
+        let bridge = McpBridge::build(
+            vec![server],
+            &AcpMcpConfig::default(),
+            &native_set(&[]),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            bridge.permission_key("mcp__notion__read_file"),
+            Some("notion/read_file")
+        );
+        assert_eq!(bridge.permission_key("read_file"), None);
         bridge.shutdown().await;
     }
 
