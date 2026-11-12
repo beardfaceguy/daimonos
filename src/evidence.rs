@@ -9,18 +9,18 @@
 //! checkpoints (#1239, after the enumeration drift of #1113): `exec` and
 //! `execute_script` can mutate anything, and a `git checkout` that reverts the
 //! model's own work is a mutation no name list would flag. The fingerprint is a
-//! git tree object built in a per-turn shadow repository, so it is
-//! content-addressed, includes ignored workspace content, never touches the
-//! user's index, and is removed at the end of the turn. A turn holds a flock on
-//! its repo's `<instance>.lock`; when a killed turn skips that removal, the next
-//! turn in the same workspace sweeps every repo whose lock is free (#1617).
+//! hash of every workspace entry's metadata (path, type, size, mtime, inode),
+//! including ignored content, with content hashing only for files written in
+//! the last moments (ADR-035, #1617). It writes nothing and never touches the
+//! user's index. It replaced a per-turn git shadow repository that copied the
+//! whole tree, build output included.
 //!
 //! When the fingerprint is unavailable the status is [`EvidenceStatus::Unknown`]
 //! rather than "no mutations" — reporting unobserved absence as evidence is the
 //! exact failure this ledger exists to prevent.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceStatus {
@@ -114,250 +114,174 @@ pub fn verifier_exit(tool_name: &str, input: &serde_json::Value, content: &str) 
         .and_then(serde_json::Value::as_i64)
 }
 
-/// Per-turn shadow git dir under the global daimonos state dir:
-/// `<base>/evidence/<workspace-key>/<instance>.git`. The workspace key groups
-/// diagnostics; the random instance prevents concurrent sessions from sharing
-/// an index, lock, or object store.
-///
-/// It deliberately lives **outside** the workspace. An in-tree shadow repo
-/// shows up as untracked files in the user's own `git status`, which both
-/// pollutes the tree and changes what the agent observes — corrupting the very
-/// thing this module measures.
-pub fn workspace_git_dir(base: &Path, workspace: &Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let key: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    base.join("evidence").join(key)
-}
+/// Files modified this recently before a scan also get their content hashed.
+/// Filesystem timestamps come from a coarse clock (a few ms on Linux, up to
+/// 2 s on FAT), so two quick same-size writes can share an mtime. Git calls
+/// this the "racy" case and solves it the same way.
+const RACY_WINDOW: Duration = Duration::from_secs(2);
 
-/// Content fingerprint of a workspace, computed in a private shadow repository.
+/// Workspace fingerprint built from file metadata (vikunja #1617, ADR-035).
+///
+/// A scan records each entry's relative path, type, size, mtime, and (on
+/// Unix) inode and mode, plus a symlink's target. Ignored files count: an
+/// agent can change a generated or secret-bearing ignored file. Only `.git`
+/// and `.daimonos` directories are skipped. Reading metadata takes about
+/// 0.1 s for 43k files; the former shadow-repo snapshot copied every byte
+/// (about 3 min and 8 GB for a 21 GB `target/`).
+///
+/// A revert can count as a change, because its mtime moved even when its
+/// bytes match again. That errs toward an "unverified" warning, never toward
+/// a missed change.
 pub struct Worktree {
     workspace: PathBuf,
-    git_dir: PathBuf,
-    /// Exclusive flock on `<instance>.lock`, held for the turn's lifetime.
-    /// The kernel releases it when the process dies, which is how a later
-    /// sweep tells an orphaned repo from a live one (#1617).
-    owner: std::sync::Mutex<Option<std::fs::File>>,
-}
-
-/// Owner-lock path that pairs with a shadow repo: `<instance>.git` →
-/// `<instance>.lock`.
-fn lock_path(git_dir: &Path) -> PathBuf {
-    git_dir.with_extension("lock")
-}
-
-/// Open and exclusively lock `path`. Retries when a concurrent sweep unlinked
-/// the file between open and lock: a lock on an unlinked inode protects
-/// nothing, because the next sweep would create and lock a fresh file.
-fn acquire_owner_lock(path: &Path) -> Result<std::fs::File, String> {
-    use fs2::FileExt;
-    for _ in 0..8 {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        file.try_lock_exclusive()
-            .map_err(|e| format!("lock {}: {e}", path.display()))?;
-        if still_linked(&file, path) {
-            return Ok(file);
-        }
-    }
-    Err(format!("lock {} kept being removed", path.display()))
-}
-
-#[cfg(unix)]
-fn still_linked(file: &std::fs::File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), std::fs::metadata(path)) {
-        (Ok(held), Ok(current)) => held.ino() == current.ino() && held.dev() == current.dev(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn still_linked(_file: &std::fs::File, path: &Path) -> bool {
-    path.exists()
-}
-
-/// Remove every shadow repo in `store` whose owner lock is free, plus lock
-/// files whose repo is gone (#1617). Each repo belongs to one turn and `Drop`
-/// removes it, so a free lock means its turn's process died. Best effort:
-/// any entry that cannot be locked or removed is left for a later sweep.
-pub(crate) fn sweep_orphans(store: &Path) {
-    use fs2::FileExt;
-    let Ok(entries) = std::fs::read_dir(store) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let (repo, lock) = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("git") => (path.clone(), lock_path(&path)),
-            Some("lock") => (path.with_extension("git"), path.clone()),
-            _ => continue,
-        };
-        if path == lock && repo.exists() {
-            continue; // handled through its repo entry
-        }
-        let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock)
-        else {
-            continue;
-        };
-        if file.try_lock_exclusive().is_err() {
-            continue; // a live turn owns it
-        }
-        let removed = !repo.exists() || std::fs::remove_dir_all(&repo).is_ok();
-        if removed {
-            let _ = std::fs::remove_file(&lock);
-            tracing::info!(
-                target: "daimonos::evidence",
-                event = "evidence_orphan_removed",
-                repo = %repo.display(),
-            );
-        }
-    }
+    legacy_store: PathBuf,
 }
 
 impl Worktree {
-    /// Build a fingerprinter for `workspace`, storing its shadow repo under
-    /// `state_base` (normally `~/.daimonos`).
+    /// Build a fingerprinter for `workspace`. `state_base` (normally
+    /// `~/.daimonos`) only locates the legacy shadow-repo store to remove.
     pub fn new(workspace: impl Into<PathBuf>, state_base: &Path) -> Self {
-        let workspace = workspace.into();
-        let git_dir =
-            workspace_git_dir(state_base, &workspace).join(format!("{}.git", uuid::Uuid::new_v4()));
         Self {
-            workspace,
-            git_dir,
-            owner: std::sync::Mutex::new(None),
+            workspace: workspace.into(),
+            legacy_store: state_base.join("evidence"),
         }
     }
 
-    /// Content hash of the current worktree, or `None` when it cannot be
-    /// computed (no git binary, unreadable workspace). Never an error: absent
-    /// evidence is reported as absent, not as a failed turn.
+    /// Metadata fingerprint of the current worktree, or `None` when the
+    /// workspace cannot be read. Never an error: absent evidence is reported
+    /// as absent, not as a failed turn.
     pub async fn fingerprint(&self) -> Option<String> {
-        self.init().await.ok()?;
-        // Force ignored content into the observation: an agent can mutate a
-        // generated or secret-bearing ignored file, and calling that turn clean
-        // would be false evidence. Only repository/state internals are excluded.
-        self.git(&[
-            "add",
-            "--force",
-            "-A",
-            "--",
-            ".",
-            ":(exclude).git",
-            ":(exclude).git/**",
-            ":(exclude).daimonos",
-            ":(exclude).daimonos/**",
-        ])
-        .await
-        .ok()?;
-        let tree = self.git(&["write-tree"]).await.ok()?;
-        Some(tree.trim().to_string())
-    }
-
-    async fn init(&self) -> Result<(), String> {
-        if self.git_dir.join("HEAD").exists() {
-            return Ok(());
-        }
-        if let Some(parent) = self.git_dir.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
-            // #1617: own the repo before it exists, so a concurrent sweep can
-            // never remove it; then reclaim repos that killed turns left behind.
-            let lock = acquire_owner_lock(&lock_path(&self.git_dir))?;
-            *self.owner.lock().unwrap_or_else(|p| p.into_inner()) = Some(lock);
-            let store = parent.to_path_buf();
-            // Deleting multi-GB orphans must not delay this turn.
-            tokio::task::spawn_blocking(move || sweep_orphans(&store));
-        }
-        let out = tokio::process::Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(&self.git_dir)
-            .stdin(Stdio::null())
-            .output()
+        remove_legacy_store_once(&self.legacy_store);
+        let workspace = self.workspace.clone();
+        tokio::task::spawn_blocking(move || scan(&workspace))
             .await
-            .map_err(|e| format!("git init: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git init failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        // Exclude our own store and the checkpoint store, or the fingerprint
-        // would change every time either of them writes. The explicit add
-        // pathspecs above retain these exclusions even with --force.
-        let info = self.git_dir.join("info");
-        tokio::fs::create_dir_all(&info)
-            .await
-            .map_err(|e| format!("create info: {e}"))?;
-        tokio::fs::write(info.join("exclude"), ".daimonos/\n")
-            .await
-            .map_err(|e| format!("write exclude: {e}"))?;
-        Ok(())
-    }
-
-    /// Run one git command against the shadow repo. `--git-dir`/`--work-tree`
-    /// are always explicit and the ambient git environment is stripped, so a
-    /// stray `GIT_DIR` cannot redirect this into the real repository.
-    async fn git(&self, args: &[&str]) -> Result<String, String> {
-        let out = tokio::process::Command::new("git")
-            .arg("--git-dir")
-            .arg(&self.git_dir)
-            .arg("--work-tree")
-            .arg(&self.workspace)
-            .args(args)
-            .current_dir(&self.workspace)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| format!("git {}: {e}", args.first().unwrap_or(&"")))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git {} failed: {}",
-                args.first().unwrap_or(&""),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+            .ok()?
     }
 }
 
-impl Drop for Worktree {
-    fn drop(&mut self) {
-        // Per-turn object stores are bounded by turn lifetime. Best effort:
-        // shutdown must never fail merely because cleanup could not complete.
-        let _ = std::fs::remove_dir_all(&self.git_dir);
-        // Unlink the lock while still holding it, then release it (#1617).
-        if let Some(lock) = self
-            .owner
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let _ = std::fs::remove_file(lock_path(&self.git_dir));
-            drop(lock);
+fn scan(workspace: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let racy_since = SystemTime::now()
+        .checked_sub(RACY_WINDOW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut hasher = Sha256::new();
+    let walker = walkdir::WalkDir::new(workspace)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !matches!(entry.file_name().to_str(), Some(".git" | ".daimonos"))
+        });
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // An unreadable workspace root means nothing was observed.
+            Err(error) if error.depth() == 0 => return None,
+            // An unreadable subtree is part of the observed state.
+            Err(error) => {
+                hasher.update(b"E\0");
+                if let Some(path) = error.path() {
+                    hasher.update(path.as_os_str().as_encoded_bytes());
+                }
+                hasher.update(b"\0");
+                continue;
+            }
+        };
+        if entry.depth() == 0 {
+            continue;
         }
-        if let Some(workspace_dir) = self.git_dir.parent() {
-            let _ = std::fs::remove_dir(workspace_dir);
+        let relative = entry.path().strip_prefix(workspace).ok()?;
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        match entry.metadata() {
+            Ok(metadata) => record_entry(&mut hasher, entry.path(), &metadata, racy_since),
+            Err(_) => hasher.update(b"E"),
+        }
+        hasher.update(b"\n");
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn record_entry(
+    hasher: &mut sha2::Sha256,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    racy_since: SystemTime,
+) {
+    use sha2::Digest;
+    let file_type = metadata.file_type();
+    let kind: &[u8] = if file_type.is_dir() {
+        b"d"
+    } else if file_type.is_symlink() {
+        b"l"
+    } else if file_type.is_file() {
+        b"f"
+    } else {
+        b"o"
+    };
+    hasher.update(kind);
+    if file_type.is_dir() {
+        return; // its entries are recorded individually
+    }
+    hasher.update(metadata.len().to_le_bytes());
+    let modified = metadata.modified().ok();
+    let mtime_ns = modified
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    hasher.update(mtime_ns.to_le_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.mode().to_le_bytes());
+    }
+    if file_type.is_symlink() {
+        if let Ok(target) = std::fs::read_link(path) {
+            hasher.update(target.as_os_str().as_encoded_bytes());
+        }
+    } else if file_type.is_file() && modified.is_none_or(|time| time >= racy_since) {
+        // Racy entry: hash its bytes so a same-tick, same-size rewrite shows.
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                if std::io::copy(&mut file, hasher).is_err() {
+                    hasher.update(b"E");
+                }
+            }
+            Err(_) => hasher.update(b"E"),
         }
     }
+}
+
+/// Remove the shadow-repo store that earlier versions wrote per turn
+/// (`<state>/evidence`). Killed turns left multi-GB repos there (62 GB on one
+/// machine, #1617). Nothing writes it any more, so it is deleted once per
+/// process, in the background. A turn of an older build that is still running
+/// loses its snapshot; its evidence becomes `Unknown`, which is advisory.
+fn remove_legacy_store_once(store: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let store = store.to_path_buf();
+        tokio::task::spawn_blocking(move || remove_legacy_store(&store));
+    });
+}
+
+pub(crate) fn remove_legacy_store(store: &Path) {
+    if !store.exists() {
+        return;
+    }
+    let removed = std::fs::remove_dir_all(store).is_ok();
+    tracing::info!(
+        target: "daimonos::evidence",
+        event = "evidence_legacy_store_removed",
+        store = %store.display(),
+        removed,
+    );
 }
 
 #[cfg(test)]
@@ -467,6 +391,34 @@ mod tests {
         );
     }
 
+    /// #1617 / ADR-035: the fingerprint is a metadata scan. It must not copy
+    /// the workspace anywhere, and a same-size rewrite inside one coarse clock
+    /// tick (identical size and mtime) must still register.
+    #[tokio::test]
+    async fn metadata_fingerprint_writes_nothing_and_sees_same_tick_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let tree = Worktree::new(dir.path().to_path_buf(), state.path());
+
+        let before = tree.fingerprint().await.expect("scan succeeds");
+        std::fs::write(dir.path().join("a.txt"), "two").unwrap();
+        let after = tree.fingerprint().await.unwrap();
+
+        assert_ne!(
+            before, after,
+            "a same-size rewrite must change the fingerprint"
+        );
+        let written: Vec<_> = walkdir::WalkDir::new(state.path())
+            .min_depth(1)
+            .into_iter()
+            .collect();
+        assert!(
+            written.is_empty(),
+            "no copies under the state dir: {written:?}"
+        );
+    }
+
     #[tokio::test]
     async fn fingerprint_changes_only_when_content_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -474,7 +426,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let tree = Worktree::new(dir.path().to_path_buf(), state.path());
 
-        let first = tree.fingerprint().await.expect("git available");
+        let first = tree.fingerprint().await.expect("scan succeeds");
         let unchanged = tree.fingerprint().await.unwrap();
         assert_eq!(first, unchanged, "an untouched tree hashes identically");
 
@@ -487,9 +439,8 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "three").unwrap();
         assert_ne!(changed, tree.fingerprint().await.unwrap());
 
-        // Reverting returns to the original hash: the tree really is unchanged.
-        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
-        assert_eq!(first, tree.fingerprint().await.unwrap());
+        // A revert is not asserted either way: ADR-035 lets it count as a
+        // change, because the file's mtime moved even when its bytes match.
     }
 
     #[tokio::test]
@@ -510,62 +461,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_fingerprinters_use_independent_shadow_repositories() {
+    async fn concurrent_fingerprints_of_one_tree_agree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "one").unwrap();
         let state = tempfile::tempdir().unwrap();
         let left = Worktree::new(dir.path().to_path_buf(), state.path());
         let right = Worktree::new(dir.path().to_path_buf(), state.path());
-        assert_ne!(left.git_dir, right.git_dir);
         let (a, b) = tokio::join!(left.fingerprint(), right.fingerprint());
         assert_eq!(a, b);
     }
 
     #[tokio::test]
-    async fn shadow_repository_is_removed_on_drop() {
+    async fn created_and_deleted_files_change_the_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "one").unwrap();
         let state = tempfile::tempdir().unwrap();
-        let path;
-        {
-            let tree = Worktree::new(dir.path().to_path_buf(), state.path());
-            path = tree.git_dir.clone();
-            assert!(tree.fingerprint().await.is_some());
-            assert!(path.exists());
-            assert!(
-                lock_path(&path).exists(),
-                "a live turn holds its owner lock"
-            );
-        }
-        assert!(!path.exists());
-        assert!(
-            !lock_path(&path).exists(),
-            "drop must not leave a lock file"
+        let tree = Worktree::new(dir.path().to_path_buf(), state.path());
+        let base = tree.fingerprint().await.unwrap();
+        std::fs::write(dir.path().join("b.txt"), "new").unwrap();
+        let created = tree.fingerprint().await.unwrap();
+        assert_ne!(base, created, "a new file must register");
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        assert_ne!(
+            created,
+            tree.fingerprint().await.unwrap(),
+            "a deletion must register"
         );
     }
 
-    /// #1617: a killed turn never runs `Drop`, so its multi-GB shadow repo
-    /// leaked. A sweep removes every repo whose owner lock is free and keeps
-    /// repos that a live turn still holds.
     #[tokio::test]
-    async fn sweep_removes_orphaned_repos_and_keeps_live_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    async fn a_missing_workspace_is_unobservable() {
         let state = tempfile::tempdir().unwrap();
-        let live = Worktree::new(dir.path().to_path_buf(), state.path());
-        assert!(live.fingerprint().await.is_some());
-        let store = live.git_dir.parent().unwrap().to_path_buf();
-        // A repo left by a killed process: no lock holder, maybe no lock file.
-        let orphan = store.join("dead.git");
-        std::fs::create_dir_all(orphan.join("objects")).unwrap();
-        let stale_lock = store.join("gone.lock");
-        std::fs::write(&stale_lock, "").unwrap();
+        let tree = Worktree::new(state.path().join("does-not-exist"), state.path());
+        assert_eq!(tree.fingerprint().await, None);
+    }
 
-        sweep_orphans(&store);
+    /// #1617: earlier versions left multi-GB per-turn shadow repos under
+    /// `<state>/evidence` when a turn was killed. The new scan writes nothing
+    /// there, so the whole legacy store is removed.
+    #[test]
+    fn legacy_shadow_store_is_removed() {
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("evidence");
+        std::fs::create_dir_all(store.join("abc").join("dead.git").join("objects")).unwrap();
+        std::fs::write(store.join("abc").join("dead.lock"), "").unwrap();
 
-        assert!(!orphan.exists(), "orphaned repo must be removed");
-        assert!(!stale_lock.exists(), "lock without a repo must be removed");
-        assert!(live.git_dir.exists(), "a live turn's repo must be kept");
+        remove_legacy_store(&store);
+
+        assert!(!store.exists());
+        remove_legacy_store(&store); // absent store is a no-op
     }
 
     #[tokio::test]
@@ -576,7 +521,7 @@ mod tests {
         let tree = Worktree::new(dir.path().to_path_buf(), state.path());
         assert!(
             tree.fingerprint().await.is_some(),
-            "the shadow repo is ours, so the workspace needs no git of its own"
+            "the scan reads the workspace directly, so it needs no git of its own"
         );
     }
 }
