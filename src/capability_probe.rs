@@ -101,13 +101,15 @@ pub async fn run_probe(
 ) -> ProbeOutcome {
     let payload = serde_json::to_string(&probe.payload).unwrap_or_else(|_| "{}".to_string());
     // The wording is owned by `prompts/capability_probe_directive.md`; only the
-    // tool name and the payload are interpolated as data (R1). `{tool_name}` is
-    // substituted first so a payload value can never be mistaken for a
-    // placeholder.
-    let directive = PROBE_DIRECTIVE_TEMPLATE
-        .trim_end()
-        .replace("{tool_name}", final_spec.tool_name())
-        .replace("{payload}", &payload);
+    // tool name and the payload are interpolated as data (R1). The template is
+    // rendered in a SINGLE pass ([`render_directive`]) so neither value is ever
+    // rescanned: a tool name that is literally `{payload}`, or a payload that
+    // contains `{tool_name}`, is copied verbatim (r5).
+    let directive = render_directive(
+        PROBE_DIRECTIVE_TEMPLATE.trim_end(),
+        final_spec.tool_name(),
+        &payload,
+    );
     let ctx = Context {
         messages: vec![Message::user(directive)],
         system: Some(PROBE_PROMPT.to_string()),
@@ -138,6 +140,36 @@ pub async fn run_probe(
         );
     }
     outcome
+}
+
+/// Render the probe directive template in ONE pass. Each `{tool_name}` and
+/// `{payload}` placeholder in `template` is replaced exactly once with the
+/// given value, and text that a replacement inserts is never scanned for a
+/// further placeholder. This keeps the final-tool name and the payload as
+/// opaque data: a tool name that is the literal text `{payload}`, or a payload
+/// value that contains `{tool_name}`, is copied verbatim rather than
+/// re-substituted (r5). Only these two placeholders are recognized; any other
+/// `{...}` text in the template is literal.
+fn render_directive(template: &str, tool_name: &str, payload: &str) -> String {
+    let mut out = String::with_capacity(template.len() + tool_name.len() + payload.len());
+    let mut rest = template;
+    loop {
+        let next_tool = rest.find("{tool_name}");
+        let next_payload = rest.find("{payload}");
+        let (pos, placeholder_len, value) = match (next_tool, next_payload) {
+            (None, None) => {
+                out.push_str(rest);
+                return out;
+            }
+            (Some(t), None) => (t, "{tool_name}".len(), tool_name),
+            (None, Some(p)) => (p, "{payload}".len(), payload),
+            (Some(t), Some(p)) if t <= p => (t, "{tool_name}".len(), tool_name),
+            (Some(_), Some(p)) => (p, "{payload}".len(), payload),
+        };
+        out.push_str(&rest[..pos]);
+        out.push_str(value);
+        rest = &rest[pos + placeholder_len..];
+    }
 }
 
 /// Pure classification of one probe response. A pass is exactly one schema-valid
@@ -247,6 +279,25 @@ mod tests {
         .unwrap();
         let err = load_payload(&path, &spec()).unwrap_err();
         assert!(err.contains("does not validate"), "{err}");
+    }
+
+    #[test]
+    fn render_directive_is_single_pass() {
+        let template = "Call the tool `{tool_name}` exactly once with these arguments:\n{payload}";
+        // An ordinary final-tool name gives exactly the current text.
+        let ordinary = render_directive(template, "final_answer", "{\"verdict\":\"supported\"}");
+        assert_eq!(
+            ordinary,
+            "Call the tool `final_answer` exactly once with these arguments:\n{\"verdict\":\"supported\"}"
+        );
+        // A single pass: a tool name that is the literal text `{payload}` stays
+        // literal, and a payload that contains `{tool_name}` stays literal.
+        // Neither replacement rescans the text the other inserts.
+        let tricky = render_directive(template, "{payload}", "{\"a\":\"{tool_name}\"}");
+        assert_eq!(
+            tricky,
+            "Call the tool `{payload}` exactly once with these arguments:\n{\"a\":\"{tool_name}\"}"
+        );
     }
 
     #[test]
