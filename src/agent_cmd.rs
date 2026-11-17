@@ -178,6 +178,15 @@ pub async fn run_agent(
     if let Some(spec) = &args.final_output {
         tools.push(spec.tool_schema());
     }
+    // FR-02 (WP06, listing inventory, ADR-023): the catalog offered to the
+    // model must agree with the dispatchable set. Under an active explicit
+    // allowlist, offer only allowlisted tools (the final-answer tool is required
+    // to be on the list at startup — R1 — so it survives this filter). The
+    // agent loop additionally refuses any unlisted name at dispatch.
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+    if policy.is_active() {
+        tools.retain(|t| policy.allows(&t.name));
+    }
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let thought_capture = match args.thought_log {

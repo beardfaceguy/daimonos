@@ -661,29 +661,55 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
+        // R7 (ADR-023 effective catalog): config-registered custom local tools
+        // are dispatchable names too, so an allowlist that names one must not
+        // false-reject at startup. Caller-worker/remote names defer to WP10.
+        known.extend(cfg.tools.keys().cloned());
+        // WP05 final-answer tool (PM Q-FR-02-2): record its name so the caller
+        // MAY allowlist it; below it is REQUIRED to be listed, never auto-added.
+        let mut final_output_tool: Option<String> = None;
         if let Some(crate::cli::Command::Agent(args)) = &cli.command {
             if let Some(control) = &args.final_output {
                 if let Ok(text) = std::fs::read_to_string(control) {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if let Some(name) = value.get("tool_name").and_then(|n| n.as_str()) {
                             known.insert(name.to_string());
+                            final_output_tool = Some(name.to_string());
                         }
                     }
                 }
             }
         }
-        if let Some(unknown) = names.iter().find(|name| !known.contains(name.as_str())) {
-            eprintln!(
-                "{}",
-                serde_json::json!({"error": {
-                    "code": "run_configuration_invalid",
-                    "reason": "tool_allowlist_unknown_entry",
-                    "message": format!(
-                        "--tool-allowlist entry '{unknown}' matches no known tool"
-                    )
-                }})
-            );
-            std::process::exit(2);
+        match run_policy::validate_allowlist(&names, &known, final_output_tool.as_deref()) {
+            Ok(()) => {}
+            Err(run_policy::AllowlistError::UnknownEntry(unknown)) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_unknown_entry",
+                        "message": format!(
+                            "--tool-allowlist entry '{unknown}' matches no known tool"
+                        )
+                    }})
+                );
+                std::process::exit(2);
+            }
+            Err(run_policy::AllowlistError::MissingFinalOutput(name)) => {
+                // R1 / PM Q-FR-02-2 / ADR-023: fail-closed when final-output is
+                // configured but its final-answer tool is not on the allowlist.
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_missing_final_output",
+                        "message": format!(
+                            "--tool-allowlist omits the configured final-output tool '{name}'; final-output requires it to be listed (it is never added automatically)"
+                        )
+                    }})
+                );
+                std::process::exit(2);
+            }
         }
         cfg.tool_allowlist = Some(names);
         cfg.tool_allowlist_path = Some(path.clone());
@@ -693,7 +719,35 @@ async fn main() -> anyhow::Result<()> {
     // before the review starts.
     if let Some(names) = &cfg.tool_allowlist {
         let policy = run_policy::ToolPolicy::from_config(Some(names));
-        let effective = policy.effective(None).unwrap_or_default();
+        // R4 (ADR-023): report the true intersection with the run's existing
+        // legacy restriction, not the raw list. The only per-name legacy
+        // restriction is the agent-env `allowed_commands` (enforced in the
+        // agent loop); read it best-effort for the agent-family frontends.
+        // MCP carries no such per-name restriction here, so its report equals
+        // the list. The allowlist can only narrow, never widen it.
+        let legacy_allowed: Vec<String> = match &cli.command {
+            Some(Command::Agent(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::Chat(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::Acp(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::SessionDaemon(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            _ => Vec::new(),
+        };
+        let legacy_set: std::collections::BTreeSet<String> = legacy_allowed.into_iter().collect();
+        let legacy_pred = |name: &str| legacy_set.contains(name);
+        let legacy: Option<&dyn Fn(&str) -> bool> = if legacy_set.is_empty() {
+            None
+        } else {
+            Some(&legacy_pred)
+        };
+        let effective = policy.effective(legacy).unwrap_or_default();
         eprintln!(
             "{}",
             serde_json::json!({ "effective_tool_allowlist": effective })

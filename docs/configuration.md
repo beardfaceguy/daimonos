@@ -1460,6 +1460,9 @@ Enforce an explicit tool allowlist for a run. `PATH` is a JSON file holding an a
 - Every call is checked before it runs, at every direct, batch, Starlark, `execute_script`, and remote/worker dispatch boundary; a composite must itself be listed and its inner calls are each checked.
 - An entry matching no known tool fails the run at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_unknown_entry`). With `--final-output`, the designated final-answer tool must be listed explicitly (never added automatically).
 - Caller-owned: read only from this flag, never from workspace/user config or the environment; it can only narrow existing restrictions (the effective set is their intersection).
-- At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`.
+- At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`. This is the intersection with the run's active legacy restriction (the agent-env `allowed_commands`), i.e. the set the run will actually permit — not necessarily the raw list.
+- The policy filters every tool-name surface, not just execution: `tools/list`, `list_all_tools`, `get_tool_schema`, `list_tool_signatures`, the MCP server instructions, the session-daemon socket listing, and the agent's offered catalog. An unlisted tool is never served, probed, or dumped.
+- With `--final-output`, if the designated final-answer tool is omitted from the allowlist the run fails at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_missing_final_output`). It is never added automatically.
+- A config-registered custom local tool (`[tools.*]` in `daimonos.toml`) is a dispatchable name and may be allowlisted. Workspace/user config can neither set nor disable the allowlist (`--tool-allowlist` is the sole source).
 - Refusals carry the `tool_not_allowed` code and are recorded in the `--audit-path` record.
 - Honored on every frontend and carried in the session-daemon launch identity, so daemon reuse cannot bypass it.

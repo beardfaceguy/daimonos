@@ -261,20 +261,30 @@ def test_lazy_list_all_tools_is_filtered_to_the_allowlist(daimonos_factory, tmp_
     assert listed == set(names), listed
 
 
-def test_environment_cannot_widen_or_disable_the_allowlist(daimonos_factory, tmp_path):
-    """AC-02.5 / requirement 6: nothing the caller did not pass explicitly can
-    widen or disable the list. An environment variable that names extra tools is
-    ignored: `write_file` stays refused and the model listing is unchanged."""
-    names = ["read_file", "search", "workspace_info"]
+def test_workspace_config_cannot_widen_or_disable_the_allowlist(daimonos_factory, tmp_path):
+    """AC-02.5 / requirement 6 (R5): the REAL precedence vectors — a workspace
+    `daimonos.toml` that (a) declares an extra local tool and (b) tries to set
+    `tool_allowlist` itself — cannot widen or disable the caller's explicit
+    `--tool-allowlist`. `cfg.tool_allowlist` is `#[serde(skip)]`, so the config
+    key is ignored, and a config-registered tool is still subject to the CLI
+    list. The tool the config named (write_file) and the extra tool stay
+    refused; the model listing is exactly the CLI list."""
+    # (a) registers a local tool `extra`; (b) attempts to set the allowlist.
+    (tmp_path / "daimonos.toml").write_text(
+        'tool_allowlist = ["write_file", "exec"]\n'
+        '[tools.extra]\nbin = "/bin/true"\n')
+    names = ["read_file", "search"]
     allowlist = _write_allowlist(tmp_path, names)
-    client = daimonos_factory(
-        tmp_path,
-        args=["--tool-allowlist", str(allowlist)],
-        env={"DAIMONOS_TOOL_ALLOWLIST": "read_file,write_file,exec"},
-    )
+    client = daimonos_factory(tmp_path, args=["--tool-allowlist", str(allowlist)])
+    # The config's attempt to set the allowlist is ignored: a tool it named
+    # (write_file) stays refused.
     result = client.call_tool("write_file", {"path": "n.txt", "content": "x"})
     assert _refusal(result)["code"] == NOT_ALLOWED
     assert not (tmp_path / "n.txt").exists()
+    # The config-registered `extra` tool is not on the CLI allowlist -> refused.
+    refused_extra = client.call_tool("extra", {})
+    assert _refusal(refused_extra)["code"] == NOT_ALLOWED
+    # The listing is exactly the CLI list (config neither widened nor disabled).
     listed = {t["name"] for t in client.list_tools()}
     assert listed == set(names), listed
 
@@ -331,3 +341,204 @@ def test_allowlist_refusal_is_recorded_as_tool_refusal(daimonos_binary, tmp_path
     # The allowed read was still recorded as an executed tool_call.
     assert any(e.get("reason") is None for e in _by_kind(events, "tool_call")), events
     assert not (workspace / "out.txt").exists(), "a refused write must not be made"
+
+
+# =====================================================================
+# Run r2 review fixes (ADR-023, PM Q-FR-02-2). Each test drives a real
+# daimonos process. Reserved reasons (INTERFACES.md exit-2 taxonomy):
+MISSING_FINAL = "tool_allowlist_missing_final_output"
+# Reuse the hermetic control-file + isolated-env helpers from the WP05 suite.
+from test_structured_output import (  # noqa: E402
+    SCHEMA,
+    _isolated_env,
+    _write_control,
+    _last_json,
+)
+
+
+# --- R1 (BLOCKER): omitted final-answer tool fails startup -------------------
+
+
+def test_final_output_tool_absent_from_allowlist_fails_startup(daimonos_binary, tmp_path):
+    """R1 / PM Q-FR-02-2 / ADR-023: when `--tool-allowlist` is active and
+    `--final-output` is configured, an allowlist that omits the final-answer
+    tool fails the run at startup (exit 2, `run_configuration_invalid`,
+    reason `tool_allowlist_missing_final_output`) naming the omitted tool. The
+    name is never added automatically."""
+    home = tmp_path / "home"
+    home.mkdir()
+    control = _write_control(
+        tmp_path, schema=SCHEMA, tool_name="final_answer",
+        tool_description="finish", corrective_retries=0)
+    allowlist = _write_allowlist(tmp_path, ["read_file", "search"])
+    completed = subprocess.run(
+        [daimonos_binary, "--workspace", str(tmp_path),
+         "--tool-allowlist", str(allowlist), "agent",
+         "--final-output", control, "--print", "hi"],
+        capture_output=True, text=True, timeout=90, env=_isolated_env(home))
+    assert completed.returncode == 2, (completed.returncode, completed.stderr)
+    error = _startup_error(completed.stderr.encode())
+    assert error["code"] == CFG_INVALID, error
+    assert error["reason"] == MISSING_FINAL, error
+    assert "final_answer" in error["message"], error
+
+
+def test_final_output_tool_on_allowlist_starts_cleanly(daimonos_binary, tmp_path):
+    """The complement: when the final-answer tool IS on the allowlist, the
+    missing-final-output guard does not fire (startup proceeds past it). The
+    effective-list report is emitted and includes the final-answer name."""
+    home = tmp_path / "home"
+    home.mkdir()
+    control = _write_control(
+        tmp_path, schema=SCHEMA, tool_name="final_answer",
+        tool_description="finish", corrective_retries=0)
+    allowlist = _write_allowlist(tmp_path, ["read_file", "search", "final_answer"])
+    completed = subprocess.run(
+        [daimonos_binary, "--workspace", str(tmp_path),
+         "--tool-allowlist", str(allowlist), "agent",
+         "--final-output", control, "--print", "hi"],
+        capture_output=True, text=True, timeout=90, env=_isolated_env(home))
+    # It must not fail with the missing-final-output reason (any later failure
+    # for want of a provider/credential is fine — the startup guard passed).
+    report = _effective_report(completed.stderr.encode())
+    assert report is not None and "final_answer" in report, completed.stderr
+    missing = _find_json_line(
+        completed.stderr.encode(),
+        lambda o: o.get("error", {}).get("reason") == MISSING_FINAL,
+    )
+    assert missing is None, completed.stderr
+
+
+# --- Listing-inventory helpers ----------------------------------------------
+
+
+def _sig_tool_names(text):
+    """Extract the set of daimonos tool names a `list_tool_signatures` /
+    server-instructions signature dump advertises. `print`/`tool` are language
+    builtins (not daimonos tools) and are not counted."""
+    names = set()
+    marker = 'Callable as tool("<name>", ...): '
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("def "):
+            nm = line[4:].split("(", 1)[0]
+            if nm not in ("print", "tool"):
+                names.add(nm)
+        if marker in line:
+            for n in line.split(marker, 1)[1].split(","):
+                n = n.strip()
+                if n:
+                    names.add(n)
+    return names
+
+
+def _server_instructions(daimonos_binary, workspace, args):
+    """Return the MCP server `instructions` string from a fresh initialize."""
+    import os
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp", "-w", str(workspace), *args],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=os.environ.copy(),
+    )
+    try:
+        req = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                          "clientInfo": {"name": "pytest", "version": "1.0"}}}
+        proc.stdin.write((json.dumps(req) + "\n").encode())
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        obj = json.loads(line)
+        return obj.get("result", {}).get("instructions", "") or ""
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+
+# --- R2 (MAJOR): get_tool_schema is filtered by the policy ------------------
+
+
+def test_get_tool_schema_of_unlisted_tool_returns_nothing(daimonos_factory, tmp_path):
+    """R2 / ADR-023: under an active allowlist, `get_tool_schema` must not
+    reveal the schema of an unlisted tool — the probe set equals the allowlist.
+    A listed tool's schema is returned; an unlisted name yields an unknown-tool
+    error with no schema, and the "Available" suggestion omits unlisted tools."""
+    names = ["read_file", "search", "get_tool_schema"]
+    allowlist = _write_allowlist(tmp_path, names)
+    client = daimonos_factory(tmp_path, args=["--tool-allowlist", str(allowlist)])
+    ok = client.call_tool("get_tool_schema", {"tools": ["read_file"]})
+    assert not ok.get("isError"), ok
+    assert "read_file" in ok["content"][0]["text"], ok
+    res = client.call_tool("get_tool_schema", {"tools": ["write_file"]})
+    text = res["content"][0]["text"]
+    assert res.get("isError"), text
+    assert "inputSchema" not in text, text  # no schema for an unlisted tool
+    available = text.split("Available:", 1)[1] if "Available:" in text else ""
+    assert "write_file" not in available, text
+
+
+# --- R3 (MAJOR): list_tool_signatures is filtered by the policy -------------
+
+
+def test_list_tool_signatures_is_filtered_to_the_allowlist(daimonos_factory, tmp_path):
+    """R3 / ADR-023: `list_tool_signatures` dumps only signatures of allowlisted
+    tools. The advertised set is a subset of the allowlist and never reveals an
+    unlisted tool (served, discovered, probed, and dumped sets must agree)."""
+    names = ["read_file", "search", "exec", "list_tool_signatures"]
+    allowlist = _write_allowlist(tmp_path, names)
+    client = daimonos_factory(tmp_path, args=["--tool-allowlist", str(allowlist)])
+    res = client.call_tool("list_tool_signatures", {})
+    text = res["content"][0]["text"]
+    parsed = _sig_tool_names(text)
+    assert parsed <= set(names), (parsed, names)
+    assert {"read_file", "search", "exec"} <= parsed, (parsed, text)
+    assert "write_file" not in parsed and "ls" not in parsed, parsed
+
+
+def test_server_instructions_signatures_are_filtered(daimonos_binary, tmp_path):
+    """Listing inventory: the MCP server `instructions` embed Starlark tool
+    signatures. Under an active allowlist they are filtered too, so the
+    instructions cannot reveal an unlisted tool (ADR-023 served==discovered)."""
+    names = ["read_file", "search", "execute_script"]
+    allowlist = _write_allowlist(tmp_path, names)
+    instr = _server_instructions(daimonos_binary, tmp_path, ["--tool-allowlist", str(allowlist)])
+    assert "def read_file(" in instr, instr
+    assert "def write_file(" not in instr, instr
+    assert "def exec(" not in instr, instr
+
+
+# --- R4 (MINOR): effective report intersects the legacy restriction ---------
+
+
+def test_effective_report_intersects_legacy_restriction(daimonos_binary, tmp_path):
+    """R4 / ADR-023: the startup effective-list report is the intersection with
+    the run's existing legacy restriction (agent-env `allowed_commands`), not
+    the raw list — it reports the set the run will actually permit."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = tmp_path / "agent.env"
+    env_file.write_text("DAIMONOS_AGENT_ALLOWED_COMMANDS=read_file\n")
+    allowlist = _write_allowlist(tmp_path, ["read_file", "search"])
+    completed = subprocess.run(
+        [daimonos_binary, "--workspace", str(tmp_path),
+         "--tool-allowlist", str(allowlist), "agent",
+         "--agent-env", str(env_file), "--print", "hi"],
+        capture_output=True, text=True, timeout=90, env=_isolated_env(home))
+    report = _effective_report(completed.stderr.encode())
+    assert report == ["read_file"], (report, completed.stderr)
+
+
+# --- R7 (MINOR): config-registered custom tools are allowlistable -----------
+
+
+def test_config_registered_tool_can_be_allowlisted(daimonos_binary, tmp_path):
+    """R7 / ADR-023 effective catalog: a config-registered custom local tool is
+    a dispatchable name, so allowlisting it must not false-reject at startup."""
+    (tmp_path / "daimonos.toml").write_text('[tools.mytool]\nbin = "/bin/true"\n')
+    allowlist = _write_allowlist(tmp_path, ["read_file", "mytool"])
+    proc = _run_startup(daimonos_binary, tmp_path, ["--tool-allowlist", str(allowlist)])
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    report = _effective_report(proc.stderr)
+    assert report is not None and "mytool" in report, proc.stderr
