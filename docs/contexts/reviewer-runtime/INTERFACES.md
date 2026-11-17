@@ -209,6 +209,8 @@ WP13 extends existing `tool_output::bound_text` with an output policy.
 Truncated responses retain paging or query-narrowing guidance. They never advertise a nonexistent saved file.
 User-requested explicit file writes remain ordinary tool operations, not spill output.
 
+_Status (WP13, implemented):_ `--no-output-spill` (global CLI flag) sets `tool_output.save_full_output = false`. `src/tool_output.rs::bound_text`, `reformat_text`, and `microcompact_history` honor it by bounding/pruning in place with `NO_SPILL_MARKER`/`NO_SPILL_PRUNED_MARKER` and never calling `store_full`. Wired for the MCP and agent frontends on `master` (WP10 worker routing must propagate `save_full_output` when built — see WP13 handoff). Script/pipeline/batch aggregation routes go through the same `bound_text`/`bounded_text_tool_result` seam. Spellings `--no-output-spill` and `save_full_output` are now in use.
+
 WP18 owns `src/tool_budget.rs` (new): `ToolBudget`, `BudgetReceipt`, and `LimitFailure`.
 Method reservations: `ToolBudget::check_deadline()`, `charge_input(bytes)`, and `remaining()` return typed results.
 A call starts with an absolute deadline and a remaining logical-input counter at admission.

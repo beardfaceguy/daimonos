@@ -14,6 +14,7 @@ Date: 2026-11-03
 - **Logical input:** File, git-object, or index content read or scanned to serve a call. It is not physical I/O or output size.
 - **Offline-tools authority:** A process network ceiling for local tool servers, distinct from the networked model side.
 - **Tool-contract version:** Compatibility identity of tool definitions, separate from binary and source-commit identity.
+- **No-spill output:** Caller-owned mode (`--no-output-spill`, `tool_output.save_full_output = false`) that bounds oversized tool results in place with paging/narrowing guidance, writing no spill file and advertising no saved-file pointer on any route. Implemented in WP13; see INTERFACES/INVENTORIES status notes.
 
 The [package plan](../../handoffs/2026-10-28-dbunk-remaining-work.md#adr-inventory) indexes Accepted ADRs 021–032.
 The user accepted those decisions and all four G0 interface groups on 2026-10-29 UTC.

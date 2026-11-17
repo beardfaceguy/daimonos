@@ -418,6 +418,17 @@ complete text in a private managed file and returns a UTF-8-safe head/tail
 preview containing its path. Storage failures fail open: the successful tool
 result remains unchanged.
 
+The caller-owned `--no-output-spill` flag (config `save_full_output = false`,
+ADR-021 / FR-11) bounds oversized results in place instead: no full copy is
+written and no saved-file pointer is emitted, including on the reformat route
+(below). The preview still marks the truncation explicitly and tells the model
+to page (`offset`/`limit`) or narrow its query to retrieve more. Use it when the
+caller's state directory is not readable by the agent, so a saved-file pointer
+would only mislead it. Old-result pruning behaves the same way under this mode:
+results are still pruned to reclaim tokens, but with no stored copy and no path.
+Default behavior is preserved when the flag is absent; the flag cannot be
+weakened by configuration.
+
 Before each provider call, older successful tool results are also pruned
 newest-first against a deterministic token budget. Errors and the configured
 number of recent results are preserved. Large string arguments from old
@@ -433,6 +444,7 @@ other metadata.
 | `intra_turn_result_budget_tokens` | `40000` | Approximate newest-first budget for prior successful results |
 | `intra_turn_keep_recent_results` | `5` | Most-recent successful results always preserved |
 | `old_argument_max_chars` | `2000` | Threshold for truncating old edit/write string arguments |
+| `save_full_output` | `true` | Save a full copy and emit a saved-file pointer for bounded output. `false` (CLI `--no-output-spill`, ADR-021/FR-11) bounds in place with paging/narrowing guidance and no spill file or pointer. |
 
 ```toml
 [tool_output]
@@ -442,6 +454,7 @@ retention_days = 7
 intra_turn_result_budget_tokens = 40_000
 intra_turn_keep_recent_results = 5
 old_argument_max_chars = 2_000
+save_full_output = true
 ```
 
 ### `[loop_detector]` — Tool retry-storm detection
