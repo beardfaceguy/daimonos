@@ -7,6 +7,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **Explicit-only configuration** (`--ignore-config-files`, FR-09, ADR-021).
+  A global, default-off run option that refuses every implicit configuration
+  source (environment files, config files, agent instructions, skills, default
+  MCP/Zed settings, ignore files, and file-defined CLI plugins) so a hostile
+  workspace or home file cannot configure an opted-in run. Explicit
+  caller-supplied inputs (`--config` and the paths it names, `--agent-env`,
+  `--agent-instructions`) remain honored, and each ignored source is reported
+  by path at startup. The setting is pinned into a session daemon's launch
+  identity.
+  Ignore-file suppression (D08) covers every walker an opted-in run can reach:
+  content `search`, `search mode="files"` (the filename index), their confined
+  `--confine-paths` equivalents, and `snapshot` create/restore.
+  The over-broad-root index warm-up preflight honors the policy too, so a
+  hostile `.gitignore` cannot change which paths an opted-in run eagerly
+  indexes. A process-level test confirms that under the option a hostile
+  workspace `agent-instructions.md` never reaches the model request.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

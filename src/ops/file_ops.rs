@@ -901,9 +901,18 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
 
     let pattern_clone = pattern.clone();
     let workspace = session.workspace.clone();
+    // D08 (ADR-021, FR-09): explicit-only runs let no implicit ignore file steer the walk.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
 
     let result = tokio::task::spawn_blocking(move || {
-        grep_blocking(&pattern_clone, &root, &workspace, max, file_glob.as_deref())
+        grep_blocking(
+            &pattern_clone,
+            &root,
+            &workspace,
+            max,
+            file_glob.as_deref(),
+            apply_ignore_files,
+        )
     })
     .await;
 
@@ -950,6 +959,10 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
         op.n.unwrap_or(session.cfg.search.default_grep_max as i64)
             .max(1) as usize;
     let file_glob = op.g.clone();
+    // D08 (ADR-021, FR-09): explicit-only runs read no implicit ignore file,
+    // even under confinement (--confine-paths), so a hostile ignore file cannot
+    // steer confined evidence grep.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
     let result = tokio::task::spawn_blocking(move || {
         let mut searcher = Searcher::new();
         let mut scan = |file: std::fs::File,
@@ -994,7 +1007,11 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
                 ..WalkOptions::default()
             },
         )?;
-        let ignores = crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk);
+        let ignores = if apply_ignore_files {
+            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk)
+        } else {
+            crate::confined_ignore::ConfinedIgnore::disabled(&authority)
+        };
         let mut skipped = walk.skipped.len();
         for entry in walk.entries {
             if matches.len() >= max {
@@ -1050,6 +1067,7 @@ fn grep_blocking(
     workspace: &Path,
     max: usize,
     file_glob: Option<&str>,
+    apply_ignore_files: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     use grep_regex::RegexMatcher;
     use grep_searcher::sinks::UTF8;
@@ -1061,7 +1079,19 @@ fn grep_blocking(
     let mut matches = Vec::new();
 
     let mut walk = WalkBuilder::new(root);
-    walk.hidden(true).git_ignore(true);
+    walk.hidden(true);
+    if apply_ignore_files {
+        walk.git_ignore(true);
+    } else {
+        // D08 (ADR-021, FR-09): disable every implicit ignore-file layer so a
+        // hostile `.gitignore`/`.ignore` cannot steer evidence walks. Built-in
+        // hidden-file filtering is not an ignore file and is left unchanged.
+        walk.git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
 
     let _ = file_glob; // glob filtering handled per-file below
 
