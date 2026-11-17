@@ -13,9 +13,13 @@
 use jsonschema::{Draft, Validator};
 use serde_json::Value;
 
-/// Default bound on how many validation error strings are surfaced for one
-/// instance. The real cap is caller/config owned (`max_validation_errors`);
-/// this constant only backs direct module callers and tests.
+/// Fixed internal cap on how many validation error strings are surfaced for
+/// one instance. WP05's `--final-output` caller interface does not expose this
+/// bound (see INTERFACES.md L43); it is an internal safety cap, not a caller or
+/// config control. The reserved `reviewer.*` configuration groups
+/// (INTERFACES.md L286-290) may later expose a `max_validation_errors` config
+/// cap under package-level configuration review; until then this value is used
+/// unconditionally by `FinalOutputSpec::compile` and direct module callers.
 pub const DEFAULT_MAX_VALIDATION_ERRORS: usize = 32;
 
 /// A schema that cannot be used locally, detected before any model request or
