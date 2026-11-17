@@ -172,6 +172,19 @@ fn build_provider(
     .map_err(anyhow::Error::msg)
 }
 
+/// WP07 (FR-04, ADR-025): read and validate the controlled model profile from a
+/// caller-owned JSON file. Returns a validated [`providers::ControlledProfile`]
+/// or an error naming the option, the path, and the problem (e.g. the missing
+/// required value). Reads configuration only — no credential or network.
+fn load_controlled_profile(path: &Path) -> anyhow::Result<providers::ControlledProfile> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: invalid JSON: {e}", path.display()))?;
+    providers::ControlledProfile::from_json(&value)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))
+}
+
 fn resolve_thought_log_path(
     enabled: bool,
     override_path: Option<PathBuf>,
@@ -259,7 +272,39 @@ pub async fn run_agent(
         agent_env,
         debug_thoughts,
         debug_thoughts_path,
+        model_profile,
+        final_output,
+        capability_probe_payload,
+        worker_config,
     } = args;
+    // WP09 (FR-04 reqs 14-17, ADR-027): the capability probe requires FR-01
+    // structured final output AND a complete controlled model profile (PM
+    // answer A-to-Q-FR-04-2 / reviewer-runtime INTERFACES.md). Refuse at
+    // startup, naming the offending option, before any model request — on
+    // every agent mode that accepts the flag (print, dry-run, the interactive
+    // fallback). Chat/ACP/session-daemon never carry this agent-only flag, so
+    // clap already rejects it there as an unexpected argument.
+    if capability_probe_payload.is_some() {
+        if final_output.is_none() {
+            emit_run_configuration_invalid(
+                "capability_probe_requires_final_output",
+                "--capability-probe-payload requires --final-output (FR-01 structured final output)",
+            );
+        }
+        if model_profile.is_none() {
+            emit_run_configuration_invalid(
+                "capability_probe_requires_model_profile",
+                "--capability-probe-payload requires --model-profile (controlled model transport)",
+            );
+        }
+    }
+    // WP07 (FR-04): validate the controlled model profile before any work, in
+    // every mode. A partial profile fails here naming the missing value(s);
+    // this validates configuration only and reads no credential or network.
+    let controlled_profile = match &model_profile {
+        Some(path) => Some(load_controlled_profile(path)?),
+        None => None,
+    };
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
     // no TTY is attached. Only the Print fallback's require_agent_task error
@@ -307,6 +352,16 @@ pub async fn run_agent(
             // Dry-run never calls the provider and does not load the agent env,
             // so effort is immaterial here; use the default.
             thinking: providers::ThinkingLevel::default(),
+            audit: None,
+            // WP05: dry-run never runs the loop, so final-output is inert here.
+            final_output: None,
+            final_output_sink: None,
+            // WP09: dry-run never contacts a provider, so no probe is sent.
+            capability_probe: None,
+            capability_probe_sink: None,
+            // WP10: dry-run never runs the loop; worker-only is inert here and
+            // the flag is refused in dry-run at parse anyway (clap conflict).
+            worker_config: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -351,6 +406,14 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 debug_tokens: token_log.is_some(),
+                // FR-07 (R4): read-only is part of the daemon identity so a
+                // read-only client spawns a read-only daemon and refuses to
+                // attach to one started without it.
+                workspace_read_only: cfg.workspace_read_only,
+                // FR-02 (WP06): the allowlist is part of the daemon identity so
+                // an allowlisted client spawns an allowlisted daemon and refuses
+                // to attach to one started without the same selection.
+                tool_allowlist: cfg.tool_allowlist_path.as_deref(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),
@@ -450,15 +513,151 @@ pub async fn run_agent(
     } else {
         task
     };
+    // WP05 (ADR-024) CI-1: resolve and validate the explicit final-output
+    // control file BEFORE the agent env file is read. INTERFACES.md startup
+    // order resolves explicit control files (step 3) ahead of environment
+    // mutation / implicit reads, so a config error exits 2, an unusable or
+    // external-reference schema exits 20 with the final-output error shape, and
+    // a final-tool name that collides with a registered tool exits 2
+    // (tool_name_collision) — all fail-closed before a single model request and
+    // regardless of whether an agent env file exists on the host.
+    let final_output_runtime = match &final_output {
+        Some(path) => {
+            let spec = match crate::structured_output::load_control(path) {
+                Ok(spec) => spec,
+                Err(startup) => emit_final_output_startup_error(startup),
+            };
+            let collides = crate::tool_facade::active_schemas_for_policy(
+                workspace,
+                &cfg.prompts.resolved_tool_descriptions,
+                cfg.filesystem_authority.is_some(),
+                // Final-output name-collision check needs the FULL native
+                // catalog, independent of any --tool-allowlist.
+                &crate::run_policy::ToolPolicy::unrestricted(),
+            )
+            .iter()
+            .any(|schema| schema.name.as_str() == spec.tool_name());
+            if collides {
+                emit_final_output_startup_error(
+                    crate::structured_output::FinalOutputStartupError {
+                        exit_code: 2,
+                        message: Some(format!(
+                            "final-output control file: tool_name '{}' collides with a registered tool (tool_name_collision)",
+                            spec.tool_name()
+                        )),
+                        json: None,
+                    },
+                );
+            }
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+            Some((std::sync::Arc::new(spec), sink))
+        }
+        None => None,
+    };
+    // WP09 (ADR-027): load and LOCALLY validate the caller's minimal probe
+    // payload before any model request. The earlier refusal guarantees the
+    // probe is reachable only with --final-output present, so a final spec
+    // exists here. An unreadable, non-JSON, or schema-invalid payload is a
+    // caller configuration error (exit 2), not a model failure.
+    let capability_probe_payload_value = match (&capability_probe_payload, &final_output_runtime) {
+        (Some(path), Some((spec, _))) => match crate::capability_probe::load_payload(path, spec) {
+            Ok(value) => Some(value),
+            Err(message) => {
+                emit_run_configuration_invalid("capability_probe_payload_invalid", &message)
+            }
+        },
+        _ => None,
+    };
+    // WP09 (ADR-027): assemble the probe materials from the run's controlled
+    // profile while it is still in scope. `request_retries` is forced to 0 so
+    // the probe is exactly one attempt regardless of the run's retry setting.
+    // The credential comes from the profile's named variable (the same single
+    // source as the run provider); when it is unset or empty the probe is not
+    // built and the provider construction below produces the canonical error.
+    let (capability_probe, capability_probe_sink) =
+        match (&capability_probe_payload_value, &controlled_profile) {
+            (Some(payload), Some(profile)) => match std::env::var(&profile.spec.credential_env) {
+                Ok(credential) if !credential.trim().is_empty() => {
+                    let mut request = profile.request.clone();
+                    request.request_retries = 0;
+                    let probe = crate::capability_probe::ProbeSpec {
+                        spec: profile.spec.clone(),
+                        request,
+                        credential,
+                        payload: payload.clone(),
+                    };
+                    let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    (Some(probe), Some(sink))
+                }
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+    // WP10 (FR-05, ADR-028) startup ordering: resolve and validate the explicit
+    // worker control file BEFORE the agent env file is read (INTERFACES.md
+    // step 3: explicit control files precede environment mutation / implicit
+    // reads). A malformed or empty document fails the run at startup
+    // (run_configuration_invalid) — fail-closed, before any model request or
+    // worker launch. Worker discovery itself happens in the loop builder, once,
+    // before the catalog freeze.
+    // A malformed/unreadable/empty worker control file is a configuration
+    // fault: emit the reviewed `run_configuration_invalid` JSON and exit 2
+    // (INTERFACES.md exit table), never generic anyhow exit 1.
+    let worker_config_runtime = match &worker_config {
+        Some(path) => {
+            let invalid = |reason: &str, detail: String| -> ! {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": reason,
+                        "message": format!("--worker-config {}: {detail}", path.display()),
+                    }})
+                );
+                std::process::exit(2);
+            };
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(error) => invalid("worker_config_unreadable", error.to_string()),
+            };
+            match crate::worker_runtime::WorkerConfig::parse(&content) {
+                Ok(config) => Some(std::sync::Arc::new(config)),
+                Err(error) => invalid("worker_config_invalid", error),
+            }
+        }
+        None => None,
+    };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-    let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(
-        &effective_provider,
-        &agent,
-        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
-    )?;
+    // WP10 (R1, ADR-028): capture the resolved model credential BEFORE the
+    // provider consumes it, so a worker whose explicit env value or argv entry
+    // discloses it can be refused before any worker launches. Default provider:
+    // the agent env `DAIMONOS_AGENT_API_KEY`. Controlled profile (WP07): the
+    // value of its named credential variable.
+    let model_credential: Option<String> = match &controlled_profile {
+        Some(profile) => std::env::var(&profile.spec.credential_env).ok(),
+        None => Some(agent.api_key.clone()),
+    };
+    // WP07 (FR-04): when a controlled profile is set it is the SOLE source of
+    // the provider/model/credential; every completion routes through the opt-in
+    // controlled transport. Otherwise legacy provider construction is unchanged.
+    let (effective_model, llm): (String, Box<dyn providers::LlmProvider>) =
+        if let Some(profile) = controlled_profile {
+            let controlled_model = profile.spec.model.clone();
+            let provider = providers::router::ControlledProvider::from_profile(profile)
+                .map_err(anyhow::Error::msg)?;
+            (controlled_model, Box::new(provider))
+        } else {
+            (
+                model.unwrap_or_else(|| agent.model.clone()),
+                build_provider(
+                    &effective_provider,
+                    &agent,
+                    providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+                )?,
+            )
+        };
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
@@ -481,6 +680,37 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
+    // WP10 (R1, ADR-028 Decision; D33/K2): refuse a worker whose explicit `env`
+    // value or `args` entry discloses the resolved model credential. This is a
+    // pure configuration refusal that needs NO runtime state, so it runs BEFORE
+    // the audit opens — like every other exit-2 configuration refusal it then
+    // leaves no audit file (never a lone `run_start`). Fail-closed before any
+    // worker launches (discovery happens inside run_agent): exit 2 with a named
+    // reason whose text never contains the credential value.
+    if let (Some(config), Some(credential)) = (&worker_config_runtime, &model_credential) {
+        if let Err(reason) = config.reject_credential_disclosure(std::slice::from_ref(credential)) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "worker_credential_disclosure",
+                    "message": reason,
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+    // WP08 (ADR-026): open the caller-requested audit sink immediately before
+    // the first model request. A failure to open (or to write the `run_start`
+    // event) is a required-audit failure that aborts the run with exit 23,
+    // before any provider call — distinct from OTLP's fail-open policy.
+    let audit = open_run_audit(
+        &cfg,
+        &effective_provider,
+        &effective_model,
+        &agent,
+        workspace,
+    );
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -490,10 +720,274 @@ pub async fn run_agent(
         token_log,
         thought_log,
         thinking: agent.thinking.clone(),
+        audit: audit.clone(),
+        final_output: final_output_runtime
+            .as_ref()
+            .map(|(spec, _)| std::sync::Arc::clone(spec)),
+        final_output_sink: final_output_runtime
+            .as_ref()
+            .map(|(_, sink)| std::sync::Arc::clone(sink)),
+        capability_probe,
+        capability_probe_sink: capability_probe_sink.clone(),
+        worker_config: worker_config_runtime.clone(),
     };
-    let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
+    // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
+    // and any required-audit write failure surfaced as exit 23 — BEFORE the
+    // run's assistant output reaches stdout, so a finish-time audit failure can
+    // never leave a published "success" that the record does not cover. When
+    // audit is enabled the output is buffered and flushed only after
+    // `finalize_run_audit` succeeds; with audit off the path is byte-identical
+    // to before (direct stdout).
+    let result = if let Some(audit) = &audit {
+        use std::io::Write as _;
+        let mut buffer: Vec<u8> = Vec::new();
+        let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
+        // WP09 (G1): peek (not take) the probe verdict so the terminal audit
+        // record agrees with the process exit that `emit_probe_outcome` will
+        // produce below; `emit_probe_outcome` still consumes the sink after.
+        let probe_verdict = capability_probe_sink
+            .as_ref()
+            .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        // WP09 (G2): peek (not take) the final-output verdict for the same
+        // single-source reconciliation; `emit_final_output_outcome` takes it
+        // after the buffer flush below.
+        let final_verdict = final_output_runtime
+            .as_ref()
+            .and_then(|(_, sink)| sink.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        finalize_run_audit(
+            audit,
+            &result,
+            probe_verdict.as_ref(),
+            final_verdict.as_ref(),
+        );
+        let mut stdout = std::io::stdout();
+        stdout.write_all(&buffer)?;
+        stdout.flush()?;
+        result
+    } else {
+        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
+    };
+    // WP10 (FR-05, ADR-028): a required worker failure (initialization, call,
+    // liveness, or teardown) ends the run with the reviewed `worker_unavailable`
+    // exit 22 (INTERFACES.md exit table) — never generic anyhow exit 1, and
+    // never a local fallback. This also covers the model-side final-output
+    // contract: a lost worker takes precedence over the final-output mapping.
+    if worker_config_runtime.is_some() {
+        exit_on_config_invalid(&result);
+        exit_on_worker_failure(&result);
+    }
+    let result = result?;
+    // WP09 (FR-04, ADR-027): a failed capability probe is terminal and precedes
+    // any final-output decision (the agent loop never ran after a failed
+    // probe). Emit the distinct `model_unsupported` exit (21) here, before the
+    // final-output outcome is considered.
+    if let Some(sink) = &capability_probe_sink {
+        emit_probe_outcome(sink);
+    }
+    // WP05 (ADR-024): map the terminal final-output decision to the reviewed
+    // stdout/stderr + exit-code contract. Diverges (process::exit) when active.
+    if let Some((_, sink)) = &final_output_runtime {
+        emit_final_output_outcome(sink);
+    }
     check_agent_result(&result)
+}
+
+/// Build the `run_start` metadata from the default-provider agent configuration
+/// and open the audit sink. Returns `None` when `--audit-path` is absent.
+/// Unavailable metadata (e.g. `wire`, which WP07 controlled transport supplies)
+/// is explicit, never invented (ADR-026).
+fn open_run_audit(
+    cfg: &config::Config,
+    effective_provider: &str,
+    effective_model: &str,
+    agent: &agent_env::AgentEnv,
+    workspace: &Path,
+) -> Option<Arc<crate::run_audit::RunAudit>> {
+    let path = cfg.audit_path.as_ref()?;
+    let meta = crate::run_audit::RunAuditMeta {
+        provider_label: Some(effective_provider.to_string()),
+        requested_model: Some(effective_model.to_string()),
+        base_url_host: crate::run_audit::base_url_host(&agent.base_url),
+        // `wire` is a WP07 controlled-transport concept; the default provider
+        // does not expose it. Recorded as explicit-unavailable (pending hook).
+        wire: None,
+        // The NAME of the credential variable, never its value.
+        credential_env: Some("DAIMONOS_AGENT_API_KEY".to_string()),
+        effective_allowlist: (!agent.allowed_commands.is_empty())
+            .then(|| agent.allowed_commands.clone()),
+        effective_root: Some(workspace.display().to_string()),
+        workspace_read_only: cfg.workspace_read_only,
+    };
+    let limits = crate::run_audit::AuditLimits {
+        max_event_bytes: cfg.reviewer.audit.max_event_bytes,
+        max_events: cfg.reviewer.audit.max_events,
+    };
+    let run_id = analytics::read_agent_session_id_env().unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("run-{}-{}", std::process::id(), nanos)
+    });
+    match crate::run_audit::RunAudit::open(path, run_id, limits, &meta) {
+        Ok(audit) => Some(Arc::new(audit)),
+        Err(failure) => {
+            eprintln!("{}", failure.diagnostic_json());
+            std::process::exit(failure.exit_code());
+        }
+    }
+}
+
+/// Write the terminal `run_end` event before the frontend reports success, and
+/// convert a mid-run or terminal audit-write failure into exit 23 (fail-closed,
+/// ADR-026). The original run failure code is preserved as secondary metadata.
+/// Map one agent result to the terminal `(status, exit_code)` recorded in
+/// `run_end`. This is the SINGLE source for both the audit's terminal record
+/// and the process exit (R7): `check_agent_result` fails the process only when
+/// the run stopped with `StopReason::Error` (exit 1) and otherwise exits 0, so
+/// the recorded `exit_code` and the process return code always agree, while the
+/// `status` string still reflects a non-`EndTurn` ending (e.g. a turn/token
+/// limit) instead of a bare "ok".
+fn run_terminal_status(
+    result: &anyhow::Result<agent::AgentResult>,
+    probe: Option<&crate::capability_probe::ProbeOutcome>,
+    final_output: Option<&crate::structured_output::FinalOutputOutcome>,
+) -> (&'static str, i32) {
+    // D33/K1: a typed post-discovery configuration refusal records the reviewed
+    // `run_configuration_invalid` exit 2 (the process exits 2 via
+    // `exit_on_config_invalid`). This precedes every other verdict below, as the
+    // process-exit order in `run_agent_print` does (config, worker, probe,
+    // final-output), so the `run_end` record and the process code always agree.
+    if matches!(result, Ok(r) if r.config_invalid.is_some()) {
+        return ("run_configuration_invalid", 2);
+    }
+    // WP10 (FR-05, R7, D33/K3): a required-worker failure — the in-run TYPED
+    // `worker_lost` flag OR an initialization `Err` that run_agent returns with
+    // our own `worker_unavailable` prefix — records the reviewed
+    // `worker_unavailable` exit 22, from the SAME classifier (`worker_failure`)
+    // the process exit uses, so the record and the exit always agree (never a
+    // recorded `error`/1 while the process exits 22).
+    if worker_failure(result).is_some() {
+        return (crate::worker_runtime::WORKER_UNAVAILABLE, 22);
+    }
+    // WP09 (G1, FR-04/ADR-027): a failed capability probe is terminal and the
+    // process exits 21 (`model_unsupported`) via `emit_probe_outcome`. The
+    // terminal `run_end` record must agree, so the probe verdict is consulted
+    // here — the single source for both the audit record and the process exit
+    // — before the stop-reason mapping below. (Precedes final-output: the loop
+    // never ran after a failed probe; matches the process-exit order.)
+    if let Some(crate::capability_probe::ProbeOutcome::ModelUnsupported { .. }) = probe {
+        return ("model_unsupported", 21);
+    }
+    // WP09 (G2, ADR-024/026): when final-output mode carries a terminal verdict,
+    // the process diverges via `emit_final_output_outcome` (exit 20/24/0). The
+    // run_end record must carry the same exit code, so the final-output verdict
+    // is the single source here too, ahead of the stop-reason mapping.
+    if let Some(outcome) = final_output {
+        use crate::structured_output::FinalOutputOutcome;
+        return match outcome {
+            FinalOutputOutcome::Success(_) => ("ok", 0),
+            FinalOutputOutcome::Failure(_) => ("structured_output_failed", 20),
+            FinalOutputOutcome::RequestLimit(_) => ("model_request_limit", 24),
+        };
+    }
+    match result {
+        Ok(r) => match r.stop_reason {
+            providers::StopReason::EndTurn | providers::StopReason::ToolUse => ("ok", 0),
+            providers::StopReason::MaxTokens => ("max_tokens", 0),
+            providers::StopReason::Refusal => ("refusal", 0),
+            providers::StopReason::Aborted => ("aborted", 0),
+            providers::StopReason::Error => ("error", 1),
+        },
+        Err(_) => ("error", 1),
+    }
+}
+
+/// WP10 (R7, D33/K3): classify a terminal result as a required-worker failure,
+/// returning the operator-facing message when it is. TWO shapes map here: the
+/// in-run TYPED `worker_lost` flag (never a substring of `error_message`, which
+/// can carry tool/model content), and an initialization `Err` that `run_agent`
+/// returns as the TYPED `worker_runtime::WorkerInitError` (R1) — DOWNCAST here,
+/// never matched by a substring of the anyhow message, so an unrelated error
+/// whose text merely contains the token is NOT a worker verdict. This is the
+/// SINGLE classifier shared by
+/// `run_terminal_status` (the audit `run_end`) and `exit_on_worker_failure`
+/// (the process exit), so the recorded exit_code and the process code always
+/// agree on the reviewed `worker_unavailable` exit 22.
+fn worker_failure(result: &anyhow::Result<agent::AgentResult>) -> Option<String> {
+    match result {
+        Err(error) => error
+            .downcast_ref::<crate::worker_runtime::WorkerInitError>()
+            .map(|typed| typed.to_string()),
+        Ok(run) if run.worker_lost => Some(
+            run.error_message
+                .clone()
+                .unwrap_or_else(|| crate::worker_runtime::WORKER_UNAVAILABLE.to_string()),
+        ),
+        Ok(_) => None,
+    }
+}
+
+/// WP10 (FR-05, ADR-028): if the terminal run outcome is a required-worker
+/// failure (see `worker_failure`), emit the reviewed `worker_unavailable` JSON
+/// and exit 22 (INTERFACES.md exit table). Otherwise return so normal handling
+/// (final-output/exit) proceeds. Diverges on a worker failure.
+fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
+    if let Some(message) = worker_failure(result) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": crate::worker_runtime::WORKER_UNAVAILABLE,
+                "message": message,
+            }})
+        );
+        std::process::exit(22);
+    }
+}
+
+/// WP10 (D33/K1, ADR-026): if the terminal run outcome carries a typed
+/// post-discovery configuration refusal (e.g. an allowlist entry served by no
+/// worker), emit the reviewed `run_configuration_invalid` JSON and exit 2. The
+/// matching `run_end` was already written by the single terminal source
+/// (`finalize_run_audit`/`run_terminal_status`); this only prints and exits, so
+/// the audit is never a lone `run_start`. Diverges on a config refusal.
+fn exit_on_config_invalid(result: &anyhow::Result<agent::AgentResult>) {
+    if let Ok(run) = result {
+        if let Some(verdict) = &run.config_invalid {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": verdict.reason,
+                    "message": verdict.message,
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn finalize_run_audit(
+    audit: &Arc<crate::run_audit::RunAudit>,
+    result: &anyhow::Result<agent::AgentResult>,
+    probe: Option<&crate::capability_probe::ProbeOutcome>,
+    final_output: Option<&crate::structured_output::FinalOutputOutcome>,
+) {
+    // A mid-run write failure already poisoned the sink; surface it first.
+    if let Some(failure) = audit.take_failure() {
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
+    let (status, exit_code) = run_terminal_status(result, probe, final_output);
+    let secondary = matches!(result, Ok(r) if r.stop_reason == providers::StopReason::Error)
+        .then_some("provider_error");
+    if let Err(mut failure) = audit.finish(status, exit_code, None) {
+        if let Some(code) = secondary {
+            failure = failure.with_secondary(code);
+        }
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
 }
 
 pub async fn run_chat(
@@ -1188,6 +1682,95 @@ fn require_agent_task(
     })
 }
 
+/// WP09 (FR-04, ADR-027): emit a machine-readable `run_configuration_invalid`
+/// refusal naming the offending option and exit 2 (reviewer-runtime
+/// INTERFACES.md exit-code table). Diverges (process::exit).
+fn emit_run_configuration_invalid(reason: &str, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "error": {
+                "code": "run_configuration_invalid",
+                "reason": reason,
+                "message": message,
+            }
+        })
+    );
+    std::process::exit(2);
+}
+
+/// WP09 (FR-04 reqs 14-17, ADR-027): map the capability-probe verdict to the
+/// reviewed contract. A pass returns (the run continues to its final-output
+/// decision); `model_unsupported` writes a machine-readable line to stderr and
+/// exits 21 (reviewer-runtime INTERFACES.md). No evidence tool ran.
+fn emit_probe_outcome(sink: &std::sync::Mutex<Option<crate::capability_probe::ProbeOutcome>>) {
+    use crate::capability_probe::ProbeOutcome;
+    let outcome = sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(ProbeOutcome::ModelUnsupported { reason }) = outcome {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "error": { "code": "model_unsupported", "reason": reason }
+            })
+        );
+        std::process::exit(21);
+    }
+}
+
+/// Emit a final-output startup refusal and exit with its reviewed code (ADR-024
+/// / reviewer-runtime INTERFACES.md): a JSON line for the final-output error
+/// shape (exit 20, schema_unusable), else plain stderr text (exit 2). Diverges.
+fn emit_final_output_startup_error(error: crate::structured_output::FinalOutputStartupError) -> ! {
+    if let Some(json) = &error.json {
+        eprintln!("{}", serde_json::to_string(json).unwrap_or_default());
+    } else if let Some(message) = &error.message {
+        eprintln!("{message}");
+    }
+    std::process::exit(error.exit_code);
+}
+
+/// Emit the terminal final-output decision and exit per the reviewed contract
+/// (ADR-024 / INTERFACES.md): success writes only the validated argument JSON
+/// (plus one newline, already embedded) to stdout and exits 0; a typed failure
+/// writes the bounded error JSON to stderr and exits 20; the inclusive
+/// model-request ceiling writes the `turn_limit` JSON to stderr and exits 24.
+/// A run that reached no terminal decision is reported as `no_final_call`
+/// (exit 20). Diverges (process::exit).
+fn emit_final_output_outcome(
+    sink: &std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>,
+) -> ! {
+    use crate::structured_output::FinalOutputOutcome;
+    use std::io::Write as _;
+    let outcome = sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match outcome {
+        Some(FinalOutputOutcome::Success(stdout)) => {
+            print!("{stdout}");
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+        Some(FinalOutputOutcome::Failure(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(20);
+        }
+        Some(FinalOutputOutcome::RequestLimit(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(24);
+        }
+        None => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "reason": "no_final_call",
+                    "validation_errors": [],
+                    "attempts": 0,
+                    "model_requests": 0,
+                })
+            );
+            std::process::exit(20);
+        }
+    }
+}
+
 fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
     match result.evidence.status() {
         crate::evidence::EvidenceStatus::Unverified => eprintln!(
@@ -1413,10 +1996,76 @@ mod tests {
             last_call_usage: Default::default(),
             context_overflow: false,
             evidence: Default::default(),
+            worker_lost: false,
+            config_invalid: None,
         };
 
         let error = check_agent_result(&result).unwrap_err();
 
         assert!(error.to_string().contains("provider unavailable"));
+    }
+
+    #[test]
+    fn run_terminal_status_uses_typed_worker_lost_not_substring() {
+        // WP10 (R7): the worker-loss exit mapping is decided by the TYPED
+        // `worker_lost` flag, never by a substring of `error_message`. A
+        // generic provider error whose message merely CONTAINS the token must
+        // map to the generic error exit (1), not the worker exit (22).
+        let mk = |worker_lost: bool, msg: &str| agent::AgentResult {
+            messages: Vec::new(),
+            usage: Default::default(),
+            stop_reason: providers::StopReason::Error,
+            error_message: Some(msg.to_string()),
+            last_call_usage: Default::default(),
+            context_overflow: false,
+            evidence: Default::default(),
+            worker_lost,
+            config_invalid: None,
+        };
+        assert_eq!(
+            run_terminal_status(
+                &Ok(mk(false, "tool RESULT text mentions worker_unavailable")),
+                None,
+                None
+            ),
+            ("error", 1)
+        );
+        assert_eq!(
+            run_terminal_status(
+                &Ok(mk(true, "worker_unavailable: toolside read_note failed")),
+                None,
+                None
+            ),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
+    }
+
+    #[test]
+    fn worker_init_failure_is_typed_not_message_substring() {
+        // WP10 (R1): a worker INITIALIZATION failure is carried as a TYPED
+        // error (`WorkerInitError`) that the terminal classifier downcasts; it
+        // is never matched by a substring of an arbitrary anyhow message. A
+        // generic `Err` whose text merely CONTAINS the token must map to the
+        // generic error exit (1), never the worker exit (22).
+        let untyped: anyhow::Result<agent::AgentResult> = Err(anyhow::anyhow!(
+            "provider said worker_unavailable mid-stream"
+        ));
+        assert!(worker_failure(&untyped).is_none());
+        assert_eq!(run_terminal_status(&untyped, None, None), ("error", 1));
+
+        // The TYPED init error IS a worker verdict (exit 22), keeping the
+        // reviewed `worker_unavailable: <detail>` operator message.
+        let typed: anyhow::Result<agent::AgentResult> =
+            Err(anyhow::Error::new(crate::worker_runtime::WorkerInitError {
+                message: "toolside discovery failed".to_string(),
+            }));
+        assert_eq!(
+            worker_failure(&typed).as_deref(),
+            Some("worker_unavailable: toolside discovery failed")
+        );
+        assert_eq!(
+            run_terminal_status(&typed, None, None),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
     }
 }

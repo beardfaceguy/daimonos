@@ -72,6 +72,11 @@ async fn dispatch_op(
         ))
         .into_response(&format!("opcode {}", op.c));
     }
+    // FR-07 (ADR-022): refuse workspace mutations and opaque effects before they
+    // run when the workspace is read-only. Reads/internal effects pass through.
+    if let Err(failure) = session.admission.admit_opcode(op.c) {
+        return failure.into_response(&format!("opcode {}", op.c));
+    }
     match op.c {
         protocol::op::READ => file_ops::read(session, &op).await,
         protocol::op::WRITE => file_ops::write(session, &op).await,

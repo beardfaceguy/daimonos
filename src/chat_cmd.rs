@@ -79,6 +79,7 @@ pub fn build_agent_config(
         system_prompt,
         &crate::tool_descriptions::ToolDescriptions::default(),
         false,
+        &crate::run_policy::ToolPolicy::unrestricted(),
     )
 }
 
@@ -92,9 +93,12 @@ fn build_agent_config_with_descriptions(
     system_prompt: String,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     confined: bool,
+    // FR-02 (WP06, ADR-023) R1: the chat REPL offers the model only allowlisted
+    // tools (filtered at the single source); unrestricted => legacy behavior.
+    policy: &crate::run_policy::ToolPolicy,
 ) -> AgentConfig {
     let tools: Vec<ToolSchema> =
-        tool_facade::active_schemas_for_policy(workspace, descriptions, confined)
+        tool_facade::active_schemas_for_policy(workspace, descriptions, confined, policy)
             .into_iter()
             .map(|s| ToolSchema {
                 name: s.name,
@@ -236,6 +240,9 @@ pub async fn run_chat(
     compaction: Option<CompactionPolicy>,
 ) -> anyhow::Result<()> {
     let system_prompt = crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await;
+    // FR-02 (WP06, ADR-023) R1: filter the chat catalog by the explicit
+    // allowlist at the single source; a no-op with no explicit list.
+    let tool_policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
     let mut config = build_agent_config_with_descriptions(
         workspace,
         model.clone(),
@@ -245,6 +252,7 @@ pub async fn run_chat(
         system_prompt,
         &cfg.prompts.resolved_tool_descriptions,
         cfg.filesystem_authority.is_some(),
+        &tool_policy,
     );
     config.cancelled_turn_message = Some(crate::prompts::cancelled_turn(&cfg).await);
     // Outbound MCP servers (#1289): the chat REPL reads the Claude-style
@@ -253,7 +261,13 @@ pub async fn run_chat(
         config.tools.iter().map(|tool| tool.name.clone()).collect();
     let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, None).await;
     if let Some(mcp) = &agent_mcp {
-        config.tools.extend(mcp.tools());
+        // FR-02 R1: remote MCP tools obey the same allowlist (listing ==
+        // dispatchable set); a no-op with no explicit list.
+        config.tools.extend(
+            mcp.tools()
+                .into_iter()
+                .filter(|t| tool_policy.allows(&t.name)),
+        );
         config.remote_tool_dispatch = Some(mcp.dispatch_hook());
     }
     let session_store_busy_timeout =

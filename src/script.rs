@@ -700,6 +700,21 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 /// `tool("…")` universal prevents the model
 /// from spending retry turns learning which names require dedicated bindings.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
+    // FR-02 (WP06, ADR-023): the explicit allowlist is checked for EVERY inner
+    // Starlark call here — the compact opcode shortcut (`write_file(...)`) and
+    // the generic `tool("name", ...)` / plugin fall-through alike — so a listed
+    // `execute_script` can still reach only individually allowed names. Nested
+    // arbitrary Starlark cannot reset or widen the run policy. The refusal is a
+    // structured Response carrying the reviewed `tool_not_allowed` code.
+    if let Some(failure) = with_ctx(|ctx| {
+        let session = ctx.session.clone();
+        Ok(ctx
+            .handle
+            .block_on(async { session.lock().await.policy.admit(name) })
+            .err())
+    })? {
+        return Ok(failure.into_response(name));
+    }
     let resp = match tools::build_request(name, args) {
         Some(Ok(request)) => dispatch_request(request, name)?,
         Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
@@ -1539,6 +1554,16 @@ pub fn tool_signatures() -> String {
 
 /// Render only signatures admitted by the current filesystem policy.
 pub fn tool_signatures_for_policy(confined: bool) -> String {
+    tool_signatures_filtered(confined, &|_| true)
+}
+
+/// Like [`tool_signatures_for_policy`], but also hides any tool the run's
+/// explicit `--tool-allowlist` disallows (FR-02 R3, ADR-023): the dumped
+/// Starlark signatures must match the dispatchable set, so
+/// `list_tool_signatures` and the server instructions cannot reveal an unlisted
+/// tool. `print`/`tool` are language builtins (not daimonos tools) and are
+/// always shown. Context: src/script.rs.
+pub fn tool_signatures_filtered(confined: bool, allow: &dyn Fn(&str) -> bool) -> String {
     let sigs = [
         "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
@@ -1572,20 +1597,21 @@ pub fn tool_signatures_for_policy(confined: bool) -> String {
         .into_iter()
         .filter(|t| t.to_request.is_some())
         .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
+        .filter(|t| allow(t.name))
         .map(|t| t.name)
         .collect();
     via_generic.sort_unstable();
     let shown: Vec<&str> = sigs
         .into_iter()
         .filter(|signature| {
-            if !confined {
-                return true;
-            }
             let name = signature
                 .strip_prefix("def ")
                 .and_then(|text| text.split('(').next())
                 .unwrap_or("");
-            name == "print" || name == "tool" || crate::path_policy::tool_allowed(name)
+            if name == "print" || name == "tool" {
+                return true;
+            }
+            (!confined || crate::path_policy::tool_allowed(name)) && allow(name)
         })
         .map(|signature| {
             if confined && signature.starts_with("def tool(") {

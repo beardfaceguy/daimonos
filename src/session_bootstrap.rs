@@ -27,6 +27,22 @@ pub struct BootstrapOptions<'a> {
     pub confine_reference: Option<&'a Path>,
     pub confine_identity: Option<&'a str>,
     pub debug_tokens: bool,
+    /// FR-07 (ADR-022, WP04): whether the client requested `--workspace-read-only`.
+    /// This is part of the daemon's immutable launch identity: a read-only client
+    /// must spawn a read-only daemon (forwarded in `daemon_args`) and must refuse
+    /// to attach to a daemon that was started without it (hashed into
+    /// `bootstrap_fingerprint`, treated as an explicit selection in
+    /// `launch_identity`). The daemon's `Session::admission` is pinned from the
+    /// DAEMON's own config, so reuse across this boundary would otherwise bypass
+    /// the read-only gate (R4).
+    pub workspace_read_only: bool,
+    /// FR-02 (WP06): the client's `--tool-allowlist` file path. Part of the
+    /// daemon's immutable launch identity exactly like `workspace_read_only`:
+    /// forwarded in `daemon_args`, hashed into `bootstrap_fingerprint`, and an
+    /// explicit selection in `launch_identity`, so a client requesting an
+    /// allowlist cannot be served by a daemon started without the same one (the
+    /// daemon pins `Session::policy` from its OWN config).
+    pub tool_allowlist: Option<&'a Path>,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -184,6 +200,13 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if options.debug_tokens {
         args.push(OsString::from("--debug-tokens"));
     }
+    if options.workspace_read_only {
+        args.push(OsString::from("--workspace-read-only"));
+    }
+    if let Some(path) = options.tool_allowlist {
+        args.push(OsString::from("--tool-allowlist"));
+        args.push(path.as_os_str().to_owned());
+    }
     if let Some(reference) = options.confine_reference {
         args.push(OsString::from("--confine-paths"));
         args.push(OsString::from("--confine-root"));
@@ -235,6 +258,15 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.debug_tokens {
         digest.update(b"debug-tokens\0");
     }
+    if options.workspace_read_only {
+        digest.update(b"workspace-read-only\0");
+    }
+    if let Some(path) = options.tool_allowlist {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        digest.update(b"tool-allowlist\0");
+        digest.update(canonical.as_os_str().as_bytes());
+        digest.update([0_u8]);
+    }
     if let Some(identity) = options.confine_identity {
         digest.update(b"confined-root\0");
         digest.update(identity.as_bytes());
@@ -254,6 +286,8 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.state_dir.is_none()
         && options.agent_instructions.is_none()
         && !options.debug_tokens
+        && !options.workspace_read_only
+        && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
     {
         return Ok(LaunchIdentity::NotRequested);
@@ -331,12 +365,14 @@ mod tests {
     ) -> BootstrapOptions<'a> {
         BootstrapOptions {
             workspace,
+            tool_allowlist: None,
             config_path: Some(config),
             state_dir: None,
             agent_instructions: None,
             confine_reference: None,
             confine_identity: None,
             debug_tokens: false,
+            workspace_read_only: false,
             socket_path: socket,
             provider: Some("openrouter"),
             model: Some("test/model"),
@@ -534,6 +570,104 @@ mod tests {
         assert_eq!(
             bootstrap_fingerprint(&direct),
             bootstrap_fingerprint(&aliased)
+        );
+    }
+
+    // R4 (FR-07, ADR-022): `--workspace-read-only` is part of the daemon's
+    // launch identity. A read-only client (a) spawns a read-only daemon,
+    // (b) hashes read-only into the fingerprint, and (c) treats read-only as an
+    // explicit selection so attaching to a daemon with a different (e.g.
+    // non-read-only) identity is Mismatched, never a silent NotRequested join.
+    #[test]
+    fn read_only_is_forwarded_to_the_spawned_daemon() {
+        let mut opts = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&opts).contains(&OsString::from("--workspace-read-only")));
+        opts.workspace_read_only = true;
+        assert!(daemon_args(&opts).contains(&OsString::from("--workspace-read-only")));
+    }
+
+    #[test]
+    fn read_only_changes_the_bootstrap_fingerprint() {
+        let plain = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let mut read_only = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        read_only.workspace_read_only = true;
+        assert_ne!(
+            bootstrap_fingerprint(&plain),
+            bootstrap_fingerprint(&read_only)
+        );
+    }
+
+    #[test]
+    fn read_only_client_refuses_a_non_read_only_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("session.sock");
+        let config = directory.path().join("config.toml");
+        let agent_env = directory.path().join("agent.env");
+        let metadata_path = crate::session_daemon::instance_metadata_path(&socket);
+
+        // A read-only client whose ONLY selection is read-only is still an
+        // explicit selection (not NotRequested), so it is compared against the
+        // daemon's published identity.
+        let read_only = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            workspace_read_only: true,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+
+        // The running daemon published a NON-read-only fingerprint (its own
+        // bare identity). The client must NOT silently attach.
+        let non_read_only = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": 1,
+                "bootstrap_fingerprint": bootstrap_fingerprint(&non_read_only),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            launch_identity(&read_only).unwrap(),
+            LaunchIdentity::Mismatched
+        );
+
+        // A read-only client attaching to a read-only daemon Matches.
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": 1,
+                "bootstrap_fingerprint": bootstrap_fingerprint(&read_only),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            launch_identity(&read_only).unwrap(),
+            LaunchIdentity::Matched
         );
     }
 }
