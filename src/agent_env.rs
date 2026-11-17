@@ -137,6 +137,36 @@ impl AgentEnv {
         crate::paths::home_dir().map(|home| home.join(".config").join("daimonos").join("agent.env"))
     }
 
+    /// Best-effort read of ONLY the legacy `DAIMONOS_AGENT_ALLOWED_COMMANDS`
+    /// restriction from the resolved agent-env file, for the FR-02 startup
+    /// effective-allowlist report (ADR-023 R4: the report is the intersection
+    /// with existing restrictions). It NEVER fails the run — any
+    /// resolution/read/parse problem yields no restriction (empty vec) — and it
+    /// does NOT replace the authoritative [`load`](Self::load), which still
+    /// validates every field in the agent flow. Context: src/agent_env.rs.
+    pub fn read_allowed_commands_best_effort(flag: Option<PathBuf>) -> Vec<String> {
+        let Some(path) = Self::resolve_path(flag) else {
+            return Vec::new();
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut vars = parse_dotenv(&content);
+        // Mirror the authoritative loader's process-override precedence for just
+        // this one key, so the report matches what the run will enforce.
+        let process_vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                let key = key.into_string().ok()?;
+                if key != "DAIMONOS_AGENT_ALLOWED_COMMANDS" {
+                    return None;
+                }
+                Some((key, value.into_string().ok()?))
+            })
+            .collect();
+        merge_process_overrides(&mut vars, &process_vars);
+        parse_list(vars.get("DAIMONOS_AGENT_ALLOWED_COMMANDS"))
+    }
+
     /// Load + validate the agent env file. Returns a clear error (naming the
     /// path and any missing/invalid values) rather than falling back to defaults.
     pub fn load(flag: Option<PathBuf>) -> Result<AgentEnv, String> {

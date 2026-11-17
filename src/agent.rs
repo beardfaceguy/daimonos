@@ -240,6 +240,29 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// WP08 (FR-04, ADR-026): caller-requested local run audit sink. `None` =
+    /// audit off. When present, every provider response and tool dispatch in
+    /// this loop is recorded; a required-audit write failure poisons the sink
+    /// and stops the run before further model/tool work.
+    pub audit: Option<std::sync::Arc<crate::run_audit::RunAudit>>,
+    /// WP05 (ADR-024): opt-in structured final output. `Some` switches the loop
+    /// to terminal-call accounting over the caller's final-answer tool; the
+    /// terminal decision is recorded in `final_output_sink`. `None` leaves the
+    /// loop behaviour unchanged.
+    pub final_output: Option<std::sync::Arc<crate::structured_output::FinalOutputSpec>>,
+    /// Where `run_inner` records the terminal final-output decision for the
+    /// frontend to map to stdout/stderr and the reviewed exit code.
+    pub final_output_sink: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>>,
+    >,
+    /// WP10 (FR-05, ADR-028): opt-in credential-free worker execution. `Some`
+    /// routes EVERY non-final tool call through a caller-supplied worker or
+    /// refuses it — no native/opcode/script/local/remote fallback. A lost
+    /// worker aborts the run with a distinct `worker_unavailable` failure and
+    /// no further tool runs. The final-answer tool is intercepted earlier
+    /// (`final_output`) and is never forwarded to a worker. `None` leaves
+    /// dispatch unchanged (legacy ACP bridging stays fail-open).
+    pub worker_executor: Option<std::sync::Arc<crate::worker_runtime::WorkerExecutor>>,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -322,6 +345,28 @@ pub struct AgentResult {
     /// What this turn was observed to do: whether the workspace changed and
     /// whether a verifier passed afterwards (vikunja #1198). Report-only.
     pub evidence: crate::evidence::EvidenceLedger,
+    /// WP10 (R7, ADR-028): the run ended because a required worker route was
+    /// lost (exit, stall, or closed stdio). A TYPED terminal reason so the
+    /// frontend maps the distinct `worker_unavailable` exit (22) WITHOUT
+    /// substring-matching `error_message`, which can carry tool/model content.
+    pub worker_lost: bool,
+    /// WP10 (D33/K1, ADR-026): a post-discovery configuration refusal that can
+    /// be decided only AFTER a side effect (a worker was started and its tools
+    /// discovered). Carried as a TYPED terminal verdict — like `worker_lost` —
+    /// so the single terminal source (`agent_runtime::run_terminal_status`)
+    /// records the reviewed `run_configuration_invalid` exit 2 in `run_end`
+    /// before the process exits with the same code, never a lone `run_start`
+    /// indistinguishable from a killed process.
+    pub config_invalid: Option<ConfigInvalid>,
+}
+
+/// WP10 (D33/K1): a typed terminal configuration refusal raised after a worker
+/// side effect (e.g. an allowlist entry that no discovered worker serves). The
+/// `reason` is the reviewed `run_configuration_invalid` cause code; `message`
+/// is the operator-facing diagnostic (never contains a credential value).
+pub struct ConfigInvalid {
+    pub reason: &'static str,
+    pub message: String,
 }
 
 // --- Pure helpers ---
@@ -905,9 +950,15 @@ async fn run_inner(
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+    // WP08: per-run model-request sequence for the audit record (ADR-026).
+    let mut audit_model_seq: u64 = 0;
     if let Some(journal) = &journal {
         journal.checkpoint(&messages).await;
     }
+
+    // WP05 (ADR-024): final-output terminal-call accounting. `None` outside
+    // final-output mode leaves the loop behaviour unchanged.
+    let mut final_state = config.final_output.as_ref().map(|spec| spec.new_state());
 
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
     // once per turn — explicit config wins, then the env override, then the
@@ -985,6 +1036,47 @@ async fn run_inner(
     let mut evidence_degraded = false;
 
     loop {
+        // WP05 (ADR-024): inclusive model-request ceiling. Covers every HTTP
+        // attempt; a refusal sends nothing and yields turn_limit (exit 24). In
+        // final-output mode in-generation retries/failover/resume are disabled
+        // (agent_cmd), so recording once per iteration is exact.
+        if let Some(state) = final_state.as_mut() {
+            if !state.can_request() {
+                if let Some(sink) = &config.final_output_sink {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(crate::structured_output::FinalOutputOutcome::RequestLimit(
+                            state.request_limit_json(),
+                        ));
+                }
+                return AgentResult {
+                    messages: close_orphan_tool_calls(messages),
+                    usage: total_usage,
+                    stop_reason: StopReason::EndTurn,
+                    error_message: None,
+                    last_call_usage: Usage::default(),
+                    context_overflow: false,
+                    evidence,
+                    worker_lost: false,
+                    config_invalid: None,
+                };
+            }
+            state.record_request();
+            // WP05 R4: record a real-counter fallback outcome now, so a loop
+            // exit that reaches no explicit terminal decision (e.g. a
+            // `MaxTokens` evidence turn with auto-continue disabled) still
+            // reports the true attempts/model_requests instead of 0/0. Any
+            // genuine Success/Failure/RequestLimit decision below overwrites
+            // this and returns, so the tentative value never survives a real
+            // decision; only an Evidence turn carries it to the next iteration,
+            // where it is refreshed with the updated counters.
+            if let Some(sink) = &config.final_output_sink {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::structured_output::FinalOutputOutcome::Failure(
+                        state.no_final_call_json(),
+                    ));
+            }
+        }
+
         // Deterministically shed old successful tool context before every
         // provider call. This runs inside a single user turn, where ADR-002's
         // between-turn compaction cannot help.
@@ -1137,6 +1229,35 @@ async fn run_inner(
         if let Some(journal) = &journal {
             journal.record_usage(&total_usage, &resp.usage);
         }
+        // WP08 audit (ADR-026): record this provider request. HTTP status and
+        // explicit retry index are WP07 controlled-transport metadata not
+        // exposed by the default provider, so they are recorded as
+        // explicit-unavailable / 0. A required-audit write failure ends the run
+        // before the next model request (fail-closed).
+        if let Some(audit) = &config.audit {
+            let _ = audit.record_model_request(
+                audit_model_seq,
+                None,
+                0,
+                false,
+                Some(resp.usage.input),
+                Some(resp.usage.output),
+            );
+            audit_model_seq += 1;
+            if audit.poisoned() {
+                return AgentResult {
+                    messages,
+                    usage: total_usage,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("audit_write_failed".to_string()),
+                    last_call_usage: resp.usage,
+                    context_overflow: false,
+                    evidence,
+                    worker_lost: false,
+                    config_invalid: None,
+                };
+            }
+        }
         if let Some(log_cfg) = &config.token_log {
             let context_composition = crate::context_metrics::measure_context(&ctx);
             let response_tool_calls = resp
@@ -1171,6 +1292,113 @@ async fn run_inner(
             });
             if let Some(journal) = &journal {
                 journal.checkpoint(&messages).await;
+            }
+        }
+
+        // WP05 (ADR-024): terminal final-output classification. An ordinary
+        // evidence step (ordinary tool calls only) falls through to normal
+        // dispatch below. Any ending is resolved here: success records the
+        // validated JSON, a failed ending sends one corrective turn or records
+        // the typed failure. The final-answer tool is never dispatched.
+        if let (Some(spec), Some(state)) = (config.final_output.as_ref(), final_state.as_mut()) {
+            use crate::structured_output::{
+                FailureDisposition, FinalFailureReason, FinalOutputOutcome, TurnClassification,
+            };
+            match spec.classify(&resp) {
+                TurnClassification::Evidence => {}
+                TurnClassification::Success { arguments } => {
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Success(
+                                crate::structured_output::success_stdout(&arguments),
+                            ));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: None,
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                        worker_lost: false,
+                        config_invalid: None,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } if failure.reason == FinalFailureReason::EndpointError => {
+                    // WP05 R1 (integrator decision, run r4): an endpoint error
+                    // (StopReason::Error) is a terminal ending. It exits 20
+                    // with reason `endpoint_error`, sends NO corrective turn,
+                    // and does NOT consume the corrective-retry budget
+                    // (register_failure is skipped, so `attempts` stays 0).
+                    // Transport retries belong to WP07 `request_retries`, not
+                    // to final output; FR-01/ADR-024 are silent on the
+                    // disposition, so this applies the integrator rule. The
+                    // classifier emits no `error_results` for an endpoint
+                    // error, so there is no unanswered tool call to pair.
+                    let _ = error_results;
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Failure(state.failure_json(&failure)));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: Some(failure.reason.as_str().to_string()),
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                        worker_lost: false,
+                        config_invalid: None,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } => match state.register_failure(failure) {
+                    FailureDisposition::Retry(f) => {
+                        // One wire-valid user turn answers every unexecuted
+                        // call (execute none) and restates the final rule.
+                        let corrective = spec.corrective_message(&f);
+                        let mut content = error_results;
+                        content.extend(corrective.content);
+                        messages.push(Message {
+                            role: Role::User,
+                            content,
+                        });
+                        if let Some(journal) = &journal {
+                            journal.checkpoint(&messages).await;
+                        }
+                        continue;
+                    }
+                    FailureDisposition::Fail(f) => {
+                        if !error_results.is_empty() {
+                            messages.push(Message {
+                                role: Role::User,
+                                content: error_results,
+                            });
+                        }
+                        if let Some(sink) = &config.final_output_sink {
+                            *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(FinalOutputOutcome::Failure(state.failure_json(&f)));
+                        }
+                        return AgentResult {
+                            messages: close_orphan_tool_calls(messages),
+                            usage: total_usage,
+                            stop_reason: StopReason::EndTurn,
+                            error_message: Some(f.reason.as_str().to_string()),
+                            last_call_usage: resp.usage,
+                            context_overflow: resp.context_overflow,
+                            evidence,
+                            worker_lost: false,
+                            config_invalid: None,
+                        };
+                    }
+                },
             }
         }
 
@@ -1325,6 +1553,8 @@ async fn run_inner(
                     last_call_usage: resp.usage,
                     context_overflow: resp.context_overflow,
                     evidence,
+                    worker_lost: false,
+                    config_invalid: None,
                 };
             }
             StopReason::ToolUse => {
@@ -1347,6 +1577,16 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+                // WP10 (ADR-028): set to the distinct failure detail when a
+                // worker route is lost. Unlike `terminate` (which maps to a
+                // benign Aborted/exit-0 ending), this ends the run as a genuine
+                // StopReason::Error with no local fallback and no further tool.
+                let mut worker_abort: Option<String> = None;
+                // The error message carried if `terminate` is set below. An
+                // after_tool_call hook keeps the default; an audit-write poison
+                // (R5) overrides it to the same self-describing code the
+                // model-request audit path uses.
+                let mut terminate_reason: &str = "terminated by after_tool_call hook";
 
                 // Baseline for this turn's first tool call. Taken here so
                 // read-only turns never shell out to git at all.
@@ -1425,7 +1665,105 @@ async fn run_inner(
                         )
                     });
                     let mut transient = false;
-                    let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                    // R1 (ADR-022, INVENTORIES tool-class table): the agent /
+                    // chat / ACP run loop owns its own execute_script branch,
+                    // which bypasses `mcp::run_execute_script`. execute_script
+                    // is opaque — its inner effects cannot be mediated — so
+                    // refuse it here, before the Starlark engine starts, with
+                    // the same structured payload as the MCP boundary. An
+                    // allowlist entry cannot override this refusal.
+                    let script_refused_read_only =
+                        name == EXECUTE_SCRIPT_TOOL && session.lock().await.admission.read_only();
+                    // FR-02 (WP06, ADR-023): the explicit allowlist is the first,
+                    // immutable check for EVERY model tool call in this loop —
+                    // opcode-backed tools dispatch straight through
+                    // `tool_facade::invoke` (not `mcp::dispatch_tool_inner`), so
+                    // this is the agent loop's own dispatch boundary and it must
+                    // carry the run policy. A refused name is answered with the
+                    // reviewed `tool_not_allowed` code before any effect; the
+                    // final-answer tool is required to be on the list at startup
+                    // and is intercepted earlier, so it is never refused here.
+                    let policy_refused = !session.lock().await.policy.allows(&name);
+                    let (mut content, is_error, mut outcome) = if policy_refused {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+                            "message": format!(
+                                "tool {name} is not on the explicit tool allowlist"
+                            ),
+                            "tool": name.clone(),
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if let Some(worker) = &config.worker_executor {
+                        // WP10 (FR-05, ADR-028): worker-only execution. Every
+                        // non-final tool call is routed to a caller-supplied
+                        // worker or refused here — BEFORE any native/opcode/
+                        // script/local/remote dispatch, so nothing ever runs in
+                        // this credential-bearing process. The final-answer tool
+                        // is intercepted earlier (final-output classification
+                        // above) and never reaches this branch. Worker tools are
+                        // the caller's sandbox: the only gate they pass is the
+                        // FR-02 allowlist (`policy.allows`, checked above); they
+                        // are not path-checked or read-only-refused here
+                        // (PM FR-05 clarification).
+                        use crate::worker_runtime::WorkerDispatch;
+                        let base_outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        match worker.call(&name, &input).await {
+                            WorkerDispatch::Served { content, is_error } => {
+                                (content, is_error, Some(base_outcome))
+                            }
+                            WorkerDispatch::NoRoute => {
+                                // No worker serves this name. Refuse with the
+                                // reviewed code; NOTHING executes locally.
+                                let content = serde_json::json!({
+                                    "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+                                    "message": format!(
+                                        "tool {name} is not served by any configured worker"
+                                    ),
+                                    "tool": name.clone(),
+                                    "retryable": false,
+                                })
+                                .to_string();
+                                (content, true, Some(base_outcome))
+                            }
+                            WorkerDispatch::Aborted(detail) => {
+                                // Terminal: the worker route was lost. Record
+                                // the distinct failure, let this call flow
+                                // through the audit boundary below, then end the
+                                // run with no fallback and no further tool.
+                                let content = serde_json::json!({
+                                    "code": crate::worker_runtime::WORKER_UNAVAILABLE,
+                                    "message": detail.clone(),
+                                    "tool": name.clone(),
+                                    "retryable": false,
+                                })
+                                .to_string();
+                                worker_abort = Some(detail);
+                                (content, true, Some(base_outcome))
+                            }
+                        }
+                    } else if script_refused_read_only {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+                            "message": "execute_script cannot be mediated while the workspace is read-only",
+                            "tool": "execute_script",
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
                         // `Arc<Mutex<Session>>` clone rather than a `&mut`.
@@ -1714,6 +2052,58 @@ async fn run_inner(
                         evidence.record_call(false, verifier);
                     }
 
+                    // WP08 audit (FR-04, ADR-026): record this dispatch at the
+                    // admission boundary using the RAW result (before output
+                    // bounding below truncates it). Arguments and results are
+                    // stored only as SHA-256 of their canonical JSON; no
+                    // content, credential, header, or body enters the record. A
+                    // required-audit write failure poisons the sink and ends
+                    // the run before any further model/tool work (fail-closed).
+                    if let Some(audit) = &config.audit {
+                        // WP10 (AC-05.4, WP08/ADR-026): a lost worker route is
+                        // not a JSON policy refusal (its code is outside
+                        // REFUSAL_CODES), so refusal_code() would not surface
+                        // it. Record the distinct `worker_unavailable` reason
+                        // explicitly so the audit identifies the worker death
+                        // at the dispatch boundary before run_end.
+                        let reason = if worker_abort.is_some() {
+                            Some(crate::worker_runtime::WORKER_UNAVAILABLE.to_string())
+                        } else {
+                            crate::run_audit::refusal_code(&content)
+                        };
+                        // WP10 (AC-05.3): a worker-only run records every
+                        // dispatch under the `worker` route so the audit proves
+                        // the model-side process executed nothing locally.
+                        let route = if config.worker_executor.is_some() {
+                            crate::worker_runtime::WORKER_ROUTE
+                        } else {
+                            dispatch_tool_kind(&name)
+                        };
+                        let _ = audit.record_tool(
+                            &name,
+                            route,
+                            &crate::run_audit::hash_json_value(&input),
+                            &crate::run_audit::hash_result_str(&content),
+                            reason.as_deref(),
+                            tool_started.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        if audit.poisoned() {
+                            terminate_reason = "audit_write_failed";
+                            terminate = true;
+                            break;
+                        }
+                    }
+
+                    // WP10 (ADR-028, AC-05.4): a lost worker route is terminal.
+                    // The failed dispatch has now been recorded in the audit
+                    // above; stop before any further tool call in this turn and
+                    // end the run with the distinct failure (handled after the
+                    // loop). No local fallback runs.
+                    if worker_abort.is_some() {
+                        break;
+                    }
+
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
                         if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
@@ -1908,15 +2298,40 @@ async fn run_inner(
                     }
                 }
 
+                if let Some(detail) = worker_abort {
+                    // WP10 (ADR-028, FR-05 req 6): a lost worker route ends the
+                    // run with a DISTINCT failure (StopReason::Error carrying
+                    // the stable `worker_unavailable` token) and NO local
+                    // fallback. The frontend maps Error to a non-zero exit; the
+                    // audit already recorded the failed dispatch above and the
+                    // terminal run_end is written by finalize_run_audit.
+                    return AgentResult {
+                        messages,
+                        usage: total_usage,
+                        stop_reason: StopReason::Error,
+                        error_message: Some(format!(
+                            "{}: {detail}",
+                            crate::worker_runtime::WORKER_UNAVAILABLE
+                        )),
+                        last_call_usage: resp.usage,
+                        context_overflow: false,
+                        evidence,
+                        worker_lost: true,
+                        config_invalid: None,
+                    };
+                }
+
                 if terminate {
                     return AgentResult {
                         messages,
                         usage: total_usage,
                         stop_reason: StopReason::Aborted,
-                        error_message: Some("terminated by after_tool_call hook".to_string()),
+                        error_message: Some(terminate_reason.to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
+                        worker_lost: false,
+                        config_invalid: None,
                     };
                 }
 
@@ -1959,6 +2374,8 @@ async fn run_inner(
                                 last_call_usage: resp.usage,
                                 context_overflow: false,
                                 evidence,
+                                worker_lost: false,
+                                config_invalid: None,
                             };
                         }
                     }
@@ -7140,6 +7557,49 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_in_tool_dispatch_reports_audit_write_failed() {
+        // R5: when the required audit sink fails while recording a tool
+        // dispatch, the run aborts with the self-describing `audit_write_failed`
+        // message — the same code the model-request audit path uses — not the
+        // generic after_tool_call termination message. The internal error
+        // message is not observable at the process boundary (finalize exits 23
+        // first), so this is asserted at the agent-loop public seam.
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "nonexistent_tool", json!({})),
+            end_turn_resp(), // must not be reached
+        ]);
+        // max_events = 2: run_start and the first model_request consume the two
+        // allowed events, so the first tool-dispatch record poisons the sink
+        // (not the earlier model-request audit path).
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = std::sync::Arc::new(
+            crate::run_audit::RunAudit::open(
+                &audit_path,
+                "run-r5".into(),
+                crate::run_audit::AuditLimits {
+                    max_event_bytes: 65536,
+                    max_events: 2,
+                },
+                &crate::run_audit::RunAuditMeta::default(),
+            )
+            .unwrap(),
+        );
+        let config = AgentConfig {
+            audit: Some(audit),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("audit_write_failed"),
+            "tool-dispatch audit poison must carry the same code as the model-request path"
+        );
     }
 
     #[tokio::test]

@@ -53,9 +53,63 @@ cargo test
 python3 -m pytest tests/ -v
 ```
 
+`tests/test_request_control.py` covers the controlled model transport (WP07 / FR-04) through the CLI; it uses only local fake endpoints and never a credentialed endpoint. It includes startup validation (AC-04.7, including the refusal of a sampling parameter smuggled via `extra_body_fields` and of a `messages` profile that omits the mandatory `max_tokens`, plus acceptance of a `chat` profile that omits it), the default-off opt-out regression, process-level recording of body/headers/retry/redirect/tool-choice on both wires, a fail-closed refusal of `--model-profile` combined with `--interactive`, and an ambient-proxy-ignored check against a local counting proxy. The transport-level exact body/header/timeout/proxy/forced-choice assertions (AC-04.1–04.5) run under `cargo test providers::controlled_transport_tests`.
+
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
+The `tests/test_read_only_workspace.py` suite (FR-07, `--workspace-read-only`) includes a test that
+bind-mounts an evidence workspace read-only via `unshare -Urnm`; it is skipped when Linux user and
+mount namespaces are unavailable, like the git_read read-only-mount test. It also drives
+`daimonos agent --print` with a local fake provider to prove `execute_script` is refused
+(`tool_policy_unsupported`) before any Starlark runs in agent mode, and the same refusal through
+the `daimonos acp` JSON-RPC frontend (both drive the shared `run_inner` loop), and that an
+`DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
+use local fake endpoints only (no live credentials). The suite also drives an interactive
+read-only `daimonos agent` over a PTY to prove the bootstrapped session daemon inherits
+`--workspace-read-only` (part of the daemon launch identity, so daemon reuse cannot bypass the
+gate), checks that each `batch` child and a `tool_pipeline` carry their named refusal code with no
+file created, that the `~`-prefixed trace dir is resolved like the writer, and that startup
+refusals use the exit-2 `run_configuration_invalid`/`reason` shape.
+
+The `tests/test_run_audit.py` suite (FR-04, `--audit-path`) drives `daimonos
+agent --print` with a local fake OpenAI-style provider to prove the opt-in run
+audit: a versioned `run_start`…`run_end` JSONL lifecycle, `tool_call`/
+`tool_refusal` records with SHA-256 argument/result hashes and durations,
+`model_request` records, the fail-closed exit-23 contract on an audit open
+failure (no model request runs), the exit-2 refusal when the path is outside an
+explicit state root, and the opt-out regression (no file when the option is
+off). It includes the AC-04.8 scan asserting the exact credential value appears
+nowhere in the complete audit record. All endpoints are local fakes; no live
+credentials are used.
 
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.
+
+## tests/test_structured_output.py (WP05, FR-01)
+
+Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn-limit, zero/exhausted-retry, evidence-turn, and success-on-last-request cases run against a local scripted model endpoint on BOTH wires — Chat Completions (`openrouter`) and Messages (`anthropic`). No live API or real credentials. Run: `python3 -m pytest tests/test_structured_output.py -v`.
+
+- `test_tool_allowlist.py` (FR-02/WP06): drives a real `daimonos` process proving `--tool-allowlist` is the effective set at every listing and dispatch boundary — AC-02.1..02.6, the audit `tool_refusal`, nested Starlark/batch cannot bypass it, and the default-off regression. Reuses the fake-provider agent harness from `test_run_audit.py`. The r2 review-fix tests add: schema lookup (`get_tool_schema`) and signature dump (`list_tool_signatures`) are filtered to the allowlist, the MCP server instructions hide unlisted signatures, the effective report is the intersection with the agent-env `allowed_commands` legacy restriction, `--final-output` omitting the final-answer tool fails startup (`tool_allowlist_missing_final_output`), a workspace `daimonos.toml` can neither widen nor disable the list, and a config-registered `[tools.*]` tool may be allowlisted.
+
+## tests/test_worker_isolation.py (WP10, FR-05)
+
+Credential-free worker execution acceptance tests (ADR-028). Drive a real
+`daimonos agent --worker-config` process against a local scripted model endpoint
+and a RECORDING, credential-free MCP-stdio worker (pure stdlib). The worker dumps
+its own process environment and records every served tool call, so isolation and
+routing are observed from the outside — no live API, no real credentials. Covers
+AC-05.1 (no credential in worker env; the credential is a real var of the
+model-side process), AC-05.3 (every call served by a worker, recorded under the
+`worker` audit route, none in-process), AC-05.4 (a killed worker aborts with the
+distinct `worker_unavailable` exit 22 and runs no later tool), AC-05.5 (the
+`--tool-allowlist` is the sole admission gate for worker tools), the WP04
+read-only pass-through (worker tools are the caller's sandbox, not path-checked),
+the WP08/ADR-026 audited-worker-death case, the default-off regression, and the
+fail-closed control-file validation (exit 2). The no-network container leg
+(AC-05.2) and the WP09 capability-probe leg are integration merge items — the
+pure-stdlib worker makes no outbound connection. Run:
+`python3 -m pytest tests/test_worker_isolation.py -v`.
+
+- `test_worker_isolation.py` (WP10 r2): adds credential-disclosure refusal (R1), the no-network namespace leg via `unshare -Urn` (AC-05.2, skipped if the host cannot create a user+net namespace), post-discovery allowlist validation (R3), the `--final-output`+`--worker-config` final-only case (R4), process-table reaping incl. a stalled worker + descendant (R6), typed lost-worker terminal (R7), and `command`-with-`=` refusal (R8).
+- `test_worker_isolation.py` (WP10 r5): the AC-05.2 network-isolation leg requires a host that can create an unprivileged user and network namespace (`unshare -Urn`) and is skipped on hosts that cannot; because the plan's final gate treats a skipped mandatory acceptance check as a blocker, this skip is NOT a pass and the gate must run on a userns-capable host.

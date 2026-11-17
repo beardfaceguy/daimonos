@@ -89,7 +89,8 @@ local CLI tools and local stdio MCP servers are refused. `--dump-prompts` and
 `session export --output` are refused because their writes are not mediated.
 Explicitly forwarded HTTP MCP
 servers remain a separate trust boundary. This is not a sandbox for
-external services or a read-only workspace; WP04 covers the read-only gate.
+external services or a read-only workspace; the read-only gate below is a
+separate, independent option.
 
 Workspace-discovered control files are read through the authority. Explicit
 caller-selected control files remain separate inputs. An explicit `--config`
@@ -101,6 +102,116 @@ tracing, and `--debug-thoughts` require `--state-dir` in confined mode. Global
 ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose
 target text.
+
+## Read-only workspace (`--workspace-read-only`)
+
+`--workspace-read-only` prohibits every Daimonos-initiated workspace mutation
+for the whole run — startup, tool calls, and teardown. It is independent of
+`--confine-paths` and `--state-dir`; any combination is allowed. When absent,
+behavior is unchanged (default off).
+
+While it is on:
+
+- Every requested workspace mutation is refused before it runs, with the named
+  error `workspace_write_forbidden`. `write_file`, `edit_file`, and
+  `append_file` are refused for **every target path** — including paths
+  **outside** the workspace — and no write is relocated: a refused write writes
+  nowhere. `snapshot restore` is always refused; `snapshot create`/`delete` are
+  refused unless the snapshot store is relocated outside the workspace (then
+  they only read the workspace and write the relocated store). `kgl_query` and
+  `kgl_assert` are refused unless the KGL store is relocated (their store open
+  would otherwise create `<workspace>/.kgl`). Refusals apply at every dispatch
+  boundary, including each `batch` child.
+- Opaque local tools whose effects cannot be mediated are refused with
+  `tool_policy_unsupported`: arbitrary `exec`/background processes, the repair
+  helper, tool pipelines/registration, `execute_script`, and the external CLI
+  plugins (`git`, `gh`, `cargo`, `pytest`, `docker`, `curl`, `shellcheck`,
+  `npm`, `discord`). An allowlist entry cannot override these refusals. This
+  holds in every frontend: `execute_script` is refused before any Starlark runs
+  over MCP and in `daimonos agent` / `chat` / `acp` (the shared agent run loop),
+  not only on the MCP path.
+- Read and metadata tools keep working: `read_file`, `ls`, `search`,
+  `diff_files`, `git_read` (its private status scratch is relocated outside the
+  workspace), `workspace_info`, `get_tool_schema`, `list_tool_signatures`,
+  `list_all_tools`, `session_stats`, `set_verbosity`, and
+  `set_external_session_id`.
+- Internal state (logs, analytics, index, snapshots, KGL, checkpoints) is never
+  written under the workspace. It uses `--state-dir` when provided. Without
+  `--state-dir`, any internal writer whose configured or default destination
+  resolves inside the workspace is refused at startup with
+  `workspace_write_forbidden` rather than silently written or relocated — e.g.
+  a `logging.directory`, `tool_output.directory`, snapshot/process/`git_read`
+  status directory configured inside the workspace, enabled per-turn
+  `checkpoint`s (whose shadow repo defaults to `<workspace>/.daimonos/
+  checkpoints.git`), the structural request-trace directory
+  (`DAIMONOS_OPENROUTER_TRACE_DIR`), or the KGL autoindex/observation
+  (`DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE`). This refusal is
+  independent of `--state-dir`. The guarded set is the single registry
+  `run_policy::INTERNAL_WRITERS`, cross-checked against the reviewer-runtime
+  INVENTORIES.md W-rows by a completeness test.
+- Startup refusals use the reserved exit-2 taxonomy: the process prints
+  `{"error":{"code":"run_configuration_invalid","reason":"workspace_write_forbidden",...}}`
+  and exits 2 — the same shape as a state-authority failure — rather than a
+  top-level tool-refusal code. The `DAIMONOS_OPENROUTER_TRACE_DIR` destination
+  is resolved exactly as its writer resolves it (verbatim, no `~` expansion), so
+  the guard and the writer agree on whether it lands inside the workspace.
+- A session daemon carries `--workspace-read-only` as part of its launch
+  identity: a read-only client spawns a read-only daemon and refuses to attach
+  to a daemon that was started without the option, rather than being served by a
+  long-lived process whose admission is not read-only.
+
+The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
+`EffectClass`). See ADR-022.
+
+## Local run audit (`--audit-path`)
+
+`--audit-path PATH` turns on a caller-requested, privacy-preserving run audit
+(WP08, FR-04). It is **default off**: without the option, behavior is unchanged
+and no audit file is written. The audit is independent of optional analytics and
+OTLP tracing, and works without controlled transport or a model profile.
+
+The audit is one private JSONL file, one line per event. The file is created
+with `O_CREAT | O_EXCL` and mode `0600`; an existing destination is **never**
+appended to (that is a write failure, below). Every line is a versioned record
+carrying `audit_version`, the shared `run_id`, a monotonic `sequence`, and a
+`kind`. The lifecycle is `run_start` first and `run_end` last; in between come
+`model_request`, `tool_call`, `tool_refusal`, and (wired by later packages)
+`probe_result` and `limit_hit` events.
+
+Privacy rules (ADR-006 D6, ADR-026) — the record never contains:
+
+- a credential **value**; only the credential **variable name** is recorded;
+- a model base URL's userinfo, port, path, or query; only its **host**;
+- prompt text, request/response/error bodies, or headers;
+- tool argument or result **contents**: arguments and results are recorded as
+  SHA-256 hashes of their canonical (sorted-key) bytes, never cleartext and
+  never a `Debug` string;
+- evidence-file contents.
+
+Unavailable metadata is recorded as explicit `null`, never invented.
+
+**Required-write failure contract (fail-closed).** Unlike OTLP tracing, which
+fails open, a requested audit is required: if the sink cannot be opened,
+written, or finished, the run stops with exit code `23`
+(`audit_write_failed`). An open failure stops the run **before any model
+request**; a mid-run write failure poisons the sink and aborts before further
+model or tool work. The diagnostic never echoes a secret.
+
+**Destination.** The path is resolved before any model work. With an explicit
+state root (`--state-dir`), the audit path must be **under** the state root; an
+outside path fails startup with exit `2` (`run_configuration_invalid`) and the
+error names both `--audit-path` and the offending path. Without `--state-dir`,
+the path must be **outside** the workspace (it is private run evidence, not
+workspace output). Event bounds come from `[reviewer.audit]` (below).
+
+**Supported frontend scope.** The audit is written only by the one-shot
+`daimonos agent --print` frontend. Because a run must never falsely look
+audited (ADR-026), every other frontend that accepts the global `--audit-path`
+— `chat`, `acp`, the MCP server, the session daemon, the interactive agent, and
+`agent --dry-run` — **refuses** the option at startup with exit `2`
+(`run_configuration_invalid`, reason `audit_unsupported_frontend`) rather than
+ignore it silently. The interactive agent refuses before any session-daemon
+launch, so a daemon never runs a falsely-audited session.
 
 ## Agent Environment File
 
@@ -138,6 +249,66 @@ DAIMONOS_AGENT_PROVIDER=openai
 DAIMONOS_AGENT_MODEL=gpt-5.6-sol
 DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
 DAIMONOS_AGENT_API_KEY=sk-...
+```
+
+### Controlled model transport (`--model-profile`)
+
+`daimonos agent --model-profile <PATH>` is an opt-in, profile-scoped request
+transport (ADR-025, FR-04 requirements 1-13). Default off: without the flag,
+agent mode keeps its current provider behavior unchanged. It is designed for
+callers that must know and test exactly what is sent to a model endpoint.
+
+The path is ONE JSON object that is the sole source of the model request
+configuration. The five identity values are all required; a partial profile
+fails at startup naming every missing value. None of the five may be combined
+with another source, so `--model-profile` cannot be used together with
+`--model` or `--provider`.
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `provider_label` | yes | A caller label for the run. |
+| `model` | yes | The exact model identifier sent on the wire. |
+| `base_url` | yes | The endpoint base URL. |
+| `wire` | yes | `"chat"` (Chat Completions, `{base_url}/chat/completions`) or `"messages"` (Anthropic Messages, `{base_url}/v1/messages`). Never inferred from the model or URL. |
+| `credential_env` | yes | Name of the environment variable holding the credential. The value is read only from this variable and never appears in logs or exports. |
+| `max_tokens` | messages: yes; chat: no | Caller-owned output ceiling. There is no built-in default: on the `messages` wire it is mandatory, so a `messages` profile that omits it fails at startup naming the field; on the `chat` wire it is sent only when the caller set it and omitted entirely otherwise. |
+| `timeout_ms` | no (default 60000) | Request timeout, in milliseconds. |
+| `request_retries` | no (default 0) | Caller-configured retry count. The HTTP layer performs no hidden retries; every attempt is recorded. Bounded by the model-request ceiling (`100`, ADR-025); a larger value is refused at startup. |
+| `proxy` | no | An explicit proxy URL. Proxy environment variables are otherwise ignored. |
+| `extra_body_fields` | no | Explicit, caller-configured extra body fields, validated at startup. A key is refused before any request if it overwrites a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or is any sampling, forced-choice, strictness, streaming, or multi-choice parameter on either wire (e.g. `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `logit_bias`, `n`, `best_of`, `logprobs`, `top_logprobs`, `function_call`, `parallel_tool_calls`, `strict`, `response_format`, `stream`, `stream_options`). No allowlist of permitted extras is defined, so only keys outside that denylist and the protected set are accepted. |
+
+The retry ceiling (`100`) and the fallback `timeout_ms` (`60000`) are fixed constants of the
+controlled transport. They are not `daimonos.default.toml` settings: ADR-025 defines the ceiling as a
+safety invariant, not an operator setting, and the timeout applies only when the caller omits the field.
+
+The flag is mutually exclusive with `--model`, `--provider`, and `--interactive`.
+The controlled transport is honored only by the one-shot send path; the
+interactive TUI routes model requests through the session daemon, which carries
+no profile, so combining `--model-profile` with `--interactive` is refused at
+startup (fail closed) rather than silently using the legacy transport.
+
+Any top-level field beyond this set fails startup. In this mode the request body
+contains only the fixed field set, carries no sampling parameters, sets
+automatic tool choice explicitly whenever tools are offered (never a forced
+choice and never a provider `strict` flag), uses only the stable endpoint path,
+and sends only the fixed header set (the credential header, `Content-Type`,
+`anthropic-version` on Messages, a fixed Daimonos `User-Agent`, plus standard
+transport headers). Ambient organization/project/custom headers, tracing or
+telemetry export, HTTP redirects (a 3xx is an endpoint error), and ambient
+proxies are all suppressed. A client-construction error fails the profile
+rather than falling back to the default client.
+
+```json
+{
+  "provider_label": "anthropic",
+  "model": "claude-opus-5-5",
+  "base_url": "https://api.anthropic.com",
+  "wire": "messages",
+  "credential_env": "ANTHROPIC_API_KEY",
+  "max_tokens": 4096,
+  "timeout_ms": 30000,
+  "request_retries": 0
+}
 ```
 
 ### Tool approval lists (`DAIMONOS_AGENT_PERMISSION_MODE`)
@@ -774,6 +945,24 @@ max_concurrent_connects = 8
 max_tools_per_server = 128
 ```
 
+### `[reviewer.audit]` — Local run audit bounds
+
+Bounds for the caller-requested local run audit (`--audit-path`, WP08/FR-04).
+They apply only when the audit is enabled.
+
+```toml
+[reviewer.audit]
+# Maximum serialized bytes for one audit event. A larger event is a required-
+# audit failure (exit 23), never a silent truncation.
+max_event_bytes = 65536
+# Maximum number of audit events recorded for one run.
+max_events = 100000
+```
+
+Exceeding either bound is a required-audit write failure (exit `23`,
+`audit_write_failed`), consistent with the fail-closed contract above — the run
+stops rather than silently dropping or truncating a record.
+
 ### `[logging]` — Runtime Diagnostics
 
 Daimonos writes structured JSON logs to a rotating file independently of the
@@ -1249,3 +1438,114 @@ Storage failures remain visible as degraded durability until a full save succeed
 
 [ADR-020](adr/020-durable-turn-checkpoints.md) explains the design and rollback behavior.
 [The glossary](contexts/session-durability/CONTEXT.md) defines checkpoint and canonical history.
+
+## Structured final output (`--final-output`)
+
+Opt-in (FR-01 / ADR-024). `daimonos agent --final-output <PATH>` makes a one-shot `--print` run end with a single schema-validated JSON document on stdout. The control file is JSON with these keys:
+
+- `schema` *or* `schema_path` (mutually exclusive; exactly one required) — the JSON Schema draft 2020-12 document for the final answer.
+- `tool_name`, `tool_description` — the final-answer tool the model sees. The schema is offered unchanged (no strict-subset rewrite). `tool_name` must not collide with a registered tool (startup exit 2).
+- `corrective_retries` — extra ending attempts after the first (dbunk uses 1).
+- `max_model_requests` (optional) — inclusive ceiling on model requests for the whole run; exceeding it fails with reason `turn_limit` (exit 24).
+
+Success emits only the validated argument JSON and one newline (exit 0). A failed ending writes a bounded JSON error object to stderr with `reason`, `validation_errors`, `attempts`, and `model_requests` (exit 20). An external schema reference is refused before any model request (`schema_unusable`, exit 20). Default off leaves agent mode unchanged.
+
+## `--tool-allowlist PATH` (FR-02, WP06)
+
+Enforce an explicit tool allowlist for a run. `PATH` is a JSON file holding an array of exact exported tool names, e.g. `["read_file", "search", "workspace_info"]`.
+
+- **Default off.** Omitting the flag keeps legacy behavior (all tools allowed).
+- An empty array `[]` grants no tools (deny-all), distinct from omitting the flag.
+- The model sees **exactly** the allowlisted tools in every listing, including lazy/`list_all_tools` listings.
+- Every call is checked before it runs, at every direct, batch, Starlark, `execute_script`, and remote/worker dispatch boundary; a composite must itself be listed and its inner calls are each checked.
+- An entry matching no known tool fails the run at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_unknown_entry`). With `--final-output`, the designated final-answer tool must be listed explicitly (never added automatically).
+- Caller-owned: read only from this flag, never from workspace/user config or the environment; it can only narrow existing restrictions (the effective set is their intersection).
+- At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`. This is the intersection with the run's active legacy restriction (the agent-env `allowed_commands`), i.e. the set the run will actually permit — not necessarily the raw list.
+- Scope of the report (FR-02, ADR-023, r3 decision): the `effective_tool_allowlist` reflects the allowlist intersected with the agent-env `allowed_commands` only. The rest of `SafetyPolicy::gate` — `denied_commands`, permission-mode patterns, and approval mode — is NOT folded into this report (a session-free full-gate evaluation at startup is not a small change, and permission/approval yield an *ask*, not an exclusion). Those checks still refuse at the dispatch boundary regardless, so enforcement is unaffected; only the one-line report may list a name that `denied_commands` would additionally block.
+- The policy filters every tool-name surface, not just execution: `tools/list`, `list_all_tools`, `get_tool_schema`, `list_tool_signatures`, the MCP server instructions, the session-daemon socket listing, and the agent's offered catalog. An unlisted tool is never served, probed, or dumped.
+- Agent-family catalogs (r3 fix, ADR-023 R1/R2): the model-facing catalog of `agent --print`, `daimonos chat`, `daimonos acp`, and the interactive/session-daemon agent is built from one source (`tool_facade::active_schemas_for_policy`), which the allowlist filters — so every one of those frontends offers the model exactly the allowlist (no per-frontend filter). Forwarded/outbound MCP tools offered to the model obey the same allowlist. The embedded Starlark signature block inside the `execute_script` tool *description* is filtered too, so under an active allowlist it never names an unlisted tool (e.g. `write_file`).
+- With `--final-output`, if the designated final-answer tool is omitted from the allowlist the run fails at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_missing_final_output`). It is never added automatically.
+- A config-registered custom local tool (`[tools.*]` in `daimonos.toml`) is a dispatchable name and may be allowlisted. Workspace/user config can neither set nor disable the allowlist (`--tool-allowlist` is the sole source).
+- Refusals carry the `tool_not_allowed` code and are recorded in the `--audit-path` record.
+- Honored on every frontend and carried in the session-daemon launch identity, so daemon reuse cannot bypass it.
+- Composite delegation (r4 fix, ADR-023 R1): the composite opcodes `tool_pipeline` and `lint_repair` run an inner registered tool named by their `tool_id` argument. That inner name is now checked against the allowlist before the tool runs, so a *listed* `tool_pipeline`/`lint_repair` can never reach an *unlisted* registered `[tools.*]` tool (PM Q-FR-02-1). A refused inner tool never runs and the refusal carries `tool_not_allowed`, naming the inner tool.
+- Remote and worker tool names (r4 note, R2): in this package the allowlist may name only native tools and config-registered `[tools.*]` local tools. Remote MCP (`server/tool`) forwarded names cannot be placed on the allowlist yet — listing one fails startup as an unknown entry. Caller-supplied worker tool names (`mcp__{worker}__{tool}`), however, MAY be allowlisted when `--worker-config` is set (WP10, FR-05): they are validated against the discovered worker catalog after discovery, and any allowlist entry that names no tool of the frozen run — including a native name such as `read_file`, which dispatches to nothing in worker mode — ends the run at startup (exit 2, `run_configuration_invalid` / `tool_allowlist_unknown_entry`, naming the entry) before the first model request. Consequently, while an allowlist is active every forwarded/outbound MCP tool is removed from the model catalog and refused at dispatch (there is no allowlist entry that could admit it).
+- A malformed `--tool-allowlist` file (not valid JSON, or not a JSON array of strings) and an unreadable file both fail the run at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_invalid`); the read/parse error is reported and the file is never silently treated as “no list”.
+
+## Credential-free worker execution (`--worker-config`)
+
+Opt-in (FR-05 / ADR-028). `daimonos agent --worker-config <PATH>` makes a
+one-shot `--print` run execute **no tool in the model-side process**. The
+model-side process holds the credential and reaches the model endpoint; every
+non-final tool call is routed to a caller-supplied MCP-stdio *worker* or
+refused. There is no local/native/opcode/script fallback. The final-answer tool
+(`--final-output`, FR-01) stays intercepted and validated model-side and is
+never forwarded to a worker. Default off leaves agent mode byte-for-byte
+unchanged (the legacy ACP bridge remains fail-open).
+
+The control file is JSON:
+
+```json
+{ "workers": {
+    "toolside": { "command": "/abs/daimonos", "args": ["--mcp", "-w", "/evidence"],
+                  "env": { "PATH": "/usr/bin" } },
+    "compute":  { "command": "/abs/compute", "env": {} }
+} }
+```
+
+- `workers` — a required, non-empty map of worker name to definition. Each entry
+  has a required `command` (string), optional `args` (array of strings), and
+  optional `env` (object of string→string). Names are sorted for a deterministic
+  catalog and worker order.
+- **Credential-free by construction.** Each worker child is launched from a
+  *cleared* environment (`env -i`) plus **only** its explicit `env` map, so no
+  model credential, provider configuration, or inherited ambient variable
+  reaches it (AC-05.1). Executable lookup is caller-controlled: pass an absolute
+  `command`, or include `PATH` in `env`.
+- **Discovery before freeze.** All workers are connected and their tools
+  discovered (`initialize` + `tools/list`) before the model-visible catalog is
+  frozen. Tools are exported as `mcp__{worker}__{tool}`, exactly like the
+  forwarded bridge, so the `--tool-allowlist` (FR-02) and `--audit-path`
+  (FR-04) treat them uniformly. The model-visible catalog is the
+  worker-discovered tools only; no native in-process tool is offered.
+- **Admission.** A worker tool's only run-policy gate is the `--tool-allowlist`
+  check at the agent-loop dispatch boundary (`run_policy::ToolPolicy::allows`).
+  Worker tools are the caller's sandbox: they are **not** path-checked and are
+  **not** refused by `--workspace-read-only` (PM FR-05). The caller must
+  separately sandbox the workers (stdio alone is not proof of confinement).
+- **Fail-closed.** A malformed, unreadable, or empty control file fails at
+  startup with `run_configuration_invalid` (exit 2) before any model request or
+  worker launch. A required worker that cannot launch or handshake aborts the
+  run with `worker_unavailable` (exit 22) and never falls back to a local tool.
+- **No-fallback liveness.** A worker that exits, closes stdio, or stalls during
+  a call ends the run with the distinct `worker_unavailable` failure (exit 22);
+  the failed dispatch is recorded in the `--audit-path` record (under the
+  `worker` route with reason `worker_unavailable`) and **no further tool runs**.
+- **Agent-only.** `--worker-config` is honored only by the one-shot `--print`
+  path. It conflicts with `--interactive` and `--dry-run` (refused at startup by
+  the argument parser), and the `chat`, `acp`, and session-daemon frontends do
+  not carry it at all (unexpected-argument error). An entry in `--tool-allowlist`
+  that names a worker-scoped tool (`mcp__…`) is cross-checked after worker
+  discovery and before the first model request: an entry that no worker serves
+  fails the run at startup (exit 2, `run_configuration_invalid`, reason
+  `tool_allowlist_unknown_entry`, naming the entry), never silently later at
+  dispatch. Native and final-answer names are validated earlier at parse.
+- **No credential disclosure.** Beyond the cleared environment, a worker whose
+  explicit `env` value or `args` entry *discloses* the resolved model credential
+  is refused before any worker starts (exit 2, `run_configuration_invalid`,
+  reason `worker_credential_disclosure`). The diagnostic names the worker and
+  the location (an env value, or `args[index]`) but never the credential value.
+- **Launcher.** The cleared-environment launcher (`env`) is resolved by
+  ABSOLUTE path (`/usr/bin/env`, then `/bin/env`), never through an inherited
+  `PATH`. A `command` containing `=` is rejected at parse (it would be misparsed
+  by `env` as an assignment). On a platform that ships no `env` at those paths,
+  credential-free worker execution is unavailable and the launch fails with
+  `worker_unavailable` (exit 22).
+- **Reaping.** Every owned worker child is reaped through the managed lifecycle
+  on every ending (normal, worker-abort, final-output failure): teardown signals
+  the worker's process group `SIGTERM`, waits a bounded grace, then `SIGKILL`s
+  the group — so no worker child (or descendant, e.g. an `unshare` wrapper)
+  outlives the run even when a graceful `shut_down` cannot reap it. On non-Unix
+  platforms reaping relies on the SDK's `kill_on_drop` at process exit.
+
+See ADR-028 and `tests/test_worker_isolation.py`.
