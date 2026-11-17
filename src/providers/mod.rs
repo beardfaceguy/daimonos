@@ -682,6 +682,12 @@ pub struct ControlledProfile {
     pub request: ControlledRequest,
 }
 
+/// The model-request ceiling (ADR-025): the controlled transport owns the
+/// exact attempt count, so a caller-configured `request_retries` is bounded by
+/// this hard maximum. It is a safety invariant of the controlled transport
+/// (not an operator tunable); a profile naming more is refused at validation.
+pub const CONTROLLED_REQUEST_RETRY_CEILING: u32 = 100;
+
 impl ControlledProfile {
     /// Parse and validate one complete profile object. Fails naming every
     /// missing required value (FR-04 req 2), rejects an inferred/invalid wire
@@ -775,9 +781,15 @@ impl ControlledProfile {
             request.timeout = std::time::Duration::from_millis(ms);
         }
         if let Some(v) = obj.get("request_retries") {
-            request.request_retries = v.as_u64().filter(|n| *n <= 100).ok_or_else(|| {
-                "model profile request_retries must be a non-negative integer".to_string()
-            })? as u32;
+            request.request_retries = v
+                .as_u64()
+                .filter(|n| *n <= CONTROLLED_REQUEST_RETRY_CEILING as u64)
+                .ok_or_else(|| {
+                    format!(
+                        "model profile request_retries must be a non-negative integer no greater \
+                         than the model-request ceiling of {CONTROLLED_REQUEST_RETRY_CEILING}"
+                    )
+                })? as u32;
         }
         if let Some(v) = obj.get("proxy") {
             if !v.is_null() {
@@ -923,8 +935,19 @@ pub async fn controlled_send(
             Ok(r) => r,
             Err(e) => {
                 // Transport fault: transient, so a caller-configured retry may
-                // re-issue it. Message names no body/headers/key.
-                last = LlmResponse::retryable_error(format!("controlled network error: {e}"));
+                // re-issue it. Message names no body/headers/key. A client-side
+                // timeout (the caller's `timeout_ms`) is named explicitly so the
+                // failure is observable as a timeout, not a generic send error
+                // (FR-04 req 11; R4).
+                let msg = if e.is_timeout() {
+                    format!(
+                        "controlled request timed out after {}ms",
+                        req.timeout.as_millis()
+                    )
+                } else {
+                    format!("controlled network error: {e}")
+                };
+                last = LlmResponse::retryable_error(msg);
                 continue;
             }
         };
@@ -1075,6 +1098,109 @@ pub(crate) mod test_support {
             }
         });
         (format!("http://{address}"), count)
+    }
+
+    /// WP07 R4: a fake endpoint that accepts the connection, consumes the
+    /// request, then sleeps `delay_ms` before replying 200. A controlled
+    /// request with a shorter `timeout_ms` must terminate with a timeout error
+    /// before the reply ever arrives.
+    pub async fn slow_http_server(delay_ms: u64) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let body =
+                    r#"{"content":[{"type":"text","text":"late"}],"stop_reason":"end_turn"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// WP07 R7 (AC-04.5): a fake Messages endpoint that returns HTTP 400 for any
+    /// FORCED `tool_choice` (`type` of `any`/`tool`, or anything other than
+    /// `auto`) and 200 otherwise. Because the controlled wire always sends
+    /// `{"type":"auto"}`, a controlled request is accepted; the endpoint would
+    /// reject a forced choice. Counts (accepted_ok, rejected_400).
+    pub async fn forced_choice_rejecting_messages_server(
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let task_rejected = rejected.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let n = match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(str::trim)
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let raw = String::from_utf8_lossy(&request);
+                let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let choice = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("tool_choice").cloned());
+                let forced = match &choice {
+                    Some(serde_json::Value::Object(o)) => {
+                        o.get("type").and_then(serde_json::Value::as_str) != Some("auto")
+                    }
+                    Some(serde_json::Value::String(s)) => s != "auto",
+                    // A tools request with no tool_choice would let the model be
+                    // forced by default on some servers; treat absence as forced.
+                    _ => true,
+                };
+                let (status, payload) = if forced {
+                    task_rejected.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"forced tool_choice refused"}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), rejected)
     }
 }
 
@@ -1542,7 +1668,10 @@ mod tests {
 mod controlled_transport_tests {
     //! WP07 controlled transport (ADR-025). Transport-level AC-04.1-04.5 and
     //! the profile validation behind AC-04.7, against local fake endpoints only.
-    use super::test_support::{counting_http_server, mock_http_server};
+    use super::test_support::{
+        counting_http_server, forced_choice_rejecting_messages_server, mock_http_server,
+        slow_http_server,
+    };
     use super::*;
     use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::Ordering;
@@ -1605,6 +1734,29 @@ mod controlled_transport_tests {
         "accept-encoding",
         "connection",
     ];
+    /// R6 (review r3): a scoped environment variable that is restored (or
+    /// removed) when the guard drops, even on panic. Keeps a test that must set
+    /// an env var (e.g. to resolve a credential) from leaking it into siblings.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvGuard { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     const CHAT_ALLOWED: [&str; 8] = [
         "authorization",
         "content-type",
@@ -1684,17 +1836,16 @@ mod controlled_transport_tests {
         assert!(!body.contains("cache_control"));
     }
 
-    // AC-04.2: hostile org/project/custom-header env vars never alter the set.
+    // AC-04.2 (Messages): the request carries ONLY the fixed allowed header
+    // set. R6 (review r3): this no longer mutates process-global env (which the
+    // controlled path never reads, so it proved nothing and leaked into sibling
+    // tests). Ambient org/project/custom-header and proxy env vars are proven
+    // ignored at the PROCESS level in tests/test_request_control.py, where the
+    // subprocess environment is isolated. Here the fixed header set is enforced
+    // by construction: the adapter emits an exact header vec and the client has
+    // no default headers or middleware.
     #[tokio::test]
-    async fn controlled_messages_ignores_hostile_header_environment() {
-        for (k, v) in [
-            ("OPENAI_ORG_ID", "org-x"),
-            ("OPENAI_PROJECT_ID", "proj-x"),
-            ("OPENAI_CUSTOM_HEADERS", "x-leak=1"),
-            ("ANTHROPIC_CUSTOM_HEADERS", "x-leak=1"),
-        ] {
-            std::env::set_var(k, v);
-        }
+    async fn controlled_messages_emits_only_the_fixed_header_set() {
         let (base, rx) = mock_http_server(
             "200 OK",
             "application/json",
@@ -1885,6 +2036,33 @@ mod controlled_transport_tests {
         );
     }
 
+    // R8 (review r3): the caller retry count is bounded by the named
+    // model-request ceiling (ADR-025), not a bare literal. The boundary value
+    // is accepted; one past it is refused with an error that names the ceiling.
+    #[test]
+    fn controlled_profile_request_retries_bounded_by_named_ceiling() {
+        let at = |n: u64| {
+            serde_json::json!({
+                "provider_label": "a", "model": "m", "base_url": "http://x",
+                "wire": "messages", "credential_env": "K", "request_retries": n
+            })
+        };
+        let ok = ControlledProfile::from_json(&at(CONTROLLED_REQUEST_RETRY_CEILING as u64))
+            .expect("the ceiling value itself is accepted");
+        assert_eq!(ok.request.request_retries, CONTROLLED_REQUEST_RETRY_CEILING);
+
+        let err = ControlledProfile::from_json(&at(CONTROLLED_REQUEST_RETRY_CEILING as u64 + 1))
+            .expect_err("one past the ceiling is refused");
+        assert!(
+            err.contains(&CONTROLLED_REQUEST_RETRY_CEILING.to_string()),
+            "error must name the ceiling value: {err}"
+        );
+        assert!(
+            err.contains("ceiling"),
+            "error must name it a ceiling: {err}"
+        );
+    }
+
     // req 4/5/6: explicit extras cannot overwrite protected or add forbidden fields.
     #[test]
     fn controlled_extra_body_fields_cannot_break_protections() {
@@ -1920,7 +2098,7 @@ mod controlled_transport_tests {
     #[tokio::test]
     async fn controlled_credential_never_appears_in_debug_or_errors() {
         const SECRET: &str = "sk-SUPER-SECRET-TOKEN-7f3a9c1e";
-        std::env::set_var("CTRL_H6_KEY", SECRET);
+        let _cred = EnvGuard::set("CTRL_H6_KEY", SECRET);
         let profile = ControlledProfile::from_json(&serde_json::json!({
             "provider_label": "anthropic", "model": "claude-opus-5-5",
             "base_url": "http://127.0.0.1:1", "wire": "messages",
@@ -1929,7 +2107,6 @@ mod controlled_transport_tests {
         .unwrap();
         let provider = super::router::ControlledProvider::from_profile(profile).unwrap();
         let debug = format!("{provider:?}");
-        std::env::remove_var("CTRL_H6_KEY");
         assert!(
             !debug.contains(SECRET),
             "credential leaked in Debug: {debug}"
@@ -1966,5 +2143,158 @@ mod controlled_transport_tests {
             .error_message
             .expect("redirect must be an error")
             .contains(SECRET));
+    }
+
+    // R4 (review r3) / req 11: a controlled request with a short `timeout_ms`
+    // terminates with a timeout error well inside the bound, never waiting for
+    // a slow endpoint to reply.
+    #[tokio::test]
+    async fn controlled_request_times_out_against_a_slow_endpoint() {
+        let base = slow_http_server(5_000).await;
+        let req = ControlledRequest {
+            timeout: std::time::Duration::from_millis(150),
+            ..ControlledRequest::default()
+        };
+        let start = std::time::Instant::now();
+        let resp = controlled_send(&messages_spec(base), &req, "K", &ctx_with_tool()).await;
+        let elapsed = start.elapsed();
+        let msg = resp.error_message.expect("a timed-out request must error");
+        assert!(
+            msg.to_lowercase().contains("time"),
+            "error must indicate a timeout: {msg}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must end at the 150ms caller timeout, not wait for the 5s endpoint (took {elapsed:?})"
+        );
+    }
+
+    // R5 (review r3) / req 13: an explicit `proxy` is honored — the request
+    // goes to the proxy, and the endpoint host is NOT contacted directly.
+    // (Ambient HTTP(S)_PROXY/ALL_PROXY being IGNORED is proven at the process
+    // level in tests/test_request_control.py with a counting proxy server.)
+    #[tokio::test]
+    async fn controlled_explicit_proxy_is_used_and_endpoint_not_contacted_directly() {
+        let (endpoint, endpoint_hits) = counting_http_server("200 OK", None, "{}").await;
+        let (proxy, proxy_hits) = counting_http_server("503 Service Unavailable", None, "{}").await;
+        let req = ControlledRequest {
+            proxy: Some(proxy.clone()),
+            ..ControlledRequest::default()
+        };
+        let _ = controlled_send(&messages_spec(endpoint), &req, "K", &ctx_with_tool()).await;
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            1,
+            "the explicit proxy must receive the request"
+        );
+        assert_eq!(
+            endpoint_hits.load(Ordering::SeqCst),
+            0,
+            "the endpoint host must not be contacted directly when a proxy is set"
+        );
+    }
+
+    // R7 (review r3) / AC-04.5: a fake Messages endpoint that returns HTTP 400
+    // for any FORCED tool_choice ACCEPTS the controlled request, because the
+    // controlled wire always sends {"type":"auto"}. The 400 path is never hit.
+    #[tokio::test]
+    async fn controlled_messages_never_provokes_the_forced_choice_rejection() {
+        let (base, rejected) = forced_choice_rejecting_messages_server().await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "K",
+            &ctx_with_tool(),
+        )
+        .await;
+        assert!(
+            resp.error_message.is_none(),
+            "the auto tool_choice must be accepted (not a forced-choice 400): {:?}",
+            resp.error_message
+        );
+        assert_eq!(
+            rejected.load(Ordering::SeqCst),
+            0,
+            "the endpoint must never reject the controlled request as a forced choice"
+        );
+    }
+
+    // R3 (review r3) / AC-04.2: with a tracing provider installed and an active
+    // trace span, NO trace-propagation or telemetry header travels on EITHER
+    // wire, and the header set stays the fixed allowed set. The controlled
+    // client has no propagation middleware; this guards a future addition.
+    #[tokio::test]
+    async fn controlled_headers_fixed_under_active_tracing_both_wires() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        let _provider = tracing::subscriber::set_default(subscriber);
+        let span = tracing::info_span!("controlled-request", trace_id = "deadbeefcafef00d");
+        tracing::info!(parent: &span, "controlled request under an active tracing provider");
+
+        const TRACE_HEADERS: [&str; 6] = [
+            "traceparent",
+            "tracestate",
+            "baggage",
+            "b3",
+            "x-b3-traceid",
+            "x-b3-spanid",
+        ];
+
+        // Messages wire.
+        let (base, rx) = mock_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#.into(),
+        )
+        .await;
+        let _ = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "K",
+            &ctx_with_tool(),
+        )
+        .await;
+        let (_, headers, _) = parse_request(&rx.await.unwrap());
+        for h in TRACE_HEADERS {
+            assert!(
+                !headers.contains_key(h),
+                "trace header {h} leaked on messages wire"
+            );
+        }
+        for name in headers.keys() {
+            assert!(
+                ANTHROPIC_ALLOWED.contains(&name.as_str()),
+                "unexpected header {name} on messages wire"
+            );
+        }
+
+        // Chat wire.
+        let (base, rx) = mock_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#.into(),
+        )
+        .await;
+        let _ = controlled_send(
+            &chat_spec(base),
+            &ControlledRequest::default(),
+            "K",
+            &ctx_with_tool(),
+        )
+        .await;
+        let (_, headers, _) = parse_request(&rx.await.unwrap());
+        for h in TRACE_HEADERS {
+            assert!(
+                !headers.contains_key(h),
+                "trace header {h} leaked on chat wire"
+            );
+        }
+        for name in headers.keys() {
+            assert!(
+                CHAT_ALLOWED.contains(&name.as_str()),
+                "unexpected header {name} on chat wire"
+            );
+        }
     }
 }

@@ -18,7 +18,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   only the fixed body/header set, set automatic tool choice explicitly (never a
   forced choice or provider `strict` flag), send no sampling parameters, use the
   stable endpoint path, and suppress ambient headers, telemetry, redirects, and
-  ambient proxies. Default off; legacy provider behavior is unchanged.
+  ambient proxies. Default off; legacy provider behavior is unchanged. The flag
+  is honored only by the one-shot send path and fails closed when combined with
+  `--interactive` (the interactive TUI routes through the session daemon, which
+  carries no profile). Caller `request_retries` is bounded by the model-request
+  ceiling (`100`, ADR-025).
 
 ## [0.1.5] - 2026-10-18
 

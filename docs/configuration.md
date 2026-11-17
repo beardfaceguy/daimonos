@@ -162,9 +162,15 @@ with another source, so `--model-profile` cannot be used together with
 | `credential_env` | yes | Name of the environment variable holding the credential. The value is read only from this variable and never appears in logs or exports. |
 | `max_tokens` | no (default 1024) | Caller-owned output ceiling (Messages sends it; Chat omits it). |
 | `timeout_ms` | no (default 60000) | Request timeout, in milliseconds. |
-| `request_retries` | no (default 0) | Caller-configured retry count. The HTTP layer performs no hidden retries; every attempt is recorded. |
+| `request_retries` | no (default 0) | Caller-configured retry count. The HTTP layer performs no hidden retries; every attempt is recorded. Bounded by the model-request ceiling (`100`, ADR-025); a larger value is refused at startup. |
 | `proxy` | no | An explicit proxy URL. Proxy environment variables are otherwise ignored. |
 | `extra_body_fields` | no | Explicit, caller-configured extra body fields. They can never overwrite a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or introduce a forbidden sampling/forced-choice/strict field. |
+
+The flag is mutually exclusive with `--model`, `--provider`, and `--interactive`.
+The controlled transport is honored only by the one-shot send path; the
+interactive TUI routes model requests through the session daemon, which carries
+no profile, so combining `--model-profile` with `--interactive` is refused at
+startup (fail closed) rather than silently using the legacy transport.
 
 Any top-level field beyond this set fails startup. In this mode the request body
 contains only the fixed field set, carries no sampling parameters, sets

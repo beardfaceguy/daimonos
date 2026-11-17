@@ -188,9 +188,18 @@ _WP07 status (implemented, transport only):_ the provider-neutral seams
 (Messages) and `src/providers/openrouter.rs` (Chat); `ControlledProvider` in
 `src/providers/router.rs`. The caller flag is `daimonos agent --model-profile PATH`
 (`src/cli.rs`, validated in `src/agent_runtime.rs`), mutually exclusive with
-`--model`/`--provider`. Transport-level AC-04.1-04.5 are asserted by
-`cargo test providers::controlled_transport_tests`; AC-04.7 and the opt-out
-regression by `tests/test_request_control.py`. The capability probe (AC-04.6)
+`--model`/`--provider`/`--interactive`. It is honored only by the one-shot send
+path; combining it with `--interactive` fails closed at startup, because the
+interactive TUI routes through the session daemon which carries no profile
+(`chat`/`acp` expose no such flag). Caller `request_retries` is bounded by the
+named model-request ceiling `CONTROLLED_REQUEST_RETRY_CEILING` (`100`, ADR-025).
+Transport-level AC-04.1-04.5 are asserted by
+`cargo test providers::controlled_transport_tests` (exact body/headers, the
+timeout against a slow endpoint, explicit-proxy routing, the 400-on-forced
+`tool_choice` endpoint, and fixed headers under an active tracing provider on
+both wires); AC-04.7, the opt-out regression, the fail-closed `--interactive`
+refusal, and the ambient-proxy-ignored counting-proxy check by
+`tests/test_request_control.py`. The capability probe (AC-04.6)
 and audit record remain WP09/WP08; the integrated probe repeats AC-04.1-04.5.
 
 WP09 owns `src/capability_probe.rs` (new): `ProbeSpec` and `ProbeOutcome`.

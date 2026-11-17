@@ -53,7 +53,7 @@ cargo test
 python3 -m pytest tests/ -v
 ```
 
-`tests/test_request_control.py` covers the controlled model transport (WP07 / FR-04) through the CLI; it uses only local fake endpoints and never a credentialed endpoint.
+`tests/test_request_control.py` covers the controlled model transport (WP07 / FR-04) through the CLI; it uses only local fake endpoints and never a credentialed endpoint. It includes startup validation (AC-04.7), the default-off opt-out regression, process-level recording of body/headers/retry/redirect/tool-choice on both wires, a fail-closed refusal of `--model-profile` combined with `--interactive`, and an ambient-proxy-ignored check against a local counting proxy. The transport-level exact body/header/timeout/proxy/forced-choice assertions (AC-04.1–04.5) run under `cargo test providers::controlled_transport_tests`.
 
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.

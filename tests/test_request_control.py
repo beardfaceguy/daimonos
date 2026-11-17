@@ -609,3 +609,125 @@ def test_process_default_off_keeps_legacy_request_unchanged(daimonos_binary, tmp
     # request streams. Neither is true of the controlled wire.
     assert body.get("stream") is True, body
     assert body["tools"][0]["function"]["strict"] is False, body["tools"][0]
+
+
+# ---------------------------------------------------------------------------
+# R1 (review r3): fail-closed frontend check.
+#
+# `--model-profile` is honored only by the one-shot print send-path. The
+# interactive TUI returns through the session daemon, which has no profile
+# field, so an interactive run could only use the legacy transport. A
+# security-critical opt-in must never fall open to legacy: the flag is mutually
+# exclusive with --interactive at the CLI boundary, so the combination is
+# refused at startup (parse time, before any request or TTY check). Interactive
+# mode is reachable ONLY via the --interactive flag (tui::resolve_agent_mode),
+# so this closes every path to it. Chat/ACP subcommands expose no
+# --model-profile flag at all, so they cannot be handed a profile.
+# ---------------------------------------------------------------------------
+
+
+def test_interactive_with_model_profile_is_refused_fail_closed(daimonos_binary, tmp_path):
+    profile = _write_profile(tmp_path / "full.json")
+    result = subprocess.run(
+        [daimonos_binary, "--workspace", str(tmp_path), "agent",
+         "--interactive", "--model-profile", str(profile), "a task"],
+        capture_output=True, text=True, timeout=TIMEOUT,
+    )
+    assert result.returncode != 0, result.stdout
+    combined = result.stderr + result.stdout
+    # A named, fail-closed refusal of the combination — not a silent legacy run.
+    assert "--model-profile" in combined, combined
+    assert "--interactive" in combined, combined
+    assert "cannot be used with" in combined, combined
+
+
+def test_chat_and_acp_expose_no_model_profile_flag(daimonos_binary):
+    # The other frontends cannot be handed a profile at all: the flag is absent,
+    # so there is no silent-legacy path to close for them.
+    for sub in ("chat", "acp"):
+        completed = subprocess.run(
+            [daimonos_binary, sub, "--help"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        assert "--model-profile" not in completed.stdout, sub
+
+
+# ---------------------------------------------------------------------------
+# R5 (review r3): ambient proxy is ignored, proven with a COUNTING proxy.
+#
+# HTTP_PROXY / HTTPS_PROXY / ALL_PROXY are pointed at a local server that counts
+# every connection. The controlled client calls reqwest `.no_proxy()`, so the
+# request must reach the profile endpoint DIRECTLY and the proxy must receive
+# nothing. (An EXPLICIT `proxy` value being honored is proven at the transport
+# level in providers::controlled_transport_tests.)
+# ---------------------------------------------------------------------------
+
+
+class _CountingProxy:
+    """A local server counting every connection it receives (POST/GET/CONNECT)."""
+
+    def __init__(self):
+        self.hits = 0
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def _count_and_reply(self):
+                owner.hits += 1
+                payload = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length:
+                    self.rfile.read(length)
+                self._count_and_reply()
+
+            def do_GET(self):
+                self._count_and_reply()
+
+            def do_CONNECT(self):
+                owner.hits += 1
+                self.send_response(200)
+                self.end_headers()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=3)
+
+
+def test_process_ambient_proxy_is_ignored_counting_proxy_untouched(daimonos_binary, tmp_path):
+    endpoint = RecordingEndpoint("messages")
+    proxy = _CountingProxy()
+    try:
+        result = _run_print(
+            daimonos_binary, tmp_path, endpoint, "messages",
+            extra_env={"HTTP_PROXY": proxy.url, "HTTPS_PROXY": proxy.url,
+                       "ALL_PROXY": proxy.url},
+        )
+    finally:
+        endpoint.close()
+        proxy.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert len(endpoint.post_requests) == 1, "request must reach the endpoint directly"
+    assert proxy.hits == 0, f"ambient proxy must receive nothing, got {proxy.hits}"
