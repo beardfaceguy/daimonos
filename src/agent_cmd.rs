@@ -340,6 +340,15 @@ pub async fn run_agent(
             if let Some(mcp) = agent_mcp {
                 mcp.shutdown().await;
             }
+            // WP10 merge fix (#1575, invariant 4 / R6): the failed-probe early
+            // return must reap owned worker children through the managed MCP
+            // lifecycle, not merely drop the `Arc`. Dropping relies on
+            // `kill_on_drop`, which does NOT reap a stubborn worker's
+            // descendant process group; only `shutdown()` force-reaps it. The
+            // normal end and the allowlist refusal already call this.
+            if let Some(executor) = &worker_executor {
+                executor.shutdown().await;
+            }
             return Ok(AgentResult {
                 messages: vec![Message::user(&args.task)],
                 usage: Default::default(),
@@ -357,10 +366,25 @@ pub async fn run_agent(
     }
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
+    // #1575 (invariant 4 / R6): a thought-log open failure here is a post-probe
+    // early error; reap the owned worker through its managed lifecycle before
+    // returning so no worker (or its descendant group) outlives the run.
+    // (`agent_mcp` is provably `None` whenever `worker_executor` is `Some` — the
+    // outbound-MCP connect above is skipped in worker-only mode — so reaping the
+    // executor alone suffices for the worker invariant on this path.)
     let thought_capture = match args.thought_log {
-        Some(path) => Some(Arc::new(ThoughtCapture::open(path.clone()).map_err(
-            |error| anyhow::anyhow!("failed to open thought log {}: {error}", path.display()),
-        )?)),
+        Some(path) => match ThoughtCapture::open(path.clone()) {
+            Ok(capture) => Some(Arc::new(capture)),
+            Err(error) => {
+                if let Some(executor) = &worker_executor {
+                    executor.shutdown().await;
+                }
+                return Err(anyhow::anyhow!(
+                    "failed to open thought log {}: {error}",
+                    path.display()
+                ));
+            }
+        },
         None => None,
     };
     let on_stream_event = thought_capture.as_ref().map(|capture| {
@@ -427,12 +451,28 @@ pub async fn run_agent(
     let skill_workspace = workspace.to_path_buf();
     let skill_task = args.task.clone();
     let skill_config = cfg.agent.skills.clone();
-    let task = tokio::task::spawn_blocking(move || {
+    // #1575 (invariant 4 / R6): a skill-activation failure (join error or the
+    // expansion itself) is a post-probe early error; reap the owned worker
+    // before returning so no worker (or its descendant group) outlives the run.
+    let task = match tokio::task::spawn_blocking(move || {
         crate::skills::expand_manual_invocation(&skill_workspace, &skill_task, &skill_config, &[])
     })
     .await
-    .map_err(|error| anyhow::anyhow!("Agent skill activation failed: {error}"))?
-    .map_err(anyhow::Error::msg)?;
+    {
+        Ok(Ok(task)) => task,
+        Ok(Err(error)) => {
+            if let Some(executor) = &worker_executor {
+                executor.shutdown().await;
+            }
+            return Err(anyhow::Error::msg(error));
+        }
+        Err(error) => {
+            if let Some(executor) = &worker_executor {
+                executor.shutdown().await;
+            }
+            return Err(anyhow::anyhow!("Agent skill activation failed: {error}"));
+        }
+    };
     let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
     crate::provisioning::provision_session(&mut tool_session, &services);
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));

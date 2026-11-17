@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -42,7 +43,12 @@ from test_capability_probe import (
     _write_payload,
     _write_profile,
 )
-from test_worker_isolation import WORKER_SRC, _worker_survivors, _write_worker
+from test_worker_isolation import (
+    WORKER_SRC,
+    WORKER_STUBBORN_SRC,
+    _worker_survivors,
+    _write_worker,
+)
 
 TIMEOUT = 120
 
@@ -426,3 +432,64 @@ def test_c7_worker_env_discloses_credential_refused_before_everything(
     assert _worker_survivors(str(script_py)) == []
     # Refused before the audit opened: no audit file exists (not a lone run_start).
     assert not audit.exists(), "an audit file was opened before the config refusal"
+
+
+# ==========================================================================
+# C8: a STUBBORN worker (ignores stdin closure — a non-daemon thread outlives
+# `main()` — and spawns a long-lived GRANDCHILD in its own process group) is
+# discovered BEFORE the probe. The probe then FAILS (text only). The
+# failed-probe early return must still shut the worker executor down and reap
+# the worker AND its grandchild before the process exits (invariant 4 / R6),
+# not merely drop the executor `Arc`. Exit 21, run_end model_unsupported 21,
+# exactly one model request (the probe), no surviving worker, no surviving
+# grandchild. (C2's worker exits on stdin close, so it cannot see this defect:
+# the earlier failed-probe path omitted `executor.shutdown()`.)
+#
+# Two NON-overlapping process needles are used so each survivor count is
+# unambiguous: the worker's cmdline contains the script PATH; the grandchild's
+# cmdline contains the MARKER. Neither string contains the other.
+# ==========================================================================
+def test_c8_probe_failure_reaps_stubborn_worker(daimonos_binary, tmp_path):
+    script = tmp_path / "stubborn.py"
+    script.write_text(WORKER_STUBBORN_SRC)
+    marker = "c8-stubborn-grandchild-reap-needle"
+    assert str(script) not in marker and marker not in str(script)
+    worker_config = tmp_path / "wc.json"
+    worker_config.write_text(json.dumps({"workers": {"toolside": {
+        "command": sys.executable,
+        "args": [str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "GRANDCHILD_MARKER": marker,
+                "PYTHONCOERCECLOCALE": "0"},
+    }}}))
+    allowlist = [WORKER_READ, FINAL_TOOL]
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        completed, posts = _run_combined(
+            daimonos_binary, tmp_path, [_text()],
+            allowlist=allowlist, worker_config=worker_config, audit_path=audit)
+
+        assert completed.returncode == 21, completed.stderr + completed.stdout
+        assert "model_unsupported" in (completed.stderr + completed.stdout)
+        # Exactly one model request reached the wire: the probe.
+        assert len(posts) == 1, posts
+        events = _read_events(audit)
+        probe = [e for e in events if e.get("kind") == "probe_result"]
+        assert len(probe) == 1 and probe[0]["status"] == "model_unsupported", probe
+        run_end = [e for e in events if e.get("kind") == "run_end"]
+        assert run_end and run_end[-1]["status"] == "model_unsupported", run_end
+        assert run_end[-1]["exit_code"] == 21, run_end
+        # Neither the stalled worker nor its grandchild outlives the failed probe.
+        worker_alive = _worker_survivors(str(script))
+        grandchild_alive = _worker_survivors(marker)
+        assert worker_alive == [], worker_alive
+        assert grandchild_alive == [], grandchild_alive
+    finally:
+        # A failed assertion above must NOT leak processes on this host: reap
+        # whatever the needles still find (both the direct worker and the
+        # grandchild process group).
+        for pid in set(_worker_survivors(str(script)) + _worker_survivors(marker)):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
