@@ -321,6 +321,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
 
+    /// Bound oversized tool output in place without writing a full-output spill
+    /// copy or emitting a saved-file pointer (ADR-021, FR-11). Truncated results
+    /// keep paging/narrowing guidance. Default behavior is preserved when absent.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_output_spill: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -373,6 +379,26 @@ mod tests {
         assert!(!Cli::try_parse_from(["daimonos", "acp"])
             .unwrap()
             .confinement_requested());
+    }
+
+    #[test]
+    fn no_output_spill_is_a_global_opt_in_flag() {
+        // Global: parses before and after a subcommand, and defaults off.
+        assert!(
+            !Cli::try_parse_from(["daimonos", "mcp"])
+                .unwrap()
+                .no_output_spill
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "--no-output-spill", "mcp"])
+                .unwrap()
+                .no_output_spill
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "mcp", "--no-output-spill"])
+                .unwrap()
+                .no_output_spill
+        );
     }
 
     #[test]

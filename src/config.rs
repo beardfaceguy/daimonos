@@ -425,6 +425,11 @@ pub struct ToolOutputConfig {
     pub old_argument_max_chars: usize,
     /// Opt-in LLM reformatting of noisy verifier-tool output (vikunja #1235).
     pub reformat: ReformatConfig,
+    /// Save full copies and emit saved-file pointers for bounded output.
+    /// `false` (caller-owned `--no-output-spill`, ADR-021/FR-11) bounds oversized
+    /// results in place with paging/narrowing guidance only: no full copy is
+    /// written and no saved-file path is advertised. Context: ADR-021.
+    pub save_full_output: bool,
 }
 
 /// Opt-in LLM reformatting of high-volume, low-signal tool output — test
@@ -480,6 +485,7 @@ impl Default for ToolOutputConfig {
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
             reformat: ReformatConfig::default(),
+            save_full_output: true,
         }
     }
 }

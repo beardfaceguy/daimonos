@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **No-spill tool output** (`--no-output-spill`, config `tool_output.save_full_output = false`;
+  ADR-021 / FR-11). Bounds oversized tool results in place: the producer writes
+  no full-output spill file and emits no saved-file pointer, on the native,
+  process, background-process, reformat, and old-result-pruning routes.
+  Background processes (`bg`/`poll`) hold bounded output in memory instead of
+  writing an artifact file and advertise no `log` path. Truncated results keep
+  explicit truncation plus paging/narrowing guidance. Default behavior (a spill
+  file and a `full output saved to` pointer) is unchanged when the flag is
+  absent.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

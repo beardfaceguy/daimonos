@@ -462,6 +462,13 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // WP13 (ADR-021, FR-11): the caller-owned no-spill option bounds oversized
+    // tool output in place without writing a full-output copy or advertising a
+    // saved-file pointer. It cannot be weakened by configuration, so apply it
+    // after load/validate. Default behavior is preserved when the flag is absent.
+    if cli.no_output_spill {
+        cfg.tool_output.save_full_output = false;
+    }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(

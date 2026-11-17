@@ -59,6 +59,9 @@ Explicit user file-edit operations are not internal state. They remain governed 
 | W27 | `src/managed_process.rs::create_artifact` | Background-process output under HOME `.daimonos/process-output`, explicit process path, or temp fallback | Relocate before launch. Include failed-spawn cleanup and no-spill admission where applicable. | WP01, WP04, WP13 / I |
 
 Each constructor's owner must test its direct path and every frontend that calls it.
+
+_Status (WP13, implemented):_ W12 (`store_full`) is no longer reached under no-spill. `bound_text`, `reformat_text`, and `microcompact_history` branch on `tool_output.save_full_output`; when `false` they bound/prune in place without opening or writing the full copy, so the state-file inventory is unchanged. W27 (`create_artifact`, background/managed-process capture) now honors no-spill: `ManagedBackground::spawn` consults `save_full_output` and, when `false`, captures bounded output in an in-memory buffer (`drain_to_memory`) instead of calling `create_artifact`, so `bg` writes no file and advertises no `log` path and `poll`/`kill` read/clean up the buffer. Only WP10's spawned-worker route still needs to propagate `save_full_output` to child sessions when built (see WP13 handoff).
+
 WAL/SHM files, rotation files, locks, removals, migrations, and failed-operation cleanup count as writes.
 The evidence-folder growth issue is a separate deferred task. This work relocates that storage but does not add retention policy.
 
