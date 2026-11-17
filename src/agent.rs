@@ -1268,7 +1268,7 @@ async fn run_inner(
         // the typed failure. The final-answer tool is never dispatched.
         if let (Some(spec), Some(state)) = (config.final_output.as_ref(), final_state.as_mut()) {
             use crate::structured_output::{
-                FailureDisposition, FinalOutputOutcome, TurnClassification,
+                FailureDisposition, FinalFailureReason, FinalOutputOutcome, TurnClassification,
             };
             match spec.classify(&resp) {
                 TurnClassification::Evidence => {}
@@ -1284,6 +1284,35 @@ async fn run_inner(
                         usage: total_usage,
                         stop_reason: StopReason::EndTurn,
                         error_message: None,
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } if failure.reason == FinalFailureReason::EndpointError => {
+                    // WP05 R1 (integrator decision, run r4): an endpoint error
+                    // (StopReason::Error) is a terminal ending. It exits 20
+                    // with reason `endpoint_error`, sends NO corrective turn,
+                    // and does NOT consume the corrective-retry budget
+                    // (register_failure is skipped, so `attempts` stays 0).
+                    // Transport retries belong to WP07 `request_retries`, not
+                    // to final output; FR-01/ADR-024 are silent on the
+                    // disposition, so this applies the integrator rule. The
+                    // classifier emits no `error_results` for an endpoint
+                    // error, so there is no unanswered tool call to pair.
+                    let _ = error_results;
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Failure(state.failure_json(&failure)));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: Some(failure.reason.as_str().to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: resp.context_overflow,
                         evidence,
