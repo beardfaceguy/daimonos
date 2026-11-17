@@ -25,6 +25,7 @@ Date: 2026-11-03
 - **worker_unavailable:** The distinct, stable failure for a required worker's initialization, call, liveness, or teardown failure in worker-only mode. It ends the run with no local fallback and no further tool; the process and the audit `run_end` both carry exit 22 (INTERFACES.md exit table). The lost dispatch is recorded at the boundary under the `worker` route with reason `worker_unavailable` before `run_end`. Token: `worker_runtime::WORKER_UNAVAILABLE`. Implemented (WP10).
 - **Worker admission:** In worker-only mode a worker tool's sole run-policy gate is `run_policy::ToolPolicy::allows` at the agent-loop dispatch boundary (FR-02). Worker tools are the caller's sandbox: they are not path-checked and not refused under `--workspace-read-only` (PM FR-05). Implemented (WP10).
 - **Explicit-only discovery:** The `--ignore-config-files` run option. It refuses every implicit configuration source (D01–D09) so only caller-supplied explicit inputs configure a run, and reports each ignored source by path at startup.
+- **No-spill output:** Caller-owned mode (`--no-output-spill`, `tool_output.save_full_output = false`) that bounds oversized tool results in place with paging/narrowing guidance, writing no spill file and advertising no saved-file pointer on any route. Implemented in WP13; see INTERFACES/INVENTORIES status notes.
 
 The [package plan](../../handoffs/2026-10-28-dbunk-remaining-work.md#adr-inventory) indexes Accepted ADRs 021–032.
 The user accepted those decisions and all four G0 interface groups on 2026-10-29 UTC.

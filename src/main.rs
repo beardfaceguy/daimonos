@@ -537,6 +537,13 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // WP13 (ADR-021, FR-11): the caller-owned no-spill option bounds oversized
+    // tool output in place without writing a full-output copy or advertising a
+    // saved-file pointer. It cannot be weakened by configuration, so apply it
+    // after load/validate. Default behavior is preserved when the flag is absent.
+    if cli.no_output_spill {
+        cfg.tool_output.save_full_output = false;
+    }
     // FR-07 (ADR-022): pin the read-only workspace decision before any writer.
     cfg.workspace_read_only = cli.workspace_read_only;
     if cfg.workspace_read_only
