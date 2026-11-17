@@ -48,6 +48,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `{"type": "object"}`, a caller reads the marks through `get_tool_schema`,
   which returns the complete annotated schema. FR-15 full self-contained schemas
   (WP17) will remove this limitation.
+- **Structured final output** (`daimonos agent --final-output <control.json>`,
+  ADR-024, FR-01). Opt-in, default off. A run ends only when the model makes a
+  single call to a caller-designated final-answer tool whose arguments validate
+  against the caller's Draft 2020-12 JSON Schema (validated offline with
+  `jsonschema` 0.60.2, format assertion on, external references refused without
+  I/O). On success the process emits exactly the validated argument JSON plus
+  one newline on stdout and exits 0; a typed failure emits a bounded JSON error
+  (`reason`, `validation_errors`, `attempts`, `model_requests`) on stderr and
+  exits 20; the inclusive model-request ceiling emits reason `turn_limit` and
+  exits 24. Corrective retries are bounded independently of the model-request
+  count, a mixed ending executes none of its calls, and the flag is refused on
+  frontends that cannot honor it (interactive, dry-run, chat, ACP, daemon).
 
 ## [0.1.5] - 2026-10-18
 

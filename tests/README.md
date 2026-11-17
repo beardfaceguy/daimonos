@@ -79,3 +79,7 @@ or live endpoint is required — the fake endpoint is local.
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.
+
+## tests/test_structured_output.py (WP05, FR-01)
+
+Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn-limit, zero/exhausted-retry, evidence-turn, and success-on-last-request cases run against a local scripted model endpoint on BOTH wires — Chat Completions (`openrouter`) and Messages (`anthropic`). No live API or real credentials. Run: `python3 -m pytest tests/test_structured_output.py -v`.

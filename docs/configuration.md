@@ -1313,3 +1313,14 @@ Storage failures remain visible as degraded durability until a full save succeed
 
 [ADR-020](adr/020-durable-turn-checkpoints.md) explains the design and rollback behavior.
 [The glossary](contexts/session-durability/CONTEXT.md) defines checkpoint and canonical history.
+
+## Structured final output (`--final-output`)
+
+Opt-in (FR-01 / ADR-024). `daimonos agent --final-output <PATH>` makes a one-shot `--print` run end with a single schema-validated JSON document on stdout. The control file is JSON with these keys:
+
+- `schema` *or* `schema_path` (mutually exclusive; exactly one required) — the JSON Schema draft 2020-12 document for the final answer.
+- `tool_name`, `tool_description` — the final-answer tool the model sees. The schema is offered unchanged (no strict-subset rewrite). `tool_name` must not collide with a registered tool (startup exit 2).
+- `corrective_retries` — extra ending attempts after the first (dbunk uses 1).
+- `max_model_requests` (optional) — inclusive ceiling on model requests for the whole run; exceeding it fails with reason `turn_limit` (exit 24).
+
+Success emits only the validated argument JSON and one newline (exit 0). A failed ending writes a bounded JSON error object to stderr with `reason`, `validation_errors`, `attempts`, and `model_requests` (exit 20). An external schema reference is refused before any model request (`schema_unusable`, exit 20). Default off leaves agent mode unchanged.
