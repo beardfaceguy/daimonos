@@ -80,6 +80,10 @@ pub struct Session {
     pub verbosity: crate::verbosity::Verbosity,
     /// Pinned filesystem authority shared by this run (ADR-022).
     pub authority: Option<Arc<crate::path_policy::FilesystemAuthority>>,
+    /// Read-only admission table for `--workspace-read-only` (FR-07, ADR-022).
+    /// Derived from `cfg.workspace_read_only`; consulted at every dispatch
+    /// boundary before an effect begins. Context: src/run_policy.rs.
+    pub admission: crate::run_policy::ToolAdmission,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
@@ -97,6 +101,19 @@ impl Session {
             SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref());
         let verbosity = cfg.mcp.default_verbosity;
         let authority = cfg.filesystem_authority.clone();
+        // FR-07 (G1/G6): the KGL and snapshot stores are "relocated" only when
+        // they resolve outside the workspace; then their tools may proceed
+        // read-only. A workspace-relative configured path is treated as NOT
+        // relocated (fail-closed).
+        let relocated = |dir: Option<&std::path::PathBuf>| {
+            dir.map(|d| !crate::run_policy::resolves_inside(&workspace, d))
+                .unwrap_or(false)
+        };
+        let admission = crate::run_policy::ToolAdmission::new(
+            cfg.workspace_read_only,
+            relocated(cfg.kgl.state_directory.as_ref()),
+            relocated(cfg.snapshot_directory.as_ref()),
+        );
         Self {
             workspace,
             cwd,
@@ -120,6 +137,7 @@ impl Session {
             last_response_meta: ResponseMeta::default(),
             verbosity,
             authority,
+            admission,
         }
     }
 

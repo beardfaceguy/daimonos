@@ -145,6 +145,10 @@ pub struct Config {
     /// Pinned at startup and shared across sessions (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// `--workspace-read-only` (FR-07, ADR-022): prohibit every workspace
+    /// mutation. Caller-owned; never deserialized from workspace config.
+    #[serde(skip)]
+    pub workspace_read_only: bool,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }

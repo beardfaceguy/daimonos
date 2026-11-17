@@ -89,7 +89,8 @@ local CLI tools and local stdio MCP servers are refused. `--dump-prompts` and
 `session export --output` are refused because their writes are not mediated.
 Explicitly forwarded HTTP MCP
 servers remain a separate trust boundary. This is not a sandbox for
-external services or a read-only workspace; WP04 covers the read-only gate.
+external services or a read-only workspace; the read-only gate below is a
+separate, independent option.
 
 Workspace-discovered control files are read through the authority. Explicit
 caller-selected control files remain separate inputs. An explicit `--config`
@@ -101,6 +102,66 @@ tracing, and `--debug-thoughts` require `--state-dir` in confined mode. Global
 ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose
 target text.
+
+## Read-only workspace (`--workspace-read-only`)
+
+`--workspace-read-only` prohibits every Daimonos-initiated workspace mutation
+for the whole run — startup, tool calls, and teardown. It is independent of
+`--confine-paths` and `--state-dir`; any combination is allowed. When absent,
+behavior is unchanged (default off).
+
+While it is on:
+
+- Every requested workspace mutation is refused before it runs, with the named
+  error `workspace_write_forbidden`. `write_file`, `edit_file`, and
+  `append_file` are refused for **every target path** — including paths
+  **outside** the workspace — and no write is relocated: a refused write writes
+  nowhere. `snapshot restore` is always refused; `snapshot create`/`delete` are
+  refused unless the snapshot store is relocated outside the workspace (then
+  they only read the workspace and write the relocated store). `kgl_query` and
+  `kgl_assert` are refused unless the KGL store is relocated (their store open
+  would otherwise create `<workspace>/.kgl`). Refusals apply at every dispatch
+  boundary, including each `batch` child.
+- Opaque local tools whose effects cannot be mediated are refused with
+  `tool_policy_unsupported`: arbitrary `exec`/background processes, the repair
+  helper, tool pipelines/registration, `execute_script`, and the external CLI
+  plugins (`git`, `gh`, `cargo`, `pytest`, `docker`, `curl`, `shellcheck`,
+  `npm`, `discord`). An allowlist entry cannot override these refusals. This
+  holds in every frontend: `execute_script` is refused before any Starlark runs
+  over MCP and in `daimonos agent` / `chat` / `acp` (the shared agent run loop),
+  not only on the MCP path.
+- Read and metadata tools keep working: `read_file`, `ls`, `search`,
+  `diff_files`, `git_read` (its private status scratch is relocated outside the
+  workspace), `workspace_info`, `get_tool_schema`, `list_tool_signatures`,
+  `list_all_tools`, `session_stats`, `set_verbosity`, and
+  `set_external_session_id`.
+- Internal state (logs, analytics, index, snapshots, KGL, checkpoints) is never
+  written under the workspace. It uses `--state-dir` when provided. Without
+  `--state-dir`, any internal writer whose configured or default destination
+  resolves inside the workspace is refused at startup with
+  `workspace_write_forbidden` rather than silently written or relocated — e.g.
+  a `logging.directory`, `tool_output.directory`, snapshot/process/`git_read`
+  status directory configured inside the workspace, enabled per-turn
+  `checkpoint`s (whose shadow repo defaults to `<workspace>/.daimonos/
+  checkpoints.git`), the structural request-trace directory
+  (`DAIMONOS_OPENROUTER_TRACE_DIR`), or the KGL autoindex/observation
+  (`DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE`). This refusal is
+  independent of `--state-dir`. The guarded set is the single registry
+  `run_policy::INTERNAL_WRITERS`, cross-checked against the reviewer-runtime
+  INVENTORIES.md W-rows by a completeness test.
+- Startup refusals use the reserved exit-2 taxonomy: the process prints
+  `{"error":{"code":"run_configuration_invalid","reason":"workspace_write_forbidden",...}}`
+  and exits 2 — the same shape as a state-authority failure — rather than a
+  top-level tool-refusal code. The `DAIMONOS_OPENROUTER_TRACE_DIR` destination
+  is resolved exactly as its writer resolves it (verbatim, no `~` expansion), so
+  the guard and the writer agree on whether it lands inside the workspace.
+- A session daemon carries `--workspace-read-only` as part of its launch
+  identity: a read-only client spawns a read-only daemon and refuses to attach
+  to a daemon that was started without the option, rather than being served by a
+  long-lived process whose admission is not read-only.
+
+The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
+`EffectClass`). See ADR-022.
 
 ## Agent Environment File
 

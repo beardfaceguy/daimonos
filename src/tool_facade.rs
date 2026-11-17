@@ -76,10 +76,11 @@ pub async fn invoke_with_progress(
     };
     if !response.ok {
         if let Some(data) = response.d.as_mut().and_then(Value::as_object_mut) {
-            if data
-                .get("code")
-                .is_some_and(|code| code == crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED)
-            {
+            if data.get("code").is_some_and(|code| {
+                code == crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED
+                    || code == crate::run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN
+                    || code == crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED
+            }) {
                 data.insert("tool".into(), Value::String(name.to_string()));
             }
         }

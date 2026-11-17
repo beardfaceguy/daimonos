@@ -351,6 +351,10 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 debug_tokens: token_log.is_some(),
+                // FR-07 (R4): read-only is part of the daemon identity so a
+                // read-only client spawns a read-only daemon and refuses to
+                // attach to one started without it.
+                workspace_read_only: cfg.workspace_read_only,
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),

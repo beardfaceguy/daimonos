@@ -2,6 +2,7 @@
 
 Date: 2026-10-29
 Status: Launch contracts approved by the user on 2026-10-29 UTC. Package dependencies and operational preflight still apply.
+Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`). Startup refusals use the reserved exit-2 taxonomy below: top-level `code` is `run_configuration_invalid` with the specific cause in `reason` (e.g. `workspace_write_forbidden`), matching the state-authority failure shape (the two tool-refusal codes remain tool-result codes, never exit-2 top-level codes). `--workspace-read-only` is part of the session-daemon launch identity (`src/session_bootstrap.rs`: forwarded to a spawned daemon, hashed into the bootstrap fingerprint, and an explicit selection in `launch_identity`), so a read-only client cannot be served by a daemon started without it.
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Decisions: Accepted ADRs 021–032. Scope: the approved 20-package [plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Coverage: [INVENTORIES.md](INVENTORIES.md).
@@ -250,9 +251,10 @@ Do not present generic `anyhow` text as the machine-readable contract.
 | 24 | `model_request_limit` | Inclusive request counter prevents the next attempt |
 | 25 | `controlled_endpoint_error` | Controlled transport failure outside a probe or final-output failure context |
 
-Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
+Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `workspace_write_forbidden`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
 `state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
+`workspace_write_forbidden` is the WP04 startup refusal when an internal writer's destination resolves inside the workspace under `--workspace-read-only`; it reuses the one FR-07 spelling for both the startup (exit-2) reason and the tool-refusal code below, so operators see a single name for every prohibited workspace write.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.
 A probe endpoint failure uses exit 21. A later controlled endpoint failure in final-output mode uses exit 20 with `endpoint_error`.
 Audit failure takes precedence over reporting successful completion. Preserve the original failure code as bounded secondary metadata when available.

@@ -7,6 +7,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **`--workspace-read-only` (FR-07).** A global, default-off option that
+  prohibits every Daimonos-initiated workspace mutation end to end (startup,
+  tool calls, teardown). Workspace mutations are refused with
+  `workspace_write_forbidden` and opaque, unmediatable tools (`execute_script`,
+  arbitrary `exec`, the repair helper, external CLI plugins) with
+  `tool_policy_unsupported`, at every dispatch boundary; an allowlist cannot
+  override the refusal. `execute_script` is refused before any Starlark runs in
+  every frontend — over MCP/daemon and in `daimonos agent` / `chat` / `acp`
+  (the shared agent run loop) — not only on the MCP path. Read tools, including
+  `git_read`, keep working, and internal state uses `--state-dir`; the
+  startup-guarded internal writers are a single registry
+  (`run_policy::INTERNAL_WRITERS`, incl. the request-trace directory W11)
+  cross-checked against the INVENTORIES.md W-rows by a completeness test.
+  Central admission table in `src/run_policy.rs`. See ADR-022 and
+  `docs/configuration.md`. Startup refusals use the reserved exit-2 shape
+  (`code: run_configuration_invalid`, `reason: workspace_write_forbidden`), the
+  same as a state-authority failure. `--workspace-read-only` is part of a
+  session daemon's launch identity, so a read-only client spawns a read-only
+  daemon and will not attach to one started without it. The request-trace
+  startup guard resolves `DAIMONOS_OPENROUTER_TRACE_DIR` through the writer's
+  own resolver, so the guard and the writer agree on the destination.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
