@@ -5,6 +5,7 @@ mod agent_env;
 mod agent_mcp;
 mod agent_runtime;
 mod analytics;
+mod capability_probe;
 mod chat_cmd;
 mod checkpoint;
 mod cli;
@@ -39,7 +40,10 @@ mod providers;
 mod provisioning;
 mod remote_auth;
 mod remote_gateway;
+mod run_audit;
+mod run_policy;
 mod safety;
+mod schema_validation;
 mod script;
 mod session;
 mod session_bootstrap;
@@ -56,6 +60,7 @@ mod session_timeline;
 mod skills;
 mod snapshot;
 mod state_root;
+mod structured_output;
 mod tool_descriptions;
 mod tool_facade;
 mod tool_output;
@@ -163,6 +168,43 @@ fn exit_for_state_failure(error: state_root::RunFailure) -> ! {
         }})
     );
     std::process::exit(error.exit_code);
+}
+
+/// Load the caller's explicit `--tool-allowlist` file (FR-02, WP06): a JSON
+/// array of exact exported tool names. Returns the names in file order (the
+/// policy itself dedups/sorts). Caller-owned: read only here, never from
+/// workspace/user config. Errors are operator-facing startup messages.
+fn load_tool_allowlist(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let expanded = paths::expand_tilde(&path.to_string_lossy());
+    let bytes = std::fs::read(&expanded).map_err(|error| {
+        format!(
+            "--tool-allowlist {}: cannot read file: {error}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "--tool-allowlist {}: not valid JSON: {error}",
+            path.display()
+        )
+    })?;
+    let array = value.as_array().ok_or_else(|| {
+        format!(
+            "--tool-allowlist {}: must be a JSON array of tool names",
+            path.display()
+        )
+    })?;
+    let mut names = Vec::with_capacity(array.len());
+    for entry in array {
+        let name = entry.as_str().ok_or_else(|| {
+            format!(
+                "--tool-allowlist {}: every entry must be a string tool name",
+                path.display()
+            )
+        })?;
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 #[tokio::main]
@@ -461,6 +503,287 @@ async fn main() -> anyhow::Result<()> {
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    // FR-07 (ADR-022): pin the read-only workspace decision before any writer.
+    cfg.workspace_read_only = cli.workspace_read_only;
+    if cfg.workspace_read_only
+        && cfg.state_authority.is_none()
+        && (kgl::autoindex::enabled() || kgl::observe::enabled())
+    {
+        // These writers emit `.kgl` under the workspace. Relocation needs an
+        // explicit state root; without one, refuse rather than silently write.
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": "run_configuration_invalid",
+                "reason": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                "message": "KGL autoindex/observation would write under the read-only workspace; relocate with --state-dir or disable them"
+            }})
+        );
+        std::process::exit(2);
+    }
+    // FR-07 (G3, G2): refuse before any service starts when an unconditional
+    // internal writer would land inside the read-only workspace. Independent of
+    // --state-dir — an explicit state root simply relocates these destinations
+    // so they fall outside the workspace and pass. The KGL and snapshot stores
+    // are guarded on use (tool/opcode admission), not here.
+    if cfg.workspace_read_only {
+        // The single registry of startup-guarded internal writers lives in
+        // `run_policy::StartupDestinations`; this fills each enabled writer's
+        // resolved destination (R3). A completeness test cross-checks the
+        // registry against INVENTORIES.md so a new workspace-capable writer
+        // cannot be added without a disposition. The KGL autoindex/observe
+        // stores (W07-W09) are handled by the dedicated block above.
+        let destinations = run_policy::StartupDestinations {
+            logging_dir: cfg
+                .logging
+                .enabled
+                .then(|| cfg.logging.resolved_directory()),
+            analytics_db: cfg
+                .analytics
+                .enabled
+                .then(|| cfg.analytics.resolved_db_path()),
+            coordination_db_dir: cfg
+                .coordination
+                .enabled
+                .then(|| cfg.coordination.resolved_db_dir()),
+            tool_output_dir: Some(cfg.tool_output.resolved_directory()),
+            process_artifact_dir: cfg
+                .process
+                .artifact_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
+            git_read_status_dir: cfg
+                .git_read
+                .status_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
+            // Agent/chat per-turn checkpoints write this shadow git repo and the
+            // current frontend (src/agent.rs) never relocates it, so refuse at
+            // startup rather than write under the workspace.
+            checkpoint_repo: cfg
+                .checkpoint
+                .enabled
+                .then(|| workspace.join(".daimonos/checkpoints.git")),
+            // W11 (R3): the structural request-trace directory is sourced from
+            // the environment (`providers::request_trace::RequestTrace::from_env`),
+            // not Config. An inside-workspace trace dir without --state-dir is
+            // caught only by this guard (WP02 state validation requires a state
+            // root to refuse an out-of-state trace dir). R5: resolve it through
+            // the writer's own resolver so the guard's destination matches the
+            // writer's byte-for-byte (verbatim value, no tilde expansion).
+            request_trace_dir: crate::providers::request_trace::configured_directory(),
+        };
+        if let Some((w_id, label, path)) = destinations.first_inside_workspace(true, &workspace) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                    "message": format!(
+                        "{label} ({w_id}) resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
+                        path.display()
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+    // WP08 (FR-04, ADR-026): validate and resolve the caller-requested audit
+    // destination before any writer or model work. With an explicit state root
+    // it must stay under that root (StateAuthority::explicit_destination names
+    // the offending option and path and exits 2). Without one it must simply
+    // lie outside the evidence workspace. The sink itself is opened by the
+    // agent frontend immediately before the first model request (startup #6).
+    cfg.audit_path = match &cli.audit_path {
+        None => None,
+        Some(requested) => {
+            let resolved = match &cfg.state_authority {
+                Some(authority) => {
+                    match authority.explicit_destination("--audit-path", requested) {
+                        Ok(path) => path,
+                        Err(error) => exit_for_state_failure(error),
+                    }
+                }
+                None => {
+                    let expanded = paths::expand_tilde(&requested.to_string_lossy());
+                    let candidate = if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        std::env::current_dir().unwrap_or_default().join(expanded)
+                    };
+                    if run_policy::resolves_inside(&workspace, &candidate) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"error": {
+                                "code": "run_configuration_invalid",
+                                "reason": "audit_path_inside_workspace",
+                                "message": format!(
+                                    "--audit-path {} is inside the evidence workspace; choose a private destination outside it",
+                                    requested.display()
+                                )
+                            }})
+                        );
+                        std::process::exit(2);
+                    }
+                    candidate
+                }
+            };
+            Some(resolved)
+        }
+    };
+    // FR-02 (WP06, ADR-023): load and pin the caller's explicit tool allowlist
+    // before any model work. Caller-owned: read only from --tool-allowlist,
+    // never from workspace/user config, so nothing the caller did not pass can
+    // widen or disable it (requirement 6). An absent flag keeps legacy behavior.
+    if let Some(path) = &cli.tool_allowlist {
+        let names = match load_tool_allowlist(path) {
+            Ok(names) => names,
+            Err(message) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_invalid",
+                        "message": message,
+                    }})
+                );
+                std::process::exit(2);
+            }
+        };
+        // AC-02.4 / requirement 5: validate every entry against the effective
+        // catalog before any model work. The known set is the full native /
+        // registry catalog plus the caller's designated final-answer tool when
+        // final-output is configured (an offered tool that must be explicitly
+        // listed, never added automatically — ADR-023, PM FR-02-2). An entry
+        // matching no tool fails the run at startup naming it (fail-closed);
+        // nothing is dropped silently.
+        let mut known: std::collections::BTreeSet<String> = crate::tools::all_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        // R7 (ADR-023 effective catalog): config-registered custom local tools
+        // are dispatchable names too, so an allowlist that names one must not
+        // false-reject at startup. Caller-worker/remote names defer to WP10.
+        known.extend(cfg.tools.keys().cloned());
+        // WP05 final-answer tool (PM Q-FR-02-2): record its name so the caller
+        // MAY allowlist it; below it is REQUIRED to be listed, never auto-added.
+        let mut final_output_tool: Option<String> = None;
+        if let Some(crate::cli::Command::Agent(args)) = &cli.command {
+            if let Some(control) = &args.final_output {
+                if let Ok(text) = std::fs::read_to_string(control) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(name) = value.get("tool_name").and_then(|n| n.as_str()) {
+                            known.insert(name.to_string());
+                            final_output_tool = Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        match run_policy::validate_allowlist(&names, &known, final_output_tool.as_deref()) {
+            Ok(()) => {}
+            Err(run_policy::AllowlistError::UnknownEntry(unknown)) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_unknown_entry",
+                        "message": format!(
+                            "--tool-allowlist entry '{unknown}' matches no known tool"
+                        )
+                    }})
+                );
+                std::process::exit(2);
+            }
+            Err(run_policy::AllowlistError::MissingFinalOutput(name)) => {
+                // R1 / PM Q-FR-02-2 / ADR-023: fail-closed when final-output is
+                // configured but its final-answer tool is not on the allowlist.
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_missing_final_output",
+                        "message": format!(
+                            "--tool-allowlist omits the configured final-output tool '{name}'; final-output requires it to be listed (it is never added automatically)"
+                        )
+                    }})
+                );
+                std::process::exit(2);
+            }
+        }
+        cfg.tool_allowlist = Some(names);
+        cfg.tool_allowlist_path = Some(path.clone());
+    }
+    // FR-02 requirement 7: report the effective allowlist (the set the run will
+    // actually permit) in a machine-readable line so the caller can confirm it
+    // before the review starts.
+    if let Some(names) = &cfg.tool_allowlist {
+        let policy = run_policy::ToolPolicy::from_config(Some(names));
+        // R4 (ADR-023): report the true intersection with the run's existing
+        // legacy restriction, not the raw list. The only per-name legacy
+        // restriction is the agent-env `allowed_commands` (enforced in the
+        // agent loop); read it best-effort for the agent-family frontends.
+        // MCP carries no such per-name restriction here, so its report equals
+        // the list. The allowlist can only narrow, never widen it.
+        let legacy_allowed: Vec<String> = match &cli.command {
+            Some(Command::Agent(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::Chat(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::Acp(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            Some(Command::SessionDaemon(a)) => {
+                crate::agent_env::AgentEnv::read_allowed_commands_best_effort(a.agent_env.clone())
+            }
+            _ => Vec::new(),
+        };
+        let legacy_set: std::collections::BTreeSet<String> = legacy_allowed.into_iter().collect();
+        let legacy_pred = |name: &str| legacy_set.contains(name);
+        let legacy: Option<&dyn Fn(&str) -> bool> = if legacy_set.is_empty() {
+            None
+        } else {
+            Some(&legacy_pred)
+        };
+        let effective = policy.effective(legacy).unwrap_or_default();
+        eprintln!(
+            "{}",
+            serde_json::json!({ "effective_tool_allowlist": effective })
+        );
+    }
+    // WP08 (R1, ADR-026): a run must never falsely look audited. The audit is
+    // written only by the one-shot `agent --print` frontend; every other
+    // frontend that accepts the global --audit-path (chat, ACP, the MCP server,
+    // the session daemon, the interactive agent, and dry-run) refuses the
+    // option at startup with a named error rather than silently ignore it.
+    if cfg.audit_path.is_some() {
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let honored = matches!(
+            &cli.command,
+            Some(Command::Agent(a)) if !(a.dry_run || a.interactive && !a.print && tty)
+        );
+        if !honored {
+            let frontend = match &cli.command {
+                Some(Command::Agent(a)) if a.dry_run => "agent --dry-run",
+                Some(Command::Agent(_)) => "interactive agent",
+                _ => runtime_mode.log_name(),
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "audit_unsupported_frontend",
+                    "message": format!(
+                        "--audit-path is not supported by the {frontend} frontend; only `agent --print` writes a run audit"
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
     }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {

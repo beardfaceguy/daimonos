@@ -35,6 +35,25 @@ pub struct AgentCmdArgs {
     /// Reasoning effort for the model (#1122), from `DAIMONOS_AGENT_THINKING`
     /// (default `medium`). Forwarded into `CompleteOpts.thinking`.
     pub thinking: crate::providers::ThinkingLevel,
+    /// WP08 (FR-04, ADR-026): caller-requested local run audit sink, threaded
+    /// into the agent loop. `None` = audit off.
+    pub audit: Option<Arc<crate::run_audit::RunAudit>>,
+    /// Opt-in structured final output (ADR-024, WP05). `Some` offers the
+    /// final-answer tool and switches the loop to terminal-call accounting;
+    /// the outcome is recorded in `final_output_sink`. `None` = unchanged.
+    pub final_output: Option<Arc<crate::structured_output::FinalOutputSpec>>,
+    /// Where the agent loop records the terminal final-output decision for the
+    /// caller to map to stdout/stderr and the reviewed exit code.
+    pub final_output_sink: Option<Arc<Mutex<Option<crate::structured_output::FinalOutputOutcome>>>>,
+    /// WP09 (FR-04 reqs 14-17, ADR-027): the single same-tool capability probe.
+    /// `Some` sends one unretried probe offering the frozen run tool catalog
+    /// before any evidence tool runs; the verdict is recorded in
+    /// `capability_probe_sink` and a failed probe stops the run before the
+    /// agent loop. `None` = probe off (default).
+    pub capability_probe: Option<crate::capability_probe::ProbeSpec>,
+    /// Where the capability-probe verdict is recorded for the caller to map to
+    /// the `model_unsupported` exit (21).
+    pub capability_probe_sink: Option<Arc<Mutex<Option<crate::capability_probe::ProbeOutcome>>>>,
 }
 
 enum ThoughtCaptureState {
@@ -124,10 +143,16 @@ pub async fn run_agent(
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
+    // FR-02 (WP06, ADR-023) R1: the explicit allowlist filters the offered
+    // catalog at its single source (`active_schemas_for_policy`), so the
+    // per-frontend `retain` below is gone. With no explicit list this is a
+    // no-op (legacy behavior).
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
     let schemas = tool_facade::active_schemas_for_policy(
         workspace,
         &cfg.prompts.resolved_tool_descriptions,
         cfg.filesystem_authority.is_some(),
+        &policy,
     );
 
     if args.dry_run {
@@ -158,9 +183,56 @@ pub async fn run_agent(
         tools.iter().map(|tool| tool.name.clone()).collect();
     let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, args.analytics.clone()).await;
     if let Some(mcp) = &agent_mcp {
-        tools.extend(mcp.tools());
+        // FR-02 R1: outbound MCP tools are subject to the same allowlist so the
+        // listing equals the dispatchable set; a no-op with no explicit list.
+        tools.extend(mcp.tools().into_iter().filter(|t| policy.allows(&t.name)));
     }
 
+    // WP05 (ADR-024): offer the caller's final-answer tool with its schema
+    // unchanged and switch the loop to terminal-call accounting. The tool is
+    // intercepted model-side and never dispatched or routed to a worker.
+    let final_output_active = args.final_output.is_some();
+    if let Some(spec) = &args.final_output {
+        tools.push(spec.tool_schema());
+    }
+    // The offered catalog was already filtered at its single source
+    // (`active_schemas_for_policy`) and at the MCP extend above; the
+    // final-answer tool is required on the allowlist at startup (R1), so no
+    // per-frontend `retain` is needed here. The agent loop still refuses any
+    // unlisted name at every dispatch boundary.
+    // WP09 (FR-04 reqs 14-17, ADR-027): the single same-tool capability probe
+    // runs here, offering the EXACT frozen `tools` vector the run will offer
+    // (byte-equivalent; no dummy substitute), before any evidence tool. A
+    // failed probe stops the run immediately — the agent loop never starts, so
+    // no evidence tool executes — and the recorded verdict is mapped to the
+    // `model_unsupported` exit (21) by the frontend.
+    if let Some(probe) = &args.capability_probe {
+        let final_spec = args
+            .final_output
+            .as_ref()
+            .expect("capability probe requires final-output (enforced at startup)");
+        let outcome =
+            crate::capability_probe::run_probe(probe, &tools, final_spec, args.audit.as_deref())
+                .await;
+        let passed = outcome.passed();
+        if let Some(sink) = &args.capability_probe_sink {
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        }
+        if !passed {
+            if let Some(mcp) = agent_mcp {
+                mcp.shutdown().await;
+            }
+            return Ok(AgentResult {
+                messages: vec![Message::user(&args.task)],
+                usage: Default::default(),
+                stop_reason: crate::providers::StopReason::Aborted,
+                error_message: Some("model_unsupported".to_string()),
+                last_call_usage: Default::default(),
+                context_overflow: false,
+                evidence: Default::default(),
+            });
+        }
+    }
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let thought_capture = match args.thought_log {
@@ -192,6 +264,32 @@ pub async fn run_agent(
             label: "agent".to_string(),
         }),
         remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
+        audit: args.audit.clone(),
+        // WP05 (ADR-024): final-output mode makes each generation exactly one
+        // HTTP attempt so the inclusive model-request ceiling is exact. Disable
+        // in-generation retries, failover, turn-level error-resume, and
+        // max-tokens auto-continue; none add a request outside that ceiling.
+        provider_retry: if final_output_active {
+            crate::agent::ProviderRetryConfig {
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: Vec::new(),
+            }
+        } else {
+            crate::agent::ProviderRetryConfig::default()
+        },
+        error_resume_budget: if final_output_active { Some(0) } else { None },
+        auto_continue_budget: if final_output_active { Some(0) } else { None },
+        final_output: args.final_output.clone(),
+        final_output_sink: args.final_output_sink.clone(),
+        // WP09 (R5, ADR-027): a probe reaches this point only after it passed,
+        // having already spent exactly one model request; seed the loop's
+        // ceiling so the probe counts against `max_model_requests`.
+        prior_model_requests: if args.capability_probe.is_some() {
+            1
+        } else {
+            0
+        },
         ..AgentConfig::default()
     };
 
@@ -265,11 +363,16 @@ pub async fn run_agent(
     // completed provider run has closed its span and reached analytics.
     thought_capture_result?;
 
-    for msg in &result.messages {
-        if matches!(msg.role, Role::Assistant) {
-            for block in &msg.content {
-                if let ContentBlock::Text(t) = block {
-                    writeln!(out, "{t}")?;
+    // WP05 (ADR-024): final-output mode owns stdout — only the validated
+    // argument JSON (emitted by the caller) may appear there. Suppress the
+    // normal assistant-text echo so nothing else reaches stdout (AC-01.7).
+    if !final_output_active {
+        for msg in &result.messages {
+            if matches!(msg.role, Role::Assistant) {
+                for block in &msg.content {
+                    if let ContentBlock::Text(t) = block {
+                        writeln!(out, "{t}")?;
+                    }
                 }
             }
         }
@@ -347,6 +450,10 @@ mod tests {
     fn args(task: &str) -> AgentCmdArgs {
         AgentCmdArgs {
             task: task.to_string(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -354,6 +461,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         }
     }
 
@@ -453,6 +561,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "do it".into(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -460,6 +572,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -472,6 +585,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "my task".into(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -479,6 +596,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -493,6 +611,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "go".into(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -500,6 +622,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)
@@ -607,12 +730,17 @@ mod tests {
         let a = AgentCmdArgs {
             task: "go".into(),
             model: Some("claude-haiku-4-5".into()),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             dry_run: false,
             safety: None,
             analytics: None,
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::Medium,
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -647,6 +775,11 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::High,
+            audit: None,
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -703,8 +836,13 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: Some(log_path.clone()),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -757,6 +895,10 @@ mod tests {
         let provider = MockProvider::new(vec![end_turn_with_text("done")]);
         let a = AgentCmdArgs {
             task: "test analytics wiring".into(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -764,6 +906,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -785,6 +928,10 @@ mod tests {
 
         let a = AgentCmdArgs {
             task: "dry run task".into(),
+            final_output: None,
+            final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -792,6 +939,7 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
+            audit: None,
         };
         let mut out = Vec::new();
         run_agent(&PanicProvider, dir.path(), default_cfg(), a, &mut out)

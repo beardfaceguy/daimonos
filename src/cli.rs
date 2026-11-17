@@ -44,6 +44,48 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// WP07 (FR-04): opt-in controlled model transport. Path to ONE JSON object
+    /// owning the five required values (`provider_label`, `model`, `base_url`,
+    /// `wire` = "chat"|"messages", `credential_env`) and the optional controlled
+    /// request settings (`max_tokens`, `timeout_ms`, `request_retries`, `proxy`,
+    /// `extra_body_fields`). The sole source for those values; cannot be combined
+    /// with --model/--provider. Default off keeps legacy provider behavior.
+    #[arg(
+        long,
+        value_name = "PATH",
+        // WP07 R1 (review r3): the controlled profile is honored only by the
+        // one-shot print send-path. Interactive mode returns through the session
+        // daemon, which carries no profile, so it could only fall back to the
+        // legacy transport. A security-critical opt-in must fail closed: refuse
+        // the combination at parse time. Interactive mode is reachable only via
+        // --interactive (tui::resolve_agent_mode), so this closes every path.
+        conflicts_with_all = ["model", "provider", "interactive"]
+    )]
+    pub model_profile: Option<PathBuf>,
+    /// Opt-in structured final output (ADR-024, FR-01). Path to a JSON control
+    /// file: `schema` XOR `schema_path`, `tool_name`, `tool_description`,
+    /// `corrective_retries`, and optional `max_model_requests`. On success the
+    /// run emits only the validated argument JSON and one newline on stdout; a
+    /// failed ending emits the typed final-output error. Default off.
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot emit a single validated terminal document, so the flag is
+    /// refused there at startup (ADR-024 / INTERFACES.md frontend coverage)
+    /// rather than silently ignored. The chat, ACP, and session-daemon
+    /// frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+    pub final_output: Option<PathBuf>,
+    /// WP09 (FR-04 requirements 14-17, ADR-027): opt-in same-tool capability
+    /// probe. Path to a JSON file holding ONE minimal valid payload for the
+    /// final-answer tool. Before any evidence tool runs, Daimonos sends exactly
+    /// one unretried probe offering the frozen run tool catalog and asking the
+    /// model to call the final-answer tool once with this payload. Only one
+    /// schema-valid final call passes; any other outcome exits 21
+    /// (`model_unsupported`) and does no further work. Requires --final-output
+    /// (FR-01) and --model-profile (controlled transport); omitting either is a
+    /// startup refusal (exit 2). Default off.
+    #[arg(long, value_name = "PATH")]
+    pub capability_probe_payload: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -320,6 +362,28 @@ pub struct Cli {
     /// also enables confinement (reviewer-runtime INTERFACES.md, FR-03).
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
+
+    /// Prohibit every workspace mutation end to end (FR-07, ADR-022). Internal
+    /// state still writes under `--state-dir`. Default off; when absent,
+    /// behavior is unchanged.
+    #[arg(long, global = true, default_value_t = false)]
+    pub workspace_read_only: bool,
+
+    /// Write a caller-requested, private JSONL run audit to PATH (WP08, FR-04).
+    /// Default off. The destination is outside evidence and, with --state-dir,
+    /// must be under the state root. A requested audit write failure stops the
+    /// run (exit 23). Context: ADR-026.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub audit_path: Option<PathBuf>,
+
+    /// Enforce an explicit tool allowlist for the run (FR-02, ADR-023). PATH is
+    /// a JSON array of exact exported tool names. Omitted keeps legacy
+    /// behavior (all tools). An empty array `[]` grants no tools. Unknown names
+    /// fail at startup (exit 2). The list is the effective set at every model
+    /// listing and every direct, batch, Starlark, plugin, and remote dispatch;
+    /// it cannot be widened by workspace/environment config. Default off.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tool_allowlist: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,

@@ -240,6 +240,27 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// WP08 (FR-04, ADR-026): caller-requested local run audit sink. `None` =
+    /// audit off. When present, every provider response and tool dispatch in
+    /// this loop is recorded; a required-audit write failure poisons the sink
+    /// and stops the run before further model/tool work.
+    pub audit: Option<std::sync::Arc<crate::run_audit::RunAudit>>,
+    /// WP05 (ADR-024): opt-in structured final output. `Some` switches the loop
+    /// to terminal-call accounting over the caller's final-answer tool; the
+    /// terminal decision is recorded in `final_output_sink`. `None` leaves the
+    /// loop behaviour unchanged.
+    pub final_output: Option<std::sync::Arc<crate::structured_output::FinalOutputSpec>>,
+    /// Where `run_inner` records the terminal final-output decision for the
+    /// frontend to map to stdout/stderr and the reviewed exit code.
+    pub final_output_sink: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>>,
+    >,
+    /// WP09 (FR-04, ADR-027): model requests already spent BEFORE this loop (the
+    /// one capability probe). The loop seeds `FinalOutputState` with these via
+    /// `record_request`, so the probe counts against the same WP05 inclusive
+    /// model-request ceiling (reviewer-runtime INTERFACES.md R5). `0` (the
+    /// default) means no probe ran and the loop behaves exactly as before.
+    pub prior_model_requests: u32,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -905,9 +926,24 @@ async fn run_inner(
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+    // WP08: per-run model-request sequence for the audit record (ADR-026).
+    let mut audit_model_seq: u64 = 0;
     if let Some(journal) = &journal {
         journal.checkpoint(&messages).await;
     }
+
+    // WP05 (ADR-024): final-output terminal-call accounting. `None` outside
+    // final-output mode leaves the loop behaviour unchanged.
+    let mut final_state = config.final_output.as_ref().map(|spec| {
+        // WP09 (R5, ADR-027): seed the shared ceiling with requests already
+        // spent before the loop (the one capability probe) so the probe counts
+        // against the same inclusive `max_model_requests`.
+        let mut state = spec.new_state();
+        for _ in 0..config.prior_model_requests {
+            state.record_request();
+        }
+        state
+    });
 
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
     // once per turn — explicit config wins, then the env override, then the
@@ -985,6 +1021,45 @@ async fn run_inner(
     let mut evidence_degraded = false;
 
     loop {
+        // WP05 (ADR-024): inclusive model-request ceiling. Covers every HTTP
+        // attempt; a refusal sends nothing and yields turn_limit (exit 24). In
+        // final-output mode in-generation retries/failover/resume are disabled
+        // (agent_cmd), so recording once per iteration is exact.
+        if let Some(state) = final_state.as_mut() {
+            if !state.can_request() {
+                if let Some(sink) = &config.final_output_sink {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(crate::structured_output::FinalOutputOutcome::RequestLimit(
+                            state.request_limit_json(),
+                        ));
+                }
+                return AgentResult {
+                    messages: close_orphan_tool_calls(messages),
+                    usage: total_usage,
+                    stop_reason: StopReason::EndTurn,
+                    error_message: None,
+                    last_call_usage: Usage::default(),
+                    context_overflow: false,
+                    evidence,
+                };
+            }
+            state.record_request();
+            // WP05 R4: record a real-counter fallback outcome now, so a loop
+            // exit that reaches no explicit terminal decision (e.g. a
+            // `MaxTokens` evidence turn with auto-continue disabled) still
+            // reports the true attempts/model_requests instead of 0/0. Any
+            // genuine Success/Failure/RequestLimit decision below overwrites
+            // this and returns, so the tentative value never survives a real
+            // decision; only an Evidence turn carries it to the next iteration,
+            // where it is refreshed with the updated counters.
+            if let Some(sink) = &config.final_output_sink {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::structured_output::FinalOutputOutcome::Failure(
+                        state.no_final_call_json(),
+                    ));
+            }
+        }
+
         // Deterministically shed old successful tool context before every
         // provider call. This runs inside a single user turn, where ADR-002's
         // between-turn compaction cannot help.
@@ -1137,6 +1212,69 @@ async fn run_inner(
         if let Some(journal) = &journal {
             journal.record_usage(&total_usage, &resp.usage);
         }
+        // WP08 audit (ADR-026): record this provider request. WP09 (G3): the
+        // WP07 controlled transport exposes the observed HTTP status, the
+        // zero-based retry index, and the profile's wire for this completion
+        // via `take_controlled_observation`; the default provider returns
+        // `None`, recorded as explicit-unavailable / 0. A required-audit write
+        // failure ends the run before the next model request (fail-closed).
+        if let Some(audit) = &config.audit {
+            let obs = provider.take_controlled_observation();
+            let wire = obs.as_ref().and_then(|o| o.wire);
+            // WP09 (G6): record EVERY HTTP attempt the controlled transport made
+            // for this completion (INTERFACES.md: "Record every attempted
+            // request"). A caller `request_retries` lets one completion retry
+            // inside the transport; each attempt becomes one `model_request`
+            // with its own status and zero-based retry index. The completion's
+            // usage is carried on the final attempt only; earlier attempts have
+            // none. A non-controlled provider exposes no attempts, so it still
+            // records exactly one request (the prior behavior).
+            match obs.as_ref() {
+                Some(o) if !o.attempts.is_empty() => {
+                    let last_idx = o.attempts.len() - 1;
+                    for (i, att) in o.attempts.iter().enumerate() {
+                        let (input, output) = if i == last_idx {
+                            (Some(resp.usage.input), Some(resp.usage.output))
+                        } else {
+                            (None, None)
+                        };
+                        let _ = audit.record_model_request(
+                            audit_model_seq,
+                            att.http_status,
+                            att.retry_index,
+                            false,
+                            input,
+                            output,
+                            wire,
+                        );
+                        audit_model_seq += 1;
+                    }
+                }
+                _ => {
+                    let _ = audit.record_model_request(
+                        audit_model_seq,
+                        obs.as_ref().and_then(|o| o.http_status),
+                        obs.as_ref().map(|o| o.retry_index).unwrap_or(0),
+                        false,
+                        Some(resp.usage.input),
+                        Some(resp.usage.output),
+                        wire,
+                    );
+                    audit_model_seq += 1;
+                }
+            }
+            if audit.poisoned() {
+                return AgentResult {
+                    messages,
+                    usage: total_usage,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("audit_write_failed".to_string()),
+                    last_call_usage: resp.usage,
+                    context_overflow: false,
+                    evidence,
+                };
+            }
+        }
         if let Some(log_cfg) = &config.token_log {
             let context_composition = crate::context_metrics::measure_context(&ctx);
             let response_tool_calls = resp
@@ -1171,6 +1309,107 @@ async fn run_inner(
             });
             if let Some(journal) = &journal {
                 journal.checkpoint(&messages).await;
+            }
+        }
+
+        // WP05 (ADR-024): terminal final-output classification. An ordinary
+        // evidence step (ordinary tool calls only) falls through to normal
+        // dispatch below. Any ending is resolved here: success records the
+        // validated JSON, a failed ending sends one corrective turn or records
+        // the typed failure. The final-answer tool is never dispatched.
+        if let (Some(spec), Some(state)) = (config.final_output.as_ref(), final_state.as_mut()) {
+            use crate::structured_output::{
+                FailureDisposition, FinalFailureReason, FinalOutputOutcome, TurnClassification,
+            };
+            match spec.classify(&resp) {
+                TurnClassification::Evidence => {}
+                TurnClassification::Success { arguments } => {
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Success(
+                                crate::structured_output::success_stdout(&arguments),
+                            ));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: None,
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } if failure.reason == FinalFailureReason::EndpointError => {
+                    // WP05 R1 (integrator decision, run r4): an endpoint error
+                    // (StopReason::Error) is a terminal ending. It exits 20
+                    // with reason `endpoint_error`, sends NO corrective turn,
+                    // and does NOT consume the corrective-retry budget
+                    // (register_failure is skipped, so `attempts` stays 0).
+                    // Transport retries belong to WP07 `request_retries`, not
+                    // to final output; FR-01/ADR-024 are silent on the
+                    // disposition, so this applies the integrator rule. The
+                    // classifier emits no `error_results` for an endpoint
+                    // error, so there is no unanswered tool call to pair.
+                    let _ = error_results;
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Failure(state.failure_json(&failure)));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: Some(failure.reason.as_str().to_string()),
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } => match state.register_failure(failure) {
+                    FailureDisposition::Retry(f) => {
+                        // One wire-valid user turn answers every unexecuted
+                        // call (execute none) and restates the final rule.
+                        let corrective = spec.corrective_message(&f);
+                        let mut content = error_results;
+                        content.extend(corrective.content);
+                        messages.push(Message {
+                            role: Role::User,
+                            content,
+                        });
+                        if let Some(journal) = &journal {
+                            journal.checkpoint(&messages).await;
+                        }
+                        continue;
+                    }
+                    FailureDisposition::Fail(f) => {
+                        if !error_results.is_empty() {
+                            messages.push(Message {
+                                role: Role::User,
+                                content: error_results,
+                            });
+                        }
+                        if let Some(sink) = &config.final_output_sink {
+                            *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(FinalOutputOutcome::Failure(state.failure_json(&f)));
+                        }
+                        return AgentResult {
+                            messages: close_orphan_tool_calls(messages),
+                            usage: total_usage,
+                            stop_reason: StopReason::EndTurn,
+                            error_message: Some(f.reason.as_str().to_string()),
+                            last_call_usage: resp.usage,
+                            context_overflow: resp.context_overflow,
+                            evidence,
+                        };
+                    }
+                },
             }
         }
 
@@ -1347,6 +1586,11 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+                // The error message carried if `terminate` is set below. An
+                // after_tool_call hook keeps the default; an audit-write poison
+                // (R5) overrides it to the same self-describing code the
+                // model-request audit path uses.
+                let mut terminate_reason: &str = "terminated by after_tool_call hook";
 
                 // Baseline for this turn's first tool call. Taken here so
                 // read-only turns never shell out to git at all.
@@ -1425,7 +1669,54 @@ async fn run_inner(
                         )
                     });
                     let mut transient = false;
-                    let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                    // R1 (ADR-022, INVENTORIES tool-class table): the agent /
+                    // chat / ACP run loop owns its own execute_script branch,
+                    // which bypasses `mcp::run_execute_script`. execute_script
+                    // is opaque — its inner effects cannot be mediated — so
+                    // refuse it here, before the Starlark engine starts, with
+                    // the same structured payload as the MCP boundary. An
+                    // allowlist entry cannot override this refusal.
+                    let script_refused_read_only =
+                        name == EXECUTE_SCRIPT_TOOL && session.lock().await.admission.read_only();
+                    // FR-02 (WP06, ADR-023): the explicit allowlist is the first,
+                    // immutable check for EVERY model tool call in this loop —
+                    // opcode-backed tools dispatch straight through
+                    // `tool_facade::invoke` (not `mcp::dispatch_tool_inner`), so
+                    // this is the agent loop's own dispatch boundary and it must
+                    // carry the run policy. A refused name is answered with the
+                    // reviewed `tool_not_allowed` code before any effect; the
+                    // final-answer tool is required to be on the list at startup
+                    // and is intercepted earlier, so it is never refused here.
+                    let policy_refused = !session.lock().await.policy.allows(&name);
+                    let (mut content, is_error, mut outcome) = if policy_refused {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+                            "message": format!(
+                                "tool {name} is not on the explicit tool allowlist"
+                            ),
+                            "tool": name.clone(),
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if script_refused_read_only {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+                            "message": "execute_script cannot be mediated while the workspace is read-only",
+                            "tool": "execute_script",
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
                         // `Arc<Mutex<Session>>` clone rather than a `&mut`.
@@ -1714,6 +2005,31 @@ async fn run_inner(
                         evidence.record_call(false, verifier);
                     }
 
+                    // WP08 audit (FR-04, ADR-026): record this dispatch at the
+                    // admission boundary using the RAW result (before output
+                    // bounding below truncates it). Arguments and results are
+                    // stored only as SHA-256 of their canonical JSON; no
+                    // content, credential, header, or body enters the record. A
+                    // required-audit write failure poisons the sink and ends
+                    // the run before any further model/tool work (fail-closed).
+                    if let Some(audit) = &config.audit {
+                        let reason = crate::run_audit::refusal_code(&content);
+                        let _ = audit.record_tool(
+                            &name,
+                            dispatch_tool_kind(&name),
+                            &crate::run_audit::hash_json_value(&input),
+                            &crate::run_audit::hash_result_str(&content),
+                            reason.as_deref(),
+                            tool_started.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        if audit.poisoned() {
+                            terminate_reason = "audit_write_failed";
+                            terminate = true;
+                            break;
+                        }
+                    }
+
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
                         if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
@@ -1913,7 +2229,7 @@ async fn run_inner(
                         messages,
                         usage: total_usage,
                         stop_reason: StopReason::Aborted,
-                        error_message: Some("terminated by after_tool_call hook".to_string()),
+                        error_message: Some(terminate_reason.to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
@@ -7140,6 +7456,49 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_in_tool_dispatch_reports_audit_write_failed() {
+        // R5: when the required audit sink fails while recording a tool
+        // dispatch, the run aborts with the self-describing `audit_write_failed`
+        // message — the same code the model-request audit path uses — not the
+        // generic after_tool_call termination message. The internal error
+        // message is not observable at the process boundary (finalize exits 23
+        // first), so this is asserted at the agent-loop public seam.
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "nonexistent_tool", json!({})),
+            end_turn_resp(), // must not be reached
+        ]);
+        // max_events = 2: run_start and the first model_request consume the two
+        // allowed events, so the first tool-dispatch record poisons the sink
+        // (not the earlier model-request audit path).
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = std::sync::Arc::new(
+            crate::run_audit::RunAudit::open(
+                &audit_path,
+                "run-r5".into(),
+                crate::run_audit::AuditLimits {
+                    max_event_bytes: 65536,
+                    max_events: 2,
+                },
+                &crate::run_audit::RunAuditMeta::default(),
+            )
+            .unwrap(),
+        );
+        let config = AgentConfig {
+            audit: Some(audit),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("audit_write_failed"),
+            "tool-dispatch audit poison must carry the same code as the model-request path"
+        );
     }
 
     #[tokio::test]
