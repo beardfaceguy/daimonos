@@ -491,6 +491,161 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `tool-contract` command — effective tool contract dump
+
+```bash
+daimonos tool-contract                 # dump for the default workspace (.)
+daimonos tool-contract -w /path        # dump for a specific workspace
+```
+
+`daimonos tool-contract` prints the effective tool contract as deterministic
+JSON on stdout and exits, without starting a model run or a session store
+(FR-13). The document is a function of the same inputs that shape the served
+catalog — workspace context checks, exposure tier, schema mode
+(`[mcp] full_tool_schemas` / `DAIMONOS_MCP_FULL_SCHEMAS`), and confinement — so
+its `tools` array equals what the MCP server serves over `tools/list` for those
+inputs. Each entry carries `name`, `description`, `input_schema`, and
+registry-derived `tier`/`route` metadata; the top level carries the standalone
+`contract_version` and the `effective_options` that produced the dump. The same
+version is reported over MCP initialization in
+`_meta["io.daimonos/tool-contract-version"]`, separate from the binary version.
+Changes are tracked in `docs/tool-contract-changelog.md` (see ADR-029).
+
+#### Owned path annotations (`x-daimonos-path`)
+
+Every Daimonos-owned tool argument whose value is a filesystem path, a glob, or
+a directory to walk is marked in the tool's input schema with the standard
+annotation `"x-daimonos-path": true` (FR-14). The marker means the same thing in
+every tool: *this string is a filesystem location Daimonos resolves against the
+run root.* For an array of paths the marker sits on the array's `items` schema,
+so the path **elements** are marked. A caller can therefore enumerate a tool's
+path slots directly from its schema, with no hand-written per-tool list.
+
+The annotation is unconditional (there is no option to disable it) and purely
+additive: it adds the marker and changes no other schema keyword. It is
+**semantic, not spelling** — these are deliberately *not* marked:
+
+- opaque command, argv, or script-code strings (`exec.command`/`exec.args`,
+  `execute_script.code`, raw `git.args`);
+- agent-mail reservation glob patterns (`reserve_paths.paths`,
+  `release_reservations.paths`, `check_conflicts.paths`), which are opaque
+  reservation keys never resolved against the filesystem;
+- URLs, revisions, search patterns, identifiers, and enums;
+- caller-provided MCP worker tools and the caller's final-answer schema.
+
+The marks are caller-facing metadata applied in the shared serving pipeline
+(`src/tools.rs::tool_definitions`), so the `daimonos tool-contract` dump, the
+live `tools/list`, and `get_tool_schema` carry identical marks for the same
+inputs. The marks are **not** sent to the model endpoint: the schemas the agent
+hands to the model are preserved unchanged (FR-15), because a strict endpoint
+may reject an unknown keyword.
+
+**Tier limitation (today).** The dump and `tools/list` carry a full schema only
+for the tools whose schema is served in full in the initial exposure tier — 21
+of the 35 tools today. The path marks therefore appear in the dump only for
+those 21 tools (6 of which have path arguments). For the other 14 tools the
+initial-tier schema is stripped to `{"type": "object"}`, so a caller reads their
+path marks through `get_tool_schema`, which always returns the complete
+annotated schema. FR-15 full self-contained schemas (WP17) will serve every
+schema in full and remove this limitation; AC-14.1 is not claimed for the
+stripped tools from the dump alone.
+
+ADR-022 performs the actual path enforcement through a separate path
+(`src/path_policy.rs`); it does not yet consult the owned-argument table in
+`src/path_annotations.rs`, which today is read only by the schema annotator. See
+ADR-029 and FR-14.
+
+#### Full, self-contained tool schemas (`--full-tool-schemas`)
+
+By default `list_tools` and the `tool-contract` dump serve a full JSON Schema
+only for the tools whose schema is exposed in the initial tier, and strip the
+rest to `{"type": "object"}` (progressive exposure, to save prefix tokens). The
+opt-in **full-schema mode** instead serves and exports the full, self-contained
+schema for *every* tool (FR-15). Enable it in any of three ways, which follow a
+fixed precedence: the CLI flag wins over the environment variable, which wins
+over the configuration key.
+
+```bash
+daimonos --full-tool-schemas tool-contract   # global CLI flag — wins over env and config
+# or
+export DAIMONOS_MCP_FULL_SCHEMAS=1            # environment — wins over the config key
+# or
+[mcp]
+full_tool_schemas = true                      # daimonos.toml — lowest precedence
+```
+
+The mode is purely additive and opt-in: with it off, the terse/lazy placeholder
+serving is unchanged. With it on, every served/exported schema is a valid,
+self-contained Draft 2020-12 document: no reference to another file or URL (only
+local `$defs`/`$ref`), no recursive reference cycle, and no definition name that
+would clash when a caller combines tool schemas. These are checked offline
+before any model request, MCP full serving, or export (`src/schema_contract.rs`,
+reusing the Draft 2020-12 validator in `src/schema_validation.rs`); a schema that
+fails is refused with run reason `schema_unusable` (ADR-030). A schema that is
+valid and self-contained but which a *particular* model endpoint rejects is not
+refused here — that surfaces at the capability probe, never as a guessed startup
+blacklist. Caller-supplied worker and final-answer schemas are preserved and
+offered unchanged, not rewritten to a vendor subset.
+
+The flag is honored on every frontend that accepts it: the MCP server serves
+full schemas over `tools/list`; `tool-contract` exports them; the agent, chat,
+ACP, and session-daemon frontends enforce the self-contained gate before the
+first model request; and the session daemon carries the mode in its launch
+identity, so an interactive client requesting it cannot silently attach to a
+daemon started without it. Context: ADR-030.
+
+For an agent frontend (agent/chat/ACP/daemon) the option does **not** change the
+tool schemas sent to the model — those are already full and unchanged — so it
+adds only the startup self-contained check; the model request is identical with
+and without it. The three switches follow a fixed precedence and all run that
+same check once the mode is on: an explicit `--full-tool-schemas` flag turns the
+mode **on for every value** of `DAIMONOS_MCP_FULL_SCHEMAS` (so a false-y
+variable such as `0`/`false`/`off`/empty cannot silently mask the flag); without
+the flag, `DAIMONOS_MCP_FULL_SCHEMAS` wins over `[mcp] full_tool_schemas = true`
+(a false-y variable disables the mode even when the config key enables it). The
+check covers the native tool catalog
+(served, exported, and sent to the model) and the caller-supplied `--final-output`
+final-answer schema, which is accepted and offered unchanged but refused
+(`schema_unusable`, exit 20, final-output error shape) if it contains a
+recursive reference cycle. The self-contained check resolves every in-document
+reference form with proper Draft 2020-12 URI/anchor semantics (not a
+string-prefix test): a JSON-pointer `$ref` (percent-decoded, then `~1`/`~0`), a
+plain-name `$anchor`, a `$dynamicRef` to a `$dynamicAnchor`, and a `$ref` that
+names the document's or an embedded resource's `$id` (absolute or relative to
+the base URI, with or without a fragment). A reference it cannot resolve inside
+the document is refused `schema_unusable` and named, never fetched (fail
+closed). The cross-tool definition-name clash rule applies only to
+Daimonos-owned definitions; a supplied schema is never refused for a definition
+name. Context: ADR-030.
+
+The check reads **schema positions only**. A reference keyword (`$ref`,
+`$dynamicRef`) has a meaning only in a schema; a `$ref`-shaped object that is the
+value of a data keyword (`const`, `enum`, `default`, `examples`) is data, not a
+reference, so it is not followed and such a schema is accepted and offered
+unchanged. A reference under a keyword the check does not recognize is read
+conservatively (fail closed), so a cycle hidden there is still refused. If two
+schema positions declare the same `$id` (resolving to one URI) or the same
+anchor (one base URI and name), the document is refused `schema_unusable` with
+the duplicate named: the static index never silently replaces an identifier.
+Context: ADR-030.
+
+A **very deep** schema is analyzed without ever ending the process by a signal.
+The self-contained check follows local references iteratively (an explicit work
+list, not call recursion), so a large but finite, non-recursive `$ref` chain —
+hundreds of thousands of linked definitions — is analyzed and **accepted**
+(exit 0) exactly as the default placeholder mode accepts it; a chain that closes
+into a cycle is still refused `schema_unusable`. Only a genuinely pathological
+document with millions of schema positions exhausts the static-analysis budget
+and is refused `schema_unusable` (exit 20) — never a crash. (A schema whose JSON
+nesting exceeds the JSON parser's own depth limit is rejected by the parser
+before this check runs, in both modes.) Context: ADR-030.
+
+The static-analysis budget is a **fixed internal guard of 10000000 steps**, not
+a configuration key: there is no TOML setting or environment variable to raise
+or lower it. A document that would make the check visit more than that many
+schema positions is refused `schema_unusable` (exit 20) rather than running
+unbounded; every realistic schema stays far below the limit. Context: ADR-030.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,
@@ -1249,3 +1404,14 @@ Storage failures remain visible as degraded durability until a full save succeed
 
 [ADR-020](adr/020-durable-turn-checkpoints.md) explains the design and rollback behavior.
 [The glossary](contexts/session-durability/CONTEXT.md) defines checkpoint and canonical history.
+
+## Structured final output (`--final-output`)
+
+Opt-in (FR-01 / ADR-024). `daimonos agent --final-output <PATH>` makes a one-shot `--print` run end with a single schema-validated JSON document on stdout. The control file is JSON with these keys:
+
+- `schema` *or* `schema_path` (mutually exclusive; exactly one required) — the JSON Schema draft 2020-12 document for the final answer.
+- `tool_name`, `tool_description` — the final-answer tool the model sees. The schema is offered unchanged (no strict-subset rewrite). `tool_name` must not collide with a registered tool (startup exit 2).
+- `corrective_retries` — extra ending attempts after the first (dbunk uses 1).
+- `max_model_requests` (optional) — inclusive ceiling on model requests for the whole run; exceeding it fails with reason `turn_limit` (exit 24).
+
+Success emits only the validated argument JSON and one newline (exit 0). A failed ending writes a bounded JSON error object to stderr with `reason`, `validation_errors`, `attempts`, and `model_requests` (exit 20). An external schema reference is refused before any model request (`schema_unusable`, exit 20). Default off leaves agent mode unchanged.

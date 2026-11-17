@@ -44,6 +44,19 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// Opt-in structured final output (ADR-024, FR-01). Path to a JSON control
+    /// file: `schema` XOR `schema_path`, `tool_name`, `tool_description`,
+    /// `corrective_retries`, and optional `max_model_requests`. On success the
+    /// run emits only the validated argument JSON and one newline on stdout; a
+    /// failed ending emits the typed final-output error. Default off.
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot emit a single validated terminal document, so the flag is
+    /// refused there at startup (ADR-024 / INTERFACES.md frontend coverage)
+    /// rather than silently ignored. The chat, ACP, and session-daemon
+    /// frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+    pub final_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -206,6 +219,9 @@ pub enum Command {
     McpConfig(McpConfigArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
     Daemon,
+    /// Print the effective tool contract as deterministic JSON and exit
+    /// (WP15, FR-13). Session-free: no model run or session store is started.
+    ToolContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +237,7 @@ pub enum RuntimeMode {
     McpAuth,
     Daemon,
     Stats,
+    ToolContract,
 }
 
 impl RuntimeMode {
@@ -237,6 +254,7 @@ impl RuntimeMode {
             Self::McpAuth => "mcp_auth",
             Self::Daemon => "socket",
             Self::Stats => "stats",
+            Self::ToolContract => "tool_contract",
         }
     }
 
@@ -321,6 +339,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
 
+    /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
+    /// schemas instead of the default stripped placeholders (WP17, FR-15).
+    /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still
+    /// applies. Opt-in: the legacy terse/lazy serving stays the default when it
+    /// is absent. Context: docs/adr/030-self-contained-full-schemas.md.
+    #[arg(long, global = true, default_value_t = false)]
+    pub full_tool_schemas: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -348,6 +374,7 @@ impl Cli {
                 .map(RuntimeMode::McpSocket)
                 .unwrap_or(RuntimeMode::McpStdio),
             Some(Command::Daemon) => RuntimeMode::Daemon,
+            Some(Command::ToolContract) => RuntimeMode::ToolContract,
             None if self.stats => RuntimeMode::Stats,
             None if self.mcp => RuntimeMode::McpStdio,
             None => self

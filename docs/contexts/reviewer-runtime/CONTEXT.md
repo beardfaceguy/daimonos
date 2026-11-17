@@ -14,6 +14,10 @@ Date: 2026-11-03
 - **Logical input:** File, git-object, or index content read or scanned to serve a call. It is not physical I/O or output size.
 - **Offline-tools authority:** A process network ceiling for local tool servers, distinct from the networked model side.
 - **Tool-contract version:** Compatibility identity of tool definitions, separate from binary and source-commit identity.
+- **Owned path annotation (`x-daimonos-path`):** Schema marker on a Daimonos-owned argument whose value is a filesystem path, glob, or walk root, including array elements. Semantic, not spelling: opaque command/script strings and reservation glob patterns are not marked (FR-14, ADR-029).
+- **Final output:** The opt-in `daimonos agent --final-output` mode whose only success is exactly one validated UTF-8 JSON document and a trailing newline on stdout; otherwise it ends with a distinct typed failure.
+- **turn_limit:** The final-output reason emitted when the caller's `max_model_requests` ceiling refuses a further model request; the run exits 24 (`model_request_limit`) and sends nothing.
+- **Typed failure object:** The bounded final-output failure JSON (`reason`, `validation_errors`, `attempts`, `model_requests`) written to stderr or an authorized state destination, never a free-text message.
 
 The [package plan](../../handoffs/2026-10-28-dbunk-remaining-work.md#adr-inventory) indexes Accepted ADRs 021–032.
 The user accepted those decisions and all four G0 interface groups on 2026-10-29 UTC.
