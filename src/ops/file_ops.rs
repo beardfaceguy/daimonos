@@ -476,7 +476,9 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
             .and_then(|pattern| glob::Pattern::new(pattern).ok());
     let filter = op.n2;
     let result = tokio::task::spawn_blocking(move || {
-        let start = authority.open_read(&path)?;
+        // WP14: honor no-follow for the explicit scope so a symlink named as
+        // the ls root is refused with its target, never listed through.
+        let start = authority.open_read_policy(&path)?;
         let base = start.relative_path().to_path_buf();
         let walk = authority.walk(
             &path,
@@ -768,8 +770,9 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let supplied = Path::new(&pattern);
         if explicit_scope {
+            // WP14: no-follow refuses a symlink named as the glob scope.
             authority
-                .open_read(&scope)
+                .open_read_policy(&scope)
                 .map_err(|error| error.with_argument(&scope_argument))?;
         }
         let (scope, relative) = if supplied.is_absolute() {
@@ -781,8 +784,9 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
             )
         } else {
             if !explicit_scope {
+                // WP14: no-follow refuses a symlink named as the glob scope.
                 authority
-                    .open_read(&scope)
+                    .open_read_policy(&scope)
                     .map_err(|error| error.with_argument(&scope_argument))?;
             }
             (scope, supplied.to_path_buf())
@@ -817,7 +821,8 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
             suffix.push(name);
         }
         let start = scope.join(prefix);
-        let directory = match authority.open_read(&start) {
+        // WP14: no-follow refuses a symlink in the glob prefix path.
+        let directory = match authority.open_read_policy(&start) {
             Ok(directory) => directory,
             Err(error) if error.code == crate::path_policy::CODE_PATH_NOT_FOUND => {
                 return Ok((Vec::new(), 0));
@@ -980,7 +985,9 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
                 .is_ok()
         };
         let mut matches = Vec::new();
-        let start = authority.open_read(&root)?;
+        // WP14: honor no-follow for the explicit scope so a symlink named as
+        // the search root is refused with its target, never scanned through.
+        let start = authority.open_read_policy(&root)?;
         if start.metadata().is_ok_and(|metadata| metadata.is_file()) {
             let display = authority.root().join(start.relative_path());
             if file_glob
@@ -1022,7 +1029,10 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
             {
                 continue;
             }
-            let authorized = match authority.open_read(&entry.relative_path) {
+            // WP14: under no-follow, re-open via the policy so an in-root
+            // symlink-to-file entry listed by the walk is refused (skipped),
+            // never scanned through to its target's content.
+            let authorized = match authority.open_read_policy(&entry.relative_path) {
                 Ok(authorized) => authorized,
                 Err(_) => {
                     skipped += 1;

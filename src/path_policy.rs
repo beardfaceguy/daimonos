@@ -73,9 +73,13 @@ pub struct ToolFailure {
     pub message: String,
     pub tool: Option<String>,
     pub argument: Option<String>,
-    /// Literal, unresolved link text for a no-follow refusal (WP14). Present
-    /// only when the refused link stays inside the root, so it never discloses
-    /// resolved outside content. Escaping-link refusals leave this `None`.
+    /// Literal, unresolved link text for a no-follow refusal (WP14, FR-12).
+    /// Set for EVERY link refused under the no-follow policy, including a link
+    /// whose literal target escapes the root: the value is the link text stored
+    /// inside the workspace, read with `readlink` without ever opening or
+    /// resolving the target, so it discloses no resolved outside content.
+    /// Confinement-only `symlink_refused` refusals (no-follow absent) leave this
+    /// `None`.
     // `Box<String>` is deliberate: a thin 8-byte pointer keeps `ToolFailure`
     // under clippy's `result_large_err` threshold (a bare `String`/`Box<str>`
     // would push the many `Result<_, ToolFailure>` returns over 128 bytes).
@@ -159,10 +163,12 @@ impl ToolFailure {
         )
     }
 
-    /// Independent no-follow refusal (WP14, FR-12): the link stays inside the
-    /// root but the no-follow option forbids reading or walking through it. The
-    /// reviewed `symlink_refused` code carries the link's literal target text as
-    /// metadata without ever opening or resolving the target.
+    /// Independent no-follow refusal (WP14, FR-12): a symlink component is
+    /// refused because the no-follow option forbids reading or walking through
+    /// it, regardless of whether its literal target stays inside the root or
+    /// escapes it. The reviewed `symlink_refused` code carries the link's
+    /// literal target text as metadata without ever opening or resolving the
+    /// target.
     pub fn symlink_not_followed(argument: &Path, target: &str) -> Self {
         let mut failure = Self::refusal(
             CODE_SYMLINK_REFUSED,
@@ -453,6 +459,22 @@ impl FilesystemAuthority {
     /// True when the independent no-follow option is active.
     pub fn no_follow(&self) -> bool {
         self.no_follow
+    }
+
+    /// Open `path` for reading honoring the active no-follow policy (WP14).
+    /// When no-follow is enabled this refuses any symlink component and
+    /// surfaces its literal target text ([`open_read_no_follow`](Self::open_read_no_follow));
+    /// otherwise it follows in-root links exactly like
+    /// [`open_read`](Self::open_read). Tool consumers that open or scan an
+    /// explicitly named path or walk scope must use this, never `open_read`
+    /// directly, so a link named as the target or as a walk root is never read
+    /// or listed through.
+    pub fn open_read_policy(&self, path: &Path) -> Result<AuthorizedRead, ToolFailure> {
+        if self.no_follow {
+            self.open_read_no_follow(path)
+        } else {
+            self.open_read(path)
+        }
     }
 
     /// The fixed canonical root this authority confines to.
