@@ -240,6 +240,16 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// WP05 (ADR-024): opt-in structured final output. `Some` switches the loop
+    /// to terminal-call accounting over the caller's final-answer tool; the
+    /// terminal decision is recorded in `final_output_sink`. `None` leaves the
+    /// loop behaviour unchanged.
+    pub final_output: Option<std::sync::Arc<crate::structured_output::FinalOutputSpec>>,
+    /// Where `run_inner` records the terminal final-output decision for the
+    /// frontend to map to stdout/stderr and the reviewed exit code.
+    pub final_output_sink: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>>,
+    >,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -909,6 +919,10 @@ async fn run_inner(
         journal.checkpoint(&messages).await;
     }
 
+    // WP05 (ADR-024): final-output terminal-call accounting. `None` outside
+    // final-output mode leaves the loop behaviour unchanged.
+    let mut final_state = config.final_output.as_ref().map(|spec| spec.new_state());
+
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
     // once per turn — explicit config wins, then the env override, then the
     // built-in default (0 = off).
@@ -985,6 +999,31 @@ async fn run_inner(
     let mut evidence_degraded = false;
 
     loop {
+        // WP05 (ADR-024): inclusive model-request ceiling. Covers every HTTP
+        // attempt; a refusal sends nothing and yields turn_limit (exit 24). In
+        // final-output mode in-generation retries/failover/resume are disabled
+        // (agent_cmd), so recording once per iteration is exact.
+        if let Some(state) = final_state.as_mut() {
+            if !state.can_request() {
+                if let Some(sink) = &config.final_output_sink {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(crate::structured_output::FinalOutputOutcome::RequestLimit(
+                            state.request_limit_json(),
+                        ));
+                }
+                return AgentResult {
+                    messages: close_orphan_tool_calls(messages),
+                    usage: total_usage,
+                    stop_reason: StopReason::EndTurn,
+                    error_message: None,
+                    last_call_usage: Usage::default(),
+                    context_overflow: false,
+                    evidence,
+                };
+            }
+            state.record_request();
+        }
+
         // Deterministically shed old successful tool context before every
         // provider call. This runs inside a single user turn, where ADR-002's
         // between-turn compaction cannot help.
@@ -1171,6 +1210,78 @@ async fn run_inner(
             });
             if let Some(journal) = &journal {
                 journal.checkpoint(&messages).await;
+            }
+        }
+
+        // WP05 (ADR-024): terminal final-output classification. An ordinary
+        // evidence step (ordinary tool calls only) falls through to normal
+        // dispatch below. Any ending is resolved here: success records the
+        // validated JSON, a failed ending sends one corrective turn or records
+        // the typed failure. The final-answer tool is never dispatched.
+        if let (Some(spec), Some(state)) = (config.final_output.as_ref(), final_state.as_mut()) {
+            use crate::structured_output::{
+                FailureDisposition, FinalOutputOutcome, TurnClassification,
+            };
+            match spec.classify(&resp) {
+                TurnClassification::Evidence => {}
+                TurnClassification::Success { arguments } => {
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Success(
+                                crate::structured_output::success_stdout(&arguments),
+                            ));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: None,
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } => match state.register_failure(failure) {
+                    FailureDisposition::Retry(f) => {
+                        // One wire-valid user turn answers every unexecuted
+                        // call (execute none) and restates the final rule.
+                        let corrective = spec.corrective_message(&f);
+                        let mut content = error_results;
+                        content.extend(corrective.content);
+                        messages.push(Message {
+                            role: Role::User,
+                            content,
+                        });
+                        if let Some(journal) = &journal {
+                            journal.checkpoint(&messages).await;
+                        }
+                        continue;
+                    }
+                    FailureDisposition::Fail(f) => {
+                        if !error_results.is_empty() {
+                            messages.push(Message {
+                                role: Role::User,
+                                content: error_results,
+                            });
+                        }
+                        if let Some(sink) = &config.final_output_sink {
+                            *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(FinalOutputOutcome::Failure(state.failure_json(&f)));
+                        }
+                        return AgentResult {
+                            messages: close_orphan_tool_calls(messages),
+                            usage: total_usage,
+                            stop_reason: StopReason::EndTurn,
+                            error_message: Some(f.reason.as_str().to_string()),
+                            last_call_usage: resp.usage,
+                            context_overflow: resp.context_overflow,
+                            evidence,
+                        };
+                    }
+                },
             }
         }
 

@@ -35,6 +35,13 @@ pub struct AgentCmdArgs {
     /// Reasoning effort for the model (#1122), from `DAIMONOS_AGENT_THINKING`
     /// (default `medium`). Forwarded into `CompleteOpts.thinking`.
     pub thinking: crate::providers::ThinkingLevel,
+    /// Opt-in structured final output (ADR-024, WP05). `Some` offers the
+    /// final-answer tool and switches the loop to terminal-call accounting;
+    /// the outcome is recorded in `final_output_sink`. `None` = unchanged.
+    pub final_output: Option<Arc<crate::structured_output::FinalOutputSpec>>,
+    /// Where the agent loop records the terminal final-output decision for the
+    /// caller to map to stdout/stderr and the reviewed exit code.
+    pub final_output_sink: Option<Arc<Mutex<Option<crate::structured_output::FinalOutputOutcome>>>>,
 }
 
 enum ThoughtCaptureState {
@@ -161,6 +168,13 @@ pub async fn run_agent(
         tools.extend(mcp.tools());
     }
 
+    // WP05 (ADR-024): offer the caller's final-answer tool with its schema
+    // unchanged and switch the loop to terminal-call accounting. The tool is
+    // intercepted model-side and never dispatched or routed to a worker.
+    let final_output_active = args.final_output.is_some();
+    if let Some(spec) = &args.final_output {
+        tools.push(spec.tool_schema());
+    }
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let thought_capture = match args.thought_log {
@@ -192,6 +206,23 @@ pub async fn run_agent(
             label: "agent".to_string(),
         }),
         remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
+        // WP05 (ADR-024): final-output mode makes each generation exactly one
+        // HTTP attempt so the inclusive model-request ceiling is exact. Disable
+        // in-generation retries, failover, turn-level error-resume, and
+        // max-tokens auto-continue; none add a request outside that ceiling.
+        provider_retry: if final_output_active {
+            crate::agent::ProviderRetryConfig {
+                max_attempts: 0,
+                base_delay: std::time::Duration::ZERO,
+                failover_models: Vec::new(),
+            }
+        } else {
+            crate::agent::ProviderRetryConfig::default()
+        },
+        error_resume_budget: if final_output_active { Some(0) } else { None },
+        auto_continue_budget: if final_output_active { Some(0) } else { None },
+        final_output: args.final_output.clone(),
+        final_output_sink: args.final_output_sink.clone(),
         ..AgentConfig::default()
     };
 
@@ -265,11 +296,16 @@ pub async fn run_agent(
     // completed provider run has closed its span and reached analytics.
     thought_capture_result?;
 
-    for msg in &result.messages {
-        if matches!(msg.role, Role::Assistant) {
-            for block in &msg.content {
-                if let ContentBlock::Text(t) = block {
-                    writeln!(out, "{t}")?;
+    // WP05 (ADR-024): final-output mode owns stdout — only the validated
+    // argument JSON (emitted by the caller) may appear there. Suppress the
+    // normal assistant-text echo so nothing else reaches stdout (AC-01.7).
+    if !final_output_active {
+        for msg in &result.messages {
+            if matches!(msg.role, Role::Assistant) {
+                for block in &msg.content {
+                    if let ContentBlock::Text(t) = block {
+                        writeln!(out, "{t}")?;
+                    }
                 }
             }
         }
@@ -347,6 +383,8 @@ mod tests {
     fn args(task: &str) -> AgentCmdArgs {
         AgentCmdArgs {
             task: task.to_string(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -453,6 +491,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "do it".into(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -472,6 +512,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "my task".into(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -493,6 +535,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = AgentCmdArgs {
             task: "go".into(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -607,6 +651,8 @@ mod tests {
         let a = AgentCmdArgs {
             task: "go".into(),
             model: Some("claude-haiku-4-5".into()),
+            final_output: None,
+            final_output_sink: None,
             dry_run: false,
             safety: None,
             analytics: None,
@@ -647,6 +693,8 @@ mod tests {
             token_log: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::High,
+            final_output: None,
+            final_output_sink: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -703,6 +751,8 @@ mod tests {
             safety: None,
             analytics: None,
             token_log: Some(log_path.clone()),
+            final_output: None,
+            final_output_sink: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
         };
@@ -757,6 +807,8 @@ mod tests {
         let provider = MockProvider::new(vec![end_turn_with_text("done")]);
         let a = AgentCmdArgs {
             task: "test analytics wiring".into(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -785,6 +837,8 @@ mod tests {
 
         let a = AgentCmdArgs {
             task: "dry run task".into(),
+            final_output: None,
+            final_output_sink: None,
             model: None,
             dry_run: true,
             safety: None,

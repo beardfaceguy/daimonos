@@ -259,6 +259,7 @@ pub async fn run_agent(
         agent_env,
         debug_thoughts,
         debug_thoughts_path,
+        final_output,
     } = args;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
@@ -307,6 +308,9 @@ pub async fn run_agent(
             // Dry-run never calls the provider and does not load the agent env,
             // so effort is immaterial here; use the default.
             thinking: providers::ThinkingLevel::default(),
+            // WP05: dry-run never runs the loop, so final-output is inert here.
+            final_output: None,
+            final_output_sink: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -481,6 +485,41 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
+    // WP05 (ADR-024): structured final output. Parse and compile the control
+    // file before any provider work — a config error exits 2, an unusable or
+    // external-reference schema exits 20 with the final-output error shape, and
+    // a final-tool name that collides with a registered tool exits 2
+    // (tool_name_collision). All fail-closed before a single model request.
+    let final_output_runtime = match &final_output {
+        Some(path) => {
+            let spec = match crate::structured_output::load_control(path) {
+                Ok(spec) => spec,
+                Err(startup) => emit_final_output_startup_error(startup),
+            };
+            let collides = crate::tool_facade::active_schemas_for_policy(
+                workspace,
+                &cfg.prompts.resolved_tool_descriptions,
+                cfg.filesystem_authority.is_some(),
+            )
+            .iter()
+            .any(|schema| schema.name.as_str() == spec.tool_name());
+            if collides {
+                emit_final_output_startup_error(
+                    crate::structured_output::FinalOutputStartupError {
+                        exit_code: 2,
+                        message: Some(format!(
+                            "final-output control file: tool_name '{}' collides with a registered tool (tool_name_collision)",
+                            spec.tool_name()
+                        )),
+                        json: None,
+                    },
+                );
+            }
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+            Some((std::sync::Arc::new(spec), sink))
+        }
+        None => None,
+    };
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -490,9 +529,20 @@ pub async fn run_agent(
         token_log,
         thought_log,
         thinking: agent.thinking.clone(),
+        final_output: final_output_runtime
+            .as_ref()
+            .map(|(spec, _)| std::sync::Arc::clone(spec)),
+        final_output_sink: final_output_runtime
+            .as_ref()
+            .map(|(_, sink)| std::sync::Arc::clone(sink)),
     };
     let result =
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
+    // WP05 (ADR-024): map the terminal final-output decision to the reviewed
+    // stdout/stderr + exit-code contract. Diverges (process::exit) when active.
+    if let Some((_, sink)) = &final_output_runtime {
+        emit_final_output_outcome(sink);
+    }
     check_agent_result(&result)
 }
 
@@ -1186,6 +1236,60 @@ fn require_agent_task(
         };
         anyhow::anyhow!("agent task is required in {} mode; {hint}", mode.as_str())
     })
+}
+
+/// Emit a final-output startup refusal and exit with its reviewed code (ADR-024
+/// / reviewer-runtime INTERFACES.md): a JSON line for the final-output error
+/// shape (exit 20, schema_unusable), else plain stderr text (exit 2). Diverges.
+fn emit_final_output_startup_error(error: crate::structured_output::FinalOutputStartupError) -> ! {
+    if let Some(json) = &error.json {
+        eprintln!("{}", serde_json::to_string(json).unwrap_or_default());
+    } else if let Some(message) = &error.message {
+        eprintln!("{message}");
+    }
+    std::process::exit(error.exit_code);
+}
+
+/// Emit the terminal final-output decision and exit per the reviewed contract
+/// (ADR-024 / INTERFACES.md): success writes only the validated argument JSON
+/// (plus one newline, already embedded) to stdout and exits 0; a typed failure
+/// writes the bounded error JSON to stderr and exits 20; the inclusive
+/// model-request ceiling writes the `turn_limit` JSON to stderr and exits 24.
+/// A run that reached no terminal decision is reported as `no_final_call`
+/// (exit 20). Diverges (process::exit).
+fn emit_final_output_outcome(
+    sink: &std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>,
+) -> ! {
+    use crate::structured_output::FinalOutputOutcome;
+    use std::io::Write as _;
+    let outcome = sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match outcome {
+        Some(FinalOutputOutcome::Success(stdout)) => {
+            print!("{stdout}");
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+        Some(FinalOutputOutcome::Failure(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(20);
+        }
+        Some(FinalOutputOutcome::RequestLimit(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(24);
+        }
+        None => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "reason": "no_final_call",
+                    "validation_errors": [],
+                    "attempts": 0,
+                    "model_requests": 0,
+                })
+            );
+            std::process::exit(20);
+        }
+    }
 }
 
 fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {

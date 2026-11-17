@@ -139,6 +139,8 @@ Both paths apply identical selection and validation. A network-dependent discove
 ## Structured final output and controlled requests
 
 WP05 owns `src/structured_output.rs` and the reusable `src/schema_validation.rs` (both new): `FinalOutputSpec`, `FinalOutputState`, and `FinalAttemptFailure`.
+
+> Status (WP05, run wp05-20261117): implemented and wired behind `daimonos agent --final-output`. The model-request ceiling emits reason `turn_limit` in its JSON while using exit code 24 (`model_request_limit`). Acceptance suite `tests/test_structured_output.py` passes on both the Chat Completions and Messages mock wires. Validator dependency `jsonschema =0.60.2` (default features off) added per the human's FR-01 approval.
 Use `jsonschema` version `0.60.2`, the full draft-2020-12 validator selected by Accepted ADR-024.
 Compile with default external resolver features disabled. Assert `format: date-time` and permit only self-contained local references.
 Acceptance of ADR-024 confirms this named validator dependency. This step does not add it to Cargo.toml.

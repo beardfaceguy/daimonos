@@ -44,6 +44,13 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// Opt-in structured final output (ADR-024, FR-01). Path to a JSON control
+    /// file: `schema` XOR `schema_path`, `tool_name`, `tool_description`,
+    /// `corrective_retries`, and optional `max_model_requests`. On success the
+    /// run emits only the validated argument JSON and one newline on stdout; a
+    /// failed ending emits the typed final-output error. Default off.
+    #[arg(long, value_name = "PATH")]
+    pub final_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
