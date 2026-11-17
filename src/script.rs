@@ -1554,6 +1554,16 @@ pub fn tool_signatures() -> String {
 
 /// Render only signatures admitted by the current filesystem policy.
 pub fn tool_signatures_for_policy(confined: bool) -> String {
+    tool_signatures_filtered(confined, &|_| true)
+}
+
+/// Like [`tool_signatures_for_policy`], but also hides any tool the run's
+/// explicit `--tool-allowlist` disallows (FR-02 R3, ADR-023): the dumped
+/// Starlark signatures must match the dispatchable set, so
+/// `list_tool_signatures` and the server instructions cannot reveal an unlisted
+/// tool. `print`/`tool` are language builtins (not daimonos tools) and are
+/// always shown. Context: src/script.rs.
+pub fn tool_signatures_filtered(confined: bool, allow: &dyn Fn(&str) -> bool) -> String {
     let sigs = [
         "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
@@ -1587,20 +1597,21 @@ pub fn tool_signatures_for_policy(confined: bool) -> String {
         .into_iter()
         .filter(|t| t.to_request.is_some())
         .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
+        .filter(|t| allow(t.name))
         .map(|t| t.name)
         .collect();
     via_generic.sort_unstable();
     let shown: Vec<&str> = sigs
         .into_iter()
         .filter(|signature| {
-            if !confined {
-                return true;
-            }
             let name = signature
                 .strip_prefix("def ")
                 .and_then(|text| text.split('(').next())
                 .unwrap_or("");
-            name == "print" || name == "tool" || crate::path_policy::tool_allowed(name)
+            if name == "print" || name == "tool" {
+                return true;
+            }
+            (!confined || crate::path_policy::tool_allowed(name)) && allow(name)
         })
         .map(|signature| {
             if confined && signature.starts_with("def tool(") {

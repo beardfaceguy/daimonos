@@ -143,10 +143,16 @@ pub async fn run_agent(
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
+    // FR-02 (WP06, ADR-023) R1: the explicit allowlist filters the offered
+    // catalog at its single source (`active_schemas_for_policy`), so the
+    // per-frontend `retain` below is gone. With no explicit list this is a
+    // no-op (legacy behavior).
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
     let schemas = tool_facade::active_schemas_for_policy(
         workspace,
         &cfg.prompts.resolved_tool_descriptions,
         cfg.filesystem_authority.is_some(),
+        &policy,
     );
 
     if args.dry_run {
@@ -177,7 +183,9 @@ pub async fn run_agent(
         tools.iter().map(|tool| tool.name.clone()).collect();
     let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, args.analytics.clone()).await;
     if let Some(mcp) = &agent_mcp {
-        tools.extend(mcp.tools());
+        // FR-02 R1: outbound MCP tools are subject to the same allowlist so the
+        // listing equals the dispatchable set; a no-op with no explicit list.
+        tools.extend(mcp.tools().into_iter().filter(|t| policy.allows(&t.name)));
     }
 
     // WP05 (ADR-024): offer the caller's final-answer tool with its schema
@@ -187,6 +195,11 @@ pub async fn run_agent(
     if let Some(spec) = &args.final_output {
         tools.push(spec.tool_schema());
     }
+    // The offered catalog was already filtered at its single source
+    // (`active_schemas_for_policy`) and at the MCP extend above; the
+    // final-answer tool is required on the allowlist at startup (R1), so no
+    // per-frontend `retain` is needed here. The agent loop still refuses any
+    // unlisted name at every dispatch boundary.
     // WP09 (FR-04 reqs 14-17, ADR-027): the single same-tool capability probe
     // runs here, offering the EXACT frozen `tools` vector the run will offer
     // (byte-equivalent; no dummy substitute), before any evidence tool. A

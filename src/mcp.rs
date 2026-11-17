@@ -496,6 +496,9 @@ async fn dispatch_tool_inner(
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let results: Vec<Value> = all
                 .into_iter()
+                // FR-02 (WP06, R2, ADR-023): the probe/schema-lookup set must
+                // equal the allowlist — never reveal an unlisted tool's schema.
+                .filter(|t| session.policy.allows(&t.name))
                 .filter(|t| names.contains(&t.name))
                 .map(|t| {
                     json!({
@@ -507,7 +510,12 @@ async fn dispatch_tool_inner(
                 .collect();
 
             if results.is_empty() {
-                let known: Vec<&str> = tools::mcp_tool_names();
+                // The suggestion list is filtered too, so an unlisted name is
+                // never advertised as available (ADR-023).
+                let known: Vec<&str> = tools::mcp_tool_names()
+                    .into_iter()
+                    .filter(|&n| session.policy.allows(n))
+                    .collect();
                 err_text(format!(
                     "unknown tool(s): {:?}. Available: {:?}",
                     names, known
@@ -518,7 +526,15 @@ async fn dispatch_tool_inner(
         }
 
         "list_tool_signatures" => {
-            let sigs = script::tool_signatures_for_policy(session.authority.is_some());
+            // FR-02 (WP06, R3, ADR-023): the dumped Starlark signatures must
+            // match the dispatchable set, so filter them by the explicit
+            // allowlist when one is active.
+            let confined = session.authority.is_some();
+            let sigs = if session.policy.is_active() {
+                script::tool_signatures_filtered(confined, &|name| session.policy.allows(name))
+            } else {
+                script::tool_signatures_for_policy(confined)
+            };
             ok_text(sigs)
         }
 
@@ -1667,13 +1683,21 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
         ),
     ];
 
+    // FR-02 (WP06, listing inventory, ADR-023): the server instructions embed
+    // the Starlark tool signatures the model reads. Under an active explicit
+    // allowlist they are filtered too, so the instructions agree with the
+    // served/dispatched set and cannot reveal an unlisted tool.
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+    let confined = cfg.filesystem_authority.is_some();
+    let signatures = if policy.is_active() {
+        script::tool_signatures_filtered(confined, &|name| policy.allows(name))
+    } else if confined {
+        script::tool_signatures_for_policy(true)
+    } else {
+        script::tool_signatures()
+    };
     parts.push(format!(
-        "Starlark tool functions for execute_script:\n{}",
-        if cfg.filesystem_authority.is_some() {
-            script::tool_signatures_for_policy(true)
-        } else {
-            script::tool_signatures()
-        }
+        "Starlark tool functions for execute_script:\n{signatures}"
     ));
 
     if let Some(authority) = &cfg.filesystem_authority {
@@ -2047,7 +2071,16 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
     let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
     let verbosity = session.verbosity;
     all.into_iter()
-        .filter(|t| session.exposed_tools.contains(&t.name))
+        // FR-02 (WP06, listing inventory): the session-daemon socket listing is
+        // filtered by the explicit allowlist too (mirrors the MCP tools/list
+        // path), so an allowlisted daemon serves exactly the allowlisted tools.
+        .filter(|t| {
+            if session.policy.is_active() {
+                session.policy.allows(&t.name)
+            } else {
+                session.exposed_tools.contains(&t.name)
+            }
+        })
         .filter(|t| passes_session_context_check(session, &t.name))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
