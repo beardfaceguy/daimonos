@@ -142,6 +142,12 @@ names each ignored source by path, without reading its contents, for example:
 {"effective_policy":{"ignore_config_files":true,"ignored":[{"kind":"D01","label":"environment file","path":"/work/agent.env"}]}}
 ```
 
+Under the option a hostile workspace `agent-instructions.md` (D04) is not
+layered into the agent system prompt, so it never reaches the model request.
+The index warm-up preflight (the over-broad-root guard) is covered by the
+ignore-file suppression above, so a hostile `.gitignore` cannot change which
+paths an opted-in run eagerly indexes.
+
 The option is part of a session daemon's launch identity: a daemon started with
 `--ignore-config-files` is distinct from one started without it, the same way
 `--confine-paths` pins a daemon. Reusing a running daemon with a different

@@ -1285,7 +1285,12 @@ fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
             .with_discovery_policy(session.cfg.discovery_policy);
     session.read_cache.clear();
     let should_warm = session.authority.is_none()
-        && crate::index::should_warm_index(&new_root, &session.cfg.index, true);
+        && crate::index::should_warm_index(
+            &new_root,
+            &session.cfg.index,
+            session.cfg.discovery_policy,
+            true,
+        );
     let idx = Arc::new(
         WorkspaceIndex::new(new_root, &session.cfg.index, false)
             .with_discovery_policy(session.cfg.discovery_policy),

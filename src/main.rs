@@ -966,7 +966,7 @@ async fn run_tool_service(
     // the inotify watch cap. Detect once and suppress the heavyweight
     // watchers/indexers; the MCP `roots` handshake (or an explicit `-w`)
     // re-roots to a real project later.
-    let overbroad = !index::should_eager_index(&workspace, &cfg.index);
+    let overbroad = !index::should_eager_index(&workspace, &cfg.index, cfg.discovery_policy);
     if overbroad && !mcp_quiet_stderr {
         eprintln!(
             "daimonos: workspace {:?} is an over-broad root (large, no project marker); \

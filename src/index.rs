@@ -775,12 +775,17 @@ fn start_watcher(
     }
 }
 
-pub fn should_warm_index(root: &Path, cfg: &IndexConfig, long_lived: bool) -> bool {
+pub fn should_warm_index(
+    root: &Path,
+    cfg: &IndexConfig,
+    policy: crate::discovery_policy::DiscoveryPolicy,
+    long_lived: bool,
+) -> bool {
     long_lived
         && match cfg.mode {
             IndexMode::Eager => true,
             IndexMode::Lazy => false,
-            IndexMode::Hybrid => should_eager_index(root, cfg),
+            IndexMode::Hybrid => should_eager_index(root, cfg, policy),
         }
 }
 
@@ -798,7 +803,11 @@ pub fn should_warm_index(root: &Path, cfg: &IndexConfig, long_lived: bool) -> bo
 /// downloads dir (large, no project marker) all return false — without a
 /// hand-maintained list of paths. `max_files` bounds retained state while
 /// `max_walk_entries` bounds traversal work.
-pub fn should_eager_index(root: &Path, cfg: &IndexConfig) -> bool {
+pub fn should_eager_index(
+    root: &Path,
+    cfg: &IndexConfig,
+    policy: crate::discovery_policy::DiscoveryPolicy,
+) -> bool {
     if !cfg.guard_overbroad_roots {
         return true;
     }
@@ -816,7 +825,7 @@ pub fn should_eager_index(root: &Path, cfg: &IndexConfig) -> bool {
     let budget = cfg.effective_max_files();
 
     // Small enough to fully index no matter what it is.
-    if preflight_within_budget(&root, cfg, budget) {
+    if preflight_within_budget(&root, cfg, policy, budget) {
         return true;
     }
 
@@ -833,12 +842,38 @@ fn has_project_marker(root: &Path, cfg: &IndexConfig) -> bool {
 /// `max_depth`) counting regular files, and early-exit as soon as the count
 /// exceeds `budget` or total visited entries exceed `max_walk_entries`.
 /// Returns true only when the whole tree fits within both bounds.
-fn preflight_within_budget(root: &Path, cfg: &IndexConfig, budget: usize) -> bool {
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .max_depth(Some(cfg.max_depth))
-        .build();
+/// Build the bounded preflight walker. Under
+/// [`crate::discovery_policy::DiscoveryPolicy::ExplicitOnly`] (WP11, FR-09,
+/// ADR-021) every implicit ignore-file layer is disabled so the warm-up
+/// decision never reads a hostile `.gitignore`/`.ignore`; hidden-file filtering
+/// is not an ignore file and is left unchanged.
+fn preflight_walk_builder(
+    root: &Path,
+    cfg: &IndexConfig,
+    policy: crate::discovery_policy::DiscoveryPolicy,
+) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(true).max_depth(Some(cfg.max_depth));
+    if policy.allows_implicit() {
+        builder.git_ignore(true);
+    } else {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+    builder
+}
+
+fn preflight_within_budget(
+    root: &Path,
+    cfg: &IndexConfig,
+    policy: crate::discovery_policy::DiscoveryPolicy,
+    budget: usize,
+) -> bool {
+    let walker = preflight_walk_builder(root, cfg, policy).build();
     let mut count = 0usize;
     let mut visited_entries = 0usize;
     for entry in walker {
@@ -1147,7 +1182,11 @@ mod tests {
             max_files: 50,
             ..Default::default()
         };
-        assert!(should_eager_index(dir.path(), &cfg));
+        assert!(should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
@@ -1159,7 +1198,11 @@ mod tests {
             max_files: 3,
             ..Default::default()
         };
-        assert!(!should_eager_index(dir.path(), &cfg));
+        assert!(!should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
@@ -1172,7 +1215,11 @@ mod tests {
             max_files: 3,
             ..Default::default()
         };
-        assert!(should_eager_index(dir.path(), &cfg));
+        assert!(should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
@@ -1185,13 +1232,21 @@ mod tests {
             max_files: 3,
             ..Default::default()
         };
-        assert!(should_eager_index(dir.path(), &cfg));
+        assert!(should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
     fn gate_never_crawls_filesystem_root() {
         let cfg = IndexConfig::default();
-        assert!(!should_eager_index(Path::new("/"), &cfg));
+        assert!(!should_eager_index(
+            Path::new("/"),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
@@ -1203,7 +1258,11 @@ mod tests {
             guard_overbroad_roots: false,
             ..Default::default()
         };
-        assert!(should_eager_index(dir.path(), &cfg));
+        assert!(should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
     }
 
     #[test]
@@ -1215,12 +1274,78 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!should_warm_index(dir.path(), &cfg, true));
+        assert!(!should_warm_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit,
+            true
+        ));
         cfg.mode = IndexMode::Lazy;
-        assert!(!should_warm_index(dir.path(), &cfg, true));
+        assert!(!should_warm_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit,
+            true
+        ));
         cfg.mode = IndexMode::Eager;
-        assert!(should_warm_index(dir.path(), &cfg, true));
-        assert!(!should_warm_index(dir.path(), &cfg, false));
+        assert!(should_warm_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit,
+            true
+        ));
+        assert!(!should_warm_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit,
+            false
+        ));
+    }
+
+    /// WP11 (FR-09, ADR-021), reviewer R1: the warm-up preflight walk must not
+    /// read implicit ignore files under explicit-only discovery. A hostile
+    /// `.gitignore` that would hide a file under implicit discovery leaves the
+    /// explicit-only preflight count unchanged from the file-removed count.
+    #[test]
+    fn explicit_only_preflight_ignores_hostile_gitignore() {
+        use crate::discovery_policy::DiscoveryPolicy;
+
+        fn count_preflight(root: &Path, cfg: &IndexConfig, policy: DiscoveryPolicy) -> usize {
+            preflight_walk_builder(root, cfg, policy)
+                .build()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .count()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // A `.git` marker makes the `ignore` crate honor `.gitignore` (it only
+        // applies git ignore layers inside a repo); hidden-filtering skips it.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        std::fs::write(dir.path().join("secret.txt"), b"s").unwrap();
+        let cfg = IndexConfig::default();
+
+        // Count with no ignore file present at all (explicit-only baseline).
+        let count_file_removed = count_preflight(dir.path(), &cfg, DiscoveryPolicy::ExplicitOnly);
+
+        // A hostile ignore file that WOULD hide `secret.txt` under implicit
+        // discovery. It is itself hidden, so hidden-filtering drops it from the
+        // count regardless of policy.
+        std::fs::write(dir.path().join(".gitignore"), b"secret.txt\n").unwrap();
+
+        let count_implicit = count_preflight(dir.path(), &cfg, DiscoveryPolicy::Implicit);
+        let count_explicit = count_preflight(dir.path(), &cfg, DiscoveryPolicy::ExplicitOnly);
+
+        assert!(
+            count_implicit < count_explicit,
+            "implicit discovery honors the hostile .gitignore ({count_implicit} < {count_explicit})"
+        );
+        assert_eq!(
+            count_explicit, count_file_removed,
+            "explicit-only preflight count with a hostile .gitignore must equal the file-removed count"
+        );
     }
 
     #[tokio::test]
@@ -1234,7 +1359,11 @@ mod tests {
         };
         let idx = WorkspaceIndex::new(dir.path().to_path_buf(), &cfg, false);
         let stats = idx.stats().await;
-        assert!(!should_eager_index(dir.path(), &cfg));
+        assert!(!should_eager_index(
+            dir.path(),
+            &cfg,
+            crate::discovery_policy::DiscoveryPolicy::Implicit
+        ));
         assert_eq!(stats.files, 0);
         assert_eq!(stats.coverage, IndexCoverage::Cold);
     }

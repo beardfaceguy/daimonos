@@ -21,6 +21,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Ignore-file suppression (D08) covers every walker an opted-in run can reach:
   content `search`, `search mode="files"` (the filename index), their confined
   `--confine-paths` equivalents, and `snapshot` create/restore.
+  The over-broad-root index warm-up preflight honors the policy too, so a
+  hostile `.gitignore` cannot change which paths an opted-in run eagerly
+  indexes. A process-level test confirms that under the option a hostile
+  workspace `agent-instructions.md` never reaches the model request.
 
 ## [0.1.5] - 2026-10-18
 

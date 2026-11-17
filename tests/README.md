@@ -62,7 +62,11 @@ workspace corpus configures nothing, each ignored source is reported by path, an
 an explicit `--config` is still honored. It also asserts ignore-file suppression
 across every reachable walker — content `search`, `search mode="files"`, their
 confined (`--confine-paths`) equivalents, and `snapshot` create/restore — plus the
-exit-2 `config_invalid` failure for an invalid explicit `--config`. Like the other suites it needs the CLI
+exit-2 `config_invalid` failure for an invalid explicit `--config`. Process-level
+proofs confirm a hostile workspace `agent-instructions.md` never reaches the
+model request (observed on the recorded chat-completions request captured by a
+local fake provider) and that an ignored `[tools.*]` registration is absent
+from `tools/list` and undispatchable. Like the other suites it needs the CLI
 programs on `PATH` (the plugin tests spawn `pytest`); export the virtualenv's
 `bin` directory as shown above before running.
 

@@ -264,16 +264,76 @@ mod tests {
 
     #[test]
     fn report_value_shape_is_stable() {
-        let ignored = vec![IgnoredSource {
-            kind: DiscoveryKind::Config,
-            path: PathBuf::from("/ws/daimonos.toml"),
-        }];
+        // Reviewer R3: assert the report against an independently stated schema
+        // (key sets, value types, the `D\d\d` kind code pattern) rather than
+        // echoing the literal inputs back, so the test fails if the serialized
+        // shape drifts even when the inputs happen to match.
+        let ignored = vec![
+            IgnoredSource {
+                kind: DiscoveryKind::Config,
+                path: PathBuf::from("/ws/daimonos.toml"),
+            },
+            IgnoredSource {
+                kind: DiscoveryKind::IgnoreFiles,
+                path: PathBuf::from("/ws/.gitignore"),
+            },
+        ];
         let value = report_value(&ignored);
-        assert_eq!(value["effective_policy"]["ignore_config_files"], true);
-        assert_eq!(value["effective_policy"]["ignored"][0]["kind"], "D02");
+
+        // Top level: exactly one key, `effective_policy`, an object.
+        let top = value.as_object().expect("report is a JSON object");
         assert_eq!(
-            value["effective_policy"]["ignored"][0]["path"],
-            "/ws/daimonos.toml"
+            top.keys().collect::<Vec<_>>(),
+            vec!["effective_policy"],
+            "top level exposes only effective_policy"
         );
+        let policy = top["effective_policy"]
+            .as_object()
+            .expect("effective_policy is an object");
+
+        // effective_policy: exactly {ignore_config_files: bool, ignored: array}.
+        let mut policy_keys = policy.keys().cloned().collect::<Vec<_>>();
+        policy_keys.sort();
+        assert_eq!(policy_keys, vec!["ignore_config_files", "ignored"]);
+        assert_eq!(
+            policy["ignore_config_files"].as_bool(),
+            Some(true),
+            "the report only exists for explicit-only, so the flag is always true"
+        );
+        let entries = policy["ignored"].as_array().expect("ignored is an array");
+        assert_eq!(
+            entries.len(),
+            ignored.len(),
+            "one reported entry per ignored source"
+        );
+
+        // Every entry: exactly {kind: "D<nn>", label: non-empty, path: non-empty}.
+        for entry in entries {
+            let obj = entry.as_object().expect("entry is an object");
+            let mut keys = obj.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec!["kind", "label", "path"],
+                "entry schema is {{kind, label, path}}"
+            );
+            let kind = obj["kind"].as_str().expect("kind is a string");
+            let bytes = kind.as_bytes();
+            assert!(
+                bytes.len() == 3
+                    && bytes[0] == b'D'
+                    && bytes[1].is_ascii_digit()
+                    && bytes[2].is_ascii_digit(),
+                "kind {kind:?} must match the inventory code pattern D<nn>"
+            );
+            assert!(
+                obj["label"].as_str().is_some_and(|l| !l.is_empty()),
+                "label is a non-empty human-readable string"
+            );
+            assert!(
+                obj["path"].as_str().is_some_and(|p| !p.is_empty()),
+                "path is a non-empty string"
+            );
+        }
     }
 }

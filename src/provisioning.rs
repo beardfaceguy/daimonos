@@ -53,7 +53,7 @@ pub async fn build_tool_services(
             .with_discovery_policy(cfg.discovery_policy),
     );
     let background_work = cfg.filesystem_authority.is_none()
-        && index::should_warm_index(workspace, &cfg.index, eager_index);
+        && index::should_warm_index(workspace, &cfg.index, cfg.discovery_policy, eager_index);
     if background_work {
         index.spawn_reindex();
     }
