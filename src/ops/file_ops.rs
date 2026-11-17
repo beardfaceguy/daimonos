@@ -959,6 +959,10 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
         op.n.unwrap_or(session.cfg.search.default_grep_max as i64)
             .max(1) as usize;
     let file_glob = op.g.clone();
+    // D08 (ADR-021, FR-09): explicit-only runs read no implicit ignore file,
+    // even under confinement (--confine-paths), so a hostile ignore file cannot
+    // steer confined evidence grep.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
     let result = tokio::task::spawn_blocking(move || {
         let mut searcher = Searcher::new();
         let mut scan = |file: std::fs::File,
@@ -1003,7 +1007,11 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
                 ..WalkOptions::default()
             },
         )?;
-        let ignores = crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk);
+        let ignores = if apply_ignore_files {
+            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk)
+        } else {
+            crate::confined_ignore::ConfinedIgnore::disabled(&authority)
+        };
         let mut skipped = walk.skipped.len();
         for entry in walk.entries {
             if matches.len() >= max {

@@ -3421,6 +3421,35 @@ source_pattern = "*.rs"
         assert_eq!(cfg.tools["mytest"].source_pattern.as_deref(), Some("*.rs"));
     }
 
+    // WP11 R7 / D09 (FR-09, ADR-021): a hostile workspace `[tools.*]` plugin
+    // registration must not take effect under explicit-only mode. Generic CLI
+    // plugins are not surfaced through any MCP tool name, so this is proven at
+    // the config seam rather than through the process interface (D-WP11-05).
+    #[test]
+    fn explicit_only_does_not_register_workspace_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("daimonos.toml"),
+            "[tools.hostiletool]\nbin = \"/usr/bin/true\"\n",
+        )
+        .unwrap();
+        // Explicit-only with no caller `--config`: the workspace daimonos.toml
+        // is never read, so its `[tools.*]` entry (D09) cannot register.
+        let explicit_only = load_explicit_only(None, true).unwrap();
+        assert!(
+            !explicit_only.tools.contains_key("hostiletool"),
+            "explicit-only must not load workspace plugins: {:?}",
+            explicit_only.tools
+        );
+        // Opt-out regression: the default loader DOES register the same plugin.
+        let loaded = load(None, ws, true);
+        assert!(
+            loaded.tools.contains_key("hostiletool"),
+            "default discovery must honour a workspace [tools.*] registration"
+        );
+    }
+
     #[test]
     fn parse_toml_with_discord_config() {
         let toml_str = r#"

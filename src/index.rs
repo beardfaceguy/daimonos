@@ -38,6 +38,11 @@ pub struct WorkspaceIndex {
     /// Disabled in MCP quiet mode so hosts like Cursor don't surface benign
     /// lines as `[error]` (they classify all subprocess stderr as errors).
     log_progress: bool,
+    /// WP11 (FR-09, ADR-021): when false (explicit-only mode) the filename
+    /// index walk disables every implicit ignore-file layer, so a hostile
+    /// `.gitignore`/`.ignore` cannot drop files from `search mode=files`/`find`
+    /// results. Default true: ordinary discovery is unchanged.
+    apply_ignore_files: bool,
 }
 
 struct IndexState {
@@ -112,7 +117,20 @@ impl WorkspaceIndex {
             max_walk_entries: cfg.max_walk_entries,
             mode: cfg.mode,
             log_progress,
+            apply_ignore_files: true,
         }
+    }
+
+    /// Apply an explicit-only discovery policy to the index walk (WP11,
+    /// FR-09, ADR-021). Under [`DiscoveryPolicy::ExplicitOnly`] the implicit
+    /// ignore-file layers are disabled so an ignore-listed file is still
+    /// indexed and returned by `search mode=files`/`find`.
+    pub fn with_discovery_policy(
+        mut self,
+        policy: crate::discovery_policy::DiscoveryPolicy,
+    ) -> Self {
+        self.apply_ignore_files = policy.allows_implicit();
+        self
     }
 
     /// Rebuild the index in the background.
@@ -166,6 +184,7 @@ impl WorkspaceIndex {
         let max_files = self.max_files;
         let max_walk_entries = self.max_walk_entries;
         let log_progress = self.log_progress;
+        let apply_ignore_files = self.apply_ignore_files;
 
         tokio::task::spawn_blocking(move || {
             // Serialize against any other reindex already in flight on the
@@ -216,11 +235,23 @@ impl WorkspaceIndex {
             // Walk the workspace and collect current file set
             let mut current_files: HashMap<String, u64> = HashMap::new();
 
-            let walker = WalkBuilder::new(&root)
-                .hidden(true)
-                .git_ignore(true)
-                .max_depth(Some(max_depth))
-                .build();
+            let mut walk_builder = WalkBuilder::new(&root);
+            walk_builder.hidden(true).max_depth(Some(max_depth));
+            if apply_ignore_files {
+                walk_builder.git_ignore(true);
+            } else {
+                // WP11 (FR-09, ADR-021): explicit-only — disable every implicit
+                // ignore-file layer so a hostile ignore file cannot steer the
+                // filename index. Hidden-file filtering is not an ignore file
+                // and is left unchanged.
+                walk_builder
+                    .git_ignore(false)
+                    .git_global(false)
+                    .git_exclude(false)
+                    .ignore(false)
+                    .parents(false);
+            }
+            let walker = walk_builder.build();
 
             let mut cap_reason = None;
             let mut walk_failed = false;

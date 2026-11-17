@@ -18,6 +18,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `--agent-instructions`) remain honored, and each ignored source is reported
   by path at startup. The setting is pinned into a session daemon's launch
   identity.
+  Ignore-file suppression (D08) covers every walker an opted-in run can reach:
+  content `search`, `search mode="files"` (the filename index), their confined
+  `--confine-paths` equivalents, and `snapshot` create/restore.
 
 ## [0.1.5] - 2026-10-18
 

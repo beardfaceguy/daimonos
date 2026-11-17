@@ -94,7 +94,8 @@ impl Session {
         };
         let env = Self::build_initial_env(&cfg);
         let snapshot_store =
-            SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref());
+            SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref())
+                .with_discovery_policy(cfg.discovery_policy);
         let verbosity = cfg.mcp.default_verbosity;
         let authority = cfg.filesystem_authority.clone();
         Self {

@@ -220,3 +220,230 @@ def test_mixed_hostile_corpus_is_fully_ignored_and_reported(daimonos_factory, tm
         assert code in kinds, policy
     # The report names paths and never reads contents; every path is absolute.
     assert all(entry["path"].startswith("/") for entry in policy["ignored"]), policy
+
+
+# ---------------------------------------------------------------------------
+# WP11 run r2 (reviewer findings R1-R7). Every recognised discovery walker must
+# honour explicit-only mode, not only the non-confined content grep. These
+# tests drive the real `daimonos` process; the confined cases combine
+# `--confine-paths` (ADR-022) with `--ignore-config-files` (ADR-021/FR-09).
+# ---------------------------------------------------------------------------
+
+import subprocess
+
+CONFINE_FLAG = "--confine-paths"
+
+
+def _search_file_names(client, pattern):
+    """`search mode=files` -> filename/trigram index (op::FIND). Returns the
+    relative paths of the ranked results."""
+    result = client.call_tool("search", {"pattern": pattern, "mode": "files"})
+    assert not result.get("isError"), result
+    payload = json.loads(result["content"][0]["text"])
+    return {entry["file"] for entry in payload.get("results", [])}
+
+
+# --- R1: filename index walk (src/index.rs::WorkspaceIndex via op::FIND) ----
+
+
+def test_optout_ignore_file_filters_mode_files_search(daimonos_factory, tmp_path):
+    """Default-off regression: an implicit .ignore still removes a file from the
+    `search mode=files` index results (unchanged behaviour)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    names = _search_file_names(daimonos_factory(ws), "hidden")
+    assert not any(n.endswith("hidden.txt") for n in names), names
+
+
+def test_ignore_config_files_disables_ignore_in_mode_files_search(daimonos_factory, tmp_path):
+    """R1: under --ignore-config-files, `search mode=files` (the filename index
+    walk) must return an ignore-listed file; a hostile .ignore cannot steer it."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    names = _search_file_names(daimonos_factory(ws, args=[IGNORE_FLAG]), "hidden")
+    assert any(n.endswith("hidden.txt") for n in names), names
+
+
+# --- R2: confined content grep (src/ops/file_ops.rs::grep_confined) ---------
+
+
+def test_optout_confined_search_honors_ignore_file(daimonos_factory, tmp_path):
+    """Default-off regression under confinement: .ignore still steers content
+    search."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    files = _search_files(daimonos_factory(ws, args=[CONFINE_FLAG]))
+    assert any(f.endswith("visible.txt") for f in files), files
+    assert not any(f.endswith("hidden.txt") for f in files), files
+
+
+def test_confined_and_ignore_config_files_disables_ignore_in_search(daimonos_factory, tmp_path):
+    """R2: --confine-paths AND --ignore-config-files together must not let a
+    hostile .ignore steer the confined content grep."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    files = _search_files(daimonos_factory(ws, args=[CONFINE_FLAG, IGNORE_FLAG]))
+    assert any(f.endswith("hidden.txt") for f in files), files
+
+
+# --- R2b: confined filename walk (src/ops/mod.rs::find_confined) ------------
+
+
+def test_optout_confined_mode_files_honors_ignore(daimonos_factory, tmp_path):
+    """Default-off regression under confinement: .ignore still steers the
+    confined filename walk."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    names = _search_file_names(daimonos_factory(ws, args=[CONFINE_FLAG]), "hidden")
+    assert not any(n.endswith("hidden.txt") for n in names), names
+
+
+def test_confined_and_ignore_config_files_disables_ignore_in_mode_files(daimonos_factory, tmp_path):
+    """R2b: --confine-paths AND --ignore-config-files must not let a hostile
+    .ignore steer `search mode=files` (find_confined)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    names = _search_file_names(daimonos_factory(ws, args=[CONFINE_FLAG, IGNORE_FLAG]), "hidden")
+    assert any(n.endswith("hidden.txt") for n in names), names
+
+
+# --- R3: snapshot walker (src/snapshot.rs::copy_workspace) ------------------
+
+
+def _snapshot_files(workspace):
+    """Relative paths captured in the newest workspace-local snapshot."""
+    root = workspace / ".daimonos" / "snapshots"
+    found = set()
+    if root.exists():
+        for snap in root.iterdir():
+            files_dir = snap / "files"
+            if files_dir.exists():
+                for path in files_dir.rglob("*"):
+                    if path.is_file():
+                        found.add(str(path.relative_to(files_dir)))
+    return found
+
+
+def test_optout_snapshot_honors_ignore_file(daimonos_factory, tmp_path):
+    """Default-off regression: `snapshot create` honours .ignore (unchanged)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    result = daimonos_factory(ws).call_tool("snapshot", {"action": "create"})
+    assert not result.get("isError"), result
+    files = _snapshot_files(ws)
+    assert "visible.txt" in files, files
+    assert "hidden.txt" not in files, files
+
+
+def test_ignore_config_files_disables_ignore_in_snapshot(daimonos_factory, tmp_path):
+    """R3: under --ignore-config-files, `snapshot create` must capture an
+    ignore-listed file; a hostile .ignore cannot shape the snapshot."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_ignored_tree(ws)
+    result = daimonos_factory(ws, args=[IGNORE_FLAG]).call_tool(
+        "snapshot", {"action": "create"}
+    )
+    assert not result.get("isError"), result
+    files = _snapshot_files(ws)
+    assert "hidden.txt" in files, files
+
+
+# --- R4 / R6: invalid explicit --config fails, no fallback ------------------
+
+
+def _find_error_json(stderr_text):
+    for line in stderr_text.splitlines():
+        line = line.strip()
+        if '"error"' in line:
+            return json.loads(line)
+    return None
+
+
+def _run_until_exit(binary, workspace, extra):
+    """Run a (startup-failing) daimonos process to completion, capturing output."""
+    return subprocess.run(
+        [binary, "--mcp", "-w", str(workspace), *extra],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def test_explicit_only_invalid_config_emits_reserved_reason(daimonos_binary, tmp_path):
+    """R4: an invalid explicit --config under --ignore-config-files exits 2 with
+    the reserved exit-2 reason `config_invalid` (INTERFACES.md)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[unterminated_table\n")
+    proc = _run_until_exit(daimonos_binary, ws, [IGNORE_FLAG, "--config", str(bad)])
+    assert proc.returncode == 2, (proc.returncode, proc.stderr.decode(errors="replace"))
+    payload = _find_error_json(proc.stderr.decode(errors="replace"))
+    assert payload is not None, proc.stderr.decode(errors="replace")
+    assert payload["error"]["code"] == "run_configuration_invalid", payload
+    assert payload["error"]["reason"] == "config_invalid", payload
+
+
+def test_explicit_only_unreadable_config_does_not_fall_back(daimonos_binary, tmp_path):
+    """R6: an unreadable explicit --config exits 2 and selects no other source -
+    not even a hostile workspace daimonos.toml."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # A workspace config that WOULD narrow search if any fallback occurred.
+    (ws / "daimonos.toml").write_text(f"[search]\ndefault_grep_max = {NARROW_MAX}\n")
+    missing = tmp_path / "does_not_exist.toml"
+    proc = _run_until_exit(daimonos_binary, ws, [IGNORE_FLAG, "--config", str(missing)])
+    assert proc.returncode == 2, (proc.returncode, proc.stderr.decode(errors="replace"))
+    payload = _find_error_json(proc.stderr.decode(errors="replace"))
+    assert payload is not None, proc.stderr.decode(errors="replace")
+    assert payload["error"]["code"] == "run_configuration_invalid", payload
+    # No fallback: the failure names the explicit path, never the workspace file.
+    assert "does_not_exist.toml" in payload["error"]["message"], payload
+    assert "daimonos.toml" not in payload["error"]["message"], payload
+
+
+# --- R5: D06 (mcp_servers.json) and D07 (Zed settings) report naming --------
+
+
+def test_report_names_mcp_servers_and_zed_settings_by_path(daimonos_factory, tmp_path):
+    """R5: with fixtures at their candidate HOME/XDG locations, the startup
+    report names D06 (mcp_servers.json) and D07 (Zed settings.json) by path."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    xdg = tmp_path / "xdg"
+    (xdg / "daimonos").mkdir(parents=True)
+    (xdg / "daimonos" / "mcp_servers.json").write_text("{}\n")
+    (xdg / "zed").mkdir(parents=True)
+    (xdg / "zed" / "settings.json").write_text("{}\n")
+    client = daimonos_factory(ws, env={"XDG_CONFIG_HOME": str(xdg)}, args=[IGNORE_FLAG])
+    policy = _drain_effective_policy(client)
+    assert policy is not None, "explicit-only run must print an effective-policy report"
+    ignored = policy["ignored"]
+    assert any(
+        entry["kind"] == "D06" and entry["path"].endswith("mcp_servers.json")
+        for entry in ignored
+    ), ignored
+    assert any(
+        entry["kind"] == "D07" and entry["path"].endswith("settings.json")
+        for entry in ignored
+    ), ignored
+
+
+# --- R7: D09 plugin/tool registration suppression ---------------------------
+#
+# Generic ``[tools.*]`` (GenericCliPlugin) registrations are NOT surfaced in the
+# MCP ``tools/list`` (a fixed builtin set) nor under any dispatchable MCP tool
+# name, so D09 suppression is not observable through the daimonos process
+# interface. It is proven instead at the config seam in
+# ``src/config.rs::tests::explicit_only_does_not_register_workspace_plugins``
+# (decision D-WP11-05): ``load_explicit_only`` never reads the workspace
+# ``daimonos.toml``, so its ``[tools.*]`` entries cannot register, while the
+# default loader does register them.

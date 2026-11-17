@@ -48,11 +48,10 @@ pub async fn build_tool_services(
     let registry = Arc::new(ToolRegistry::with_process_config(cfg.process.clone()));
     crate::plugins::register_builtin_plugins(cfg, &registry, quiet_stderr).await;
 
-    let index = Arc::new(WorkspaceIndex::new(
-        workspace.to_path_buf(),
-        &cfg.index,
-        !quiet_stderr,
-    ));
+    let index = Arc::new(
+        WorkspaceIndex::new(workspace.to_path_buf(), &cfg.index, !quiet_stderr)
+            .with_discovery_policy(cfg.discovery_policy),
+    );
     let background_work = cfg.filesystem_authority.is_none()
         && index::should_warm_index(workspace, &cfg.index, eager_index);
     if background_work {

@@ -121,8 +121,11 @@ When it is set, these implicit sources are disabled:
   roots are not discovered, and no skill executables are registered.
 - **MCP servers:** the default Zed `context_servers` settings file is not
   opened.
-- **Ignore files:** `.gitignore`, `.ignore`, and global/parent ignore files do
-  not steer `search` or evidence walks.
+- **Ignore files:** `.gitignore`, `.ignore`, `.git/info/exclude`, and
+  global/parent ignore files do not steer any walker that an opted-in run can
+  reach: content `search` and `search mode="files"` (the filename index),
+  their confined `--confine-paths` equivalents, and `snapshot` create/restore.
+  Built-in hidden-file filtering is not an ignore file and is unchanged.
 - **CLI plugins:** only explicitly configured tools are registered; no
   workspace or user plugins.
 

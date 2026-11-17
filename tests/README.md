@@ -59,7 +59,10 @@ The git_read tests use temporary repositories and require no remote objects or p
 `tests/test_configuration_isolation.py` drives a real `daimonos` process to assert
 explicit-only configuration discovery (`--ignore-config-files`, FR-09): a hostile
 workspace corpus configures nothing, each ignored source is reported by path, and
-an explicit `--config` is still honored. Like the other suites it needs the CLI
+an explicit `--config` is still honored. It also asserts ignore-file suppression
+across every reachable walker — content `search`, `search mode="files"`, their
+confined (`--confine-paths`) equivalents, and `snapshot` create/restore — plus the
+exit-2 `config_invalid` failure for an invalid explicit `--config`. Like the other suites it needs the CLI
 programs on `PATH` (the plugin tests spawn `pytest`); export the virtualenv's
 `bin` directory as shown above before running.
 

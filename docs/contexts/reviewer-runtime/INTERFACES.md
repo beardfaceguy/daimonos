@@ -252,6 +252,7 @@ Do not present generic `anyhow` text as the machine-readable contract.
 
 Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
+WP11 (FR-09, ADR-021) adds exit-2 reason `config_invalid`: the explicit-only loader (`--ignore-config-files`) emits it for an unreadable or invalid explicit `--config` and selects no other source.
 `state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.
 A probe endpoint failure uses exit 21. A later controlled endpoint failure in final-output mode uses exit 20 with `endpoint_error`.
