@@ -755,10 +755,44 @@ mod tests {
         let mut child = ManagedChild::spawn(&mut command).unwrap();
         let group = child.process_group.unwrap();
         child.terminate(Duration::from_millis(50)).await.unwrap();
-        // SAFETY: signal 0 probes existence without changing process state.
-        let rc = unsafe { libc::kill(-group, 0) };
-        assert_eq!(rc, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        // A just-killed group member (the backgrounded job, often reparented
+        // and sometimes caught mid fork-before-exec) can linger for a few
+        // microseconds as a dying or zombie process before the kernel/reaper
+        // removes it, and such a member still answers `kill(-group, 0)`. A
+        // zombie is not running, so wait a bounded time for every real member
+        // to disappear, then assert the group retains no running member.
+        let running_members = || {
+            let mut survivors = Vec::new();
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                let Some((_, rest)) = stat.rsplit_once(") ") else {
+                    continue;
+                };
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                let state = fields.first().copied().unwrap_or("?");
+                let pgrp: i32 = fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                // A zombie is not running; it no longer executes code.
+                if pgrp == group && state != "Z" {
+                    survivors.push(format!("pid={pid} state={state}"));
+                }
+            }
+            survivors
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !running_members().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let survivors = running_members();
+        assert!(
+            survivors.is_empty(),
+            "process group {group} still has running members: {survivors:?}"
+        );
     }
 
     #[cfg(unix)]
