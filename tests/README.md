@@ -59,9 +59,15 @@ The `tests/test_read_only_workspace.py` suite (FR-07, `--workspace-read-only`) i
 bind-mounts an evidence workspace read-only via `unshare -Urnm`; it is skipped when Linux user and
 mount namespaces are unavailable, like the git_read read-only-mount test. It also drives
 `daimonos agent --print` with a local fake provider to prove `execute_script` is refused
-(`tool_policy_unsupported`) before any Starlark runs in agent mode, and that an
+(`tool_policy_unsupported`) before any Starlark runs in agent mode, and the same refusal through
+the `daimonos acp` JSON-RPC frontend (both drive the shared `run_inner` loop), and that an
 `DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
-use local fake endpoints only (no live credentials).
+use local fake endpoints only (no live credentials). The suite also drives an interactive
+read-only `daimonos agent` over a PTY to prove the bootstrapped session daemon inherits
+`--workspace-read-only` (part of the daemon launch identity, so daemon reuse cannot bypass the
+gate), checks that each `batch` child and a `tool_pipeline` carry their named refusal code with no
+file created, that the `~`-prefixed trace dir is resolved like the writer, and that startup
+refusals use the exit-2 `run_configuration_invalid`/`reason` shape.
 
 The `tests/test_run_audit.py` suite (FR-04, `--audit-path`) drives `daimonos
 agent --print` with a local fake OpenAI-style provider to prove the opt-in run

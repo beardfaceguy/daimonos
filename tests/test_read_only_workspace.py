@@ -184,6 +184,25 @@ def _refusal(result):
     return json.loads(result["content"][0]["text"])
 
 
+def _startup_error(stderr):
+    """Parse the single-line JSON `{"error": {...}}` a startup guard prints to
+    stderr before exiting 2. R1: the read-only startup refusal must use the
+    reserved exit-2 taxonomy (top-level `code == run_configuration_invalid`
+    with the specific cause in `reason`), the same shape as the state-authority
+    failure (INTERFACES.md)."""
+    for line in reversed(stderr.strip().splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "error" in obj:
+            return obj["error"]
+    raise AssertionError(f"no startup error JSON in stderr: {stderr!r}")
+
+
 # --- Slice 1: option parsing + one refused mutation (write_file) -------------
 
 
@@ -793,8 +812,10 @@ def test_g3_startup_refuses_logging_directory_inside_workspace(daimonos_binary, 
     )
     rc, stderr = _run_startup(daimonos_binary, workspace)
     assert rc == 2, (rc, stderr)
-    assert "workspace_write_forbidden" in stderr, stderr
-    assert "logging.directory" in stderr, stderr
+    err = _startup_error(stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "logging.directory" in err["message"], err
     # Refused before services start: nothing was written under the workspace.
     assert not (workspace / "logs").exists()
 
@@ -807,8 +828,10 @@ def test_g3_startup_refuses_tool_output_directory_inside_workspace(daimonos_bina
     )
     rc, stderr = _run_startup(daimonos_binary, workspace)
     assert rc == 2, (rc, stderr)
-    assert "workspace_write_forbidden" in stderr, stderr
-    assert "tool_output.directory" in stderr, stderr
+    err = _startup_error(stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "tool_output.directory" in err["message"], err
     assert not (workspace / "spill").exists()
 
 
@@ -821,8 +844,10 @@ def test_g3_startup_refuses_checkpoint_shadow_repo_inside_workspace(daimonos_bin
     (workspace / "daimonos.toml").write_text("[checkpoint]\nenabled = true\n")
     rc, stderr = _run_startup(daimonos_binary, workspace)
     assert rc == 2, (rc, stderr)
-    assert "workspace_write_forbidden" in stderr, stderr
-    assert "checkpoint" in stderr, stderr
+    err = _startup_error(stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "checkpoint" in err["message"], err
     assert not (workspace / ".daimonos").exists()
 
 
@@ -1020,7 +1045,9 @@ def test_g2_agent_print_refuses_checkpoint_at_startup(daimonos_binary, tmp_path)
         capture_output=True, text=True, timeout=60, env=env,
     )
     assert completed.returncode == 2, (completed.returncode, completed.stdout, completed.stderr)
-    assert "workspace_write_forbidden" in completed.stderr, completed.stderr
+    err = _startup_error(completed.stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
     assert _snapshot(workspace) == before, "startup refusal still mutated the workspace"
     assert not (workspace / ".daimonos").exists()
 
@@ -1207,7 +1234,361 @@ def test_r3_startup_refuses_request_trace_directory_inside_workspace(
     )
 
     assert completed.returncode == 2, (completed.returncode, completed.stdout, completed.stderr)
-    assert "workspace_write_forbidden" in completed.stderr, completed.stderr
-    assert "request_trace" in completed.stderr, completed.stderr
+    err = _startup_error(completed.stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "request_trace" in err["message"], err
     assert not trace_dir.exists(), "startup created the refused trace directory"
     assert _snapshot(workspace) == before, "startup refusal mutated the workspace"
+
+
+# =====================================================================
+# r5 review findings (dbunk-reviewer/wp04-r2/review-wp04.md): R4, R1, R2,
+# R3, R5. Each closes one reviewer finding.
+# =====================================================================
+
+
+# --- R4 (MAJOR): session-daemon reuse must not bypass the read-only gate ----
+#
+# A session daemon (W19, run_session_daemon) is a long-lived process whose
+# Session.admission is pinned from the DAEMON's own cfg.workspace_read_only
+# (src/session.rs). The interactive frontend (src/agent_runtime.rs) bootstraps
+# or attaches to that daemon via src/session_bootstrap.rs. Before this fix,
+# BootstrapOptions carried no workspace_read_only: a freshly bootstrapped daemon
+# was spawned WITHOUT --workspace-read-only (daemon_args omitted it) and a client
+# requesting read-only attached to a non-read-only daemon as LaunchIdentity
+# NotRequested -> every write/exec served unguarded. The fix makes
+# --workspace-read-only part of the daemon identity. This process-level test
+# proves the spawned daemon inherits the flag (the fresh-spawn half); the
+# attach-refusal half (fingerprint/launch_identity) is covered by the
+# src/session_bootstrap.rs seam unit tests.
+def test_r4_interactive_bootstrap_spawns_read_only_daemon(daimonos_binary, tmp_path):
+    import pty
+    import select
+    import signal
+    import tempfile
+    import time
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    agent_env = tmp_path / "agent.env"
+    agent_env.write_text("\n".join([
+        "DAIMONOS_AGENT_PROVIDER=openrouter",
+        "DAIMONOS_AGENT_MODEL=test/model",
+        "DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:1",
+        "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+        "DAIMONOS_AGENT_API_KEY=test",
+        "DAIMONOS_AGENT_COMPACTION=off",
+        "",
+    ]))
+    with tempfile.TemporaryDirectory(prefix="ds-") as short:
+        state = Path(short) / "s"
+        state.mkdir(mode=0o700)
+        workspace_id = hashlib.sha256(os.fsencode(workspace.resolve())).hexdigest()[:16]
+        socket_path = state / "sockets" / f"session-{workspace_id}.sock"
+        instance_path = Path(str(socket_path) + ".pid")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                   XDG_DATA_HOME=str(home / "data"), TMPDIR=str(tmp_path))
+        master_fd, slave_fd = pty.openpty()
+        command = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state),
+                   "--workspace-read-only",
+                   "agent", "--interactive", "--agent-env", str(agent_env)]
+        process = subprocess.Popen(
+            command, stdin=slave_fd, stdout=slave_fd, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+        os.close(slave_fd)
+        daemon_pid = None
+        try:
+            deadline = time.monotonic() + 15
+            while not instance_path.exists() and time.monotonic() < deadline:
+                assert process.poll() is None, process.stderr.read()
+                time.sleep(0.01)
+            assert instance_path.exists(), "read-only agent did not bootstrap a daemon"
+            daemon_pid = json.loads(instance_path.read_text())["pid"]
+            cmdline = (Path("/proc") / str(daemon_pid) / "cmdline").read_bytes().split(b"\0")
+            # The daemon must be part of the read-only identity: a client that
+            # requested read-only may only be served by a read-only daemon.
+            assert b"--workspace-read-only" in cmdline, cmdline
+            # Drive the TUI to a clean quit so teardown verifies the socket is
+            # removed and the read-only workspace stayed empty.
+            output = b""
+            deadline = time.monotonic() + 15
+            while b"\x1b[6n" not in output and time.monotonic() < deadline:
+                assert process.poll() is None, process.stderr.read()
+                readable, _, _ = select.select([master_fd], [], [], 0.05)
+                if readable:
+                    output += os.read(master_fd, 65536)
+            assert b"\x1b[6n" in output
+            os.write(master_fd, b"\x1b[1;1R")
+            time.sleep(0.05)
+            os.write(master_fd, b"/quit\r")
+            process.wait(timeout=10)
+            assert process.returncode == 0, process.stderr.read()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            if daemon_pid is not None:
+                try:
+                    os.kill(daemon_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 5
+                while socket_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            os.close(master_fd)
+    # The read-only workspace was never written through the whole session.
+    assert list(workspace.iterdir()) == [], list(workspace.iterdir())
+
+
+# --- R1: the KGL startup refusal also uses the exit-2 taxonomy --------------
+def test_r1_startup_kgl_store_refusal_uses_run_configuration_invalid(
+    daimonos_binary, tmp_path
+):
+    """R1: the KGL autoindex/observe startup block (main.rs) must carry the same
+    reserved exit-2 shape as every other run_configuration_invalid failure:
+    top-level code=run_configuration_invalid, reason=workspace_write_forbidden.
+    Enabling observation without --state-dir would create <workspace>/.kgl."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    env = {**os.environ, "DAIMONOS_KGL_OBSERVE": "1"}
+    rc, stderr = _run_startup(daimonos_binary, workspace, env=env)
+    assert rc == 2, (rc, stderr)
+    err = _startup_error(stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "KGL" in err["message"], err
+    assert not (workspace / ".kgl").exists()
+
+
+# --- R2: tool_pipeline stays refused wholesale (stages bypass the boundaries)-
+def test_r2_pipeline_refused_wholesale_and_creates_no_file(daimonos_factory, tmp_path):
+    """R2 (see issues.md): tool_pipeline runs external-CLI subprocess stages via
+    ToolRegistry::pipeline; a stage never re-enters ops::dispatch_op /
+    mcp::dispatch_tool_inner, so there is no per-stage admission seam. The whole
+    pipeline is therefore refused (tool_policy_unsupported) before any stage can
+    run, and nothing is written."""
+    client = daimonos_factory(tmp_path, args=RO)
+    result = client.call_tool(
+        "tool_pipeline", {"tool_id": "cargo", "stages": ["check", "build"]}
+    )
+    payload = _refusal(result)
+    assert payload["code"] == "tool_policy_unsupported", payload
+    assert payload["retryable"] is False, payload
+    assert list(tmp_path.iterdir()) == [], list(tmp_path.iterdir())
+
+
+# --- R3: each refused batch child carries its own named code ----------------
+def test_r3_batch_children_carry_named_codes_under_read_only(daimonos_factory, tmp_path):
+    """R3: batch dispatches every child through dispatch_tool -> dispatch_op /
+    dispatch_tool_inner, so a write_file child is refused as
+    workspace_write_forbidden and an exec child as tool_policy_unsupported, each
+    carried on its own child result, and no file is created."""
+    client = daimonos_factory(tmp_path, args=RO)
+    result = client.call_tool("batch", {"ops": [
+        {"tool": "write_file", "arguments": {"path": "b.txt", "content": "x"}},
+        {"tool": "exec", "arguments": {"command": "touch", "args": ["e.txt"]}},
+    ]})
+    # The batch envelope itself is not a policy refusal; the children carry it.
+    assert _policy_code(result) is None, result
+    children = json.loads(result["content"][0]["text"])
+    by_tool = {c["tool"]: c for c in children if "tool" in c}
+    write_err = json.loads(by_tool["write_file"]["error"])
+    assert write_err["code"] == "workspace_write_forbidden", write_err
+    exec_err = json.loads(by_tool["exec"]["error"])
+    assert exec_err["code"] == "tool_policy_unsupported", exec_err
+    assert not (tmp_path / "b.txt").exists()
+    assert not (tmp_path / "e.txt").exists()
+
+
+# --- R5: the startup guard resolves the trace dir like the writer does ------
+def test_r5_startup_request_trace_resolves_like_the_writer(daimonos_binary, tmp_path):
+    """R5: the W11 request-trace startup guard must resolve
+    DAIMONOS_OPENROUTER_TRACE_DIR exactly as the writer
+    (providers::request_trace::RequestTrace::from_env) does — verbatim, with no
+    tilde expansion. A `~/sub` value is used VERBATIM by the writer (a literal
+    relative `~/sub` that lands inside the workspace), but the old guard expanded
+    `~/` to $HOME (outside the workspace) and so missed the inside-workspace
+    write. With the resolver shared, the guard refuses it like any other
+    inside-workspace destination."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    (tmp_path / "tmp").mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+    env.update(_isolated_env(tmp_path))  # HOME/XDG/TMP outside the workspace
+    # Verbatim `~/sub` is relative (the writer does PathBuf::from, no expansion),
+    # so it resolves inside the workspace; the old guard expanded it to
+    # $HOME/sub (outside) and let startup proceed.
+    env["DAIMONOS_OPENROUTER_TRACE_DIR"] = "~/sub"
+    rc, stderr = _run_startup(daimonos_binary, workspace, env=env)
+    assert rc == 2, (rc, stderr)
+    err = _startup_error(stderr)
+    assert err["code"] == "run_configuration_invalid", err
+    assert err["reason"] == "workspace_write_forbidden", err
+    assert "request_trace" in err["message"], err
+    # The literal `~/sub` directory must not have been created under the ws.
+    assert not (workspace / "~").exists()
+
+
+# =====================================================================
+# r6 review findings (dbunk-reviewer/wp04-9e1f6e7/review-wp04.md): R2 (the
+# ACP-frontend execute_script refusal is observable at the process boundary)
+# and R1 (the exit-2 reason taxonomy, closed in INTERFACES.md + the existing
+# startup tests above that pin reason == workspace_write_forbidden).
+# =====================================================================
+
+
+# --- R2: execute_script refused through the ACP frontend, not only agent-print
+#
+# Production callers of crate::script::execute / execute_with_op_count:
+#   - src/mcp.rs::run_execute_script          (MCP frontend; guarded)
+#   - src/agent.rs::run_inner execute_script branch (shared agent loop; guarded)
+#   - src/acp_cmd.rs::acp_tool_session_execute_script_can_call_builtin_git_plugin
+#     is a #[tokio::test], NOT production.
+# The ACP frontend drives the SAME src/agent.rs::run_inner loop, so its
+# execute_script branch consults session.admission.read_only() before any
+# Starlark runs. This process-level test proves that externally: a read-only
+# ACP session must hand the model `tool_policy_unsupported` and never execute
+# the body (no sentinel, no file, workspace byte-identical). It mirrors
+# test_r1_agent_print_refuses_execute_script_before_starlark_runs through the
+# ACP JSON-RPC frontend instead of `agent --print`.
+class _AcpClient:
+    """A minimal ACP JSON-RPC client over the daimonos `acp` subcommand's
+    stdio. It issues `initialize`/`session/new`/`session/prompt`, replies to
+    any server->client request with a JSON-RPC error (the real editor is not
+    present), and matches responses to requests by id."""
+
+    def __init__(self, binary, workspace, state_dir, agent_env, env):
+        import queue
+        import threading
+
+        self._responses = queue.Queue()
+        self._pending = {}
+        self._id = 0
+        self.stderr = open(state_dir / "acp-stderr.log", "w")
+        command = [
+            binary, "--workspace", str(workspace), "--workspace-read-only",
+            "--state-dir", str(state_dir), "acp", "--agent-env", str(agent_env),
+        ]
+        self.process = subprocess.Popen(
+            command, cwd=str(workspace), env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=self.stderr, text=True, bufsize=1,
+        )
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self):
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in message and "method" not in message:
+                self._responses.put(message)
+            elif "id" in message:
+                # Server->client request (e.g. fs/permission): the editor is
+                # not present; refuse so the agent loop proceeds / terminates.
+                self._send({"jsonrpc": "2.0", "id": message["id"],
+                            "error": {"code": -32601, "message": "no client"}})
+            # Notifications (session/update) are not needed by this test.
+        self._responses.put(None)
+
+    def _send(self, value):
+        self.process.stdin.write(json.dumps(value) + "\n")
+        self.process.stdin.flush()
+
+    def request(self, method, params, timeout=60):
+        import time
+        self._id += 1
+        number = self._id
+        self._send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while number not in self._pending:
+            message = self._responses.get(timeout=max(0.01, deadline - time.monotonic()))
+            if message is None:
+                raise RuntimeError(f"ACP exited early: {self.process.poll()}")
+            self._pending[message["id"]] = message
+        message = self._pending.pop(number)
+        if "error" in message:
+            raise RuntimeError(f"ACP RPC error: {message['error']}")
+        return message["result"]
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        self._reader.join(timeout=2)
+        self.stderr.close()
+
+
+def test_r2_acp_session_refuses_execute_script_before_starlark_runs(
+    daimonos_binary, tmp_path
+):
+    """R2 (ADR-022; INVENTORIES tool-class table): the ACP frontend drives the
+    shared src/agent.rs::run_inner loop, whose execute_script branch must
+    consult the admission table exactly like `agent --print` (R1) and the MCP
+    `run_execute_script` do. Through a real read-only ACP session the model
+    must receive the structured `tool_policy_unsupported` refusal and the
+    Starlark body must NOT run. Uses --state-dir so internal stores relocate
+    outside the workspace (as in the agent-print R1 test)."""
+    workspace = tmp_path / "evidence"
+    _seed_repo(workspace)
+    (tmp_path / "tmp").mkdir()
+    before = _snapshot(workspace)
+
+    provider = _ExecuteScriptProvider()
+    client = None
+    try:
+        agent_env = tmp_path / "agent.env"
+        agent_env.write_text("\n".join([
+            "DAIMONOS_AGENT_PROVIDER=openrouter",
+            "DAIMONOS_AGENT_MODEL=test/model",
+            f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{provider.server.server_port}/v1",
+            "DAIMONOS_AGENT_API_KEY=synthetic-not-a-real-key",
+            "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+            "DAIMONOS_AGENT_COMPACTION=off",
+            "DAIMONOS_AGENT_MODELS_DISCOVER=off",
+            "DAIMONOS_AGENT_ALLOWED_COMMANDS=execute_script,write_file,read_file",
+            "",
+        ]))
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+        env.update(_isolated_env(tmp_path))
+
+        client = _AcpClient(daimonos_binary, workspace, state, agent_env, env)
+        client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {},
+                       "clientInfo": {"name": "wp04-r2-probe", "version": "1"}})
+        session_id = client.request(
+            "session/new", {"cwd": str(workspace), "mcpServers": []})["sessionId"]
+        client.request("session/prompt", {"sessionId": session_id,
+                       "prompt": [{"type": "text", "text": "please run the script"}]})
+    finally:
+        if client is not None:
+            client.close()
+        provider.close()
+
+    # (a) The model saw the structured opaque-tool refusal as the tool result,
+    #     through the ACP frontend's run_inner loop (not just agent --print).
+    assert provider.tool_result_text is not None, "provider never received a tool result"
+    assert "tool_policy_unsupported" in provider.tool_result_text, provider.tool_result_text
+    assert "execute_script" in provider.tool_result_text, provider.tool_result_text
+    # (b) The Starlark body did not run: its sentinel value never materialized.
+    assert str(_ExecuteScriptProvider.SENTINEL) not in provider.tool_result_text, (
+        "execute_script body executed in ACP mode under --workspace-read-only"
+    )
+    # (c) The workspace and its .git are byte-identical; nothing was written.
+    assert _snapshot(workspace) == before, "ACP script run mutated the read-only workspace"
+    assert not (workspace / "from_script.txt").exists(), "the refused script wrote a file"
+    assert not (workspace / ".daimonos").exists()

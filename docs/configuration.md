@@ -149,6 +149,16 @@ While it is on:
   independent of `--state-dir`. The guarded set is the single registry
   `run_policy::INTERNAL_WRITERS`, cross-checked against the reviewer-runtime
   INVENTORIES.md W-rows by a completeness test.
+- Startup refusals use the reserved exit-2 taxonomy: the process prints
+  `{"error":{"code":"run_configuration_invalid","reason":"workspace_write_forbidden",...}}`
+  and exits 2 — the same shape as a state-authority failure — rather than a
+  top-level tool-refusal code. The `DAIMONOS_OPENROUTER_TRACE_DIR` destination
+  is resolved exactly as its writer resolves it (verbatim, no `~` expansion), so
+  the guard and the writer agree on whether it lands inside the workspace.
+- A session daemon carries `--workspace-read-only` as part of its launch
+  identity: a read-only client spawns a read-only daemon and refuses to attach
+  to a daemon that was started without the option, rather than being served by a
+  long-lived process whose admission is not read-only.
 
 The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
 `EffectClass`). See ADR-022.

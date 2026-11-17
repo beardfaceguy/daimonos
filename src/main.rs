@@ -475,7 +475,8 @@ async fn main() -> anyhow::Result<()> {
         eprintln!(
             "{}",
             serde_json::json!({"error": {
-                "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                "code": "run_configuration_invalid",
+                "reason": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
                 "message": "KGL autoindex/observation would write under the read-only workspace; relocate with --state-dir or disable them"
             }})
         );
@@ -526,19 +527,19 @@ async fn main() -> anyhow::Result<()> {
                 .then(|| workspace.join(".daimonos/checkpoints.git")),
             // W11 (R3): the structural request-trace directory is sourced from
             // the environment (`providers::request_trace::RequestTrace::from_env`),
-            // not Config, so read it here. An inside-workspace trace dir without
-            // --state-dir is caught only by this guard (WP02 state validation
-            // requires a state root to refuse an out-of-state trace dir).
-            request_trace_dir: std::env::var("DAIMONOS_OPENROUTER_TRACE_DIR")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(|value| paths::expand_tilde(&value)),
+            // not Config. An inside-workspace trace dir without --state-dir is
+            // caught only by this guard (WP02 state validation requires a state
+            // root to refuse an out-of-state trace dir). R5: resolve it through
+            // the writer's own resolver so the guard's destination matches the
+            // writer's byte-for-byte (verbatim value, no tilde expansion).
+            request_trace_dir: crate::providers::request_trace::configured_directory(),
         };
         if let Some((w_id, label, path)) = destinations.first_inside_workspace(true, &workspace) {
             eprintln!(
                 "{}",
                 serde_json::json!({"error": {
-                    "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                    "code": "run_configuration_invalid",
+                    "reason": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
                     "message": format!(
                         "{label} ({w_id}) resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
                         path.display()
