@@ -171,7 +171,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
     mode accepts it; a chain that closes into a cycle is still refused
     `schema_unusable`. Only a pathological document with millions of schema
     positions exhausts the static-analysis budget and is refused
-    `schema_unusable` (exit 20) — never a crash.
+    `schema_unusable` (exit 20) — never a crash. That budget is a fixed internal
+    guard of 10000000 steps, not a configuration key.
+  - An explicit `--full-tool-schemas` flag now wins over the
+    `DAIMONOS_MCP_FULL_SCHEMAS` variable for every value: a false-y variable
+    (`0`/`false`/`off`/empty) no longer silently masks the flag. Without the
+    flag the variable still wins over the `[mcp] full_tool_schemas` config key
+    (precedence unchanged).
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the

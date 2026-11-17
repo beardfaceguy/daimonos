@@ -1895,6 +1895,22 @@ mod tests {
             .expect("a finite non-recursive reference chain is not recursive");
     }
 
+    /// WP17 r6 (W1): the recursion check ALONE (`detect_recursion`, not the WP05
+    /// compile) stays iterative and fast on a very deep chain — 100000 local
+    /// definitions are analyzed without a stack overflow. The CI
+    /// `subprocess.TimeoutExpired` on the 100000-case process test was the WP05
+    /// 2020-12 compile of the supplied schema, not this check (the default mode
+    /// needs the same time), so the process test runs 20000 and the check's own
+    /// cost is pinned here instead.
+    #[test]
+    fn accepts_a_very_deep_finite_reference_chain_in_the_check_alone() {
+        // Measured once in the debug build: ~1.4 s for the check alone, well
+        // under the 2 s bar in the r6 direction, so the case is pinned here.
+        let schema = deep_reference_chain(100_000);
+        detect_recursion("deepchain100k", &schema)
+            .expect("a finite non-recursive 100000-chain is not recursive");
+    }
+
     /// WP17 r5 (W1): the same depth of reference hops, but closed into a cycle
     /// at the far end, is still refused as `schema_unusable` (the iterative
     /// driver detects the back-edge to an on-path target) rather than crashing
