@@ -166,6 +166,10 @@ with another source, so `--model-profile` cannot be used together with
 | `proxy` | no | An explicit proxy URL. Proxy environment variables are otherwise ignored. |
 | `extra_body_fields` | no | Explicit, caller-configured extra body fields, validated at startup. A key is refused before any request if it overwrites a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or is any sampling, forced-choice, strictness, streaming, or multi-choice parameter on either wire (e.g. `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `logit_bias`, `n`, `best_of`, `logprobs`, `top_logprobs`, `function_call`, `parallel_tool_calls`, `strict`, `response_format`, `stream`, `stream_options`). No allowlist of permitted extras is defined, so only keys outside that denylist and the protected set are accepted. |
 
+The retry ceiling (`100`) and the fallback `timeout_ms` (`60000`) are fixed constants of the
+controlled transport. They are not `daimonos.default.toml` settings: ADR-025 defines the ceiling as a
+safety invariant, not an operator setting, and the timeout applies only when the caller omits the field.
+
 The flag is mutually exclusive with `--model`, `--provider`, and `--interactive`.
 The controlled transport is honored only by the one-shot send path; the
 interactive TUI routes model requests through the session daemon, which carries
