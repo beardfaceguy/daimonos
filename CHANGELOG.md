@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **Controlled model transport** (`daimonos agent --model-profile <PATH>`,
+  ADR-025, FR-04 transport requirements 1-13). An opt-in, profile-scoped request
+  transport: one caller-owned JSON object supplies the five required values
+  (`provider_label`, `model`, `base_url`, `wire`, `credential_env`) plus optional
+  `max_tokens`, `timeout_ms`, `request_retries`, `proxy`, and `extra_body_fields`.
+  A partial profile fails at startup naming the missing value(s). Requests carry
+  only the fixed body/header set, set automatic tool choice explicitly (never a
+  forced choice or provider `strict` flag), send no sampling parameters, use the
+  stable endpoint path, and suppress ambient headers, telemetry, redirects, and
+  ambient proxies. Default off; legacy provider behavior is unchanged.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

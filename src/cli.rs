@@ -44,6 +44,14 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// WP07 (FR-04): opt-in controlled model transport. Path to ONE JSON object
+    /// owning the five required values (`provider_label`, `model`, `base_url`,
+    /// `wire` = "chat"|"messages", `credential_env`) and the optional controlled
+    /// request settings (`max_tokens`, `timeout_ms`, `request_retries`, `proxy`,
+    /// `extra_body_fields`). The sole source for those values; cannot be combined
+    /// with --model/--provider. Default off keeps legacy provider behavior.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["model", "provider"])]
+    pub model_profile: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

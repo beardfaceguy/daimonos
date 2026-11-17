@@ -581,6 +581,383 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+// === WP07: controlled model transport (ADR-025, FR-04 requirements 1-13) ===
+//
+// Context: docs/contexts/reviewer-runtime/CONTEXT.md; ADR-025. An opt-in,
+// profile-scoped request transport that leaves the legacy adapters unchanged.
+// These are the provider-NEUTRAL option seams (integrator-owned per the G0
+// ledger). All vendor wire rules stay provider-local in anthropic.rs (Messages)
+// and openrouter.rs (Chat); this module only resolves the caller-owned profile,
+// builds the profile-scoped HTTP client, and runs the shared attempt/redirect
+// discipline. No field is inferred and no hidden default is supplied.
+
+/// The two serialization wires the controlled profile supports. Never inferred
+/// from a model name or base URL (FR-04 requirement 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    /// Chat Completions (`{base}/chat/completions`), including OpenRouter's
+    /// OpenAI-compatible endpoint.
+    Chat,
+    /// Anthropic Messages (`{base}/v1/messages`, stable path only).
+    Messages,
+}
+
+impl Wire {
+    pub fn parse(value: &str) -> Option<Wire> {
+        match value {
+            "chat" => Some(Wire::Chat),
+            "messages" => Some(Wire::Messages),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Wire::Chat => "chat",
+            Wire::Messages => "messages",
+        }
+    }
+}
+
+/// The five caller-owned values that fully identify a controlled model request
+/// (FR-04 requirements 1-2). All are required and come from ONE source; none is
+/// combined with an env/flag fallback. The credential VALUE is read elsewhere
+/// from `credential_env` and never stored here, exported, or logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledModelSpec {
+    pub provider_label: String,
+    pub model: String,
+    pub base_url: String,
+    pub wire: Wire,
+    pub credential_env: String,
+}
+
+/// Caller-owned controlled request settings beyond the five identity values
+/// (FR-04 requirements 6, 10, 11, 13). `extra_body_fields` are explicit, audited
+/// additions the caller configured; they can never overwrite a protected field
+/// or introduce a forbidden sampling/forced-choice/strict behavior.
+#[derive(Debug, Clone)]
+pub struct ControlledRequest {
+    pub max_tokens: u32,
+    pub timeout: std::time::Duration,
+    pub request_retries: u32,
+    pub proxy: Option<String>,
+    pub extra_body_fields: serde_json::Map<String, Value>,
+}
+
+impl Default for ControlledRequest {
+    fn default() -> Self {
+        ControlledRequest {
+            max_tokens: 1024,
+            timeout: std::time::Duration::from_secs(60),
+            request_retries: 0,
+            proxy: None,
+            extra_body_fields: serde_json::Map::new(),
+        }
+    }
+}
+
+/// A fully prepared controlled HTTP request. The wire adapter owns the URL, the
+/// exact fixed header set (credential header included), and the fixed body; the
+/// shared executor only sends it. Keeping this provider-built preserves
+/// wire-local ownership while sharing the no-redirect/no-ambient-proxy client.
+pub struct ControlledHttp {
+    pub url: String,
+    /// Exact, ordered header set. The credential value is already injected and
+    /// must never be logged.
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+}
+
+/// The fixed User-Agent identifying Daimonos and its version (FR-04 req 8).
+pub fn controlled_user_agent() -> String {
+    format!("daimonos/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The complete parsed controlled profile: the five identity values plus the
+/// request settings. Built from one JSON object; see [`ControlledProfile::from_json`].
+#[derive(Debug, Clone)]
+pub struct ControlledProfile {
+    pub spec: ControlledModelSpec,
+    pub request: ControlledRequest,
+}
+
+impl ControlledProfile {
+    /// Parse and validate one complete profile object. Fails naming every
+    /// missing required value (FR-04 req 2), rejects an inferred/invalid wire
+    /// (req 3), and refuses any unconfigured extra top-level field. Reading the
+    /// credential value is NOT performed here: this validates configuration
+    /// only, so a partial profile fails before any network or credential read.
+    pub fn from_json(value: &Value) -> Result<ControlledProfile, String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "model profile must be a JSON object".to_string())?;
+
+        const IDENTITY: [&str; 5] = [
+            "provider_label",
+            "model",
+            "base_url",
+            "wire",
+            "credential_env",
+        ];
+        const OPTIONAL: [&str; 5] = [
+            "max_tokens",
+            "timeout_ms",
+            "request_retries",
+            "proxy",
+            "extra_body_fields",
+        ];
+
+        // Refuse any field we do not explicitly understand: an unconfigured
+        // extra field must fail, never travel silently (FR-04 req 6, defaults).
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !IDENTITY.contains(k) && !OPTIONAL.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "model profile has unconfigured field(s): {}",
+                unknown.join(", ")
+            ));
+        }
+
+        let string_field = |name: &str| -> Option<String> {
+            obj.get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+
+        let mut missing: Vec<&str> = Vec::new();
+        let provider_label = string_field("provider_label");
+        let model = string_field("model");
+        let base_url = string_field("base_url");
+        let wire_raw = string_field("wire");
+        let credential_env = string_field("credential_env");
+        for (present, name) in [
+            (provider_label.is_some(), "provider_label"),
+            (model.is_some(), "model"),
+            (base_url.is_some(), "base_url"),
+            (wire_raw.is_some(), "wire"),
+            (credential_env.is_some(), "credential_env"),
+        ] {
+            if !present {
+                missing.push(name);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "model profile incomplete: missing {}",
+                missing.join(", ")
+            ));
+        }
+
+        let wire_raw = wire_raw.unwrap();
+        let wire = Wire::parse(&wire_raw).ok_or_else(|| {
+            format!("model profile wire must be \"chat\" or \"messages\", not {wire_raw:?}")
+        })?;
+
+        let mut request = ControlledRequest::default();
+        if let Some(v) = obj.get("max_tokens") {
+            request.max_tokens = v
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                .ok_or_else(|| "model profile max_tokens must be a positive integer".to_string())?
+                as u32;
+        }
+        if let Some(v) = obj.get("timeout_ms") {
+            let ms = v
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "model profile timeout_ms must be a positive integer".to_string())?;
+            request.timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(v) = obj.get("request_retries") {
+            request.request_retries = v.as_u64().filter(|n| *n <= 100).ok_or_else(|| {
+                "model profile request_retries must be a non-negative integer".to_string()
+            })? as u32;
+        }
+        if let Some(v) = obj.get("proxy") {
+            if !v.is_null() {
+                request.proxy = Some(
+                    v.as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| {
+                            "model profile proxy must be a non-empty string".to_string()
+                        })?
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(v) = obj.get("extra_body_fields") {
+            request.extra_body_fields = v
+                .as_object()
+                .ok_or_else(|| "model profile extra_body_fields must be an object".to_string())?
+                .clone();
+        }
+
+        Ok(ControlledProfile {
+            spec: ControlledModelSpec {
+                provider_label: provider_label.unwrap(),
+                model: model.unwrap(),
+                base_url: base_url.unwrap(),
+                wire,
+                credential_env: credential_env.unwrap(),
+            },
+            request,
+        })
+    }
+}
+
+/// Top-level body fields the caller's `extra_body_fields` may never overwrite,
+/// and forbidden sampling/forced-choice/strict keys they may never introduce
+/// (FR-04 requirements 4, 5, 6). Applies to both wires.
+pub(crate) const PROTECTED_BODY_FIELDS: [&str; 6] = [
+    "model",
+    "max_tokens",
+    "messages",
+    "tools",
+    "tool_choice",
+    "system",
+];
+pub(crate) const FORBIDDEN_BODY_FIELDS: [&str; 5] =
+    ["temperature", "top_p", "top_k", "stream", "strict"];
+
+/// Merge caller `extra_body_fields` into a controlled body. Refuses to overwrite
+/// a protected field or introduce a forbidden sampling/forced-choice/strict key.
+pub(crate) fn apply_extra_body_fields(
+    body: &mut serde_json::Map<String, Value>,
+    extra: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    for (key, value) in extra {
+        if PROTECTED_BODY_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "controlled extra_body_fields may not overwrite protected field {key:?}"
+            ));
+        }
+        if FORBIDDEN_BODY_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "controlled extra_body_fields may not introduce forbidden field {key:?}"
+            ));
+        }
+        body.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
+/// Build the profile-scoped HTTP client (FR-04 requirements 9-13). Explicit
+/// caller timeout; no redirects; no ambient proxy (only an explicit one); no
+/// default headers; no client-library telemetry. A construction error fails the
+/// profile — the legacy fallback client is never reused.
+pub fn controlled_client(req: &ControlledRequest) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(req.timeout)
+        // Ignore HTTP_PROXY/HTTPS_PROXY/ALL_PROXY and any system proxy.
+        .no_proxy();
+    if let Some(proxy) = &req.proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy).map_err(|e| format!("controlled proxy invalid: {e}"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|e| format!("controlled client construction failed: {e}"))
+}
+
+/// Dispatch one controlled request end to end: build the wire-local request,
+/// build the profile-scoped client, and run the shared attempt discipline. The
+/// credential value is injected into the wire headers and never logged. Returns
+/// an [`LlmResponse`]; a 3xx is a terminal endpoint error (never followed, body
+/// never re-sent to another host, FR-04 req 12).
+pub async fn controlled_send(
+    spec: &ControlledModelSpec,
+    req: &ControlledRequest,
+    credential: &str,
+    ctx: &Context,
+) -> LlmResponse {
+    let http = match spec.wire {
+        Wire::Messages => anthropic::controlled_request(spec, req, credential, ctx),
+        Wire::Chat => openrouter::controlled_request(spec, req, credential, ctx),
+    };
+    let http = match http {
+        Ok(h) => h,
+        Err(e) => return LlmResponse::error(e),
+    };
+    let client = match controlled_client(req) {
+        Ok(c) => c,
+        Err(e) => return LlmResponse::error(e),
+    };
+    let body = match serde_json::to_string(&http.body) {
+        Ok(b) => b,
+        Err(e) => return LlmResponse::error(format!("controlled body serialize failed: {e}")),
+    };
+    let user_agent = controlled_user_agent();
+    let max_attempts = req.request_retries.saturating_add(1);
+    let mut last = LlmResponse::error("controlled request made no attempt");
+    for attempt in 0..max_attempts {
+        // Every attempt is observable (FR-04 req 10). The audit record (WP08)
+        // consumes the sequence; here we only emit a non-sensitive count.
+        tracing::debug!(
+            target: "daimonos::providers",
+            event = "controlled_request_attempt",
+            attempt = attempt + 1,
+            of = max_attempts,
+            wire = spec.wire.as_str(),
+        );
+        let mut rb = client.post(&http.url).header("user-agent", &user_agent);
+        for (name, value) in &http.headers {
+            rb = rb.header(name.as_str(), value.as_str());
+        }
+        let sent = rb.body(body.clone()).send();
+        let result = match with_deadline("controlled response headers", req.timeout, sent).await {
+            Ok(r) => r,
+            Err(timeout) => {
+                last = timeout;
+                continue;
+            }
+        };
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // Transport fault: transient, so a caller-configured retry may
+                // re-issue it. Message names no body/headers/key.
+                last = LlmResponse::retryable_error(format!("controlled network error: {e}"));
+                continue;
+            }
+        };
+        let status = resp.status();
+        if status.is_redirection() {
+            // No redirect is followed and the body is never re-sent to another
+            // host; a 3xx is a terminal endpoint error (FR-04 req 12).
+            return LlmResponse::error(format!(
+                "controlled endpoint error: unexpected redirect {status}"
+            ));
+        }
+        if status.is_success() {
+            return controlled_decode(spec, &resp.text().await.unwrap_or_default(), &spec.model);
+        }
+        let full = format!("controlled endpoint error: API {status}");
+        if is_retryable_status(status.as_u16()) {
+            last = LlmResponse::retryable_error(full);
+            continue;
+        }
+        return LlmResponse::error(full);
+    }
+    last
+}
+
+/// Decode a successful controlled response body into an [`LlmResponse`] using
+/// the wire-local parser.
+fn controlled_decode(spec: &ControlledModelSpec, body: &str, model: &str) -> LlmResponse {
+    match spec.wire {
+        Wire::Messages => anthropic::controlled_decode(body, model),
+        Wire::Chat => openrouter::controlled_decode(body, model),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     pub async fn mock_http_server(
@@ -630,6 +1007,67 @@ pub(crate) mod test_support {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (format!("http://{address}"), rx)
+    }
+
+    /// WP07: a fake endpoint that answers EVERY connection with a fixed status
+    /// (and optional extra header, e.g. `Location` for a redirect), counting
+    /// the connections it accepts. Used to prove attempt counts and that a
+    /// non-2xx/redirect produces no extra request and no second host is hit.
+    pub async fn counting_http_server(
+        status: &'static str,
+        extra_header: Option<(&'static str, &'static str)>,
+        response_body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let task_count = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                task_count.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let n = match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(str::trim)
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let extra = extra_header
+                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), count)
     }
 }
 
@@ -1090,5 +1528,381 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod controlled_transport_tests {
+    //! WP07 controlled transport (ADR-025). Transport-level AC-04.1-04.5 and
+    //! the profile validation behind AC-04.7, against local fake endpoints only.
+    use super::test_support::{counting_http_server, mock_http_server};
+    use super::*;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::Ordering;
+
+    fn ctx_with_tool() -> Context {
+        Context {
+            messages: vec![Message::user("inspect this")],
+            system: Some("system prompt".into()),
+            tools: vec![ToolSchema {
+                name: "final_answer".into(),
+                description: "the final answer tool".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            stable_prefix_len: 0,
+        }
+    }
+
+    fn messages_spec(base_url: String) -> ControlledModelSpec {
+        ControlledModelSpec {
+            provider_label: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            base_url,
+            wire: Wire::Messages,
+            credential_env: "CTRL_KEY".into(),
+        }
+    }
+
+    fn chat_spec(base_url: String) -> ControlledModelSpec {
+        ControlledModelSpec {
+            provider_label: "openrouter".into(),
+            model: "some/model".into(),
+            base_url,
+            wire: Wire::Chat,
+            credential_env: "CTRL_KEY".into(),
+        }
+    }
+
+    /// Split a captured raw HTTP request into (request_line, lowercased headers, body).
+    fn parse_request(raw: &str) -> (String, HashMap<String, String>, String) {
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap().to_string();
+        let headers = lines
+            .filter_map(|l| {
+                l.split_once(':')
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            })
+            .collect();
+        (request_line, headers, body.to_string())
+    }
+
+    const ANTHROPIC_ALLOWED: [&str; 9] = [
+        "x-api-key",
+        "anthropic-version",
+        "content-type",
+        "user-agent",
+        "host",
+        "content-length",
+        "accept",
+        "accept-encoding",
+        "connection",
+    ];
+    const CHAT_ALLOWED: [&str; 8] = [
+        "authorization",
+        "content-type",
+        "user-agent",
+        "host",
+        "content-length",
+        "accept",
+        "accept-encoding",
+        "connection",
+    ];
+
+    // AC-04.1 (Messages body) + AC-04.5 (automatic, never forced tool choice).
+    #[tokio::test]
+    async fn controlled_messages_body_and_headers_are_the_fixed_set() {
+        let (base, rx) = mock_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#.into(),
+        )
+        .await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "SECRET_CREDENTIAL",
+            &ctx_with_tool(),
+        )
+        .await;
+        assert!(resp.error_message.is_none(), "{:?}", resp.error_message);
+
+        let raw = rx.await.unwrap();
+        let (request_line, headers, body) = parse_request(&raw);
+        // Stable path only; never a beta path or query string (req 7).
+        assert!(
+            request_line.starts_with("POST /v1/messages "),
+            "{request_line}"
+        );
+        assert!(!request_line.contains("beta"));
+        assert_eq!(headers.get("x-api-key").unwrap(), "SECRET_CREDENTIAL");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert!(headers.get("user-agent").unwrap().starts_with("daimonos/"));
+        for name in headers.keys() {
+            assert!(
+                ANTHROPIC_ALLOWED.contains(&name.as_str()),
+                "unexpected header {name}"
+            );
+        }
+
+        let obj = serde_json::from_str::<Value>(&body).unwrap();
+        let obj = obj.as_object().unwrap();
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "max_tokens",
+                "messages",
+                "model",
+                "system",
+                "tool_choice",
+                "tools"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<&str>>()
+        );
+        assert_eq!(obj["model"], Value::from("claude-opus-5-5"));
+        assert_eq!(obj["max_tokens"], Value::from(1024));
+        // Automatic, never forced (req 5).
+        assert_eq!(obj["tool_choice"], serde_json::json!({"type": "auto"}));
+        for forced in ["required", "any", "tool"] {
+            assert_ne!(obj["tool_choice"]["type"], Value::from(forced));
+        }
+        // No sampling, no stream, no strict flag anywhere (req 4, 5).
+        for banned in ["temperature", "top_p", "top_k", "stream"] {
+            assert!(obj.get(banned).is_none(), "sampling field {banned} present");
+        }
+        assert!(obj["tools"][0].get("strict").is_none());
+        assert!(!body.contains("cache_control"));
+    }
+
+    // AC-04.2: hostile org/project/custom-header env vars never alter the set.
+    #[tokio::test]
+    async fn controlled_messages_ignores_hostile_header_environment() {
+        for (k, v) in [
+            ("OPENAI_ORG_ID", "org-x"),
+            ("OPENAI_PROJECT_ID", "proj-x"),
+            ("OPENAI_CUSTOM_HEADERS", "x-leak=1"),
+            ("ANTHROPIC_CUSTOM_HEADERS", "x-leak=1"),
+        ] {
+            std::env::set_var(k, v);
+        }
+        let (base, rx) = mock_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"content":[{"type":"text","text":"ok"}]}"#.into(),
+        )
+        .await;
+        let _ = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "SECRET_CREDENTIAL",
+            &ctx_with_tool(),
+        )
+        .await;
+        let (_, headers, _) = parse_request(&rx.await.unwrap());
+        for leaked in [
+            "openai-organization",
+            "openai-project",
+            "x-organization",
+            "x-leak",
+            "traceparent",
+        ] {
+            assert!(!headers.contains_key(leaked), "leaked header {leaked}");
+        }
+        for name in headers.keys() {
+            assert!(
+                ANTHROPIC_ALLOWED.contains(&name.as_str()),
+                "unexpected header {name}"
+            );
+        }
+    }
+
+    // AC-04.3: a 503 with no caller retry produces exactly one request.
+    #[tokio::test]
+    async fn controlled_503_makes_exactly_one_attempt_when_retries_zero() {
+        let (base, count) = counting_http_server("503 Service Unavailable", None, "{}").await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "K",
+            &ctx_with_tool(),
+        )
+        .await;
+        assert!(resp.error_message.is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    // req 10: a caller-configured retry count is honored and every attempt is real.
+    #[tokio::test]
+    async fn controlled_caller_retries_are_visible_and_counted() {
+        let (base, count) = counting_http_server("503 Service Unavailable", None, "{}").await;
+        let req = ControlledRequest {
+            request_retries: 2,
+            ..ControlledRequest::default()
+        };
+        let resp = controlled_send(&messages_spec(base), &req, "K", &ctx_with_tool()).await;
+        assert!(resp.error_message.is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    // AC-04.4: a 307 is an endpoint error; it is not followed and no other host
+    // is contacted (exactly one request reaches the fake).
+    #[tokio::test]
+    async fn controlled_307_is_endpoint_error_and_not_followed() {
+        let (base, count) = counting_http_server(
+            "307 Temporary Redirect",
+            Some(("location", "http://127.0.0.1:9/elsewhere")),
+            "{}",
+        )
+        .await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            "K",
+            &ctx_with_tool(),
+        )
+        .await;
+        let msg = resp.error_message.expect("redirect must be an error");
+        assert!(msg.contains("redirect"), "{msg}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    // AC-04.1 (Chat body) + AC-04.5: chat sends `"auto"`, no strict, no sampling.
+    #[tokio::test]
+    async fn controlled_chat_body_and_headers_are_the_fixed_set() {
+        let (base, rx) = mock_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#.into(),
+        )
+        .await;
+        let resp = controlled_send(
+            &chat_spec(base),
+            &ControlledRequest::default(),
+            "SECRET_CREDENTIAL",
+            &ctx_with_tool(),
+        )
+        .await;
+        assert!(resp.error_message.is_none(), "{:?}", resp.error_message);
+
+        let raw = rx.await.unwrap();
+        let (request_line, headers, body) = parse_request(&raw);
+        assert!(
+            request_line.starts_with("POST /chat/completions "),
+            "{request_line}"
+        );
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer SECRET_CREDENTIAL"
+        );
+        assert!(!headers.contains_key("x-api-key"));
+        for name in headers.keys() {
+            assert!(
+                CHAT_ALLOWED.contains(&name.as_str()),
+                "unexpected header {name}"
+            );
+        }
+
+        let obj = serde_json::from_str::<Value>(&body).unwrap();
+        let obj = obj.as_object().unwrap();
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["messages", "model", "tool_choice", "tools"]
+                .into_iter()
+                .collect::<BTreeSet<&str>>()
+        );
+        assert_eq!(obj["tool_choice"], Value::from("auto"));
+        for banned in ["temperature", "top_p", "top_k", "stream"] {
+            assert!(obj.get(banned).is_none(), "sampling field {banned} present");
+        }
+        // No provider "strict" flag on tool definitions (req 5).
+        assert!(obj["tools"][0].get("strict").is_none());
+        assert!(obj["tools"][0]["function"].get("strict").is_none());
+        assert!(!body.contains("strict"));
+    }
+
+    // AC-04.7 (configuration): all five required; partial fails naming the
+    // missing ones; wire never inferred; unknown fields refused.
+    #[test]
+    fn controlled_profile_requires_all_five_values() {
+        let partial = serde_json::json!({
+            "provider_label": "anthropic",
+            "model": "claude-opus-5-5",
+            "wire": "messages"
+        });
+        let err = ControlledProfile::from_json(&partial).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.contains("base_url"), "{err}");
+        assert!(err.contains("credential_env"), "{err}");
+    }
+
+    #[test]
+    fn controlled_profile_rejects_unconfigured_and_invalid_wire() {
+        let unknown = serde_json::json!({
+            "provider_label": "a", "model": "m", "base_url": "http://x",
+            "wire": "messages", "credential_env": "K", "temperature": 0.5
+        });
+        assert!(ControlledProfile::from_json(&unknown)
+            .unwrap_err()
+            .contains("unconfigured"));
+
+        let bad_wire = serde_json::json!({
+            "provider_label": "a", "model": "m", "base_url": "http://x",
+            "wire": "guess", "credential_env": "K"
+        });
+        assert!(ControlledProfile::from_json(&bad_wire)
+            .unwrap_err()
+            .contains("wire"));
+    }
+
+    #[test]
+    fn controlled_profile_accepts_complete_and_parses_request_settings() {
+        let full = serde_json::json!({
+            "provider_label": "anthropic", "model": "claude-opus-5-5",
+            "base_url": "https://api.example.com", "wire": "messages",
+            "credential_env": "CTRL_KEY", "max_tokens": 4096, "timeout_ms": 30000,
+            "request_retries": 0, "proxy": null,
+            "extra_body_fields": {"metadata": {"user_id": "dbunk"}}
+        });
+        let profile = ControlledProfile::from_json(&full).unwrap();
+        assert_eq!(profile.spec.wire, Wire::Messages);
+        assert_eq!(profile.request.max_tokens, 4096);
+        assert_eq!(profile.request.request_retries, 0);
+        assert!(profile.request.proxy.is_none());
+        assert_eq!(
+            profile.request.timeout,
+            std::time::Duration::from_millis(30000)
+        );
+    }
+
+    // req 4/5/6: explicit extras cannot overwrite protected or add forbidden fields.
+    #[test]
+    fn controlled_extra_body_fields_cannot_break_protections() {
+        let mut body = serde_json::Map::new();
+        let overwrite = serde_json::json!({"model": "other"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(apply_extra_body_fields(&mut body, &overwrite)
+            .unwrap_err()
+            .contains("protected"));
+
+        let forbidden = serde_json::json!({"temperature": 0.7})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(apply_extra_body_fields(&mut body, &forbidden)
+            .unwrap_err()
+            .contains("forbidden"));
+
+        let allowed = serde_json::json!({"metadata": {"k": "v"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_extra_body_fields(&mut body, &allowed).unwrap();
+        assert_eq!(body["metadata"], serde_json::json!({"k": "v"}));
     }
 }

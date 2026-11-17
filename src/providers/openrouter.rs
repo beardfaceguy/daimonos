@@ -593,6 +593,75 @@ fn supports_explicit_prompt_cache(model: &str) -> bool {
     model.starts_with("anthropic/")
 }
 
+// --- WP07 controlled Chat Completions wire (ADR-025, FR-04 requirements 1-13) ---
+//
+// Context: ADR-025. The Chat wire's provider-local serialization for the
+// controlled transport. Separate from `request_body`: it emits ONLY the fixed
+// body/header sets, sets `tool_choice` to `"auto"` explicitly when tools are
+// offered (never a forced choice), sends no sampling field, and pins NO
+// provider `strict` flag on tool definitions. The structural request trace is
+// never captured in this mode.
+
+/// Fixed controlled Chat tool definitions: no `strict` flag (FR-04 req 5).
+fn controlled_tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Build the fixed controlled Chat request (body + exact header set + URL).
+/// `credential` is injected into the `Authorization: Bearer` header and never
+/// logged.
+pub(crate) fn controlled_request(
+    spec: &crate::providers::ControlledModelSpec,
+    req: &crate::providers::ControlledRequest,
+    credential: &str,
+    ctx: &Context,
+) -> Result<crate::providers::ControlledHttp, String> {
+    let messages = messages_to_wire(ctx.system.as_deref(), &ctx.messages);
+    let tools = controlled_tools_to_wire(&ctx.tools);
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), json!(spec.model));
+    body.insert("messages".to_string(), json!(messages));
+    body.insert("tools".to_string(), json!(tools));
+    // Explicit automatic tool choice whenever tools are offered (FR-04 req 5).
+    if !tools.is_empty() {
+        body.insert("tool_choice".to_string(), json!("auto"));
+    }
+    crate::providers::apply_extra_body_fields(&mut body, &req.extra_body_fields)?;
+
+    // Stable Chat Completions path under the caller base URL (FR-04 req 6-7).
+    let url = format!("{}/chat/completions", spec.base_url.trim_end_matches('/'));
+    let headers = vec![
+        ("authorization".to_string(), format!("Bearer {credential}")),
+        ("content-type".to_string(), "application/json".to_string()),
+    ];
+    Ok(crate::providers::ControlledHttp {
+        url,
+        headers,
+        body: Value::Object(body),
+    })
+}
+
+/// Decode a successful controlled Chat response body.
+pub(crate) fn controlled_decode(body: &str, _model: &str) -> LlmResponse {
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => parse_response(&value),
+        Err(e) => LlmResponse::error(format!("controlled parse error: {e}")),
+    }
+}
+
 /// Serialize tool schemas to the OpenAI `tools` array format.
 pub(crate) fn tools_to_wire(tools: &[ToolSchema]) -> Vec<Value> {
     tools

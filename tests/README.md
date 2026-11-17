@@ -53,6 +53,8 @@ cargo test
 python3 -m pytest tests/ -v
 ```
 
+`tests/test_request_control.py` covers the controlled model transport (WP07 / FR-04) through the CLI; it uses only local fake endpoints and never a credentialed endpoint.
+
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
 

@@ -181,6 +181,18 @@ Auxiliary summary/reformat calls use the same controlled authority and request c
 If an auxiliary path cannot honor the exact request contract, refuse before sending with `auxiliary_request_unsupported` metadata.
 Do not silently drop history or perform a hidden fallback request after that refusal. Default non-profile compaction remains unchanged.
 
+_WP07 status (implemented, transport only):_ the provider-neutral seams
+(`Wire`, `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`,
+`ControlledHttp`, `controlled_client`, `controlled_send`) live in
+`src/providers/mod.rs`; the wire-local serializers in `src/providers/anthropic.rs`
+(Messages) and `src/providers/openrouter.rs` (Chat); `ControlledProvider` in
+`src/providers/router.rs`. The caller flag is `daimonos agent --model-profile PATH`
+(`src/cli.rs`, validated in `src/agent_runtime.rs`), mutually exclusive with
+`--model`/`--provider`. Transport-level AC-04.1-04.5 are asserted by
+`cargo test providers::controlled_transport_tests`; AC-04.7 and the opt-out
+regression by `tests/test_request_control.py`. The capability probe (AC-04.6)
+and audit record remain WP09/WP08; the integrated probe repeats AC-04.1-04.5.
+
 WP09 owns `src/capability_probe.rs` (new): `ProbeSpec` and `ProbeOutcome`.
 The caller supplies a minimal valid final payload. Local schema validation occurs before the endpoint call.
 The probe offers the byte-equivalent frozen definitions that the review offers. No dummy-tool substitute is allowed.

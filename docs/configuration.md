@@ -140,6 +140,56 @@ DAIMONOS_AGENT_BASE_URL=https://api.openai.com/v1
 DAIMONOS_AGENT_API_KEY=sk-...
 ```
 
+### Controlled model transport (`--model-profile`)
+
+`daimonos agent --model-profile <PATH>` is an opt-in, profile-scoped request
+transport (ADR-025, FR-04 requirements 1-13). Default off: without the flag,
+agent mode keeps its current provider behavior unchanged. It is designed for
+callers that must know and test exactly what is sent to a model endpoint.
+
+The path is ONE JSON object that is the sole source of the model request
+configuration. The five identity values are all required; a partial profile
+fails at startup naming every missing value. None of the five may be combined
+with another source, so `--model-profile` cannot be used together with
+`--model` or `--provider`.
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `provider_label` | yes | A caller label for the run. |
+| `model` | yes | The exact model identifier sent on the wire. |
+| `base_url` | yes | The endpoint base URL. |
+| `wire` | yes | `"chat"` (Chat Completions, `{base_url}/chat/completions`) or `"messages"` (Anthropic Messages, `{base_url}/v1/messages`). Never inferred from the model or URL. |
+| `credential_env` | yes | Name of the environment variable holding the credential. The value is read only from this variable and never appears in logs or exports. |
+| `max_tokens` | no (default 1024) | Caller-owned output ceiling (Messages sends it; Chat omits it). |
+| `timeout_ms` | no (default 60000) | Request timeout, in milliseconds. |
+| `request_retries` | no (default 0) | Caller-configured retry count. The HTTP layer performs no hidden retries; every attempt is recorded. |
+| `proxy` | no | An explicit proxy URL. Proxy environment variables are otherwise ignored. |
+| `extra_body_fields` | no | Explicit, caller-configured extra body fields. They can never overwrite a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or introduce a forbidden sampling/forced-choice/strict field. |
+
+Any top-level field beyond this set fails startup. In this mode the request body
+contains only the fixed field set, carries no sampling parameters, sets
+automatic tool choice explicitly whenever tools are offered (never a forced
+choice and never a provider `strict` flag), uses only the stable endpoint path,
+and sends only the fixed header set (the credential header, `Content-Type`,
+`anthropic-version` on Messages, a fixed Daimonos `User-Agent`, plus standard
+transport headers). Ambient organization/project/custom headers, tracing or
+telemetry export, HTTP redirects (a 3xx is an endpoint error), and ambient
+proxies are all suppressed. A client-construction error fails the profile
+rather than falling back to the default client.
+
+```json
+{
+  "provider_label": "anthropic",
+  "model": "claude-opus-5-5",
+  "base_url": "https://api.anthropic.com",
+  "wire": "messages",
+  "credential_env": "ANTHROPIC_API_KEY",
+  "max_tokens": 4096,
+  "timeout_ms": 30000,
+  "request_retries": 0
+}
+```
+
 ### Tool approval lists (`DAIMONOS_AGENT_PERMISSION_MODE`)
 
 `DAIMONOS_AGENT_PERMISSION_MODE` is optional. It decides which tool calls ask
