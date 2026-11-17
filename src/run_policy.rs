@@ -34,6 +34,104 @@ use std::path::{Component, Path, PathBuf};
 pub const CODE_WORKSPACE_WRITE_FORBIDDEN: &str = "workspace_write_forbidden";
 /// Refusal code for an opaque tool whose effects cannot be mediated read-only.
 pub const CODE_TOOL_POLICY_UNSUPPORTED: &str = "tool_policy_unsupported";
+/// Refusal code for a tool not on the explicit `--tool-allowlist` (FR-02, WP06).
+/// Reserved in reviewer-runtime INTERFACES.md and `run_audit::REFUSAL_CODES`, so
+/// a boundary result carrying it is recorded as a `tool_refusal` by WP08.
+pub const CODE_TOOL_NOT_ALLOWED: &str = "tool_not_allowed";
+
+/// The explicit run allowlist (FR-02, ADR-023), kept separate from the legacy
+/// policy and from the read-only [`ToolAdmission`]. It is the one immutable
+/// authority consulted at every direct and delegated dispatch boundary
+/// (`mcp::dispatch_tool_inner`, `script::dispatch_tool_by_name`, batch children,
+/// the `execute_script` branches, and the remote/worker hook) and at every
+/// model-visible listing (tools/list, `list_all_tools`, the agent catalog).
+///
+/// `None` preserves current behavior (no explicit list — legacy). `Some(set)`
+/// is an explicit selection: an empty set grants NO tools (a deliberate
+/// deny-all), which is distinct from `None`. Nested composite calls can never
+/// reset or widen it, and workspace/environment settings can never add to it
+/// (it is built only from the caller's `--tool-allowlist`).
+///
+/// This allowlist can only *narrow*: it is an additional restrictive filter
+/// layered on top of the legacy `SafetyPolicy` restrictions and the read-only /
+/// confinement admissions, which remain stronger and may still refuse an
+/// otherwise-listed tool (INTERFACES.md). Context: src/run_policy.rs.
+#[derive(Debug, Clone, Default)]
+pub struct ToolPolicy {
+    allowlist: Option<std::collections::BTreeSet<String>>,
+}
+
+impl ToolPolicy {
+    /// No explicit allowlist: legacy behavior, every tool is allowed.
+    pub fn unrestricted() -> Self {
+        ToolPolicy { allowlist: None }
+    }
+
+    /// An explicit allowlist. An empty iterator yields a deny-all policy.
+    pub fn explicit<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ToolPolicy {
+            allowlist: Some(names.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    /// Build from the caller-owned config value (`None` => legacy).
+    pub fn from_config(names: Option<&Vec<String>>) -> Self {
+        match names {
+            None => Self::unrestricted(),
+            Some(list) => Self::explicit(list.iter().cloned()),
+        }
+    }
+
+    /// True when an explicit allowlist is in force (even an empty one).
+    pub fn is_active(&self) -> bool {
+        self.allowlist.is_some()
+    }
+
+    /// Whether `name` is permitted by the explicit allowlist. With no explicit
+    /// list every name is allowed (legacy). This never widens another policy:
+    /// read-only/confinement admissions are checked separately and are stronger.
+    pub fn allows(&self, name: &str) -> bool {
+        match &self.allowlist {
+            None => true,
+            Some(set) => set.contains(name),
+        }
+    }
+
+    /// Admit (or refuse) a tool by exported name at a dispatch boundary. The
+    /// refusal carries the reviewed `tool_not_allowed` code and names the tool
+    /// without exposing any denied payload (ADR-023).
+    pub fn admit(&self, name: &str) -> Result<(), ToolFailure> {
+        if self.allows(name) {
+            Ok(())
+        } else {
+            Err(ToolFailure {
+                code: CODE_TOOL_NOT_ALLOWED.to_string(),
+                message: format!("tool {name} is not on the explicit tool allowlist"),
+                tool: Some(name.to_string()),
+                argument: None,
+                budget: None,
+                retryable: false,
+            })
+        }
+    }
+
+    /// The effective allowlist as a sorted vector, or `None` when no explicit
+    /// list is in force. Intersected with the legacy restriction when one is
+    /// supplied (the allowlist can only narrow it, never widen it — the
+    /// reported set is what the run will actually permit).
+    pub fn effective(&self, legacy_allows: Option<&dyn Fn(&str) -> bool>) -> Option<Vec<String>> {
+        self.allowlist.as_ref().map(|set| {
+            set.iter()
+                .filter(|name| legacy_allows.map(|f| f(name)).unwrap_or(true))
+                .cloned()
+                .collect()
+        })
+    }
+}
 
 /// How a tool/opcode affects the world, for read-only admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

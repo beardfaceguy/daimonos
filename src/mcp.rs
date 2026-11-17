@@ -414,6 +414,16 @@ async fn dispatch_tool_inner(
     name: &str,
     args: &Value,
 ) -> std::result::Result<CallToolResult, CallToolError> {
+    // FR-02 (WP06, ADR-023): the explicit tool allowlist is the first, immutable
+    // check at this boundary — before activation, use tracking, or any effect.
+    // It is reached by direct MCP calls, every batch child (via `dispatch_tool`),
+    // and Starlark non-opcode `tool()` fall-through, so a nested/composite call
+    // can never reach an unlisted tool. A refused name carries the reviewed
+    // `tool_not_allowed` code (recorded as a `tool_refusal` by WP08) and names
+    // the tool without exposing its arguments.
+    if let Err(failure) = session.policy.admit(name) {
+        return response_to_result(failure.into_response(name));
+    }
     if !session.exposed_tools.contains(name) {
         session.activate_tool(name);
     }
@@ -517,6 +527,10 @@ async fn dispatch_tool_inner(
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let summary: Vec<Value> = all
                 .iter()
+                // FR-02 (WP06, AC-02.3): the lazy "load more tools" listing is
+                // filtered by the explicit allowlist too, so no tiered listing
+                // can reveal an unlisted tool (ADR-023).
+                .filter(|tool| session.policy.allows(&tool.name))
                 .filter(|tool| {
                     session.authority.is_none() || crate::path_policy::tool_allowed(&tool.name)
                 })
@@ -1358,7 +1372,18 @@ impl ServerHandler for DaimonosHandler {
         let verbosity = session.verbosity;
         let visible: Vec<Tool> = all
             .into_iter()
-            .filter(|t| session.exposed_tools.contains(&t.name))
+            // FR-02 (WP06, AC-02.3): when an explicit allowlist is in force the
+            // model sees EXACTLY the allowlisted tools — every one of them
+            // (even normally-lazy/on-demand tools) and nothing else — so served,
+            // discovered, and executable names agree (ADR-023). With no explicit
+            // list, the legacy lazy exposure set applies unchanged.
+            .filter(|t| {
+                if session.policy.is_active() {
+                    session.policy.allows(&t.name)
+                } else {
+                    session.exposed_tools.contains(&t.name)
+                }
+            })
             .filter(|t| passes_session_context_check(&session, &t.name))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
@@ -1406,6 +1431,12 @@ impl ServerHandler for DaimonosHandler {
         let mut session = self.session.lock().await;
 
         if params.name == "batch" {
+            // FR-02 (WP06, ADR-023): batch is a composite tool and must itself
+            // be on the explicit allowlist before any child runs; its children
+            // are checked independently at `dispatch_tool_inner`.
+            if let Err(failure) = session.policy.admit("batch") {
+                return response_to_result(failure.into_response("batch"));
+            }
             let ops = match args.get("ops").and_then(|v| v.as_array()) {
                 Some(arr) => arr.clone(),
                 None => return err_text("batch requires 'ops' array".into()),
@@ -1548,6 +1579,18 @@ async fn run_execute_script(
     session: Arc<Mutex<Session>>,
     args: &Value,
 ) -> Result<script::ScriptResult, String> {
+    // FR-02 (WP06, ADR-023): execute_script is itself a composite tool and must
+    // be on the explicit allowlist; otherwise refuse the whole call before any
+    // Starlark runs (a fabricated call to an unlisted composite never executes).
+    if !session.lock().await.policy.allows("execute_script") {
+        return Err(serde_json::json!({
+            "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+            "message": "tool execute_script is not on the explicit tool allowlist",
+            "tool": "execute_script",
+            "retryable": false,
+        })
+        .to_string());
+    }
     // FR-07 (ADR-022): execute_script is opaque — its inner effects cannot be
     // mediated — so refuse it before any Starlark runs when the workspace is
     // read-only. An allowlist entry cannot override this refusal. G7: return

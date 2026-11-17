@@ -1440,3 +1440,17 @@ Opt-in (FR-01 / ADR-024). `daimonos agent --final-output <PATH>` makes a one-sho
 - `max_model_requests` (optional) — inclusive ceiling on model requests for the whole run; exceeding it fails with reason `turn_limit` (exit 24).
 
 Success emits only the validated argument JSON and one newline (exit 0). A failed ending writes a bounded JSON error object to stderr with `reason`, `validation_errors`, `attempts`, and `model_requests` (exit 20). An external schema reference is refused before any model request (`schema_unusable`, exit 20). Default off leaves agent mode unchanged.
+
+## `--tool-allowlist PATH` (FR-02, WP06)
+
+Enforce an explicit tool allowlist for a run. `PATH` is a JSON file holding an array of exact exported tool names, e.g. `["read_file", "search", "workspace_info"]`.
+
+- **Default off.** Omitting the flag keeps legacy behavior (all tools allowed).
+- An empty array `[]` grants no tools (deny-all), distinct from omitting the flag.
+- The model sees **exactly** the allowlisted tools in every listing, including lazy/`list_all_tools` listings.
+- Every call is checked before it runs, at every direct, batch, Starlark, `execute_script`, and remote/worker dispatch boundary; a composite must itself be listed and its inner calls are each checked.
+- An entry matching no known tool fails the run at startup (exit 2, `run_configuration_invalid`, reason `tool_allowlist_unknown_entry`). With `--final-output`, the designated final-answer tool must be listed explicitly (never added automatically).
+- Caller-owned: read only from this flag, never from workspace/user config or the environment; it can only narrow existing restrictions (the effective set is their intersection).
+- At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`.
+- Refusals carry the `tool_not_allowed` code and are recorded in the `--audit-path` record.
+- Honored on every frontend and carried in the session-daemon launch identity, so daemon reuse cannot bypass it.

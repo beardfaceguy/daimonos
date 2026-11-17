@@ -156,3 +156,5 @@ binary now also reports its real version: earlier releases still said 0.1.1.
   mid-turn is expected until the re-stream de-duplication follow-up lands.
 - **Release builds install cross targets on the pinned 1.96.0 toolchain**,
   which unbreaks tagged releases.
+
+- Enforced tool allowlist (`--tool-allowlist PATH`, FR-02/WP06): an explicit JSON array of exact exported tool names is the effective policy at every model listing (tools/list, `list_all_tools`) and every dispatch boundary (direct MCP, batch children, Starlark `tool()`/opcode shortcuts, `execute_script`, the agent loop). Omitted = legacy (all tools); `[]` = none; unknown names fail at startup (exit 2 `run_configuration_invalid`). Caller-owned (never widened by workspace/env config); part of the session-daemon launch identity; refusals carry `tool_not_allowed` and reach the `--audit-path` record.

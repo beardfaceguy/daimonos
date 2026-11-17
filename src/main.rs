@@ -169,6 +169,43 @@ fn exit_for_state_failure(error: state_root::RunFailure) -> ! {
     std::process::exit(error.exit_code);
 }
 
+/// Load the caller's explicit `--tool-allowlist` file (FR-02, WP06): a JSON
+/// array of exact exported tool names. Returns the names in file order (the
+/// policy itself dedups/sorts). Caller-owned: read only here, never from
+/// workspace/user config. Errors are operator-facing startup messages.
+fn load_tool_allowlist(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let expanded = paths::expand_tilde(&path.to_string_lossy());
+    let bytes = std::fs::read(&expanded).map_err(|error| {
+        format!(
+            "--tool-allowlist {}: cannot read file: {error}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "--tool-allowlist {}: not valid JSON: {error}",
+            path.display()
+        )
+    })?;
+    let array = value.as_array().ok_or_else(|| {
+        format!(
+            "--tool-allowlist {}: must be a JSON array of tool names",
+            path.display()
+        )
+    })?;
+    let mut names = Vec::with_capacity(array.len());
+    for entry in array {
+        let name = entry.as_str().ok_or_else(|| {
+            format!(
+                "--tool-allowlist {}: every entry must be a string tool name",
+                path.display()
+            )
+        })?;
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -594,6 +631,74 @@ async fn main() -> anyhow::Result<()> {
             Some(resolved)
         }
     };
+    // FR-02 (WP06, ADR-023): load and pin the caller's explicit tool allowlist
+    // before any model work. Caller-owned: read only from --tool-allowlist,
+    // never from workspace/user config, so nothing the caller did not pass can
+    // widen or disable it (requirement 6). An absent flag keeps legacy behavior.
+    if let Some(path) = &cli.tool_allowlist {
+        let names = match load_tool_allowlist(path) {
+            Ok(names) => names,
+            Err(message) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_invalid",
+                        "message": message,
+                    }})
+                );
+                std::process::exit(2);
+            }
+        };
+        // AC-02.4 / requirement 5: validate every entry against the effective
+        // catalog before any model work. The known set is the full native /
+        // registry catalog plus the caller's designated final-answer tool when
+        // final-output is configured (an offered tool that must be explicitly
+        // listed, never added automatically — ADR-023, PM FR-02-2). An entry
+        // matching no tool fails the run at startup naming it (fail-closed);
+        // nothing is dropped silently.
+        let mut known: std::collections::BTreeSet<String> = crate::tools::all_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        if let Some(crate::cli::Command::Agent(args)) = &cli.command {
+            if let Some(control) = &args.final_output {
+                if let Ok(text) = std::fs::read_to_string(control) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(name) = value.get("tool_name").and_then(|n| n.as_str()) {
+                            known.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(unknown) = names.iter().find(|name| !known.contains(name.as_str())) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "tool_allowlist_unknown_entry",
+                    "message": format!(
+                        "--tool-allowlist entry '{unknown}' matches no known tool"
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
+        cfg.tool_allowlist = Some(names);
+        cfg.tool_allowlist_path = Some(path.clone());
+    }
+    // FR-02 requirement 7: report the effective allowlist (the set the run will
+    // actually permit) in a machine-readable line so the caller can confirm it
+    // before the review starts.
+    if let Some(names) = &cfg.tool_allowlist {
+        let policy = run_policy::ToolPolicy::from_config(Some(names));
+        let effective = policy.effective(None).unwrap_or_default();
+        eprintln!(
+            "{}",
+            serde_json::json!({ "effective_tool_allowlist": effective })
+        );
+    }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(

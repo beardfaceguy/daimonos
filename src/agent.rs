@@ -1593,7 +1593,32 @@ async fn run_inner(
                     // allowlist entry cannot override this refusal.
                     let script_refused_read_only =
                         name == EXECUTE_SCRIPT_TOOL && session.lock().await.admission.read_only();
-                    let (mut content, is_error, mut outcome) = if script_refused_read_only {
+                    // FR-02 (WP06, ADR-023): the explicit allowlist is the first,
+                    // immutable check for EVERY model tool call in this loop —
+                    // opcode-backed tools dispatch straight through
+                    // `tool_facade::invoke` (not `mcp::dispatch_tool_inner`), so
+                    // this is the agent loop's own dispatch boundary and it must
+                    // carry the run policy. A refused name is answered with the
+                    // reviewed `tool_not_allowed` code before any effect; the
+                    // final-answer tool is required to be on the list at startup
+                    // and is intercepted earlier, so it is never refused here.
+                    let policy_refused = !session.lock().await.policy.allows(&name);
+                    let (mut content, is_error, mut outcome) = if policy_refused {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+                            "message": format!(
+                                "tool {name} is not on the explicit tool allowlist"
+                            ),
+                            "tool": name.clone(),
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if script_refused_read_only {
                         let content = serde_json::json!({
                             "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
                             "message": "execute_script cannot be mediated while the workspace is read-only",

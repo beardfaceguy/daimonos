@@ -365,6 +365,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub audit_path: Option<PathBuf>,
 
+    /// Enforce an explicit tool allowlist for the run (FR-02, ADR-023). PATH is
+    /// a JSON array of exact exported tool names. Omitted keeps legacy
+    /// behavior (all tools). An empty array `[]` grants no tools. Unknown names
+    /// fail at startup (exit 2). The list is the effective set at every model
+    /// listing and every direct, batch, Starlark, plugin, and remote dispatch;
+    /// it cannot be widened by workspace/environment config. Default off.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tool_allowlist: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

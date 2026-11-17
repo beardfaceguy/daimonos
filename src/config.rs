@@ -177,6 +177,19 @@ pub struct Config {
     /// never deserialized from workspace config.
     #[serde(skip)]
     pub audit_path: Option<std::path::PathBuf>,
+    /// `--tool-allowlist` (FR-02, WP06, ADR-023): the caller's explicit
+    /// allowlist of exact exported tool names, already loaded and validated at
+    /// startup. `None` keeps legacy behavior (all tools allowed); `Some(vec)`
+    /// is an explicit selection and `Some(empty)` grants no tools. Caller-owned;
+    /// never deserialized from workspace/user config, so nothing the caller did
+    /// not pass explicitly can widen or disable it (requirement 6).
+    #[serde(skip)]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// The original `--tool-allowlist` file path, kept so the interactive
+    /// session daemon can be spawned with the same flag and carry it in its
+    /// launch identity (FR-02, WP06; mirrors `workspace_read_only`). Caller-owned.
+    #[serde(skip)]
+    pub tool_allowlist_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }

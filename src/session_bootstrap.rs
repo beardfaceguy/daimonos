@@ -36,6 +36,13 @@ pub struct BootstrapOptions<'a> {
     /// DAEMON's own config, so reuse across this boundary would otherwise bypass
     /// the read-only gate (R4).
     pub workspace_read_only: bool,
+    /// FR-02 (WP06): the client's `--tool-allowlist` file path. Part of the
+    /// daemon's immutable launch identity exactly like `workspace_read_only`:
+    /// forwarded in `daemon_args`, hashed into `bootstrap_fingerprint`, and an
+    /// explicit selection in `launch_identity`, so a client requesting an
+    /// allowlist cannot be served by a daemon started without the same one (the
+    /// daemon pins `Session::policy` from its OWN config).
+    pub tool_allowlist: Option<&'a Path>,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -196,6 +203,10 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if options.workspace_read_only {
         args.push(OsString::from("--workspace-read-only"));
     }
+    if let Some(path) = options.tool_allowlist {
+        args.push(OsString::from("--tool-allowlist"));
+        args.push(path.as_os_str().to_owned());
+    }
     if let Some(reference) = options.confine_reference {
         args.push(OsString::from("--confine-paths"));
         args.push(OsString::from("--confine-root"));
@@ -250,6 +261,12 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.workspace_read_only {
         digest.update(b"workspace-read-only\0");
     }
+    if let Some(path) = options.tool_allowlist {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        digest.update(b"tool-allowlist\0");
+        digest.update(canonical.as_os_str().as_bytes());
+        digest.update([0_u8]);
+    }
     if let Some(identity) = options.confine_identity {
         digest.update(b"confined-root\0");
         digest.update(identity.as_bytes());
@@ -270,6 +287,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.agent_instructions.is_none()
         && !options.debug_tokens
         && !options.workspace_read_only
+        && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
     {
         return Ok(LaunchIdentity::NotRequested);
@@ -347,6 +365,7 @@ mod tests {
     ) -> BootstrapOptions<'a> {
         BootstrapOptions {
             workspace,
+            tool_allowlist: None,
             config_path: Some(config),
             state_dir: None,
             agent_instructions: None,

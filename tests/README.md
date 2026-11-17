@@ -89,3 +89,5 @@ If a local run uses temporary programs, report their versions and the PATH prefi
 ## tests/test_structured_output.py (WP05, FR-01)
 
 Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn-limit, zero/exhausted-retry, evidence-turn, and success-on-last-request cases run against a local scripted model endpoint on BOTH wires — Chat Completions (`openrouter`) and Messages (`anthropic`). No live API or real credentials. Run: `python3 -m pytest tests/test_structured_output.py -v`.
+
+- `test_tool_allowlist.py` (FR-02/WP06): drives a real `daimonos` process proving `--tool-allowlist` is the effective set at every listing and dispatch boundary — AC-02.1..02.6, the audit `tool_refusal`, nested Starlark/batch cannot bypass it, and the default-off regression. Reuses the fake-provider agent harness from `test_run_audit.py`.

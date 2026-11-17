@@ -381,6 +381,10 @@ pub async fn run_agent(
                 // read-only client spawns a read-only daemon and refuses to
                 // attach to one started without it.
                 workspace_read_only: cfg.workspace_read_only,
+                // FR-02 (WP06): the allowlist is part of the daemon identity so
+                // an allowlisted client spawns an allowlisted daemon and refuses
+                // to attach to one started without the same selection.
+                tool_allowlist: cfg.tool_allowlist_path.as_deref(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),

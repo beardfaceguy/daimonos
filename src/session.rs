@@ -84,6 +84,11 @@ pub struct Session {
     /// Derived from `cfg.workspace_read_only`; consulted at every dispatch
     /// boundary before an effect begins. Context: src/run_policy.rs.
     pub admission: crate::run_policy::ToolAdmission,
+    /// Explicit tool allowlist for `--tool-allowlist` (FR-02, ADR-023). Derived
+    /// from `cfg.tool_allowlist`; consulted by name at every dispatch boundary
+    /// and model-visible listing. Unrestricted keeps legacy behavior.
+    /// Context: src/run_policy.rs::ToolPolicy.
+    pub policy: crate::run_policy::ToolPolicy,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
@@ -114,6 +119,7 @@ impl Session {
             relocated(cfg.kgl.state_directory.as_ref()),
             relocated(cfg.snapshot_directory.as_ref()),
         );
+        let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
         Self {
             workspace,
             cwd,
@@ -138,6 +144,7 @@ impl Session {
             verbosity,
             authority,
             admission,
+            policy,
         }
     }
 

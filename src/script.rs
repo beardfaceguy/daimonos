@@ -700,6 +700,21 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 /// `tool("…")` universal prevents the model
 /// from spending retry turns learning which names require dedicated bindings.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
+    // FR-02 (WP06, ADR-023): the explicit allowlist is checked for EVERY inner
+    // Starlark call here — the compact opcode shortcut (`write_file(...)`) and
+    // the generic `tool("name", ...)` / plugin fall-through alike — so a listed
+    // `execute_script` can still reach only individually allowed names. Nested
+    // arbitrary Starlark cannot reset or widen the run policy. The refusal is a
+    // structured Response carrying the reviewed `tool_not_allowed` code.
+    if let Some(failure) = with_ctx(|ctx| {
+        let session = ctx.session.clone();
+        Ok(ctx
+            .handle
+            .block_on(async { session.lock().await.policy.admit(name) })
+            .err())
+    })? {
+        return Ok(failure.into_response(name));
+    }
     let resp = match tools::build_request(name, args) {
         Some(Ok(request)) => dispatch_request(request, name)?,
         Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
