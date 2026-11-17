@@ -156,6 +156,7 @@ pub async fn run_agent(
             context_overflow: false,
             evidence: Default::default(),
             worker_lost: false,
+            config_invalid: None,
         });
     }
 
@@ -220,17 +221,29 @@ pub async fn run_agent(
             }) {
                 // Reap the already-connected workers before failing closed.
                 executor.shutdown().await;
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"error": {
-                        "code": "run_configuration_invalid",
-                        "reason": "tool_allowlist_unknown_entry",
-                        "message": format!(
-                            "--tool-allowlist entry '{unknown}' is served by no configured worker"
-                        ),
-                    }})
-                );
-                std::process::exit(2);
+                // D33/K1 (ADR-026): this refusal is decided only AFTER a side
+                // effect (the worker was started). Do NOT process::exit here —
+                // that would leave a lone `run_start` in the audit. Carry a
+                // TYPED verdict so the single terminal source
+                // (`agent_runtime::run_terminal_status`) records one `run_end`
+                // (`run_configuration_invalid`, exit 2) before the process exits
+                // with the same code (`exit_on_config_invalid`).
+                let message =
+                    format!("--tool-allowlist entry '{unknown}' is served by no configured worker");
+                return Ok(AgentResult {
+                    messages: Vec::new(),
+                    usage: Default::default(),
+                    stop_reason: crate::providers::StopReason::Error,
+                    error_message: Some(message.clone()),
+                    last_call_usage: Default::default(),
+                    context_overflow: false,
+                    evidence: Default::default(),
+                    worker_lost: false,
+                    config_invalid: Some(crate::agent::ConfigInvalid {
+                        reason: "tool_allowlist_unknown_entry",
+                        message,
+                    }),
+                });
             }
         }
     }

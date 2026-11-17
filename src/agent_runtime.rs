@@ -613,21 +613,13 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
-    // WP08 (ADR-026): open the caller-requested audit sink immediately before
-    // the first model request. A failure to open (or to write the `run_start`
-    // event) is a required-audit failure that aborts the run with exit 23,
-    // before any provider call — distinct from OTLP's fail-open policy.
-    let audit = open_run_audit(
-        &cfg,
-        &effective_provider,
-        &effective_model,
-        &agent,
-        workspace,
-    );
-    // WP10 (R1, ADR-028 Decision): refuse a worker whose explicit `env` value or
-    // `args` entry discloses the resolved model credential. Fail-closed BEFORE
-    // any worker launches (discovery happens inside run_agent): exit 2 with a
-    // named reason whose text never contains the credential value.
+    // WP10 (R1, ADR-028 Decision; D33/K2): refuse a worker whose explicit `env`
+    // value or `args` entry discloses the resolved model credential. This is a
+    // pure configuration refusal that needs NO runtime state, so it runs BEFORE
+    // the audit opens — like every other exit-2 configuration refusal it then
+    // leaves no audit file (never a lone `run_start`). Fail-closed before any
+    // worker launches (discovery happens inside run_agent): exit 2 with a named
+    // reason whose text never contains the credential value.
     if let (Some(config), Some(credential)) = (&worker_config_runtime, &model_credential) {
         if let Err(reason) = config.reject_credential_disclosure(std::slice::from_ref(credential)) {
             eprintln!(
@@ -641,6 +633,17 @@ pub async fn run_agent(
             std::process::exit(2);
         }
     }
+    // WP08 (ADR-026): open the caller-requested audit sink immediately before
+    // the first model request. A failure to open (or to write the `run_start`
+    // event) is a required-audit failure that aborts the run with exit 23,
+    // before any provider call — distinct from OTLP's fail-open policy.
+    let audit = open_run_audit(
+        &cfg,
+        &effective_provider,
+        &effective_model,
+        &agent,
+        workspace,
+    );
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -684,6 +687,7 @@ pub async fn run_agent(
     // never a local fallback. This also covers the model-side final-output
     // contract: a lost worker takes precedence over the final-output mapping.
     if worker_config_runtime.is_some() {
+        exit_on_config_invalid(&result);
         exit_on_worker_failure(&result);
     }
     let result = result?;
@@ -752,49 +756,64 @@ fn open_run_audit(
 /// `status` string still reflects a non-`EndTurn` ending (e.g. a turn/token
 /// limit) instead of a bare "ok".
 fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static str, i32) {
+    // D33/K1: a typed post-discovery configuration refusal records the reviewed
+    // `run_configuration_invalid` exit 2 (the process exits 2 via
+    // `exit_on_config_invalid`).
+    if matches!(result, Ok(r) if r.config_invalid.is_some()) {
+        return ("run_configuration_invalid", 2);
+    }
+    // WP10 (FR-05, R7, D33/K3): a required-worker failure — the in-run TYPED
+    // `worker_lost` flag OR an initialization `Err` that run_agent returns with
+    // our own `worker_unavailable` prefix — records the reviewed
+    // `worker_unavailable` exit 22, from the SAME classifier (`worker_failure`)
+    // the process exit uses, so the record and the exit always agree (never a
+    // recorded `error`/1 while the process exits 22).
+    if worker_failure(result).is_some() {
+        return (crate::worker_runtime::WORKER_UNAVAILABLE, 22);
+    }
     match result {
         Ok(r) => match r.stop_reason {
             providers::StopReason::EndTurn | providers::StopReason::ToolUse => ("ok", 0),
             providers::StopReason::MaxTokens => ("max_tokens", 0),
             providers::StopReason::Refusal => ("refusal", 0),
             providers::StopReason::Aborted => ("aborted", 0),
-            // WP10 (FR-05): a lost worker route is a distinct terminal failure.
-            // Its recorded exit_code must agree with the process exit the
-            // reviewed table assigns (22), not the generic error exit (1).
-            // WP10 (R7): decide on the TYPED `worker_lost` flag, never a
-            // substring of `error_message` (which can carry tool/model content).
-            providers::StopReason::Error if r.worker_lost => {
-                (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
-            }
             providers::StopReason::Error => ("error", 1),
         },
         Err(_) => ("error", 1),
     }
 }
 
-/// WP10 (FR-05, ADR-028): if the terminal run outcome is a required-worker
-/// failure (an `Err` whose message carries `worker_unavailable`, or an
-/// `Ok(StopReason::Error)` whose `error_message` does), emit the reviewed
-/// `worker_unavailable` JSON and exit 22 (INTERFACES.md exit table). Otherwise
-/// return so normal handling (final-output/exit) proceeds. Diverges on a
-/// worker failure.
-fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
-    let message = match result {
+/// WP10 (R7, D33/K3): classify a terminal result as a required-worker failure,
+/// returning the operator-facing message when it is. TWO shapes map here: the
+/// in-run TYPED `worker_lost` flag (never a substring of `error_message`, which
+/// can carry tool/model content), and an initialization `Err` that `run_agent`
+/// returns carrying our OWN `worker_unavailable` prefix (a value we construct,
+/// not model content). This is the SINGLE classifier shared by
+/// `run_terminal_status` (the audit `run_end`) and `exit_on_worker_failure`
+/// (the process exit), so the recorded exit_code and the process code always
+/// agree on the reviewed `worker_unavailable` exit 22.
+fn worker_failure(result: &anyhow::Result<agent::AgentResult>) -> Option<String> {
+    match result {
         Err(error) => {
             let text = error.to_string();
             text.contains(crate::worker_runtime::WORKER_UNAVAILABLE)
                 .then_some(text)
         }
-        // WP10 (R7): the in-run lost-worker case is identified by the TYPED
-        // `worker_lost` flag, not by substring-matching `error_message`.
         Ok(run) if run.worker_lost => Some(
             run.error_message
                 .clone()
                 .unwrap_or_else(|| crate::worker_runtime::WORKER_UNAVAILABLE.to_string()),
         ),
         Ok(_) => None,
-    };
-    if let Some(message) = message {
+    }
+}
+
+/// WP10 (FR-05, ADR-028): if the terminal run outcome is a required-worker
+/// failure (see `worker_failure`), emit the reviewed `worker_unavailable` JSON
+/// and exit 22 (INTERFACES.md exit table). Otherwise return so normal handling
+/// (final-output/exit) proceeds. Diverges on a worker failure.
+fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
+    if let Some(message) = worker_failure(result) {
         eprintln!(
             "{}",
             serde_json::json!({"error": {
@@ -803,6 +822,28 @@ fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
             }})
         );
         std::process::exit(22);
+    }
+}
+
+/// WP10 (D33/K1, ADR-026): if the terminal run outcome carries a typed
+/// post-discovery configuration refusal (e.g. an allowlist entry served by no
+/// worker), emit the reviewed `run_configuration_invalid` JSON and exit 2. The
+/// matching `run_end` was already written by the single terminal source
+/// (`finalize_run_audit`/`run_terminal_status`); this only prints and exits, so
+/// the audit is never a lone `run_start`. Diverges on a config refusal.
+fn exit_on_config_invalid(result: &anyhow::Result<agent::AgentResult>) {
+    if let Ok(run) = result {
+        if let Some(verdict) = &run.config_invalid {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": verdict.reason,
+                    "message": verdict.message,
+                }})
+            );
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1799,6 +1840,7 @@ mod tests {
             context_overflow: false,
             evidence: Default::default(),
             worker_lost: false,
+            config_invalid: None,
         };
 
         let error = check_agent_result(&result).unwrap_err();
@@ -1821,6 +1863,7 @@ mod tests {
             context_overflow: false,
             evidence: Default::default(),
             worker_lost,
+            config_invalid: None,
         };
         assert_eq!(
             run_terminal_status(&Ok(mk(

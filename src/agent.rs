@@ -350,6 +350,23 @@ pub struct AgentResult {
     /// frontend maps the distinct `worker_unavailable` exit (22) WITHOUT
     /// substring-matching `error_message`, which can carry tool/model content.
     pub worker_lost: bool,
+    /// WP10 (D33/K1, ADR-026): a post-discovery configuration refusal that can
+    /// be decided only AFTER a side effect (a worker was started and its tools
+    /// discovered). Carried as a TYPED terminal verdict — like `worker_lost` —
+    /// so the single terminal source (`agent_runtime::run_terminal_status`)
+    /// records the reviewed `run_configuration_invalid` exit 2 in `run_end`
+    /// before the process exits with the same code, never a lone `run_start`
+    /// indistinguishable from a killed process.
+    pub config_invalid: Option<ConfigInvalid>,
+}
+
+/// WP10 (D33/K1): a typed terminal configuration refusal raised after a worker
+/// side effect (e.g. an allowlist entry that no discovered worker serves). The
+/// `reason` is the reviewed `run_configuration_invalid` cause code; `message`
+/// is the operator-facing diagnostic (never contains a credential value).
+pub struct ConfigInvalid {
+    pub reason: &'static str,
+    pub message: String,
 }
 
 // --- Pure helpers ---
@@ -1040,6 +1057,7 @@ async fn run_inner(
                     context_overflow: false,
                     evidence,
                     worker_lost: false,
+                    config_invalid: None,
                 };
             }
             state.record_request();
@@ -1236,6 +1254,7 @@ async fn run_inner(
                     context_overflow: false,
                     evidence,
                     worker_lost: false,
+                    config_invalid: None,
                 };
             }
         }
@@ -1303,6 +1322,7 @@ async fn run_inner(
                         context_overflow: resp.context_overflow,
                         evidence,
                         worker_lost: false,
+                        config_invalid: None,
                     };
                 }
                 TurnClassification::Failure {
@@ -1333,6 +1353,7 @@ async fn run_inner(
                         context_overflow: resp.context_overflow,
                         evidence,
                         worker_lost: false,
+                        config_invalid: None,
                     };
                 }
                 TurnClassification::Failure {
@@ -1374,6 +1395,7 @@ async fn run_inner(
                             context_overflow: resp.context_overflow,
                             evidence,
                             worker_lost: false,
+                            config_invalid: None,
                         };
                     }
                 },
@@ -1532,6 +1554,7 @@ async fn run_inner(
                     context_overflow: resp.context_overflow,
                     evidence,
                     worker_lost: false,
+                    config_invalid: None,
                 };
             }
             StopReason::ToolUse => {
@@ -2294,6 +2317,7 @@ async fn run_inner(
                         context_overflow: false,
                         evidence,
                         worker_lost: true,
+                        config_invalid: None,
                     };
                 }
 
@@ -2307,6 +2331,7 @@ async fn run_inner(
                         context_overflow: false,
                         evidence,
                         worker_lost: false,
+                        config_invalid: None,
                     };
                 }
 
@@ -2350,6 +2375,7 @@ async fn run_inner(
                                 context_overflow: false,
                                 evidence,
                                 worker_lost: false,
+                                config_invalid: None,
                             };
                         }
                     }

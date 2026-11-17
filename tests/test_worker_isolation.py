@@ -734,3 +734,91 @@ def test_r8_command_with_equals_is_refused_at_parse(daimonos_binary, tmp_path):
     assert completed.returncode == 2, completed.stdout + completed.stderr
     assert "run_configuration_invalid" in completed.stderr
     assert "command" in completed.stderr
+
+
+# --- r3 D33 fixes (K1/K2/K3): terminal record and process exit always agree ---
+
+
+def test_k1_unknown_allowlist_entry_records_run_end_and_reaps_worker(
+        daimonos_binary, tmp_path):
+    # D33/K1: a worker-scoped allowlist entry that no worker serves can be
+    # decided only AFTER a side effect (the worker was started and discovered).
+    # It must end through the single terminal source: the audit carries
+    # run_start AND exactly one run_end with status run_configuration_invalid and
+    # exit_code 2 (never a lone run_start, which is indistinguishable from a
+    # killed process), the process exits 2 naming the entry, and no worker child
+    # survives.
+    config, _, _ = _write_worker(tmp_path)
+    script = str(tmp_path / "worker.py")
+    audit = tmp_path / "state" / "audit.jsonl"
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, audit_path=audit,
+                     allowlist=["mcp__toolside__read_note", "mcp__ghost__missing"])
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run_configuration_invalid" in completed.stderr
+    assert "tool_allowlist_unknown_entry" in completed.stderr
+    assert "mcp__ghost__missing" in completed.stderr
+    events = [json.loads(line) for line in audit.read_text().splitlines()
+              if line.strip()]
+    kinds = [e.get("kind") for e in events]
+    assert kinds.count("run_start") == 1, events
+    run_end = [e for e in events if e.get("kind") == "run_end"]
+    assert len(run_end) == 1, events
+    assert run_end[0].get("status") == "run_configuration_invalid", run_end
+    assert run_end[0].get("exit_code") == 2, run_end
+    # The worker was started (the side effect) but reaped before the exit.
+    assert _worker_survivors(script) == [], "a worker survived the config refusal"
+
+
+def test_k2_credential_disclosure_leaves_no_audit_file_and_no_worker(
+        daimonos_binary, tmp_path):
+    # D33/K2: a worker `env` value that discloses the model credential is a pure
+    # configuration refusal needing no runtime state. It is refused BEFORE the
+    # audit opens, so it leaves NO audit file (the same as every other exit-2
+    # configuration refusal), starts no worker, and the diagnostic never
+    # contains the credential value.
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_SRC)
+    record = tmp_path / "worker_env.json"
+    audit = tmp_path / "state" / "audit.jsonl"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": sys.executable,
+        "args": [str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "WORKER_RECORD": str(record),
+                "PROVIDER_KEY": CREDENTIAL},
+    }}}))
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, audit_path=audit)
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "worker_credential_disclosure" in completed.stderr
+    assert CREDENTIAL not in (completed.stdout + completed.stderr)
+    # No worker launched: its startup record was never written.
+    assert not record.exists(), "a worker launched despite credential disclosure"
+    # No audit file: the refusal precedes open_run_audit, so run_start was never
+    # written (a lone run_start would be indistinguishable from a kill).
+    assert not audit.exists(), (
+        "an audit file was created for a pre-audit configuration refusal")
+
+
+def test_k3_worker_init_failure_records_matching_run_end(daimonos_binary, tmp_path):
+    # D33/K3 inventory gap: a required worker that cannot initialize is returned
+    # as an Err from run_agent (not the in-run worker_lost flag). Its terminal
+    # run_end must carry the SAME exit as the process (22 / worker_unavailable),
+    # via the single terminal source, so an audited init failure is never
+    # recorded as a generic error (exit 1) while the process exits 22.
+    audit = tmp_path / "state" / "audit.jsonl"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"gone": {
+        "command": str(tmp_path / "does-not-exist"), "env": {}}}}))
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, audit_path=audit)
+    assert completed.returncode == 22, completed.stdout + completed.stderr
+    assert "worker_unavailable" in (completed.stdout + completed.stderr)
+    events = [json.loads(line) for line in audit.read_text().splitlines()
+              if line.strip()]
+    run_end = [e for e in events if e.get("kind") == "run_end"]
+    assert len(run_end) == 1, events
+    assert run_end[0].get("status") == "worker_unavailable", run_end
+    assert run_end[0].get("exit_code") == 22, run_end
