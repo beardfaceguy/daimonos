@@ -2,7 +2,7 @@
 
 Date: 2026-10-29
 Status: Launch contracts approved by the user on 2026-10-29 UTC. Package dependencies and operational preflight still apply.
-Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`).
+Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`). Startup refusals use the reserved exit-2 taxonomy below: top-level `code` is `run_configuration_invalid` with the specific cause in `reason` (e.g. `workspace_write_forbidden`), matching the state-authority failure shape (the two tool-refusal codes remain tool-result codes, never exit-2 top-level codes). `--workspace-read-only` is part of the session-daemon launch identity (`src/session_bootstrap.rs`: forwarded to a spawned daemon, hashed into the bootstrap fingerprint, and an explicit selection in `launch_identity`), so a read-only client cannot be served by a daemon started without it.
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Decisions: Accepted ADRs 021–032. Scope: the approved 20-package [plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Coverage: [INVENTORIES.md](INVENTORIES.md).
