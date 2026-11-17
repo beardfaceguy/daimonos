@@ -3,6 +3,8 @@
 The full suites invoke installed CLI programs. They do not replace missing programs with stubs.
 Rust uses the repository's pinned toolchain in `rust-toolchain.toml`.
 
+`tests/conftest.py` sets `RUSTUP_AUTO_INSTALL=0` for the whole suite so a `cargo` probe in a daimonos subprocess never downloads and installs a pinned toolchain (even when a test replaces HOME).
+
 ## Prerequisites
 
 Install Git, curl, Node.js, npm, ShellCheck, Python, and Python virtual-environment support.

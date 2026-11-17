@@ -7,6 +7,14 @@ from typing import List, Optional
 
 import pytest
 
+# A `cargo` availability probe is a rustup shim; inside a project pinning a
+# toolchain via rust-toolchain.toml it would download and install that toolchain
+# (~615 MB, network) when $HOME lacks .rustup. Forbid auto-install for every
+# daimonos subprocess a test starts (including tests that replace HOME), so the
+# suite never triggers a toolchain download. setdefault leaves an explicit
+# outer value untouched.
+os.environ.setdefault("RUSTUP_AUTO_INSTALL", "0")
+
 
 class DaimonosClient:
     """Manages a daimonos subprocess and sends JSON-RPC over stdio."""

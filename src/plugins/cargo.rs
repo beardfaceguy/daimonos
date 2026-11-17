@@ -413,6 +413,14 @@ async fn cargo_add(
 pub fn is_available() -> bool {
     std::process::Command::new("cargo")
         .arg("--version")
+        // `cargo` is a rustup shim: inside a project pinning a toolchain via
+        // rust-toolchain.toml, a bare `cargo --version` makes the shim download
+        // and install that toolchain (~615 MB, network) into $HOME/.rustup when
+        // it is absent. This is a passive availability probe at startup, so
+        // forbid auto-install: the shim then fails fast with "toolchain is not
+        // installed" and we report cargo unavailable instead of fetching a
+        // toolchain (daimonos fix: startup probe must not install a toolchain).
+        .env("RUSTUP_AUTO_INSTALL", "0")
         // Never inherit our stdin; see build_command in ops/exec_ops.rs.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
