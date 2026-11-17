@@ -1022,6 +1022,20 @@ async fn run_inner(
                 };
             }
             state.record_request();
+            // WP05 R4: record a real-counter fallback outcome now, so a loop
+            // exit that reaches no explicit terminal decision (e.g. a
+            // `MaxTokens` evidence turn with auto-continue disabled) still
+            // reports the true attempts/model_requests instead of 0/0. Any
+            // genuine Success/Failure/RequestLimit decision below overwrites
+            // this and returns, so the tentative value never survives a real
+            // decision; only an Evidence turn carries it to the next iteration,
+            // where it is refreshed with the updated counters.
+            if let Some(sink) = &config.final_output_sink {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::structured_output::FinalOutputOutcome::Failure(
+                        state.no_final_call_json(),
+                    ));
+            }
         }
 
         // Deterministically shed old successful tool context before every

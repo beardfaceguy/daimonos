@@ -219,16 +219,31 @@ impl FinalOutputSpec {
 
         // A clean success is exactly one final call and no other calls.
         if final_count == 1 && calls.len() == 1 {
-            let (_, _, input) = calls[0];
+            let (id, _, input) = calls[0];
             let errors = self.validator.validate(input, self.max_validation_errors);
             if errors.is_empty() {
                 return TurnClassification::Success {
                     arguments: input.clone(),
                 };
             }
+            // FR-01 req 6: a failed ending that contains tool calls answers
+            // every call. The single invalid final-answer call is paired with
+            // an ordered error result so a corrective turn is wire-valid on
+            // both endpoints (ADR-024 strict unanswered-call rule) instead of
+            // leaving an orphan `tool_use`/`tool_call`.
+            let invalid_text = prompt_section(FinalFailureReason::InvalidArguments.as_str());
+            let content = if invalid_text.is_empty() {
+                FinalFailureReason::InvalidArguments.as_str().to_string()
+            } else {
+                invalid_text
+            };
             return TurnClassification::Failure {
                 failure: FinalAttemptFailure::new(FinalFailureReason::InvalidArguments, errors),
-                error_results: Vec::new(),
+                error_results: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content,
+                    is_error: true,
+                }],
             };
         }
 
@@ -340,6 +355,20 @@ impl FinalOutputState {
         json!({
             "reason": failure.reason.as_str(),
             "validation_errors": failure.validation_errors,
+            "attempts": self.final_attempts,
+            "model_requests": self.model_requests,
+        })
+    }
+
+    /// The fallback terminal JSON for a run that exits the loop without an
+    /// explicit final-output decision (e.g. a `MaxTokens` evidence turn with
+    /// auto-continue disabled). Reports the run's REAL counters with reason
+    /// `no_final_call` so the caller never sees `attempts: 0, model_requests: 0`
+    /// after requests were actually sent (FR-01 req 8).
+    pub fn no_final_call_json(&self) -> Value {
+        json!({
+            "reason": "no_final_call",
+            "validation_errors": [],
             "attempts": self.final_attempts,
             "model_requests": self.model_requests,
         })
@@ -586,12 +615,42 @@ mod tests {
             StopReason::ToolUse,
         );
         match s.classify(&r) {
-            TurnClassification::Failure { failure, .. } => {
+            TurnClassification::Failure {
+                failure,
+                error_results,
+            } => {
                 assert_eq!(failure.reason, FinalFailureReason::InvalidArguments);
                 assert!(!failure.validation_errors.is_empty());
+                // FR-01 req 6 / R1: the single invalid call is answered with an
+                // ordered error result so a corrective turn is wire-valid.
+                assert_eq!(error_results.len(), 1);
+                match &error_results[0] {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        content,
+                    } => {
+                        assert_eq!(tool_use_id, "1");
+                        assert!(is_error);
+                        assert!(!content.is_empty());
+                    }
+                    _ => panic!("expected a paired tool result"),
+                }
             }
             other => panic!("expected failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_final_call_json_reports_real_counters() {
+        let mut state = spec(1, None).new_state();
+        state.record_request();
+        state.record_request();
+        let v = state.no_final_call_json();
+        assert_eq!(v["reason"], "no_final_call");
+        assert_eq!(v["attempts"], 0);
+        assert_eq!(v["model_requests"], 2);
+        assert!(v["validation_errors"].is_array());
     }
 
     #[test]

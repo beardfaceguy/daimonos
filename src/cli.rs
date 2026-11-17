@@ -49,7 +49,13 @@ pub struct AgentArgs {
     /// `corrective_retries`, and optional `max_model_requests`. On success the
     /// run emits only the validated argument JSON and one newline on stdout; a
     /// failed ending emits the typed final-output error. Default off.
-    #[arg(long, value_name = "PATH")]
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot emit a single validated terminal document, so the flag is
+    /// refused there at startup (ADR-024 / INTERFACES.md frontend coverage)
+    /// rather than silently ignored. The chat, ACP, and session-daemon
+    /// frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
     pub final_output: Option<PathBuf>,
 }
 

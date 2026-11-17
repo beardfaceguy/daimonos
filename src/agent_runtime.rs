@@ -454,6 +454,44 @@ pub async fn run_agent(
     } else {
         task
     };
+    // WP05 (ADR-024) CI-1: resolve and validate the explicit final-output
+    // control file BEFORE the agent env file is read. INTERFACES.md startup
+    // order resolves explicit control files (step 3) ahead of environment
+    // mutation / implicit reads, so a config error exits 2, an unusable or
+    // external-reference schema exits 20 with the final-output error shape, and
+    // a final-tool name that collides with a registered tool exits 2
+    // (tool_name_collision) — all fail-closed before a single model request and
+    // regardless of whether an agent env file exists on the host.
+    let final_output_runtime = match &final_output {
+        Some(path) => {
+            let spec = match crate::structured_output::load_control(path) {
+                Ok(spec) => spec,
+                Err(startup) => emit_final_output_startup_error(startup),
+            };
+            let collides = crate::tool_facade::active_schemas_for_policy(
+                workspace,
+                &cfg.prompts.resolved_tool_descriptions,
+                cfg.filesystem_authority.is_some(),
+            )
+            .iter()
+            .any(|schema| schema.name.as_str() == spec.tool_name());
+            if collides {
+                emit_final_output_startup_error(
+                    crate::structured_output::FinalOutputStartupError {
+                        exit_code: 2,
+                        message: Some(format!(
+                            "final-output control file: tool_name '{}' collides with a registered tool (tool_name_collision)",
+                            spec.tool_name()
+                        )),
+                        json: None,
+                    },
+                );
+            }
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+            Some((std::sync::Arc::new(spec), sink))
+        }
+        None => None,
+    };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
@@ -485,41 +523,6 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
-    // WP05 (ADR-024): structured final output. Parse and compile the control
-    // file before any provider work — a config error exits 2, an unusable or
-    // external-reference schema exits 20 with the final-output error shape, and
-    // a final-tool name that collides with a registered tool exits 2
-    // (tool_name_collision). All fail-closed before a single model request.
-    let final_output_runtime = match &final_output {
-        Some(path) => {
-            let spec = match crate::structured_output::load_control(path) {
-                Ok(spec) => spec,
-                Err(startup) => emit_final_output_startup_error(startup),
-            };
-            let collides = crate::tool_facade::active_schemas_for_policy(
-                workspace,
-                &cfg.prompts.resolved_tool_descriptions,
-                cfg.filesystem_authority.is_some(),
-            )
-            .iter()
-            .any(|schema| schema.name.as_str() == spec.tool_name());
-            if collides {
-                emit_final_output_startup_error(
-                    crate::structured_output::FinalOutputStartupError {
-                        exit_code: 2,
-                        message: Some(format!(
-                            "final-output control file: tool_name '{}' collides with a registered tool (tool_name_collision)",
-                            spec.tool_name()
-                        )),
-                        json: None,
-                    },
-                );
-            }
-            let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
-            Some((std::sync::Arc::new(spec), sink))
-        }
-        None => None,
-    };
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
