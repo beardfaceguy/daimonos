@@ -160,11 +160,11 @@ with another source, so `--model-profile` cannot be used together with
 | `base_url` | yes | The endpoint base URL. |
 | `wire` | yes | `"chat"` (Chat Completions, `{base_url}/chat/completions`) or `"messages"` (Anthropic Messages, `{base_url}/v1/messages`). Never inferred from the model or URL. |
 | `credential_env` | yes | Name of the environment variable holding the credential. The value is read only from this variable and never appears in logs or exports. |
-| `max_tokens` | no (default 1024) | Caller-owned output ceiling (Messages sends it; Chat omits it). |
+| `max_tokens` | messages: yes; chat: no | Caller-owned output ceiling. There is no built-in default: on the `messages` wire it is mandatory, so a `messages` profile that omits it fails at startup naming the field; on the `chat` wire it is sent only when the caller set it and omitted entirely otherwise. |
 | `timeout_ms` | no (default 60000) | Request timeout, in milliseconds. |
 | `request_retries` | no (default 0) | Caller-configured retry count. The HTTP layer performs no hidden retries; every attempt is recorded. Bounded by the model-request ceiling (`100`, ADR-025); a larger value is refused at startup. |
 | `proxy` | no | An explicit proxy URL. Proxy environment variables are otherwise ignored. |
-| `extra_body_fields` | no | Explicit, caller-configured extra body fields. They can never overwrite a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or introduce a forbidden sampling/forced-choice/strict field. |
+| `extra_body_fields` | no | Explicit, caller-configured extra body fields, validated at startup. A key is refused before any request if it overwrites a protected field (`model`, `max_tokens`, `messages`, `tools`, `tool_choice`, `system`) or is any sampling, forced-choice, strictness, streaming, or multi-choice parameter on either wire (e.g. `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `logit_bias`, `n`, `best_of`, `logprobs`, `top_logprobs`, `function_call`, `parallel_tool_calls`, `strict`, `response_format`, `stream`, `stream_options`). No allowlist of permitted extras is defined, so only keys outside that denylist and the protected set are accepted. |
 
 The flag is mutually exclusive with `--model`, `--provider`, and `--interactive`.
 The controlled transport is honored only by the one-shot send path; the

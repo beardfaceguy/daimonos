@@ -638,7 +638,11 @@ pub struct ControlledModelSpec {
 /// or introduce a forbidden sampling/forced-choice/strict behavior.
 #[derive(Debug, Clone)]
 pub struct ControlledRequest {
-    pub max_tokens: u32,
+    /// Caller-owned output ceiling (FR-04 req 6). There is no built-in default
+    /// on the request path: the Messages wire requires it (enforced at startup
+    /// in [`ControlledProfile::from_json`]); the Chat wire omits the field
+    /// entirely when the caller did not set it.
+    pub max_tokens: Option<u32>,
     pub timeout: std::time::Duration,
     pub request_retries: u32,
     pub proxy: Option<String>,
@@ -648,7 +652,7 @@ pub struct ControlledRequest {
 impl Default for ControlledRequest {
     fn default() -> Self {
         ControlledRequest {
-            max_tokens: 1024,
+            max_tokens: None,
             timeout: std::time::Duration::from_secs(60),
             request_retries: 0,
             proxy: None,
@@ -682,10 +686,13 @@ pub struct ControlledProfile {
     pub request: ControlledRequest,
 }
 
-/// The model-request ceiling (ADR-025): the controlled transport owns the
-/// exact attempt count, so a caller-configured `request_retries` is bounded by
-/// this hard maximum. It is a safety invariant of the controlled transport
-/// (not an operator tunable); a profile naming more is refused at validation.
+/// The model-request retry ceiling. ADR-025 ("Controlled model requests use an
+/// isolated opt-in transport profile") specifies that the controlled transport
+/// owns the exact attempt count and that a caller-configured `request_retries`
+/// is subject to the model-request ceiling. ADR-025 treats this ceiling as a
+/// safety invariant of the transport, NOT an operator setting, so it is a
+/// compile-time constant rather than a `daimonos.default.toml` tunable; a
+/// profile naming a larger value is refused at startup validation.
 pub const CONTROLLED_REQUEST_RETRY_CEILING: u32 = 100;
 
 impl ControlledProfile {
@@ -767,11 +774,21 @@ impl ControlledProfile {
 
         let mut request = ControlledRequest::default();
         if let Some(v) = obj.get("max_tokens") {
-            request.max_tokens = v
-                .as_u64()
-                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
-                .ok_or_else(|| "model profile max_tokens must be a positive integer".to_string())?
-                as u32;
+            request.max_tokens = Some(
+                v.as_u64()
+                    .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                    .ok_or_else(|| {
+                        "model profile max_tokens must be a positive integer".to_string()
+                    })? as u32,
+            );
+        }
+        // max_tokens is caller-owned (FR-04 req 6). On the Messages wire the
+        // field is mandatory, so a Messages profile that omits it fails at
+        // startup naming the field — no built-in default travels on the wire.
+        if wire == Wire::Messages && request.max_tokens.is_none() {
+            return Err(
+                "model profile incomplete: the messages wire requires max_tokens".to_string(),
+            );
         }
         if let Some(v) = obj.get("timeout_ms") {
             let ms = v
@@ -804,10 +821,25 @@ impl ControlledProfile {
             }
         }
         if let Some(v) = obj.get("extra_body_fields") {
-            request.extra_body_fields = v
+            let map = v
                 .as_object()
-                .ok_or_else(|| "model profile extra_body_fields must be an object".to_string())?
-                .clone();
+                .ok_or_else(|| "model profile extra_body_fields must be an object".to_string())?;
+            // Refuse a protected-field overwrite or a forbidden
+            // sampling/forced-choice/strict/stream/multi-choice key at startup,
+            // before any request is built (FR-04 req 4; ADR-025).
+            for key in map.keys() {
+                if PROTECTED_BODY_FIELDS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "model profile extra_body_fields may not overwrite protected field {key:?}"
+                    ));
+                }
+                if FORBIDDEN_BODY_FIELDS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "model profile extra_body_fields may not introduce forbidden field {key:?}"
+                    ));
+                }
+            }
+            request.extra_body_fields = map.clone();
         }
 
         Ok(ControlledProfile {
@@ -834,8 +866,43 @@ pub(crate) const PROTECTED_BODY_FIELDS: [&str; 6] = [
     "tool_choice",
     "system",
 ];
-pub(crate) const FORBIDDEN_BODY_FIELDS: [&str; 5] =
-    ["temperature", "top_p", "top_k", "stream", "strict"];
+/// Sampling, forced-choice, strictness, streaming, and multi-choice parameters
+/// the caller's `extra_body_fields` may never introduce on EITHER wire. FR-04
+/// req 4 bans "temperature, top_p, top_k, or any other sampling parameter" and
+/// ADR-025 states explicit extensions cannot override the mandatory
+/// sampling/forced-choice prohibitions. Neither ADR-025 nor INTERFACES.md names
+/// an allowlist of permitted extra keys, so a complete denylist across both the
+/// Messages and Chat vocabularies is enforced (decision D-WP07-R4-R1). Keys
+/// that collide with a field Daimonos sets itself are refused separately via
+/// [`PROTECTED_BODY_FIELDS`].
+pub(crate) const FORBIDDEN_BODY_FIELDS: [&str; 21] = [
+    // sampling
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_a",
+    "typical_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
+    "logit_bias",
+    // multi-choice / forced output detail
+    "n",
+    "best_of",
+    "logprobs",
+    "top_logprobs",
+    // forced choice
+    "function_call",
+    "parallel_tool_calls",
+    // strictness / structured forcing
+    "strict",
+    "response_format",
+    // streaming
+    "stream",
+    "stream_options",
+];
 
 /// Merge caller `extra_body_fields` into a controlled body. Refuses to overwrite
 /// a protected field or introduce a forbidden sampling/forced-choice/strict key.
@@ -1779,7 +1846,10 @@ mod controlled_transport_tests {
         .await;
         let resp = controlled_send(
             &messages_spec(base),
-            &ControlledRequest::default(),
+            &ControlledRequest {
+                max_tokens: Some(1024),
+                ..ControlledRequest::default()
+            },
             "SECRET_CREDENTIAL",
             &ctx_with_tool(),
         )
@@ -2027,7 +2097,7 @@ mod controlled_transport_tests {
         });
         let profile = ControlledProfile::from_json(&full).unwrap();
         assert_eq!(profile.spec.wire, Wire::Messages);
-        assert_eq!(profile.request.max_tokens, 4096);
+        assert_eq!(profile.request.max_tokens, Some(4096));
         assert_eq!(profile.request.request_retries, 0);
         assert!(profile.request.proxy.is_none());
         assert_eq!(
@@ -2044,7 +2114,8 @@ mod controlled_transport_tests {
         let at = |n: u64| {
             serde_json::json!({
                 "provider_label": "a", "model": "m", "base_url": "http://x",
-                "wire": "messages", "credential_env": "K", "request_retries": n
+                "wire": "messages", "credential_env": "K", "max_tokens": 256,
+                "request_retries": n
             })
         };
         let ok = ControlledProfile::from_json(&at(CONTROLLED_REQUEST_RETRY_CEILING as u64))
@@ -2091,6 +2162,122 @@ mod controlled_transport_tests {
         assert_eq!(body["metadata"], serde_json::json!({"k": "v"}));
     }
 
+    // R4 review (R1): extra_body_fields can carry a sampling parameter that the
+    // old five-entry denylist never named. FR-04 req 4 bans every sampling
+    // parameter and ADR-025 forbids explicit extensions overriding that
+    // prohibition. Such a profile must be refused at startup (from_json),
+    // before any request is built or sent, naming the offending field.
+    #[test]
+    fn controlled_profile_rejects_sampling_in_extra_body_fields() {
+        let with_extra = |field: &str| {
+            serde_json::json!({
+                "provider_label": "openrouter", "model": "m",
+                "base_url": "http://x", "wire": "chat",
+                "credential_env": "K", "extra_body_fields": { field: 1 }
+            })
+        };
+        for field in [
+            "frequency_penalty",
+            "presence_penalty",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "seed",
+            "min_p",
+            "repetition_penalty",
+            "stream_options",
+            "response_format",
+            "best_of",
+            "parallel_tool_calls",
+        ] {
+            let err = ControlledProfile::from_json(&with_extra(field))
+                .expect_err("a sampling/forced-choice extra must be refused at startup");
+            assert!(err.contains(field), "error must name {field}: {err}");
+            assert!(
+                err.contains("forbidden"),
+                "error must call it forbidden: {err}"
+            );
+        }
+    }
+
+    // R4 review (R2): max_tokens comes from the caller (FR-04 req 6). On the
+    // Messages wire the field is mandatory, so a Messages profile that omits it
+    // must fail at startup naming the field — there is no built-in default on
+    // the request path. On the Chat wire the field is optional.
+    #[test]
+    fn controlled_messages_profile_requires_caller_max_tokens() {
+        let p = serde_json::json!({
+            "provider_label": "anthropic", "model": "m", "base_url": "http://x",
+            "wire": "messages", "credential_env": "K"
+        });
+        let err = ControlledProfile::from_json(&p)
+            .expect_err("a Messages profile without max_tokens must fail at startup");
+        assert!(
+            err.contains("max_tokens"),
+            "error must name max_tokens: {err}"
+        );
+    }
+
+    #[test]
+    fn controlled_chat_profile_allows_omitted_max_tokens() {
+        let p = serde_json::json!({
+            "provider_label": "openrouter", "model": "m", "base_url": "http://x",
+            "wire": "chat", "credential_env": "K"
+        });
+        assert!(
+            ControlledProfile::from_json(&p).is_ok(),
+            "a Chat profile may omit max_tokens"
+        );
+    }
+
+    // R4 review (R2): the Chat wire carries the caller's max_tokens only when
+    // the caller set it, and omits the field entirely otherwise — no built-in
+    // value is ever injected on the request path.
+    #[test]
+    fn controlled_chat_body_includes_max_tokens_only_when_caller_set_it() {
+        let ctx = ctx_with_tool();
+        // Drive through from_json (not a struct literal) so the test is
+        // agnostic to the max_tokens field representation.
+        let chat_profile = |extra: Value| {
+            let mut obj = serde_json::json!({
+                "provider_label": "openrouter", "model": "some/model",
+                "base_url": "http://x", "wire": "chat", "credential_env": "K"
+            });
+            obj.as_object_mut().unwrap().extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            ControlledProfile::from_json(&obj).unwrap()
+        };
+        let unset = crate::providers::openrouter::controlled_request(
+            &chat_spec("http://x".into()),
+            &chat_profile(serde_json::json!({})).request,
+            "K",
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            unset.body.get("max_tokens").is_none(),
+            "Chat omits max_tokens when the caller did not set it"
+        );
+        let set = crate::providers::openrouter::controlled_request(
+            &chat_spec("http://x".into()),
+            &chat_profile(serde_json::json!({"max_tokens": 321})).request,
+            "K",
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            set.body.get("max_tokens"),
+            Some(&serde_json::json!(321)),
+            "Chat carries the caller's max_tokens when set"
+        );
+    }
+
     // H6: a credential value never appears in a Debug representation or in any
     // controlled-mode error message. INTERFACES: "Do not include ... a secret
     // value in error messages." The credential is injected only into wire
@@ -2102,7 +2289,7 @@ mod controlled_transport_tests {
         let profile = ControlledProfile::from_json(&serde_json::json!({
             "provider_label": "anthropic", "model": "claude-opus-5-5",
             "base_url": "http://127.0.0.1:1", "wire": "messages",
-            "credential_env": "CTRL_H6_KEY"
+            "credential_env": "CTRL_H6_KEY", "max_tokens": 256
         }))
         .unwrap();
         let provider = super::router::ControlledProvider::from_profile(profile).unwrap();

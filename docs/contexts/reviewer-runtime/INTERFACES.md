@@ -164,7 +164,7 @@ Required final-output reasons remain `no_final_call`, `mixed_calls`, `invalid_ar
 Do not collapse those into one free-text message. The terminal failure records its last validation errors.
 
 WP07 adapts existing `src/providers/anthropic.rs`, `src/providers/openrouter.rs`, and `src/providers/router.rs`.
-I owns shared `ControlledModelSpec`, `ControlledRequest`, and `ControlledTransport` seams in existing `src/providers/mod.rs`.
+I owns the shared controlled-transport seams in existing `src/providers/mod.rs`. The shipped symbols are `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`, `ControlledHttp`, `controlled_client`, and `controlled_send` (the earlier reserved name `ControlledTransport` was not used; the transport is realized as `controlled_send` + `ControlledHttp` + `controlled_client`).
 Do not add a parallel controlled provider module or duplicate wire implementation.
 The model-profile JSON contains `provider_label`, `model`, `base_url`, `wire`, and `credential_env` as one complete source.
 Additional caller controls are `max_tokens`, `timeout_ms`, `request_retries`, `proxy`, and explicit `extra_body_fields`.
@@ -199,7 +199,13 @@ timeout against a slow endpoint, explicit-proxy routing, the 400-on-forced
 `tool_choice` endpoint, and fixed headers under an active tracing provider on
 both wires); AC-04.7, the opt-out regression, the fail-closed `--interactive`
 refusal, and the ambient-proxy-ignored counting-proxy check by
-`tests/test_request_control.py`. The capability probe (AC-04.6)
+`tests/test_request_control.py`. `max_tokens` is caller-owned with no built-in
+default: mandatory on the `messages` wire (a profile omitting it is refused at
+startup) and omitted on the `chat` wire unless the caller set it.
+`extra_body_fields` are validated at startup against `PROTECTED_BODY_FIELDS` and
+a complete `FORBIDDEN_BODY_FIELDS` denylist (every sampling, forced-choice,
+strictness, streaming, and multi-choice parameter on both wires); no allowlist
+of permitted extras is defined. The capability probe (AC-04.6)
 and audit record remain WP09/WP08; the integrated probe repeats AC-04.1-04.5.
 
 WP09 owns `src/capability_probe.rs` (new): `ProbeSpec` and `ProbeOutcome`.

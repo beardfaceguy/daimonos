@@ -635,6 +635,11 @@ pub(crate) fn controlled_request(
     body.insert("model".to_string(), json!(spec.model));
     body.insert("messages".to_string(), json!(messages));
     body.insert("tools".to_string(), json!(tools));
+    // max_tokens is caller-owned (FR-04 req 6); on the Chat wire it is optional,
+    // so emit it only when the caller set it and omit the field otherwise.
+    if let Some(max_tokens) = req.max_tokens {
+        body.insert("max_tokens".to_string(), json!(max_tokens));
+    }
     // Explicit automatic tool choice whenever tools are offered (FR-04 req 5).
     if !tools.is_empty() {
         body.insert("tool_choice".to_string(), json!("auto"));

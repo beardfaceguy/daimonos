@@ -114,6 +114,42 @@ def test_unconfigured_extra_field_is_refused(daimonos_binary, tmp_path):
     assert "unconfigured" in (result.stderr + result.stdout)
 
 
+def test_sampling_extra_body_field_is_refused_at_startup(daimonos_binary, tmp_path):
+    # R4 review (R1): a sampling parameter smuggled through extra_body_fields (a
+    # key the old short denylist never named) is refused at startup, before any
+    # request, naming the offending field. FR-04 req 4 / ADR-025.
+    path = tmp_path / "sampling_extra.json"
+    data = json.loads(_write_profile(tmp_path / "base.json", max_tokens=256).read_text())
+    data["extra_body_fields"] = {"frequency_penalty": 2.0}
+    path.write_text(json.dumps(data))
+    result = _run_agent(daimonos_binary, tmp_path, "--model-profile", str(path))
+    assert result.returncode != 0, result.stdout
+    combined = result.stderr + result.stdout
+    assert "frequency_penalty" in combined, combined
+    assert "forbidden" in combined, combined
+
+
+def test_messages_profile_without_max_tokens_fails_at_startup(daimonos_binary, tmp_path):
+    # R4 review (R2): on the messages wire max_tokens is mandatory; a profile
+    # that omits it fails at startup naming the field (no built-in default on
+    # the request path). FR-04 req 6.
+    profile = _write_profile(tmp_path / "no_max.json")  # messages, no max_tokens
+    result = _run_agent(daimonos_binary, tmp_path, "--model-profile", str(profile))
+    assert result.returncode != 0, result.stdout
+    assert "max_tokens" in (result.stderr + result.stdout)
+
+
+def test_chat_profile_without_max_tokens_is_accepted_at_startup(daimonos_binary, tmp_path):
+    # R4 review (R2): on the chat wire max_tokens is optional; a complete chat
+    # profile that omits it validates and the dry-run proceeds with no request.
+    profile = _write_profile(
+        tmp_path / "chat_no_max.json",
+        wire="chat", provider_label="openrouter", model="some/model",
+    )
+    result = _run_agent(daimonos_binary, tmp_path, "--model-profile", str(profile))
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_profile_cannot_be_combined_with_model_or_provider_flags(daimonos_binary, tmp_path):
     # FR-04 req 2: values must not be combined from different sources. The flag
     # is mutually exclusive with --model/--provider at the CLI boundary.
@@ -382,7 +418,10 @@ def test_process_chat_body_is_the_fixed_set_no_sampling(daimonos_binary, tmp_pat
     assert len(posts) == 1, posts
     assert posts[0]["path"] == "/chat/completions", posts[0]["path"]
     body = posts[0]["body"]
-    assert set(body) == {"model", "messages", "tools", "tool_choice"}, body
+    # R4 review (R2): the Chat wire now carries the caller's max_tokens (the
+    # profile sets 256), and still no sampling field.
+    assert set(body) == {"model", "messages", "tools", "tool_choice", "max_tokens"}, body
+    assert body["max_tokens"] == 256, body
     for sampling in ("temperature", "top_p", "top_k", "stream"):
         assert sampling not in body, f"sampling field {sampling} present"
 

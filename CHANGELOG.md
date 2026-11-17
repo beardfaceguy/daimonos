@@ -18,7 +18,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   only the fixed body/header set, set automatic tool choice explicitly (never a
   forced choice or provider `strict` flag), send no sampling parameters, use the
   stable endpoint path, and suppress ambient headers, telemetry, redirects, and
-  ambient proxies. Default off; legacy provider behavior is unchanged. The flag
+  ambient proxies. `max_tokens` is caller-owned with no built-in default:
+  mandatory on the `messages` wire (a profile omitting it fails at startup) and
+  omitted on the `chat` wire unless the caller set it. `extra_body_fields` are
+  validated at startup and refused before any request if they overwrite a
+  protected field or carry any sampling, forced-choice, strictness, streaming,
+  or multi-choice parameter on either wire. Default off; legacy provider behavior is unchanged. The flag
   is honored only by the one-shot send path and fails closed when combined with
   `--interactive` (the interactive TUI routes through the session daemon, which
   carries no profile). Caller `request_retries` is bounded by the model-request

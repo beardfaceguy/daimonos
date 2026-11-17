@@ -521,8 +521,12 @@ pub(crate) fn controlled_request(
 
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), json!(spec.model));
-    // max_tokens comes from the caller (FR-04 req 6, 11).
-    body.insert("max_tokens".to_string(), json!(req.max_tokens));
+    // max_tokens is caller-owned (FR-04 req 6, 11); the Messages wire requires
+    // it, enforced at startup in `ControlledProfile::from_json`. Emit the
+    // caller value; never inject a built-in default on the request path.
+    if let Some(max_tokens) = req.max_tokens {
+        body.insert("max_tokens".to_string(), json!(max_tokens));
+    }
     if let Some(system) = &ctx.system {
         body.insert("system".to_string(), json!(system));
     }
