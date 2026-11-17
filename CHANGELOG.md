@@ -7,6 +7,52 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **`--audit-path` (FR-04).** A global, default-off option that writes a
+  caller-requested, privacy-preserving run audit: one private JSONL file
+  (`O_CREAT | O_EXCL`, mode `0600`, never appended) with a versioned
+  lifecycle (`run_start` … `run_end`), `model_request`, `tool_call`, and
+  `tool_refusal` records sharing one `run_id` and a monotonic `sequence`. It
+  is independent of optional analytics and OTLP export and works without
+  controlled transport or a model profile. Credentials, URL userinfo/path/
+  query, prompts, bodies, headers, and tool argument/result contents never
+  enter the record; arguments and results are SHA-256 hashes of canonical
+  (sorted-key) bytes, only the credential variable name and base-URL host are
+  recorded, and unavailable metadata is explicit `null`. Unlike OTLP's
+  fail-open tracing, a requested audit is required: an open/write/finish
+  failure (including an existing destination, or exceeding
+  `[reviewer.audit]` `max_event_bytes`/`max_events`) stops the run with exit
+  `23` (`audit_write_failed`) — an open failure before any model request, a
+  mid-run failure before further model or tool work. With `--state-dir` the
+  path must be under the state root (else exit `2`, naming the option and
+  path); otherwise it must be outside the workspace. New module
+  `src/run_audit.rs`. See ADR-026 and `docs/configuration.md`.
+  The audit is written only by the one-shot `agent --print` frontend; every
+  other frontend that accepts the global option (`chat`, `acp`, the MCP
+  server, the session daemon, the interactive agent, and `agent --dry-run`)
+  refuses `--audit-path` at startup with exit `2` (`run_configuration_invalid`,
+  reason `audit_unsupported_frontend`) rather than run a falsely-audited
+  session. The terminal `run_end` record is written before any assistant
+  output is published, and its `status`/`exit_code` come from the same
+  terminal source as the process exit. The typed `AuditEvent` renders the same
+  JSON that is streamed to the file.
+- **`--workspace-read-only` (FR-07).** A global, default-off option that
+  prohibits every Daimonos-initiated workspace mutation end to end (startup,
+  tool calls, teardown). Workspace mutations are refused with
+  `workspace_write_forbidden` and opaque, unmediatable tools (`execute_script`,
+  arbitrary `exec`, the repair helper, external CLI plugins) with
+  `tool_policy_unsupported`, at every dispatch boundary; an allowlist cannot
+  override the refusal. `execute_script` is refused before any Starlark runs in
+  every frontend — over MCP/daemon and in `daimonos agent` / `chat` / `acp`
+  (the shared agent run loop) — not only on the MCP path. Read tools, including
+  `git_read`, keep working, and internal state uses `--state-dir`; the
+  startup-guarded internal writers are a single registry
+  (`run_policy::INTERNAL_WRITERS`, incl. the request-trace directory W11)
+  cross-checked against the INVENTORIES.md W-rows by a completeness test.
+  Central admission table in `src/run_policy.rs`. See ADR-022 and
+  `docs/configuration.md`.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

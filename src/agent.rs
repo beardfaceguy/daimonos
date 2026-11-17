@@ -240,6 +240,11 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// WP08 (FR-04, ADR-026): caller-requested local run audit sink. `None` =
+    /// audit off. When present, every provider response and tool dispatch in
+    /// this loop is recorded; a required-audit write failure poisons the sink
+    /// and stops the run before further model/tool work.
+    pub audit: Option<std::sync::Arc<crate::run_audit::RunAudit>>,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -905,6 +910,8 @@ async fn run_inner(
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+    // WP08: per-run model-request sequence for the audit record (ADR-026).
+    let mut audit_model_seq: u64 = 0;
     if let Some(journal) = &journal {
         journal.checkpoint(&messages).await;
     }
@@ -1137,6 +1144,33 @@ async fn run_inner(
         if let Some(journal) = &journal {
             journal.record_usage(&total_usage, &resp.usage);
         }
+        // WP08 audit (ADR-026): record this provider request. HTTP status and
+        // explicit retry index are WP07 controlled-transport metadata not
+        // exposed by the default provider, so they are recorded as
+        // explicit-unavailable / 0. A required-audit write failure ends the run
+        // before the next model request (fail-closed).
+        if let Some(audit) = &config.audit {
+            let _ = audit.record_model_request(
+                audit_model_seq,
+                None,
+                0,
+                false,
+                Some(resp.usage.input),
+                Some(resp.usage.output),
+            );
+            audit_model_seq += 1;
+            if audit.poisoned() {
+                return AgentResult {
+                    messages,
+                    usage: total_usage,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("audit_write_failed".to_string()),
+                    last_call_usage: resp.usage,
+                    context_overflow: false,
+                    evidence,
+                };
+            }
+        }
         if let Some(log_cfg) = &config.token_log {
             let context_composition = crate::context_metrics::measure_context(&ctx);
             let response_tool_calls = resp
@@ -1347,6 +1381,11 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+                // The error message carried if `terminate` is set below. An
+                // after_tool_call hook keeps the default; an audit-write poison
+                // (R5) overrides it to the same self-describing code the
+                // model-request audit path uses.
+                let mut terminate_reason: &str = "terminated by after_tool_call hook";
 
                 // Baseline for this turn's first tool call. Taken here so
                 // read-only turns never shell out to git at all.
@@ -1425,7 +1464,29 @@ async fn run_inner(
                         )
                     });
                     let mut transient = false;
-                    let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                    // R1 (ADR-022, INVENTORIES tool-class table): the agent /
+                    // chat / ACP run loop owns its own execute_script branch,
+                    // which bypasses `mcp::run_execute_script`. execute_script
+                    // is opaque — its inner effects cannot be mediated — so
+                    // refuse it here, before the Starlark engine starts, with
+                    // the same structured payload as the MCP boundary. An
+                    // allowlist entry cannot override this refusal.
+                    let script_refused_read_only =
+                        name == EXECUTE_SCRIPT_TOOL && session.lock().await.admission.read_only();
+                    let (mut content, is_error, mut outcome) = if script_refused_read_only {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+                            "message": "execute_script cannot be mediated while the workspace is read-only",
+                            "tool": "execute_script",
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
                         // `Arc<Mutex<Session>>` clone rather than a `&mut`.
@@ -1714,6 +1775,31 @@ async fn run_inner(
                         evidence.record_call(false, verifier);
                     }
 
+                    // WP08 audit (FR-04, ADR-026): record this dispatch at the
+                    // admission boundary using the RAW result (before output
+                    // bounding below truncates it). Arguments and results are
+                    // stored only as SHA-256 of their canonical JSON; no
+                    // content, credential, header, or body enters the record. A
+                    // required-audit write failure poisons the sink and ends
+                    // the run before any further model/tool work (fail-closed).
+                    if let Some(audit) = &config.audit {
+                        let reason = crate::run_audit::refusal_code(&content);
+                        let _ = audit.record_tool(
+                            &name,
+                            dispatch_tool_kind(&name),
+                            &crate::run_audit::hash_json_value(&input),
+                            &crate::run_audit::hash_result_str(&content),
+                            reason.as_deref(),
+                            tool_started.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        if audit.poisoned() {
+                            terminate_reason = "audit_write_failed";
+                            terminate = true;
+                            break;
+                        }
+                    }
+
                     // after_tool_call hook
                     if let Some(hook) = &config.after_tool_call {
                         if matches!(hook(&info, &content, is_error), AfterHookResult::Terminate) {
@@ -1913,7 +1999,7 @@ async fn run_inner(
                         messages,
                         usage: total_usage,
                         stop_reason: StopReason::Aborted,
-                        error_message: Some("terminated by after_tool_call hook".to_string()),
+                        error_message: Some(terminate_reason.to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
@@ -7140,6 +7226,49 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_in_tool_dispatch_reports_audit_write_failed() {
+        // R5: when the required audit sink fails while recording a tool
+        // dispatch, the run aborts with the self-describing `audit_write_failed`
+        // message — the same code the model-request audit path uses — not the
+        // generic after_tool_call termination message. The internal error
+        // message is not observable at the process boundary (finalize exits 23
+        // first), so this is asserted at the agent-loop public seam.
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "nonexistent_tool", json!({})),
+            end_turn_resp(), // must not be reached
+        ]);
+        // max_events = 2: run_start and the first model_request consume the two
+        // allowed events, so the first tool-dispatch record poisons the sink
+        // (not the earlier model-request audit path).
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = std::sync::Arc::new(
+            crate::run_audit::RunAudit::open(
+                &audit_path,
+                "run-r5".into(),
+                crate::run_audit::AuditLimits {
+                    max_event_bytes: 65536,
+                    max_events: 2,
+                },
+                &crate::run_audit::RunAuditMeta::default(),
+            )
+            .unwrap(),
+        );
+        let config = AgentConfig {
+            audit: Some(audit),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("audit_write_failed"),
+            "tool-dispatch audit poison must carry the same code as the model-request path"
+        );
     }
 
     #[tokio::test]

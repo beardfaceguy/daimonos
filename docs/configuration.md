@@ -89,7 +89,8 @@ local CLI tools and local stdio MCP servers are refused. `--dump-prompts` and
 `session export --output` are refused because their writes are not mediated.
 Explicitly forwarded HTTP MCP
 servers remain a separate trust boundary. This is not a sandbox for
-external services or a read-only workspace; WP04 covers the read-only gate.
+external services or a read-only workspace; the read-only gate below is a
+separate, independent option.
 
 Workspace-discovered control files are read through the authority. Explicit
 caller-selected control files remain separate inputs. An explicit `--config`
@@ -101,6 +102,106 @@ tracing, and `--debug-thoughts` require `--state-dir` in confined mode. Global
 ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose
 target text.
+
+## Read-only workspace (`--workspace-read-only`)
+
+`--workspace-read-only` prohibits every Daimonos-initiated workspace mutation
+for the whole run — startup, tool calls, and teardown. It is independent of
+`--confine-paths` and `--state-dir`; any combination is allowed. When absent,
+behavior is unchanged (default off).
+
+While it is on:
+
+- Every requested workspace mutation is refused before it runs, with the named
+  error `workspace_write_forbidden`. `write_file`, `edit_file`, and
+  `append_file` are refused for **every target path** — including paths
+  **outside** the workspace — and no write is relocated: a refused write writes
+  nowhere. `snapshot restore` is always refused; `snapshot create`/`delete` are
+  refused unless the snapshot store is relocated outside the workspace (then
+  they only read the workspace and write the relocated store). `kgl_query` and
+  `kgl_assert` are refused unless the KGL store is relocated (their store open
+  would otherwise create `<workspace>/.kgl`). Refusals apply at every dispatch
+  boundary, including each `batch` child.
+- Opaque local tools whose effects cannot be mediated are refused with
+  `tool_policy_unsupported`: arbitrary `exec`/background processes, the repair
+  helper, tool pipelines/registration, `execute_script`, and the external CLI
+  plugins (`git`, `gh`, `cargo`, `pytest`, `docker`, `curl`, `shellcheck`,
+  `npm`, `discord`). An allowlist entry cannot override these refusals. This
+  holds in every frontend: `execute_script` is refused before any Starlark runs
+  over MCP and in `daimonos agent` / `chat` / `acp` (the shared agent run loop),
+  not only on the MCP path.
+- Read and metadata tools keep working: `read_file`, `ls`, `search`,
+  `diff_files`, `git_read` (its private status scratch is relocated outside the
+  workspace), `workspace_info`, `get_tool_schema`, `list_tool_signatures`,
+  `list_all_tools`, `session_stats`, `set_verbosity`, and
+  `set_external_session_id`.
+- Internal state (logs, analytics, index, snapshots, KGL, checkpoints) is never
+  written under the workspace. It uses `--state-dir` when provided. Without
+  `--state-dir`, any internal writer whose configured or default destination
+  resolves inside the workspace is refused at startup with
+  `workspace_write_forbidden` rather than silently written or relocated — e.g.
+  a `logging.directory`, `tool_output.directory`, snapshot/process/`git_read`
+  status directory configured inside the workspace, enabled per-turn
+  `checkpoint`s (whose shadow repo defaults to `<workspace>/.daimonos/
+  checkpoints.git`), the structural request-trace directory
+  (`DAIMONOS_OPENROUTER_TRACE_DIR`), or the KGL autoindex/observation
+  (`DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE`). This refusal is
+  independent of `--state-dir`. The guarded set is the single registry
+  `run_policy::INTERNAL_WRITERS`, cross-checked against the reviewer-runtime
+  INVENTORIES.md W-rows by a completeness test.
+
+The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
+`EffectClass`). See ADR-022.
+
+## Local run audit (`--audit-path`)
+
+`--audit-path PATH` turns on a caller-requested, privacy-preserving run audit
+(WP08, FR-04). It is **default off**: without the option, behavior is unchanged
+and no audit file is written. The audit is independent of optional analytics and
+OTLP tracing, and works without controlled transport or a model profile.
+
+The audit is one private JSONL file, one line per event. The file is created
+with `O_CREAT | O_EXCL` and mode `0600`; an existing destination is **never**
+appended to (that is a write failure, below). Every line is a versioned record
+carrying `audit_version`, the shared `run_id`, a monotonic `sequence`, and a
+`kind`. The lifecycle is `run_start` first and `run_end` last; in between come
+`model_request`, `tool_call`, `tool_refusal`, and (wired by later packages)
+`probe_result` and `limit_hit` events.
+
+Privacy rules (ADR-006 D6, ADR-026) — the record never contains:
+
+- a credential **value**; only the credential **variable name** is recorded;
+- a model base URL's userinfo, port, path, or query; only its **host**;
+- prompt text, request/response/error bodies, or headers;
+- tool argument or result **contents**: arguments and results are recorded as
+  SHA-256 hashes of their canonical (sorted-key) bytes, never cleartext and
+  never a `Debug` string;
+- evidence-file contents.
+
+Unavailable metadata is recorded as explicit `null`, never invented.
+
+**Required-write failure contract (fail-closed).** Unlike OTLP tracing, which
+fails open, a requested audit is required: if the sink cannot be opened,
+written, or finished, the run stops with exit code `23`
+(`audit_write_failed`). An open failure stops the run **before any model
+request**; a mid-run write failure poisons the sink and aborts before further
+model or tool work. The diagnostic never echoes a secret.
+
+**Destination.** The path is resolved before any model work. With an explicit
+state root (`--state-dir`), the audit path must be **under** the state root; an
+outside path fails startup with exit `2` (`run_configuration_invalid`) and the
+error names both `--audit-path` and the offending path. Without `--state-dir`,
+the path must be **outside** the workspace (it is private run evidence, not
+workspace output). Event bounds come from `[reviewer.audit]` (below).
+
+**Supported frontend scope.** The audit is written only by the one-shot
+`daimonos agent --print` frontend. Because a run must never falsely look
+audited (ADR-026), every other frontend that accepts the global `--audit-path`
+— `chat`, `acp`, the MCP server, the session daemon, the interactive agent, and
+`agent --dry-run` — **refuses** the option at startup with exit `2`
+(`run_configuration_invalid`, reason `audit_unsupported_frontend`) rather than
+ignore it silently. The interactive agent refuses before any session-daemon
+launch, so a daemon never runs a falsely-audited session.
 
 ## Agent Environment File
 
@@ -773,6 +874,24 @@ max_servers = 32
 max_concurrent_connects = 8
 max_tools_per_server = 128
 ```
+
+### `[reviewer.audit]` — Local run audit bounds
+
+Bounds for the caller-requested local run audit (`--audit-path`, WP08/FR-04).
+They apply only when the audit is enabled.
+
+```toml
+[reviewer.audit]
+# Maximum serialized bytes for one audit event. A larger event is a required-
+# audit failure (exit 23), never a silent truncation.
+max_event_bytes = 65536
+# Maximum number of audit events recorded for one run.
+max_events = 100000
+```
+
+Exceeding either bound is a required-audit write failure (exit `23`,
+`audit_write_failed`), consistent with the fail-closed contract above — the run
+stops rather than silently dropping or truncating a record.
 
 ### `[logging]` — Runtime Diagnostics
 

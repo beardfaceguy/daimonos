@@ -55,6 +55,24 @@ python3 -m pytest tests/ -v
 
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
+The `tests/test_read_only_workspace.py` suite (FR-07, `--workspace-read-only`) includes a test that
+bind-mounts an evidence workspace read-only via `unshare -Urnm`; it is skipped when Linux user and
+mount namespaces are unavailable, like the git_read read-only-mount test. It also drives
+`daimonos agent --print` with a local fake provider to prove `execute_script` is refused
+(`tool_policy_unsupported`) before any Starlark runs in agent mode, and that an
+`DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
+use local fake endpoints only (no live credentials).
+
+The `tests/test_run_audit.py` suite (FR-04, `--audit-path`) drives `daimonos
+agent --print` with a local fake OpenAI-style provider to prove the opt-in run
+audit: a versioned `run_start`…`run_end` JSONL lifecycle, `tool_call`/
+`tool_refusal` records with SHA-256 argument/result hashes and durations,
+`model_request` records, the fail-closed exit-23 contract on an audit open
+failure (no model request runs), the exit-2 refusal when the path is outside an
+explicit state root, and the opt-out regression (no file when the option is
+off). It includes the AC-04.8 scan asserting the exact credential value appears
+nowhere in the complete audit record. All endpoints are local fakes; no live
+credentials are used.
 
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.

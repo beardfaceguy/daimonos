@@ -95,10 +95,32 @@ impl Default for ToolLimitsConfig {
     }
 }
 
+/// Bounds for the caller-requested local run audit (WP08, FR-04 reqs 18-20).
+/// Context: ADR-026, reviewer-runtime INTERFACES.md `reviewer.audit`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReviewerAuditConfig {
+    /// Maximum serialized bytes for one audit event. A larger event is a
+    /// required-audit failure, never a silent truncation.
+    pub max_event_bytes: usize,
+    /// Maximum number of audit events for one run.
+    pub max_events: u64,
+}
+
+impl Default for ReviewerAuditConfig {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: 65536,
+            max_events: 100_000,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct ReviewerConfig {
     pub tool_limits: ToolLimitsConfig,
+    pub audit: ReviewerAuditConfig,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -145,6 +167,16 @@ pub struct Config {
     /// Pinned at startup and shared across sessions (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// `--workspace-read-only` (FR-07, ADR-022): prohibit every workspace
+    /// mutation. Caller-owned; never deserialized from workspace config.
+    #[serde(skip)]
+    pub workspace_read_only: bool,
+    /// `--audit-path` (WP08, FR-04): the caller-requested local audit
+    /// destination, already validated and resolved (outside evidence; under
+    /// the state root when an explicit state root is selected). Caller-owned;
+    /// never deserialized from workspace config.
+    #[serde(skip)]
+    pub audit_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }

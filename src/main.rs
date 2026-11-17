@@ -39,6 +39,8 @@ mod providers;
 mod provisioning;
 mod remote_auth;
 mod remote_gateway;
+mod run_audit;
+mod run_policy;
 mod safety;
 mod script;
 mod session;
@@ -461,6 +463,164 @@ async fn main() -> anyhow::Result<()> {
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    // FR-07 (ADR-022): pin the read-only workspace decision before any writer.
+    cfg.workspace_read_only = cli.workspace_read_only;
+    if cfg.workspace_read_only
+        && cfg.state_authority.is_none()
+        && (kgl::autoindex::enabled() || kgl::observe::enabled())
+    {
+        // These writers emit `.kgl` under the workspace. Relocation needs an
+        // explicit state root; without one, refuse rather than silently write.
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                "message": "KGL autoindex/observation would write under the read-only workspace; relocate with --state-dir or disable them"
+            }})
+        );
+        std::process::exit(2);
+    }
+    // FR-07 (G3, G2): refuse before any service starts when an unconditional
+    // internal writer would land inside the read-only workspace. Independent of
+    // --state-dir — an explicit state root simply relocates these destinations
+    // so they fall outside the workspace and pass. The KGL and snapshot stores
+    // are guarded on use (tool/opcode admission), not here.
+    if cfg.workspace_read_only {
+        // The single registry of startup-guarded internal writers lives in
+        // `run_policy::StartupDestinations`; this fills each enabled writer's
+        // resolved destination (R3). A completeness test cross-checks the
+        // registry against INVENTORIES.md so a new workspace-capable writer
+        // cannot be added without a disposition. The KGL autoindex/observe
+        // stores (W07-W09) are handled by the dedicated block above.
+        let destinations = run_policy::StartupDestinations {
+            logging_dir: cfg
+                .logging
+                .enabled
+                .then(|| cfg.logging.resolved_directory()),
+            analytics_db: cfg
+                .analytics
+                .enabled
+                .then(|| cfg.analytics.resolved_db_path()),
+            coordination_db_dir: cfg
+                .coordination
+                .enabled
+                .then(|| cfg.coordination.resolved_db_dir()),
+            tool_output_dir: Some(cfg.tool_output.resolved_directory()),
+            process_artifact_dir: cfg
+                .process
+                .artifact_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
+            git_read_status_dir: cfg
+                .git_read
+                .status_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
+            // Agent/chat per-turn checkpoints write this shadow git repo and the
+            // current frontend (src/agent.rs) never relocates it, so refuse at
+            // startup rather than write under the workspace.
+            checkpoint_repo: cfg
+                .checkpoint
+                .enabled
+                .then(|| workspace.join(".daimonos/checkpoints.git")),
+            // W11 (R3): the structural request-trace directory is sourced from
+            // the environment (`providers::request_trace::RequestTrace::from_env`),
+            // not Config, so read it here. An inside-workspace trace dir without
+            // --state-dir is caught only by this guard (WP02 state validation
+            // requires a state root to refuse an out-of-state trace dir).
+            request_trace_dir: std::env::var("DAIMONOS_OPENROUTER_TRACE_DIR")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| paths::expand_tilde(&value)),
+        };
+        if let Some((w_id, label, path)) = destinations.first_inside_workspace(true, &workspace) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                    "message": format!(
+                        "{label} ({w_id}) resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
+                        path.display()
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+    // WP08 (FR-04, ADR-026): validate and resolve the caller-requested audit
+    // destination before any writer or model work. With an explicit state root
+    // it must stay under that root (StateAuthority::explicit_destination names
+    // the offending option and path and exits 2). Without one it must simply
+    // lie outside the evidence workspace. The sink itself is opened by the
+    // agent frontend immediately before the first model request (startup #6).
+    cfg.audit_path = match &cli.audit_path {
+        None => None,
+        Some(requested) => {
+            let resolved = match &cfg.state_authority {
+                Some(authority) => {
+                    match authority.explicit_destination("--audit-path", requested) {
+                        Ok(path) => path,
+                        Err(error) => exit_for_state_failure(error),
+                    }
+                }
+                None => {
+                    let expanded = paths::expand_tilde(&requested.to_string_lossy());
+                    let candidate = if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        std::env::current_dir().unwrap_or_default().join(expanded)
+                    };
+                    if run_policy::resolves_inside(&workspace, &candidate) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"error": {
+                                "code": "run_configuration_invalid",
+                                "reason": "audit_path_inside_workspace",
+                                "message": format!(
+                                    "--audit-path {} is inside the evidence workspace; choose a private destination outside it",
+                                    requested.display()
+                                )
+                            }})
+                        );
+                        std::process::exit(2);
+                    }
+                    candidate
+                }
+            };
+            Some(resolved)
+        }
+    };
+    // WP08 (R1, ADR-026): a run must never falsely look audited. The audit is
+    // written only by the one-shot `agent --print` frontend; every other
+    // frontend that accepts the global --audit-path (chat, ACP, the MCP server,
+    // the session daemon, the interactive agent, and dry-run) refuses the
+    // option at startup with a named error rather than silently ignore it.
+    if cfg.audit_path.is_some() {
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let honored = matches!(
+            &cli.command,
+            Some(Command::Agent(a)) if !(a.dry_run || a.interactive && !a.print && tty)
+        );
+        if !honored {
+            let frontend = match &cli.command {
+                Some(Command::Agent(a)) if a.dry_run => "agent --dry-run",
+                Some(Command::Agent(_)) => "interactive agent",
+                _ => runtime_mode.log_name(),
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "audit_unsupported_frontend",
+                    "message": format!(
+                        "--audit-path is not supported by the {frontend} frontend; only `agent --print` writes a run audit"
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
     }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
