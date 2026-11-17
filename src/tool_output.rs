@@ -521,11 +521,14 @@ pub async fn reformat_text(
     // No-spill (ADR-021, FR-11): the reformat route is explicitly in scope, so
     // show the (lossless) summary but never store the raw output and advertise
     // no saved-file pointer. The summary already carries the distinct signal;
-    // the raw detail is recovered by re-running the tool, as for every no-spill
-    // result.
+    // the marker still states how to recover the raw detail (re-run the tool),
+    // matching the wording style of NO_SPILL_MARKER / NO_SPILL_PRUNED_MARKER so
+    // the model is never left to assume the condensed result is the whole of it.
     if !cfg.save_full_output {
-        let visible =
-            format!("{summary}\n\n[reformatted from {original_chars} chars; output not saved]");
+        let visible = format!(
+            "{summary}\n\n[reformatted from {original_chars} chars; output not saved, \
+             re-run the tool to retrieve the full output]"
+        );
         return BoundText {
             visible_chars: visible.chars().count(),
             content: visible,
@@ -1041,6 +1044,15 @@ mod tests {
         .await;
 
         assert!(out.content.contains("1 distinct failure"));
+        // FR-11.1 (R2): a no-spill result must say how to get the full output,
+        // like NO_SPILL_MARKER / NO_SPILL_PRUNED_MARKER. The reformat summary is
+        // lossless, but the raw detail is still gone, so the recovery hint must
+        // be present.
+        assert!(
+            out.content.contains("re-run the tool"),
+            "reformat marker must tell the model how to retrieve the full output: {}",
+            out.content
+        );
         assert!(
             out.output_path.is_none(),
             "no file is retained under no-spill"

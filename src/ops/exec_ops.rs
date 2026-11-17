@@ -655,6 +655,7 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
         &mut command,
         &session.cfg.process,
         &format!("bg-{pid}"),
+        session.cfg.tool_output.save_full_output,
     ) {
         Ok(process) => process,
         Err(e) => return Response::err(5, &format!("spawn: {e}")),
@@ -662,10 +663,14 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
     let output_path = process.output_path.clone();
     session.bg_processes.insert(pid, process);
 
-    Response::ok(json!({
-        "pid": pid,
-        "log": output_path.to_string_lossy(),
-    }))
+    // No-spill (ADR-021, FR-11): advertise the artifact path only when one was
+    // written. Under `--no-output-spill` the bounded output is read back via
+    // `poll` alone, so no saved-file pointer is emitted.
+    let mut data = json!({ "pid": pid });
+    if let Some(path) = &output_path {
+        data["log"] = json!(path.to_string_lossy());
+    }
+    Response::ok(data)
 }
 
 pub async fn poll(session: &mut Session, op: &Op) -> Response {
@@ -681,21 +686,18 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
     };
 
     let status = process.try_wait();
-    let output_path = process.output_path.clone();
     let tail_n = session.cfg.process.poll_tail_lines;
+    let max_read = session.cfg.process.output_memory_bytes;
 
     match status {
         Ok(Some(exit)) => {
             let code = exit.code().unwrap_or(-1);
             if let Some(mut process) = session.bg_processes.remove(&pid) {
                 let _ = process.settle_output().await;
-                let tail = crate::managed_process::tail_lines(
-                    &output_path,
-                    tail_n,
-                    session.cfg.process.output_memory_bytes,
-                )
-                .await
-                .ok();
+                // No-spill (ADR-021, FR-11): `read_tail` serves the in-memory
+                // buffer when no artifact file was written, so the caller sees
+                // the same bounded tail either way.
+                let tail = process.read_tail(tail_n, max_read).await.ok();
                 process.cleanup_artifact();
                 return Response::ok(json!({
                     "running": false,
@@ -710,13 +712,7 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
             }))
         }
         Ok(None) => {
-            let tail = crate::managed_process::tail_lines(
-                &output_path,
-                tail_n,
-                session.cfg.process.output_memory_bytes,
-            )
-            .await
-            .ok();
+            let tail = process.read_tail(tail_n, max_read).await.ok();
             Response::ok(json!({
                 "running": true,
                 "tail": tail,
@@ -742,7 +738,9 @@ pub async fn kill(session: &mut Session, op: &Op) -> Response {
     let grace = std::time::Duration::from_millis(session.cfg.process.termination_grace_ms);
     match process.terminate(grace).await {
         Ok(_) => {
-            crate::managed_process::remove_artifact(&output_path);
+            if let Some(path) = &output_path {
+                crate::managed_process::remove_artifact(path);
+            }
             Response::ok(json!({"ok": true}))
         }
         Err(e) => Response::err(4, &format!("kill: {e}")),
