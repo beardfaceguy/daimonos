@@ -946,6 +946,13 @@ pub async fn controlled_send(
         }
         return LlmResponse::error(full);
     }
+    // The controlled transport owns the EXACT attempt count (FR-04 req 10):
+    // the caller's `request_retries` are the sole retry authority, consumed
+    // inside this loop. Hand back a terminal (non-retryable) error so the
+    // agent loop adds no hidden retry or error-resume of its own on top
+    // (AC-04.3). Intermediate `last` values stay retryable only to drive this
+    // local loop.
+    last.retryable = false;
     last
 }
 
@@ -1904,5 +1911,60 @@ mod controlled_transport_tests {
             .clone();
         apply_extra_body_fields(&mut body, &allowed).unwrap();
         assert_eq!(body["metadata"], serde_json::json!({"k": "v"}));
+    }
+
+    // H6: a credential value never appears in a Debug representation or in any
+    // controlled-mode error message. INTERFACES: "Do not include ... a secret
+    // value in error messages." The credential is injected only into wire
+    // headers (never logged); failures name status/transport, not the key.
+    #[tokio::test]
+    async fn controlled_credential_never_appears_in_debug_or_errors() {
+        const SECRET: &str = "sk-SUPER-SECRET-TOKEN-7f3a9c1e";
+        std::env::set_var("CTRL_H6_KEY", SECRET);
+        let profile = ControlledProfile::from_json(&serde_json::json!({
+            "provider_label": "anthropic", "model": "claude-opus-5-5",
+            "base_url": "http://127.0.0.1:1", "wire": "messages",
+            "credential_env": "CTRL_H6_KEY"
+        }))
+        .unwrap();
+        let provider = super::router::ControlledProvider::from_profile(profile).unwrap();
+        let debug = format!("{provider:?}");
+        std::env::remove_var("CTRL_H6_KEY");
+        assert!(
+            !debug.contains(SECRET),
+            "credential leaked in Debug: {debug}"
+        );
+        assert!(debug.contains("[redacted]"), "debug must redact: {debug}");
+
+        // A non-2xx endpoint failure never names the credential.
+        let (base, _count) = counting_http_server("503 Service Unavailable", None, "{}").await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &ControlledRequest::default(),
+            SECRET,
+            &ctx_with_tool(),
+        )
+        .await;
+        let msg = resp.error_message.expect("503 must be an error");
+        assert!(!msg.contains(SECRET), "credential leaked in error: {msg}");
+
+        // A redirect endpoint error likewise names no credential.
+        let (base2, _c2) = counting_http_server(
+            "307 Temporary Redirect",
+            Some(("location", "http://127.0.0.1:9/elsewhere")),
+            "{}",
+        )
+        .await;
+        let resp2 = controlled_send(
+            &messages_spec(base2),
+            &ControlledRequest::default(),
+            SECRET,
+            &ctx_with_tool(),
+        )
+        .await;
+        assert!(!resp2
+            .error_message
+            .expect("redirect must be an error")
+            .contains(SECRET));
     }
 }
