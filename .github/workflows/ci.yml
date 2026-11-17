@@ -62,10 +62,12 @@ jobs:
       - run: cargo build
       - name: Install CLI test prerequisites
         run: sudo apt-get update && sudo apt-get install --yes npm shellcheck
-      - name: Report user namespace support
+      - name: Allow unprivileged user namespaces for the mount and network tests
         run: |
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone || true
-          if unshare -Urnm true; then echo "unshare -Urnm: available"; else echo "unshare -Urnm: unavailable"; fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -Urnm true
+          echo "unshare -Urnm: available"
       - run: pytest tests/ -v -rs
 
   android:
