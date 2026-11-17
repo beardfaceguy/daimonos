@@ -49,6 +49,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   daemon and will not attach to one started without it. The request-trace
   startup guard resolves `DAIMONOS_OPENROUTER_TRACE_DIR` through the writer's
   own resolver, so the guard and the writer agree on the destination.
+- **Controlled model transport** (`daimonos agent --model-profile <PATH>`,
+  ADR-025, FR-04 transport requirements 1-13). An opt-in, profile-scoped request
+  transport: one caller-owned JSON object supplies the five required values
+  (`provider_label`, `model`, `base_url`, `wire`, `credential_env`) plus optional
+  `max_tokens`, `timeout_ms`, `request_retries`, `proxy`, and `extra_body_fields`.
+  A partial profile fails at startup naming the missing value(s). Requests carry
+  only the fixed body/header set, set automatic tool choice explicitly (never a
+  forced choice or provider `strict` flag), send no sampling parameters, use the
+  stable endpoint path, and suppress ambient headers, telemetry, redirects, and
+  ambient proxies. `max_tokens` is caller-owned with no built-in default:
+  mandatory on the `messages` wire (a profile omitting it fails at startup) and
+  omitted on the `chat` wire unless the caller set it. `extra_body_fields` are
+  validated at startup and refused before any request if they overwrite a
+  protected field or carry any sampling, forced-choice, strictness, streaming,
+  or multi-choice parameter on either wire. Default off; legacy provider behavior is unchanged. The flag
+  is honored only by the one-shot send path and fails closed when combined with
+  `--interactive` (the interactive TUI routes through the session daemon, which
+  carries no profile). Caller `request_retries` is bounded by the model-request
+  ceiling (`100`, ADR-025).
 
 ## [0.1.5] - 2026-10-18
 

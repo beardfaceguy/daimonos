@@ -172,6 +172,19 @@ fn build_provider(
     .map_err(anyhow::Error::msg)
 }
 
+/// WP07 (FR-04, ADR-025): read and validate the controlled model profile from a
+/// caller-owned JSON file. Returns a validated [`providers::ControlledProfile`]
+/// or an error naming the option, the path, and the problem (e.g. the missing
+/// required value). Reads configuration only — no credential or network.
+fn load_controlled_profile(path: &Path) -> anyhow::Result<providers::ControlledProfile> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: invalid JSON: {e}", path.display()))?;
+    providers::ControlledProfile::from_json(&value)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))
+}
+
 fn resolve_thought_log_path(
     enabled: bool,
     override_path: Option<PathBuf>,
@@ -259,7 +272,15 @@ pub async fn run_agent(
         agent_env,
         debug_thoughts,
         debug_thoughts_path,
+        model_profile,
     } = args;
+    // WP07 (FR-04): validate the controlled model profile before any work, in
+    // every mode. A partial profile fails here naming the missing value(s);
+    // this validates configuration only and reads no credential or network.
+    let controlled_profile = match &model_profile {
+        Some(path) => Some(load_controlled_profile(path)?),
+        None => None,
+    };
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
     // no TTY is attached. Only the Print fallback's require_agent_task error
@@ -458,12 +479,25 @@ pub async fn run_agent(
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-    let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(
-        &effective_provider,
-        &agent,
-        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
-    )?;
+    // WP07 (FR-04): when a controlled profile is set it is the SOLE source of
+    // the provider/model/credential; every completion routes through the opt-in
+    // controlled transport. Otherwise legacy provider construction is unchanged.
+    let (effective_model, llm): (String, Box<dyn providers::LlmProvider>) =
+        if let Some(profile) = controlled_profile {
+            let controlled_model = profile.spec.model.clone();
+            let provider = providers::router::ControlledProvider::from_profile(profile)
+                .map_err(anyhow::Error::msg)?;
+            (controlled_model, Box::new(provider))
+        } else {
+            (
+                model.unwrap_or_else(|| agent.model.clone()),
+                build_provider(
+                    &effective_provider,
+                    &agent,
+                    providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+                )?,
+            )
+        };
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {

@@ -1,4 +1,9 @@
 //! Opt-in structural request trace. Never receives credentials or message bodies.
+//!
+//! WP07 (ADR-025, INVENTORIES W11): the controlled model transport
+//! ([`super::controlled_send`]) is a separate request path that never invokes
+//! [`RequestTrace::capture`], so structural tracing is disabled in controlled
+//! mode by construction regardless of `DAIMONOS_OPENROUTER_TRACE_DIR`.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
