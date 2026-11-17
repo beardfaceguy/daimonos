@@ -21,6 +21,12 @@ anyhow = "1"
 toml = "0.8"
 notify = { version = "7", features = ["macos_fsevent"] }
 json-patch = "3"
+# Full JSON Schema draft 2020-12 validator for structured final output
+# (ADR-024 / reviewer-runtime INTERFACES.md, WP05). Exact pin and
+# default-features-off are mandated: with the crate's default resolver features
+# disabled, any reference needing file/HTTP retrieval is refused at compile time
+# without performing I/O. Approved by the human (PM answers round 1, FR-01).
+jsonschema = { version = "=0.60.2", default-features = false }
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"

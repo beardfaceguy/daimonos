@@ -1699,6 +1699,10 @@ fn build_agent_config(
         // session updates is a follow-up.
         error_resume_budget: None,
         on_provider_notice: None,
+        // WP05 (ADR-024): ACP is interactive, not the one-shot final-output
+        // path; structured final output stays off here.
+        final_output: None,
+        final_output_sink: None,
         // #1240: bounded retry of transient provider failures, then failover
         // along the configured chain. An ACP client (Zed) surfaces a provider
         // blip as a failed turn the user must redo, so absorbing it is exactly
