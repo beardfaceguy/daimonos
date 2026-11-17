@@ -600,9 +600,16 @@ the `--full-tool-schemas` flag, `DAIMONOS_MCP_FULL_SCHEMAS=1`, and
 `[mcp] full_tool_schemas = true`. The check covers the native tool catalog
 (served, exported, and sent to the model) and the caller-supplied `--final-output`
 final-answer schema, which is accepted and offered unchanged but refused
-(`schema_unusable`, exit 20, final-output error shape) if it contains a local
-recursive reference. The cross-tool definition-name clash rule applies only to
-dbunk-owned definitions; a supplied schema is never refused for a definition
+(`schema_unusable`, exit 20, final-output error shape) if it contains a
+recursive reference cycle. The self-contained check resolves every in-document
+reference form with proper Draft 2020-12 URI/anchor semantics (not a
+string-prefix test): a JSON-pointer `$ref` (percent-decoded, then `~1`/`~0`), a
+plain-name `$anchor`, a `$dynamicRef` to a `$dynamicAnchor`, and a `$ref` that
+names the document's or an embedded resource's `$id` (absolute or relative to
+the base URI, with or without a fragment). A reference it cannot resolve inside
+the document is refused `schema_unusable` and named, never fetched (fail
+closed). The cross-tool definition-name clash rule applies only to
+Daimonos-owned definitions; a supplied schema is never refused for a definition
 name. Context: ADR-030.
 
 ### `[session]` — Daemon-owned agent sessions

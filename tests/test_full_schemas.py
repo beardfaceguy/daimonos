@@ -642,3 +642,79 @@ def test_s2_full_mode_offers_anchor_schema_unchanged(daimonos_binary, tmp_path, 
     assert posts == 1, f"expected exactly one model request, got {posts}"
     assert recorded == ANCHOR_SUPPLIED_SCHEMA, (
         f"$anchor final-answer schema in the request was rewritten:\n{recorded}")
+
+
+# ---------------------------------------------------------------------------
+# WP17 r3 (T3): a supplied final-answer schema that is recursive through a
+# reference form the r2 detector did not follow -- a plain-name ``$anchor`` and
+# the schema's own ``$id`` -- must be refused in full-schema mode exactly like
+# the JSON-pointer recursion of S1: exit 20, ``schema_unusable``, the
+# final-output error shape, and no model request. The WP05 Draft-2020-12
+# validator accepts each (it resolves the reference), so the refusal is the
+# detector's, before any request (ADR-030; integrator r3 direction).
+# ---------------------------------------------------------------------------
+
+# Recursive through a plain-name ``$anchor``: ``#node -> #node``.
+ANCHOR_RECURSIVE_SUPPLIED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"node": {"$ref": "#node"}},
+    "$defs": {
+        "node": {
+            "$anchor": "node",
+            "type": "object",
+            "properties": {"child": {"$ref": "#node"}},
+        }
+    },
+}
+
+# Recursive through the document's own ``$id``: a property points a ``$ref`` at
+# the absolute ``$id`` of the root resource, i.e. back at the whole document.
+ID_RECURSIVE_SUPPLIED_SCHEMA = {
+    "$id": "https://daimonos.test/final-answer",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"loop": {"$ref": "https://daimonos.test/final-answer"}},
+}
+
+_T3_RECURSIVE = {
+    "anchor": ANCHOR_RECURSIVE_SUPPLIED_SCHEMA,
+    "id": ID_RECURSIVE_SUPPLIED_SCHEMA,
+}
+
+
+@BOTH_WIRES
+@pytest.mark.parametrize("form", list(_T3_RECURSIVE))
+def test_t3_full_mode_refuses_recursive_supplied_schema_by_form(
+    daimonos_binary, tmp_path, wire, form
+):
+    """T3: a supplied schema recursive through ``$anchor`` or through its own
+    ``$id`` is refused before any model request in full-schema mode -- exit 20,
+    reason ``schema_unusable``, the final-output error shape -- and the endpoint
+    receives no request (parity with S1's JSON-pointer recursion)."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, _T3_RECURSIVE[form],
+        {"loop": {}, "node": {}}, full_mode=True)
+    assert completed.returncode == 20, (
+        f"recursive supplied schema (via {form}) in full mode must exit 20, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    err = _last_json_line(completed.stderr)
+    assert err.get("reason") == "schema_unusable", f"stderr={completed.stderr}"
+    assert posts == 0, f"a model request was made before refusal (posts={posts})"
+
+
+@BOTH_WIRES
+@pytest.mark.parametrize("form", list(_T3_RECURSIVE))
+def test_t3_default_accepts_recursive_supplied_schema_by_form(
+    daimonos_binary, tmp_path, wire, form
+):
+    """T3 default pin: WITHOUT full-schema mode the same ``$anchor``/``$id``
+    recursive supplied schema is accepted exactly as today (exit 0, one model
+    request). WP17 changes nothing outside its opt-in mode."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, _T3_RECURSIVE[form],
+        {"loop": {}, "node": {}}, full_mode=False)
+    assert completed.returncode == 0, (
+        f"recursive supplied schema (via {form}) must be accepted by default, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"

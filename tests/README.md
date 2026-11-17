@@ -108,3 +108,13 @@ to the model deep-equal/unchanged. The metaschema and self-containment checks
 rely on the product's own Draft 2020-12 validator (`src/schema_validation.rs` /
 `src/schema_contract.rs`); no third-party `jsonschema` dependency is added or
 required.
+
+The r3 cases extend the supplied-schema coverage to every reference form the
+recursion detector follows: both-wire process tests refuse a supplied
+final-answer schema that is recursive through a plain-name `$anchor` and one
+recursive through its own `$id` (exit 20, `schema_unusable`, zero requests),
+with the default-mode accept pins alongside. The matching Draft 2020-12
+URI/anchor resolution and the fail-closed (D41) refusal of an unresolvable
+in-document reference are proven at the `src/schema_contract.rs` unit seam
+(decoded JSON-pointer, `$anchor`, `$dynamicRef`/`$dynamicAnchor`, and `$id`-named
+`$ref`), still with no third-party dependency.

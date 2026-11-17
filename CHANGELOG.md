@@ -28,9 +28,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
     `[mcp] full_tool_schemas`) all run that same check. The check now also covers
     the caller-supplied `--final-output` final-answer schema: it is offered
     unchanged but refused as `schema_unusable` (exit 20, final-output error
-    shape) when it contains a local recursive reference. Definition-name clash
-    refusal applies only to dbunk-owned definitions; a supplied schema is never
-    refused for a definition name.
+    shape) when it contains a recursive reference cycle. The self-contained
+    check follows every in-document reference form with proper 2020-12
+    URI/anchor semantics: a percent-/`~`-decoded JSON-pointer `$ref`, a
+    plain-name `$anchor`, a `$dynamicRef` to a `$dynamicAnchor`, and a `$ref`
+    naming the document's or an embedded resource's `$id` (absolute or relative
+    to the base, with or without a fragment); a reference it cannot resolve
+    inside the document is refused `schema_unusable` and named, never fetched
+    (fail closed). Definition-name clash refusal applies only to Daimonos-owned
+    definitions; a supplied schema is never refused for a definition name.
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the
