@@ -164,7 +164,7 @@ Required final-output reasons remain `no_final_call`, `mixed_calls`, `invalid_ar
 Do not collapse those into one free-text message. The terminal failure records its last validation errors.
 
 WP07 adapts existing `src/providers/anthropic.rs`, `src/providers/openrouter.rs`, and `src/providers/router.rs`.
-I owns shared `ControlledModelSpec`, `ControlledRequest`, and `ControlledTransport` seams in existing `src/providers/mod.rs`.
+I owns the shared controlled-transport seams in existing `src/providers/mod.rs`. The shipped symbols are `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`, `ControlledHttp`, `controlled_client`, and `controlled_send` (the earlier reserved name `ControlledTransport` was not used; the transport is realized as `controlled_send` + `ControlledHttp` + `controlled_client`).
 Do not add a parallel controlled provider module or duplicate wire implementation.
 The model-profile JSON contains `provider_label`, `model`, `base_url`, `wire`, and `credential_env` as one complete source.
 Additional caller controls are `max_tokens`, `timeout_ms`, `request_retries`, `proxy`, and explicit `extra_body_fields`.
@@ -180,6 +180,33 @@ Controlled requests can run without final-output mode or audit. Final-output mod
 Auxiliary summary/reformat calls use the same controlled authority and request counter. They must not select a legacy provider or retry policy.
 If an auxiliary path cannot honor the exact request contract, refuse before sending with `auxiliary_request_unsupported` metadata.
 Do not silently drop history or perform a hidden fallback request after that refusal. Default non-profile compaction remains unchanged.
+
+_WP07 status (implemented, transport only):_ the provider-neutral seams
+(`Wire`, `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`,
+`ControlledHttp`, `controlled_client`, `controlled_send`) live in
+`src/providers/mod.rs`; the wire-local serializers in `src/providers/anthropic.rs`
+(Messages) and `src/providers/openrouter.rs` (Chat); `ControlledProvider` in
+`src/providers/router.rs`. The caller flag is `daimonos agent --model-profile PATH`
+(`src/cli.rs`, validated in `src/agent_runtime.rs`), mutually exclusive with
+`--model`/`--provider`/`--interactive`. It is honored only by the one-shot send
+path; combining it with `--interactive` fails closed at startup, because the
+interactive TUI routes through the session daemon which carries no profile
+(`chat`/`acp` expose no such flag). Caller `request_retries` is bounded by the
+named model-request ceiling `CONTROLLED_REQUEST_RETRY_CEILING` (`100`, ADR-025).
+Transport-level AC-04.1-04.5 are asserted by
+`cargo test providers::controlled_transport_tests` (exact body/headers, the
+timeout against a slow endpoint, explicit-proxy routing, the 400-on-forced
+`tool_choice` endpoint, and fixed headers under an active tracing provider on
+both wires); AC-04.7, the opt-out regression, the fail-closed `--interactive`
+refusal, and the ambient-proxy-ignored counting-proxy check by
+`tests/test_request_control.py`. `max_tokens` is caller-owned with no built-in
+default: mandatory on the `messages` wire (a profile omitting it is refused at
+startup) and omitted on the `chat` wire unless the caller set it.
+`extra_body_fields` are validated at startup against `PROTECTED_BODY_FIELDS` and
+a complete `FORBIDDEN_BODY_FIELDS` denylist (every sampling, forced-choice,
+strictness, streaming, and multi-choice parameter on both wires); no allowlist
+of permitted extras is defined. The capability probe (AC-04.6)
+and audit record remain WP09/WP08; the integrated probe repeats AC-04.1-04.5.
 
 WP09 owns `src/capability_probe.rs` (new): `ProbeSpec` and `ProbeOutcome`.
 The caller supplies a minimal valid final payload. Local schema validation occurs before the endpoint call.
