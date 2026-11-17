@@ -23,6 +23,10 @@ from pathlib import Path
 # exact value and must find nothing.
 FAKE_KEY = "synthetic-not-a-real-key-AUDITSCAN-5fZ9"
 DONE = "AUDIT_AGENT_DONE_MARKER"
+# A distinctive tool-result/file-body marker. R3 (ADR-026 Confirmation) scans the
+# raw audit stream and asserts this exact string appears NOWHERE (results are
+# stored only as SHA-256, never cleartext).
+SEED_BODY_MARKER = "SEED_BODY_MARKER_7Q2XK9"
 
 
 class _FakeProvider:
@@ -86,6 +90,9 @@ class _FakeProvider:
                             "function": {"name": name,
                                          "arguments": json.dumps(arguments)}}]},
                               "tool_calls")
+                    elif step[0] == "maxtokens":
+                        # OpenAI/openrouter truncation finish_reason -> MaxTokens.
+                        chunk({"role": "assistant", "content": step[1]}, "max_tokens")
                     else:
                         chunk({"role": "assistant", "content": step[1]}, "stop")
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -224,7 +231,7 @@ def test_tool_call_and_refusal_records(daimonos_binary, tmp_path):
     the result (never contents), and an elapsed duration."""
     workspace = tmp_path / "evidence"
     workspace.mkdir()
-    (workspace / "seed.txt").write_text("evidence body that must not be hashed in cleartext\n")
+    (workspace / "seed.txt").write_text(f"evidence body {SEED_BODY_MARKER} must not be hashed in cleartext\n")
 
     provider = _FakeProvider([
         ("call", "read_file", {"path": "seed.txt"}),
@@ -251,8 +258,10 @@ def test_tool_call_and_refusal_records(daimonos_binary, tmp_path):
     assert rc["allowed"] is True, rc
     assert _HEX64.match(rc["argument_sha256"]), rc
     assert _HEX64.match(rc["result_sha256"]), rc
-    assert isinstance(rc["duration_ms"], int) and rc["duration_ms"] >= 0, rc
-    assert rc["route"], rc
+    # R6: the route is the exact native-tool identity, and a tool call that does
+    # observable work records a nonzero elapsed duration (not a hardcoded/0).
+    assert isinstance(rc["duration_ms"], int) and rc["duration_ms"] >= 1, rc
+    assert rc["route"] == "native", rc
 
     write_refusals = [e for e in refusals if e["name"] == "write_file"]
     assert write_refusals, f"no tool_refusal for write_file: {events}"
@@ -268,6 +277,11 @@ def test_tool_call_and_refusal_records(daimonos_binary, tmp_path):
     import hashlib
     canonical = json.dumps({"path": "seed.txt"}, separators=(",", ":"), sort_keys=True)
     assert rc["argument_sha256"] == hashlib.sha256(canonical.encode()).hexdigest(), rc
+
+    # R3 (ADR-026 Confirmation): the file-body marker read by read_file must not
+    # appear anywhere in the raw audit stream — not in any event or diagnostic.
+    raw = Path(audit_path).read_text()
+    assert SEED_BODY_MARKER not in raw, "tool-result content leaked into the audit record"
 
 
 def test_model_requests_recorded_and_no_credential_in_record(daimonos_binary, tmp_path):
@@ -398,3 +412,250 @@ def test_opt_out_leaves_behavior_unchanged(daimonos_binary, tmp_path):
     # No stray audit artifact anywhere under the state root.
     produced = list(state.rglob("*.jsonl"))
     assert produced == [], f"audit file written with the option off: {produced}"
+
+
+# --- R1: every frontend that accepts --audit-path must honor it or refuse it ---
+# (ADR-026: a run must never falsely look audited.) Only `agent --print` writes
+# the audit; chat, ACP, the MCP server, the session daemon, the interactive
+# agent, and dry-run refuse the option at startup with a named error.
+
+import signal
+import os as _os
+
+
+def _spawn_collect(cmd, env, *, timeout=15, pty_io=False):
+    """Run cmd; return (returncode_or_None, stderr_text).
+
+    Kills the whole process group on timeout so a frontend that fails to refuse
+    (e.g. a daemon that would otherwise serve forever, or an interactive TUI)
+    cannot linger. With pty_io, stdin+stdout are a pseudo-tty so is_terminal()
+    is true (needed to force the interactive agent mode); stderr stays a pipe.
+    """
+    master = slave = None
+    if pty_io:
+        import pty as _ptylib
+        master, slave = _ptylib.openpty()
+        stdin_arg = stdout_arg = slave
+    else:
+        stdin_arg = subprocess.DEVNULL
+        stdout_arg = subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, env=env, stdin=stdin_arg, stdout=stdout_arg,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    if slave is not None:
+        _os.close(slave)
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            _os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            _, stderr = proc.communicate(timeout=5)
+        except Exception:
+            stderr = b""
+        rc = None
+    finally:
+        if master is not None:
+            try:
+                _os.close(master)
+            except OSError:
+                pass
+    return rc, (stderr or b"").decode(errors="replace")
+
+
+def _frontend_base(tmp_path, provider):
+    """Common isolated env + a valid under-state audit path for a frontend run."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir(exist_ok=True)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    audit_path = state / "audit" / "run.jsonl"
+    env = _isolated_env(tmp_path)
+    agent_env = _agent_env(tmp_path, provider)
+    globals_ = [str(workspace), str(state), str(audit_path), str(agent_env)]
+    return workspace, state, audit_path, env, agent_env
+
+
+def _assert_refused(rc, stderr, audit_path):
+    assert rc == 2, (rc, stderr)
+    assert "run_configuration_invalid" in stderr, stderr
+    assert "audit_unsupported_frontend" in stderr, stderr
+    assert "--audit-path" in stderr, stderr
+    assert FAKE_KEY not in stderr
+    assert not audit_path.exists(), "a refused frontend must not create the audit file"
+
+
+def test_chat_frontend_refuses_audit_path(daimonos_binary, tmp_path):
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "chat", "--agent-env", str(agent_env)]
+        rc, stderr = _spawn_collect(cmd, env)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+
+
+def test_acp_frontend_refuses_audit_path(daimonos_binary, tmp_path):
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "acp", "--agent-env", str(agent_env)]
+        rc, stderr = _spawn_collect(cmd, env)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+
+
+def test_mcp_server_refuses_audit_path(daimonos_binary, tmp_path):
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "mcp"]
+        rc, stderr = _spawn_collect(cmd, env)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+
+
+def test_session_daemon_refuses_audit_path(daimonos_binary, tmp_path):
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "session-daemon", "--agent-env", str(agent_env)]
+        rc, stderr = _spawn_collect(cmd, env)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+
+
+def test_interactive_agent_refuses_audit_path(daimonos_binary, tmp_path):
+    """The interactive agent (a TTY session, attached to the session daemon)
+    does not write the audit in-process, so it refuses the option at startup —
+    before any daemon launch — rather than run a falsely-audited session."""
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "agent", "--interactive", "--agent-env", str(agent_env), "hi"]
+        rc, stderr = _spawn_collect(cmd, env, pty_io=True, timeout=15)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+
+
+def _write_config(tmp_path, body):
+    path = tmp_path / "daimonos.toml"
+    path.write_text(body)
+    return path
+
+
+def test_audit_mid_run_write_failure_stops_the_run(daimonos_binary, tmp_path):
+    """R2 (ADR-026 Confirmation): a mid-run audit write failure (forced with a
+    tiny max_events so the first model_request trips the count limit) aborts the
+    run with exit 23, emits no completion marker, and runs no model request
+    after the failure."""
+    config = _write_config(tmp_path, "[reviewer.audit]\nmax_events = 1\n")
+    provider = _FakeProvider([("end", DONE), ("end", DONE), ("end", DONE)])
+    try:
+        completed, audit_path = _run(daimonos_binary, tmp_path, provider, "hi",
+                                     extra_global=["--config", str(config)])
+    finally:
+        provider.close()
+
+    assert completed.returncode == 23, (completed.returncode, completed.stderr)
+    assert "audit_write_failed" in completed.stderr, completed.stderr
+    assert DONE not in completed.stdout, "a completion marker survived a mid-run audit failure"
+    # run_start succeeded (one line); nothing after the failing request ran.
+    assert provider.post_count == 1, provider.post_count
+    assert FAKE_KEY not in completed.stderr
+
+
+def test_audit_finish_failure_is_fail_closed(daimonos_binary, tmp_path):
+    """R2 (ADR-026 Confirmation): a finish-time (terminal run_end) audit write
+    failure — forced with max_events=2 so run_start + one model_request succeed
+    but run_end trips the limit — fails the run with exit 23 and does NOT publish
+    the assistant output, proving the terminal record is written before success."""
+    config = _write_config(tmp_path, "[reviewer.audit]\nmax_events = 2\n")
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        completed, audit_path = _run(daimonos_binary, tmp_path, provider, "hi",
+                                     extra_global=["--config", str(config)])
+    finally:
+        provider.close()
+
+    assert completed.returncode == 23, (completed.returncode, completed.stderr)
+    assert "audit_write_failed" in completed.stderr, completed.stderr
+    assert DONE not in completed.stdout, "assistant output was published before the terminal audit event"
+    assert provider.post_count == 1, provider.post_count
+    events = _read_events(audit_path)
+    assert events[-1]["kind"] != "run_end", events
+    assert FAKE_KEY not in completed.stderr
+
+
+def test_audit_path_inside_workspace_without_state_dir_is_refused(daimonos_binary, tmp_path):
+    """R4: without an explicit state root, an audit destination inside the
+    evidence workspace is refused at startup (exit 2, run_configuration_invalid,
+    reason audit_path_inside_workspace) and no model request runs."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    inside = workspace / "audit.jsonl"
+    env = _isolated_env(tmp_path)
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        agent_env = _agent_env(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(workspace),
+               "--audit-path", str(inside),
+               "agent", "--print", "--agent-env", str(agent_env), "hi"]
+        completed = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=60, env=env)
+    finally:
+        provider.close()
+
+    assert completed.returncode == 2, (completed.returncode, completed.stderr)
+    assert "run_configuration_invalid" in completed.stderr, completed.stderr
+    assert "audit_path_inside_workspace" in completed.stderr, completed.stderr
+    assert provider.post_count == 0
+    assert not inside.exists()
+
+
+def test_run_end_status_agrees_with_process_exit_on_non_endturn(daimonos_binary, tmp_path):
+    """R7: for a run that ends without EndTurn (here a max_tokens truncation with
+    auto-continue off), the run_end status/exit are derived from the same
+    terminal source as the process exit, so the recorded exit_code equals the
+    process return code and the status reflects the real (non-'ok') ending."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    audit_path = tmp_path / "state" / "audit" / "run.jsonl"
+    env = _isolated_env(tmp_path)
+    env["DAIMONOS_AGENT_AUTO_CONTINUE"] = "0"
+    provider = _FakeProvider([("maxtokens", "truncated partial answer")])
+    try:
+        agent_env = _agent_env(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(workspace),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "agent", "--print", "--agent-env", str(agent_env), "hi"]
+        completed = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=60, env=env)
+    finally:
+        provider.close()
+
+    events = _read_events(audit_path)
+    run_end = events[-1]
+    assert run_end["kind"] == "run_end", events
+    assert run_end["status"] == "max_tokens", run_end
+    assert run_end["exit_code"] == completed.returncode, (run_end, completed.returncode)
+    assert completed.returncode == 0, completed.stderr

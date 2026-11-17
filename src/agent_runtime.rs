@@ -504,11 +504,25 @@ pub async fn run_agent(
         thinking: agent.thinking.clone(),
         audit: audit.clone(),
     };
-    let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await;
-    if let Some(audit) = &audit {
+    // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
+    // and any required-audit write failure surfaced as exit 23 — BEFORE the
+    // run's assistant output reaches stdout, so a finish-time audit failure can
+    // never leave a published "success" that the record does not cover. When
+    // audit is enabled the output is buffered and flushed only after
+    // `finalize_run_audit` succeeds; with audit off the path is byte-identical
+    // to before (direct stdout).
+    let result = if let Some(audit) = &audit {
+        use std::io::Write as _;
+        let mut buffer: Vec<u8> = Vec::new();
+        let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
         finalize_run_audit(audit, &result);
-    }
+        let mut stdout = std::io::stdout();
+        stdout.write_all(&buffer)?;
+        stdout.flush()?;
+        result
+    } else {
+        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
+    };
     let result = result?;
     check_agent_result(&result)
 }
@@ -562,6 +576,26 @@ fn open_run_audit(
 /// Write the terminal `run_end` event before the frontend reports success, and
 /// convert a mid-run or terminal audit-write failure into exit 23 (fail-closed,
 /// ADR-026). The original run failure code is preserved as secondary metadata.
+/// Map one agent result to the terminal `(status, exit_code)` recorded in
+/// `run_end`. This is the SINGLE source for both the audit's terminal record
+/// and the process exit (R7): `check_agent_result` fails the process only when
+/// the run stopped with `StopReason::Error` (exit 1) and otherwise exits 0, so
+/// the recorded `exit_code` and the process return code always agree, while the
+/// `status` string still reflects a non-`EndTurn` ending (e.g. a turn/token
+/// limit) instead of a bare "ok".
+fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static str, i32) {
+    match result {
+        Ok(r) => match r.stop_reason {
+            providers::StopReason::EndTurn | providers::StopReason::ToolUse => ("ok", 0),
+            providers::StopReason::MaxTokens => ("max_tokens", 0),
+            providers::StopReason::Refusal => ("refusal", 0),
+            providers::StopReason::Aborted => ("aborted", 0),
+            providers::StopReason::Error => ("error", 1),
+        },
+        Err(_) => ("error", 1),
+    }
+}
+
 fn finalize_run_audit(
     audit: &Arc<crate::run_audit::RunAudit>,
     result: &anyhow::Result<agent::AgentResult>,
@@ -571,13 +605,9 @@ fn finalize_run_audit(
         eprintln!("{}", failure.diagnostic_json());
         std::process::exit(failure.exit_code());
     }
-    let (status, exit_code, secondary) = match result {
-        Ok(r) if r.stop_reason == providers::StopReason::Error => {
-            ("error", 1, Some("provider_error"))
-        }
-        Ok(_) => ("ok", 0, None),
-        Err(_) => ("error", 1, None),
-    };
+    let (status, exit_code) = run_terminal_status(result);
+    let secondary = matches!(result, Ok(r) if r.stop_reason == providers::StopReason::Error)
+        .then_some("provider_error");
     if let Err(mut failure) = audit.finish(status, exit_code, None) {
         if let Some(code) = secondary {
             failure = failure.with_secondary(code);

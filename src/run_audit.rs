@@ -156,6 +156,39 @@ pub fn base_url_host(url: &str) -> Option<String> {
     }
 }
 
+/// One versioned audit event, exactly as serialized to the JSONL stream:
+/// `audit_version`, `run_id`, `sequence`, `kind`, then the kind-specific fields
+/// in insertion order. Reserved public name (reviewer-runtime INTERFACES.md
+/// "Audit, output, and resource contracts"); constructing it and calling
+/// [`AuditEvent::to_json`] yields byte-identical output to the map the sink
+/// writes, so the typed event and the stream never drift.
+#[derive(Debug, Clone)]
+pub struct AuditEvent {
+    pub audit_version: &'static str,
+    pub run_id: String,
+    pub sequence: u64,
+    pub kind: String,
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl AuditEvent {
+    /// The ordered JSON object written as one line of the stream.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut event = serde_json::Map::new();
+        event.insert(
+            "audit_version".into(),
+            serde_json::json!(self.audit_version),
+        );
+        event.insert("run_id".into(), serde_json::json!(self.run_id));
+        event.insert("sequence".into(), serde_json::json!(self.sequence));
+        event.insert("kind".into(), serde_json::json!(self.kind));
+        for (key, value) in &self.fields {
+            event.insert(key.clone(), value.clone());
+        }
+        serde_json::Value::Object(event)
+    }
+}
+
 struct AuditInner {
     file: std::fs::File,
     sequence: u64,
@@ -447,18 +480,16 @@ impl RunAudit {
                     self.limits.max_events
                 )));
             }
-            let mut event = serde_json::Map::new();
-            event.insert("audit_version".into(), serde_json::json!(AUDIT_VERSION));
-            event.insert("run_id".into(), serde_json::json!(self.run_id));
-            event.insert("sequence".into(), serde_json::json!(inner.sequence));
-            event.insert("kind".into(), serde_json::json!(kind));
-            for (key, value) in fields {
-                event.insert(key, value);
-            }
-            let mut line =
-                serde_json::to_string(&serde_json::Value::Object(event)).map_err(|error| {
-                    AuditFailure::new(format!("audit event not serializable: {error}"))
-                })?;
+            let event = AuditEvent {
+                audit_version: AUDIT_VERSION,
+                run_id: self.run_id.clone(),
+                sequence: inner.sequence,
+                kind: kind.to_string(),
+                fields,
+            };
+            let mut line = serde_json::to_string(&event.to_json()).map_err(|error| {
+                AuditFailure::new(format!("audit event not serializable: {error}"))
+            })?;
             if line.len() > self.limits.max_event_bytes {
                 return Err(AuditFailure::new(format!(
                     "audit event size {} exceeds reviewer.audit.max_event_bytes = {}",
@@ -733,6 +764,30 @@ mod tests {
         );
         assert_eq!(refusal_code(r#"{"ok":true}"#), None);
         assert_eq!(refusal_code("plain text result"), None);
+    }
+
+    #[test]
+    fn audit_event_serializes_to_the_stream_json() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("status".into(), serde_json::json!("ok"));
+        fields.insert("exit_code".into(), serde_json::json!(0));
+        let event = AuditEvent {
+            audit_version: AUDIT_VERSION,
+            run_id: "r".into(),
+            sequence: 3,
+            kind: "run_end".into(),
+            fields,
+        };
+        let json = event.to_json();
+        assert_eq!(json["audit_version"], AUDIT_VERSION);
+        assert_eq!(json["run_id"], "r");
+        assert_eq!(json["sequence"], 3);
+        assert_eq!(json["kind"], "run_end");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            serde_json::to_string(&json).unwrap(),
+            r#"{"audit_version":"1","run_id":"r","sequence":3,"kind":"run_end","status":"ok","exit_code":0}"#
+        );
     }
 
     #[test]
