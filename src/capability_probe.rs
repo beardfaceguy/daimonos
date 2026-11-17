@@ -18,8 +18,11 @@
 //! configuration error, not a model failure. The probe reuses WP05's
 //! [`FinalOutputSpec::classify`] as the single source of truth for what a valid
 //! final ending is, so the probe and the run judge the final tool identically.
-//! Model-facing wording lives in `prompts/capability_probe.md`, never in Rust
-//! literals here.
+//! Model-facing wording lives entirely in `prompts/`: `capability_probe.md`
+//! holds the system-turn framing and `capability_probe_directive.md` holds the
+//! user-turn directive template. The runtime interpolates only the concrete
+//! final-tool name and the payload into the directive as data; no model-facing
+//! sentence is constructed from a Rust literal here.
 
 use std::path::Path;
 
@@ -31,9 +34,16 @@ use crate::providers::{
 };
 use crate::structured_output::{FinalFailureReason, FinalOutputSpec, TurnClassification};
 
-/// Embedded model-facing probe instruction. The `.md` file owns the wording;
-/// the runtime appends only the concrete final-tool name and payload as data.
+/// Embedded model-facing probe system prompt (the capability-check framing).
+/// The `.md` file owns all of this wording; no part of it is built in Rust.
 pub const PROBE_PROMPT: &str = include_str!("../prompts/capability_probe.md");
+
+/// Embedded model-facing probe directive template (the probe's user turn). The
+/// `.md` file owns the wording; the runtime interpolates only the concrete
+/// final-tool name (`{tool_name}`) and the compact-JSON payload (`{payload}`)
+/// as data. Trailing whitespace is trimmed so the recorded request is exact
+/// regardless of a trailing newline in the file.
+pub const PROBE_DIRECTIVE_TEMPLATE: &str = include_str!("../prompts/capability_probe_directive.md");
 
 /// Everything needed to send the single controlled probe request: the five
 /// identity values and request settings (cloned from the run's controlled
@@ -89,11 +99,15 @@ pub async fn run_probe(
     final_spec: &FinalOutputSpec,
     audit: Option<&crate::run_audit::RunAudit>,
 ) -> ProbeOutcome {
-    let directive = format!(
-        "Call the tool `{}` exactly once with these arguments:\n{}",
-        final_spec.tool_name(),
-        serde_json::to_string(&probe.payload).unwrap_or_else(|_| "{}".to_string()),
-    );
+    let payload = serde_json::to_string(&probe.payload).unwrap_or_else(|_| "{}".to_string());
+    // The wording is owned by `prompts/capability_probe_directive.md`; only the
+    // tool name and the payload are interpolated as data (R1). `{tool_name}` is
+    // substituted first so a payload value can never be mistaken for a
+    // placeholder.
+    let directive = PROBE_DIRECTIVE_TEMPLATE
+        .trim_end()
+        .replace("{tool_name}", final_spec.tool_name())
+        .replace("{payload}", &payload);
     let ctx = Context {
         messages: vec![Message::user(directive)],
         system: Some(PROBE_PROMPT.to_string()),

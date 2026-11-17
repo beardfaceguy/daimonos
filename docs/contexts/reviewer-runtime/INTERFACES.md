@@ -245,6 +245,11 @@ This event layout is a proposed interface choice, not a change to the accepted l
 - Write the successful terminal audit event before emitting the structured success JSON.
 - A process kill can leave an incomplete audit. Do not claim that this recorder supplies crash recovery for active model turns.
 
+> Status (WP09, run wp09-20261117-r4): audit field-set governance (integrator decision D34). Adding a field to an audit record is a backward-compatible change under `audit_version` "1"; `AUDIT_VERSION` is NOT bumped for a field addition (only a field removal or a changed field meaning would require a new version signal). As of this run the complete top-level key set of each record below is, besides the common envelope `audit_version` / `run_id` / `sequence` / `kind`:
+> - `model_request`: `request_sequence`, `http_status`, `retry_index`, `probe`, `wire`, `usage`.
+> - `probe_result`: `status`, `reason`, `http_status`, `retry_index`, `wire`.
+> A later change to either field set must update these two lines and `tests/test_capability_probe.py::test_audit_model_request_and_probe_result_field_sets_are_fixed` together.
+
 WP13 extends existing `tool_output::bound_text` with an output policy.
 `save_full_output=false` skips full-copy creation and saved-path metadata entirely, including failure and script/pipeline routes.
 Truncated responses retain paging or query-narrowing guidance. They never advertise a nonexistent saved file.

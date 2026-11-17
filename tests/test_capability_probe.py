@@ -102,14 +102,15 @@ def _env(tmp_path, agent_base="http://127.0.0.1:1", extra_env=None):
 def _run_probe(daimonos_binary, tmp_path, *, endpoint_url, wire="messages",
                request_retries=0, max_model_requests=None, payload=None,
                with_final=True, with_profile=True, audit_path=None,
-               mode="print", extra_argv=()):
+               mode="print", extra_argv=(),
+               provider_label="anthropic", model="claude-opus-5-5"):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     state = tmp_path / "state"
     state.mkdir(mode=0o700, exist_ok=True)
     final_f = _write_final_output(tmp_path / "final.json", max_model_requests)
     profile_f = _write_profile(tmp_path / "profile.json", endpoint_url, wire,
-                               request_retries)
+                               request_retries, provider_label, model)
     payload_f = _write_payload(tmp_path / "payload.json", payload)
     agent_env, env = _env(tmp_path)
     argv = [daimonos_binary, "--workspace", str(workspace),
@@ -343,15 +344,32 @@ _BODIES = {
     "text_plus_final": _TEXT_PLUS_FINAL, "final_different": _FINAL_DIFFERENT,
 }
 
+# Chat-wire (OpenAI Chat Completions, non-streaming) equivalents of the probe
+# answers the Chat wire is exercised with (R2): a valid final-answer tool call
+# and a text-only (no tool call) reply.
+_CHAT_FINAL_OK = {
+    "choices": [{"message": {"role": "assistant", "tool_calls": [
+        {"id": "t1", "type": "function", "function": {
+            "name": FINAL_TOOL,
+            "arguments": json.dumps({"verdict": "supported"})}}]},
+        "finish_reason": "tool_calls"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+_CHAT_TEXT_ONLY = {
+    "choices": [{"message": {"role": "assistant", "content": "I believe so"},
+                 "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+_CHAT_BODIES = {"final_ok": _CHAT_FINAL_OK, "text_only": _CHAT_TEXT_ONLY}
+
 
 class ProbeEndpoint:
     """Local fake Messages endpoint that replies with a configurable assistant
     response (a tool call, text, etc.) or an error status, recording every
     request so a test can assert exactly one was sent."""
 
-    def __init__(self, mode="final_ok", redirect_to=None):
+    def __init__(self, mode="final_ok", redirect_to=None, wire="messages"):
         self.mode = mode
         self.redirect_to = redirect_to
+        self.wire = wire
         self.requests = []
         owner = self
 
@@ -393,7 +411,8 @@ class ProbeEndpoint:
                     self._send(307, b"{}",
                                {"Location": owner.redirect_to or "http://127.0.0.1:1/x"})
                     return
-                body = _BODIES[owner.mode]
+                table = _CHAT_BODIES if owner.wire == "chat" else _BODIES
+                body = table[owner.mode]
                 self._send(200, json.dumps(body).encode())
 
             def do_GET(self):
@@ -964,3 +983,199 @@ def test_g6_controlled_retries_record_every_attempt(daimonos_binary, tmp_path):
     assert [r["retry_index"] for r in reqs] == [0, 1, 2], reqs
     assert [r["http_status"] for r in reqs] == [503, 503, 200], reqs
     assert all(r["wire"] == "messages" for r in reqs), reqs
+
+
+# ==========================================================================
+# r4 reviewer finding R2 (second independent review, commit dc46173). AC-04.1
+# is assigned to THIS package and requires the probe body to be the fixed set
+# with no sampling field on BOTH wires, yet every probe test above runs only
+# on wire="messages". These add the Chat-wire coverage (a pass case and a
+# text-only failure case) and pin the exact probe-body key set on each wire,
+# asserting the complete WP07 forbidden-field denylist never appears.
+# ==========================================================================
+
+# The complete WP07 forbidden-body denylist (src/providers/mod.rs
+# FORBIDDEN_BODY_FIELDS): no probe request on EITHER wire may carry any of
+# these sampling / forced-choice / strictness / streaming keys.
+_SAMPLING_DENYLIST = {
+    "temperature", "top_p", "top_k", "min_p", "top_a", "typical_p",
+    "frequency_penalty", "presence_penalty", "repetition_penalty", "seed",
+    "logit_bias", "n", "best_of", "logprobs", "top_logprobs", "function_call",
+    "parallel_tool_calls", "strict", "response_format", "stream",
+    "stream_options",
+}
+# The fixed body field set the controlled transport sends per wire (mirrors the
+# WP07 transport assertions in tests/test_request_control.py).
+_MESSAGES_PROBE_BODY_KEYS = {"model", "max_tokens", "system", "messages",
+                             "tools", "tool_choice"}
+_CHAT_PROBE_BODY_KEYS = {"model", "messages", "tools", "tool_choice", "max_tokens"}
+
+
+def test_probe_body_is_the_fixed_set_no_sampling_messages_wire(daimonos_binary, tmp_path):
+    # AC-04.1, Messages wire: the recorded probe request body is exactly the
+    # fixed field set and carries no sampling key.
+    endpoint = ProbeEndpoint("final_ok", wire="messages")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            wire="messages")
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    probe = endpoint.posts[0]
+    assert probe["path"] == "/v1/messages", probe["path"]
+    body = probe["body"]
+    assert set(body) == _MESSAGES_PROBE_BODY_KEYS, set(body)
+    assert _SAMPLING_DENYLIST.isdisjoint(set(body)), set(body) & _SAMPLING_DENYLIST
+
+
+def test_probe_body_is_the_fixed_set_no_sampling_chat_wire(daimonos_binary, tmp_path):
+    # AC-04.1, Chat wire: the probe runs on the Chat wire (a valid final-answer
+    # tool call passes, exit 0), and the recorded probe body is exactly the
+    # fixed Chat field set with no sampling key.
+    endpoint = ProbeEndpoint("final_ok", wire="chat")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            wire="chat", provider_label="openrouter",
+                            model="some/model")
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    probe = endpoint.posts[0]
+    assert probe["path"] == "/chat/completions", probe["path"]
+    body = probe["body"]
+    assert set(body) == _CHAT_PROBE_BODY_KEYS, set(body)
+    assert _SAMPLING_DENYLIST.isdisjoint(set(body)), set(body) & _SAMPLING_DENYLIST
+
+
+def test_probe_chat_wire_text_only_is_model_unsupported(daimonos_binary, tmp_path):
+    # AC-04.1 failure path on the Chat wire: a text-only probe reply yields the
+    # distinct model_unsupported exit (21) with exactly one request.
+    endpoint = ProbeEndpoint("text_only", wire="chat")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            wire="chat", provider_label="openrouter",
+                            model="some/model")
+    finally:
+        endpoint.close()
+    assert result.returncode == 21, result.stderr + result.stdout
+    assert len(endpoint.posts) == 1, endpoint.posts
+    assert "model_unsupported" in (result.stderr + result.stdout)
+
+
+# ==========================================================================
+# r4 reviewer finding R3 (commit dc46173, AC-04.6 audit clause). The "audit
+# record shows the probe outcome" clause was asserted only for text_only; the
+# wrong_tool / two_calls / invalid_args reasons were proven for the exit code
+# but their recorded probe_result.reason spelling was not. Parametrize the
+# audit-outcome assertion across all four failure reasons so a reason-spelling
+# regression on any of them is caught.
+# ==========================================================================
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("text_only", "text_only"),
+    ("wrong_tool", "wrong_tool"),
+    ("two_calls", "multiple_calls"),
+    ("invalid_args", "invalid_arguments"),
+])
+def test_probe_failure_audit_reason_spelling(daimonos_binary, tmp_path, mode, reason):
+    endpoint = ProbeEndpoint(mode)
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 21, result.stderr + result.stdout
+    events = _read_events(audit)
+    probe = [e for e in events if e.get("kind") == "probe_result"]
+    assert len(probe) == 1, events
+    assert probe[0]["status"] == "model_unsupported", probe[0]
+    assert probe[0]["reason"] == reason, probe[0]
+    assert CRED_VALUE not in audit.read_text()
+
+
+# ==========================================================================
+# r4 reviewer finding R4 / integrator decision D34 (commit dc46173). Fields
+# were added to the audit model_request (`wire`) and probe_result
+# (`http_status`/`retry_index`/`wire`) records without bumping AUDIT_VERSION.
+# D34: do NOT bump the version — a field ADDITION is a compatible change under
+# audit_version "1". This pins the COMPLETE top-level key set of both records
+# as they are now, so a later field change must update the audit section of
+# docs/contexts/reviewer-runtime/INTERFACES.md and this test together.
+# ==========================================================================
+
+# The common versioned envelope every audit event carries (run_audit.rs
+# AuditEvent::serialize), plus each record's own field set.
+_AUDIT_ENVELOPE = {"audit_version", "run_id", "sequence", "kind"}
+_MODEL_REQUEST_FIELDS = {"request_sequence", "http_status", "retry_index",
+                         "probe", "wire", "usage"}
+_PROBE_RESULT_FIELDS = {"status", "reason", "http_status", "retry_index", "wire"}
+
+
+def test_audit_model_request_and_probe_result_field_sets_are_fixed(daimonos_binary, tmp_path):
+    # A passing probe run with --audit-path writes both a probe_result (the
+    # probe verdict) and a model_request (the subsequent loop request fed by
+    # the WP07 controlled transport). Assert each record's complete top-level
+    # key set exactly.
+    endpoint = ProbeEndpoint("final_ok")
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    events = _read_events(audit)
+    model_requests = [e for e in events if e.get("kind") == "model_request"]
+    probe_results = [e for e in events if e.get("kind") == "probe_result"]
+    assert model_requests, events
+    assert len(probe_results) == 1, events
+    assert set(model_requests[0]) == _AUDIT_ENVELOPE | _MODEL_REQUEST_FIELDS, \
+        set(model_requests[0])
+    assert set(probe_results[0]) == _AUDIT_ENVELOPE | _PROBE_RESULT_FIELDS, \
+        set(probe_results[0])
+
+
+# ==========================================================================
+# r4 reviewer finding R1 (commit dc46173). AGENTS.md: model-facing text belongs
+# in prompts/, never in a Rust string literal. The probe's user-turn directive
+# was a Rust format! literal in src/capability_probe.rs::run_probe. This pins
+# the EXACT directive text of the recorded probe request so the move of the
+# wording into prompts/ cannot change a byte of what the model is sent (it
+# passes before the move and must still pass after; only the tool name and the
+# payload are interpolated as data).
+# ==========================================================================
+
+# The exact user-turn directive the probe sends: the externalized wording with
+# the final-tool name and the compact-JSON payload interpolated as data.
+_EXPECTED_PROBE_DIRECTIVE = (
+    "Call the tool `final_answer` exactly once with these arguments:\n"
+    '{"verdict":"supported"}'
+)
+
+
+def _string_leaves(obj):
+    out = []
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            out.extend(_string_leaves(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_string_leaves(v))
+    return out
+
+
+def test_probe_directive_text_is_exactly_pinned(daimonos_binary, tmp_path):
+    endpoint = ProbeEndpoint("final_ok", wire="messages")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            wire="messages")
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    body = endpoint.posts[0]["body"]
+    leaves = _string_leaves(body)
+    assert _EXPECTED_PROBE_DIRECTIVE in leaves, leaves
