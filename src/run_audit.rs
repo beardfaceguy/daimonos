@@ -387,7 +387,14 @@ impl RunAudit {
     /// Pending integrator hook: WP09 owns the probe and is not in this base.
     /// The event is defined here and exercised through the public seam so the
     /// integrator can wire WP09's `ProbeOutcome` to it without a schema change.
+    ///
+    /// The probe is one request to the model endpoint, so its reported token
+    /// counts are recorded here on the same `usage` shape as `model_request`
+    /// (WP09 r6, FR-04 req 19, decision D43): `(None, None)` records explicit
+    /// `null`; otherwise `{input_tokens, output_tokens}` (zero when the
+    /// endpoint reports none). Metadata is never invented (ADR-026).
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_probe_result(
         &self,
         status: &str,
@@ -395,6 +402,8 @@ impl RunAudit {
         http_status: Option<u16>,
         retry_index: u32,
         wire: Option<&str>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     ) -> Result<(), AuditFailure> {
         let mut fields = serde_json::Map::new();
         fields.insert("status".into(), serde_json::json!(status));
@@ -426,6 +435,20 @@ impl RunAudit {
             }
             None => {
                 fields.insert("wire".into(), serde_json::Value::Null);
+            }
+        }
+        match (input_tokens, output_tokens) {
+            (None, None) => {
+                fields.insert("usage".into(), serde_json::Value::Null);
+            }
+            (input, output) => {
+                fields.insert(
+                    "usage".into(),
+                    serde_json::json!({
+                        "input_tokens": input,
+                        "output_tokens": output,
+                    }),
+                );
             }
         }
         self.record("probe_result", fields)
@@ -719,6 +742,8 @@ mod tests {
                 Some(503),
                 0,
                 Some("messages"),
+                Some(10),
+                Some(2),
             )
             .unwrap();
         audit

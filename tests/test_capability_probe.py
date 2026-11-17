@@ -102,7 +102,7 @@ def _env(tmp_path, agent_base="http://127.0.0.1:1", extra_env=None):
 def _run_probe(daimonos_binary, tmp_path, *, endpoint_url, wire="messages",
                request_retries=0, max_model_requests=None, payload=None,
                with_final=True, with_profile=True, audit_path=None,
-               mode="print", extra_argv=(),
+               mode="print", extra_argv=(), extra_env=None,
                provider_label="anthropic", model="claude-opus-5-5"):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -112,7 +112,7 @@ def _run_probe(daimonos_binary, tmp_path, *, endpoint_url, wire="messages",
     profile_f = _write_profile(tmp_path / "profile.json", endpoint_url, wire,
                                request_retries, provider_label, model)
     payload_f = _write_payload(tmp_path / "payload.json", payload)
-    agent_env, env = _env(tmp_path)
+    agent_env, env = _env(tmp_path, extra_env=extra_env)
     argv = [daimonos_binary, "--workspace", str(workspace),
             "--state-dir", str(state)]
     if audit_path is not None:
@@ -122,6 +122,8 @@ def _run_probe(daimonos_binary, tmp_path, *, endpoint_url, wire="messages",
         argv += ["--print"]
     elif mode == "dry-run":
         argv += ["--dry-run"]
+    elif mode == "interactive":
+        argv += ["--interactive"]
     argv += ["--agent-env", str(agent_env)]
     if with_profile:
         argv += ["--model-profile", str(profile_f)]
@@ -338,10 +340,21 @@ _FINAL_DIFFERENT = {"content": [{"type": "tool_use", "id": "t1", "name": FINAL_T
                     "stop_reason": "tool_use",
                     "usage": {"input_tokens": 1, "output_tokens": 1}}
 
+# A valid final call whose response REPORTS distinctive token counts (U2), and
+# one that reports NO usage at all (the endpoint omits the field).
+_FINAL_OK_USAGE = {"content": [{"type": "tool_use", "id": "t1", "name": FINAL_TOOL,
+                               "input": {"verdict": "supported"}}],
+                   "stop_reason": "tool_use",
+                   "usage": {"input_tokens": 7, "output_tokens": 11}}
+_FINAL_OK_NO_USAGE = {"content": [{"type": "tool_use", "id": "t1", "name": FINAL_TOOL,
+                                  "input": {"verdict": "supported"}}],
+                      "stop_reason": "tool_use"}
+
 _BODIES = {
     "final_ok": _FINAL_OK, "text_only": _TEXT_ONLY, "wrong_tool": _WRONG_TOOL,
     "two_calls": _TWO_CALLS, "invalid_args": _INVALID_ARGS,
     "text_plus_final": _TEXT_PLUS_FINAL, "final_different": _FINAL_DIFFERENT,
+    "final_ok_usage": _FINAL_OK_USAGE, "final_ok_no_usage": _FINAL_OK_NO_USAGE,
 }
 
 # Chat-wire (OpenAI Chat Completions, non-streaming) equivalents of the probe
@@ -387,6 +400,8 @@ class ProbeEndpoint:
                 except ValueError:
                     body = None
                 owner.requests.append({"method": method, "path": self.path,
+                                       "headers": {k.lower(): v
+                                                   for k, v in self.headers.items()},
                                        "body": body})
 
             def _send(self, status, payload, extra_headers=None):
@@ -1110,7 +1125,8 @@ def test_probe_failure_audit_reason_spelling(daimonos_binary, tmp_path, mode, re
 _AUDIT_ENVELOPE = {"audit_version", "run_id", "sequence", "kind"}
 _MODEL_REQUEST_FIELDS = {"request_sequence", "http_status", "retry_index",
                          "probe", "wire", "usage"}
-_PROBE_RESULT_FIELDS = {"status", "reason", "http_status", "retry_index", "wire"}
+_PROBE_RESULT_FIELDS = {"status", "reason", "http_status", "retry_index",
+                       "wire", "usage"}
 
 
 def test_audit_model_request_and_probe_result_field_sets_are_fixed(daimonos_binary, tmp_path):
@@ -1179,3 +1195,136 @@ def test_probe_directive_text_is_exactly_pinned(daimonos_binary, tmp_path):
     body = endpoint.posts[0]["body"]
     leaves = _string_leaves(body)
     assert _EXPECTED_PROBE_DIRECTIVE in leaves, leaves
+
+
+# ==========================================================================
+# r6 U1 (review R2, AC-04.2 at the probe level). AC-04.2 (fixed headers with
+# org/project/custom-header/proxy/tracing env present) was proven only at the
+# WP07 transport level, not through a probe-level process test. These assert
+# the recorded PROBE request headers AND the first loop request headers of the
+# same run, with all of those env vars set in the process environment.
+# ==========================================================================
+
+# Env vars whose VALUES must never reach a request header and whose header
+# forms must never be set: OpenAI org/project, custom-header injection on both
+# provider families, the proxy family, and tracing variables.
+_PROBE_HOSTILE_ENV = {
+    "OPENAI_ORG_ID": "org-PROBE-HOSTILE",
+    "OPENAI_PROJECT_ID": "proj-PROBE-HOSTILE",
+    "OPENAI_CUSTOM_HEADERS": "x-openai-leak: OPENAILEAKVALUE",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-anthropic-leak: ANTHROPICLEAKVALUE",
+    "HTTP_PROXY": "http://127.0.0.1:1",
+    "HTTPS_PROXY": "http://127.0.0.1:1",
+    "ALL_PROXY": "http://127.0.0.1:1",
+    "TRACEPARENT": "00-PROBETRACEPARENT00000000000000-0000000000000000-01",
+    "OTEL_EXPORTER_OTLP_HEADERS": "x-otel-leak=OTELLEAKVALUE",
+}
+# Transport headers the HTTP client adds (excluded when checking the fixed
+# application header set; mirrors tests/test_request_control.py).
+_PROBE_TRANSPORT_HEADERS = {"host", "content-length", "accept",
+                           "accept-encoding", "connection", "user-agent"}
+# The fixed application header name set the probe (and the loop) send per wire.
+_PROBE_APP_HEADERS = {
+    "messages": {"x-api-key", "anthropic-version", "content-type"},
+    "chat": {"authorization", "content-type"},
+}
+# Header NAMES that the hostile env would inject if the transport honored it.
+_PROBE_LEAK_HEADER_NAMES = ("openai-organization", "openai-project",
+                            "x-organization", "x-openai-leak",
+                            "x-anthropic-leak", "x-otel-leak", "traceparent")
+
+
+@pytest.mark.parametrize("wire,provider_label,model", [
+    ("messages", "anthropic", "claude-opus-5-5"),
+    ("chat", "openrouter", "some/model"),
+])
+def test_probe_and_first_loop_request_headers_are_fixed_despite_hostile_env(
+        daimonos_binary, tmp_path, wire, provider_label, model):
+    # final_ok makes the probe pass and the first loop request reach the same
+    # controlled endpoint and end the run: posts[0] is the probe, posts[1] is
+    # the first loop request (R2 proved they carry the same frozen catalog).
+    endpoint = ProbeEndpoint("final_ok", wire=wire)
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            wire=wire, provider_label=provider_label, model=model,
+                            extra_env=_PROBE_HOSTILE_ENV)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert len(endpoint.posts) >= 2, endpoint.posts
+    hostile_values = set(_PROBE_HOSTILE_ENV.values())
+    for which, req in (("probe", endpoint.posts[0]),
+                       ("first_loop", endpoint.posts[1])):
+        headers = req["headers"]
+        app_headers = {k for k in headers if k not in _PROBE_TRANSPORT_HEADERS}
+        assert app_headers == _PROBE_APP_HEADERS[wire], (which, app_headers)
+        for leaked in _PROBE_LEAK_HEADER_NAMES:
+            assert leaked not in headers, (which, leaked)
+        for value in hostile_values:
+            for header_value in headers.values():
+                assert value not in header_value, (which, value, header_value)
+
+
+# ==========================================================================
+# r6 U2 (review R1, integrator decision D43; FR-04 requirement 19). The probe
+# is one request to the model endpoint, so its single probe_result record
+# carries the endpoint-reported token counts (req 19 lists them for a model
+# request). When the endpoint reports no usage, probe_result.usage follows the
+# model_request.usage convention (the counts default to zero). Pinned here and
+# in the field-set test above; the INTERFACES.md probe_result field list is
+# updated in the same slice (rule D34).
+# ==========================================================================
+
+
+@pytest.mark.parametrize("mode,expected_usage", [
+    ("final_ok_usage", {"input_tokens": 7, "output_tokens": 11}),
+    ("final_ok_no_usage", {"input_tokens": 0, "output_tokens": 0}),
+])
+def test_probe_result_records_reported_usage(daimonos_binary, tmp_path, mode,
+                                             expected_usage):
+    endpoint = ProbeEndpoint(mode)
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    events = _read_events(audit)
+    probe = [e for e in events if e.get("kind") == "probe_result"]
+    assert len(probe) == 1, events
+    assert probe[0]["usage"] == expected_usage, probe[0]
+    assert CRED_VALUE not in audit.read_text()
+
+
+# ==========================================================================
+# r6 U3 (the reviewer's UNVERIFIED point). The probe option with `--interactive`
+# in place of `--print`, and with `--dry-run` added, must end with exit code 2
+# and send NO request (measured by the integrator with the built binary): the
+# probe requires `--final-output`, which conflicts with both frontends at
+# argument parsing, so the combination fails closed before any provider contact.
+# These exercise each at the process level against a recording endpoint. The
+# complete usage-error message is not pinned.
+# ==========================================================================
+
+
+def test_probe_interactive_exits_2_and_sends_no_request(daimonos_binary, tmp_path):
+    endpoint = _UnusedEndpoint()
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            mode="interactive")
+    finally:
+        endpoint.close()
+    assert result.returncode == 2, result.stderr + result.stdout
+    assert endpoint.requests == [], "no request may be sent under --interactive"
+
+
+def test_probe_dry_run_exits_2_and_sends_no_request(daimonos_binary, tmp_path):
+    endpoint = _UnusedEndpoint()
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            mode="dry-run")
+    finally:
+        endpoint.close()
+    assert result.returncode == 2, result.stderr + result.stdout
+    assert endpoint.requests == [], "no request may be sent under --dry-run"

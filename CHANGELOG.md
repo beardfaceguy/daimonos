@@ -36,7 +36,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   controlled transport serves a request, its `model_request` audit event now
   carries the observed `http_status`, `retry_index`, and the profile's `wire`,
   and the probe's single endpoint request is recorded on its `probe_result`
-  event with the same `http_status`/`retry_index`/`wire`. An unset profile
+  event with the same `http_status`/`retry_index`/`wire` and its
+  endpoint-reported `usage` token counts (FR-04 req 19). An unset profile
   credential refuses the run identically with or without the probe flag, and
   sends no request.
 - **`--audit-path` (FR-04).** A global, default-off option that writes a

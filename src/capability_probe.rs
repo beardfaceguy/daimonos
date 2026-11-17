@@ -130,13 +130,18 @@ pub async fn run_probe(
     // poisons the sink; the frontend's audit finalize surfaces it as exit 23.
     if let Some(audit) = audit {
         // WP09 (G4): record the probe's own request metadata on the probe_result
-        // event (the probe is one request to the model endpoint).
+        // event (the probe is one request to the model endpoint). The probe's
+        // reported token counts are carried on the same event (r6, FR-04 req 19,
+        // D43), mirroring the loop's `model_request.usage` (zero counts when the
+        // endpoint reports none).
         let _ = audit.record_probe_result(
             outcome.audit_status(),
             outcome.audit_reason(),
             obs.http_status,
             obs.retry_index,
             obs.wire,
+            Some(response.usage.input),
+            Some(response.usage.output),
         );
     }
     outcome

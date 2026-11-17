@@ -247,7 +247,8 @@ This event layout is a proposed interface choice, not a change to the accepted l
 
 > Status (WP09, run wp09-20261117-r4): audit field-set governance (integrator decision D34). Adding a field to an audit record is a backward-compatible change under `audit_version` "1"; `AUDIT_VERSION` is NOT bumped for a field addition (only a field removal or a changed field meaning would require a new version signal). As of this run the complete top-level key set of each record below is, besides the common envelope `audit_version` / `run_id` / `sequence` / `kind`:
 > - `model_request`: `request_sequence`, `http_status`, `retry_index`, `probe`, `wire`, `usage`.
-> - `probe_result`: `status`, `reason`, `http_status`, `retry_index`, `wire`.
+> - `probe_result`: `status`, `reason`, `http_status`, `retry_index`, `wire`, `usage`.
+> - `probe_result.usage` (WP09, r6): the endpoint-reported token counts of the one probe request (FR-04 req 19, decision D43); same `{input_tokens, output_tokens}` object as `model_request.usage`, defaulting to zero counts when the endpoint reports none. A compatible field addition under `audit_version "1"` (no `AUDIT_VERSION` bump).
 > A later change to either field set must update these two lines and `tests/test_capability_probe.py::test_audit_model_request_and_probe_result_field_sets_are_fixed` together.
 
 WP13 extends existing `tool_output::bound_text` with an output policy.
