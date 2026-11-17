@@ -59,7 +59,8 @@ The `tests/test_read_only_workspace.py` suite (FR-07, `--workspace-read-only`) i
 bind-mounts an evidence workspace read-only via `unshare -Urnm`; it is skipped when Linux user and
 mount namespaces are unavailable, like the git_read read-only-mount test. It also drives
 `daimonos agent --print` with a local fake provider to prove `execute_script` is refused
-(`tool_policy_unsupported`) before any Starlark runs in agent mode, and that an
+(`tool_policy_unsupported`) before any Starlark runs in agent mode, and the same refusal through
+the `daimonos acp` JSON-RPC frontend (both drive the shared `run_inner` loop), and that an
 `DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
 use local fake endpoints only (no live credentials). The suite also drives an interactive
 read-only `daimonos agent` over a PTY to prove the bootstrapped session daemon inherits

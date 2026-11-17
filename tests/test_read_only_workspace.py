@@ -1432,3 +1432,163 @@ def test_r5_startup_request_trace_resolves_like_the_writer(daimonos_binary, tmp_
     assert "request_trace" in err["message"], err
     # The literal `~/sub` directory must not have been created under the ws.
     assert not (workspace / "~").exists()
+
+
+# =====================================================================
+# r6 review findings (dbunk-reviewer/wp04-9e1f6e7/review-wp04.md): R2 (the
+# ACP-frontend execute_script refusal is observable at the process boundary)
+# and R1 (the exit-2 reason taxonomy, closed in INTERFACES.md + the existing
+# startup tests above that pin reason == workspace_write_forbidden).
+# =====================================================================
+
+
+# --- R2: execute_script refused through the ACP frontend, not only agent-print
+#
+# Production callers of crate::script::execute / execute_with_op_count:
+#   - src/mcp.rs::run_execute_script          (MCP frontend; guarded)
+#   - src/agent.rs::run_inner execute_script branch (shared agent loop; guarded)
+#   - src/acp_cmd.rs::acp_tool_session_execute_script_can_call_builtin_git_plugin
+#     is a #[tokio::test], NOT production.
+# The ACP frontend drives the SAME src/agent.rs::run_inner loop, so its
+# execute_script branch consults session.admission.read_only() before any
+# Starlark runs. This process-level test proves that externally: a read-only
+# ACP session must hand the model `tool_policy_unsupported` and never execute
+# the body (no sentinel, no file, workspace byte-identical). It mirrors
+# test_r1_agent_print_refuses_execute_script_before_starlark_runs through the
+# ACP JSON-RPC frontend instead of `agent --print`.
+class _AcpClient:
+    """A minimal ACP JSON-RPC client over the daimonos `acp` subcommand's
+    stdio. It issues `initialize`/`session/new`/`session/prompt`, replies to
+    any server->client request with a JSON-RPC error (the real editor is not
+    present), and matches responses to requests by id."""
+
+    def __init__(self, binary, workspace, state_dir, agent_env, env):
+        import queue
+        import threading
+
+        self._responses = queue.Queue()
+        self._pending = {}
+        self._id = 0
+        self.stderr = open(state_dir / "acp-stderr.log", "w")
+        command = [
+            binary, "--workspace", str(workspace), "--workspace-read-only",
+            "--state-dir", str(state_dir), "acp", "--agent-env", str(agent_env),
+        ]
+        self.process = subprocess.Popen(
+            command, cwd=str(workspace), env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=self.stderr, text=True, bufsize=1,
+        )
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self):
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in message and "method" not in message:
+                self._responses.put(message)
+            elif "id" in message:
+                # Server->client request (e.g. fs/permission): the editor is
+                # not present; refuse so the agent loop proceeds / terminates.
+                self._send({"jsonrpc": "2.0", "id": message["id"],
+                            "error": {"code": -32601, "message": "no client"}})
+            # Notifications (session/update) are not needed by this test.
+        self._responses.put(None)
+
+    def _send(self, value):
+        self.process.stdin.write(json.dumps(value) + "\n")
+        self.process.stdin.flush()
+
+    def request(self, method, params, timeout=60):
+        import time
+        self._id += 1
+        number = self._id
+        self._send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while number not in self._pending:
+            message = self._responses.get(timeout=max(0.01, deadline - time.monotonic()))
+            if message is None:
+                raise RuntimeError(f"ACP exited early: {self.process.poll()}")
+            self._pending[message["id"]] = message
+        message = self._pending.pop(number)
+        if "error" in message:
+            raise RuntimeError(f"ACP RPC error: {message['error']}")
+        return message["result"]
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        self._reader.join(timeout=2)
+        self.stderr.close()
+
+
+def test_r2_acp_session_refuses_execute_script_before_starlark_runs(
+    daimonos_binary, tmp_path
+):
+    """R2 (ADR-022; INVENTORIES tool-class table): the ACP frontend drives the
+    shared src/agent.rs::run_inner loop, whose execute_script branch must
+    consult the admission table exactly like `agent --print` (R1) and the MCP
+    `run_execute_script` do. Through a real read-only ACP session the model
+    must receive the structured `tool_policy_unsupported` refusal and the
+    Starlark body must NOT run. Uses --state-dir so internal stores relocate
+    outside the workspace (as in the agent-print R1 test)."""
+    workspace = tmp_path / "evidence"
+    _seed_repo(workspace)
+    (tmp_path / "tmp").mkdir()
+    before = _snapshot(workspace)
+
+    provider = _ExecuteScriptProvider()
+    client = None
+    try:
+        agent_env = tmp_path / "agent.env"
+        agent_env.write_text("\n".join([
+            "DAIMONOS_AGENT_PROVIDER=openrouter",
+            "DAIMONOS_AGENT_MODEL=test/model",
+            f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{provider.server.server_port}/v1",
+            "DAIMONOS_AGENT_API_KEY=synthetic-not-a-real-key",
+            "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+            "DAIMONOS_AGENT_COMPACTION=off",
+            "DAIMONOS_AGENT_MODELS_DISCOVER=off",
+            "DAIMONOS_AGENT_ALLOWED_COMMANDS=execute_script,write_file,read_file",
+            "",
+        ]))
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+        env.update(_isolated_env(tmp_path))
+
+        client = _AcpClient(daimonos_binary, workspace, state, agent_env, env)
+        client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {},
+                       "clientInfo": {"name": "wp04-r2-probe", "version": "1"}})
+        session_id = client.request(
+            "session/new", {"cwd": str(workspace), "mcpServers": []})["sessionId"]
+        client.request("session/prompt", {"sessionId": session_id,
+                       "prompt": [{"type": "text", "text": "please run the script"}]})
+    finally:
+        if client is not None:
+            client.close()
+        provider.close()
+
+    # (a) The model saw the structured opaque-tool refusal as the tool result,
+    #     through the ACP frontend's run_inner loop (not just agent --print).
+    assert provider.tool_result_text is not None, "provider never received a tool result"
+    assert "tool_policy_unsupported" in provider.tool_result_text, provider.tool_result_text
+    assert "execute_script" in provider.tool_result_text, provider.tool_result_text
+    # (b) The Starlark body did not run: its sentinel value never materialized.
+    assert str(_ExecuteScriptProvider.SENTINEL) not in provider.tool_result_text, (
+        "execute_script body executed in ACP mode under --workspace-read-only"
+    )
+    # (c) The workspace and its .git are byte-identical; nothing was written.
+    assert _snapshot(workspace) == before, "ACP script run mutated the read-only workspace"
+    assert not (workspace / "from_script.txt").exists(), "the refused script wrote a file"
+    assert not (workspace / ".daimonos").exists()
