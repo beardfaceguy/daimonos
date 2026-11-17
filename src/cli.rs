@@ -75,6 +75,22 @@ pub struct AgentArgs {
     /// frontends never carry this agent-only flag at all.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
     pub final_output: Option<PathBuf>,
+    /// WP10 (FR-05, ADR-028): opt-in credential-free worker execution. Path to
+    /// a JSON control file of explicit MCP-stdio worker definitions and their
+    /// explicit, credential-free child environment (`workers` map of
+    /// name -> {command, args, env}). When set, every non-final tool call is
+    /// routed to a caller-supplied worker or refused; nothing runs in the
+    /// model-side process, and no credential, provider config, or inherited
+    /// environment reaches a worker. The final-answer tool (FR-01) is validated
+    /// and emitted model-side and is never forwarded to a worker. Default off.
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot host the two-process split (interactive returns through the
+    /// worker-less session daemon; dry-run never runs the loop), so the flag is
+    /// refused there at startup rather than silently ignored. The chat, ACP,
+    /// and session-daemon frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+    pub worker_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

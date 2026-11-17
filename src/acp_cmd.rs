@@ -1749,6 +1749,9 @@ fn build_agent_config(
         remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge_slot)),
         subcall_provider: None,
         generation_ordinal: Default::default(),
+        // WP10 (ADR-028): the ACP bridge is legacy fail-open remote dispatch,
+        // never worker-only execution. Worker-only is an agent one-shot mode.
+        worker_executor: None,
     }
 }
 

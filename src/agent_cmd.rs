@@ -45,6 +45,10 @@ pub struct AgentCmdArgs {
     /// Where the agent loop records the terminal final-output decision for the
     /// caller to map to stdout/stderr and the reviewed exit code.
     pub final_output_sink: Option<Arc<Mutex<Option<crate::structured_output::FinalOutputOutcome>>>>,
+    /// WP10 (FR-05, ADR-028): opt-in credential-free worker execution. `Some`
+    /// routes every non-final tool call to a caller-supplied worker (nothing
+    /// runs in-process). `None` = legacy local/remote dispatch.
+    pub worker_config: Option<Arc<crate::worker_runtime::WorkerConfig>>,
 }
 
 enum ThoughtCaptureState {
@@ -154,19 +158,59 @@ pub async fn run_agent(
         });
     }
 
-    let mut tools: Vec<ToolSchema> = schemas
-        .into_iter()
-        .map(|s| ToolSchema {
-            name: s.name,
-            description: s.description,
-            input_schema: s.input_schema,
-        })
-        .collect();
-    // Outbound MCP servers (#1289): one-shot agent mode reads the
-    // Claude-style file named by `[agent.mcp]`.
     let native_names: std::collections::HashSet<String> =
-        tools.iter().map(|tool| tool.name.clone()).collect();
-    let agent_mcp = crate::agent_mcp::connect(&cfg, &native_names, args.analytics.clone()).await;
+        schemas.iter().map(|tool| tool.name.clone()).collect();
+    // WP10 (FR-05, ADR-028): worker-only execution. When a `--worker-config` is
+    // supplied, discover the caller's workers BEFORE freezing the catalog
+    // (ADR-028 startup ordering), and build the model-visible catalog from the
+    // worker-discovered tools ONLY — no native in-process tools are offered,
+    // because nothing runs in this credential-bearing process. A discovery or
+    // launch failure is fail-closed: the run aborts with the distinct
+    // `worker_unavailable` error and never falls back to local tools.
+    let worker_executor = if let Some(worker_config) = &args.worker_config {
+        let init_timeout = std::time::Duration::from_secs(cfg.acp.mcp.call_timeout_secs);
+        let call_timeout = std::time::Duration::from_secs(cfg.acp.mcp.call_timeout_secs);
+        let shutdown_timeout = std::time::Duration::from_secs(cfg.acp.mcp.shutdown_timeout_secs);
+        match crate::worker_runtime::WorkerExecutor::connect(
+            worker_config,
+            &native_names,
+            init_timeout,
+            call_timeout,
+            shutdown_timeout,
+        )
+        .await
+        {
+            Ok(executor) => Some(Arc::new(executor)),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "{}: {error}",
+                    crate::worker_runtime::WORKER_UNAVAILABLE
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let mut tools: Vec<ToolSchema> = if let Some(executor) = &worker_executor {
+        executor.tools()
+    } else {
+        schemas
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s.name,
+                description: s.description,
+                input_schema: s.input_schema,
+            })
+            .collect()
+    };
+    // Outbound MCP servers (#1289): one-shot agent mode reads the Claude-style
+    // file named by `[agent.mcp]`. Disabled under worker-only mode, where tool
+    // servers come exclusively from the explicit `--worker-config`.
+    let agent_mcp = if worker_executor.is_some() {
+        None
+    } else {
+        crate::agent_mcp::connect(&cfg, &native_names, args.analytics.clone()).await
+    };
     if let Some(mcp) = &agent_mcp {
         tools.extend(mcp.tools());
     }
@@ -227,6 +271,7 @@ pub async fn run_agent(
         auto_continue_budget: if final_output_active { Some(0) } else { None },
         final_output: args.final_output.clone(),
         final_output_sink: args.final_output_sink.clone(),
+        worker_executor: worker_executor.clone(),
         ..AgentConfig::default()
     };
 
@@ -266,6 +311,12 @@ pub async fn run_agent(
     // Graceful bridge teardown before reporting; bounded by [acp.mcp] budgets.
     if let Some(mcp) = agent_mcp {
         mcp.shutdown().await;
+    }
+    // WP10 (ADR-028): reap owned worker children through the managed MCP
+    // lifecycle (cleanup/reaping checkpoint). Runs on every ending, including
+    // the worker-abort path (the lost worker is already gone; the rest reap).
+    if let Some(executor) = &worker_executor {
+        executor.shutdown().await;
     }
     let thought_capture_result = match thought_capture {
         Some(capture) => capture.finish(),
@@ -389,6 +440,7 @@ mod tests {
             task: task.to_string(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -498,6 +550,7 @@ mod tests {
             task: "do it".into(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -520,6 +573,7 @@ mod tests {
             task: "my task".into(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -544,6 +598,7 @@ mod tests {
             task: "go".into(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -661,6 +716,7 @@ mod tests {
             model: Some("claude-haiku-4-5".into()),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             dry_run: false,
             safety: None,
             analytics: None,
@@ -705,6 +761,7 @@ mod tests {
             audit: None,
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -763,6 +820,7 @@ mod tests {
             token_log: Some(log_path.clone()),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
             audit: None,
@@ -820,6 +878,7 @@ mod tests {
             task: "test analytics wiring".into(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -851,6 +910,7 @@ mod tests {
             task: "dry run task".into(),
             final_output: None,
             final_output_sink: None,
+            worker_config: None,
             model: None,
             dry_run: true,
             safety: None,

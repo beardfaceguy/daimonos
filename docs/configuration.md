@@ -1463,3 +1463,61 @@ Enforce an explicit tool allowlist for a run. `PATH` is a JSON file holding an a
 - At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`.
 - Refusals carry the `tool_not_allowed` code and are recorded in the `--audit-path` record.
 - Honored on every frontend and carried in the session-daemon launch identity, so daemon reuse cannot bypass it.
+
+## Credential-free worker execution (`--worker-config`)
+
+Opt-in (FR-05 / ADR-028). `daimonos agent --worker-config <PATH>` makes a
+one-shot `--print` run execute **no tool in the model-side process**. The
+model-side process holds the credential and reaches the model endpoint; every
+non-final tool call is routed to a caller-supplied MCP-stdio *worker* or
+refused. There is no local/native/opcode/script fallback. The final-answer tool
+(`--final-output`, FR-01) stays intercepted and validated model-side and is
+never forwarded to a worker. Default off leaves agent mode byte-for-byte
+unchanged (the legacy ACP bridge remains fail-open).
+
+The control file is JSON:
+
+```json
+{ "workers": {
+    "toolside": { "command": "/abs/daimonos", "args": ["--mcp", "-w", "/evidence"],
+                  "env": { "PATH": "/usr/bin" } },
+    "compute":  { "command": "/abs/compute", "env": {} }
+} }
+```
+
+- `workers` — a required, non-empty map of worker name to definition. Each entry
+  has a required `command` (string), optional `args` (array of strings), and
+  optional `env` (object of string→string). Names are sorted for a deterministic
+  catalog and worker order.
+- **Credential-free by construction.** Each worker child is launched from a
+  *cleared* environment (`env -i`) plus **only** its explicit `env` map, so no
+  model credential, provider configuration, or inherited ambient variable
+  reaches it (AC-05.1). Executable lookup is caller-controlled: pass an absolute
+  `command`, or include `PATH` in `env`.
+- **Discovery before freeze.** All workers are connected and their tools
+  discovered (`initialize` + `tools/list`) before the model-visible catalog is
+  frozen. Tools are exported as `mcp__{worker}__{tool}`, exactly like the
+  forwarded bridge, so the `--tool-allowlist` (FR-02) and `--audit-path`
+  (FR-04) treat them uniformly. The model-visible catalog is the
+  worker-discovered tools only; no native in-process tool is offered.
+- **Admission.** A worker tool's only run-policy gate is the `--tool-allowlist`
+  check at the agent-loop dispatch boundary (`run_policy::ToolPolicy::allows`).
+  Worker tools are the caller's sandbox: they are **not** path-checked and are
+  **not** refused by `--workspace-read-only` (PM FR-05). The caller must
+  separately sandbox the workers (stdio alone is not proof of confinement).
+- **Fail-closed.** A malformed, unreadable, or empty control file fails at
+  startup with `run_configuration_invalid` (exit 2) before any model request or
+  worker launch. A required worker that cannot launch or handshake aborts the
+  run with `worker_unavailable` (exit 22) and never falls back to a local tool.
+- **No-fallback liveness.** A worker that exits, closes stdio, or stalls during
+  a call ends the run with the distinct `worker_unavailable` failure (exit 22);
+  the failed dispatch is recorded in the `--audit-path` record (under the
+  `worker` route with reason `worker_unavailable`) and **no further tool runs**.
+- **Agent-only.** `--worker-config` is honored only by the one-shot `--print`
+  path. It conflicts with `--interactive` and `--dry-run` (refused at startup by
+  the argument parser), and the `chat`, `acp`, and session-daemon frontends do
+  not carry it at all (unexpected-argument error). An entry in `--tool-allowlist`
+  that names a worker-scoped tool (`mcp__…`) is accepted at startup in worker
+  mode; a name no worker serves is still refused at the dispatch boundary.
+
+See ADR-028 and `tests/test_worker_isolation.py`.

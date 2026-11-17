@@ -255,6 +255,14 @@ pub struct AgentConfig {
     pub final_output_sink: Option<
         std::sync::Arc<std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>>,
     >,
+    /// WP10 (FR-05, ADR-028): opt-in credential-free worker execution. `Some`
+    /// routes EVERY non-final tool call through a caller-supplied worker or
+    /// refuses it — no native/opcode/script/local/remote fallback. A lost
+    /// worker aborts the run with a distinct `worker_unavailable` failure and
+    /// no further tool runs. The final-answer tool is intercepted earlier
+    /// (`final_output`) and is never forwarded to a worker. `None` leaves
+    /// dispatch unchanged (legacy ACP bridging stays fail-open).
+    pub worker_executor: Option<std::sync::Arc<crate::worker_runtime::WorkerExecutor>>,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -1535,6 +1543,11 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+                // WP10 (ADR-028): set to the distinct failure detail when a
+                // worker route is lost. Unlike `terminate` (which maps to a
+                // benign Aborted/exit-0 ending), this ends the run as a genuine
+                // StopReason::Error with no local fallback and no further tool.
+                let mut worker_abort: Option<String> = None;
                 // The error message carried if `terminate` is set below. An
                 // after_tool_call hook keeps the default; an audit-write poison
                 // (R5) overrides it to the same self-describing code the
@@ -1652,6 +1665,57 @@ async fn run_inner(
                             ..ToolOutcome::default()
                         };
                         (content, true, Some(outcome))
+                    } else if let Some(worker) = &config.worker_executor {
+                        // WP10 (FR-05, ADR-028): worker-only execution. Every
+                        // non-final tool call is routed to a caller-supplied
+                        // worker or refused here — BEFORE any native/opcode/
+                        // script/local/remote dispatch, so nothing ever runs in
+                        // this credential-bearing process. The final-answer tool
+                        // is intercepted earlier (final-output classification
+                        // above) and never reaches this branch. Worker tools are
+                        // the caller's sandbox: the only gate they pass is the
+                        // FR-02 allowlist (`policy.allows`, checked above); they
+                        // are not path-checked or read-only-refused here
+                        // (PM FR-05 clarification).
+                        use crate::worker_runtime::WorkerDispatch;
+                        let base_outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        match worker.call(&name, &input).await {
+                            WorkerDispatch::Served { content, is_error } => {
+                                (content, is_error, Some(base_outcome))
+                            }
+                            WorkerDispatch::NoRoute => {
+                                // No worker serves this name. Refuse with the
+                                // reviewed code; NOTHING executes locally.
+                                let content = serde_json::json!({
+                                    "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+                                    "message": format!(
+                                        "tool {name} is not served by any configured worker"
+                                    ),
+                                    "tool": name.clone(),
+                                    "retryable": false,
+                                })
+                                .to_string();
+                                (content, true, Some(base_outcome))
+                            }
+                            WorkerDispatch::Aborted(detail) => {
+                                // Terminal: the worker route was lost. Record
+                                // the distinct failure, let this call flow
+                                // through the audit boundary below, then end the
+                                // run with no fallback and no further tool.
+                                let content = serde_json::json!({
+                                    "code": crate::worker_runtime::WORKER_UNAVAILABLE,
+                                    "message": detail.clone(),
+                                    "tool": name.clone(),
+                                    "retryable": false,
+                                })
+                                .to_string();
+                                worker_abort = Some(detail);
+                                (content, true, Some(base_outcome))
+                            }
+                        }
                     } else if script_refused_read_only {
                         let content = serde_json::json!({
                             "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
@@ -1962,10 +2026,28 @@ async fn run_inner(
                     // required-audit write failure poisons the sink and ends
                     // the run before any further model/tool work (fail-closed).
                     if let Some(audit) = &config.audit {
-                        let reason = crate::run_audit::refusal_code(&content);
+                        // WP10 (AC-05.4, WP08/ADR-026): a lost worker route is
+                        // not a JSON policy refusal (its code is outside
+                        // REFUSAL_CODES), so refusal_code() would not surface
+                        // it. Record the distinct `worker_unavailable` reason
+                        // explicitly so the audit identifies the worker death
+                        // at the dispatch boundary before run_end.
+                        let reason = if worker_abort.is_some() {
+                            Some(crate::worker_runtime::WORKER_UNAVAILABLE.to_string())
+                        } else {
+                            crate::run_audit::refusal_code(&content)
+                        };
+                        // WP10 (AC-05.3): a worker-only run records every
+                        // dispatch under the `worker` route so the audit proves
+                        // the model-side process executed nothing locally.
+                        let route = if config.worker_executor.is_some() {
+                            crate::worker_runtime::WORKER_ROUTE
+                        } else {
+                            dispatch_tool_kind(&name)
+                        };
                         let _ = audit.record_tool(
                             &name,
-                            dispatch_tool_kind(&name),
+                            route,
                             &crate::run_audit::hash_json_value(&input),
                             &crate::run_audit::hash_result_str(&content),
                             reason.as_deref(),
@@ -1977,6 +2059,15 @@ async fn run_inner(
                             terminate = true;
                             break;
                         }
+                    }
+
+                    // WP10 (ADR-028, AC-05.4): a lost worker route is terminal.
+                    // The failed dispatch has now been recorded in the audit
+                    // above; stop before any further tool call in this turn and
+                    // end the run with the distinct failure (handled after the
+                    // loop). No local fallback runs.
+                    if worker_abort.is_some() {
+                        break;
                     }
 
                     // after_tool_call hook
@@ -2171,6 +2262,27 @@ async fn run_inner(
                             ),
                         }
                     }
+                }
+
+                if let Some(detail) = worker_abort {
+                    // WP10 (ADR-028, FR-05 req 6): a lost worker route ends the
+                    // run with a DISTINCT failure (StopReason::Error carrying
+                    // the stable `worker_unavailable` token) and NO local
+                    // fallback. The frontend maps Error to a non-zero exit; the
+                    // audit already recorded the failed dispatch above and the
+                    // terminal run_end is written by finalize_run_audit.
+                    return AgentResult {
+                        messages,
+                        usage: total_usage,
+                        stop_reason: StopReason::Error,
+                        error_message: Some(format!(
+                            "{}: {detail}",
+                            crate::worker_runtime::WORKER_UNAVAILABLE
+                        )),
+                        last_call_usage: resp.usage,
+                        context_overflow: false,
+                        evidence,
+                    };
                 }
 
                 if terminate {

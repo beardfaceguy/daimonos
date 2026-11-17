@@ -67,6 +67,7 @@ mod tool_runner;
 mod tools;
 mod tui;
 mod verbosity;
+mod worker_runtime;
 mod zed_config;
 
 use clap::Parser;
@@ -661,6 +662,16 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
+        // WP10 (FR-05, ADR-028): when a `--worker-config` is set, the model's
+        // effective catalog is the worker-discovered tools, exported under the
+        // `mcp__{worker}__{tool}` scheme. Those names are not in the native
+        // catalog and are only known after worker discovery (which happens in
+        // the agent loop builder, not here). Accept worker-namespaced entries
+        // at startup; a name that no worker actually serves is still refused at
+        // the dispatch boundary (WorkerExecutor returns NoRoute -> the reviewed
+        // tool_not_allowed code), so the allowlist stays fail-closed for
+        // native names while remaining usable for caller-supplied worker tools.
+        let mut worker_mode = false;
         if let Some(crate::cli::Command::Agent(args)) = &cli.command {
             if let Some(control) = &args.final_output {
                 if let Ok(text) = std::fs::read_to_string(control) {
@@ -671,8 +682,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            worker_mode = args.worker_config.is_some();
         }
-        if let Some(unknown) = names.iter().find(|name| !known.contains(name.as_str())) {
+        if let Some(unknown) = names.iter().find(|name| {
+            // Known native name, or (worker mode) a worker-namespaced entry
+            // that a worker may serve; anything else is an unknown allowlist
+            // entry and is refused at startup.
+            let acceptable = known.contains(name.as_str())
+                || (worker_mode && name.starts_with(crate::mcp_bridge::REMOTE_TOOL_PREFIX));
+            !acceptable
+        }) {
             eprintln!(
                 "{}",
                 serde_json::json!({"error": {

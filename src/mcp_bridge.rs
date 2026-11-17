@@ -1139,6 +1139,166 @@ fn client_details() -> InitializeRequestParams {
     }
 }
 
+// --- WP10 (FR-05, ADR-028): credential-free worker execution ---------------
+//
+// Context: docs/adr/028-worker-only-execution.md, docs/contexts/reviewer-runtime.
+// A worker is a caller-supplied MCP-stdio tool server (e.g. daimonos run as a
+// read-only tool server inside dbunk's container, or dbunk's `compute` server).
+// It reuses the SAME ClientRuntime / StdioTransport / handshake the forwarded
+// ACP bridge uses, so this is NOT a second worker protocol (ADR-028). The one
+// difference is launch isolation: the rust_mcp_sdk StdioTransport spawns its
+// child with `Command::envs(..)` and NEVER clears the environment, so the model
+// process's credential and provider configuration would otherwise be inherited.
+// `connect_worker` launches through `env -i` so the exec'd worker starts from a
+// CLEARED environment plus only the caller's explicit map — the same env-clear
+// discipline as managed_process::apply_environment, applied to the SDK child
+// (W25). The self-connection guard is deliberately NOT applied: dbunk's tool
+// side is itself a daimonos instance, which is the intended Route-1 topology.
+
+/// One connected, owned credential-free worker client.
+pub struct WorkerClient {
+    name: String,
+    client: Arc<ClientRuntime>,
+}
+
+/// A worker's discovered tool, before namespacing into the exported catalog.
+pub struct WorkerToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// Outcome of a single worker tool call. `Down` is a terminal loss of the
+/// worker route (transport/protocol error or a stall): ADR-028 requires the run
+/// to abort with a distinct failure and NO local fallback, so it is kept
+/// separate from a served result whose `is_error` is an ordinary tool error.
+pub enum WorkerCallResult {
+    Served { content: String, is_error: bool },
+    Down(String),
+}
+
+impl WorkerClient {
+    /// Dispatch one tool call to this worker over the MCP channel. A transport
+    /// or protocol error (the worker exited, closed stdio, or never answered)
+    /// is reported as `Down`; a normal MCP result — including a tool-reported
+    /// `isError` — is `Served`. Bounded by `timeout`.
+    pub async fn call(
+        &self,
+        original_tool: &str,
+        input: &Value,
+        timeout: Duration,
+    ) -> WorkerCallResult {
+        let params = CallToolRequestParams {
+            name: original_tool.to_string(),
+            arguments: input.as_object().cloned(),
+            meta: None,
+            task: None,
+        };
+        match tokio::time::timeout(timeout, self.client.request_tool_call(params)).await {
+            Ok(Ok(result)) => {
+                let outcome = result_to_outcome(result);
+                WorkerCallResult::Served {
+                    content: outcome.content,
+                    is_error: outcome.is_error,
+                }
+            }
+            Ok(Err(e)) => WorkerCallResult::Down(format!(
+                "worker '{}' tool '{original_tool}' failed: {e}",
+                self.name
+            )),
+            Err(_) => WorkerCallResult::Down(format!(
+                "worker '{}' tool '{original_tool}' timed out after {}s",
+                self.name,
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    /// Bounded teardown: shut the client down and reap the stdio child. The
+    /// caller's budget bounds us; a slow child is detached to keep reaping.
+    pub async fn shutdown(&self, timeout: Duration) {
+        let client = Arc::clone(&self.client);
+        let mut task = tokio::spawn(async move {
+            let _ = client.shut_down().await;
+        });
+        let _ = tokio::time::timeout(timeout, &mut task).await;
+    }
+}
+
+/// Launch and connect one credential-free MCP-stdio worker. The child is
+/// started from a cleared environment (`env -i`) plus only `env`, so no
+/// inherited parent variable (model credential, provider config, ambient
+/// state) reaches it (ADR-028, AC-05.1). Executable lookup is resolved from the
+/// caller-controlled settings only: pass an absolute `command`, or include
+/// `PATH` in `env`. Discovery (initialize + tools/list) is bounded by
+/// `init_timeout`.
+pub async fn connect_worker(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    init_timeout: Duration,
+) -> Result<(WorkerClient, Vec<WorkerToolDef>), String> {
+    // `env -i <ASSIGN...> -- <command> <args...>` clears the environment for the
+    // exec'd worker and sets ONLY the explicit assignments. The SDK still spawns
+    // `env` itself with the inherited parent environment (to locate `env` on
+    // PATH), but `-i` discards all of it before the worker image is exec'd, so
+    // the worker's own environment is exactly `env`.
+    let mut wrapped: Vec<String> = Vec::with_capacity(args.len() + env.len() + 3);
+    wrapped.push("-i".to_string());
+    let mut assignments: Vec<(&String, &String)> = env.iter().collect();
+    assignments.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in assignments {
+        wrapped.push(format!("{key}={value}"));
+    }
+    // No `--` separator: GNU `env` treats the first argument without `=` as the
+    // command, and would try to exec a literal `--`. Worker commands are
+    // absolute paths (no `=`), so the first non-assignment arg is the command.
+    wrapped.push(command.to_string());
+    wrapped.extend(args.iter().cloned());
+    let transport = StdioTransport::create_with_server_launch(
+        "env".to_string(),
+        wrapped,
+        None,
+        TransportOptions::default(),
+    )
+    .map_err(|e| format!("worker '{name}' stdio transport: {e}"))?;
+    let client = client_runtime::create_client(McpClientOptions {
+        client_details: client_details(),
+        transport,
+        handler: BridgeClientHandler.to_mcp_client_handler(),
+        task_store: None,
+        server_task_store: None,
+        message_observer: None,
+    });
+    let deadline = tokio::time::Instant::now() + init_timeout;
+    // reject_daimonos = false: the worker IS allowed to be a daimonos instance
+    // (Route 1). The handshake only initializes and lists tools.
+    let tools = match handshake(&client, deadline, false).await {
+        Ok(Some(tools)) => tools,
+        Ok(None) => unreachable!("reject_daimonos is false"),
+        Err(e) => {
+            shutdown_rejected_client(client, &AcpMcpConfig::default()).await;
+            return Err(format!("worker '{name}': {e}"));
+        }
+    };
+    let defs = tools
+        .into_iter()
+        .map(|tool| WorkerToolDef {
+            name: tool.name,
+            description: tool.description.unwrap_or_default(),
+            input_schema: serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null),
+        })
+        .collect();
+    Ok((
+        WorkerClient {
+            name: name.to_string(),
+            client,
+        },
+        defs,
+    ))
+}
+
 #[cfg(test)]
 fn create_client(spec: &ServerSpec, cfg: &AcpMcpConfig) -> Result<Arc<ClientRuntime>, String> {
     create_client_with_proxy(spec, cfg, None)
@@ -1257,7 +1417,7 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 /// `mcp__{server}__{tool}`, sanitized to the provider tool-name constraint
 /// (`^[a-zA-Z0-9_-]{1,64}$`) and truncated to 64 bytes. Non-conforming chars
 /// become `_`.
-fn namespaced_name(server: &str, tool: &str) -> String {
+pub(crate) fn namespaced_name(server: &str, tool: &str) -> String {
     let raw = format!("{REMOTE_TOOL_PREFIX}{server}__{tool}");
     let mut s: String = raw
         .chars()

@@ -274,6 +274,7 @@ pub async fn run_agent(
         debug_thoughts_path,
         model_profile,
         final_output,
+        worker_config,
     } = args;
     // WP07 (FR-04): validate the controlled model profile before any work, in
     // every mode. A partial profile fails here naming the missing value(s);
@@ -333,6 +334,9 @@ pub async fn run_agent(
             // WP05: dry-run never runs the loop, so final-output is inert here.
             final_output: None,
             final_output_sink: None,
+            // WP10: dry-run never runs the loop; worker-only is inert here and
+            // the flag is refused in dry-run at parse anyway (clap conflict).
+            worker_config: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -522,6 +526,40 @@ pub async fn run_agent(
         }
         None => None,
     };
+    // WP10 (FR-05, ADR-028) startup ordering: resolve and validate the explicit
+    // worker control file BEFORE the agent env file is read (INTERFACES.md
+    // step 3: explicit control files precede environment mutation / implicit
+    // reads). A malformed or empty document fails the run at startup
+    // (run_configuration_invalid) — fail-closed, before any model request or
+    // worker launch. Worker discovery itself happens in the loop builder, once,
+    // before the catalog freeze.
+    // A malformed/unreadable/empty worker control file is a configuration
+    // fault: emit the reviewed `run_configuration_invalid` JSON and exit 2
+    // (INTERFACES.md exit table), never generic anyhow exit 1.
+    let worker_config_runtime = match &worker_config {
+        Some(path) => {
+            let invalid = |reason: &str, detail: String| -> ! {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": reason,
+                        "message": format!("--worker-config {}: {detail}", path.display()),
+                    }})
+                );
+                std::process::exit(2);
+            };
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(error) => invalid("worker_config_unreadable", error.to_string()),
+            };
+            match crate::worker_runtime::WorkerConfig::parse(&content) {
+                Ok(config) => Some(std::sync::Arc::new(config)),
+                Err(error) => invalid("worker_config_invalid", error),
+            }
+        }
+        None => None,
+    };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
@@ -593,6 +631,7 @@ pub async fn run_agent(
         final_output_sink: final_output_runtime
             .as_ref()
             .map(|(_, sink)| std::sync::Arc::clone(sink)),
+        worker_config: worker_config_runtime.clone(),
     };
     // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
     // and any required-audit write failure surfaced as exit 23 — BEFORE the
@@ -613,6 +652,14 @@ pub async fn run_agent(
     } else {
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
     };
+    // WP10 (FR-05, ADR-028): a required worker failure (initialization, call,
+    // liveness, or teardown) ends the run with the reviewed `worker_unavailable`
+    // exit 22 (INTERFACES.md exit table) — never generic anyhow exit 1, and
+    // never a local fallback. This also covers the model-side final-output
+    // contract: a lost worker takes precedence over the final-output mapping.
+    if worker_config_runtime.is_some() {
+        exit_on_worker_failure(&result);
+    }
     let result = result?;
     // WP05 (ADR-024): map the terminal final-output decision to the reviewed
     // stdout/stderr + exit-code contract. Diverges (process::exit) when active.
@@ -685,9 +732,51 @@ fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static
             providers::StopReason::MaxTokens => ("max_tokens", 0),
             providers::StopReason::Refusal => ("refusal", 0),
             providers::StopReason::Aborted => ("aborted", 0),
+            // WP10 (FR-05): a lost worker route is a distinct terminal failure.
+            // Its recorded exit_code must agree with the process exit the
+            // reviewed table assigns (22), not the generic error exit (1).
+            providers::StopReason::Error
+                if r.error_message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(crate::worker_runtime::WORKER_UNAVAILABLE)) =>
+            {
+                (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+            }
             providers::StopReason::Error => ("error", 1),
         },
         Err(_) => ("error", 1),
+    }
+}
+
+/// WP10 (FR-05, ADR-028): if the terminal run outcome is a required-worker
+/// failure (an `Err` whose message carries `worker_unavailable`, or an
+/// `Ok(StopReason::Error)` whose `error_message` does), emit the reviewed
+/// `worker_unavailable` JSON and exit 22 (INTERFACES.md exit table). Otherwise
+/// return so normal handling (final-output/exit) proceeds. Diverges on a
+/// worker failure.
+fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
+    let message = match result {
+        Err(error) => {
+            let text = error.to_string();
+            text.contains(crate::worker_runtime::WORKER_UNAVAILABLE)
+                .then_some(text)
+        }
+        Ok(run) if run.stop_reason == providers::StopReason::Error => run
+            .error_message
+            .as_deref()
+            .filter(|m| m.contains(crate::worker_runtime::WORKER_UNAVAILABLE))
+            .map(str::to_string),
+        Ok(_) => None,
+    };
+    if let Some(message) = message {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": crate::worker_runtime::WORKER_UNAVAILABLE,
+                "message": message,
+            }})
+        );
+        std::process::exit(22);
     }
 }
 

@@ -9,6 +9,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **`--worker-config` (FR-05).** An opt-in, default-off `agent --print` option
+  for credential-free worker execution (ADR-028). The model-side process holds
+  the credential and reaches the endpoint but executes no tool itself: every
+  non-final tool call is routed to a caller-supplied MCP-stdio worker named in
+  a JSON control file (`workers` map of name -> `{command, args, env}`) or
+  refused, with no local/native/opcode/script fallback. Each worker child is
+  launched from a cleared environment (`env -i`) plus only its explicit `env`
+  map, so no credential, provider configuration, or inherited variable reaches
+  its env, argv, or initialization. Worker tools are discovered before the
+  catalog is frozen and exported as `mcp__{worker}__{tool}`, so `--tool-allowlist`
+  and `--audit-path` treat them uniformly; the allowlist is their sole run-policy
+  gate (worker tools are the caller's sandbox and are not path-checked or refused
+  under `--workspace-read-only`). The final-answer tool (`--final-output`) stays
+  intercepted and validated model-side and is never forwarded to a worker. A
+  malformed/empty control file fails closed at startup (`run_configuration_invalid`,
+  exit 2); a required worker that cannot launch, or that exits/stalls during a
+  call, aborts the run with the distinct `worker_unavailable` (exit 22), records
+  the failed dispatch in the audit under the `worker` route, and runs no later
+  tool. Agent-only: refused in `--interactive`/`--dry-run` and absent from the
+  `chat`, `acp`, and session-daemon frontends. New module `src/worker_runtime.rs`
+  and `mcp_bridge::connect_worker`. See ADR-028 and `docs/configuration.md`.
 - **`--audit-path` (FR-04).** A global, default-off option that writes a
   caller-requested, privacy-preserving run audit: one private JSONL file
   (`O_CREAT | O_EXCL`, mode `0600`, never appended) with a versioned

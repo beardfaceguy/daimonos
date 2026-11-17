@@ -91,3 +91,22 @@ If a local run uses temporary programs, report their versions and the PATH prefi
 Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn-limit, zero/exhausted-retry, evidence-turn, and success-on-last-request cases run against a local scripted model endpoint on BOTH wires — Chat Completions (`openrouter`) and Messages (`anthropic`). No live API or real credentials. Run: `python3 -m pytest tests/test_structured_output.py -v`.
 
 - `test_tool_allowlist.py` (FR-02/WP06): drives a real `daimonos` process proving `--tool-allowlist` is the effective set at every listing and dispatch boundary — AC-02.1..02.6, the audit `tool_refusal`, nested Starlark/batch cannot bypass it, and the default-off regression. Reuses the fake-provider agent harness from `test_run_audit.py`.
+
+## tests/test_worker_isolation.py (WP10, FR-05)
+
+Credential-free worker execution acceptance tests (ADR-028). Drive a real
+`daimonos agent --worker-config` process against a local scripted model endpoint
+and a RECORDING, credential-free MCP-stdio worker (pure stdlib). The worker dumps
+its own process environment and records every served tool call, so isolation and
+routing are observed from the outside — no live API, no real credentials. Covers
+AC-05.1 (no credential in worker env; the credential is a real var of the
+model-side process), AC-05.3 (every call served by a worker, recorded under the
+`worker` audit route, none in-process), AC-05.4 (a killed worker aborts with the
+distinct `worker_unavailable` exit 22 and runs no later tool), AC-05.5 (the
+`--tool-allowlist` is the sole admission gate for worker tools), the WP04
+read-only pass-through (worker tools are the caller's sandbox, not path-checked),
+the WP08/ADR-026 audited-worker-death case, the default-off regression, and the
+fail-closed control-file validation (exit 2). The no-network container leg
+(AC-05.2) and the WP09 capability-probe leg are integration merge items — the
+pure-stdlib worker makes no outbound connection. Run:
+`python3 -m pytest tests/test_worker_isolation.py -v`.
