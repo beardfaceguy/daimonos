@@ -62,7 +62,11 @@ jobs:
       - run: cargo build
       - name: Install CLI test prerequisites
         run: sudo apt-get update && sudo apt-get install --yes npm shellcheck
-      - run: pytest tests/ -v
+      - name: Report user namespace support
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone || true
+          if unshare -Urnm true; then echo "unshare -Urnm: available"; else echo "unshare -Urnm: unavailable"; fi
+      - run: pytest tests/ -v -rs
 
   android:
     name: Android test + debug APK
