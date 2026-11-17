@@ -2,6 +2,12 @@
 
 Date: 2026-10-29
 Status: Launch contracts approved by the user on 2026-10-29 UTC. Package dependencies and operational preflight still apply.
+Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`). Startup refusals use the reserved exit-2 taxonomy below: top-level `code` is `run_configuration_invalid` with the specific cause in `reason` (e.g. `workspace_write_forbidden`), matching the state-authority failure shape (the two tool-refusal codes remain tool-result codes, never exit-2 top-level codes). `--workspace-read-only` is part of the session-daemon launch identity (`src/session_bootstrap.rs`: forwarded to a spawned daemon, hashed into the bootstrap fingerprint, and an explicit selection in `launch_identity`), so a read-only client cannot be served by a daemon started without it.
+
+Implementation status: WP08 (`--audit-path`, FR-04) is implemented. The reserved spellings `--audit-path`, `src/run_audit.rs` (`RunAudit`, `AuditFailure`), the exit code `23` / `audit_write_failed`, and the `[reviewer.audit]` bounds (`max_event_bytes`, `max_events`) are live (`tests/test_run_audit.py`). `run_start`, `model_request`, `tool_call`, and `tool_refusal` are wired through the one-shot agent frontend; `probe_result` (WP09) and `limit_hit` (WP18), and the `model_request` HTTP-status/`wire` fields (WP07), are defined in the module and exercised through its public test seam as pending integrator hooks.
+
+Implementation status (WP08, r2): the reserved type `AuditEvent` is now provided in `src/run_audit.rs` (it renders the exact JSON streamed to the file, so all three reserved spellings `RunAudit`/`AuditEvent`/`AuditFailure` are live). `--audit-path` is honored only by `agent --print`; every other frontend that accepts it (`chat`, `acp`, the MCP server, the session daemon, the interactive agent, `agent --dry-run`) refuses at startup with exit `2` (`run_configuration_invalid`, reason `audit_unsupported_frontend`). The terminal `run_end` record is written before any assistant output is published, and its `status`/`exit_code` are derived from the same terminal source as the process exit. Process-level coverage of mid-run-write and finish-time audit failures (both exit `23`), and of each refusing frontend, is in `tests/test_run_audit.py`.
+Implementation status (WP08, r3): `run_end.reported_model` is a pending integrator hook, recorded next to the `model_request` HTTP-status/`wire` fields (WP07). The default provider adapter (`src/providers/mod.rs::LlmResponse`) carries no endpoint-reported model identifier and no adapter parses `"model"` from the response body, so `run_end` records `reported_model: null`; wiring it requires a WP07 transport change that exposes the reported model, not a WP08 change.
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Decisions: Accepted ADRs 021–032. Scope: the approved 20-package [plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Coverage: [INVENTORIES.md](INVENTORIES.md).
@@ -139,6 +145,10 @@ Both paths apply identical selection and validation. A network-dependent discove
 ## Structured final output and controlled requests
 
 WP05 owns `src/structured_output.rs` and the reusable `src/schema_validation.rs` (both new): `FinalOutputSpec`, `FinalOutputState`, and `FinalAttemptFailure`.
+
+> Status (WP05, run wp05-20261117): implemented and wired behind `daimonos agent --final-output`. The model-request ceiling emits reason `turn_limit` in its JSON while using exit code 24 (`model_request_limit`). Acceptance suite `tests/test_structured_output.py` passes on both the Chat Completions and Messages mock wires. Validator dependency `jsonschema =0.60.2` (default features off) added per the human's FR-01 approval.
+The `daimonos agent --final-output` control file (`schema`/`schema_path`, `tool_name`, `tool_description`, `corrective_retries`, `max_model_requests`) is the complete FR-01 caller interface; the reserved `reviewer.final_output` configuration group names no additional fields until package-level configuration review.
+> Status (WP05, run wp05-20261117-r3): independent-review fixes landed. Every failed ending that contains tool calls (including a single `invalid_arguments` call) now pairs each call with an ordered `is_error` result, so a corrective turn is wire-valid on both endpoints; the acceptance mocks enforce the strict unanswered-call rule (HTTP 400). The `--final-output` control file is validated before the agent env file is read (startup-order step 3), so a config/collision error exits 2 regardless of host agent.env. `--final-output` is refused (exit 2) on interactive, dry-run, chat, ACP, and session-daemon frontends. The no-final-decision fallback reports the run's real `attempts`/`model_requests`. Open reconciliation (R5): the WP09 FR-04 capability probe must call `FinalOutputState::record_request` so the one probe request counts against the same inclusive ceiling.
 Use `jsonschema` version `0.60.2`, the full draft-2020-12 validator selected by Accepted ADR-024.
 Compile with default external resolver features disabled. Assert `format: date-time` and permit only self-contained local references.
 Acceptance of ADR-024 confirms this named validator dependency. This step does not add it to Cargo.toml.
@@ -164,7 +174,7 @@ Required final-output reasons remain `no_final_call`, `mixed_calls`, `invalid_ar
 Do not collapse those into one free-text message. The terminal failure records its last validation errors.
 
 WP07 adapts existing `src/providers/anthropic.rs`, `src/providers/openrouter.rs`, and `src/providers/router.rs`.
-I owns shared `ControlledModelSpec`, `ControlledRequest`, and `ControlledTransport` seams in existing `src/providers/mod.rs`.
+I owns the shared controlled-transport seams in existing `src/providers/mod.rs`. The shipped symbols are `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`, `ControlledHttp`, `controlled_client`, and `controlled_send` (the earlier reserved name `ControlledTransport` was not used; the transport is realized as `controlled_send` + `ControlledHttp` + `controlled_client`).
 Do not add a parallel controlled provider module or duplicate wire implementation.
 The model-profile JSON contains `provider_label`, `model`, `base_url`, `wire`, and `credential_env` as one complete source.
 Additional caller controls are `max_tokens`, `timeout_ms`, `request_retries`, `proxy`, and explicit `extra_body_fields`.
@@ -180,6 +190,33 @@ Controlled requests can run without final-output mode or audit. Final-output mod
 Auxiliary summary/reformat calls use the same controlled authority and request counter. They must not select a legacy provider or retry policy.
 If an auxiliary path cannot honor the exact request contract, refuse before sending with `auxiliary_request_unsupported` metadata.
 Do not silently drop history or perform a hidden fallback request after that refusal. Default non-profile compaction remains unchanged.
+
+_WP07 status (implemented, transport only):_ the provider-neutral seams
+(`Wire`, `ControlledModelSpec`, `ControlledRequest`, `ControlledProfile`,
+`ControlledHttp`, `controlled_client`, `controlled_send`) live in
+`src/providers/mod.rs`; the wire-local serializers in `src/providers/anthropic.rs`
+(Messages) and `src/providers/openrouter.rs` (Chat); `ControlledProvider` in
+`src/providers/router.rs`. The caller flag is `daimonos agent --model-profile PATH`
+(`src/cli.rs`, validated in `src/agent_runtime.rs`), mutually exclusive with
+`--model`/`--provider`/`--interactive`. It is honored only by the one-shot send
+path; combining it with `--interactive` fails closed at startup, because the
+interactive TUI routes through the session daemon which carries no profile
+(`chat`/`acp` expose no such flag). Caller `request_retries` is bounded by the
+named model-request ceiling `CONTROLLED_REQUEST_RETRY_CEILING` (`100`, ADR-025).
+Transport-level AC-04.1-04.5 are asserted by
+`cargo test providers::controlled_transport_tests` (exact body/headers, the
+timeout against a slow endpoint, explicit-proxy routing, the 400-on-forced
+`tool_choice` endpoint, and fixed headers under an active tracing provider on
+both wires); AC-04.7, the opt-out regression, the fail-closed `--interactive`
+refusal, and the ambient-proxy-ignored counting-proxy check by
+`tests/test_request_control.py`. `max_tokens` is caller-owned with no built-in
+default: mandatory on the `messages` wire (a profile omitting it is refused at
+startup) and omitted on the `chat` wire unless the caller set it.
+`extra_body_fields` are validated at startup against `PROTECTED_BODY_FIELDS` and
+a complete `FORBIDDEN_BODY_FIELDS` denylist (every sampling, forced-choice,
+strictness, streaming, and multi-choice parameter on both wires); no allowlist
+of permitted extras is defined. The capability probe (AC-04.6)
+and audit record remain WP09/WP08; the integrated probe repeats AC-04.1-04.5.
 
 WP09 owns `src/capability_probe.rs` (new): `ProbeSpec` and `ProbeOutcome`.
 The caller supplies a minimal valid final payload. Local schema validation occurs before the endpoint call.
@@ -250,9 +287,10 @@ Do not present generic `anyhow` text as the machine-readable contract.
 | 24 | `model_request_limit` | Inclusive request counter prevents the next attempt |
 | 25 | `controlled_endpoint_error` | Controlled transport failure outside a probe or final-output failure context |
 
-Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
+Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `workspace_write_forbidden`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
 `state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
+`workspace_write_forbidden` is the WP04 startup refusal when an internal writer's destination resolves inside the workspace under `--workspace-read-only`; it reuses the one FR-07 spelling for both the startup (exit-2) reason and the tool-refusal code below, so operators see a single name for every prohibited workspace write.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.
 A probe endpoint failure uses exit 21. A later controlled endpoint failure in final-output mode uses exit 20 with `endpoint_error`.
 Audit failure takes precedence over reporting successful completion. Preserve the original failure code as bounded secondary metadata when available.
@@ -343,3 +381,11 @@ The first wave needs WP01/WP03 launch contracts closed. No implementation agent 
 No development notes or task updates may go to Vikunja before the previously agreed final approval.
 
 _Anchors:_ src/main.rs::main, src/provisioning.rs::build_tool_services, src/session.rs::Session::resolve_path, src/providers/mod.rs::CompleteOpts, src/managed_process.rs::ManagedChild::terminate, src/agent.rs::AgentSession::staged_prompt_message, src/mcp.rs::dispatch_local_tool, src/ops/mod.rs::dispatch_with_progress, src/tool_output.rs::bound_text
+
+Implementation status: WP06 (`--tool-allowlist PATH`, FR-02) is implemented. `src/run_policy.rs::ToolPolicy` (`Option<BTreeSet<String>>`: absent = legacy, `Some(empty)` = deny-all) is the effective policy consulted by name at every listing and dispatch boundary: `mcp::handle_list_tools_request` and the `list_all_tools` handler (model sees exactly the allowlist), `mcp::dispatch_tool_inner` (direct MCP + batch children + Starlark non-opcode), the `batch`/`execute_script` special cases, `script::dispatch_tool_by_name` (Starlark opcode + generic `tool()`), and the agent loop's own dispatch chokepoint (opcode tools bypass `dispatch_tool_inner`). Unknown entries fail at startup with exit-2 `run_configuration_invalid` reason `tool_allowlist_unknown_entry` (the final-answer tool must be listed explicitly). Refusals carry `tool_not_allowed` (already in `run_audit::REFUSAL_CODES`, recorded as `tool_refusal`). Caller-owned (`#[serde(skip)]`), never widened by workspace/env config, and part of the session-daemon launch identity (`session_bootstrap.rs`). Read-only/confinement admissions remain stronger and may still refuse an otherwise-listed tool.
+
+Implementation status (WP06, r3 review fixes): the model-facing catalog is now filtered at a single source. `tool_facade::active_schemas_for_policy` takes the `ToolPolicy` and returns only allowlisted tools, so `agent --print`, `daimonos chat`, `daimonos acp` (`agent_tools`), and the session daemon (`session_factory`) all offer the model exactly the allowlist with no per-frontend `retain` (the retain in `agent_cmd.rs` is removed). Forwarded/outbound MCP tools offered to the model are filtered by the same policy. The `execute_script` tool *description*'s embedded Starlark signature block uses `script::tool_signatures_filtered` under the policy, so it never names an unlisted tool (ADR-023 served==dispatched, R1/R2). The `effective_tool_allowlist` report scope is the allowlist intersected with the agent-env `allowed_commands` only; `denied_commands`/permission-mode/approval are enforced at dispatch but not folded into the report (r3 decision; a session-free full-gate evaluation is not a small change). Collision/name-gathering callers of `active_schemas_for_policy` (ACP native-name sets, final-output name-collision check) pass an unrestricted policy by design — they must see the full native catalog. Caller-owned worker names in the startup known-catalog remain deferred to WP10.
+
+Implementation status: WP06 (r2 review fixes) extends the above. The explicit policy now also filters schema lookup (`get_tool_schema`), the Starlark signature dump (`list_tool_signatures`), the MCP server-instructions signature section, the session-daemon socket listing, and the agent-print offered catalog — so the served, discovered, probed, dumped, and dispatched sets agree (ADR-023). With `--final-output`, an allowlist that omits the designated final-answer tool fails at startup with exit-2 `run_configuration_invalid` reason `tool_allowlist_missing_final_output`; the name is never added automatically (PM Q-FR-02-2). The reported `effective_tool_allowlist` is the intersection with the run's active legacy restriction (the agent-env `allowed_commands`), i.e. the set the run will actually permit. Config-registered custom local tools (`[tools.*]`) are part of the known catalog and may be allowlisted.
+
+Implementation status: WP06 (r4 review fixes) extends the above. Exit-2 taxonomy addition: a malformed or unreadable `--tool-allowlist` file fails at startup with `run_configuration_invalid` reason `tool_allowlist_invalid` (joining `tool_allowlist_unknown_entry` and `tool_allowlist_missing_final_output` as the three reserved WP06 exit-2 reasons; `tests/test_tool_allowlist.py::test_malformed_allowlist_file_fails_at_startup` and `::test_unreadable_allowlist_file_fails_at_startup`). Delegation (ADR-023 R1, PM Q-FR-02-1): the composite opcodes `tool_pipeline` and `lint_repair` (and the raw-protocol `tool_run`) now check their inner `tool_id` against the policy (`src/ops/tool_ops.rs` → `session.policy.admit(tool_id)`) before `ToolRegistry::pipeline`/`::repair`/`::run`, so a listed composite cannot reach an unlisted registered tool; the refused inner tool never runs (`tests/test_tool_allowlist.py::test_tool_pipeline_inner_tool_not_on_allowlist_is_refused`, `::test_lint_repair_inner_tool_not_on_allowlist_is_refused`, and the `ops::tool_ops` unit tests). In this package the allowlist names only native and config-registered `[tools.*]` tools; remote/worker names defer to WP10, and an active allowlist therefore removes every forwarded MCP tool from the catalog.

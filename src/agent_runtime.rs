@@ -172,6 +172,19 @@ fn build_provider(
     .map_err(anyhow::Error::msg)
 }
 
+/// WP07 (FR-04, ADR-025): read and validate the controlled model profile from a
+/// caller-owned JSON file. Returns a validated [`providers::ControlledProfile`]
+/// or an error naming the option, the path, and the problem (e.g. the missing
+/// required value). Reads configuration only — no credential or network.
+fn load_controlled_profile(path: &Path) -> anyhow::Result<providers::ControlledProfile> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: invalid JSON: {e}", path.display()))?;
+    providers::ControlledProfile::from_json(&value)
+        .map_err(|e| anyhow::anyhow!("--model-profile {}: {e}", path.display()))
+}
+
 fn resolve_thought_log_path(
     enabled: bool,
     override_path: Option<PathBuf>,
@@ -259,7 +272,16 @@ pub async fn run_agent(
         agent_env,
         debug_thoughts,
         debug_thoughts_path,
+        model_profile,
+        final_output,
     } = args;
+    // WP07 (FR-04): validate the controlled model profile before any work, in
+    // every mode. A partial profile fails here naming the missing value(s);
+    // this validates configuration only and reads no credential or network.
+    let controlled_profile = match &model_profile {
+        Some(path) => Some(load_controlled_profile(path)?),
+        None => None,
+    };
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
     // no TTY is attached. Only the Print fallback's require_agent_task error
@@ -307,6 +329,10 @@ pub async fn run_agent(
             // Dry-run never calls the provider and does not load the agent env,
             // so effort is immaterial here; use the default.
             thinking: providers::ThinkingLevel::default(),
+            audit: None,
+            // WP05: dry-run never runs the loop, so final-output is inert here.
+            final_output: None,
+            final_output_sink: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -351,6 +377,14 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 debug_tokens: token_log.is_some(),
+                // FR-07 (R4): read-only is part of the daemon identity so a
+                // read-only client spawns a read-only daemon and refuses to
+                // attach to one started without it.
+                workspace_read_only: cfg.workspace_read_only,
+                // FR-02 (WP06): the allowlist is part of the daemon identity so
+                // an allowlisted client spawns an allowlisted daemon and refuses
+                // to attach to one started without the same selection.
+                tool_allowlist: cfg.tool_allowlist_path.as_deref(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
                 model: model.as_deref(),
@@ -450,15 +484,69 @@ pub async fn run_agent(
     } else {
         task
     };
+    // WP05 (ADR-024) CI-1: resolve and validate the explicit final-output
+    // control file BEFORE the agent env file is read. INTERFACES.md startup
+    // order resolves explicit control files (step 3) ahead of environment
+    // mutation / implicit reads, so a config error exits 2, an unusable or
+    // external-reference schema exits 20 with the final-output error shape, and
+    // a final-tool name that collides with a registered tool exits 2
+    // (tool_name_collision) — all fail-closed before a single model request and
+    // regardless of whether an agent env file exists on the host.
+    let final_output_runtime = match &final_output {
+        Some(path) => {
+            let spec = match crate::structured_output::load_control(path) {
+                Ok(spec) => spec,
+                Err(startup) => emit_final_output_startup_error(startup),
+            };
+            let collides = crate::tool_facade::active_schemas_for_policy(
+                workspace,
+                &cfg.prompts.resolved_tool_descriptions,
+                cfg.filesystem_authority.is_some(),
+                // Final-output name-collision check needs the FULL native
+                // catalog, independent of any --tool-allowlist.
+                &crate::run_policy::ToolPolicy::unrestricted(),
+            )
+            .iter()
+            .any(|schema| schema.name.as_str() == spec.tool_name());
+            if collides {
+                emit_final_output_startup_error(
+                    crate::structured_output::FinalOutputStartupError {
+                        exit_code: 2,
+                        message: Some(format!(
+                            "final-output control file: tool_name '{}' collides with a registered tool (tool_name_collision)",
+                            spec.tool_name()
+                        )),
+                        json: None,
+                    },
+                );
+            }
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+            Some((std::sync::Arc::new(spec), sink))
+        }
+        None => None,
+    };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
-    let effective_model = model.unwrap_or_else(|| agent.model.clone());
-    let llm = build_provider(
-        &effective_provider,
-        &agent,
-        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
-    )?;
+    // WP07 (FR-04): when a controlled profile is set it is the SOLE source of
+    // the provider/model/credential; every completion routes through the opt-in
+    // controlled transport. Otherwise legacy provider construction is unchanged.
+    let (effective_model, llm): (String, Box<dyn providers::LlmProvider>) =
+        if let Some(profile) = controlled_profile {
+            let controlled_model = profile.spec.model.clone();
+            let provider = providers::router::ControlledProvider::from_profile(profile)
+                .map_err(anyhow::Error::msg)?;
+            (controlled_model, Box::new(provider))
+        } else {
+            (
+                model.unwrap_or_else(|| agent.model.clone()),
+                build_provider(
+                    &effective_provider,
+                    &agent,
+                    providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+                )?,
+            )
+        };
     let analytics_store = if cfg.analytics.enabled {
         let db_path = cfg.analytics.resolved_db_path();
         match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
@@ -481,6 +569,17 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
+    // WP08 (ADR-026): open the caller-requested audit sink immediately before
+    // the first model request. A failure to open (or to write the `run_start`
+    // event) is a required-audit failure that aborts the run with exit 23,
+    // before any provider call — distinct from OTLP's fail-open policy.
+    let audit = open_run_audit(
+        &cfg,
+        &effective_provider,
+        &effective_model,
+        &agent,
+        workspace,
+    );
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -490,10 +589,130 @@ pub async fn run_agent(
         token_log,
         thought_log,
         thinking: agent.thinking.clone(),
+        audit: audit.clone(),
+        final_output: final_output_runtime
+            .as_ref()
+            .map(|(spec, _)| std::sync::Arc::clone(spec)),
+        final_output_sink: final_output_runtime
+            .as_ref()
+            .map(|(_, sink)| std::sync::Arc::clone(sink)),
     };
-    let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
+    // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
+    // and any required-audit write failure surfaced as exit 23 — BEFORE the
+    // run's assistant output reaches stdout, so a finish-time audit failure can
+    // never leave a published "success" that the record does not cover. When
+    // audit is enabled the output is buffered and flushed only after
+    // `finalize_run_audit` succeeds; with audit off the path is byte-identical
+    // to before (direct stdout).
+    let result = if let Some(audit) = &audit {
+        use std::io::Write as _;
+        let mut buffer: Vec<u8> = Vec::new();
+        let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
+        finalize_run_audit(audit, &result);
+        let mut stdout = std::io::stdout();
+        stdout.write_all(&buffer)?;
+        stdout.flush()?;
+        result
+    } else {
+        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
+    };
+    let result = result?;
+    // WP05 (ADR-024): map the terminal final-output decision to the reviewed
+    // stdout/stderr + exit-code contract. Diverges (process::exit) when active.
+    if let Some((_, sink)) = &final_output_runtime {
+        emit_final_output_outcome(sink);
+    }
     check_agent_result(&result)
+}
+
+/// Build the `run_start` metadata from the default-provider agent configuration
+/// and open the audit sink. Returns `None` when `--audit-path` is absent.
+/// Unavailable metadata (e.g. `wire`, which WP07 controlled transport supplies)
+/// is explicit, never invented (ADR-026).
+fn open_run_audit(
+    cfg: &config::Config,
+    effective_provider: &str,
+    effective_model: &str,
+    agent: &agent_env::AgentEnv,
+    workspace: &Path,
+) -> Option<Arc<crate::run_audit::RunAudit>> {
+    let path = cfg.audit_path.as_ref()?;
+    let meta = crate::run_audit::RunAuditMeta {
+        provider_label: Some(effective_provider.to_string()),
+        requested_model: Some(effective_model.to_string()),
+        base_url_host: crate::run_audit::base_url_host(&agent.base_url),
+        // `wire` is a WP07 controlled-transport concept; the default provider
+        // does not expose it. Recorded as explicit-unavailable (pending hook).
+        wire: None,
+        // The NAME of the credential variable, never its value.
+        credential_env: Some("DAIMONOS_AGENT_API_KEY".to_string()),
+        effective_allowlist: (!agent.allowed_commands.is_empty())
+            .then(|| agent.allowed_commands.clone()),
+        effective_root: Some(workspace.display().to_string()),
+        workspace_read_only: cfg.workspace_read_only,
+    };
+    let limits = crate::run_audit::AuditLimits {
+        max_event_bytes: cfg.reviewer.audit.max_event_bytes,
+        max_events: cfg.reviewer.audit.max_events,
+    };
+    let run_id = analytics::read_agent_session_id_env().unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("run-{}-{}", std::process::id(), nanos)
+    });
+    match crate::run_audit::RunAudit::open(path, run_id, limits, &meta) {
+        Ok(audit) => Some(Arc::new(audit)),
+        Err(failure) => {
+            eprintln!("{}", failure.diagnostic_json());
+            std::process::exit(failure.exit_code());
+        }
+    }
+}
+
+/// Write the terminal `run_end` event before the frontend reports success, and
+/// convert a mid-run or terminal audit-write failure into exit 23 (fail-closed,
+/// ADR-026). The original run failure code is preserved as secondary metadata.
+/// Map one agent result to the terminal `(status, exit_code)` recorded in
+/// `run_end`. This is the SINGLE source for both the audit's terminal record
+/// and the process exit (R7): `check_agent_result` fails the process only when
+/// the run stopped with `StopReason::Error` (exit 1) and otherwise exits 0, so
+/// the recorded `exit_code` and the process return code always agree, while the
+/// `status` string still reflects a non-`EndTurn` ending (e.g. a turn/token
+/// limit) instead of a bare "ok".
+fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static str, i32) {
+    match result {
+        Ok(r) => match r.stop_reason {
+            providers::StopReason::EndTurn | providers::StopReason::ToolUse => ("ok", 0),
+            providers::StopReason::MaxTokens => ("max_tokens", 0),
+            providers::StopReason::Refusal => ("refusal", 0),
+            providers::StopReason::Aborted => ("aborted", 0),
+            providers::StopReason::Error => ("error", 1),
+        },
+        Err(_) => ("error", 1),
+    }
+}
+
+fn finalize_run_audit(
+    audit: &Arc<crate::run_audit::RunAudit>,
+    result: &anyhow::Result<agent::AgentResult>,
+) {
+    // A mid-run write failure already poisoned the sink; surface it first.
+    if let Some(failure) = audit.take_failure() {
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
+    let (status, exit_code) = run_terminal_status(result);
+    let secondary = matches!(result, Ok(r) if r.stop_reason == providers::StopReason::Error)
+        .then_some("provider_error");
+    if let Err(mut failure) = audit.finish(status, exit_code, None) {
+        if let Some(code) = secondary {
+            failure = failure.with_secondary(code);
+        }
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
 }
 
 pub async fn run_chat(
@@ -1186,6 +1405,60 @@ fn require_agent_task(
         };
         anyhow::anyhow!("agent task is required in {} mode; {hint}", mode.as_str())
     })
+}
+
+/// Emit a final-output startup refusal and exit with its reviewed code (ADR-024
+/// / reviewer-runtime INTERFACES.md): a JSON line for the final-output error
+/// shape (exit 20, schema_unusable), else plain stderr text (exit 2). Diverges.
+fn emit_final_output_startup_error(error: crate::structured_output::FinalOutputStartupError) -> ! {
+    if let Some(json) = &error.json {
+        eprintln!("{}", serde_json::to_string(json).unwrap_or_default());
+    } else if let Some(message) = &error.message {
+        eprintln!("{message}");
+    }
+    std::process::exit(error.exit_code);
+}
+
+/// Emit the terminal final-output decision and exit per the reviewed contract
+/// (ADR-024 / INTERFACES.md): success writes only the validated argument JSON
+/// (plus one newline, already embedded) to stdout and exits 0; a typed failure
+/// writes the bounded error JSON to stderr and exits 20; the inclusive
+/// model-request ceiling writes the `turn_limit` JSON to stderr and exits 24.
+/// A run that reached no terminal decision is reported as `no_final_call`
+/// (exit 20). Diverges (process::exit).
+fn emit_final_output_outcome(
+    sink: &std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>,
+) -> ! {
+    use crate::structured_output::FinalOutputOutcome;
+    use std::io::Write as _;
+    let outcome = sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match outcome {
+        Some(FinalOutputOutcome::Success(stdout)) => {
+            print!("{stdout}");
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+        Some(FinalOutputOutcome::Failure(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(20);
+        }
+        Some(FinalOutputOutcome::RequestLimit(json)) => {
+            eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            std::process::exit(24);
+        }
+        None => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "reason": "no_final_call",
+                    "validation_errors": [],
+                    "attempts": 0,
+                    "model_requests": 0,
+                })
+            );
+            std::process::exit(20);
+        }
+    }
 }
 
 fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
