@@ -770,3 +770,108 @@ def test_execute_script_description_lists_only_allowlisted_signatures(daimonos_b
     assert "def read_file(" in desc, desc
     assert "def write_file(" not in desc, desc
     assert "def exec(" not in desc, desc
+
+
+# =====================================================================
+# Run r4 review fixes (third independent review, commit c53af27).
+# R1 (MAJOR / ADR-023, PM Q-FR-02-1): the composite opcodes `tool_pipeline`
+# and `lint_repair` delegate to an inner registered tool named by `tool_id`.
+# A listed composite must never reach an UNLISTED inner tool — the inner name
+# is checked against the explicit policy before the registry runs it, and the
+# inner tool never runs. These tests drive a real MCP process with a
+# config-registered `[tools.marker]` tool (NOT on the allowlist) whose command
+# would create a marker file if it ran. R4 (MINOR): a malformed or unreadable
+# `--tool-allowlist` file fails startup with the exit-2 reason
+# `tool_allowlist_invalid` (INTERFACES.md taxonomy).
+import os as _os_r4  # noqa: E402
+
+INVALID = "tool_allowlist_invalid"  # reserved exit-2 reason (INTERFACES.md)
+
+
+def _write_marker_tool(tmp_path, marker):
+    """Write an executable that creates `marker` when run; return its path.
+
+    The `[tools.*]` config registers a generic plugin with a single `run`
+    command whose bin is this script (args are empty), so the marker path is
+    baked into the script body.
+    """
+    script = tmp_path / "marker_tool.sh"
+    script.write_text("#!/bin/sh\necho ran > '%s'\n" % marker)
+    script.chmod(0o755)
+    return script
+
+
+def test_tool_pipeline_inner_tool_not_on_allowlist_is_refused(daimonos_factory, tmp_path):
+    """R1 / ADR-023 / PM Q-FR-02-1: with `tool_pipeline` on the allowlist and a
+    config-registered `[tools.marker]` tool that is NOT, `tool_pipeline` naming
+    that inner `tool_id` is refused (`tool_not_allowed`, naming the inner tool)
+    and the inner tool never runs (no marker file). Delegation cannot bypass the
+    explicit policy."""
+    marker = tmp_path / "pipeline_ran.marker"
+    tool = _write_marker_tool(tmp_path, marker)
+    (tmp_path / "daimonos.toml").write_text('[tools.marker]\nbin = "%s"\n' % tool)
+    allowlist = _write_allowlist(tmp_path, ["read_file", "tool_pipeline"])
+    client = daimonos_factory(tmp_path, args=["--tool-allowlist", str(allowlist)])
+    result = client.call_tool("tool_pipeline", {"tool_id": "marker", "stages": ["run"]})
+    payload = _refusal(result)
+    assert payload["code"] == NOT_ALLOWED, payload
+    assert payload.get("tool") == "marker", payload
+    assert not marker.exists(), "a refused pipeline inner tool must not run"
+
+
+def test_lint_repair_inner_tool_not_on_allowlist_is_refused(daimonos_factory, tmp_path):
+    """R1 / ADR-023 / PM Q-FR-02-1: with `lint_repair` on the allowlist and a
+    config-registered `[tools.marker]` tool that is NOT, `lint_repair` naming
+    that inner `tool_id` is refused (`tool_not_allowed`) BEFORE the registry is
+    consulted — the response is the policy refusal, not an inner
+    `unknown command 'lint'` error, and the inner tool never runs."""
+    marker = tmp_path / "repair_ran.marker"
+    tool = _write_marker_tool(tmp_path, marker)
+    (tmp_path / "daimonos.toml").write_text('[tools.marker]\nbin = "%s"\n' % tool)
+    allowlist = _write_allowlist(tmp_path, ["read_file", "lint_repair"])
+    client = daimonos_factory(tmp_path, args=["--tool-allowlist", str(allowlist)])
+    result = client.call_tool("lint_repair", {"tool_id": "marker"})
+    assert result.get("isError"), result
+    text = result["content"][0]["text"]
+    assert NOT_ALLOWED in text, text  # not an inner "unknown command" error
+    payload = json.loads(text)
+    assert payload["code"] == NOT_ALLOWED, payload
+    assert payload.get("tool") == "marker", payload
+    assert "unknown command" not in text, text  # delegation never reached
+    assert not marker.exists(), "a refused lint_repair inner tool must not run"
+
+
+# --- R4 (MINOR): malformed / unreadable allowlist file fails startup --------
+
+
+def test_malformed_allowlist_file_fails_at_startup(daimonos_binary, tmp_path):
+    """R4 / INTERFACES.md exit-2 taxonomy: a `--tool-allowlist` file that is not
+    valid JSON fails the run at startup (exit 2, `run_configuration_invalid`,
+    reason `tool_allowlist_invalid`); no effective-list report is emitted."""
+    path = tmp_path / "bad.json"
+    path.write_text("{ not valid json ]")
+    proc = _run_startup(daimonos_binary, tmp_path, ["--tool-allowlist", str(path)])
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    error = _startup_error(proc.stderr)
+    assert error["code"] == CFG_INVALID, error
+    assert error["reason"] == INVALID, error
+    assert _effective_report(proc.stderr) is None, proc.stderr
+
+
+def test_unreadable_allowlist_file_fails_at_startup(daimonos_binary, tmp_path):
+    """R4: an unreadable `--tool-allowlist` file fails startup with the same
+    `tool_allowlist_invalid` reason (the read error is reported, not silently
+    treated as legacy/no-list)."""
+    if hasattr(_os_r4, "geteuid") and _os_r4.geteuid() == 0:
+        pytest.skip("root bypasses file permissions; cannot exercise unreadable path")
+    path = tmp_path / "noperm.json"
+    path.write_text('["read_file"]')
+    path.chmod(0o000)
+    try:
+        proc = _run_startup(daimonos_binary, tmp_path, ["--tool-allowlist", str(path)])
+    finally:
+        path.chmod(0o644)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    error = _startup_error(proc.stderr)
+    assert error["code"] == CFG_INVALID, error
+    assert error["reason"] == INVALID, error
