@@ -579,6 +579,29 @@ pub trait LlmProvider: Send + Sync {
     async fn thinking_levels(&self, _model: &str) -> Option<Vec<ThinkingLevel>> {
         None
     }
+
+    /// WP09 (G3, ADR-026 model fields): drain the transport observation of the
+    /// most recent completion, if this provider is the WP07 controlled
+    /// transport. Default `None` — legacy adapters expose no wire-level HTTP
+    /// status / retry index, so the audit records them as explicit-unavailable.
+    /// Only [`router::ControlledProvider`] overrides this; the agent loop drains
+    /// it once per response to feed `RunAudit::record_model_request`.
+    fn take_controlled_observation(&self) -> Option<ControlledObservation> {
+        None
+    }
+}
+
+/// WP09 (G3): the wire-level metadata the controlled transport
+/// ([`controlled_send`]) observes for one completion — the final HTTP status
+/// code (absent on a transport/timeout fault before any status), the wire the
+/// profile uses, and the zero-based attempt index that produced the final
+/// response. Carries no body, header, or credential. Fed into the audit's
+/// `model_request` event; never logged.
+#[derive(Debug, Clone, Default)]
+pub struct ControlledObservation {
+    pub http_status: Option<u16>,
+    pub retry_index: u32,
+    pub wire: Option<&'static str>,
 }
 
 // === WP07: controlled model transport (ADR-025, FR-04 requirements 1-13) ===
@@ -956,7 +979,11 @@ pub async fn controlled_send(
     req: &ControlledRequest,
     credential: &str,
     ctx: &Context,
+    obs: &mut ControlledObservation,
 ) -> LlmResponse {
+    // WP09 (G3): the wire is known the moment the profile is; the HTTP status
+    // and retry index are filled as attempts proceed below.
+    obs.wire = Some(spec.wire.as_str());
     let http = match spec.wire {
         Wire::Messages => anthropic::controlled_request(spec, req, credential, ctx),
         Wire::Chat => openrouter::controlled_request(spec, req, credential, ctx),
@@ -977,6 +1004,7 @@ pub async fn controlled_send(
     let max_attempts = req.request_retries.saturating_add(1);
     let mut last = LlmResponse::error("controlled request made no attempt");
     for attempt in 0..max_attempts {
+        obs.retry_index = attempt;
         // Every attempt is observable (FR-04 req 10). The audit record (WP08)
         // consumes the sequence; here we only emit a non-sensitive count.
         tracing::debug!(
@@ -1019,6 +1047,7 @@ pub async fn controlled_send(
             }
         };
         let status = resp.status();
+        obs.http_status = Some(status.as_u16());
         if status.is_redirection() {
             // No redirect is followed and the body is never re-sent to another
             // host; a 3xx is a terminal endpoint error (FR-04 req 12).
@@ -1852,6 +1881,7 @@ mod controlled_transport_tests {
             },
             "SECRET_CREDENTIAL",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         assert!(resp.error_message.is_none(), "{:?}", resp.error_message);
@@ -1927,6 +1957,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "SECRET_CREDENTIAL",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         let (_, headers, _) = parse_request(&rx.await.unwrap());
@@ -1956,6 +1987,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "K",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         assert!(resp.error_message.is_some());
@@ -1970,7 +2002,14 @@ mod controlled_transport_tests {
             request_retries: 2,
             ..ControlledRequest::default()
         };
-        let resp = controlled_send(&messages_spec(base), &req, "K", &ctx_with_tool()).await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &req,
+            "K",
+            &ctx_with_tool(),
+            &mut Default::default(),
+        )
+        .await;
         assert!(resp.error_message.is_some());
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
@@ -1990,6 +2029,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "K",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         let msg = resp.error_message.expect("redirect must be an error");
@@ -2011,6 +2051,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "SECRET_CREDENTIAL",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         assert!(resp.error_message.is_none(), "{:?}", resp.error_message);
@@ -2307,6 +2348,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             SECRET,
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         let msg = resp.error_message.expect("503 must be an error");
@@ -2324,6 +2366,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             SECRET,
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         assert!(!resp2
@@ -2343,7 +2386,14 @@ mod controlled_transport_tests {
             ..ControlledRequest::default()
         };
         let start = std::time::Instant::now();
-        let resp = controlled_send(&messages_spec(base), &req, "K", &ctx_with_tool()).await;
+        let resp = controlled_send(
+            &messages_spec(base),
+            &req,
+            "K",
+            &ctx_with_tool(),
+            &mut Default::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
         let msg = resp.error_message.expect("a timed-out request must error");
         assert!(
@@ -2368,7 +2418,14 @@ mod controlled_transport_tests {
             proxy: Some(proxy.clone()),
             ..ControlledRequest::default()
         };
-        let _ = controlled_send(&messages_spec(endpoint), &req, "K", &ctx_with_tool()).await;
+        let _ = controlled_send(
+            &messages_spec(endpoint),
+            &req,
+            "K",
+            &ctx_with_tool(),
+            &mut Default::default(),
+        )
+        .await;
         assert_eq!(
             proxy_hits.load(Ordering::SeqCst),
             1,
@@ -2392,6 +2449,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "K",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         assert!(
@@ -2440,6 +2498,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "K",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         let (_, headers, _) = parse_request(&rx.await.unwrap());
@@ -2468,6 +2527,7 @@ mod controlled_transport_tests {
             &ControlledRequest::default(),
             "K",
             &ctx_with_tool(),
+            &mut Default::default(),
         )
         .await;
         let (_, headers, _) = parse_request(&rx.await.unwrap());

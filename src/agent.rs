@@ -1212,19 +1212,22 @@ async fn run_inner(
         if let Some(journal) = &journal {
             journal.record_usage(&total_usage, &resp.usage);
         }
-        // WP08 audit (ADR-026): record this provider request. HTTP status and
-        // explicit retry index are WP07 controlled-transport metadata not
-        // exposed by the default provider, so they are recorded as
-        // explicit-unavailable / 0. A required-audit write failure ends the run
-        // before the next model request (fail-closed).
+        // WP08 audit (ADR-026): record this provider request. WP09 (G3): the
+        // WP07 controlled transport exposes the observed HTTP status, the
+        // zero-based retry index, and the profile's wire for this completion
+        // via `take_controlled_observation`; the default provider returns
+        // `None`, recorded as explicit-unavailable / 0. A required-audit write
+        // failure ends the run before the next model request (fail-closed).
         if let Some(audit) = &config.audit {
+            let obs = provider.take_controlled_observation();
             let _ = audit.record_model_request(
                 audit_model_seq,
-                None,
-                0,
+                obs.as_ref().and_then(|o| o.http_status),
+                obs.as_ref().map(|o| o.retry_index).unwrap_or(0),
                 false,
                 Some(resp.usage.input),
                 Some(resp.usage.output),
+                obs.as_ref().and_then(|o| o.wire),
             );
             audit_model_seq += 1;
             if audit.poisoned() {

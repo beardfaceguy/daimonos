@@ -28,6 +28,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   contains the credential value. No live credentialed endpoint is required. New
   module `src/capability_probe.rs`; model-facing wording in
   `prompts/capability_probe.md`. See ADR-027 and `docs/configuration.md`.
+- **Audit reconciliation for probes, limits, and controlled transport
+  (FR-04).** The terminal `run_end` audit record now always matches the
+  process exit through one source: a failed probe records `model_unsupported`
+  / `21`, and a `--final-output` ending records `20`
+  (`structured_output_failed`) or `24` (`model_request_limit`). When the
+  controlled transport serves a request, its `model_request` audit event now
+  carries the observed `http_status`, `retry_index`, and the profile's `wire`,
+  and the probe's single endpoint request is recorded on its `probe_result`
+  event with the same `http_status`/`retry_index`/`wire`. An unset profile
+  credential refuses the run identically with or without the probe flag, and
+  sends no request.
 - **`--audit-path` (FR-04).** A global, default-off option that writes a
   caller-requested, privacy-preserving run audit: one private JSONL file
   (`O_CREAT | O_EXCL`, mode `0600`, never appended) with a versioned

@@ -341,6 +341,7 @@ impl RunAudit {
         probe: bool,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        wire: Option<&str>,
     ) -> Result<(), AuditFailure> {
         let mut fields = serde_json::Map::new();
         fields.insert("request_sequence".into(), serde_json::json!(sequence));
@@ -354,6 +355,16 @@ impl RunAudit {
         }
         fields.insert("retry_index".into(), serde_json::json!(retry_index));
         fields.insert("probe".into(), serde_json::json!(probe));
+        // WP09 (G3, ADR-026 model fields): the profile's wire when the WP07
+        // controlled transport served the request; explicit `null` otherwise.
+        match wire {
+            Some(wire) => {
+                fields.insert("wire".into(), serde_json::json!(wire));
+            }
+            None => {
+                fields.insert("wire".into(), serde_json::Value::Null);
+            }
+        }
         match (input_tokens, output_tokens) {
             (None, None) => {
                 fields.insert("usage".into(), serde_json::Value::Null);
@@ -381,6 +392,9 @@ impl RunAudit {
         &self,
         status: &str,
         reason: Option<&str>,
+        http_status: Option<u16>,
+        retry_index: u32,
+        wire: Option<&str>,
     ) -> Result<(), AuditFailure> {
         let mut fields = serde_json::Map::new();
         fields.insert("status".into(), serde_json::json!(status));
@@ -390,6 +404,28 @@ impl RunAudit {
             }
             None => {
                 fields.insert("reason".into(), serde_json::Value::Null);
+            }
+        }
+        // WP09 (G4, FR-04 reqs 18-19 / ADR-026): the probe is one request to the
+        // model endpoint, so its request metadata is recorded here on the one
+        // `probe_result` event (rather than a separate `model_request`, which
+        // would need a loop-owned request_sequence slot). Unavailable values are
+        // explicit `null` (a transport/timeout fault records no http_status).
+        match http_status {
+            Some(code) => {
+                fields.insert("http_status".into(), serde_json::json!(code));
+            }
+            None => {
+                fields.insert("http_status".into(), serde_json::Value::Null);
+            }
+        }
+        fields.insert("retry_index".into(), serde_json::json!(retry_index));
+        match wire {
+            Some(wire) => {
+                fields.insert("wire".into(), serde_json::json!(wire));
+            }
+            None => {
+                fields.insert("wire".into(), serde_json::Value::Null);
             }
         }
         self.record("probe_result", fields)
@@ -674,10 +710,16 @@ mod tests {
         )
         .unwrap();
         audit
-            .record_model_request(0, Some(200), 0, true, Some(10), Some(2))
+            .record_model_request(0, Some(200), 0, true, Some(10), Some(2), Some("messages"))
             .unwrap();
         audit
-            .record_probe_result("model_unsupported", Some("text_only"))
+            .record_probe_result(
+                "model_unsupported",
+                Some("text_only"),
+                Some(503),
+                0,
+                Some("messages"),
+            )
             .unwrap();
         audit
             .record_tool("read_file", "native", "a", "b", None, 5, None)

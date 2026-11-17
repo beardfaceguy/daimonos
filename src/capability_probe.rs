@@ -100,13 +100,28 @@ pub async fn run_probe(
         tools: tools.to_vec(),
         stable_prefix_len: 0,
     };
-    let response =
-        providers::controlled_send(&probe.spec, &probe.request, &probe.credential, &ctx).await;
+    let mut obs = providers::ControlledObservation::default();
+    let response = providers::controlled_send(
+        &probe.spec,
+        &probe.request,
+        &probe.credential,
+        &ctx,
+        &mut obs,
+    )
+    .await;
     let outcome = evaluate(final_spec, &response);
     // WP08 audit (reqs 18-19): record the single probe outcome. A write failure
     // poisons the sink; the frontend's audit finalize surfaces it as exit 23.
     if let Some(audit) = audit {
-        let _ = audit.record_probe_result(outcome.audit_status(), outcome.audit_reason());
+        // WP09 (G4): record the probe's own request metadata on the probe_result
+        // event (the probe is one request to the model endpoint).
+        let _ = audit.record_probe_result(
+            outcome.audit_status(),
+            outcome.audit_reason(),
+            obs.http_status,
+            obs.retry_index,
+            obs.wire,
+        );
     }
     outcome
 }

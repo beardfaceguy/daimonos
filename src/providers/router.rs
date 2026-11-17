@@ -191,6 +191,10 @@ pub struct ControlledProvider {
     request: super::ControlledRequest,
     /// Resolved from the profile's named variable only; never logged or exported.
     credential: String,
+    /// WP09 (G3): the transport observation of the most recent completion,
+    /// drained once per response by the agent loop for the audit's
+    /// `model_request` event. Interior-mutable because `complete` takes `&self`.
+    last_observation: std::sync::Mutex<Option<super::ControlledObservation>>,
 }
 
 impl ControlledProvider {
@@ -214,6 +218,7 @@ impl ControlledProvider {
             spec: profile.spec,
             request: profile.request,
             credential,
+            last_observation: std::sync::Mutex::new(None),
         })
     }
 }
@@ -234,7 +239,22 @@ impl LlmProvider for ControlledProvider {
     /// Route the completion through the controlled transport. The profile owns
     /// the model and max_tokens, so `opts` is intentionally ignored here.
     async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
-        super::controlled_send(&self.spec, &self.request, &self.credential, ctx).await
+        let mut obs = super::ControlledObservation::default();
+        let response =
+            super::controlled_send(&self.spec, &self.request, &self.credential, ctx, &mut obs)
+                .await;
+        *self
+            .last_observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(obs);
+        response
+    }
+
+    fn take_controlled_observation(&self) -> Option<super::ControlledObservation> {
+        self.last_observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
     // `stream` falls back to `complete` (controlled mode is non-streaming: the
     // fixed body has no `stream` field). `list_models`/`context_window`/

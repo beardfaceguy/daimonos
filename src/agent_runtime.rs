@@ -671,7 +671,24 @@ pub async fn run_agent(
         use std::io::Write as _;
         let mut buffer: Vec<u8> = Vec::new();
         let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
-        finalize_run_audit(audit, &result);
+        // WP09 (G1): peek (not take) the probe verdict so the terminal audit
+        // record agrees with the process exit that `emit_probe_outcome` will
+        // produce below; `emit_probe_outcome` still consumes the sink after.
+        let probe_verdict = capability_probe_sink
+            .as_ref()
+            .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        // WP09 (G2): peek (not take) the final-output verdict for the same
+        // single-source reconciliation; `emit_final_output_outcome` takes it
+        // after the buffer flush below.
+        let final_verdict = final_output_runtime
+            .as_ref()
+            .and_then(|(_, sink)| sink.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        finalize_run_audit(
+            audit,
+            &result,
+            probe_verdict.as_ref(),
+            final_verdict.as_ref(),
+        );
         let mut stdout = std::io::stdout();
         stdout.write_all(&buffer)?;
         stdout.flush()?;
@@ -751,7 +768,31 @@ fn open_run_audit(
 /// the recorded `exit_code` and the process return code always agree, while the
 /// `status` string still reflects a non-`EndTurn` ending (e.g. a turn/token
 /// limit) instead of a bare "ok".
-fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static str, i32) {
+fn run_terminal_status(
+    result: &anyhow::Result<agent::AgentResult>,
+    probe: Option<&crate::capability_probe::ProbeOutcome>,
+    final_output: Option<&crate::structured_output::FinalOutputOutcome>,
+) -> (&'static str, i32) {
+    // WP09 (G1, FR-04/ADR-027): a failed capability probe is terminal and the
+    // process exits 21 (`model_unsupported`) via `emit_probe_outcome`. The
+    // terminal `run_end` record must agree, so the probe verdict is consulted
+    // here — the single source for both the audit record and the process exit
+    // — before the stop-reason mapping below.
+    if let Some(crate::capability_probe::ProbeOutcome::ModelUnsupported { .. }) = probe {
+        return ("model_unsupported", 21);
+    }
+    // WP09 (G2, ADR-024/026): when final-output mode carries a terminal verdict,
+    // the process diverges via `emit_final_output_outcome` (exit 20/24/0). The
+    // run_end record must carry the same exit code, so the final-output verdict
+    // is the single source here too, ahead of the stop-reason mapping.
+    if let Some(outcome) = final_output {
+        use crate::structured_output::FinalOutputOutcome;
+        return match outcome {
+            FinalOutputOutcome::Success(_) => ("ok", 0),
+            FinalOutputOutcome::Failure(_) => ("structured_output_failed", 20),
+            FinalOutputOutcome::RequestLimit(_) => ("model_request_limit", 24),
+        };
+    }
     match result {
         Ok(r) => match r.stop_reason {
             providers::StopReason::EndTurn | providers::StopReason::ToolUse => ("ok", 0),
@@ -767,13 +808,15 @@ fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static
 fn finalize_run_audit(
     audit: &Arc<crate::run_audit::RunAudit>,
     result: &anyhow::Result<agent::AgentResult>,
+    probe: Option<&crate::capability_probe::ProbeOutcome>,
+    final_output: Option<&crate::structured_output::FinalOutputOutcome>,
 ) {
     // A mid-run write failure already poisoned the sink; surface it first.
     if let Some(failure) = audit.take_failure() {
         eprintln!("{}", failure.diagnostic_json());
         std::process::exit(failure.exit_code());
     }
-    let (status, exit_code) = run_terminal_status(result);
+    let (status, exit_code) = run_terminal_status(result, probe, final_output);
     let secondary = matches!(result, Ok(r) if r.stop_reason == providers::StopReason::Error)
         .then_some("provider_error");
     if let Err(mut failure) = audit.finish(status, exit_code, None) {

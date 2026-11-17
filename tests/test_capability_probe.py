@@ -581,3 +581,218 @@ def test_probe_off_by_default_sends_no_probe_and_run_is_unchanged(daimonos_binar
     # Exactly one request: the agent loop's. No probe was sent before it.
     assert len(endpoint.posts) == 1, endpoint.posts
     assert json.loads(result.stdout) == {"verdict": "supported"}, result.stdout
+
+
+# ==========================================================================
+# r2 integrator gaps G1-G5. See DIRECTION.md (run wp09-20261117-r2).
+# ==========================================================================
+
+def _run_controlled(daimonos_binary, tmp_path, *, endpoint_url, wire="messages",
+                    request_retries=0, max_model_requests=None, corrective_retries=0,
+                    audit_path=None, with_probe=False, payload=None):
+    """A real controlled `agent --print` run with or without the capability
+    probe. When ``with_probe`` is False no ``--capability-probe-payload`` is
+    passed, so only the agent loop contacts the endpoint (used to exercise the
+    final-output + audit terminal paths, G2/G3)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    control = {
+        "schema": FINAL_SCHEMA,
+        "tool_name": FINAL_TOOL,
+        "tool_description": "Emit the final verdict.",
+        "corrective_retries": corrective_retries,
+    }
+    if max_model_requests is not None:
+        control["max_model_requests"] = max_model_requests
+    final_f = tmp_path / "final.json"
+    final_f.write_text(json.dumps(control))
+    profile_f = _write_profile(tmp_path / "profile.json", endpoint_url, wire,
+                               request_retries)
+    agent_env, env = _env(tmp_path)
+    argv = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state)]
+    if audit_path is not None:
+        argv += ["--audit-path", str(audit_path)]
+    argv += ["agent", "--print", "--agent-env", str(agent_env),
+             "--model-profile", str(profile_f), "--final-output", str(final_f)]
+    if with_probe:
+        payload_f = _write_payload(tmp_path / "payload.json", payload)
+        argv += ["--capability-probe-payload", str(payload_f)]
+    argv += ["review the evidence"]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT,
+                          env=env)
+
+
+def _run_end(path):
+    events = _read_events(path)
+    ends = [e for e in events if e.get("kind") == "run_end"]
+    assert len(ends) == 1, events
+    return ends[0]
+
+
+# --------------------------------------------------------------------------
+# G1: a FAILED probe with --audit-path must record run_end exit_code 21 and a
+# status naming `model_unsupported`, and the process must exit 21. WP08 made
+# `run_terminal_status` the single source so the audit and the process agree;
+# before the fix the probe's Aborted result mapped to ("aborted", 0) in run_end
+# while the process still exited 21.
+# --------------------------------------------------------------------------
+
+def test_g1_failed_probe_run_end_exit_code_matches_process(daimonos_binary, tmp_path):
+    endpoint = ProbeEndpoint("text_only")
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 21, result.stderr + result.stdout
+    end = _run_end(audit)
+    assert end["exit_code"] == 21, end
+    assert end["status"] == "model_unsupported", end
+
+
+# --------------------------------------------------------------------------
+# G2: with --final-output and --audit-path, a run that ends with exit 20
+# (structured_output_failed) or exit 24 (model_request_limit) must write a
+# run_end record carrying the SAME exit code (the single-source rule, G1's
+# sibling for the final-output verdict). No probe is involved here.
+# --------------------------------------------------------------------------
+
+def test_g2_structured_output_failure_run_end_exit_20(daimonos_binary, tmp_path):
+    # Loop gets text only (no final call) with no corrective retries => the
+    # final-output decision is a terminal failure (exit 20).
+    endpoint = ProbeEndpoint("text_only")
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_controlled(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                                 corrective_retries=0, audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 20, result.stderr + result.stdout
+    end = _run_end(audit)
+    assert end["exit_code"] == 20, end
+
+
+def test_g2_model_request_limit_run_end_exit_24(daimonos_binary, tmp_path):
+    # Loop gets text only; a corrective turn is permitted but the inclusive
+    # model-request ceiling (1) is already spent by the first request, so the
+    # run ends model_request_limit (exit 24) before a second request.
+    endpoint = ProbeEndpoint("text_only")
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_controlled(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                                 corrective_retries=1, max_model_requests=1,
+                                 audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 24, result.stderr + result.stdout
+    assert len(endpoint.posts) == 1, endpoint.posts
+    end = _run_end(audit)
+    assert end["exit_code"] == 24, end
+
+
+# --------------------------------------------------------------------------
+# G3: the WP07 controlled transport feeds the audit. A loop model_request
+# recorded for a real controlled run against a local fake endpoint must carry
+# the transport's observed http_status and the profile's wire (ADR-026 model
+# fields). Before the fix these were explicit-unavailable (null / absent).
+# --------------------------------------------------------------------------
+
+def test_g3_controlled_200_records_http_status_and_wire(daimonos_binary, tmp_path):
+    endpoint = ProbeEndpoint("final_ok")
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_controlled(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                                 wire="messages", audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    events = _read_events(audit)
+    reqs = [e for e in events if e.get("kind") == "model_request"]
+    assert len(reqs) == 1, events
+    assert reqs[0]["http_status"] == 200, reqs[0]
+    assert reqs[0]["wire"] == "messages", reqs[0]
+    assert reqs[0]["retry_index"] == 0, reqs[0]
+
+
+# --------------------------------------------------------------------------
+# G4: FR-04 reqs 18-19 and ADR-026 require the audit to record every request
+# to the model endpoint. The probe is one such request. Rule applied (I-01
+# amended): rather than emit a separate `model_request` (which would need a
+# request_sequence slot coordinated with the loop that owns it), the probe's
+# single request is recorded by ENRICHING the one `probe_result` event with
+# the transport's http_status, wire, and retry_index (DIRECTION.md G4 permits
+# either). So `probe_result` carries both the verdict and the request metadata.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode,status", [("text_only", 200), ("503", 503)])
+def test_g4_probe_result_records_request_metadata(daimonos_binary, tmp_path, mode, status):
+    endpoint = ProbeEndpoint(mode)
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                            audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 21, result.stderr + result.stdout
+    events = _read_events(audit)
+    probe = [e for e in events if e.get("kind") == "probe_result"]
+    assert len(probe) == 1, events
+    assert probe[0]["status"] == "model_unsupported", probe[0]
+    assert probe[0]["http_status"] == status, probe[0]
+    assert probe[0]["wire"] == "messages", probe[0]
+    assert probe[0]["retry_index"] == 0, probe[0]
+    assert CRED_VALUE not in audit.read_text()
+
+
+# --------------------------------------------------------------------------
+# G5: when the profile's credential variable is UNSET the probe is not built.
+# The run must end with the SAME named startup error as a run without the probe
+# (the controlled provider cannot resolve its credential), send no request, and
+# must NOT silently run on without the probe. Credential value absent, so the
+# error is identical whether or not --capability-probe-payload is present.
+# --------------------------------------------------------------------------
+
+def _run_controlled_no_cred(daimonos_binary, tmp_path, endpoint_url, *, with_probe):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    final_f = _write_final_output(tmp_path / "final.json")
+    profile_f = _write_profile(tmp_path / "profile.json", endpoint_url)
+    agent_env, env = _env(tmp_path)
+    env.pop(CRED_ENV, None)  # the profile's credential variable is unset
+    argv = [daimonos_binary, "--workspace", str(workspace), "--state-dir", str(state),
+            "agent", "--print", "--agent-env", str(agent_env),
+            "--model-profile", str(profile_f), "--final-output", str(final_f)]
+    if with_probe:
+        payload_f = _write_payload(tmp_path / "payload.json")
+        argv += ["--capability-probe-payload", str(payload_f)]
+    argv += ["review the evidence"]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT, env=env)
+
+
+def test_g5_unset_credential_same_error_with_or_without_probe(daimonos_binary, tmp_path):
+    with_ep = _UnusedEndpoint()
+    without_ep = _UnusedEndpoint()
+    try:
+        with_probe = _run_controlled_no_cred(daimonos_binary, tmp_path / "a",
+                                             with_ep.url, with_probe=True)
+        without_probe = _run_controlled_no_cred(daimonos_binary, tmp_path / "b",
+                                                without_ep.url, with_probe=False)
+    finally:
+        with_ep.close()
+        without_ep.close()
+    # Same named startup error, same exit code, whether or not the probe flag is
+    # present; no request is ever sent (the probe is not built, and the
+    # controlled provider refuses before any model work).
+    assert with_probe.returncode != 0, with_probe.stderr + with_probe.stdout
+    assert with_probe.returncode == without_probe.returncode, \
+        (with_probe.returncode, without_probe.returncode)
+    assert CRED_ENV in (with_probe.stderr + with_probe.stdout)
+    assert CRED_ENV in (without_probe.stderr + without_probe.stdout)
+    assert with_ep.requests == [], with_ep.requests
+    assert without_ep.requests == [], without_ep.requests
