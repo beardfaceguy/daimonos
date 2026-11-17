@@ -206,6 +206,9 @@ pub enum Command {
     McpConfig(McpConfigArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
     Daemon,
+    /// Print the effective tool contract as deterministic JSON and exit
+    /// (WP15, FR-13). Session-free: no model run or session store is started.
+    ToolContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +224,7 @@ pub enum RuntimeMode {
     McpAuth,
     Daemon,
     Stats,
+    ToolContract,
 }
 
 impl RuntimeMode {
@@ -237,6 +241,7 @@ impl RuntimeMode {
             Self::McpAuth => "mcp_auth",
             Self::Daemon => "socket",
             Self::Stats => "stats",
+            Self::ToolContract => "tool_contract",
         }
     }
 
@@ -348,6 +353,7 @@ impl Cli {
                 .map(RuntimeMode::McpSocket)
                 .unwrap_or(RuntimeMode::McpStdio),
             Some(Command::Daemon) => RuntimeMode::Daemon,
+            Some(Command::ToolContract) => RuntimeMode::ToolContract,
             None if self.stats => RuntimeMode::Stats,
             None if self.mcp => RuntimeMode::McpStdio,
             None => self

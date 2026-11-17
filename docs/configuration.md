@@ -491,6 +491,70 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `tool-contract` command — effective tool contract dump
+
+```bash
+daimonos tool-contract                 # dump for the default workspace (.)
+daimonos tool-contract -w /path        # dump for a specific workspace
+```
+
+`daimonos tool-contract` prints the effective tool contract as deterministic
+JSON on stdout and exits, without starting a model run or a session store
+(FR-13). The document is a function of the same inputs that shape the served
+catalog — workspace context checks, exposure tier, schema mode
+(`[mcp] full_tool_schemas` / `DAIMONOS_MCP_FULL_SCHEMAS`), and confinement — so
+its `tools` array equals what the MCP server serves over `tools/list` for those
+inputs. Each entry carries `name`, `description`, `input_schema`, and
+registry-derived `tier`/`route` metadata; the top level carries the standalone
+`contract_version` and the `effective_options` that produced the dump. The same
+version is reported over MCP initialization in
+`_meta["io.daimonos/tool-contract-version"]`, separate from the binary version.
+Changes are tracked in `docs/tool-contract-changelog.md` (see ADR-029).
+
+#### Owned path annotations (`x-daimonos-path`)
+
+Every Daimonos-owned tool argument whose value is a filesystem path, a glob, or
+a directory to walk is marked in the tool's input schema with the standard
+annotation `"x-daimonos-path": true` (FR-14). The marker means the same thing in
+every tool: *this string is a filesystem location Daimonos resolves against the
+run root.* For an array of paths the marker sits on the array's `items` schema,
+so the path **elements** are marked. A caller can therefore enumerate a tool's
+path slots directly from its schema, with no hand-written per-tool list.
+
+The annotation is unconditional (there is no option to disable it) and purely
+additive: it adds the marker and changes no other schema keyword. It is
+**semantic, not spelling** — these are deliberately *not* marked:
+
+- opaque command, argv, or script-code strings (`exec.command`/`exec.args`,
+  `execute_script.code`, raw `git.args`);
+- agent-mail reservation glob patterns (`reserve_paths.paths`,
+  `release_reservations.paths`, `check_conflicts.paths`), which are opaque
+  reservation keys never resolved against the filesystem;
+- URLs, revisions, search patterns, identifiers, and enums;
+- caller-provided MCP worker tools and the caller's final-answer schema.
+
+The marks are caller-facing metadata applied in the shared serving pipeline
+(`src/tools.rs::tool_definitions`), so the `daimonos tool-contract` dump, the
+live `tools/list`, and `get_tool_schema` carry identical marks for the same
+inputs. The marks are **not** sent to the model endpoint: the schemas the agent
+hands to the model are preserved unchanged (FR-15), because a strict endpoint
+may reject an unknown keyword.
+
+**Tier limitation (today).** The dump and `tools/list` carry a full schema only
+for the tools whose schema is served in full in the initial exposure tier — 21
+of the 35 tools today. The path marks therefore appear in the dump only for
+those 21 tools (6 of which have path arguments). For the other 14 tools the
+initial-tier schema is stripped to `{"type": "object"}`, so a caller reads their
+path marks through `get_tool_schema`, which always returns the complete
+annotated schema. FR-15 full self-contained schemas (WP17) will serve every
+schema in full and remove this limitation; AC-14.1 is not claimed for the
+stripped tools from the dump alone.
+
+ADR-022 performs the actual path enforcement through a separate path
+(`src/path_policy.rs`); it does not yet consult the owned-argument table in
+`src/path_annotations.rs`, which today is read only by the schema annotator. See
+ADR-029 and FR-14.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

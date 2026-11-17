@@ -56,6 +56,26 @@ python3 -m pytest tests/ -v
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
 
+`tests/test_tool_contract.py` (FR-13) drives the real `daimonos tool-contract`
+command and a live MCP server with no provider API key: it checks that the
+deterministic dump is byte-stable, equals `tools/list` for the same workspace,
+config, and schema mode, and that the contract version reported over MCP
+initialization equals the dump's version.
+
+`tests/test_path_annotations.py` (FR-14) drives the same real `daimonos
+tool-contract` dump and asserts AC-14.1: every Daimonos-owned filesystem path,
+glob, or walk argument — including the elements of path arrays — carries the
+`x-daimonos-path` annotation, and no non-path, opaque-command/script, or
+reservation-glob argument does. `get_tool_schema` over a real MCP server is
+asserted to carry the marks for every dump tool and the three on-demand tools
+(`diff_files`/`tool_pipeline`/`lint_repair`) — the only caller surface for the
+marks of the tools whose initial-tier `tools/list` schema is stripped (until
+WP17). The marks are caller-facing only: a process test drives `agent --print`
+against a local fake provider endpoint on both wires (OpenAI Chat Completions
+and Anthropic Messages) and asserts the recorded model request never contains
+`x-daimonos-path` (FR-15 preserves the model-facing schema). No provider API key
+or live endpoint is required — the fake endpoint is local.
+
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.

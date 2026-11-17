@@ -7,6 +7,48 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
+  session-free JSON dump of the effective tool contract (contract version,
+  effective options, and the effective tools with their schemas), reusing the
+  live MCP serving pipeline so the dump equals what the server serves for the
+  same inputs. The contract carries its own version (`1.0.0`), reported over MCP
+  initialization in `_meta["io.daimonos/tool-contract-version"]` and tracked in
+  `docs/tool-contract-changelog.md`. See
+  [ADR-029](docs/adr/029-effective-tool-contract.md).
+- **Default behavior change (FR-13, no opt-out).** Every MCP `initialize`
+  response now carries the additional `_meta` key
+  `io.daimonos/tool-contract-version`; this is unconditional (required by
+  AC-13.2) and has no option — the existing `server-kind` meta and
+  `serverInfo.version` (binary version) are unchanged. The session-free
+  `daimonos tool-contract` command also writes no state artifacts, including no
+  secure log file in the resolved state directory.
+- **Owned path annotations (FR-14).** Every Daimonos-owned tool argument whose
+  value is a filesystem path, a glob, or a directory to walk — including the
+  elements of path arrays — now carries the standard JSON Schema annotation
+  `"x-daimonos-path": true` in the served and exported schemas, so a caller can
+  enumerate a tool's path slots without a hand-written list. Opaque
+  command/script/argv strings, agent-mail reservation glob patterns, URLs, and
+  caller-provided worker / final-answer schemas are deliberately not marked.
+- **Default behavior change (FR-14, no opt-out).** The path annotations above are
+  added unconditionally to the served schemas (there is no option to disable
+  them). They are purely additive metadata: no existing schema key, tool, or
+  argument is changed or removed. Because a newly populated schema annotation is
+  an additive contract change, the tool-contract version moves from `1.0.0` to
+  `1.1.0` (`docs/tool-contract-changelog.md`); the binary version
+  (`serverInfo.version`) is unchanged.
+- **Scope of the path marks (FR-14).** The marks are caller-facing metadata:
+  they are carried by the `tool-contract` dump, `tools/list`, and
+  `get_tool_schema`, and are deliberately **not** sent to the model endpoint
+  (the schemas handed to the model stay unchanged per FR-15). In the initial
+  exposure tier the dump and `tools/list` serve a full schema for 21 of the 35
+  tools, so the dump shows the marks only for those tools (6 of which have path
+  arguments); for the other 14 tools whose initial-tier schema is stripped to
+  `{"type": "object"}`, a caller reads the marks through `get_tool_schema`,
+  which returns the complete annotated schema. FR-15 full self-contained schemas
+  (WP17) will remove this limitation.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
