@@ -275,6 +275,7 @@ pub async fn run_agent(
         model_profile,
         final_output,
         capability_probe_payload,
+        worker_config,
     } = args;
     // WP09 (FR-04 reqs 14-17, ADR-027): the capability probe requires FR-01
     // structured final output AND a complete controlled model profile (PM
@@ -358,6 +359,9 @@ pub async fn run_agent(
             // WP09: dry-run never contacts a provider, so no probe is sent.
             capability_probe: None,
             capability_probe_sink: None,
+            // WP10: dry-run never runs the loop; worker-only is inert here and
+            // the flag is refused in dry-run at parse anyway (clap conflict).
+            worker_config: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -589,9 +593,52 @@ pub async fn run_agent(
             },
             _ => (None, None),
         };
+    // WP10 (FR-05, ADR-028) startup ordering: resolve and validate the explicit
+    // worker control file BEFORE the agent env file is read (INTERFACES.md
+    // step 3: explicit control files precede environment mutation / implicit
+    // reads). A malformed or empty document fails the run at startup
+    // (run_configuration_invalid) — fail-closed, before any model request or
+    // worker launch. Worker discovery itself happens in the loop builder, once,
+    // before the catalog freeze.
+    // A malformed/unreadable/empty worker control file is a configuration
+    // fault: emit the reviewed `run_configuration_invalid` JSON and exit 2
+    // (INTERFACES.md exit table), never generic anyhow exit 1.
+    let worker_config_runtime = match &worker_config {
+        Some(path) => {
+            let invalid = |reason: &str, detail: String| -> ! {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": reason,
+                        "message": format!("--worker-config {}: {detail}", path.display()),
+                    }})
+                );
+                std::process::exit(2);
+            };
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(error) => invalid("worker_config_unreadable", error.to_string()),
+            };
+            match crate::worker_runtime::WorkerConfig::parse(&content) {
+                Ok(config) => Some(std::sync::Arc::new(config)),
+                Err(error) => invalid("worker_config_invalid", error),
+            }
+        }
+        None => None,
+    };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+    // WP10 (R1, ADR-028): capture the resolved model credential BEFORE the
+    // provider consumes it, so a worker whose explicit env value or argv entry
+    // discloses it can be refused before any worker launches. Default provider:
+    // the agent env `DAIMONOS_AGENT_API_KEY`. Controlled profile (WP07): the
+    // value of its named credential variable.
+    let model_credential: Option<String> = match &controlled_profile {
+        Some(profile) => std::env::var(&profile.spec.credential_env).ok(),
+        None => Some(agent.api_key.clone()),
+    };
     // WP07 (FR-04): when a controlled profile is set it is the SOLE source of
     // the provider/model/credential; every completion routes through the opt-in
     // controlled transport. Otherwise legacy provider construction is unchanged.
@@ -633,6 +680,26 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
+    // WP10 (R1, ADR-028 Decision; D33/K2): refuse a worker whose explicit `env`
+    // value or `args` entry discloses the resolved model credential. This is a
+    // pure configuration refusal that needs NO runtime state, so it runs BEFORE
+    // the audit opens — like every other exit-2 configuration refusal it then
+    // leaves no audit file (never a lone `run_start`). Fail-closed before any
+    // worker launches (discovery happens inside run_agent): exit 2 with a named
+    // reason whose text never contains the credential value.
+    if let (Some(config), Some(credential)) = (&worker_config_runtime, &model_credential) {
+        if let Err(reason) = config.reject_credential_disclosure(std::slice::from_ref(credential)) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "worker_credential_disclosure",
+                    "message": reason,
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
     // WP08 (ADR-026): open the caller-requested audit sink immediately before
     // the first model request. A failure to open (or to write the `run_start`
     // event) is a required-audit failure that aborts the run with exit 23,
@@ -662,6 +729,7 @@ pub async fn run_agent(
             .map(|(_, sink)| std::sync::Arc::clone(sink)),
         capability_probe,
         capability_probe_sink: capability_probe_sink.clone(),
+        worker_config: worker_config_runtime.clone(),
     };
     // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
     // and any required-audit write failure surfaced as exit 23 — BEFORE the
@@ -699,6 +767,15 @@ pub async fn run_agent(
     } else {
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
     };
+    // WP10 (FR-05, ADR-028): a required worker failure (initialization, call,
+    // liveness, or teardown) ends the run with the reviewed `worker_unavailable`
+    // exit 22 (INTERFACES.md exit table) — never generic anyhow exit 1, and
+    // never a local fallback. This also covers the model-side final-output
+    // contract: a lost worker takes precedence over the final-output mapping.
+    if worker_config_runtime.is_some() {
+        exit_on_config_invalid(&result);
+        exit_on_worker_failure(&result);
+    }
     let result = result?;
     // WP09 (FR-04, ADR-027): a failed capability probe is terminal and precedes
     // any final-output decision (the agent loop never ran after a failed
@@ -776,11 +853,29 @@ fn run_terminal_status(
     probe: Option<&crate::capability_probe::ProbeOutcome>,
     final_output: Option<&crate::structured_output::FinalOutputOutcome>,
 ) -> (&'static str, i32) {
+    // D33/K1: a typed post-discovery configuration refusal records the reviewed
+    // `run_configuration_invalid` exit 2 (the process exits 2 via
+    // `exit_on_config_invalid`). This precedes every other verdict below, as the
+    // process-exit order in `run_agent_print` does (config, worker, probe,
+    // final-output), so the `run_end` record and the process code always agree.
+    if matches!(result, Ok(r) if r.config_invalid.is_some()) {
+        return ("run_configuration_invalid", 2);
+    }
+    // WP10 (FR-05, R7, D33/K3): a required-worker failure — the in-run TYPED
+    // `worker_lost` flag OR an initialization `Err` that run_agent returns with
+    // our own `worker_unavailable` prefix — records the reviewed
+    // `worker_unavailable` exit 22, from the SAME classifier (`worker_failure`)
+    // the process exit uses, so the record and the exit always agree (never a
+    // recorded `error`/1 while the process exits 22).
+    if worker_failure(result).is_some() {
+        return (crate::worker_runtime::WORKER_UNAVAILABLE, 22);
+    }
     // WP09 (G1, FR-04/ADR-027): a failed capability probe is terminal and the
     // process exits 21 (`model_unsupported`) via `emit_probe_outcome`. The
     // terminal `run_end` record must agree, so the probe verdict is consulted
     // here — the single source for both the audit record and the process exit
-    // — before the stop-reason mapping below.
+    // — before the stop-reason mapping below. (Precedes final-output: the loop
+    // never ran after a failed probe; matches the process-exit order.)
     if let Some(crate::capability_probe::ProbeOutcome::ModelUnsupported { .. }) = probe {
         return ("model_unsupported", 21);
     }
@@ -805,6 +900,70 @@ fn run_terminal_status(
             providers::StopReason::Error => ("error", 1),
         },
         Err(_) => ("error", 1),
+    }
+}
+
+/// WP10 (R7, D33/K3): classify a terminal result as a required-worker failure,
+/// returning the operator-facing message when it is. TWO shapes map here: the
+/// in-run TYPED `worker_lost` flag (never a substring of `error_message`, which
+/// can carry tool/model content), and an initialization `Err` that `run_agent`
+/// returns as the TYPED `worker_runtime::WorkerInitError` (R1) — DOWNCAST here,
+/// never matched by a substring of the anyhow message, so an unrelated error
+/// whose text merely contains the token is NOT a worker verdict. This is the
+/// SINGLE classifier shared by
+/// `run_terminal_status` (the audit `run_end`) and `exit_on_worker_failure`
+/// (the process exit), so the recorded exit_code and the process code always
+/// agree on the reviewed `worker_unavailable` exit 22.
+fn worker_failure(result: &anyhow::Result<agent::AgentResult>) -> Option<String> {
+    match result {
+        Err(error) => error
+            .downcast_ref::<crate::worker_runtime::WorkerInitError>()
+            .map(|typed| typed.to_string()),
+        Ok(run) if run.worker_lost => Some(
+            run.error_message
+                .clone()
+                .unwrap_or_else(|| crate::worker_runtime::WORKER_UNAVAILABLE.to_string()),
+        ),
+        Ok(_) => None,
+    }
+}
+
+/// WP10 (FR-05, ADR-028): if the terminal run outcome is a required-worker
+/// failure (see `worker_failure`), emit the reviewed `worker_unavailable` JSON
+/// and exit 22 (INTERFACES.md exit table). Otherwise return so normal handling
+/// (final-output/exit) proceeds. Diverges on a worker failure.
+fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
+    if let Some(message) = worker_failure(result) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": crate::worker_runtime::WORKER_UNAVAILABLE,
+                "message": message,
+            }})
+        );
+        std::process::exit(22);
+    }
+}
+
+/// WP10 (D33/K1, ADR-026): if the terminal run outcome carries a typed
+/// post-discovery configuration refusal (e.g. an allowlist entry served by no
+/// worker), emit the reviewed `run_configuration_invalid` JSON and exit 2. The
+/// matching `run_end` was already written by the single terminal source
+/// (`finalize_run_audit`/`run_terminal_status`); this only prints and exits, so
+/// the audit is never a lone `run_start`. Diverges on a config refusal.
+fn exit_on_config_invalid(result: &anyhow::Result<agent::AgentResult>) {
+    if let Ok(run) = result {
+        if let Some(verdict) = &run.config_invalid {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": verdict.reason,
+                    "message": verdict.message,
+                }})
+            );
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1837,10 +1996,76 @@ mod tests {
             last_call_usage: Default::default(),
             context_overflow: false,
             evidence: Default::default(),
+            worker_lost: false,
+            config_invalid: None,
         };
 
         let error = check_agent_result(&result).unwrap_err();
 
         assert!(error.to_string().contains("provider unavailable"));
+    }
+
+    #[test]
+    fn run_terminal_status_uses_typed_worker_lost_not_substring() {
+        // WP10 (R7): the worker-loss exit mapping is decided by the TYPED
+        // `worker_lost` flag, never by a substring of `error_message`. A
+        // generic provider error whose message merely CONTAINS the token must
+        // map to the generic error exit (1), not the worker exit (22).
+        let mk = |worker_lost: bool, msg: &str| agent::AgentResult {
+            messages: Vec::new(),
+            usage: Default::default(),
+            stop_reason: providers::StopReason::Error,
+            error_message: Some(msg.to_string()),
+            last_call_usage: Default::default(),
+            context_overflow: false,
+            evidence: Default::default(),
+            worker_lost,
+            config_invalid: None,
+        };
+        assert_eq!(
+            run_terminal_status(
+                &Ok(mk(false, "tool RESULT text mentions worker_unavailable")),
+                None,
+                None
+            ),
+            ("error", 1)
+        );
+        assert_eq!(
+            run_terminal_status(
+                &Ok(mk(true, "worker_unavailable: toolside read_note failed")),
+                None,
+                None
+            ),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
+    }
+
+    #[test]
+    fn worker_init_failure_is_typed_not_message_substring() {
+        // WP10 (R1): a worker INITIALIZATION failure is carried as a TYPED
+        // error (`WorkerInitError`) that the terminal classifier downcasts; it
+        // is never matched by a substring of an arbitrary anyhow message. A
+        // generic `Err` whose text merely CONTAINS the token must map to the
+        // generic error exit (1), never the worker exit (22).
+        let untyped: anyhow::Result<agent::AgentResult> = Err(anyhow::anyhow!(
+            "provider said worker_unavailable mid-stream"
+        ));
+        assert!(worker_failure(&untyped).is_none());
+        assert_eq!(run_terminal_status(&untyped, None, None), ("error", 1));
+
+        // The TYPED init error IS a worker verdict (exit 22), keeping the
+        // reviewed `worker_unavailable: <detail>` operator message.
+        let typed: anyhow::Result<agent::AgentResult> =
+            Err(anyhow::Error::new(crate::worker_runtime::WorkerInitError {
+                message: "toolside discovery failed".to_string(),
+            }));
+        assert_eq!(
+            worker_failure(&typed).as_deref(),
+            Some("worker_unavailable: toolside discovery failed")
+        );
+        assert_eq!(
+            run_terminal_status(&typed, None, None),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
     }
 }

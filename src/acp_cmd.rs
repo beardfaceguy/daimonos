@@ -1755,6 +1755,9 @@ fn build_agent_config(
         // WP09 (R5): ACP is interactive, not the one-shot probe path; no
         // capability probe runs here, so no prior model requests are seeded.
         prior_model_requests: 0,
+        // WP10 (ADR-028): the ACP bridge is legacy fail-open remote dispatch,
+        // never worker-only execution. Worker-only is an agent one-shot mode.
+        worker_executor: None,
     }
 }
 

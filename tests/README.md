@@ -95,3 +95,24 @@ Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn
 ## tests/test_capability_probe.py (WP09, FR-04)
 
 Same-tool capability-probe acceptance tests (ADR-027, requirements 14–17). They drive a real `daimonos agent --print` process against local fake Messages endpoints (the pattern from `test_request_control.py`), never a credentialed endpoint. Coverage: the `--capability-probe-payload` caller interface and its startup refusals (requires `--final-output` and `--model-profile`; rejected on `--dry-run` and the non-agent frontends); local payload validation before any request is sent (invalid/missing-field/non-JSON → exit 2, zero requests); the one unretried probe offering the frozen catalog — a pass proceeds to exit 0, while text-only, wrong-tool, two-calls, invalid-arguments, a 503, and a 3xx redirect each give the `model_unsupported` exit 21 with exactly one request and no further work (AC-04.1–04.7, zero-retry, local-reference, redirect-not-followed); the probe outcome recorded as a single `probe_result` audit event with no credential value (AC-04.6/04.8); and the probe request counting against the `max_model_requests` ceiling (R5, exit 24). Run: `python3 -m pytest tests/test_capability_probe.py -v`.
+## tests/test_worker_isolation.py (WP10, FR-05)
+
+Credential-free worker execution acceptance tests (ADR-028). Drive a real
+`daimonos agent --worker-config` process against a local scripted model endpoint
+and a RECORDING, credential-free MCP-stdio worker (pure stdlib). The worker dumps
+its own process environment and records every served tool call, so isolation and
+routing are observed from the outside — no live API, no real credentials. Covers
+AC-05.1 (no credential in worker env; the credential is a real var of the
+model-side process), AC-05.3 (every call served by a worker, recorded under the
+`worker` audit route, none in-process), AC-05.4 (a killed worker aborts with the
+distinct `worker_unavailable` exit 22 and runs no later tool), AC-05.5 (the
+`--tool-allowlist` is the sole admission gate for worker tools), the WP04
+read-only pass-through (worker tools are the caller's sandbox, not path-checked),
+the WP08/ADR-026 audited-worker-death case, the default-off regression, and the
+fail-closed control-file validation (exit 2). The no-network container leg
+(AC-05.2) and the WP09 capability-probe leg are integration merge items — the
+pure-stdlib worker makes no outbound connection. Run:
+`python3 -m pytest tests/test_worker_isolation.py -v`.
+
+- `test_worker_isolation.py` (WP10 r2): adds credential-disclosure refusal (R1), the no-network namespace leg via `unshare -Urn` (AC-05.2, skipped if the host cannot create a user+net namespace), post-discovery allowlist validation (R3), the `--final-output`+`--worker-config` final-only case (R4), process-table reaping incl. a stalled worker + descendant (R6), typed lost-worker terminal (R7), and `command`-with-`=` refusal (R8).
+- `test_worker_isolation.py` (WP10 r5): the AC-05.2 network-isolation leg requires a host that can create an unprivileged user and network namespace (`unshare -Urn`) and is skipped on hosts that cannot; because the plan's final gate treats a skipped mandatory acceptance check as a blocker, this skip is NOT a pass and the gate must run on a userns-capable host.

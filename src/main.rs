@@ -68,6 +68,7 @@ mod tool_runner;
 mod tools;
 mod tui;
 mod verbosity;
+mod worker_runtime;
 mod zed_config;
 
 use clap::Parser;
@@ -662,6 +663,20 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
+        // WP10 (FR-05, ADR-028): when a `--worker-config` is set, the model's
+        // effective catalog is the worker-discovered tools, exported under the
+        // `mcp__{worker}__{tool}` scheme. Those names are not in the native
+        // catalog and are only known after worker discovery (which happens in
+        // the agent loop builder, not here). Accept worker-namespaced entries
+        // at startup; after discovery `agent_cmd::run_agent` (r4, D38) validates
+        // EVERY allowlist entry against the frozen catalog of the run (the
+        // discovered worker tools, plus the final-answer tool when
+        // `--final-output` is set) and ends the run at startup (exit 2,
+        // `tool_allowlist_unknown_entry`, naming the entry) before the first
+        // model request if any entry — a worker-scoped name no worker serves, OR
+        // a native name such as `read_file` that dispatches to nothing in worker
+        // mode — names no tool of the run. The allowlist stays fail-closed.
+        let mut worker_mode = false;
         // R7 (ADR-023 effective catalog): config-registered custom local tools
         // are dispatchable names too, so an allowlist that names one must not
         // false-reject at startup. Caller-worker/remote names defer to WP10.
@@ -680,6 +695,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            worker_mode = args.worker_config.is_some();
+        }
+        // Merge of WP06 and WP10. A worker-scoped entry is not in the native
+        // catalog and is known only after worker discovery. In worker mode it
+        // passes this startup check and is cross-checked after discovery
+        // (`agent_cmd::run_agent`). Every other entry, and the final-output
+        // tool requirement, go through `validate_allowlist` unchanged.
+        if worker_mode {
+            known.extend(
+                names
+                    .iter()
+                    .filter(|name| name.starts_with(crate::mcp_bridge::REMOTE_TOOL_PREFIX))
+                    .cloned(),
+            );
         }
         match run_policy::validate_allowlist(&names, &known, final_output_tool.as_deref()) {
             Ok(()) => {}
