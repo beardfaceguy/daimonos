@@ -24,11 +24,19 @@
 //! of scope (ADR-029): this module only knows native registry tool names.
 //!
 //! The annotation is applied once in the serving pipeline
-//! ([`crate::tools::tool_definitions`]) and the agent catalog
-//! ([`crate::tool_facade::active_schemas_for_policy`]), so the deterministic
-//! `daimonos tool-contract` dump and the live `tools/list` carry identical
-//! marks by construction (AC-14.1). ADR-022 performs the actual enforcement and
-//! reads the same table via [`path_arguments`].
+//! ([`crate::tools::tool_definitions`]), so the deterministic `daimonos
+//! tool-contract` dump, the live `tools/list`, and `get_tool_schema` carry
+//! identical marks by construction (AC-14.1). It is deliberately **not** added
+//! to the agent/model catalog ([`crate::tool_facade::active_schemas_for_policy`]):
+//! those schemas are sent to the model endpoint, which FR-15 requires be
+//! preserved unchanged and which may reject an unknown keyword (I3/D28). The
+//! mark is caller-facing metadata, not part of the model request.
+//!
+//! [`path_arguments`] is the reviewed table of owned path arguments. Today only
+//! [`annotate`] reads it; ADR-022 performs path enforcement through a separate
+//! path (`crate::path_policy`) and does not yet consult this table. If a future
+//! change routes ADR-022 enforcement through [`path_arguments`], add a
+//! consistency guard so the two cannot drift.
 
 use serde_json::Value;
 
@@ -72,11 +80,13 @@ const fn array(name: &'static str) -> PathArg {
 }
 
 /// The reviewed set of owned path arguments for a native tool, by name. An
-/// empty slice means the tool has no owned path argument. This is the single
-/// source of truth both the schema annotator and ADR-022 enforcement consult.
+/// empty slice means the tool has no owned path argument. Today its only reader
+/// is [`annotate`] (the schema annotator). It is written as the intended single
+/// source of truth for owned path arguments so a future ADR-022 enforcement
+/// path can share it, but no enforcement code consults it yet (see module docs).
 pub fn path_arguments(tool: &str) -> &'static [PathArg] {
     // Reviewed tables, held as `'static` constants so the function can hand out
-    // borrowed slices (ADR-022 enforcement and the schema annotator share them).
+    // borrowed slices to its reader(s).
     const PATH_ONLY: [PathArg; 1] = [scalar("path")];
     const SEARCH_ARGS: [PathArg; 2] = [scalar("path"), scalar("glob")];
     // `git_read` (pinned local read plugin): workspace-relative repo/path and a

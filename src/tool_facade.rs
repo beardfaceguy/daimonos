@@ -45,10 +45,13 @@ pub fn active_schemas_for_policy(
                 description.push_str("\n\nExact Starlark tool signatures:\n");
                 description.push_str(&crate::script::tool_signatures_for_policy(confined));
             }
-            let mut input_schema = descriptions.schema_with_parameters(t.name, &t.schema);
-            // WP16 (FR-14): same owned path annotations the MCP serving path adds,
-            // so `x-daimonos-path` is consistent across frontends.
-            crate::path_annotations::annotate(t.name, &mut input_schema);
+            // WP16 (FR-14): the owned path annotation is a *caller-facing* schema
+            // mark (the `tool-contract` dump, `tools/list`, `get_tool_schema`). It
+            // is deliberately NOT applied here: this catalog becomes the tool
+            // schemas sent to the model endpoint, which FR-15 requires be
+            // preserved unchanged and which may reject an unknown keyword. ADR-029
+            // scopes the mark to serving/export and does not start a model run.
+            let input_schema = descriptions.schema_with_parameters(t.name, &t.schema);
             NeutralToolSchema {
                 name: t.name.to_string(),
                 description,
@@ -109,32 +112,23 @@ mod tests {
 
     // --- active_schemas ---
 
-    /// WP16 (FR-14): the agent-facing catalog carries the same owned path
-    /// annotations the MCP serving path does, so `x-daimonos-path` is consistent
-    /// across frontends. `read_file.path` is marked; its non-path `offset` is
-    /// not, and the opaque `execute_script.code` is never marked.
+    /// WP16 (FR-14, I3/D28): the agent-facing catalog is the tool schemas sent
+    /// to the model endpoint, so it must NOT carry the owned `x-daimonos-path`
+    /// mark (FR-15 preserves supplied schemas; a strict endpoint may reject an
+    /// unknown keyword). The absence on the wire is proven end-to-end by the
+    /// process test `tests/test_path_annotations.py::
+    /// test_model_request_omits_owned_path_annotation` on both wires; the mark
+    /// lives only in the served/exported catalog (`tool-contract` dump,
+    /// `tools/list`, `get_tool_schema`).
     #[test]
-    fn active_schemas_carry_owned_path_annotations() {
+    fn active_schemas_do_not_carry_owned_path_annotations() {
         let dir = tempfile::tempdir().unwrap();
         let schemas = default_schemas(dir.path());
         let read_file = schemas
             .iter()
             .find(|s| s.name == "read_file")
             .expect("read_file schema");
-        let props = &read_file.input_schema["properties"];
-        assert_eq!(
-            props["path"][crate::path_annotations::PATH_ANNOTATION_KEY],
-            json!(true)
-        );
-        assert!(props["offset"]
-            .get(crate::path_annotations::PATH_ANNOTATION_KEY)
-            .is_none());
-
-        let script = schemas
-            .iter()
-            .find(|s| s.name == "execute_script")
-            .expect("execute_script schema");
-        assert!(script.input_schema["properties"]["code"]
+        assert!(read_file.input_schema["properties"]["path"]
             .get(crate::path_annotations::PATH_ANNOTATION_KEY)
             .is_none());
     }

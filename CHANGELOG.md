@@ -38,6 +38,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   an additive contract change, the tool-contract version moves from `1.0.0` to
   `1.1.0` (`docs/tool-contract-changelog.md`); the binary version
   (`serverInfo.version`) is unchanged.
+- **Scope of the path marks (FR-14).** The marks are caller-facing metadata:
+  they are carried by the `tool-contract` dump, `tools/list`, and
+  `get_tool_schema`, and are deliberately **not** sent to the model endpoint
+  (the schemas handed to the model stay unchanged per FR-15). In the initial
+  exposure tier the dump and `tools/list` serve a full schema for 21 of the 35
+  tools, so the dump shows the marks only for those tools (6 of which have path
+  arguments); for the other 14 tools whose initial-tier schema is stripped to
+  `{"type": "object"}`, a caller reads the marks through `get_tool_schema`,
+  which returns the complete annotated schema. FR-15 full self-contained schemas
+  (WP17) will remove this limitation.
 
 ## [0.1.5] - 2026-10-18
 

@@ -533,10 +533,27 @@ additive: it adds the marker and changes no other schema keyword. It is
 - URLs, revisions, search patterns, identifiers, and enums;
 - caller-provided MCP worker tools and the caller's final-answer schema.
 
-Because the marks are applied in the shared serving pipeline, the
-`daimonos tool-contract` dump and the live `tools/list` carry identical marks
-for the same inputs. ADR-022 performs the actual path enforcement and reads the
-same owned-argument table (`src/path_annotations.rs`). See ADR-029 and FR-14.
+The marks are caller-facing metadata applied in the shared serving pipeline
+(`src/tools.rs::tool_definitions`), so the `daimonos tool-contract` dump, the
+live `tools/list`, and `get_tool_schema` carry identical marks for the same
+inputs. The marks are **not** sent to the model endpoint: the schemas the agent
+hands to the model are preserved unchanged (FR-15), because a strict endpoint
+may reject an unknown keyword.
+
+**Tier limitation (today).** The dump and `tools/list` carry a full schema only
+for the tools whose schema is served in full in the initial exposure tier — 21
+of the 35 tools today. The path marks therefore appear in the dump only for
+those 21 tools (6 of which have path arguments). For the other 14 tools the
+initial-tier schema is stripped to `{"type": "object"}`, so a caller reads their
+path marks through `get_tool_schema`, which always returns the complete
+annotated schema. FR-15 full self-contained schemas (WP17) will serve every
+schema in full and remove this limitation; AC-14.1 is not claimed for the
+stripped tools from the dump alone.
+
+ADR-022 performs the actual path enforcement through a separate path
+(`src/path_policy.rs`); it does not yet consult the owned-argument table in
+`src/path_annotations.rs`, which today is read only by the schema annotator. See
+ADR-029 and FR-14.
 
 ### `[session]` — Daemon-owned agent sessions
 

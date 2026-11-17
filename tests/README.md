@@ -66,10 +66,15 @@ initialization equals the dump's version.
 tool-contract` dump and asserts AC-14.1: every Daimonos-owned filesystem path,
 glob, or walk argument — including the elements of path arrays — carries the
 `x-daimonos-path` annotation, and no non-path, opaque-command/script, or
-reservation-glob argument does. A Rust seam test
-(`tool_facade::active_schemas_carry_owned_path_annotations`) checks the agent
-catalog carries the same marks, since no model-free process interface observes
-it. No provider API key is required.
+reservation-glob argument does. `get_tool_schema` over a real MCP server is
+asserted to carry the marks for every dump tool and the three on-demand tools
+(`diff_files`/`tool_pipeline`/`lint_repair`) — the only caller surface for the
+marks of the tools whose initial-tier `tools/list` schema is stripped (until
+WP17). The marks are caller-facing only: a process test drives `agent --print`
+against a local fake provider endpoint on both wires (OpenAI Chat Completions
+and Anthropic Messages) and asserts the recorded model request never contains
+`x-daimonos-path` (FR-15 preserves the model-facing schema). No provider API key
+or live endpoint is required — the fake endpoint is local.
 
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
