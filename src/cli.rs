@@ -321,6 +321,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
 
+    /// Prohibit every workspace mutation end to end (FR-07, ADR-022). Internal
+    /// state still writes under `--state-dir`. Default off; when absent,
+    /// behavior is unchanged.
+    #[arg(long, global = true, default_value_t = false)]
+    pub workspace_read_only: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

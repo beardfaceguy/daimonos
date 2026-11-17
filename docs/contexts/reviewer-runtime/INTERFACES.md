@@ -2,6 +2,7 @@
 
 Date: 2026-10-29
 Status: Launch contracts approved by the user on 2026-10-29 UTC. Package dependencies and operational preflight still apply.
+Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`).
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Decisions: Accepted ADRs 021–032. Scope: the approved 20-package [plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Coverage: [INVENTORIES.md](INVENTORIES.md).

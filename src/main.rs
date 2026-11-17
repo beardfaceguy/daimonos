@@ -39,6 +39,7 @@ mod providers;
 mod provisioning;
 mod remote_auth;
 mod remote_gateway;
+mod run_policy;
 mod safety;
 mod script;
 mod session;
@@ -461,6 +462,74 @@ async fn main() -> anyhow::Result<()> {
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    // FR-07 (ADR-022): pin the read-only workspace decision before any writer.
+    cfg.workspace_read_only = cli.workspace_read_only;
+    if cfg.workspace_read_only
+        && cfg.state_authority.is_none()
+        && (kgl::autoindex::enabled() || kgl::observe::enabled())
+    {
+        // These writers emit `.kgl` under the workspace. Relocation needs an
+        // explicit state root; without one, refuse rather than silently write.
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                "message": "KGL autoindex/observation would write under the read-only workspace; relocate with --state-dir or disable them"
+            }})
+        );
+        std::process::exit(2);
+    }
+    // FR-07 (G3, G2): refuse before any service starts when an unconditional
+    // internal writer would land inside the read-only workspace. Independent of
+    // --state-dir — an explicit state root simply relocates these destinations
+    // so they fall outside the workspace and pass. The KGL and snapshot stores
+    // are guarded on use (tool/opcode admission), not here.
+    if cfg.workspace_read_only {
+        let mut destinations: Vec<(&str, std::path::PathBuf)> = Vec::new();
+        if cfg.logging.enabled {
+            destinations.push(("logging.directory", cfg.logging.resolved_directory()));
+        }
+        if cfg.analytics.enabled {
+            destinations.push(("analytics.db_path", cfg.analytics.resolved_db_path()));
+        }
+        if cfg.coordination.enabled {
+            destinations.push(("coordination.db_dir", cfg.coordination.resolved_db_dir()));
+        }
+        destinations.push((
+            "tool_output.directory",
+            cfg.tool_output.resolved_directory(),
+        ));
+        if let Some(path) = &cfg.process.artifact_directory {
+            destinations.push(("process.artifact_directory", paths::expand_tilde(path)));
+        }
+        if let Some(path) = &cfg.git_read.status_directory {
+            destinations.push(("git_read.status_directory", paths::expand_tilde(path)));
+        }
+        if cfg.checkpoint.enabled {
+            // Agent/chat per-turn checkpoints write this shadow git repo and the
+            // current frontend (src/agent.rs) never relocates it, so refuse at
+            // startup rather than write under the workspace.
+            destinations.push((
+                "checkpoint shadow repository",
+                workspace.join(".daimonos/checkpoints.git"),
+            ));
+        }
+        if let Some((label, path)) =
+            run_policy::first_internal_destination_inside_workspace(true, &workspace, &destinations)
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
+                    "message": format!(
+                        "{label} resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
+                        path.display()
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
     }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {

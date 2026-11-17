@@ -4,6 +4,7 @@ Date: 2026-11-03
 
 - **Run authority:** Immutable caller-selected limits on configuration, storage, access, and execution for one run.
 - **State root:** Caller-owned location for internal artifacts. It is not permission to relocate explicit tool writes.
+- **Read-only workspace:** The `--workspace-read-only` run state. Every Daimonos-initiated workspace mutation is refused (`workspace_write_forbidden`) and opaque, unmediatable tools are refused (`tool_policy_unsupported`); internal state uses the state root. Admission table: `src/run_policy.rs` (`ToolAdmission`, `EffectClass`). Implemented (WP04).
 - **Confinement root:** Fixed run-scoped boundary for authorized filesystem access. `set_cwd` does not change it.
 - **Working directory:** Mutable session base for relative paths. With confinement enabled, the filesystem authority enforces the confinement root for every operation.
 - **Effective catalog:** The definitions actually selected after registration, workspace checks, policy, tier, and schema mode.

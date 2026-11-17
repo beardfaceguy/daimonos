@@ -425,6 +425,12 @@ async fn dispatch_tool_inner(
         return response_to_result(resp);
     }
 
+    // FR-07 (ADR-022): non-opcode tools (external CLI plugins, repair helpers)
+    // are opaque under read-only; read/meta tools and git_read are admitted.
+    // Refuse before any effect begins; an allowlist cannot override this.
+    if let Err(failure) = session.admission.admit_tool(name) {
+        return response_to_result(failure.into_response(name));
+    }
     // ADR-022: non-opcode tools need an explicit safe classification.
     if session.authority.is_some() && !crate::path_policy::tool_allowed(name) {
         return response_to_result(
@@ -1542,6 +1548,20 @@ async fn run_execute_script(
     session: Arc<Mutex<Session>>,
     args: &Value,
 ) -> Result<script::ScriptResult, String> {
+    // FR-07 (ADR-022): execute_script is opaque — its inner effects cannot be
+    // mediated — so refuse it before any Starlark runs when the workspace is
+    // read-only. An allowlist entry cannot override this refusal. G7: return
+    // the same structured payload (code/message/tool/retryable) as every other
+    // refusal, serialized so `script_result_to_content` surfaces it verbatim.
+    if session.lock().await.admission.read_only() {
+        return Err(serde_json::json!({
+            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+            "message": "execute_script cannot be mediated while the workspace is read-only",
+            "tool": "execute_script",
+            "retryable": false,
+        })
+        .to_string());
+    }
     session
         .lock()
         .await

@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **`--workspace-read-only` (FR-07).** A global, default-off option that
+  prohibits every Daimonos-initiated workspace mutation end to end (startup,
+  tool calls, teardown). Workspace mutations are refused with
+  `workspace_write_forbidden` and opaque, unmediatable tools (`execute_script`,
+  arbitrary `exec`, the repair helper, external CLI plugins) with
+  `tool_policy_unsupported`, at every dispatch boundary; an allowlist cannot
+  override the refusal. Read tools, including `git_read`, keep working, and
+  internal state uses `--state-dir`. Central admission table in
+  `src/run_policy.rs`. See ADR-022 and `docs/configuration.md`.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
