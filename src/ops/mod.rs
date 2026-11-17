@@ -187,6 +187,10 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     let max =
         op.n.unwrap_or(session.cfg.search.default_find_max as i64)
             .max(1) as usize;
+    // D08 (ADR-021, FR-09): explicit-only runs read no implicit ignore file,
+    // even under confinement, so a hostile ignore file cannot steer the
+    // confined filename walk behind `search mode=files`/`find`.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
     let result = tokio::task::spawn_blocking(move || {
         let start = authority.open_read(&root)?;
         let only_file = start
@@ -205,8 +209,11 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
                 ..WalkOptions::default()
             },
         )?;
-        let ignores =
-            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &scan_root, &walk);
+        let ignores = if apply_ignore_files {
+            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &scan_root, &walk)
+        } else {
+            crate::confined_ignore::ConfinedIgnore::disabled(&authority)
+        };
         let skip_extensions = cfg.skip_set();
         let skipped = walk.skipped.len();
         let paths = walk

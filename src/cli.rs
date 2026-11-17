@@ -414,6 +414,13 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub full_tool_schemas: bool,
 
+    /// Refuse every implicit configuration source (environment files, config,
+    /// instructions, skills, registrations, ignore files); honour only explicit
+    /// caller inputs such as `--config` (reviewer-runtime INTERFACES.md, FR-09;
+    /// ADR-021). Default-off: current discovery behaviour is unchanged.
+    #[arg(long, global = true, default_value_t = false)]
+    pub ignore_config_files: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -422,6 +429,11 @@ impl Cli {
     /// True when either confinement flag is present (ADR-022).
     pub fn confinement_requested(&self) -> bool {
         self.confine_paths || self.confine_root.is_some()
+    }
+
+    /// True when explicit-only configuration discovery is requested (FR-09).
+    pub fn explicit_only(&self) -> bool {
+        self.ignore_config_files
     }
 
     /// Resolve old flags and normalized subcommands to one runtime identity.
@@ -456,6 +468,23 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_config_files_is_global_and_default_off() {
+        assert!(!Cli::try_parse_from(["daimonos", "mcp"])
+            .unwrap()
+            .explicit_only());
+        assert!(
+            Cli::try_parse_from(["daimonos", "--ignore-config-files", "mcp"])
+                .unwrap()
+                .explicit_only()
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "mcp", "--ignore-config-files"])
+                .unwrap()
+                .explicit_only()
+        );
+    }
 
     #[test]
     fn confinement_flags_are_global_and_root_implies_confinement() {

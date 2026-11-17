@@ -213,6 +213,62 @@ audited (ADR-026), every other frontend that accepts the global `--audit-path`
 ignore it silently. The interactive agent refuses before any session-daemon
 launch, so a daemon never runs a falsely-audited session.
 
+## Explicit-only configuration (`--ignore-config-files`)
+
+`--ignore-config-files` refuses every *implicit* configuration source so a
+hostile workspace or home file cannot configure an opted-in run. It is a global
+run option and is default off: when it is absent, discovery is unchanged.
+
+When it is set, these implicit sources are disabled:
+
+- **Environment files:** a workspace `agent.env` and the
+  `~/.config/daimonos/agent.env` (or `$XDG_CONFIG_HOME`) fallback are not read
+  or applied.
+- **Config files:** a workspace `daimonos.toml` and the HOME/XDG config are not
+  read.
+- **Agent instructions:** global and workspace `agent-instructions.md` are not
+  read.
+- **Skills:** the global (`~/.agents/skills`) and workspace (`.agents/skills`)
+  roots are not discovered, and no skill executables are registered.
+- **MCP servers:** the default Zed `context_servers` settings file is not
+  opened.
+- **Ignore files:** `.gitignore`, `.ignore`, `.git/info/exclude`, and
+  global/parent ignore files do not steer any walker that an opted-in run can
+  reach: content `search` and `search mode="files"` (the filename index),
+  their confined `--confine-paths` equivalents, and `snapshot` create/restore.
+  Built-in hidden-file filtering is not an ignore file and is unchanged.
+- **CLI plugins:** only explicitly configured tools are registered; no
+  workspace or user plugins.
+
+Explicit, caller-supplied inputs remain honored: an explicit `--config PATH` and
+the control paths it names (prompt overrides, `[agent.mcp] servers_file`, Zed
+settings), together with `--agent-env`, `$DAIMONOS_AGENT_ENV`, and
+`--agent-instructions`. An invalid explicit input fails the run rather than
+falling back to another source (ADR-021).
+
+At startup the run prints a one-line JSON effective-policy report to stderr that
+names each ignored source by path, without reading its contents, for example:
+
+```json
+{"effective_policy":{"ignore_config_files":true,"ignored":[{"kind":"D01","label":"environment file","path":"/work/agent.env"}]}}
+```
+
+Under the option a hostile workspace `agent-instructions.md` (D04) is not
+layered into the agent system prompt, so it never reaches the model request.
+The index warm-up preflight (the over-broad-root guard) is covered by the
+ignore-file suppression above, so a hostile `.gitignore` cannot change which
+paths an opted-in run eagerly indexes.
+
+The option is part of a session daemon's launch identity: a daemon started with
+`--ignore-config-files` is distinct from one started without it, the same way
+`--confine-paths` pins a daemon. Reusing a running daemon with a different
+setting spawns a new one.
+
+Live remote model discovery is governed separately (see controlled transport
+and `DAIMONOS_AGENT_MODELS_DISCOVER`), not by this option.
+
+See ADR-021 and `src/discovery_policy.rs`.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,

@@ -455,6 +455,7 @@ pub async fn run_agent(
                 agent_instructions: explicit_agent_instructions.as_deref(),
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
+                ignore_config_files: cfg.discovery_policy.is_explicit_only(),
                 debug_tokens: token_log.is_some(),
                 // FR-07 (R4): read-only is part of the daemon identity so a
                 // read-only client spawns a read-only daemon and refuses to
@@ -1677,6 +1678,20 @@ fn load_agent_env(
         agent_env::AgentEnv::load(Some(selected))
     } else if cfg.state_authority.is_some() {
         agent_env::AgentEnv::load_explicit(path)
+    } else if cfg.discovery_policy.is_explicit_only() {
+        // D03 (ADR-021, FR-09): explicit-only discovery reads no implicit
+        // `~/.config/daimonos/agent.env`. The caller must name the file with
+        // `--agent-env` (resolved here) or `DAIMONOS_AGENT_ENV` (captured as
+        // `caller_agent_env`). A missing explicit input fails rather than
+        // falling back to the home file.
+        match path.or_else(|| cfg.caller_agent_env.clone()) {
+            Some(selected) => agent_env::AgentEnv::load(Some(selected)),
+            None => Err(
+                "explicit-only mode (--ignore-config-files): set --agent-env \
+                 or DAIMONOS_AGENT_ENV; no implicit ~/.config/daimonos/agent.env is read"
+                    .to_string(),
+            ),
+        }
     } else {
         agent_env::AgentEnv::load(path)
     };
@@ -1851,6 +1866,21 @@ fn check_agent_result(result: &agent::AgentResult) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WP11 (FR-09, ADR-021): explicit-only discovery refuses the implicit
+    // `~/.config/daimonos/agent.env` fallback; the caller must name the file
+    // with `--agent-env` (or `DAIMONOS_AGENT_ENV`). D03 in reviewer-runtime
+    // INVENTORIES.md.
+    #[test]
+    fn explicit_only_agent_env_requires_an_explicit_path() {
+        let cfg = config::Config {
+            discovery_policy: crate::discovery_policy::DiscoveryPolicy::ExplicitOnly,
+            ..Default::default()
+        };
+        let error = load_agent_env(None, &cfg)
+            .expect_err("explicit-only must refuse the implicit home agent.env");
+        assert!(error.to_string().contains("explicit-only mode"), "{error}");
+    }
 
     async fn mock_openrouter() -> (String, tokio::sync::oneshot::Receiver<String>) {
         let body = serde_json::json!({

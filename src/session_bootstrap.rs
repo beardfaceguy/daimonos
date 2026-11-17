@@ -26,6 +26,10 @@ pub struct BootstrapOptions<'a> {
     pub agent_instructions: Option<&'a Path>,
     pub confine_reference: Option<&'a Path>,
     pub confine_identity: Option<&'a str>,
+    /// Explicit-only configuration discovery (ADR-021, FR-09). Pinned into the
+    /// daemon launch identity so a daemon started with the mode is never reused
+    /// by a frontend that did not request it, and vice versa.
+    pub ignore_config_files: bool,
     pub debug_tokens: bool,
     /// FR-07 (ADR-022, WP04): whether the client requested `--workspace-read-only`.
     /// This is part of the daemon's immutable launch identity: a read-only client
@@ -216,6 +220,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--confine-root"));
         args.push(reference.as_os_str().to_owned());
     }
+    if options.ignore_config_files {
+        args.push(OsString::from("--ignore-config-files"));
+    }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
     args.push(options.socket_path.as_os_str().to_owned());
@@ -279,6 +286,9 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         digest.update(identity.as_bytes());
         digest.update([0_u8]);
     }
+    if options.ignore_config_files {
+        digest.update(b"ignore-config-files\0");
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
@@ -299,6 +309,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && !options.workspace_read_only
         && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
+        && !options.ignore_config_files
     {
         return Ok(LaunchIdentity::NotRequested);
     }
@@ -381,6 +392,7 @@ mod tests {
             agent_instructions: None,
             confine_reference: None,
             confine_identity: None,
+            ignore_config_files: false,
             debug_tokens: false,
             workspace_read_only: false,
             socket_path: socket,
@@ -448,6 +460,57 @@ mod tests {
         assert_ne!(
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)
+        );
+    }
+
+    // WP11 (FR-09, ADR-021): explicit-only mode is pinned into the daemon's
+    // launch identity, the same way --confine-paths is.
+    #[test]
+    fn explicit_only_is_pinned_into_daemon_launch_identity() {
+        let base = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let explicit = BootstrapOptions {
+            ignore_config_files: true,
+            ..options(
+                Path::new("/workspace"),
+                Path::new("/config.toml"),
+                Path::new("/runtime/session.sock"),
+                Path::new("/agent.env"),
+            )
+        };
+        let args = daemon_args(&explicit);
+        assert!(args.iter().any(|arg| arg == "--ignore-config-files"));
+        assert!(!daemon_args(&base)
+            .iter()
+            .any(|arg| arg == "--ignore-config-files"));
+        assert_ne!(
+            bootstrap_fingerprint(&base),
+            bootstrap_fingerprint(&explicit)
+        );
+    }
+
+    #[test]
+    fn explicit_only_alone_requests_a_pinned_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("session.sock");
+        let config = directory.path().join("config.toml");
+        let agent_env = directory.path().join("agent.env");
+        let pinned = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            ignore_config_files: true,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+        assert_ne!(
+            launch_identity(&pinned).unwrap(),
+            LaunchIdentity::NotRequested,
+            "explicit-only mode must request a pinned daemon identity"
         );
     }
 

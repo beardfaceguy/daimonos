@@ -312,6 +312,7 @@ Do not present generic `anyhow` text as the machine-readable contract.
 Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `workspace_write_forbidden`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
 WP09 (capability probe) adds three exit-2 reasons under the same `run_configuration_invalid` code: `capability_probe_requires_final_output` and `capability_probe_requires_model_profile` (the probe flag is present but `--final-output` / `--model-profile` is missing), and `capability_probe_payload_invalid` (the caller's minimal payload is an unreadable file, invalid JSON, or fails the final-answer schema — refused locally before any request).
+WP11 (FR-09, ADR-021) adds exit-2 reason `config_invalid`: the explicit-only loader (`--ignore-config-files`) emits it for an unreadable or invalid explicit `--config` and selects no other source.
 `state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
 `workspace_write_forbidden` is the WP04 startup refusal when an internal writer's destination resolves inside the workspace under `--workspace-read-only`; it reuses the one FR-07 spelling for both the startup (exit-2) reason and the tool-refusal code below, so operators see a single name for every prohibited workspace write.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.
@@ -408,6 +409,8 @@ The user explicitly approved all four groups. The integrator may open the releva
 ADR acceptance and this ledger's human review are complete. No further design approval is required for the reviewed scope.
 The first wave needs WP01/WP03 launch contracts closed. No implementation agent is assigned or launched by preparing these artifacts.
 No development notes or task updates may go to Vikunja before the previously agreed final approval.
+
+Implementation status: the WP11 / FR-09 `--ignore-config-files` row is implemented as the reviewed spelling — a global, default-off option that disables D01–D09 while honoring explicit `--config`/`--agent-env`/`--agent-instructions`, pinned into the session-daemon launch identity, with a startup effective-policy report. See `src/discovery_policy.rs` and `tests/test_configuration_isolation.py`. The index warm-up preflight (`src/index.rs::should_warm_index`/`preflight_within_budget`) is threaded with the discovery policy, and instruction (D04) suppression is observed at the process boundary on the recorded model request to a local fake provider (see `tests/test_configuration_isolation.py`).
 
 _Anchors:_ src/main.rs::main, src/provisioning.rs::build_tool_services, src/session.rs::Session::resolve_path, src/providers/mod.rs::CompleteOpts, src/managed_process.rs::ManagedChild::terminate, src/agent.rs::AgentSession::staged_prompt_message, src/mcp.rs::dispatch_local_tool, src/ops/mod.rs::dispatch_with_progress, src/tool_output.rs::bound_text
 

@@ -20,6 +20,11 @@ pub struct SnapshotStore {
     workspace: PathBuf,
     snapshots_root: PathBuf,
     selected_state: bool,
+    /// WP11 (FR-09, ADR-021): when false (explicit-only mode) the snapshot
+    /// create/restore walks disable implicit ignore-file layers so a hostile
+    /// `.gitignore`/`.ignore` cannot shape which workspace files are captured
+    /// or restored. Default true: ordinary snapshotting is unchanged.
+    apply_ignore_files: bool,
 }
 
 impl SnapshotStore {
@@ -31,6 +36,7 @@ impl SnapshotStore {
             workspace,
             snapshots_root,
             selected_state: false,
+            apply_ignore_files: true,
         }
     }
 
@@ -42,7 +48,20 @@ impl SnapshotStore {
             workspace,
             snapshots_root,
             selected_state: true,
+            apply_ignore_files: true,
         }
+    }
+
+    /// Apply an explicit-only discovery policy to the snapshot walks (WP11,
+    /// FR-09, ADR-021). Under [`DiscoveryPolicy::ExplicitOnly`] the implicit
+    /// ignore-file layers are disabled so an ignore-listed file is still
+    /// captured and restored.
+    pub fn with_discovery_policy(
+        mut self,
+        policy: crate::discovery_policy::DiscoveryPolicy,
+    ) -> Self {
+        self.apply_ignore_files = policy.allows_implicit();
+        self
     }
 
     /// Build a store for `workspace`, honoring an optional relocated snapshots
@@ -86,7 +105,8 @@ impl SnapshotStore {
     pub async fn create(&self, tag: Option<String>) -> Result<SnapshotMeta, String> {
         let workspace = self.workspace.clone();
         let root = self.snapshots_root.clone();
-        tokio::task::spawn_blocking(move || create_impl(&workspace, &root, tag))
+        let apply_ignore_files = self.apply_ignore_files;
+        tokio::task::spawn_blocking(move || create_impl(&workspace, &root, tag, apply_ignore_files))
             .await
             .map_err(|e| format!("spawn: {e}"))?
     }
@@ -99,9 +119,12 @@ impl SnapshotStore {
         let root = self.snapshots_root.clone();
         let selected_state = self.selected_state;
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || restore_impl(&workspace, &root, &id, selected_state))
-            .await
-            .map_err(|e| format!("spawn: {e}"))?
+        let apply_ignore_files = self.apply_ignore_files;
+        tokio::task::spawn_blocking(move || {
+            restore_impl(&workspace, &root, &id, selected_state, apply_ignore_files)
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))?
     }
 
     /// List all snapshots, newest first.
@@ -142,13 +165,18 @@ fn read_manifest_at(root: &Path, id: &str) -> Result<SnapshotMeta, String> {
     serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
 }
 
-fn create_impl(workspace: &Path, root: &Path, tag: Option<String>) -> Result<SnapshotMeta, String> {
+fn create_impl(
+    workspace: &Path,
+    root: &Path,
+    tag: Option<String>,
+    apply_ignore_files: bool,
+) -> Result<SnapshotMeta, String> {
     let id = Uuid::new_v4().to_string();
     let snap_dir_path = snap_dir(root, &id);
     let files_dir = snap_dir_path.join("files");
 
     std::fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
-    let (file_count, total_bytes) = copy_workspace(workspace, &files_dir)?;
+    let (file_count, total_bytes) = copy_workspace(workspace, &files_dir, apply_ignore_files)?;
 
     let meta = SnapshotMeta {
         id,
@@ -170,6 +198,7 @@ fn restore_impl(
     root: &Path,
     id: &str,
     selected_state: bool,
+    apply_ignore_files: bool,
 ) -> Result<SnapshotMeta, String> {
     let snap_dir_path = snap_dir(root, id);
     if !snap_dir_path.exists() {
@@ -183,7 +212,7 @@ fn restore_impl(
         reject_snapshot_symlink(&files_dir)?;
     }
     let meta = read_manifest_at(root, id)?;
-    restore_workspace(workspace, &files_dir, selected_state)?;
+    restore_workspace(workspace, &files_dir, selected_state, apply_ignore_files)?;
     Ok(meta)
 }
 
@@ -224,18 +253,40 @@ fn delete_impl(root: &Path, id: &str) -> Result<(), String> {
     std::fs::remove_dir_all(&snap_dir_path).map_err(|e| format!("delete: {e}"))
 }
 
-fn copy_workspace(workspace: &Path, dest: &Path) -> Result<(usize, u64), String> {
+/// WP11 (FR-09, ADR-021): gate the implicit ignore-file layers on a snapshot
+/// walker. In explicit-only mode (`apply_ignore_files == false`) every implicit
+/// ignore layer is disabled so a hostile `.gitignore`/`.ignore` cannot steer
+/// the walk; otherwise the legacy `git_ignore(true)` behaviour is preserved.
+fn configure_snapshot_ignore(builder: &mut WalkBuilder, apply_ignore_files: bool) {
+    if apply_ignore_files {
+        builder.git_ignore(true);
+    } else {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+}
+
+fn copy_workspace(
+    workspace: &Path,
+    dest: &Path,
+    apply_ignore_files: bool,
+) -> Result<(usize, u64), String> {
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
 
-    let walker = WalkBuilder::new(workspace)
-        .git_ignore(true)
-        .hidden(false)
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            name != ".daimonos" && name != ".git"
-        })
-        .build();
+    let mut builder = WalkBuilder::new(workspace);
+    builder.hidden(false).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        name != ".daimonos" && name != ".git"
+    });
+    // WP11 (FR-09, ADR-021): explicit-only disables implicit ignore-file
+    // layers so a hostile ignore file cannot shape the captured snapshot.
+    configure_snapshot_ignore(&mut builder, apply_ignore_files);
+    let walker = builder.build();
 
     for result in walker {
         let entry = result.map_err(|e| format!("walk: {e}"))?;
@@ -272,9 +323,10 @@ fn restore_workspace(
     workspace: &Path,
     snap_files: &Path,
     selected_state: bool,
+    apply_ignore_files: bool,
 ) -> Result<(), String> {
     let snap_set = collect_relative_paths(snap_files, selected_state)?;
-    let workspace_set = collect_workspace_paths(workspace)?;
+    let workspace_set = collect_workspace_paths(workspace, apply_ignore_files)?;
 
     // Remove workspace files not in the snapshot
     for (rel, path) in &workspace_set {
@@ -332,16 +384,20 @@ fn collect_relative_paths(
     Ok(map)
 }
 
-fn collect_workspace_paths(workspace: &Path) -> Result<HashMap<String, PathBuf>, String> {
+fn collect_workspace_paths(
+    workspace: &Path,
+    apply_ignore_files: bool,
+) -> Result<HashMap<String, PathBuf>, String> {
     let mut map = HashMap::new();
-    let walker = WalkBuilder::new(workspace)
-        .git_ignore(true)
-        .hidden(false)
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            name != ".daimonos" && name != ".git"
-        })
-        .build();
+    let mut builder = WalkBuilder::new(workspace);
+    builder.hidden(false).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        name != ".daimonos" && name != ".git"
+    });
+    // WP11 (FR-09, ADR-021): explicit-only disables implicit ignore-file
+    // layers so a hostile ignore file cannot shape the restore set.
+    configure_snapshot_ignore(&mut builder, apply_ignore_files);
+    let walker = builder.build();
 
     for result in walker {
         let entry = result.map_err(|e| format!("walk: {e}"))?;

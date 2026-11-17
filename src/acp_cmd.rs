@@ -1842,6 +1842,13 @@ async fn resolve_mcp_specs(
     {
         return specs;
     }
+    // D07 (ADR-021, FR-09): explicit-only discovery never opens the implicit
+    // default Zed settings file. Only a caller-set `zed_settings_path` is an
+    // explicit input; without one, fall through to the (equally gated)
+    // configured specs rather than reading `~/.config/zed/settings.json`.
+    if cfg.discovery_policy.is_explicit_only() && cfg.acp.mcp.zed_settings_path.is_none() {
+        return crate::agent_mcp::load_configured_specs(cfg).await;
+    }
     if (cfg.state_authority.is_none() && cfg.filesystem_authority.is_none())
         || cfg.acp.mcp.zed_settings_path.is_some()
     {
@@ -4562,6 +4569,66 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert!(matches!(&specs[0], ServerSpec::Http { name, .. } if name == "fwd"));
     }
+
+    // WP11 (FR-09, ADR-021): explicit-only discovery refuses the implicit
+    // default Zed settings file in the ACP cold-start fallback (D07 in
+    // reviewer-runtime INVENTORIES.md). Only a caller-set `zed_settings_path`
+    // is honoured.
+    // Holds ENV_LOCK across the awaits to serialize the process-global
+    // XDG_CONFIG_HOME mutation against other env-mutating tests; the lock is a
+    // plain std::Mutex on a single-threaded runtime (cf. pipeline_cache.rs).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn explicit_only_refuses_the_implicit_zed_settings_fallback() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("zed")).unwrap();
+        std::fs::write(
+            xdg.join("zed").join("settings.json"),
+            r#"{ "context_servers": { "x": { "url": "http://127.0.0.1:9/mcp/" } } }"#,
+        )
+        .unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        let mut cfg = Config {
+            discovery_policy: crate::discovery_policy::DiscoveryPolicy::ExplicitOnly,
+            ..Default::default()
+        };
+        cfg.acp.mcp.enabled = true;
+        cfg.acp.mcp.zed_config_fallback = true;
+
+        // No explicit zed_settings_path: the implicit default is NOT read.
+        cfg.acp.mcp.zed_settings_path = None;
+        let refused = resolve_mcp_specs(vec![], &cfg, true).await;
+
+        // A caller-set explicit path is still honoured.
+        let explicit = dir.path().join("explicit.json");
+        std::fs::write(
+            &explicit,
+            r#"{ "context_servers": { "y": { "url": "http://127.0.0.1:8/mcp/" } } }"#,
+        )
+        .unwrap();
+        cfg.acp.mcp.zed_settings_path = Some(explicit.to_string_lossy().into_owned());
+        let honoured = resolve_mcp_specs(vec![], &cfg, true).await;
+
+        match prev {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(
+            refused.is_empty(),
+            "implicit default Zed settings must be refused under explicit-only: {refused:?}"
+        );
+        assert_eq!(
+            honoured.len(),
+            1,
+            "an explicit zed_settings_path must be honoured"
+        );
+    }
+
     use std::time::Duration;
 
     #[test]

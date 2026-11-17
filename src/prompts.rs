@@ -154,6 +154,20 @@ pub async fn load_agent_instructions_confined(
     Ok((!content.trim().is_empty()).then_some(content))
 }
 
+/// Explicit-only instructions (ADR-021, FR-09): honour only the caller's
+/// `--agent-instructions` path. No workspace or global rule-set is layered; an
+/// explicit path must be readable (no fallback). `_workspace` is accepted for a
+/// uniform call shape with the implicit loaders but is never read.
+pub async fn load_agent_instructions_explicit_only(
+    cli_path: Option<&std::path::Path>,
+    _workspace: &std::path::Path,
+) -> std::io::Result<Option<String>> {
+    match cli_path {
+        Some(path) => read_agent_instructions(path, false).await,
+        None => Ok(None),
+    }
+}
+
 /// Layer an optional global rule-set with an optional project-local one. Present,
 /// non-blank sections are concatenated global-first (workspace last so it can
 /// countermand). Both are missing-ok. Factored out with explicit paths so the
@@ -478,6 +492,30 @@ pub async fn apply_summary_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WP11 (FR-09, ADR-021): explicit-only instructions honour only the caller path.
+    #[tokio::test]
+    async fn explicit_only_instructions_honor_only_cli_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join("agent-instructions.md"), "WORKSPACE RULES").unwrap();
+        assert_eq!(
+            load_agent_instructions_explicit_only(None, ws)
+                .await
+                .unwrap(),
+            None,
+            "workspace instructions must be ignored without an explicit path"
+        );
+        let explicit = dir.path().join("explicit.md");
+        std::fs::write(&explicit, "EXPLICIT RULES").unwrap();
+        assert_eq!(
+            load_agent_instructions_explicit_only(Some(&explicit), ws)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("EXPLICIT RULES")
+        );
+    }
 
     fn policy() -> CompactionPolicy {
         CompactionPolicy {
