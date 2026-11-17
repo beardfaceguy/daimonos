@@ -274,7 +274,29 @@ pub async fn run_agent(
         debug_thoughts_path,
         model_profile,
         final_output,
+        capability_probe_payload,
     } = args;
+    // WP09 (FR-04 reqs 14-17, ADR-027): the capability probe requires FR-01
+    // structured final output AND a complete controlled model profile (PM
+    // answer A-to-Q-FR-04-2 / reviewer-runtime INTERFACES.md). Refuse at
+    // startup, naming the offending option, before any model request — on
+    // every agent mode that accepts the flag (print, dry-run, the interactive
+    // fallback). Chat/ACP/session-daemon never carry this agent-only flag, so
+    // clap already rejects it there as an unexpected argument.
+    if capability_probe_payload.is_some() {
+        if final_output.is_none() {
+            emit_run_configuration_invalid(
+                "capability_probe_requires_final_output",
+                "--capability-probe-payload requires --final-output (FR-01 structured final output)",
+            );
+        }
+        if model_profile.is_none() {
+            emit_run_configuration_invalid(
+                "capability_probe_requires_model_profile",
+                "--capability-probe-payload requires --model-profile (controlled model transport)",
+            );
+        }
+    }
     // WP07 (FR-04): validate the controlled model profile before any work, in
     // every mode. A partial profile fails here naming the missing value(s);
     // this validates configuration only and reads no credential or network.
@@ -333,6 +355,9 @@ pub async fn run_agent(
             // WP05: dry-run never runs the loop, so final-output is inert here.
             final_output: None,
             final_output_sink: None,
+            // WP09: dry-run never contacts a provider, so no probe is sent.
+            capability_probe: None,
+            capability_probe_sink: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -522,6 +547,45 @@ pub async fn run_agent(
         }
         None => None,
     };
+    // WP09 (ADR-027): load and LOCALLY validate the caller's minimal probe
+    // payload before any model request. The earlier refusal guarantees the
+    // probe is reachable only with --final-output present, so a final spec
+    // exists here. An unreadable, non-JSON, or schema-invalid payload is a
+    // caller configuration error (exit 2), not a model failure.
+    let capability_probe_payload_value = match (&capability_probe_payload, &final_output_runtime) {
+        (Some(path), Some((spec, _))) => match crate::capability_probe::load_payload(path, spec) {
+            Ok(value) => Some(value),
+            Err(message) => {
+                emit_run_configuration_invalid("capability_probe_payload_invalid", &message)
+            }
+        },
+        _ => None,
+    };
+    // WP09 (ADR-027): assemble the probe materials from the run's controlled
+    // profile while it is still in scope. `request_retries` is forced to 0 so
+    // the probe is exactly one attempt regardless of the run's retry setting.
+    // The credential comes from the profile's named variable (the same single
+    // source as the run provider); when it is unset or empty the probe is not
+    // built and the provider construction below produces the canonical error.
+    let (capability_probe, capability_probe_sink) =
+        match (&capability_probe_payload_value, &controlled_profile) {
+            (Some(payload), Some(profile)) => match std::env::var(&profile.spec.credential_env) {
+                Ok(credential) if !credential.trim().is_empty() => {
+                    let mut request = profile.request.clone();
+                    request.request_retries = 0;
+                    let probe = crate::capability_probe::ProbeSpec {
+                        spec: profile.spec.clone(),
+                        request,
+                        credential,
+                        payload: payload.clone(),
+                    };
+                    let sink = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    (Some(probe), Some(sink))
+                }
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
@@ -593,6 +657,8 @@ pub async fn run_agent(
         final_output_sink: final_output_runtime
             .as_ref()
             .map(|(_, sink)| std::sync::Arc::clone(sink)),
+        capability_probe,
+        capability_probe_sink: capability_probe_sink.clone(),
     };
     // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
     // and any required-audit write failure surfaced as exit 23 — BEFORE the
@@ -614,6 +680,13 @@ pub async fn run_agent(
         agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
     };
     let result = result?;
+    // WP09 (FR-04, ADR-027): a failed capability probe is terminal and precedes
+    // any final-output decision (the agent loop never ran after a failed
+    // probe). Emit the distinct `model_unsupported` exit (21) here, before the
+    // final-output outcome is considered.
+    if let Some(sink) = &capability_probe_sink {
+        emit_probe_outcome(sink);
+    }
     // WP05 (ADR-024): map the terminal final-output decision to the reviewed
     // stdout/stderr + exit-code contract. Diverges (process::exit) when active.
     if let Some((_, sink)) = &final_output_runtime {
@@ -1402,6 +1475,41 @@ fn require_agent_task(
         };
         anyhow::anyhow!("agent task is required in {} mode; {hint}", mode.as_str())
     })
+}
+
+/// WP09 (FR-04, ADR-027): emit a machine-readable `run_configuration_invalid`
+/// refusal naming the offending option and exit 2 (reviewer-runtime
+/// INTERFACES.md exit-code table). Diverges (process::exit).
+fn emit_run_configuration_invalid(reason: &str, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "error": {
+                "code": "run_configuration_invalid",
+                "reason": reason,
+                "message": message,
+            }
+        })
+    );
+    std::process::exit(2);
+}
+
+/// WP09 (FR-04 reqs 14-17, ADR-027): map the capability-probe verdict to the
+/// reviewed contract. A pass returns (the run continues to its final-output
+/// decision); `model_unsupported` writes a machine-readable line to stderr and
+/// exits 21 (reviewer-runtime INTERFACES.md). No evidence tool ran.
+fn emit_probe_outcome(sink: &std::sync::Mutex<Option<crate::capability_probe::ProbeOutcome>>) {
+    use crate::capability_probe::ProbeOutcome;
+    let outcome = sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(ProbeOutcome::ModelUnsupported { reason }) = outcome {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "error": { "code": "model_unsupported", "reason": reason }
+            })
+        );
+        std::process::exit(21);
+    }
 }
 
 /// Emit a final-output startup refusal and exit with its reviewed code (ADR-024

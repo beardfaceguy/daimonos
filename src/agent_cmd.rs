@@ -45,6 +45,15 @@ pub struct AgentCmdArgs {
     /// Where the agent loop records the terminal final-output decision for the
     /// caller to map to stdout/stderr and the reviewed exit code.
     pub final_output_sink: Option<Arc<Mutex<Option<crate::structured_output::FinalOutputOutcome>>>>,
+    /// WP09 (FR-04 reqs 14-17, ADR-027): the single same-tool capability probe.
+    /// `Some` sends one unretried probe offering the frozen run tool catalog
+    /// before any evidence tool runs; the verdict is recorded in
+    /// `capability_probe_sink` and a failed probe stops the run before the
+    /// agent loop. `None` = probe off (default).
+    pub capability_probe: Option<crate::capability_probe::ProbeSpec>,
+    /// Where the capability-probe verdict is recorded for the caller to map to
+    /// the `model_unsupported` exit (21).
+    pub capability_probe_sink: Option<Arc<Mutex<Option<crate::capability_probe::ProbeOutcome>>>>,
 }
 
 enum ThoughtCaptureState {
@@ -178,6 +187,39 @@ pub async fn run_agent(
     if let Some(spec) = &args.final_output {
         tools.push(spec.tool_schema());
     }
+    // WP09 (FR-04 reqs 14-17, ADR-027): the single same-tool capability probe
+    // runs here, offering the EXACT frozen `tools` vector the run will offer
+    // (byte-equivalent; no dummy substitute), before any evidence tool. A
+    // failed probe stops the run immediately — the agent loop never starts, so
+    // no evidence tool executes — and the recorded verdict is mapped to the
+    // `model_unsupported` exit (21) by the frontend.
+    if let Some(probe) = &args.capability_probe {
+        let final_spec = args
+            .final_output
+            .as_ref()
+            .expect("capability probe requires final-output (enforced at startup)");
+        let outcome =
+            crate::capability_probe::run_probe(probe, &tools, final_spec, args.audit.as_deref())
+                .await;
+        let passed = outcome.passed();
+        if let Some(sink) = &args.capability_probe_sink {
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        }
+        if !passed {
+            if let Some(mcp) = agent_mcp {
+                mcp.shutdown().await;
+            }
+            return Ok(AgentResult {
+                messages: vec![Message::user(&args.task)],
+                usage: Default::default(),
+                stop_reason: crate::providers::StopReason::Aborted,
+                error_message: Some("model_unsupported".to_string()),
+                last_call_usage: Default::default(),
+                context_overflow: false,
+                evidence: Default::default(),
+            });
+        }
+    }
     let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let thought_capture = match args.thought_log {
@@ -227,6 +269,14 @@ pub async fn run_agent(
         auto_continue_budget: if final_output_active { Some(0) } else { None },
         final_output: args.final_output.clone(),
         final_output_sink: args.final_output_sink.clone(),
+        // WP09 (R5, ADR-027): a probe reaches this point only after it passed,
+        // having already spent exactly one model request; seed the loop's
+        // ceiling so the probe counts against `max_model_requests`.
+        prior_model_requests: if args.capability_probe.is_some() {
+            1
+        } else {
+            0
+        },
         ..AgentConfig::default()
     };
 
@@ -389,6 +439,8 @@ mod tests {
             task: task.to_string(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -498,6 +550,8 @@ mod tests {
             task: "do it".into(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -520,6 +574,8 @@ mod tests {
             task: "my task".into(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -544,6 +600,8 @@ mod tests {
             task: "go".into(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,
@@ -661,6 +719,8 @@ mod tests {
             model: Some("claude-haiku-4-5".into()),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             dry_run: false,
             safety: None,
             analytics: None,
@@ -705,6 +765,8 @@ mod tests {
             audit: None,
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
         };
         let mut out = Vec::new();
         run_agent(&provider, dir.path(), default_cfg(), a, &mut out)
@@ -763,6 +825,8 @@ mod tests {
             token_log: Some(log_path.clone()),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             thought_log: None,
             thinking: crate::providers::ThinkingLevel::default(),
             audit: None,
@@ -820,6 +884,8 @@ mod tests {
             task: "test analytics wiring".into(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: false,
             safety: None,
@@ -851,6 +917,8 @@ mod tests {
             task: "dry run task".into(),
             final_output: None,
             final_output_sink: None,
+            capability_probe: None,
+            capability_probe_sink: None,
             model: None,
             dry_run: true,
             safety: None,

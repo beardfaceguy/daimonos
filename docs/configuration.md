@@ -1463,3 +1463,17 @@ Enforce an explicit tool allowlist for a run. `PATH` is a JSON file holding an a
 - At startup the effective allowlist is reported on stderr: `{"effective_tool_allowlist": [...]}`.
 - Refusals carry the `tool_not_allowed` code and are recorded in the `--audit-path` record.
 - Honored on every frontend and carried in the session-daemon launch identity, so daemon reuse cannot bypass it.
+
+## Same-tool capability probe (`--capability-probe-payload`)
+
+Opt-in (FR-04 requirements 14–17 / ADR-027). `daimonos agent --print --capability-probe-payload <PATH>` sends **exactly one** unretried probe request before any evidence tool runs, to prove the endpoint can drive the *same* final-answer tool the run depends on. `PATH` is a JSON file holding one minimal, schema-valid payload for the final-answer tool.
+
+- **Default off.** Without the flag, behavior is unchanged and no probe is sent.
+- **Requires `--final-output` (FR-01) and `--model-profile` (controlled transport).** Omitting either is a startup refusal: exit `2`, `{"error":{"code":"run_configuration_invalid","reason":"capability_probe_requires_final_output"|"capability_probe_requires_model_profile",...}}`, naming the offending option. The probe flag is **agent-only**: `chat`, `acp`, and the session daemon reject it as an unexpected argument; `--dry-run` cannot send a probe and is refused (it already conflicts with `--final-output` at parse).
+- **Local payload validation first.** The payload is parsed and validated against the final-answer schema **locally, before anything is sent**. An unreadable file, invalid JSON, or a payload that fails the schema is a caller configuration error (exit `2`, reason `capability_probe_payload_invalid`), and no request is sent.
+- **Frozen catalog.** The probe offers the byte-equivalent frozen run tool catalog (the final-answer tool plus every tool the run will offer); no dummy substitute. It instructs the model to call the final-answer tool once with the payload. Text/reasoning beside the single final call is allowed.
+- **One pass, everything else stops.** A pass is exactly one schema-valid call to the final-answer tool. Every other outcome — text only, the wrong tool, two or more calls, invalid arguments, or an endpoint error (a 503, a 3xx redirect, or a timeout) — yields the distinct `model_unsupported` exit (`21`) with `{"error":{"code":"model_unsupported","reason":...}}` on stderr and **no further work** (the agent loop never starts; no evidence tool and no returned probe call is executed). The probe is exactly one HTTP attempt even when the run's profile permits retries.
+- **Counts against the ceiling.** The single probe request counts against the `--final-output` `max_model_requests` ceiling (the loop is seeded with the probe's request), so the probe cannot smuggle an extra request past the inclusive limit.
+- **Audited.** With `--audit-path`, the verdict is recorded as one `probe_result` event (`status` `model_supported`/`model_unsupported`, plus `reason` on failure); the credential value never appears. No live credentialed endpoint is required.
+
+Model-facing probe wording lives in `prompts/capability_probe.md`. See `src/capability_probe.rs` and ADR-027.

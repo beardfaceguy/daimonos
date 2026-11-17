@@ -5,6 +5,7 @@ mod agent_env;
 mod agent_mcp;
 mod agent_runtime;
 mod analytics;
+mod capability_probe;
 mod chat_cmd;
 mod checkpoint;
 mod cli;

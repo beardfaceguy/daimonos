@@ -255,6 +255,12 @@ pub struct AgentConfig {
     pub final_output_sink: Option<
         std::sync::Arc<std::sync::Mutex<Option<crate::structured_output::FinalOutputOutcome>>>,
     >,
+    /// WP09 (FR-04, ADR-027): model requests already spent BEFORE this loop (the
+    /// one capability probe). The loop seeds `FinalOutputState` with these via
+    /// `record_request`, so the probe counts against the same WP05 inclusive
+    /// model-request ceiling (reviewer-runtime INTERFACES.md R5). `0` (the
+    /// default) means no probe ran and the loop behaves exactly as before.
+    pub prior_model_requests: u32,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -928,7 +934,16 @@ async fn run_inner(
 
     // WP05 (ADR-024): final-output terminal-call accounting. `None` outside
     // final-output mode leaves the loop behaviour unchanged.
-    let mut final_state = config.final_output.as_ref().map(|spec| spec.new_state());
+    let mut final_state = config.final_output.as_ref().map(|spec| {
+        // WP09 (R5, ADR-027): seed the shared ceiling with requests already
+        // spent before the loop (the one capability probe) so the probe counts
+        // against the same inclusive `max_model_requests`.
+        let mut state = spec.new_state();
+        for _ in 0..config.prior_model_requests {
+            state.record_request();
+        }
+        state
+    });
 
     // Item 3: bounded auto-continue after a `max_tokens` truncation. Resolved
     // once per turn — explicit config wins, then the env override, then the

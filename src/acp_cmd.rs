@@ -1749,6 +1749,9 @@ fn build_agent_config(
         remote_tool_dispatch: Some(build_remote_dispatch_hook(bridge_slot)),
         subcall_provider: None,
         generation_ordinal: Default::default(),
+        // WP09 (R5): ACP is interactive, not the one-shot probe path; no
+        // capability probe runs here, so no prior model requests are seeded.
+        prior_model_requests: 0,
     }
 }
 

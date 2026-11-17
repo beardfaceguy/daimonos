@@ -75,6 +75,17 @@ pub struct AgentArgs {
     /// frontends never carry this agent-only flag at all.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
     pub final_output: Option<PathBuf>,
+    /// WP09 (FR-04 requirements 14-17, ADR-027): opt-in same-tool capability
+    /// probe. Path to a JSON file holding ONE minimal valid payload for the
+    /// final-answer tool. Before any evidence tool runs, Daimonos sends exactly
+    /// one unretried probe offering the frozen run tool catalog and asking the
+    /// model to call the final-answer tool once with this payload. Only one
+    /// schema-valid final call passes; any other outcome exits 21
+    /// (`model_unsupported`) and does no further work. Requires --final-output
+    /// (FR-01) and --model-profile (controlled transport); omitting either is a
+    /// startup refusal (exit 2). Default off.
+    #[arg(long, value_name = "PATH")]
+    pub capability_probe_payload: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

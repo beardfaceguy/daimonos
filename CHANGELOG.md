@@ -9,6 +9,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **`--capability-probe-payload` (FR-04).** A default-off `agent --print`
+  option (ADR-027) that sends exactly one unretried capability probe before any
+  evidence tool runs, proving the endpoint can drive the same final-answer tool
+  the run depends on. It requires `--final-output` and `--model-profile`
+  (omitting either is a startup refusal, exit `2`, naming the option) and is
+  agent-only (`chat`, `acp`, the session daemon, and `--dry-run` refuse it).
+  The caller's minimal payload is validated locally against the final-answer
+  schema before anything is sent (invalid payload → exit `2`, no request). The
+  probe offers the byte-equivalent frozen run tool catalog; a pass is exactly
+  one schema-valid final-answer call and the run proceeds, while every other
+  outcome — text only, the wrong tool, two or more calls, invalid arguments, or
+  an endpoint error (503, 3xx redirect, timeout) — yields the distinct
+  `model_unsupported` exit (`21`) with no further work and no returned call
+  executed. The probe is one HTTP attempt regardless of the profile's retry
+  setting, counts against the `--final-output` `max_model_requests` ceiling,
+  and (with `--audit-path`) is recorded as one `probe_result` event that never
+  contains the credential value. No live credentialed endpoint is required. New
+  module `src/capability_probe.rs`; model-facing wording in
+  `prompts/capability_probe.md`. See ADR-027 and `docs/configuration.md`.
 - **`--audit-path` (FR-04).** A global, default-off option that writes a
   caller-requested, privacy-preserving run audit: one private JSONL file
   (`O_CREAT | O_EXCL`, mode `0600`, never appended) with a versioned
