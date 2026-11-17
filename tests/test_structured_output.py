@@ -73,10 +73,30 @@ def _write_control(tmp_path, **fields) -> str:
 # repeats so a never-ending model still terminates the loop deterministically.
 
 
-def turn(calls=None, text=None, stop=None):
+def turn(calls=None, text=None, stop=None, status=None):
     # `stop` overrides the wire stop/finish reason (e.g. "max_tokens" to force a
     # truncated turn); default is tool_calls when calls are present, else stop.
-    return {"text": text, "calls": list(calls or []), "stop": stop}
+    # `status`, when a non-200 HTTP code, makes the mock answer that POST with
+    # that status (an endpoint error) instead of a model turn (ADR-024 R1).
+    return {"text": text, "calls": list(calls or []), "stop": stop,
+            "status": status}
+
+
+def _send_http_error(handler, status):
+    """Answer one POST with an HTTP error status and a small JSON body, so the
+    provider surfaces a transport endpoint error (StopReason::Error)."""
+    payload = json.dumps({"error": {"message": "mock endpoint error"}}).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.close_connection = True
+    try:
+        handler.wfile.write(payload)
+        handler.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def final_call(args, call_id="final-1"):
@@ -198,6 +218,9 @@ class _MockChat:
                 index = min(owner._index, len(owner._turns) - 1)
                 owner._index += 1
                 t = owner._turns[index]
+                if t.get("status") and t["status"] != 200:
+                    _send_http_error(self, t["status"])
+                    return
                 delta = {"role": "assistant"}
                 if t["text"] is not None:
                     delta["content"] = t["text"]
@@ -273,6 +296,9 @@ class _MockMessages:
                 index = min(owner._index, len(owner._turns) - 1)
                 owner._index += 1
                 t = owner._turns[index]
+                if t.get("status") and t["status"] != 200:
+                    _send_http_error(self, t["status"])
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Connection", "close")
@@ -565,6 +591,64 @@ def test_r4_fallback_reports_real_counters(daimonos_binary, tmp_path, wire):
     assert payload["reason"] == "no_final_call"
     assert payload["model_requests"] == 1, payload
     assert posts == 1
+
+
+@BOTH_WIRES
+def test_r4_endpoint_error_is_terminal(daimonos_binary, tmp_path, wire):
+    # R1 (ADR-024 endpoint failure; integrator decision run r4): an endpoint
+    # error (HTTP 500) is a terminal ending. It exits 20 with reason
+    # `endpoint_error`, sends no corrective turn, and never spends the
+    # corrective-retry budget. So even with a corrective retry available, only
+    # one request is made and `attempts` stays 0 (no final-answer ending was
+    # attempted). Transport retries belong to WP07 request_retries, not here.
+    completed, posts = _run(
+        daimonos_binary, tmp_path, wire,
+        [turn([final_call({"answer": "done"})], status=500)],
+        corrective_retries=1)
+    assert completed.returncode == 20, completed.stderr
+    payload = _last_json(completed.stderr)
+    assert payload["reason"] == "endpoint_error", payload
+    assert payload["attempts"] == 0, payload
+    assert payload["model_requests"] == 1, payload
+    assert posts == 1, "an endpoint error must not spend a corrective retry"
+
+
+@BOTH_WIRES
+def test_r4_invalid_date_time_is_invalid_arguments(daimonos_binary, tmp_path, wire):
+    # R2 (ADR-024 asserted date-time): a final answer whose `when` is not a
+    # valid date-time fails validation because format assertion is enabled.
+    # Exit 20, reason `invalid_arguments`, and the date-time error is preserved
+    # in validation_errors.
+    bad = turn([final_call({"answer": "done", "when": "not-a-date"})])
+    completed, _ = _run(daimonos_binary, tmp_path, wire, [bad],
+                        corrective_retries=0)
+    assert completed.returncode == 20, completed.stderr
+    payload = _last_json(completed.stderr)
+    assert payload["reason"] == "invalid_arguments", payload
+    errors = " ".join(payload["validation_errors"]).lower()
+    assert "date" in errors, payload
+
+
+@BOTH_WIRES
+def test_ac_01_5_if_then_violation_rejects(daimonos_binary, tmp_path, wire):
+    # R6 (AC-01.5 if/then): under COND_SCHEMA, kind=="tagged" requires `tags`;
+    # omitting it must reject with invalid_arguments.
+    bad = turn([final_call({"kind": "tagged", "id": "abcd"})])
+    completed, _ = _run(daimonos_binary, tmp_path, wire, [bad],
+                        schema=COND_SCHEMA, corrective_retries=0)
+    assert completed.returncode == 20, completed.stderr
+    assert _last_json(completed.stderr)["reason"] == "invalid_arguments"
+
+
+@BOTH_WIRES
+def test_ac_01_5_local_ref_violation_rejects(daimonos_binary, tmp_path, wire):
+    # R6 (AC-01.5 local $ref): `id` resolves to #/$defs/id (minLength 4); a
+    # too-short id must reject, proving the self-contained reference is enforced.
+    bad = turn([final_call({"kind": "plain", "id": "a"})])
+    completed, _ = _run(daimonos_binary, tmp_path, wire, [bad],
+                        schema=COND_SCHEMA, corrective_retries=0)
+    assert completed.returncode == 20, completed.stderr
+    assert _last_json(completed.stderr)["reason"] == "invalid_arguments"
 
 
 # --- Startup refusals (wire-independent; reached before any model request) ---

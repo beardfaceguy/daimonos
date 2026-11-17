@@ -1268,7 +1268,7 @@ async fn run_inner(
         // the typed failure. The final-answer tool is never dispatched.
         if let (Some(spec), Some(state)) = (config.final_output.as_ref(), final_state.as_mut()) {
             use crate::structured_output::{
-                FailureDisposition, FinalOutputOutcome, TurnClassification,
+                FailureDisposition, FinalFailureReason, FinalOutputOutcome, TurnClassification,
             };
             match spec.classify(&resp) {
                 TurnClassification::Evidence => {}
@@ -1284,6 +1284,35 @@ async fn run_inner(
                         usage: total_usage,
                         stop_reason: StopReason::EndTurn,
                         error_message: None,
+                        last_call_usage: resp.usage,
+                        context_overflow: resp.context_overflow,
+                        evidence,
+                    };
+                }
+                TurnClassification::Failure {
+                    failure,
+                    error_results,
+                } if failure.reason == FinalFailureReason::EndpointError => {
+                    // WP05 R1 (integrator decision, run r4): an endpoint error
+                    // (StopReason::Error) is a terminal ending. It exits 20
+                    // with reason `endpoint_error`, sends NO corrective turn,
+                    // and does NOT consume the corrective-retry budget
+                    // (register_failure is skipped, so `attempts` stays 0).
+                    // Transport retries belong to WP07 `request_retries`, not
+                    // to final output; FR-01/ADR-024 are silent on the
+                    // disposition, so this applies the integrator rule. The
+                    // classifier emits no `error_results` for an endpoint
+                    // error, so there is no unanswered tool call to pair.
+                    let _ = error_results;
+                    if let Some(sink) = &config.final_output_sink {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(FinalOutputOutcome::Failure(state.failure_json(&failure)));
+                    }
+                    return AgentResult {
+                        messages: close_orphan_tool_calls(messages),
+                        usage: total_usage,
+                        stop_reason: StopReason::EndTurn,
+                        error_message: Some(failure.reason.as_str().to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: resp.context_overflow,
                         evidence,
@@ -1506,6 +1535,11 @@ async fn run_inner(
                 let mut tool_results = Vec::new();
                 let mut round_observations = Vec::new();
                 let mut terminate = false;
+                // The error message carried if `terminate` is set below. An
+                // after_tool_call hook keeps the default; an audit-write poison
+                // (R5) overrides it to the same self-describing code the
+                // model-request audit path uses.
+                let mut terminate_reason: &str = "terminated by after_tool_call hook";
 
                 // Baseline for this turn's first tool call. Taken here so
                 // read-only turns never shell out to git at all.
@@ -1939,6 +1973,7 @@ async fn run_inner(
                             None,
                         );
                         if audit.poisoned() {
+                            terminate_reason = "audit_write_failed";
                             terminate = true;
                             break;
                         }
@@ -2143,7 +2178,7 @@ async fn run_inner(
                         messages,
                         usage: total_usage,
                         stop_reason: StopReason::Aborted,
-                        error_message: Some("terminated by after_tool_call hook".to_string()),
+                        error_message: Some(terminate_reason.to_string()),
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
@@ -7370,6 +7405,49 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_in_tool_dispatch_reports_audit_write_failed() {
+        // R5: when the required audit sink fails while recording a tool
+        // dispatch, the run aborts with the self-describing `audit_write_failed`
+        // message — the same code the model-request audit path uses — not the
+        // generic after_tool_call termination message. The internal error
+        // message is not observable at the process boundary (finalize exits 23
+        // first), so this is asserted at the agent-loop public seam.
+        let dir = tempfile::tempdir().unwrap();
+        let s = session_in(dir.path());
+        let provider = MockProvider::new(vec![
+            tool_call_resp("t1", "nonexistent_tool", json!({})),
+            end_turn_resp(), // must not be reached
+        ]);
+        // max_events = 2: run_start and the first model_request consume the two
+        // allowed events, so the first tool-dispatch record poisons the sink
+        // (not the earlier model-request audit path).
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = std::sync::Arc::new(
+            crate::run_audit::RunAudit::open(
+                &audit_path,
+                "run-r5".into(),
+                crate::run_audit::AuditLimits {
+                    max_event_bytes: 65536,
+                    max_events: 2,
+                },
+                &crate::run_audit::RunAuditMeta::default(),
+            )
+            .unwrap(),
+        );
+        let config = AgentConfig {
+            audit: Some(audit),
+            ..AgentConfig::default()
+        };
+        let result = run(&provider, shared(s), vec![Message::user("go")], &config).await;
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("audit_write_failed"),
+            "tool-dispatch audit poison must carry the same code as the model-request path"
+        );
     }
 
     #[tokio::test]
