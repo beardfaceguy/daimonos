@@ -339,6 +339,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
 
+    /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
+    /// schemas instead of the default stripped placeholders (WP17, FR-15).
+    /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still
+    /// applies. Opt-in: the legacy terse/lazy serving stays the default when it
+    /// is absent. Context: docs/adr/030-self-contained-full-schemas.md.
+    #[arg(long, global = true, default_value_t = false)]
+    pub full_tool_schemas: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

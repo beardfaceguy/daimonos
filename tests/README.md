@@ -83,3 +83,17 @@ If a local run uses temporary programs, report their versions and the PATH prefi
 ## tests/test_structured_output.py (WP05, FR-01)
 
 Structured final output acceptance tests (ADR-024). AC-01.1–01.7 plus the turn-limit, zero/exhausted-retry, evidence-turn, and success-on-last-request cases run against a local scripted model endpoint on BOTH wires — Chat Completions (`openrouter`) and Messages (`anthropic`). No live API or real credentials. Run: `python3 -m pytest tests/test_structured_output.py -v`.
+
+## tests/test_full_schemas.py (WP17, FR-15)
+
+Self-contained full-schema serving/export acceptance tests (ADR-030). Drive the
+real `daimonos` binary: the `tool-contract` dump and the MCP `tools/list` server
+with the opt-in full-schema mode on (`--full-tool-schemas`). AC-15.1 (every
+schema in the dump validates against the Draft 2020-12 metaschema — checked
+authoritatively by the binary's own validator, a zero exit being the pass — and
+contains no `$ref` outside itself), the owned-path marks appearing in the dump
+for every tool once schemas are full, the opt-out regression (default dump keeps
+the stripped placeholders), and frontend coverage (MCP server, agent frontend,
+help text; the session-daemon launch identity is covered by Rust unit tests in
+`src/session_bootstrap.rs`). No live API or real credentials. Run:
+`python3 -m pytest tests/test_full_schemas.py -v`.

@@ -555,6 +555,43 @@ ADR-022 performs the actual path enforcement through a separate path
 `src/path_annotations.rs`, which today is read only by the schema annotator. See
 ADR-029 and FR-14.
 
+#### Full, self-contained tool schemas (`--full-tool-schemas`)
+
+By default `list_tools` and the `tool-contract` dump serve a full JSON Schema
+only for the tools whose schema is exposed in the initial tier, and strip the
+rest to `{"type": "object"}` (progressive exposure, to save prefix tokens). The
+opt-in **full-schema mode** instead serves and exports the full, self-contained
+schema for *every* tool (FR-15). Enable it in any of three equivalent ways:
+
+```bash
+daimonos --full-tool-schemas tool-contract   # global CLI flag (any subcommand)
+# or
+export DAIMONOS_MCP_FULL_SCHEMAS=1            # environment (wins over config)
+# or
+[mcp]
+full_tool_schemas = true                      # daimonos.toml
+```
+
+The mode is purely additive and opt-in: with it off, the terse/lazy placeholder
+serving is unchanged. With it on, every served/exported schema is a valid,
+self-contained Draft 2020-12 document: no reference to another file or URL (only
+local `$defs`/`$ref`), no recursive reference cycle, and no definition name that
+would clash when a caller combines tool schemas. These are checked offline
+before any model request, MCP full serving, or export (`src/schema_contract.rs`,
+reusing the Draft 2020-12 validator in `src/schema_validation.rs`); a schema that
+fails is refused with run reason `schema_unusable` (ADR-030). A schema that is
+valid and self-contained but which a *particular* model endpoint rejects is not
+refused here — that surfaces at the capability probe, never as a guessed startup
+blacklist. Caller-supplied worker and final-answer schemas are preserved and
+offered unchanged, not rewritten to a vendor subset.
+
+The flag is honored on every frontend that accepts it: the MCP server serves
+full schemas over `tools/list`; `tool-contract` exports them; the agent, chat,
+ACP, and session-daemon frontends enforce the self-contained gate before the
+first model request; and the session daemon carries the mode in its launch
+identity, so an interactive client requesting it cannot silently attach to a
+daemon started without it. Context: ADR-030.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

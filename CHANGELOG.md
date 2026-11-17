@@ -9,6 +9,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **Self-contained full tool schemas (FR-15).** A new global `--full-tool-schemas`
+  flag (equivalent to `[mcp] full_tool_schemas = true` / `DAIMONOS_MCP_FULL_SCHEMAS=1`)
+  turns on an opt-in mode that serves and exports a full, self-contained JSON
+  Schema draft 2020-12 document for every tool instead of the default stripped
+  placeholders. Before any model request, serving, or export, each schema is
+  validated offline (`src/schema_contract.rs`, reusing the ADR-024 validator):
+  external references, recursive reference cycles, non-2020-12 documents, and
+  cross-tool definition-name collisions are refused with run reason
+  `schema_unusable`; an endpoint-specific rejection stays a probe failure, never
+  a guessed startup blacklist. Honored on every frontend (MCP server,
+  `tool-contract`, agent, chat, ACP) and carried in the session-daemon launch
+  identity. Default off; terse/lazy serving is unchanged. See
+  [ADR-030](docs/adr/030-self-contained-full-schemas.md).
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the

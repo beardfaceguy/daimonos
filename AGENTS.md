@@ -375,9 +375,10 @@ file — see `src/agent_env.rs` for the recognized keys. A CLI `--provider` /
   - `Terse` — name + description only; full schema on demand via
     `get_tool_schema`. Most plugin tools (`git`, `cargo`, `docker`, `gh`,
     `snapshot`, ...) live here to save prefix tokens. Setting
-    `DAIMONOS_MCP_FULL_SCHEMAS=1` or `[mcp] full_tool_schemas = true`
-    promotes them to full schemas (needed by introspecting directories such
-    as Glama).
+    `DAIMONOS_MCP_FULL_SCHEMAS=1`, `[mcp] full_tool_schemas = true`, or the
+    global `--full-tool-schemas` CLI flag promotes them to full, self-contained
+    schemas (needed by introspecting directories such as Glama, and by dbunk's
+    full-schema mode; FR-15/ADR-030, validated by `src/schema_contract.rs`).
   - `OnDemand` — hidden until activated: `list_tool_signatures`,
     `diff_files`, `tool_pipeline`, `lint_repair`.
   - `AgentOnly` — see the next bullet.

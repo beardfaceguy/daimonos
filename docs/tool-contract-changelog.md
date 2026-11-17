@@ -57,3 +57,18 @@ Initial tool-contract version (WP15, FR-13).
 - Reported the contract version over MCP initialization in
   `_meta["io.daimonos/tool-contract-version"]`, distinct from
   `serverInfo.version` (the binary version).
+
+## Notes
+
+### Full self-contained schema mode (WP17, FR-15) — no version change
+
+WP17 added the opt-in full-schema serving/export mode (the `--full-tool-schemas`
+CLI flag alongside the existing `[mcp] full_tool_schemas` / `DAIMONOS_MCP_FULL_SCHEMAS`
+seams) and a static self-contained gate (`src/schema_contract.rs`, ADR-030): in
+that mode every served/exported schema is validated offline as self-contained,
+non-recursive Draft 2020-12, with no cross-tool definition-name collision,
+before any model request. This changes no tool name, description, argument
+schema, or result shape — the full-mode schemas are exactly those the pre-existing
+config/env seam already produced — so `CONTRACT_VERSION` is deliberately **not**
+bumped. The `effective_options.full_tool_schemas` field already records which
+schema mode a dump describes.

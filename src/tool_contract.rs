@@ -124,6 +124,17 @@ impl EffectiveToolCatalog {
                 })
                 .collect();
 
+        // WP17 (FR-15): in full-schema mode every served/exported schema must be
+        // a valid, self-contained, non-recursive Draft 2020-12 document, with no
+        // cross-tool definition-name collision (ADR-030). Validate before the
+        // dump is emitted or any model request is made; an unusable schema is a
+        // `schema_unusable` run. The stripped/lazy default mode needs no such
+        // gate (its placeholders are trivially self-contained), so this is
+        // scoped to the opt-in mode and leaves default behavior unchanged.
+        if inputs.full_tool_schemas {
+            validate_self_contained(&rendered)?;
+        }
+
         Ok(Self {
             tools: rendered,
             options: EffectiveOptions {
@@ -224,6 +235,40 @@ fn registry_metadata(name: &str) -> (&'static str, &'static str) {
         }
     }
     ("unknown", "unknown")
+}
+
+/// WP17 (FR-15): the static full-schema gate (ADR-030). Validate every served
+/// schema offline — valid self-contained Draft 2020-12, no external reference,
+/// no recursive cycle, and no cross-tool definition-name collision — before any
+/// model request, MCP full serving, or export. A failure is a
+/// `run_configuration_invalid` run with reason `schema_unusable` (exit 2),
+/// detected without touching the network or filesystem. A schema that is valid
+/// and self-contained but which a particular endpoint rejects is NOT refused
+/// here: that surfaces at the capability probe as `model_unsupported` (WP09).
+///
+/// Reuses the serialized SDK `Tool` so the validated schema is byte-identical to
+/// what the server sends over `tools/list` and the dump exports.
+pub fn validate_self_contained(tools: &[rust_mcp_sdk::schema::Tool]) -> Result<(), RunFailure> {
+    let schemas: Vec<(String, Value)> = tools
+        .iter()
+        .map(|tool| {
+            let value = serde_json::to_value(tool).unwrap_or(Value::Null);
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let schema = value.get("inputSchema").cloned().unwrap_or(Value::Null);
+            (name, schema)
+        })
+        .collect();
+    let entries: Vec<(&str, &Value)> = schemas
+        .iter()
+        .map(|(name, schema)| (name.as_str(), schema))
+        .collect();
+    crate::schema_contract::ValidatedToolSchema::validate_catalog(&entries)
+        .map(|_| ())
+        .map_err(|err| RunFailure::configuration_invalid(err.reason(), err.to_string()))
 }
 
 /// The effective inputs that shaped the catalog, echoed into the dump so a
@@ -327,5 +372,39 @@ mod tests {
         let inputs = EffectiveInputs::from_config(&cfg, dir.path());
         assert_eq!(inputs.verbosity, cfg.mcp.default_verbosity);
         assert!(!inputs.confined);
+    }
+
+    /// WP17 (FR-15, AC-15.1): every schema the full-schema catalog serves is a
+    /// valid, self-contained, non-recursive Draft 2020-12 document. Proven here
+    /// by the authoritative ADR-024 validator over the real native catalog, so
+    /// `freeze` in full mode succeeds rather than refusing a native schema.
+    #[test]
+    fn full_schema_freeze_passes_the_static_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cfg = Config::default();
+        let descriptions = crate::tool_descriptions::ToolDescriptions::default();
+        let mut inputs = inputs_for(&cfg, &descriptions, dir.path());
+        inputs.full_tool_schemas = true;
+        let catalog = EffectiveToolCatalog::freeze(&inputs).expect("full-schema freeze");
+        validate_self_contained(&catalog.tools).expect("native full schemas are self-contained");
+    }
+
+    /// WP17 (FR-15): a tool schema that is not self-contained is refused before
+    /// any model request with run reason `schema_unusable` (PM A to Q-FR-15-2),
+    /// not surfaced as a serving-time panic or silently served.
+    #[test]
+    fn unusable_tool_schema_is_schema_unusable() {
+        let tool: rust_mcp_sdk::schema::Tool = serde_json::from_value(serde_json::json!({
+            "name": "leaky",
+            "description": "external ref",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "x": { "$ref": "https://example.com/remote.json" } }
+            }
+        }))
+        .unwrap();
+        let err = validate_self_contained(&[tool]).expect_err("external ref must be refused");
+        assert_eq!(err.code, "schema_unusable");
     }
 }

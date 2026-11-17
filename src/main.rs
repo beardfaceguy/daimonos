@@ -41,6 +41,7 @@ mod provisioning;
 mod remote_auth;
 mod remote_gateway;
 mod safety;
+mod schema_contract;
 mod schema_validation;
 mod script;
 mod session;
@@ -465,6 +466,15 @@ async fn main() -> anyhow::Result<()> {
             cfg.discord.redact_sensitive(&e)
         );
         std::process::exit(2);
+    }
+    // WP17 (FR-15): the global `--full-tool-schemas` flag forces full,
+    // self-contained schema serving/export on for this run, equivalent to
+    // `[mcp] full_tool_schemas = true`. Additive: the config and
+    // `DAIMONOS_MCP_FULL_SCHEMAS` env seam still apply; the flag only turns the
+    // mode on. Default off preserves the legacy stripped/terse/lazy serving.
+    // Context: docs/adr/030-self-contained-full-schemas.md.
+    if cli.full_tool_schemas {
+        cfg.mcp.full_tool_schemas = true;
     }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
