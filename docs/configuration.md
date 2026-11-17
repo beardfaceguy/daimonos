@@ -204,6 +204,15 @@ error names both `--audit-path` and the offending path. Without `--state-dir`,
 the path must be **outside** the workspace (it is private run evidence, not
 workspace output). Event bounds come from `[reviewer.audit]` (below).
 
+**Supported frontend scope.** The audit is written only by the one-shot
+`daimonos agent --print` frontend. Because a run must never falsely look
+audited (ADR-026), every other frontend that accepts the global `--audit-path`
+— `chat`, `acp`, the MCP server, the session daemon, the interactive agent, and
+`agent --dry-run` — **refuses** the option at startup with exit `2`
+(`run_configuration_invalid`, reason `audit_unsupported_frontend`) rather than
+ignore it silently. The interactive agent refuses before any session-daemon
+launch, so a daemon never runs a falsely-audited session.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,

@@ -594,6 +594,37 @@ async fn main() -> anyhow::Result<()> {
             Some(resolved)
         }
     };
+    // WP08 (R1, ADR-026): a run must never falsely look audited. The audit is
+    // written only by the one-shot `agent --print` frontend; every other
+    // frontend that accepts the global --audit-path (chat, ACP, the MCP server,
+    // the session daemon, the interactive agent, and dry-run) refuses the
+    // option at startup with a named error rather than silently ignore it.
+    if cfg.audit_path.is_some() {
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let honored = matches!(
+            &cli.command,
+            Some(Command::Agent(a)) if !(a.dry_run || a.interactive && !a.print && tty)
+        );
+        if !honored {
+            let frontend = match &cli.command {
+                Some(Command::Agent(a)) if a.dry_run => "agent --dry-run",
+                Some(Command::Agent(_)) => "interactive agent",
+                _ => runtime_mode.log_name(),
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "audit_unsupported_frontend",
+                    "message": format!(
+                        "--audit-path is not supported by the {frontend} frontend; only `agent --print` writes a run audit"
+                    )
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(

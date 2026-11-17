@@ -28,6 +28,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   path must be under the state root (else exit `2`, naming the option and
   path); otherwise it must be outside the workspace. New module
   `src/run_audit.rs`. See ADR-026 and `docs/configuration.md`.
+  The audit is written only by the one-shot `agent --print` frontend; every
+  other frontend that accepts the global option (`chat`, `acp`, the MCP
+  server, the session daemon, the interactive agent, and `agent --dry-run`)
+  refuses `--audit-path` at startup with exit `2` (`run_configuration_invalid`,
+  reason `audit_unsupported_frontend`) rather than run a falsely-audited
+  session. The terminal `run_end` record is written before any assistant
+  output is published, and its `status`/`exit_code` come from the same
+  terminal source as the process exit. The typed `AuditEvent` renders the same
+  JSON that is streamed to the file.
 - **`--workspace-read-only` (FR-07).** A global, default-off option that
   prohibits every Daimonos-initiated workspace mutation end to end (startup,
   tool calls, teardown). Workspace mutations are refused with
