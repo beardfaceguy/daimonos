@@ -491,6 +491,26 @@ idle_timeout_secs = 600
 startup_logs = false
 ```
 
+### `tool-contract` command — effective tool contract dump
+
+```bash
+daimonos tool-contract                 # dump for the default workspace (.)
+daimonos tool-contract -w /path        # dump for a specific workspace
+```
+
+`daimonos tool-contract` prints the effective tool contract as deterministic
+JSON on stdout and exits, without starting a model run or a session store
+(FR-13). The document is a function of the same inputs that shape the served
+catalog — workspace context checks, exposure tier, schema mode
+(`[mcp] full_tool_schemas` / `DAIMONOS_MCP_FULL_SCHEMAS`), and confinement — so
+its `tools` array equals what the MCP server serves over `tools/list` for those
+inputs. Each entry carries `name`, `description`, `input_schema`, and
+registry-derived `tier`/`route` metadata; the top level carries the standalone
+`contract_version` and the `effective_options` that produced the dump. The same
+version is reported over MCP initialization in
+`_meta["io.daimonos/tool-contract-version"]`, separate from the binary version.
+Changes are tracked in `docs/tool-contract-changelog.md` (see ADR-029).
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

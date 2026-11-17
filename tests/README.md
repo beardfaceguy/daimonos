@@ -56,6 +56,12 @@ python3 -m pytest tests/ -v
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
 
+`tests/test_tool_contract.py` (FR-13) drives the real `daimonos tool-contract`
+command and a live MCP server with no provider API key: it checks that the
+deterministic dump is byte-stable, equals `tools/list` for the same workspace,
+config, and schema mode, and that the contract version reported over MCP
+initialization equals the dump's version.
+
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.

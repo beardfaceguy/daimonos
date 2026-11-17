@@ -150,6 +150,7 @@ No independent updater/downloader service appeared in the inspected first-party 
 - WP06 tests direct, batch, script, pipeline, lazy activation, plugins, and remote routes against the same effective policy.
 - WP18/WP19 test cooperative stops, process-group teardown, cached/composite accounting, and complete digest failure when the budget is insufficient.
 - WP20 tests the full admitted read catalog while observing DNS, socket/connect, and child attempts from startup through shutdown.
+- WP15 tests (implemented) assert the `tool-contract` dump is byte-stable, equals MCP `tools/list` for the same workspace/config/schema-mode, mutates nothing in the workspace, and reports a contract version over MCP initialization equal to the dump's; the dump performs no implicit discovery or evidence scan and starts no session store.
 - Observation must demonstrate zero attempted outbound IP activity, not just failed requests under a disconnected network.
 - A source row with no test mapping remains an integration blocker. New consumers update this inventory in the same change.
 

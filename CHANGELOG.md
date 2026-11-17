@@ -7,6 +7,24 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
+  session-free JSON dump of the effective tool contract (contract version,
+  effective options, and the effective tools with their schemas), reusing the
+  live MCP serving pipeline so the dump equals what the server serves for the
+  same inputs. The contract carries its own version (`1.0.0`), reported over MCP
+  initialization in `_meta["io.daimonos/tool-contract-version"]` and tracked in
+  `docs/tool-contract-changelog.md`. See
+  [ADR-029](docs/adr/029-effective-tool-contract.md).
+- **Default behavior change (FR-13, no opt-out).** Every MCP `initialize`
+  response now carries the additional `_meta` key
+  `io.daimonos/tool-contract-version`; this is unconditional (required by
+  AC-13.2) and has no option — the existing `server-kind` meta and
+  `serverInfo.version` (binary version) are unchanged. The session-free
+  `daimonos tool-contract` command also writes no state artifacts, including no
+  secure log file in the resolved state directory.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
