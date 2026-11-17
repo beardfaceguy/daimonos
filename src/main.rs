@@ -39,6 +39,7 @@ mod providers;
 mod provisioning;
 mod remote_auth;
 mod remote_gateway;
+mod run_audit;
 mod run_policy;
 mod safety;
 mod script;
@@ -547,6 +548,49 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
+    // WP08 (FR-04, ADR-026): validate and resolve the caller-requested audit
+    // destination before any writer or model work. With an explicit state root
+    // it must stay under that root (StateAuthority::explicit_destination names
+    // the offending option and path and exits 2). Without one it must simply
+    // lie outside the evidence workspace. The sink itself is opened by the
+    // agent frontend immediately before the first model request (startup #6).
+    cfg.audit_path = match &cli.audit_path {
+        None => None,
+        Some(requested) => {
+            let resolved = match &cfg.state_authority {
+                Some(authority) => {
+                    match authority.explicit_destination("--audit-path", requested) {
+                        Ok(path) => path,
+                        Err(error) => exit_for_state_failure(error),
+                    }
+                }
+                None => {
+                    let expanded = paths::expand_tilde(&requested.to_string_lossy());
+                    let candidate = if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        std::env::current_dir().unwrap_or_default().join(expanded)
+                    };
+                    if run_policy::resolves_inside(&workspace, &candidate) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"error": {
+                                "code": "run_configuration_invalid",
+                                "reason": "audit_path_inside_workspace",
+                                "message": format!(
+                                    "--audit-path {} is inside the evidence workspace; choose a private destination outside it",
+                                    requested.display()
+                                )
+                            }})
+                        );
+                        std::process::exit(2);
+                    }
+                    candidate
+                }
+            };
+            Some(resolved)
+        }
+    };
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(

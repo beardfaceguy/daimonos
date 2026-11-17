@@ -3,6 +3,8 @@
 Date: 2026-10-29
 Status: Launch contracts approved by the user on 2026-10-29 UTC. Package dependencies and operational preflight still apply.
 Implementation status: WP04 (`--workspace-read-only`, FR-07) is implemented. The reserved spellings `--workspace-read-only`, `src/run_policy.rs::ToolAdmission`/`EffectClass`, and the refusal codes `workspace_write_forbidden` / `tool_policy_unsupported` are now live (`tests/test_read_only_workspace.py`).
+
+Implementation status: WP08 (`--audit-path`, FR-04) is implemented. The reserved spellings `--audit-path`, `src/run_audit.rs` (`RunAudit`, `AuditFailure`), the exit code `23` / `audit_write_failed`, and the `[reviewer.audit]` bounds (`max_event_bytes`, `max_events`) are live (`tests/test_run_audit.py`). `run_start`, `model_request`, `tool_call`, and `tool_refusal` are wired through the one-shot agent frontend; `probe_result` (WP09) and `limit_hit` (WP18), and the `model_request` HTTP-status/`wire` fields (WP07), are defined in the module and exercised through its public test seam as pending integrator hooks.
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Decisions: Accepted ADRs 021–032. Scope: the approved 20-package [plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Coverage: [INVENTORIES.md](INVENTORIES.md).

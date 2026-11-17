@@ -240,6 +240,11 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// WP08 (FR-04, ADR-026): caller-requested local run audit sink. `None` =
+    /// audit off. When present, every provider response and tool dispatch in
+    /// this loop is recorded; a required-audit write failure poisons the sink
+    /// and stops the run before further model/tool work.
+    pub audit: Option<std::sync::Arc<crate::run_audit::RunAudit>>,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -905,6 +910,8 @@ async fn run_inner(
 ) -> AgentResult {
     let mut messages = initial_messages;
     let mut total_usage = Usage::default();
+    // WP08: per-run model-request sequence for the audit record (ADR-026).
+    let mut audit_model_seq: u64 = 0;
     if let Some(journal) = &journal {
         journal.checkpoint(&messages).await;
     }
@@ -1136,6 +1143,33 @@ async fn run_inner(
         total_usage = accumulate_usage(total_usage, resp.usage.clone());
         if let Some(journal) = &journal {
             journal.record_usage(&total_usage, &resp.usage);
+        }
+        // WP08 audit (ADR-026): record this provider request. HTTP status and
+        // explicit retry index are WP07 controlled-transport metadata not
+        // exposed by the default provider, so they are recorded as
+        // explicit-unavailable / 0. A required-audit write failure ends the run
+        // before the next model request (fail-closed).
+        if let Some(audit) = &config.audit {
+            let _ = audit.record_model_request(
+                audit_model_seq,
+                None,
+                0,
+                false,
+                Some(resp.usage.input),
+                Some(resp.usage.output),
+            );
+            audit_model_seq += 1;
+            if audit.poisoned() {
+                return AgentResult {
+                    messages,
+                    usage: total_usage,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("audit_write_failed".to_string()),
+                    last_call_usage: resp.usage,
+                    context_overflow: false,
+                    evidence,
+                };
+            }
         }
         if let Some(log_cfg) = &config.token_log {
             let context_composition = crate::context_metrics::measure_context(&ctx);
@@ -1734,6 +1768,30 @@ async fn run_inner(
                         // Verifier outcome remains observable even if later
                         // mutation fingerprinting has degraded.
                         evidence.record_call(false, verifier);
+                    }
+
+                    // WP08 audit (FR-04, ADR-026): record this dispatch at the
+                    // admission boundary using the RAW result (before output
+                    // bounding below truncates it). Arguments and results are
+                    // stored only as SHA-256 of their canonical JSON; no
+                    // content, credential, header, or body enters the record. A
+                    // required-audit write failure poisons the sink and ends
+                    // the run before any further model/tool work (fail-closed).
+                    if let Some(audit) = &config.audit {
+                        let reason = crate::run_audit::refusal_code(&content);
+                        let _ = audit.record_tool(
+                            &name,
+                            dispatch_tool_kind(&name),
+                            &crate::run_audit::hash_json_value(&input),
+                            &crate::run_audit::hash_result_str(&content),
+                            reason.as_deref(),
+                            tool_started.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        if audit.poisoned() {
+                            terminate = true;
+                            break;
+                        }
                     }
 
                     // after_tool_call hook

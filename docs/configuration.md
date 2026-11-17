@@ -153,6 +153,47 @@ While it is on:
 The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
 `EffectClass`). See ADR-022.
 
+## Local run audit (`--audit-path`)
+
+`--audit-path PATH` turns on a caller-requested, privacy-preserving run audit
+(WP08, FR-04). It is **default off**: without the option, behavior is unchanged
+and no audit file is written. The audit is independent of optional analytics and
+OTLP tracing, and works without controlled transport or a model profile.
+
+The audit is one private JSONL file, one line per event. The file is created
+with `O_CREAT | O_EXCL` and mode `0600`; an existing destination is **never**
+appended to (that is a write failure, below). Every line is a versioned record
+carrying `audit_version`, the shared `run_id`, a monotonic `sequence`, and a
+`kind`. The lifecycle is `run_start` first and `run_end` last; in between come
+`model_request`, `tool_call`, `tool_refusal`, and (wired by later packages)
+`probe_result` and `limit_hit` events.
+
+Privacy rules (ADR-006 D6, ADR-026) — the record never contains:
+
+- a credential **value**; only the credential **variable name** is recorded;
+- a model base URL's userinfo, port, path, or query; only its **host**;
+- prompt text, request/response/error bodies, or headers;
+- tool argument or result **contents**: arguments and results are recorded as
+  SHA-256 hashes of their canonical (sorted-key) bytes, never cleartext and
+  never a `Debug` string;
+- evidence-file contents.
+
+Unavailable metadata is recorded as explicit `null`, never invented.
+
+**Required-write failure contract (fail-closed).** Unlike OTLP tracing, which
+fails open, a requested audit is required: if the sink cannot be opened,
+written, or finished, the run stops with exit code `23`
+(`audit_write_failed`). An open failure stops the run **before any model
+request**; a mid-run write failure poisons the sink and aborts before further
+model or tool work. The diagnostic never echoes a secret.
+
+**Destination.** The path is resolved before any model work. With an explicit
+state root (`--state-dir`), the audit path must be **under** the state root; an
+outside path fails startup with exit `2` (`run_configuration_invalid`) and the
+error names both `--audit-path` and the offending path. Without `--state-dir`,
+the path must be **outside** the workspace (it is private run evidence, not
+workspace output). Event bounds come from `[reviewer.audit]` (below).
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,
@@ -824,6 +865,24 @@ max_servers = 32
 max_concurrent_connects = 8
 max_tools_per_server = 128
 ```
+
+### `[reviewer.audit]` — Local run audit bounds
+
+Bounds for the caller-requested local run audit (`--audit-path`, WP08/FR-04).
+They apply only when the audit is enabled.
+
+```toml
+[reviewer.audit]
+# Maximum serialized bytes for one audit event. A larger event is a required-
+# audit failure (exit 23), never a silent truncation.
+max_event_bytes = 65536
+# Maximum number of audit events recorded for one run.
+max_events = 100000
+```
+
+Exceeding either bound is a required-audit write failure (exit `23`,
+`audit_write_failed`), consistent with the fail-closed contract above — the run
+stops rather than silently dropping or truncating a record.
 
 ### `[logging]` — Runtime Diagnostics
 

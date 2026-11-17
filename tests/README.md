@@ -63,6 +63,17 @@ mount namespaces are unavailable, like the git_read read-only-mount test. It als
 `DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
 use local fake endpoints only (no live credentials).
 
+The `tests/test_run_audit.py` suite (FR-04, `--audit-path`) drives `daimonos
+agent --print` with a local fake OpenAI-style provider to prove the opt-in run
+audit: a versioned `run_start`…`run_end` JSONL lifecycle, `tool_call`/
+`tool_refusal` records with SHA-256 argument/result hashes and durations,
+`model_request` records, the fail-closed exit-23 contract on an audit open
+failure (no model request runs), the exit-2 refusal when the path is outside an
+explicit state root, and the opt-out regression (no file when the option is
+off). It includes the AC-04.8 scan asserting the exact credential value appears
+nowhere in the complete audit record. All endpoints are local fakes; no live
+credentials are used.
+
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.

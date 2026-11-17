@@ -43,6 +43,14 @@ max_symlinks = 40
 # Maximum bytes in one symlink target.
 max_symlink_target_bytes = 65536
 
+[reviewer.audit]
+# Caller-requested local run audit (WP08, FR-04; enabled with --audit-path).
+# Maximum serialized bytes for one audit event. A larger event is a required-
+# audit failure (exit 23), never a silent truncation.
+max_event_bytes = 65536
+# Maximum number of audit events recorded for one run.
+max_events = 100000
+
 [search]
 # Default max results for grep when not specified by caller
 default_grep_max = 100

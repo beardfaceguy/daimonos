@@ -11,7 +11,7 @@ Date: 2026-11-03
 - **Terminal call:** A designated final-answer call intercepted on the model side rather than executed as a tool.
 - **Corrective retry:** A new model request after a failed ending. Ordinary evidence turns do not consume it.
 - **Worker-only route:** The opt-in route that forwards non-final calls to caller-supplied MCP commands without local fallback.
-- **Local audit:** Caller-requested run evidence. It is separate from optional analytics and OTLP export.
+- **Local audit:** Caller-requested run evidence (`--audit-path`). A private per-run JSONL file (`O_CREAT | O_EXCL`, mode `0600`, no append) with a versioned `run_start`…`run_end` lifecycle plus `model_request`/`tool_call`/`tool_refusal` records sharing one `run_id` and monotonic `sequence`. Separate from optional analytics and OTLP export; works without controlled transport or a model profile. ADR-006 D6 redaction (credential variable name not value, base-URL host only; argument/result SHA-256 of canonical bytes, never contents). Fail-closed per ADR-026: a required-write failure stops the run (exit 23 `audit_write_failed`), unlike OTLP's fail-open. Module: `src/run_audit.rs` (`RunAudit`, `AuditFailure`). Implemented (WP08).
 - **Logical input:** File, git-object, or index content read or scanned to serve a call. It is not physical I/O or output size.
 - **Offline-tools authority:** A process network ceiling for local tool servers, distinct from the networked model side.
 - **Tool-contract version:** Compatibility identity of tool definitions, separate from binary and source-commit identity.

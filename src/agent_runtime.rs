@@ -307,6 +307,7 @@ pub async fn run_agent(
             // Dry-run never calls the provider and does not load the agent env,
             // so effort is immaterial here; use the default.
             thinking: providers::ThinkingLevel::default(),
+            audit: None,
         };
         let result = agent_cmd::run_agent(
             &DryRunProvider,
@@ -481,6 +482,17 @@ pub async fn run_agent(
         Some(safety::SafetyPolicy::stdin_approve_fn())
     };
     let safety = safety_policy(&agent, &cfg, approve_fn)?;
+    // WP08 (ADR-026): open the caller-requested audit sink immediately before
+    // the first model request. A failure to open (or to write the `run_start`
+    // event) is a required-audit failure that aborts the run with exit 23,
+    // before any provider call — distinct from OTLP's fail-open policy.
+    let audit = open_run_audit(
+        &cfg,
+        &effective_provider,
+        &effective_model,
+        &agent,
+        workspace,
+    );
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -490,10 +502,89 @@ pub async fn run_agent(
         token_log,
         thought_log,
         thinking: agent.thinking.clone(),
+        audit: audit.clone(),
     };
     let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
+        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await;
+    if let Some(audit) = &audit {
+        finalize_run_audit(audit, &result);
+    }
+    let result = result?;
     check_agent_result(&result)
+}
+
+/// Build the `run_start` metadata from the default-provider agent configuration
+/// and open the audit sink. Returns `None` when `--audit-path` is absent.
+/// Unavailable metadata (e.g. `wire`, which WP07 controlled transport supplies)
+/// is explicit, never invented (ADR-026).
+fn open_run_audit(
+    cfg: &config::Config,
+    effective_provider: &str,
+    effective_model: &str,
+    agent: &agent_env::AgentEnv,
+    workspace: &Path,
+) -> Option<Arc<crate::run_audit::RunAudit>> {
+    let path = cfg.audit_path.as_ref()?;
+    let meta = crate::run_audit::RunAuditMeta {
+        provider_label: Some(effective_provider.to_string()),
+        requested_model: Some(effective_model.to_string()),
+        base_url_host: crate::run_audit::base_url_host(&agent.base_url),
+        // `wire` is a WP07 controlled-transport concept; the default provider
+        // does not expose it. Recorded as explicit-unavailable (pending hook).
+        wire: None,
+        // The NAME of the credential variable, never its value.
+        credential_env: Some("DAIMONOS_AGENT_API_KEY".to_string()),
+        effective_allowlist: (!agent.allowed_commands.is_empty())
+            .then(|| agent.allowed_commands.clone()),
+        effective_root: Some(workspace.display().to_string()),
+        workspace_read_only: cfg.workspace_read_only,
+    };
+    let limits = crate::run_audit::AuditLimits {
+        max_event_bytes: cfg.reviewer.audit.max_event_bytes,
+        max_events: cfg.reviewer.audit.max_events,
+    };
+    let run_id = analytics::read_agent_session_id_env().unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("run-{}-{}", std::process::id(), nanos)
+    });
+    match crate::run_audit::RunAudit::open(path, run_id, limits, &meta) {
+        Ok(audit) => Some(Arc::new(audit)),
+        Err(failure) => {
+            eprintln!("{}", failure.diagnostic_json());
+            std::process::exit(failure.exit_code());
+        }
+    }
+}
+
+/// Write the terminal `run_end` event before the frontend reports success, and
+/// convert a mid-run or terminal audit-write failure into exit 23 (fail-closed,
+/// ADR-026). The original run failure code is preserved as secondary metadata.
+fn finalize_run_audit(
+    audit: &Arc<crate::run_audit::RunAudit>,
+    result: &anyhow::Result<agent::AgentResult>,
+) {
+    // A mid-run write failure already poisoned the sink; surface it first.
+    if let Some(failure) = audit.take_failure() {
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
+    let (status, exit_code, secondary) = match result {
+        Ok(r) if r.stop_reason == providers::StopReason::Error => {
+            ("error", 1, Some("provider_error"))
+        }
+        Ok(_) => ("ok", 0, None),
+        Err(_) => ("error", 1, None),
+    };
+    if let Err(mut failure) = audit.finish(status, exit_code, None) {
+        if let Some(code) = secondary {
+            failure = failure.with_secondary(code);
+        }
+        eprintln!("{}", failure.diagnostic_json());
+        std::process::exit(failure.exit_code());
+    }
 }
 
 pub async fn run_chat(

@@ -9,6 +9,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **`--audit-path` (FR-04).** A global, default-off option that writes a
+  caller-requested, privacy-preserving run audit: one private JSONL file
+  (`O_CREAT | O_EXCL`, mode `0600`, never appended) with a versioned
+  lifecycle (`run_start` … `run_end`), `model_request`, `tool_call`, and
+  `tool_refusal` records sharing one `run_id` and a monotonic `sequence`. It
+  is independent of optional analytics and OTLP export and works without
+  controlled transport or a model profile. Credentials, URL userinfo/path/
+  query, prompts, bodies, headers, and tool argument/result contents never
+  enter the record; arguments and results are SHA-256 hashes of canonical
+  (sorted-key) bytes, only the credential variable name and base-URL host are
+  recorded, and unavailable metadata is explicit `null`. Unlike OTLP's
+  fail-open tracing, a requested audit is required: an open/write/finish
+  failure (including an existing destination, or exceeding
+  `[reviewer.audit]` `max_event_bytes`/`max_events`) stops the run with exit
+  `23` (`audit_write_failed`) — an open failure before any model request, a
+  mid-run failure before further model or tool work. With `--state-dir` the
+  path must be under the state root (else exit `2`, naming the option and
+  path); otherwise it must be outside the workspace. New module
+  `src/run_audit.rs`. See ADR-026 and `docs/configuration.md`.
 - **`--workspace-read-only` (FR-07).** A global, default-off option that
   prohibits every Daimonos-initiated workspace mutation end to end (startup,
   tool calls, teardown). Workspace mutations are refused with

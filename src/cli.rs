@@ -327,6 +327,13 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub workspace_read_only: bool,
 
+    /// Write a caller-requested, private JSONL run audit to PATH (WP08, FR-04).
+    /// Default off. The destination is outside evidence and, with --state-dir,
+    /// must be under the state root. A requested audit write failure stops the
+    /// run (exit 23). Context: ADR-026.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub audit_path: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
